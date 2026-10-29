@@ -1,0 +1,13 @@
+[package]
+name = "threadlane-registry"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Persistent global tool, model, and workflow profile registry for Threadlane"
+
+[dependencies]
+fs2 = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.10"
+thiserror = "1.0"
