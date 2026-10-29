@@ -18,6 +18,8 @@ import {
   deriveRecordedProfiles,
   formatAttachmentBadge,
   formatBindingLabel,
+  formatEvidenceFieldCheck,
+  formatEvidenceSummary,
   formatFooterStatus,
   formatModelAndEffort,
   formatProviderName,
@@ -280,8 +282,14 @@ class ThreadlaneDesktopApp {
     switchToActivity: boolean,
     focusTarget?: string
   ): Promise<void> {
+    if (this.state.pendingMutation !== null) {
+      return;
+    }
     const switched = selectBinding(this.state, bindingId, switchToActivity);
     this.state = switched.state;
+    if (!switched.ticket) {
+      return;
+    }
     this.render(focusTarget);
     await this.executeSnapshotTicket(switched.ticket);
     this.scheduleNextPoll();
@@ -621,7 +629,7 @@ class ThreadlaneDesktopApp {
       'data-change': 'binding',
       'data-focus': 'binding-select',
       'aria-label': 'Bound conversation',
-      disabled: bindings.length === 0,
+      disabled: bindings.length === 0 || pendingMutation !== null,
     });
 
     if (bindings.length === 0) {
@@ -1096,16 +1104,11 @@ class ThreadlaneDesktopApp {
         );
       }
 
-      const evidenceSummary =
-        detail.missing_model_evidence && detail.missing_effort_evidence
-          ? 'Missing model & effort evidence'
-          : detail.missing_model_evidence
-            ? 'Missing model evidence'
-            : detail.missing_effort_evidence
-              ? 'Missing effort evidence'
-              : task.needs_evidence
-                ? 'Needs provider evidence'
-                : 'Model & effort recorded';
+      const evidenceSummary = formatEvidenceSummary(
+        task,
+        detail.missing_model_evidence,
+        detail.missing_effort_evidence
+      );
 
       frag.appendChild(
         h(
@@ -1225,7 +1228,12 @@ class ThreadlaneDesktopApp {
               h(
                 'dd',
                 undefined,
-                detail.missing_model_evidence ? 'Missing model evidence' : 'Present / N/A'
+                formatEvidenceFieldCheck(
+                  task,
+                  task.observed_model,
+                  detail.missing_model_evidence,
+                  'model'
+                )
               )
             ),
             h(
@@ -1235,7 +1243,12 @@ class ThreadlaneDesktopApp {
               h(
                 'dd',
                 undefined,
-                detail.missing_effort_evidence ? 'Missing effort evidence' : 'Present / N/A'
+                formatEvidenceFieldCheck(
+                  task,
+                  task.observed_effort,
+                  detail.missing_effort_evidence,
+                  'effort'
+                )
               )
             )
           )
@@ -1325,6 +1338,7 @@ class ThreadlaneDesktopApp {
             className: 'aq-link',
             'data-select-binding': binding.binding_id,
             'data-focus': `chat-${binding.binding_id}`,
+            disabled: this.state.pendingMutation !== null,
           },
           h(
             'span',

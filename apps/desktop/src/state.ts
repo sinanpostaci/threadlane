@@ -245,7 +245,10 @@ export function selectBinding(
   state: DesktopStoreState,
   bindingId: string | null,
   switchToActivity: boolean = false
-): { state: DesktopStoreState; ticket: SnapshotTicket } {
+): { state: DesktopStoreState; ticket: SnapshotTicket | null } {
+  if (state.pendingMutation !== null) {
+    return { state, ticket: null };
+  }
   const nextEpoch = state.selectionEpoch + 1;
   const nextSeq = state.snapshotRequestSeq + 1;
   const clearDetail =

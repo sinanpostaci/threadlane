@@ -23,6 +23,8 @@ import {
   classifyTaskBucket,
   deriveRecordedProfiles,
   formatAttachmentBadge,
+  formatEvidenceFieldCheck,
+  formatEvidenceSummary,
   formatModelAndEffort,
   formatStatusLabel,
   isTaskActive,
@@ -30,7 +32,7 @@ import {
   resolveTaskBrand,
   sanitizeAppearancePreferences,
 } from './format.ts';
-import type { DesktopSnapshot, QueueBucket, RunDetail, TaskSummary } from './types.ts';
+import type { DesktopSnapshot, QueueBucket, RunDetail, TaskKind, TaskSummary } from './types.ts';
 
 function makeTask(overrides: Partial<TaskSummary> = {}): TaskSummary {
   return {
@@ -137,6 +139,7 @@ describe('snapshot polling & stale reply rejection', () => {
 
     // User switches binding before the poll resolves
     const switched = selectBinding(poll.state, 'bind-beta', true);
+    assert.ok(switched.ticket !== null);
     assert.equal(switched.state.selectedBindingId, 'bind-beta');
     assert.ok(switched.state.selectionEpoch > poll.ticket.epoch);
 
@@ -156,6 +159,55 @@ describe('snapshot polling & stale reply rejection', () => {
     assert.equal(afterFresh.selectedBindingId, 'bind-beta');
     assert.equal(afterFresh.snapshot.tasks[0]?.run_id, 'run-beta');
     assert.equal(afterFresh.pollInFlight, false);
+  });
+
+  it('serializes binding selection while mutation is pending so success and error completion never get stuck', () => {
+    // Case 1: attempted binding selection while start_demo mutation is pending, followed by mutation success
+    const initial = createInitialState();
+    const started = beginMutation(initial, 'start_demo');
+    assert.ok(started.ticket !== null);
+    assert.equal(started.state.pendingMutation, 'start_demo');
+
+    const attemptedSwitch = selectBinding(started.state, 'bind-beta', true);
+    assert.equal(attemptedSwitch.ticket, null);
+    assert.equal(attemptedSwitch.state.selectionEpoch, started.ticket.epoch);
+    assert.equal(attemptedSwitch.state.pendingMutation, 'start_demo');
+
+    const demoSnapshot = makeSnapshot({ selected_binding_id: 'bind-alpha' });
+    const afterSuccess = applyMutationSuccess(
+      attemptedSwitch.state,
+      started.ticket,
+      demoSnapshot
+    );
+    assert.equal(afterSuccess.pendingMutation, null);
+    assert.equal(afterSuccess.selectedBindingId, 'bind-alpha');
+
+    // Confirm future poll, binding selection, and mutation are all allowed after completion
+    const nextPoll = beginSnapshotPoll(afterSuccess);
+    assert.ok(nextPoll.ticket !== null);
+    const nextSwitch = selectBinding(afterSuccess, 'bind-beta', true);
+    assert.ok(nextSwitch.ticket !== null);
+    assert.equal(nextSwitch.state.selectedBindingId, 'bind-beta');
+
+    // Case 2: attempted binding selection while attach mutation is pending, followed by mutation error
+    const attach = beginMutation(afterSuccess, 'attach');
+    assert.ok(attach.ticket !== null);
+    const blockedSwitch = selectBinding(attach.state, 'bind-beta', false);
+    assert.equal(blockedSwitch.ticket, null);
+    assert.equal(blockedSwitch.state.selectionEpoch, attach.ticket.epoch);
+
+    const afterError = applyMutationError(
+      blockedSwitch.state,
+      attach.ticket,
+      'State directory does not exist.'
+    );
+    assert.equal(afterError.pendingMutation, null);
+    assert.equal(afterError.actionError, 'State directory does not exist.');
+
+    const pollAfterError = beginSnapshotPoll(afterError);
+    assert.ok(pollAfterError.ticket !== null);
+    const mutAfterError = beginMutation(afterError, 'cancel_demo');
+    assert.ok(mutAfterError.ticket !== null);
   });
 
   it('rejects a late snapshot poll reply that arrives during or after attach mutation', () => {
@@ -382,6 +434,199 @@ describe('task classification, profile derivation & appearance validation', () =
     assert.equal(profiles[0]?.activeCount, 1);
     assert.equal(profiles[0]?.needsEvidenceCount, 1);
     assert.equal(profiles[1]?.isUnassigned, true);
+  });
+
+  it('formats run evidence labels accurately across worker, demo, and unknown tasks', () => {
+    const evidenceTable: ReadonlyArray<{
+      label: string;
+      kind: TaskKind;
+      status: string;
+      observedModel: string | null;
+      observedEffort: string | null;
+      needsEvidence: boolean;
+      missingModelFlag: boolean;
+      missingEffortFlag: boolean;
+      expected: string;
+      forbidRecorded: boolean;
+    }> = [
+      {
+        label: 'queued worker with no observed values (even with requested values)',
+        kind: 'worker',
+        status: 'queued',
+        observedModel: null,
+        observedEffort: null,
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Pending (unverified)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'unknown status worker with no observed values',
+        kind: 'worker',
+        status: 'unknown',
+        observedModel: null,
+        observedEffort: null,
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Unverified (not observed)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'unknown kind task even with observed strings',
+        kind: 'unknown',
+        status: 'completed',
+        observedModel: 'gemini-4-argon-high',
+        observedEffort: 'high',
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Unverified',
+        forbidRecorded: true,
+      },
+      {
+        label: 'running worker missing observed_model',
+        kind: 'worker',
+        status: 'running',
+        observedModel: null,
+        observedEffort: 'high',
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Pending (model unverified)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'completed worker missing observed_model without explicit flag',
+        kind: 'worker',
+        status: 'completed',
+        observedModel: null,
+        observedEffort: 'high',
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Unverified (model not observed)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'running worker missing observed_effort',
+        kind: 'worker',
+        status: 'running',
+        observedModel: 'gemini-4-argon-high',
+        observedEffort: null,
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Pending (effort unverified)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'completed worker missing observed_effort without explicit flag',
+        kind: 'worker',
+        status: 'completed',
+        observedModel: 'gemini-4-argon-high',
+        observedEffort: null,
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Unverified (effort not observed)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'worker with both nonempty observed model and effort',
+        kind: 'worker',
+        status: 'completed',
+        observedModel: 'gemini-4-argon-high',
+        observedEffort: 'high',
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Model & effort recorded',
+        forbidRecorded: false,
+      },
+      {
+        label: 'local demo without missing flags',
+        kind: 'demo',
+        status: 'waiting_input',
+        observedModel: null,
+        observedEffort: null,
+        needsEvidence: false,
+        missingModelFlag: false,
+        missingEffortFlag: false,
+        expected: 'Not applicable (local demo)',
+        forbidRecorded: true,
+      },
+      {
+        label: 'demo or task with explicit missing model and effort flags',
+        kind: 'demo',
+        status: 'failed',
+        observedModel: null,
+        observedEffort: null,
+        needsEvidence: true,
+        missingModelFlag: true,
+        missingEffortFlag: true,
+        expected: 'Missing model & effort evidence',
+        forbidRecorded: true,
+      },
+      {
+        label: 'worker with explicit missing model flag',
+        kind: 'worker',
+        status: 'failed',
+        observedModel: null,
+        observedEffort: 'high',
+        needsEvidence: true,
+        missingModelFlag: true,
+        missingEffortFlag: false,
+        expected: 'Missing model evidence',
+        forbidRecorded: true,
+      },
+      {
+        label: 'worker with explicit missing effort flag',
+        kind: 'worker',
+        status: 'failed',
+        observedModel: 'deepseek-4.1-flash',
+        observedEffort: null,
+        needsEvidence: true,
+        missingModelFlag: false,
+        missingEffortFlag: true,
+        expected: 'Missing effort evidence',
+        forbidRecorded: true,
+      },
+    ];
+
+    for (const row of evidenceTable) {
+      const task = makeTask({
+        kind: row.kind,
+        status: row.status,
+        requested_model: 'requested-model-is-not-proof',
+        requested_effort: 'high',
+        observed_model: row.observedModel,
+        observed_effort: row.observedEffort,
+        needs_evidence: row.needsEvidence,
+      });
+      const actual = formatEvidenceSummary(task, row.missingModelFlag, row.missingEffortFlag);
+      assert.equal(actual, row.expected, `failed evidence case: ${row.label}`);
+      if (row.forbidRecorded) {
+        assert.ok(
+          !/recorded/i.test(actual),
+          `case "${row.label}" must not claim recorded evidence, got "${actual}"`
+        );
+      }
+    }
+
+    const queuedTask = makeTask({
+      kind: 'worker',
+      status: 'queued',
+      observed_model: null,
+      observed_effort: null,
+    });
+    assert.equal(formatEvidenceFieldCheck(queuedTask, null, false, 'model'), 'Pending (unverified)');
+    const demoTask = makeTask({ kind: 'demo', status: 'running', observed_model: null });
+    assert.equal(
+      formatEvidenceFieldCheck(demoTask, null, false, 'effort'),
+      'Not applicable (local demo)'
+    );
   });
 
   it('formats observed vs requested model telemetry and clamps appearance preferences', () => {

@@ -354,6 +354,75 @@ export function formatToolAvailability(availability: ToolAvailability): string {
   }
 }
 
+export function formatEvidenceSummary(
+  task: Pick<
+    TaskSummary,
+    'kind' | 'status' | 'observed_model' | 'observed_effort' | 'needs_evidence'
+  >,
+  missingModelEvidence: boolean = false,
+  missingEffortEvidence: boolean = false
+): string {
+  if (missingModelEvidence && missingEffortEvidence) {
+    return 'Missing model & effort evidence';
+  }
+  if (missingModelEvidence) {
+    return 'Missing model evidence';
+  }
+  if (missingEffortEvidence) {
+    return 'Missing effort evidence';
+  }
+  if (task.needs_evidence) {
+    return 'Needs provider evidence';
+  }
+  if (task.kind === 'demo') {
+    return 'Not applicable (local demo)';
+  }
+  if (task.kind !== 'worker') {
+    return 'Unverified';
+  }
+
+  const hasObservedModel = Boolean(task.observed_model && task.observed_model.trim().length > 0);
+  const hasObservedEffort = Boolean(
+    task.observed_effort && task.observed_effort.trim().length > 0
+  );
+
+  if (hasObservedModel && hasObservedEffort) {
+    return 'Model & effort recorded';
+  }
+
+  const active = classifyTaskBucket(task as TaskSummary) !== 'completed';
+  if (hasObservedModel && !hasObservedEffort) {
+    return active ? 'Pending (effort unverified)' : 'Unverified (effort not observed)';
+  }
+  if (!hasObservedModel && hasObservedEffort) {
+    return active ? 'Pending (model unverified)' : 'Unverified (model not observed)';
+  }
+  return active ? 'Pending (unverified)' : 'Unverified (not observed)';
+}
+
+export function formatEvidenceFieldCheck(
+  task: Pick<TaskSummary, 'kind' | 'status'>,
+  observedValue: string | null,
+  missingFlag: boolean,
+  fieldName: 'model' | 'effort'
+): string {
+  if (missingFlag) {
+    return fieldName === 'model' ? 'Missing model evidence' : 'Missing effort evidence';
+  }
+  if (task.kind === 'demo') {
+    return 'Not applicable (local demo)';
+  }
+  if (task.kind !== 'worker') {
+    return 'Unverified';
+  }
+  if (Boolean(observedValue && observedValue.trim().length > 0)) {
+    return 'Observed';
+  }
+  return classifyTaskBucket(task as TaskSummary) !== 'completed'
+    ? 'Pending (unverified)'
+    : 'Unverified';
+}
+
 export function deriveRecordedProfiles(tasks: readonly TaskSummary[]): RecordedProfileGroup[] {
   const groups = new Map<string, RecordedProfileGroup>();
 
