@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -887,8 +887,89 @@ pub fn is_control_config_path(rel_path: &str) -> bool {
     false
 }
 
+/// Effective write-scope matching mode for a repository-relative `allowed_write_paths` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteScopeKind {
+    /// Matches only the exact repository-relative file path (`candidate == scope`).
+    ExactFile,
+    /// Matches descendant files and directories under `scope` componentwise
+    /// (`Path::new(candidate).starts_with(Path::new(scope))`).
+    DirectorySubtree,
+}
+
+/// Checks whether a validated repository-relative path is covered by `resolved_write_scopes`
+/// (where each key is a clean repository-relative path without trailing `/` and each value is
+/// its resolved [`WriteScopeKind`]) and is not a protected control configuration path.
+///
+/// - [`WriteScopeKind::ExactFile`] entries match **only** when `rel_path == clean_scope`
+///   (and never match descendant paths such as `clean_scope/child`).
+/// - [`WriteScopeKind::DirectorySubtree`] entries match when `Path::new(rel_path)` starts with
+///   `Path::new(clean_scope)` componentwise.
+pub fn is_path_allowed_by_scopes(
+    rel_path: &str,
+    resolved_write_scopes: &BTreeMap<String, WriteScopeKind>,
+) -> bool {
+    if validate_repo_relative_path(rel_path, "changed path").is_err() {
+        return false;
+    }
+    if is_control_config_path(rel_path) {
+        return false;
+    }
+    let candidate = Path::new(rel_path);
+    resolved_write_scopes.iter().any(|(clean_scope, kind)| {
+        if clean_scope.is_empty()
+            || clean_scope.ends_with('/')
+            || validate_repo_relative_path(clean_scope, "allowed_write_paths entry").is_err()
+            || is_control_config_path(clean_scope)
+        {
+            return false;
+        }
+        match kind {
+            WriteScopeKind::ExactFile => rel_path == clean_scope.as_str(),
+            WriteScopeKind::DirectorySubtree => candidate.starts_with(Path::new(clean_scope)),
+        }
+    })
+}
+
 /// Checks whether a validated repository-relative path is covered by `allowed_write_paths`
-/// and is not a protected control configuration path.
+/// using pure syntactic scope conventions (trailing `/` means [`WriteScopeKind::DirectorySubtree`];
+/// bare entries without trailing `/` mean [`WriteScopeKind::ExactFile`]) and is not a protected
+/// control configuration path.
+pub fn is_path_allowed_syntactic(rel_path: &str, allowed_write_paths: &BTreeSet<String>) -> bool {
+    if validate_repo_relative_path(rel_path, "changed path").is_err() {
+        return false;
+    }
+    if is_control_config_path(rel_path) {
+        return false;
+    }
+    let candidate = Path::new(rel_path);
+    allowed_write_paths.iter().any(|allowed| {
+        if validate_repo_relative_path(allowed, "allowed_write_paths entry").is_err() {
+            return false;
+        }
+        if let Some(clean_dir) = allowed.strip_suffix('/') {
+            if is_control_config_path(clean_dir) {
+                return false;
+            }
+            candidate.starts_with(Path::new(clean_dir))
+        } else {
+            if is_control_config_path(allowed) {
+                return false;
+            }
+            rel_path == allowed.as_str()
+        }
+    })
+}
+
+/// Checks whether a validated repository-relative path is covered by `allowed_write_paths`
+/// under legacy syntactic prefix matching and is not a protected control configuration path.
+///
+/// Note: This legacy syntactic helper does not inspect a Git commit tree and treats bare entries
+/// as componentwise prefixes. Actual post-run diff gate acceptance in
+/// [`crate::git::evaluate_diff_gate`] resolves `allowed_write_paths` against the immutable pinned
+/// `base_commit` tree and uses [`is_path_allowed_by_scopes`] so bare file or absent paths are
+/// strictly enforced as [`WriteScopeKind::ExactFile`].
 pub fn is_path_allowed(rel_path: &str, allowed_write_paths: &BTreeSet<String>) -> bool {
     if validate_repo_relative_path(rel_path, "changed path").is_err() {
         return false;

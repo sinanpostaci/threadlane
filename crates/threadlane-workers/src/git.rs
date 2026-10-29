@@ -19,8 +19,8 @@ use crate::fs_safety::{
     write_private_json_atomic,
 };
 use crate::spec::{
-    is_control_config_path, is_path_allowed, validate_commit_ref, validate_repo_relative_path,
-    validate_simple_identifier, WorkerSpec,
+    is_control_config_path, is_path_allowed_by_scopes, validate_commit_ref,
+    validate_repo_relative_path, validate_simple_identifier, WorkerSpec, WriteScopeKind,
 };
 use crate::stream::NormalizedWorkerEvent;
 use crate::supervisor::{
@@ -1021,9 +1021,12 @@ fn evaluate_diff_gate_internal(
     let mut violations = Vec::new();
     let mut evidence_complete = true;
 
-    // 0. Collect baseline tracked symlinks (`mode == 120000`) in `base_commit` so unchanged
-    // baseline symlinks are not misclassified as newly created untracked symlinks.
+    // 0. Collect baseline tracked symlinks (`mode == 120000`) and baseline path kinds in
+    // `base_commit` so unchanged baseline symlinks are not misclassified as newly created
+    // untracked symlinks and `allowed_write_paths` scope kinds are resolved against the
+    // immutable `base_commit` tree rather than mutable worktree filesystem state.
     let mut baseline_symlinks = BTreeSet::new();
+    let mut baseline_path_kinds = BTreeMap::new();
     let ls_tree_out = run_git_bytes_bounded_with_timeout(
         &canonical_checkout,
         &["ls-tree", "-r", "-z", &manifest.base_commit],
@@ -1038,8 +1041,32 @@ fn evaluate_diff_gate_internal(
             detail: format!("git ls-tree failed supervision/budget check: {reason}"),
         });
     } else if let Ok(text) = std::str::from_utf8(&ls_tree_out.bytes) {
-        parse_ls_tree_symlinks_z(text, &mut baseline_symlinks);
+        if let Err(reason) =
+            parse_ls_tree_baseline_z(text, &mut baseline_symlinks, &mut baseline_path_kinds)
+        {
+            evidence_complete = false;
+            violations.push(DiffViolation {
+                path: "<git-ls-tree-parse>".to_string(),
+                kind: DiffViolationKind::DiffBudgetExceeded,
+                detail: format!("git ls-tree output parse failed: {reason}"),
+            });
+        }
     }
+
+    let resolved_write_scopes = if evidence_complete {
+        resolve_diff_gate_write_scopes(
+            &canonical_checkout,
+            &manifest.base_commit,
+            &manifest.allowed_write_paths,
+            &baseline_path_kinds,
+            max_git_output_bytes,
+            git_timeout_ms,
+            &mut evidence_complete,
+            &mut violations,
+        )?
+    } else {
+        None
+    };
 
     // 1. Collect binary path markers from `git diff --numstat --find-renames -z <base_commit>`
     let mut binary_paths = BTreeSet::new();
@@ -1272,11 +1299,12 @@ fn evaluate_diff_gate_internal(
             &canonical_checkout,
             entry,
             &manifest.allowed_write_paths,
+            resolved_write_scopes.as_ref(),
             &mut violations,
         );
     }
 
-    let passed = evidence_complete && violations.is_empty();
+    let passed = evidence_complete && resolved_write_scopes.is_some() && violations.is_empty();
     let acceptance_state = if passed {
         WorkAcceptanceState::DiffGatePassedPendingReview
     } else {
@@ -1303,10 +1331,188 @@ fn evaluate_diff_gate_internal(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_diff_gate_write_scopes(
+    canonical_checkout: &Path,
+    base_commit: &str,
+    allowed_write_paths: &BTreeSet<String>,
+    baseline_path_kinds: &BTreeMap<String, BaseCommitPathKind>,
+    max_git_output_bytes: usize,
+    git_timeout_ms: u64,
+    evidence_complete: &mut bool,
+    violations: &mut Vec<DiffViolation>,
+) -> Result<Option<BTreeMap<String, WriteScopeKind>>, WorkerError> {
+    let mut resolved = BTreeMap::new();
+
+    for entry in allowed_write_paths {
+        if let Err(err) = validate_repo_relative_path(entry, "allowed_write_paths entry") {
+            violations.push(DiffViolation {
+                path: entry.clone(),
+                kind: DiffViolationKind::PathEscape,
+                detail: err.to_string(),
+            });
+            continue;
+        }
+        let has_trailing_slash = entry.ends_with('/');
+        let clean = entry.strip_suffix('/').unwrap_or(entry.as_str());
+        if is_control_config_path(clean) {
+            violations.push(DiffViolation {
+                path: entry.clone(),
+                kind: DiffViolationKind::ControlConfigModified,
+                detail: format!(
+                    "allowed_write_paths entry `{entry}` targets protected control configuration"
+                ),
+            });
+            continue;
+        }
+
+        // Check whether any ancestor component of `clean` is a symlink or gitlink in `base_commit`.
+        let mut ancestor_violation = false;
+        let mut ancestor_regular_file = false;
+        let mut anc = Path::new(clean).parent();
+        while let Some(parent) = anc {
+            let parent_str = parent.to_string_lossy();
+            if parent_str.is_empty() {
+                break;
+            }
+            if let Some(&anc_kind) = baseline_path_kinds.get(parent_str.as_ref()) {
+                match anc_kind {
+                    BaseCommitPathKind::Symlink => {
+                        violations.push(DiffViolation {
+                            path: entry.clone(),
+                            kind: DiffViolationKind::SymlinkDetected,
+                            detail: format!(
+                                "allowed_write_paths entry `{entry}` traverses baseline symlink `{parent_str}` at base_commit `{base_commit}`"
+                            ),
+                        });
+                        ancestor_violation = true;
+                        break;
+                    }
+                    BaseCommitPathKind::Gitlink => {
+                        violations.push(DiffViolation {
+                            path: entry.clone(),
+                            kind: DiffViolationKind::OutsideAllowedPaths,
+                            detail: format!(
+                                "allowed_write_paths entry `{entry}` traverses baseline submodule gitlink `{parent_str}` at base_commit `{base_commit}`"
+                            ),
+                        });
+                        ancestor_violation = true;
+                        break;
+                    }
+                    BaseCommitPathKind::RegularFile => {
+                        ancestor_regular_file = true;
+                    }
+                    BaseCommitPathKind::Directory | BaseCommitPathKind::Missing => {}
+                }
+            }
+            anc = parent.parent();
+        }
+        if ancestor_violation {
+            continue;
+        }
+
+        let base_kind = if let Some(&known_kind) = baseline_path_kinds.get(clean) {
+            known_kind
+        } else if ancestor_regular_file {
+            BaseCommitPathKind::Missing
+        } else {
+            let tree_out = run_git_bytes_bounded_with_timeout(
+                canonical_checkout,
+                &["ls-tree", "-d", "-z", base_commit, "--", clean],
+                max_git_output_bytes,
+                git_timeout_ms,
+            )?;
+            if let Some(reason) = tree_out.failure_reason(max_git_output_bytes, git_timeout_ms) {
+                *evidence_complete = false;
+                violations.push(DiffViolation {
+                    path: "<git-ls-tree-scope-budget>".to_string(),
+                    kind: tree_out.violation_kind(),
+                    detail: format!(
+                        "git ls-tree -d for allowed_write_paths entry `{entry}` failed supervision/budget check: {reason}"
+                    ),
+                });
+                return Ok(None);
+            }
+            let text = std::str::from_utf8(&tree_out.bytes).map_err(|_| {
+                WorkerError::GitCommandFailed {
+                    command: format!("git ls-tree -d -z {base_commit} -- {clean}"),
+                    status: tree_out.exit_code,
+                    stderr: "git ls-tree stdout contained invalid UTF-8 bytes".to_string(),
+                }
+            })?;
+            match parse_exact_ls_tree_entry_z(text, clean) {
+                Ok(Some(kind)) => kind,
+                Ok(None) => BaseCommitPathKind::Missing,
+                Err(detail) => {
+                    *evidence_complete = false;
+                    violations.push(DiffViolation {
+                        path: "<git-ls-tree-scope-parse>".to_string(),
+                        kind: DiffViolationKind::DiffBudgetExceeded,
+                        detail,
+                    });
+                    return Ok(None);
+                }
+            }
+        };
+
+        let scope_kind = match (has_trailing_slash, base_kind) {
+            (_, BaseCommitPathKind::Symlink) => {
+                violations.push(DiffViolation {
+                    path: entry.clone(),
+                    kind: DiffViolationKind::SymlinkDetected,
+                    detail: format!(
+                        "allowed_write_paths entry `{entry}` targets a symlink at base_commit `{base_commit}`"
+                    ),
+                });
+                continue;
+            }
+            (_, BaseCommitPathKind::Gitlink) => {
+                violations.push(DiffViolation {
+                    path: entry.clone(),
+                    kind: DiffViolationKind::OutsideAllowedPaths,
+                    detail: format!(
+                        "allowed_write_paths entry `{entry}` targets a submodule gitlink at base_commit `{base_commit}`"
+                    ),
+                });
+                continue;
+            }
+            (true, BaseCommitPathKind::RegularFile) => {
+                violations.push(DiffViolation {
+                    path: entry.clone(),
+                    kind: DiffViolationKind::OutsideAllowedPaths,
+                    detail: format!(
+                        "directory allowed_write_paths entry `{entry}` (with trailing `/`) targets a non-directory file at base_commit `{base_commit}`"
+                    ),
+                });
+                continue;
+            }
+            (true, BaseCommitPathKind::Directory | BaseCommitPathKind::Missing) => {
+                WriteScopeKind::DirectorySubtree
+            }
+            (false, BaseCommitPathKind::Directory) => WriteScopeKind::DirectorySubtree,
+            (false, BaseCommitPathKind::RegularFile | BaseCommitPathKind::Missing) => {
+                WriteScopeKind::ExactFile
+            }
+        };
+
+        resolved
+            .entry(clean.to_string())
+            .and_modify(|existing| {
+                if scope_kind == WriteScopeKind::DirectorySubtree {
+                    *existing = WriteScopeKind::DirectorySubtree;
+                }
+            })
+            .or_insert(scope_kind);
+    }
+
+    Ok(Some(resolved))
+}
+
 fn evaluate_entry_violations(
     checkout_root: &Path,
     entry: &ChangedPathEntry,
     allowed_write_paths: &BTreeSet<String>,
+    resolved_write_scopes: Option<&BTreeMap<String, WriteScopeKind>>,
     violations: &mut Vec<DiffViolation>,
 ) {
     // 1. Validate path syntax & confinement for `entry.path` and `entry.orig_path`
@@ -1369,9 +1575,39 @@ fn evaluate_entry_violations(
         });
     }
 
-    // 4. Check allowed_write_paths for both `path` and `orig_path`
+    // 4. Check base_commit-resolved write scopes for both `path` and `orig_path`
     if !flagged_control {
-        if !is_path_allowed(&entry.path, allowed_write_paths) {
+        let Some(scopes) = resolved_write_scopes else {
+            violations.push(DiffViolation {
+                path: entry.path.clone(),
+                kind: DiffViolationKind::OutsideAllowedPaths,
+                detail: format!(
+                    "cannot verify changed path `{}` because baseline write-scope kinds at base_commit could not be proven",
+                    entry.path
+                ),
+            });
+            if let Some(ref orig) = entry.orig_path {
+                violations.push(DiffViolation {
+                    path: orig.clone(),
+                    kind: DiffViolationKind::OutsideAllowedPaths,
+                    detail: format!(
+                        "cannot verify renamed origin path `{orig}` because baseline write-scope kinds at base_commit could not be proven"
+                    ),
+                });
+            }
+            return;
+        };
+
+        let path_is_dir_in_checkout = fs::symlink_metadata(checkout_root.join(&entry.path))
+            .is_ok_and(|meta| meta.file_type().is_dir());
+        let exact_file_replaced_by_dir = path_is_dir_in_checkout
+            && scopes.get(&entry.path) == Some(&WriteScopeKind::ExactFile)
+            && !scopes.iter().any(|(scope_path, kind)| {
+                *kind == WriteScopeKind::DirectorySubtree
+                    && Path::new(&entry.path).starts_with(Path::new(scope_path))
+            });
+
+        if !is_path_allowed_by_scopes(&entry.path, scopes) || exact_file_replaced_by_dir {
             violations.push(DiffViolation {
                 path: entry.path.clone(),
                 kind: DiffViolationKind::OutsideAllowedPaths,
@@ -1384,7 +1620,7 @@ fn evaluate_entry_violations(
         if let Some(orig) = entry
             .orig_path
             .as_deref()
-            .filter(|orig| !is_path_allowed(orig, allowed_write_paths))
+            .filter(|orig| !is_path_allowed_by_scopes(orig, scopes))
         {
             violations.push(DiffViolation {
                 path: orig.to_string(),
@@ -2109,6 +2345,199 @@ pub fn cleanup_integrated_worktree(
             branch_preserved_reason: Some(reason),
         })
     }
+}
+
+/// Object kind of a repository-relative path in an immutable pinned Git `base_commit` tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseCommitPathKind {
+    /// Path does not exist in `base_commit` (and does not traverse a tracked symlink or gitlink).
+    Missing,
+    /// Path is a regular or executable file (`100644` or `100755` blob) in `base_commit`.
+    RegularFile,
+    /// Path is a directory (`040000` tree) in `base_commit`.
+    Directory,
+    /// Path is a symbolic link (`120000` blob) or traverses an ancestor symbolic link in `base_commit`.
+    Symlink,
+    /// Path is a submodule gitlink (`160000` commit) or traverses an ancestor gitlink in `base_commit`.
+    Gitlink,
+}
+
+/// Inspects the object kind of `rel_path` in the immutable `base_commit` tree of `repo_or_worktree`
+/// using bounded, environment-sanitized, process-group-supervised `git ls-tree` invocations.
+pub fn inspect_base_commit_path_kind(
+    repo_or_worktree: &Path,
+    base_commit: &str,
+    rel_path: &str,
+    timeout_ms: u64,
+) -> Result<BaseCommitPathKind, WorkerError> {
+    let canonical_dir = validate_existing_canonical_dir(repo_or_worktree, "repository_path")?;
+    validate_commit_ref(base_commit)?;
+    validate_repo_relative_path(rel_path, "allowed_write_paths entry")?;
+    let clean = rel_path.strip_suffix('/').unwrap_or(rel_path);
+
+    let mut ancestors = Vec::new();
+    let mut anc = Path::new(clean).parent();
+    while let Some(parent) = anc {
+        let s = parent.to_string_lossy();
+        if s.is_empty() {
+            break;
+        }
+        ancestors.push(s.to_string());
+        anc = parent.parent();
+    }
+    ancestors.reverse();
+
+    for ancestor_path in &ancestors {
+        match inspect_single_clean_path_at_base(
+            &canonical_dir,
+            base_commit,
+            ancestor_path,
+            timeout_ms,
+        )? {
+            BaseCommitPathKind::Directory => {}
+            BaseCommitPathKind::Symlink => return Ok(BaseCommitPathKind::Symlink),
+            BaseCommitPathKind::Gitlink => return Ok(BaseCommitPathKind::Gitlink),
+            BaseCommitPathKind::RegularFile | BaseCommitPathKind::Missing => {
+                return Ok(BaseCommitPathKind::Missing);
+            }
+        }
+    }
+
+    inspect_single_clean_path_at_base(&canonical_dir, base_commit, clean, timeout_ms)
+}
+
+/// Resolves a set of `allowed_write_paths` entries against the immutable `base_commit` tree in
+/// `repo_or_worktree`:
+/// - Explicit trailing-`/` entries (`"foo/"`) resolve to [`WriteScopeKind::DirectorySubtree`]
+///   (and fail closed if `"foo"` at `base_commit` is a regular file, symlink, or gitlink).
+/// - Bare entries (`"foo"`, without trailing `/`) resolve to [`WriteScopeKind::DirectorySubtree`]
+///   **only** if `"foo"` exists as a directory (`040000` tree) in `base_commit` (preserving legacy
+///   startup configuration semantics), and resolve to [`WriteScopeKind::ExactFile`] when `"foo"`
+///   is a regular file or absent (`Missing`) in `base_commit`.
+/// - Entries targeting or traversing a symlink or submodule gitlink in `base_commit` are rejected.
+pub fn resolve_allowed_write_scopes_at_base(
+    repo_or_worktree: &Path,
+    base_commit: &str,
+    allowed_write_paths: &BTreeSet<String>,
+    timeout_ms: u64,
+) -> Result<BTreeMap<String, WriteScopeKind>, WorkerError> {
+    let canonical_dir = validate_existing_canonical_dir(repo_or_worktree, "repository_path")?;
+    validate_commit_ref(base_commit)?;
+    let mut resolved = BTreeMap::new();
+
+    for entry in allowed_write_paths {
+        validate_repo_relative_path(entry, "allowed_write_paths entry")?;
+        let has_trailing_slash = entry.ends_with('/');
+        let clean = entry.strip_suffix('/').unwrap_or(entry.as_str());
+        if is_control_config_path(clean) {
+            return Err(WorkerError::SecurityViolation(format!(
+                "allowed_write_paths entry `{entry}` targets protected control configuration"
+            )));
+        }
+
+        let base_kind =
+            inspect_base_commit_path_kind(&canonical_dir, base_commit, entry, timeout_ms)?;
+        let scope_kind = match (has_trailing_slash, base_kind) {
+            (_, BaseCommitPathKind::Symlink) => {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "allowed_write_paths entry `{entry}` targets or traverses a symlink at base_commit `{base_commit}`"
+                )));
+            }
+            (_, BaseCommitPathKind::Gitlink) => {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "allowed_write_paths entry `{entry}` targets or traverses a submodule gitlink at base_commit `{base_commit}`"
+                )));
+            }
+            (true, BaseCommitPathKind::RegularFile) => {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "directory allowed_write_paths entry `{entry}` (with trailing `/`) targets a non-directory file at base_commit `{base_commit}`"
+                )));
+            }
+            (true, BaseCommitPathKind::Directory | BaseCommitPathKind::Missing) => {
+                WriteScopeKind::DirectorySubtree
+            }
+            (false, BaseCommitPathKind::Directory) => WriteScopeKind::DirectorySubtree,
+            (false, BaseCommitPathKind::RegularFile | BaseCommitPathKind::Missing) => {
+                WriteScopeKind::ExactFile
+            }
+        };
+
+        resolved
+            .entry(clean.to_string())
+            .and_modify(|existing| {
+                if scope_kind == WriteScopeKind::DirectorySubtree {
+                    *existing = WriteScopeKind::DirectorySubtree;
+                }
+            })
+            .or_insert(scope_kind);
+    }
+
+    Ok(resolved)
+}
+
+fn inspect_single_clean_path_at_base(
+    canonical_dir: &Path,
+    base_commit: &str,
+    clean: &str,
+    timeout_ms: u64,
+) -> Result<BaseCommitPathKind, WorkerError> {
+    let dir_out = run_git_bytes_bounded_with_timeout(
+        canonical_dir,
+        &["ls-tree", "-d", "-z", base_commit, "--", clean],
+        MAX_GIT_STDERR_BYTES,
+        timeout_ms,
+    )?;
+    if let Some(reason) = dir_out.failure_reason(MAX_GIT_STDERR_BYTES, timeout_ms) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git ls-tree -d -z {base_commit} -- {clean}"),
+            status: dir_out.exit_code,
+            stderr: reason,
+        });
+    }
+    let dir_text =
+        std::str::from_utf8(&dir_out.bytes).map_err(|_| WorkerError::GitCommandFailed {
+            command: format!("git ls-tree -d -z {base_commit} -- {clean}"),
+            status: dir_out.exit_code,
+            stderr: "git ls-tree stdout contained invalid UTF-8 bytes".to_string(),
+        })?;
+    if let Some(kind) = parse_exact_ls_tree_entry_z(dir_text, clean).map_err(|detail| {
+        WorkerError::GitCommandFailed {
+            command: format!("git ls-tree -d -z {base_commit} -- {clean}"),
+            status: dir_out.exit_code,
+            stderr: detail,
+        }
+    })? {
+        return Ok(kind);
+    }
+
+    let entry_out = run_git_bytes_bounded_with_timeout(
+        canonical_dir,
+        &["ls-tree", "-z", base_commit, "--", clean],
+        MAX_GIT_STDERR_BYTES,
+        timeout_ms,
+    )?;
+    if let Some(reason) = entry_out.failure_reason(MAX_GIT_STDERR_BYTES, timeout_ms) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git ls-tree -z {base_commit} -- {clean}"),
+            status: entry_out.exit_code,
+            stderr: reason,
+        });
+    }
+    let entry_text =
+        std::str::from_utf8(&entry_out.bytes).map_err(|_| WorkerError::GitCommandFailed {
+            command: format!("git ls-tree -z {base_commit} -- {clean}"),
+            status: entry_out.exit_code,
+            stderr: "git ls-tree stdout contained invalid UTF-8 bytes".to_string(),
+        })?;
+    let maybe_kind = parse_exact_ls_tree_entry_z(entry_text, clean).map_err(|detail| {
+        WorkerError::GitCommandFailed {
+            command: format!("git ls-tree -z {base_commit} -- {clean}"),
+            status: entry_out.exit_code,
+            stderr: detail,
+        }
+    })?;
+    Ok(maybe_kind.unwrap_or(BaseCommitPathKind::Missing))
 }
 
 /// Validates an exact 40-character hexadecimal Git object SHA and normalizes it to lowercase.
@@ -3146,18 +3575,82 @@ fn terminate_and_reap_git_group(
     (exit_status, reap_incomplete)
 }
 
-fn parse_ls_tree_symlinks_z(text: &str, baseline_symlinks: &mut BTreeSet<String>) {
+fn parse_ls_tree_baseline_z(
+    text: &str,
+    baseline_symlinks: &mut BTreeSet<String>,
+    baseline_path_kinds: &mut BTreeMap<String, BaseCommitPathKind>,
+) -> Result<(), String> {
     for record in text.split('\0') {
         if record.is_empty() {
             continue;
         }
         let Some((meta_part, path_part)) = record.split_once('\t') else {
-            continue;
+            return Err(format!("malformed git ls-tree record `{record}`"));
         };
-        if meta_part.starts_with("120000 ") && !path_part.is_empty() {
+        if path_part.is_empty() {
+            return Err("git ls-tree record has empty path".to_string());
+        }
+
+        let mut ancestor = Path::new(path_part).parent();
+        while let Some(parent) = ancestor {
+            let parent_str = parent.to_string_lossy();
+            if parent_str.is_empty() {
+                break;
+            }
+            baseline_path_kinds
+                .entry(parent_str.to_string())
+                .or_insert(BaseCommitPathKind::Directory);
+            ancestor = parent.parent();
+        }
+
+        let kind = if meta_part.starts_with("120000 ") {
             baseline_symlinks.insert(path_part.to_string());
+            BaseCommitPathKind::Symlink
+        } else if meta_part.starts_with("160000 ") {
+            BaseCommitPathKind::Gitlink
+        } else if meta_part.starts_with("040000 tree ") {
+            BaseCommitPathKind::Directory
+        } else if meta_part.starts_with("100644 ") || meta_part.starts_with("100755 ") {
+            BaseCommitPathKind::RegularFile
+        } else {
+            return Err(format!(
+                "unrecognized git ls-tree mode/type `{meta_part}` for `{path_part}`"
+            ));
+        };
+        baseline_path_kinds.insert(path_part.to_string(), kind);
+    }
+    Ok(())
+}
+
+fn parse_exact_ls_tree_entry_z(
+    text: &str,
+    expected_path: &str,
+) -> Result<Option<BaseCommitPathKind>, String> {
+    for record in text.split('\0') {
+        if record.is_empty() {
+            continue;
+        }
+        let Some((meta_part, path_part)) = record.split_once('\t') else {
+            return Err(format!("malformed git ls-tree record `{record}`"));
+        };
+        if path_part != expected_path {
+            continue;
+        }
+        if meta_part.starts_with("040000 tree ") {
+            return Ok(Some(BaseCommitPathKind::Directory));
+        } else if meta_part.starts_with("120000 ") {
+            return Ok(Some(BaseCommitPathKind::Symlink));
+        } else if meta_part.starts_with("160000 ") {
+            return Ok(Some(BaseCommitPathKind::Gitlink));
+        } else if meta_part.starts_with("100644 ") || meta_part.starts_with("100755 ") {
+            return Ok(Some(BaseCommitPathKind::RegularFile));
+        } else {
+            return Err(format!(
+                "unrecognized git ls-tree mode/type `{meta_part}` for `{expected_path}`"
+            ));
         }
     }
+    Ok(None)
 }
 
 fn parse_numstat_z(text: &str, binary_paths: &mut BTreeSet<String>) {

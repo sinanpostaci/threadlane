@@ -10,11 +10,12 @@ use threadlane_plans::{
 use threadlane_registry::ToolAdapter;
 use threadlane_workers::git::WORK_AREA_LOCK_FILENAME;
 use threadlane_workers::{
-    is_control_config_path, resolve_exact_commit_sha, validate_absolute_no_symlink_components,
-    validate_exact_40_hex_sha, validate_executable_file, validate_existing_canonical_dir,
-    validate_permission_pattern_path, validate_permission_pattern_str, validate_repo_relative_path,
-    validate_simple_identifier, ExecutionBudgets, WorkerFilePermissions, WorkerProvider,
-    WorkerSpec, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PATH_ENTRY_LEN,
+    inspect_base_commit_path_kind, is_control_config_path, resolve_exact_commit_sha,
+    validate_absolute_no_symlink_components, validate_exact_40_hex_sha, validate_executable_file,
+    validate_existing_canonical_dir, validate_permission_pattern_path,
+    validate_permission_pattern_str, validate_repo_relative_path, validate_simple_identifier,
+    BaseCommitPathKind, ExecutionBudgets, WorkerFilePermissions, WorkerProvider, WorkerSpec,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PATH_ENTRY_LEN,
 };
 use uuid::Uuid;
 
@@ -134,14 +135,10 @@ pub fn validate_repository_and_base_commit(
     Ok((canonical_repo, normalized_commit))
 }
 
-/// Validates a repository-relative write scope entry (either an operator allowlist entry or a
-/// task `allowed_write_paths` entry) against format, traversal, metacharacter, protected control,
-/// symlink, and file-vs-directory ambiguity rules.
-pub fn validate_write_scope_entry(
-    entry: &str,
-    canonical_repo: &Path,
+fn validate_write_scope_entry_syntax<'a>(
+    entry: &'a str,
     label: &str,
-) -> Result<String, AuthorityError> {
+) -> Result<(bool, &'a str), AuthorityError> {
     if entry.is_empty() || entry.len() > MAX_PATH_ENTRY_LEN {
         return Err(AuthorityError::InvalidWriteScope {
             path: entry.to_string(),
@@ -193,6 +190,19 @@ pub fn validate_write_scope_entry(
         });
     }
 
+    Ok((has_trailing_slash, clean))
+}
+
+/// Validates a repository-relative write scope entry (either an operator allowlist entry or a
+/// task `allowed_write_paths` entry) against format, traversal, metacharacter, protected control,
+/// symlink, and working-tree file-vs-directory ambiguity rules.
+pub fn validate_write_scope_entry(
+    entry: &str,
+    canonical_repo: &Path,
+    label: &str,
+) -> Result<String, AuthorityError> {
+    let (has_trailing_slash, clean) = validate_write_scope_entry_syntax(entry, label)?;
+
     let joined = canonical_repo.join(clean);
     validate_absolute_no_symlink_components(&joined, label).map_err(|err| {
         AuthorityError::InvalidWriteScope {
@@ -209,6 +219,112 @@ pub fn validate_write_scope_entry(
             });
         }
         if has_trailing_slash && !meta.file_type().is_dir() {
+            return Err(AuthorityError::InvalidWriteScope {
+                path: entry.to_string(),
+                reason: format!(
+                    "directory write scope `{entry}` (with trailing `/`) targets an existing non-directory in the repository"
+                ),
+            });
+        }
+        if !has_trailing_slash && meta.file_type().is_dir() {
+            return Err(AuthorityError::InvalidWriteScope {
+                path: entry.to_string(),
+                reason: format!(
+                    "ambiguous write scope `{entry}` targets an existing directory without a trailing `/`; directory scopes must end with `/`"
+                ),
+            });
+        }
+    }
+
+    Ok(entry.to_string())
+}
+
+/// Validates a repository-relative write scope entry against syntax, traversal, metacharacters,
+/// protected control paths, symlink components, working-tree metadata, **and** the immutable
+/// pinned `base_commit` tree in `canonical_repo`.
+///
+/// Rejects bare write scopes (`"foo"`, without trailing `/`) when `"foo"` is a directory (`tree`)
+/// at `base_commit` even if the mutable working tree currently has `"foo"` as a regular file or
+/// absent, preventing legacy runtime base-commit directory normalization from widening an
+/// operator's exact-file approval into a directory subtree.
+pub fn validate_write_scope_entry_at_base_commit(
+    entry: &str,
+    canonical_repo: &Path,
+    base_commit: &str,
+    label: &str,
+) -> Result<String, AuthorityError> {
+    let (has_trailing_slash, clean) = validate_write_scope_entry_syntax(entry, label)?;
+
+    let joined = canonical_repo.join(clean);
+    validate_absolute_no_symlink_components(&joined, label).map_err(|err| {
+        AuthorityError::InvalidWriteScope {
+            path: entry.to_string(),
+            reason: err.to_string(),
+        }
+    })?;
+
+    let base_kind = inspect_base_commit_path_kind(
+        canonical_repo,
+        base_commit,
+        clean,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .map_err(|err| AuthorityError::InvalidWriteScope {
+        path: entry.to_string(),
+        reason: format!("failed to inspect `{entry}` at base_commit `{base_commit}`: {err}"),
+    })?;
+
+    match base_kind {
+        BaseCommitPathKind::Symlink => {
+            return Err(AuthorityError::InvalidWriteScope {
+                path: entry.to_string(),
+                reason: format!(
+                    "{label} `{entry}` targets or traverses a symlink at base_commit `{base_commit}`"
+                ),
+            });
+        }
+        BaseCommitPathKind::Gitlink => {
+            return Err(AuthorityError::InvalidWriteScope {
+                path: entry.to_string(),
+                reason: format!(
+                    "{label} `{entry}` targets or traverses a submodule gitlink at base_commit `{base_commit}`"
+                ),
+            });
+        }
+        BaseCommitPathKind::Directory => {
+            if !has_trailing_slash {
+                return Err(AuthorityError::InvalidWriteScope {
+                    path: entry.to_string(),
+                    reason: format!(
+                        "ambiguous write scope `{entry}` targets a directory at base_commit `{base_commit}` without a trailing `/`; directory scopes must end with `/`"
+                    ),
+                });
+            }
+        }
+        BaseCommitPathKind::RegularFile => {
+            if has_trailing_slash {
+                return Err(AuthorityError::InvalidWriteScope {
+                    path: entry.to_string(),
+                    reason: format!(
+                        "directory write scope `{entry}` (with trailing `/`) targets a non-directory file at base_commit `{base_commit}`"
+                    ),
+                });
+            }
+        }
+        BaseCommitPathKind::Missing => {}
+    }
+
+    if let Ok(meta) = fs::symlink_metadata(&joined) {
+        if meta.file_type().is_symlink() {
+            return Err(AuthorityError::InvalidWriteScope {
+                path: entry.to_string(),
+                reason: format!("{label} `{entry}` targets a symlink in the repository"),
+            });
+        }
+        if has_trailing_slash
+            && !meta.file_type().is_dir()
+            && base_kind != BaseCommitPathKind::Directory
+        {
             return Err(AuthorityError::InvalidWriteScope {
                 path: entry.to_string(),
                 reason: format!(
@@ -911,6 +1027,25 @@ pub fn verify_approval_record_integrity(
         });
     }
 
+    let mut seen_op_scopes = BTreeSet::new();
+    for op_path in &record.approved_write_paths {
+        validate_stored_write_scope_syntax(
+            op_path,
+            "approved_write_paths entry",
+            &record.approval_id,
+            store_path,
+        )?;
+        if !seen_op_scopes.insert(op_path.clone()) {
+            return Err(AuthorityError::CorruptStore {
+                path: store_path.display().to_string(),
+                reason: format!(
+                    "approval `{}` contains duplicate approved_write_paths entry `{op_path}`",
+                    record.approval_id
+                ),
+            });
+        }
+    }
+
     if record.tasks.is_empty()
         || record.tasks.len() > MAX_APPROVED_TASKS
         || record.approved_task_ids.len() != record.tasks.len()
@@ -944,7 +1079,12 @@ pub fn verify_approval_record_integrity(
                 ),
             });
         }
-        verify_task_record_structure(task, &record.approval_id, store_path)?;
+        verify_task_record_structure(
+            task,
+            &record.approved_write_paths,
+            &record.approval_id,
+            store_path,
+        )?;
     }
 
     let core_digest =
@@ -1017,11 +1157,53 @@ pub fn verify_approval_record_integrity(
     Ok(())
 }
 
-fn verify_task_record_structure(
-    task: &ApprovedTaskRecord,
+fn validate_stored_write_scope_syntax(
+    entry: &str,
+    label: &str,
     approval_id: &str,
     store_path: &Path,
 ) -> Result<(), AuthorityError> {
+    validate_write_scope_entry_syntax(entry, label)
+        .map(|_| ())
+        .map_err(|err| AuthorityError::CorruptStore {
+            path: store_path.display().to_string(),
+            reason: format!("approval `{approval_id}` invalid {label} `{entry}`: {err}"),
+        })
+}
+
+fn verify_task_record_structure(
+    task: &ApprovedTaskRecord,
+    approved_write_paths: &[String],
+    approval_id: &str,
+    store_path: &Path,
+) -> Result<(), AuthorityError> {
+    if task.allowed_write_paths.is_empty() {
+        return Err(AuthorityError::CorruptStore {
+            path: store_path.display().to_string(),
+            reason: format!(
+                "approval `{approval_id}` task `{}` has empty allowed_write_paths",
+                task.task_id
+            ),
+        });
+    }
+    for task_path in &task.allowed_write_paths {
+        validate_stored_write_scope_syntax(
+            task_path,
+            "task allowed_write_paths entry",
+            approval_id,
+            store_path,
+        )?;
+        if !is_task_scope_contained_in_operator_allowlist(task_path, approved_write_paths) {
+            return Err(AuthorityError::CorruptStore {
+                path: store_path.display().to_string(),
+                reason: format!(
+                    "approval `{approval_id}` task `{}` write path `{task_path}` is not contained in approved_write_paths",
+                    task.task_id
+                ),
+            });
+        }
+    }
+
     let computed_instruction_digest = sha256_hex(task.instruction.as_bytes());
     if task.instruction_digest != computed_instruction_digest {
         return Err(AuthorityError::CorruptStore {
