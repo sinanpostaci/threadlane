@@ -121,3 +121,19 @@ nix develop "path:$tiny_flake#desktop"
    ```bash
    PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_desktop_preview.py -v
    ```
+
+
+## NVIDIA + Wayland preview on the first Linux test host
+
+The first standalone launch exited with Wayland protocol error 71. A process-local
+NVIDIA explicit-sync workaround allowed the same binary to remain open on native
+Wayland; Hyprland reported `xwayland: false`, and the user confirmed visible content.
+Use this invocation if that specific failure occurs on an NVIDIA/Wayland host:
+
+```bash
+__NV_DISABLE_EXPLICIT_SYNC=1 nix develop .#desktop --command python3 scripts/desktop_preview.py
+```
+
+The variable applies only to that launch and its children. The launcher does not
+change compositor, driver, browser, or NixOS settings. Other platforms and GPU
+configurations still need their own native smoke tests.

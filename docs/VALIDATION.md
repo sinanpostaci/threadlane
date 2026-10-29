@@ -375,3 +375,39 @@ the previously verified Rust tree is unchanged.
 The single Astra Max package-closing review passed after the targeted Git-environment
 fix and recheck, with no open blockers. Its qualified scope and evidence are
 recorded in [M2C-REVIEW.md](M2C-REVIEW.md).
+
+
+## Milestone 3A desktop preview (2026-10-29)
+
+- Integrated Rust workspace: **96 tests passed**, including seven new bridge
+  regressions. Formatting and workspace Clippy passed with warnings denied.
+- Actual supervisor regression verifies demo start, pending question, answer,
+  completion and cancellation. Repeated observer reads leave follower delivery,
+  acknowledgement and wake-up state unchanged. Dropping the observer preserves
+  the externally attached supervisor.
+- Python operator/desktop launcher regressions: **13 passed**. The actual core
+  binary also passed launcher readiness/teardown with a disposable window fixture.
+- Frontend typecheck/build and **14 focused state regressions passed**. CUA checked
+  390x840 and 320x500 viewports, five destinations, persisted appearance, scoped
+  task details, explicit missing effort, and the normal browser's disconnected
+  state. Browser fixture data is enabled only with explicit DEV `?preview=1`.
+- `cargo tauri build --debug --no-bundle` produced a standalone executable with
+  embedded frontend assets and a separate native Cargo lock. Native Clippy passed.
+- The first NVIDIA/Wayland launch exited with protocol error 71. The process-local
+  `__NV_DISABLE_EXPLICIT_SYNC=1` retry created a native Wayland window
+  (`xwayland: false`); the user confirmed correct visible content.
+- The preview performs no paid model calls and does not install OS services,
+  alter global graphics settings, consume native follower events, or modify the
+  user's NixOS configuration. Native macOS/Windows execution remains unverified.
+
+The package-closing review found two focused UI corrections: chat selection during
+pending mutations could strand the action state; absent provider telemetry could
+be labeled as recorded. Their targeted fixes and rechecks are tracked with the
+M3 checkpoint rather than repeating a full package review.
+
+The initial native user test produced two actual demo runs, both with a recorded
+`Continue` answer and `completed` state. The user did not recognize the outcome
+because completed rows were collapsed. The follow-up presentation fix routes demo
+actions to Activity and opens Finished; a regression and browser UI check confirm
+the completed row remains visible. The updated standalone window was reopened on
+native Wayland. This is GUI-to-local-runtime evidence, not native Codex orchestration.

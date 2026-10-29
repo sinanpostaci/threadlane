@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early foundation, developed with AI assistance and reviewed before checkpointing. Not production ready. All 89 Rust tests pass with the single-threaded fixture harness on Linux/NixOS, together with formatting, Clippy, build and CLI smoke. The operator harness also passes seven Python regressions and separate real-runtime/fake-provider probes. A qualified single-chat native pilot verified MCP worker start, a real isolated Argon file edit, fixed wake-up, event acknowledgement and terminal inspection; a separate fake-process run verified native cancellation. Real effort telemetry remained absent, so that patch was not accepted. Interactive provider continuation, authenticated multi-chat routing, reviewed result integration, the desktop UI and other platforms remain unfinished. See [validation evidence](docs/VALIDATION.md), the [M2C closing review](docs/M2C-REVIEW.md), [worker permissions](docs/WORKERS.md), and the [native routing gate](docs/NATIVE-ROUTING.md).
+> **Status:** Early development with AI assistance, reviewed before checkpointing. The first Linux desktop preview is available: read-only runtime observation, a separate local lifecycle demo, and appearance settings. The Rust workspace passes 96 tests, the Python harness passes 13 regressions, and the frontend passes 14 focused tests. A native Wayland window rendered successfully on the first test host with a process-local NVIDIA workaround. Interactive provider continuation, authenticated multi-chat routing, reviewed patch integration, editable profiles/Jev and other platforms remain unfinished. See [desktop usage](docs/DESKTOP.md), [validation evidence](docs/VALIDATION.md), and [worker permissions](docs/WORKERS.md).
 
 ---
 
@@ -39,7 +39,7 @@ Threadlane is a local execution middleware and control plane designed to work al
 
 ### Remaining Milestones
 - **Milestone 2 remaining integration**: Interactive provider question/Steer delivery, busy-turn and multi-chat acceptance, reconciliation of preserved uncertain artifacts, and reviewed Git integration/cleanup. The durable fixture checkpoint is not the full native workflow.
-- **Milestone 3**: Tauri narrow smoked-glass desktop control panel (`Activity`, `Chats`, `Tools`, `Profiles`, `Settings`) with an accessible opaque fallback.
+- **Milestone 3A preview is available**: [Tauri desktop panel](docs/DESKTOP.md) (`Activity`, `Chats`, `Tools`, `Profiles`, `Settings`), read-only runtime observation, a separate local demo, and configurable theme/accent/transparency. Editable profiles and worker orchestration controls remain later work.
 - **Milestone 4**: Global tool/model/effort registry, role/difficulty profiles, and shadow-mode Jev classification.
 - **Milestone 5**: Cross-platform release hardening, macOS/Windows native ACLs and secret storage, optional background service/tray packaging, and measured cost/notification budgets.
 

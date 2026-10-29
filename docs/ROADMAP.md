@@ -57,11 +57,17 @@ single-chat pilot now verifies start, real isolated file editing, return/wake-up
 event acknowledgement and separate deterministic cancellation. Missing real
 provider effort telemetry correctly prevented acceptance.
 
-Next, resolve provider evidence/interactive continuation and the
-[multi-chat routing gate](NATIVE-ROUTING.md). Busy-turn delivery, reconciliation of
-preserved uncertain artifacts, reviewed Git integration and accepted-result
-cleanup still need their own end-to-end checkpoint. The desktop UI, profiles/Jev
-and release hardening remain later milestones. See [validation](VALIDATION.md).
+Milestone 3A now adds the first narrow desktop preview: a read-only runtime
+observer, a separately owned local demo, recorded task/profile inspection, passive
+CLI discovery, and persisted appearance preferences. The standalone Linux build
+and native Wayland rendering passed on the first host with the documented
+process-local NVIDIA compatibility flag. See [desktop usage](DESKTOP.md).
+
+Provider evidence/interactive continuation and the
+[multi-chat routing gate](NATIVE-ROUTING.md) remain separate integration work.
+Busy-turn delivery, reconciliation of uncertain artifacts, reviewed Git
+integration/cleanup, editable profiles/Jev, and release hardening are not implied
+by the desktop preview. See [validation](VALIDATION.md).
 
 ## Default workflow example
 
