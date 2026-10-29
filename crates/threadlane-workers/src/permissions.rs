@@ -21,6 +21,21 @@ pub const AGY_WRITE_PERMISSION_TOOLS: [&str; 5] = [
     "multi_replace_file_content",
 ];
 
+/// Maximum number of `allowed_write_paths` entries permitted when `file_permissions` is
+/// [`WorkerFilePermissions::TaskFiles`].
+///
+/// Each entry expands into 10 session-only Antigravity permission rules (`5` write tools × exact
+/// and `/**` descendant patterns). Enforcing this finite ceiling before rule allocation prevents
+/// combinatorial rule expansion while leaving [`WorkerFilePermissions::Inherit`] unaffected.
+pub const MAX_TASK_FILES_WRITE_PATHS: usize = 128;
+
+/// Maximum serialized UTF-8 byte length of the session-only Antigravity `--settings <inline-json>`
+/// argument (`65_536` bytes / 64 KiB).
+///
+/// Kept conservatively below Linux's 128 KiB per-argument `MAX_ARG_STRLEN` (`E2BIG`) ceiling and
+/// checked on the actual `serde_json`-serialized JSON string before returning launch argv.
+pub const MAX_TASK_FILES_SETTINGS_BYTES: usize = 65_536;
+
 /// Trusted provider file-permission scoping policy for a worker invocation.
 ///
 /// Provider permission flags are session-only CLI hints; they are **not** an OS-level sandbox,
@@ -56,7 +71,8 @@ impl WorkerFilePermissions {
     }
 
     /// Validates that this permission mode is supported for `provider` and that all
-    /// `allowed_write_paths` entries are valid and free of unsafe glob/rule metacharacters.
+    /// `allowed_write_paths` entries are valid, within finite `TaskFiles` bounds, and free of
+    /// unsafe glob/rule metacharacters.
     pub fn validate_for_provider_and_paths(
         self,
         provider: WorkerProvider,
@@ -74,6 +90,13 @@ impl WorkerFilePermissions {
                 "allowed_write_paths must contain at least one repository-relative path"
                     .to_string(),
             ));
+        }
+
+        if self == Self::TaskFiles && allowed_write_paths.len() > MAX_TASK_FILES_WRITE_PATHS {
+            return Err(WorkerError::InvalidSpec(format!(
+                "allowed_write_paths contains {} entries, which exceeds the maximum of {MAX_TASK_FILES_WRITE_PATHS} entries permitted when `file_permissions` is `task_files`",
+                allowed_write_paths.len()
+            )));
         }
 
         for path_entry in allowed_write_paths {
@@ -200,5 +223,11 @@ pub fn build_antigravity_task_files_settings_json(
         permissions: AntigravityPermissionsBlock { allow },
     };
     let json = serde_json::to_string(&settings)?;
+    if json.len() > MAX_TASK_FILES_SETTINGS_BYTES {
+        return Err(WorkerError::InvalidSpec(format!(
+            "serialized `task_files` `--settings` JSON payload ({} bytes) exceeds maximum of {MAX_TASK_FILES_SETTINGS_BYTES} bytes",
+            json.len()
+        )));
+    }
     Ok(json)
 }
