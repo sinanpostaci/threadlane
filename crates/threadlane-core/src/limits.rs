@@ -4,14 +4,52 @@ use crate::error::CoreError;
 
 /// Current SQLite schema version owned by `threadlane-core`.
 ///
-/// Version 2 introduces keyset pagination indexes (`idx_runs_binding_order`,
+/// Version 2 introduced keyset pagination indexes (`idx_runs_binding_order`,
 /// `idx_questions_binding_run_order`) and in-place compaction of legacy v1
-/// full-run `command_dedup` responses. Databases at version 1 are migrated
-/// automatically and transactionally on open.
-pub const SCHEMA_VERSION: u32 = 2;
+/// full-run `command_dedup` responses. Version 3 adds the durable `workers`
+/// ledger and reopen uncertainty recovery. Databases at version 1 or 2 are
+/// migrated automatically and transactionally on open.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Legacy Milestone 1 SQLite schema version supported for in-place upgrade on open.
 pub(crate) const LEGACY_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Legacy Milestone 2A SQLite schema version supported for in-place upgrade on open.
+pub(crate) const LEGACY_SCHEMA_VERSION_V2: u32 = 2;
+
+/// Maximum number of named worker execution profiles permitted in startup configuration.
+pub const MAX_WORKER_PROFILES: usize = 32;
+
+/// Minimum global worker concurrency limit permitted in startup configuration.
+pub const MIN_WORKER_MAX_PARALLEL: usize = 1;
+
+/// Maximum global worker concurrency limit permitted in startup configuration.
+pub const MAX_WORKER_MAX_PARALLEL: usize = 8;
+
+/// Maximum byte length for a worker profile identifier (`profile_id`).
+pub const MAX_WORKER_PROFILE_ID_LEN: usize = 64;
+
+/// Exact hex byte length for an immutable SHA-256 trusted profile digest.
+pub const MAX_WORKER_DIGEST_LEN: usize = 64;
+
+/// Maximum number of durable `WorkerProgress` events persisted per worker attempt.
+///
+/// Additional live progress updates beyond this cap still update the worker's
+/// latest progress summary and increment `coalesced_progress_events` without
+/// growing the durable `events` table unboundedly.
+pub const MAX_WORKER_PROGRESS_EVENTS_PER_ATTEMPT: u32 = 32;
+
+/// Maximum byte length for sanitized summary or diagnostic text stored in a worker snapshot.
+pub const MAX_WORKER_SUMMARY_TEXT_BYTES: usize = 512;
+
+/// Maximum number of relative changed file paths previewed in a compact worker outcome.
+pub const MAX_WORKER_CHANGED_PATHS_PREVIEW: usize = 16;
+
+/// Maximum number of diff-gate violation summaries included in a compact worker outcome.
+pub const MAX_WORKER_VIOLATION_SUMMARIES: usize = 8;
+
+/// Maximum byte length for a worktree path or relative path string in a compact worker snapshot.
+pub const MAX_WORKER_PATH_BYTES: usize = 512;
 
 /// Maximum byte length for software-generated or caller-supplied identifiers.
 pub const MAX_ID_LEN: usize = 64;
