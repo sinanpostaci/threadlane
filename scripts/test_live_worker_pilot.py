@@ -7,8 +7,9 @@ All tests run offline against temporary directories and local fake executables u
 
 from __future__ import annotations
 
-import contextlib, io, json, os, stat, sys, tempfile, textwrap, unittest
+import contextlib, io, json, os, stat, subprocess, sys, tempfile, textwrap, unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import live_worker_pilot as pilot
@@ -251,6 +252,167 @@ class LiveWorkerPilotTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(os.lstat(d).st_mode), 0o700)
             for f in (out_dir / "workers_config.json", out_dir / "pilot_summary.json"):
                 self.assertEqual(stat.S_IMODE(os.lstat(f).st_mode), 0o600)
+
+    def test_git_fixture_isolation_preserves_unrelated_repo_under_poisoned_git_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            unrelated_repo = root / "unrelated_repo"
+            unrelated_repo.mkdir(mode=0o700)
+            clean_git_env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+            clean_git_env.update({
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            })
+
+            def git_clean(repo: Path, *args: str) -> str:
+                res = subprocess.run(
+                    ["git", *args], cwd=str(repo), env=clean_git_env,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+                )
+                return res.stdout
+
+            git_clean(unrelated_repo, "init", "-q")
+            (unrelated_repo / "base.txt").write_text("unrelated base\n", encoding="utf-8")
+            git_clean(unrelated_repo, "add", "--", "base.txt")
+            git_clean(
+                unrelated_repo, "-c", "user.name=Unrelated Owner", "-c", "user.email=unrelated@example.local",
+                "-c", "commit.gpgsign=false", "commit", "-q", "-m", "Unrelated base commit",
+            )
+            (unrelated_repo / "unrelated.txt").write_text("staged unrelated change\n", encoding="utf-8")
+            git_clean(unrelated_repo, "add", "--", "unrelated.txt")
+
+            hook_fired = root / "hook_fired.marker"
+            hooks_dir = unrelated_repo / ".git" / "hooks"
+            hooks_dir.mkdir(exist_ok=True)
+            hooks_marker = hooks_dir / "hooks.marker"
+            hooks_marker.write_bytes(b"preserve-hooks-marker\n")
+            _write_exec(hooks_dir / "pre-commit", f"from pathlib import Path\nPath({str(hook_fired)!r}).write_text('fired', encoding='utf-8')\n")
+
+            poison_hooks = root / "poison_hooks"
+            poison_hooks.mkdir(mode=0o700)
+            _write_exec(poison_hooks / "pre-commit", f"from pathlib import Path\nPath({str(hook_fired)!r}).write_text('fired_config', encoding='utf-8')\n")
+
+            unrelated_head_sha = git_clean(unrelated_repo, "rev-parse", "--verify", "HEAD").strip()
+            unrelated_head_bytes = (unrelated_repo / ".git" / "HEAD").read_bytes()
+            unrelated_index_bytes = (unrelated_repo / ".git" / "index").read_bytes()
+            unrelated_config_bytes = (unrelated_repo / ".git" / "config").read_bytes()
+            unrelated_hooks_marker_bytes = hooks_marker.read_bytes()
+            unrelated_status_before = git_clean(unrelated_repo, "status", "--porcelain", "--untracked-files=all")
+            self.assertEqual(unrelated_status_before.strip(), "A  unrelated.txt")
+
+            poisoned_env = {
+                "GIT_DIR": str(unrelated_repo / ".git"),
+                "GIT_WORK_TREE": str(unrelated_repo),
+                "GIT_INDEX_FILE": str(unrelated_repo / ".git" / "index"),
+                "GIT_OBJECT_DIRECTORY": str(unrelated_repo / ".git" / "objects"),
+                "GIT_COMMON_DIR": str(unrelated_repo / ".git"),
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(poison_hooks),
+                "GIT_CONFIG_KEY_1": "user.name",
+                "GIT_CONFIG_VALUE_1": "Poisoned Config User",
+                "GIT_CONFIG_PARAMETERS": f"'core.hooksPath={poison_hooks}'",
+            }
+            fresh_source = pilot.create_private_dir(root / "fresh_source")
+            log_path = root / "git_fixture.log"
+            with mock.patch.dict(os.environ, poisoned_env, clear=False):
+                fresh_sha = pilot.init_disposable_git_fixture(fresh_source, log_path)
+                verify_fresh = pilot.verify_source_checkout_unchanged(fresh_source, fresh_sha, log_path)
+
+            self.assertTrue((fresh_source / ".git").is_dir())
+            self.assertEqual(fresh_sha, git_clean(fresh_source, "rev-parse", "--verify", "HEAD").strip())
+            self.assertNotEqual(fresh_sha, unrelated_head_sha)
+            self.assertEqual(git_clean(fresh_source, "ls-tree", "--name-only", fresh_sha).splitlines(), ["greeting.txt"])
+            self.assertEqual(git_clean(fresh_source, "log", "-1", "--format=%an", fresh_sha).strip(), "Threadlane Fixture")
+            self.assertTrue(verify_fresh["preserved"])
+
+            self.assertEqual(git_clean(unrelated_repo, "rev-parse", "--verify", "HEAD").strip(), unrelated_head_sha)
+            self.assertEqual((unrelated_repo / ".git" / "HEAD").read_bytes(), unrelated_head_bytes)
+            self.assertEqual((unrelated_repo / ".git" / "index").read_bytes(), unrelated_index_bytes)
+            self.assertEqual((unrelated_repo / ".git" / "config").read_bytes(), unrelated_config_bytes)
+            self.assertEqual(hooks_marker.read_bytes(), unrelated_hooks_marker_bytes)
+            self.assertFalse(hook_fired.exists())
+            self.assertEqual(git_clean(unrelated_repo, "status", "--porcelain", "--untracked-files=all"), unrelated_status_before)
+            self.assertFalse((unrelated_repo / "greeting.txt").exists())
+
+    def test_child_env_sanitization_for_subprocess_run_and_popen(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            logs_dir = pilot.create_private_dir(root / "logs")
+            fake_home = str(root / "fake_home")
+            fake_path = os.environ.get("PATH", "/usr/bin:/bin")
+            poisoned_env = {
+                "HOME": fake_home,
+                "PATH": fake_path,
+                "PROVIDER_AUTH_SENTINEL": "keep-auth-token-999",
+                "GIT_DIR": "/poison/git_dir",
+                "GIT_WORK_TREE": "/poison/work_tree",
+                "GIT_INDEX_FILE": "/poison/index",
+                "GIT_OBJECT_DIRECTORY": "/poison/objects",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES": "/poison/alt_objects",
+                "GIT_COMMON_DIR": "/poison/common_dir",
+                "GIT_CONFIG": "/poison/config",
+                "GIT_CONFIG_PARAMETERS": "'core.hooksPath=/poison/hooks'",
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": "/poison/hooks",
+                "GIT_CONFIG_KEY_1": "protocol.allow",
+                "GIT_CONFIG_VALUE_1": "always",
+                "GIT_CONFIG_GLOBAL": "/poison/global_gitconfig",
+                "GIT_CONFIG_SYSTEM": "/poison/system_gitconfig",
+                "GIT_CONFIG_NOSYSTEM": "0",
+                "GIT_TERMINAL_PROMPT": "1",
+                "GIT_AUTHOR_NAME": "Poisoned Author",
+            }
+            expected_git_env = {
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_TERMINAL_PROMPT": "0",
+            }
+
+            with mock.patch.dict(os.environ, poisoned_env, clear=False):
+                parent_snapshot = dict(os.environ)
+
+                with mock.patch("live_worker_pilot.subprocess.run") as mock_run:
+                    mock_run.return_value = subprocess.CompletedProcess(args=["cmd"], returncode=0, stdout="{}", stderr="")
+                    pilot.run_command_logged(["cmd"], log_path=logs_dir / "cmd1.log")
+                    pilot.run_command_logged(
+                        ["cmd"],
+                        log_path=logs_dir / "cmd2.log",
+                        env={
+                            "GIT_DIR": "/explicit/poison_git_dir",
+                            "GIT_CONFIG_COUNT": "1",
+                            "GIT_CONFIG_KEY_0": "core.sshCommand",
+                            "GIT_CONFIG_VALUE_0": "evil",
+                            "EXTRA_NON_GIT_VAR": "preserved_extra",
+                        },
+                    )
+                    self.assertEqual(mock_run.call_count, 2)
+                    run_env_default = mock_run.call_args_list[0].kwargs["env"]
+                    run_env_custom = mock_run.call_args_list[1].kwargs["env"]
+
+                with mock.patch("live_worker_pilot.subprocess.Popen") as mock_popen:
+                    fake_proc = mock.MagicMock()
+                    fake_proc.poll.return_value = 0
+                    mock_popen.return_value = fake_proc
+                    with pilot.supervised_threadlane(Path("/bin/threadlane"), ["serve"], logs_dir, "sup", root):
+                        pass
+                    self.assertEqual(mock_popen.call_count, 1)
+                    popen_env = mock_popen.call_args.kwargs["env"]
+
+                self.assertEqual(dict(os.environ), parent_snapshot)
+
+            for child_env in (run_env_default, run_env_custom, popen_env):
+                git_subset = {k: v for k, v in child_env.items() if k.upper().startswith("GIT_")}
+                self.assertEqual(git_subset, expected_git_env)
+                self.assertEqual(child_env.get("PROVIDER_AUTH_SENTINEL"), "keep-auth-token-999")
+                self.assertEqual(child_env.get("HOME"), fake_home)
+                self.assertEqual(child_env.get("PATH"), fake_path)
+
+            self.assertEqual(run_env_custom.get("EXTRA_NON_GIT_VAR"), "preserved_extra")
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse, contextlib, json, os, signal, stat, subprocess, sys, time, uuid
 from pathlib import Path
-from typing import Any, Iterator, NamedTuple, NoReturn
+from typing import Any, Iterator, Mapping, NamedTuple, NoReturn
 
 PROVIDER_ID, PROFILE_ID, FILE_PERMISSIONS_MODE = "antigravity", "agy_live_pilot", "task_files"
 TRACKED_REL_PATH, INITIAL_GREETING_CONTENT, EXPECTED_GREETING_CONTENT = "greeting.txt", "Hello\n", "Hello from Threadlane\n"
@@ -212,12 +212,25 @@ def read_bounded_regular_file(path: Path, max_bytes: int = MAX_BOUNDED_READ_BYTE
     return raw.decode("utf-8")
 
 
+def build_sanitized_child_env(env: Mapping[str, str] | None = None) -> dict[str, str]:
+    merged = os.environ if env is None else {**os.environ, **env}
+    sanitized = {k: str(v) for k, v in merged.items() if not k.upper().startswith("GIT_")}
+    sanitized.update({
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    return sanitized
+
+
 def run_command_logged(
-    argv: list[str], *, log_path: Path, cwd: Path | None = None, env: dict[str, str] | None = None,
+    argv: list[str], *, log_path: Path, cwd: Path | None = None, env: Mapping[str, str] | None = None,
     timeout: float = CLI_CALL_TIMEOUT_SECONDS, error_class: str = "subprocess_failed",
 ) -> str:
+    child_env = build_sanitized_child_env(env)
     try:
-        proc = subprocess.run(argv, cwd=str(cwd) if cwd else None, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
+        proc = subprocess.run(argv, cwd=str(cwd) if cwd else None, env=child_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
     except (subprocess.TimeoutExpired, OSError) as exc:
         with open_private_log(log_path) as log_f:
             log_f.write(f"[{error_class}] subprocess exception: {type(exc).__name__}\n")
@@ -252,8 +265,9 @@ def call_threadlane_when_ready(proc: subprocess.Popen[Any], threadlane_bin: Path
 
 @contextlib.contextmanager
 def supervised_threadlane(threadlane_bin: Path, args: list[str], logs_dir: Path, prefix: str, cwd: Path) -> Iterator[subprocess.Popen[Any]]:
+    child_env = build_sanitized_child_env()
     with open_private_log(logs_dir / f"{prefix}.stdout.log") as out_f, open_private_log(logs_dir / f"{prefix}.stderr.log") as err_f:
-        proc = subprocess.Popen([str(threadlane_bin), *args], cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f, text=True)
+        proc = subprocess.Popen([str(threadlane_bin), *args], cwd=str(cwd), env=child_env, stdin=subprocess.DEVNULL, stdout=out_f, stderr=err_f, text=True)
         try:
             yield proc
         finally:
@@ -271,8 +285,7 @@ def supervised_threadlane(threadlane_bin: Path, args: list[str], logs_dir: Path,
 
 
 def run_git_isolated(repo_dir: Path, args: list[str], log_path: Path) -> str:
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null"}
-    return run_command_logged(["git", *args], log_path=log_path, cwd=repo_dir, env=env, timeout=GIT_CMD_TIMEOUT_SECONDS, error_class="git_command_failed")
+    return run_command_logged(["git", *args], log_path=log_path, cwd=repo_dir, timeout=GIT_CMD_TIMEOUT_SECONDS, error_class="git_command_failed")
 
 def init_disposable_git_fixture(source_repo: Path, log_path: Path) -> str:
     run_git_isolated(source_repo, ["init", "-q"], log_path)
