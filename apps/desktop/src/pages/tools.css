@@ -1,0 +1,452 @@
+.aq-tools-page {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
+}
+
+.aq-tools-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.aq-tools-hero-actions,
+.aq-tools-badges,
+.aq-tools-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.aq-tools-hero-actions {
+  justify-content: flex-end;
+}
+
+.aq-tools-section {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.aq-tools-section-head,
+.aq-tools-form-head,
+.aq-tools-tool-head,
+.aq-tools-model-head,
+.aq-tools-advice-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.aq-tools-heading {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.aq-tools-form,
+.aq-tools-card {
+  padding: 14px;
+  border: 1px solid var(--aq-line);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--aq-base) 62%, transparent);
+}
+
+.aq-tools-create {
+  background: color-mix(in srgb, var(--aq-field) 34%, transparent);
+}
+
+.aq-tools-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.aq-tools-form-head h4,
+.aq-tools-tool-head h4,
+.aq-tools-model-head h4,
+.aq-tools-probe h5,
+.aq-tools-api h5,
+.aq-tools-advice h5 {
+  margin: 0;
+  font-size: 0.95rem;
+  font-weight: 650;
+}
+
+.aq-tools-form-grid,
+.aq-tools-status-grid,
+.aq-tools-facts {
+  display: grid;
+  gap: 10px 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.aq-tools-form-grid {
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+}
+
+.aq-tools-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.aq-tools-field .aq-label {
+  font-size: 0.78rem;
+  color: var(--aq-muted);
+}
+
+.aq-tools-field .aq-text-input,
+.aq-tools-field select {
+  width: 100%;
+  min-width: 0;
+}
+
+.aq-tools-check-field {
+  justify-content: flex-end;
+}
+
+.aq-tools-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  color: var(--aq-text);
+}
+
+.aq-tools-hint {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 0.76rem;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-inline-error,
+.aq-tools-error {
+  color: var(--aq-danger);
+}
+
+.aq-tools-inline-error {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.aq-tools-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--aq-danger) 35%, var(--aq-line));
+  border-radius: 7px;
+  background: var(--aq-danger-bg);
+  font-size: 0.8rem;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--aq-hover);
+  color: var(--aq-muted);
+  font-size: 0.74rem;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-notice {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--aq-line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--aq-field) 52%, transparent);
+}
+
+.aq-tools-notice-success {
+  border-color: color-mix(in srgb, var(--aq-accent) 42%, var(--aq-line));
+}
+
+.aq-tools-notice-error {
+  border-color: color-mix(in srgb, var(--aq-danger) 42%, var(--aq-line));
+  background: var(--aq-danger-bg);
+}
+
+.aq-tools-notice-copy {
+  min-width: 0;
+}
+
+.aq-tools-notice-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.aq-tools-notice-text {
+  margin: 3px 0 0;
+  color: var(--aq-muted);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.aq-tools-card {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  min-width: 0;
+}
+
+.aq-tools-card-disabled {
+  opacity: 0.82;
+}
+
+.aq-tools-tool-head,
+.aq-tools-model-head {
+  justify-content: flex-start;
+  align-items: center;
+}
+
+.aq-tools-tool-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  margin-right: auto;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-tool-title .aq-tools-hint {
+  flex-basis: 100%;
+}
+
+.aq-tools-card-actions {
+  padding-top: 2px;
+}
+
+.aq-tools-delete-note {
+  flex-basis: 100%;
+}
+
+.aq-tools-delete-confirm {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--aq-danger) 40%, var(--aq-line));
+  border-radius: 7px;
+  background: var(--aq-danger-bg);
+  font-size: 0.8rem;
+}
+
+.aq-tools-status-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 3px;
+}
+
+.aq-tools-status-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--aq-line);
+}
+
+.aq-tools-status-label {
+  color: var(--aq-muted);
+  font-size: 0.76rem;
+}
+
+.aq-tools-status-value {
+  color: var(--aq-text);
+  font-size: 0.8rem;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-status-value[data-tone="ok"] {
+  color: var(--aq-accent);
+}
+
+.aq-tools-status-value[data-tone="warn"] {
+  color: var(--aq-warn);
+}
+
+.aq-tools-status-value[data-tone="danger"] {
+  color: var(--aq-danger);
+}
+
+.aq-tools-message,
+.aq-tools-inline-status {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-probe,
+.aq-tools-api,
+.aq-tools-advice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--aq-line);
+}
+
+.aq-tools-catalog {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 260px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.aq-tools-catalog-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border: 1px solid var(--aq-line);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--aq-field) 36%, transparent);
+}
+
+.aq-tools-catalog-row-invalid {
+  border-color: color-mix(in srgb, var(--aq-danger) 32%, var(--aq-line));
+}
+
+.aq-tools-catalog-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  cursor: pointer;
+}
+
+.aq-tools-catalog-check input {
+  margin-top: 3px;
+}
+
+.aq-tools-catalog-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.aq-tools-catalog-copy strong {
+  font-size: 0.84rem;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-rule {
+  width: 100%;
+  margin: 4px 0 0;
+  border: 0;
+  border-top: 1px solid var(--aq-line);
+}
+
+.aq-tools-conflict {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 9px 10px;
+  border: 1px solid color-mix(in srgb, var(--aq-warn) 45%, var(--aq-line));
+  border-radius: 7px;
+  background: var(--aq-warn-bg);
+}
+
+.aq-tools-conflict-title {
+  margin: 0;
+  color: var(--aq-warn);
+  font-size: 0.82rem;
+  font-weight: 650;
+}
+
+.aq-tools-facts {
+  margin: 0;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+}
+
+.aq-tools-facts > div {
+  min-width: 0;
+}
+
+.aq-tools-facts dt {
+  color: var(--aq-muted);
+  font-size: 0.72rem;
+}
+
+.aq-tools-facts dd {
+  margin: 2px 0 0;
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.aq-tools-guidance,
+.aq-tools-footer {
+  max-width: 82ch;
+}
+
+.aq-tools-empty {
+  padding: 8px 0;
+}
+
+@media (max-width: 680px) {
+  .aq-tools-hero,
+  .aq-tools-section-head,
+  .aq-tools-form-head,
+  .aq-tools-tool-head,
+  .aq-tools-model-head,
+  .aq-tools-advice-head {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .aq-tools-hero-actions {
+    justify-content: flex-start;
+  }
+
+  .aq-tools-form-grid,
+  .aq-tools-status-grid,
+  .aq-tools-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .aq-tools-check-field {
+    justify-content: flex-start;
+  }
+
+  .aq-tools-card,
+  .aq-tools-form {
+    padding: 11px;
+  }
+}
