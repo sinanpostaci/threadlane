@@ -170,6 +170,20 @@ validated checkout directory:
      `MalformedStream`, `OutputOverflow`, `TimedOut`, `Cancelled`, `IncompleteCleanup`,
      `NonZeroExit`.
 
+## Live progress observation
+
+`run_worker_with_observer` and `execute_worker_task_with_observer` add an optional
+bounded `tokio::sync::mpsc::Sender<NormalizedWorkerEvent>` as their final argument.
+Existing entry points retain their signatures and delegate with no observer.
+Normalized events are emitted while the worker is running. The sender uses
+`try_send`, so a slow, full or closed observer cannot block stdout drainage,
+timeout/cancellation or final model/result verification. The final report's
+`dropped_live_events` counts undelivered live notifications separately from the
+parser's retained-event truncation counter. With no observer it remains zero.
+
+This is a library interface. The durable supervisor/MCP dispatch connection is
+still the next checkpoint described in [MILESTONE-2B.md](MILESTONE-2B.md).
+
 ### 5. Git Worktree Manager, Diff Gate, and Safe Cleanup (`threadlane_workers::git`)
 
 - **Work-Area Ownership Marker and Preservation (`WorktreeManager::new`)**:

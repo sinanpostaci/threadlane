@@ -189,3 +189,24 @@ Steer/question/cancel, reviewed merge/cleanup of accepted results and the deskto
 UI still need their own integration checkpoint. Diff checks are post-run
 inspection, not an OS filesystem sandbox. macOS and Windows remain untested.
 Raw provider logs and runtime data remain private and outside version control.
+
+
+## Live worker observation follow-up (2026-10-29)
+
+Four additional fake-process regressions passed: progress is observed before
+exit, full/closed channels preserve terminal evidence and count drops,
+timeout/cancel works with a full observer, and disabled observation preserves
+existing results (including honest missing Argon effort evidence).
+
+The integrated workspace passed all 64 tests with
+`cargo test --workspace --locked -- --test-threads=1`, formatting, Clippy with
+warnings denied, build and CLI smoke. The default parallel harness attempt did
+not pass: two existing fake-executable tests received OS `ETXTBSY` / `Text file
+busy` at spawn. No behavior assertion was removed or relaxed. The single-threaded
+harness is the verified command for this checkpoint; its worker concurrency and
+process-cancellation regressions still exercise concurrent processes explicitly.
+The precise cause of the intermittent parallel fixture failure is unresolved.
+The standalone HTTP/stdio review fixtures were also verified against the actual
+supervisor and all 11 current MCP tools, without paid models or user chats.
+
+These observer changes do not yet wire real workers into durable native dispatch.
