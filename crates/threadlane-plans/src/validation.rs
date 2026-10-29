@@ -219,6 +219,7 @@ pub fn is_protected_control_path(rel_path: &str) -> bool {
 }
 
 /// Validates that `rel_path` is a clean, repository-relative, non-wildcard, non-protected write scope entry.
+/// Exact file paths have no trailing slash; directory scopes end with a single trailing `/`.
 pub fn validate_allowed_write_path(
     plan_id: &str,
     task_id: &str,
@@ -240,8 +241,10 @@ pub fn validate_allowed_write_path(
             reason: "write path must not have leading or trailing whitespace".to_string(),
         });
     }
-    if rel_path.starts_with('/')
-        || rel_path.ends_with('/')
+    let stripped = rel_path.strip_suffix('/').unwrap_or(rel_path);
+    if stripped.is_empty()
+        || rel_path.starts_with('/')
+        || stripped.ends_with('/')
         || rel_path.contains('\\')
         || rel_path.contains('\0')
         || rel_path.contains("//")
@@ -251,7 +254,7 @@ pub fn validate_allowed_write_path(
             task_id: task_id.to_string(),
             path: rel_path.to_string(),
             reason:
-                "write path must be a normalized repository-relative path without leading/trailing slashes or backslashes"
+                "write path must be a normalized repository-relative file or directory (`dir/`) path without leading slashes, double slashes, or backslashes"
                     .to_string(),
         });
     }
@@ -266,8 +269,19 @@ pub fn validate_allowed_write_path(
             reason: "write path must not contain wildcard or glob pattern characters".to_string(),
         });
     }
+    if stripped
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(PlanError::InvalidWriteScope {
+            plan_id: plan_id.to_string(),
+            task_id: task_id.to_string(),
+            path: rel_path.to_string(),
+            reason: "write path must not contain `.` or `..` traversal components".to_string(),
+        });
+    }
 
-    let path = Path::new(rel_path);
+    let path = Path::new(stripped);
     if path.is_absolute() {
         return Err(PlanError::InvalidWriteScope {
             plan_id: plan_id.to_string(),
@@ -316,7 +330,7 @@ pub fn validate_allowed_write_path(
         });
     }
 
-    if is_protected_control_path(rel_path) {
+    if is_protected_control_path(stripped) {
         return Err(PlanError::InvalidWriteScope {
             plan_id: plan_id.to_string(),
             task_id: task_id.to_string(),

@@ -313,6 +313,11 @@ class ThreadlaneDesktopApp {
       const snapshot = await ipcDesktopSnapshot(ticket.requestedBindingId);
       this.state = applySnapshotPollSuccess(this.state, ticket, snapshot);
       if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+        this.plansPage.syncRuntimeContext(
+          this.state.snapshot.bindings,
+          this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
+          this.state.snapshot.attachment
+        );
         this.renderHeader();
         this.renderFooter();
         return;
@@ -331,6 +336,11 @@ class ThreadlaneDesktopApp {
       const msg = err instanceof Error ? err.message : 'Failed to load desktop snapshot.';
       this.state = applySnapshotPollError(this.state, ticket, msg);
       if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+        this.plansPage.syncRuntimeContext(
+          this.state.snapshot.bindings,
+          this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
+          this.state.snapshot.attachment
+        );
         this.renderHeader();
         this.renderFooter();
         return;
@@ -1639,7 +1649,8 @@ class ThreadlaneDesktopApp {
         this.state.registrySnapshot,
         this.state.snapshot.bindings,
         this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
-        this.state.plansError
+        this.state.plansError,
+        this.state.snapshot.attachment
       )
     );
     return frag;
