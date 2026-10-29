@@ -662,16 +662,45 @@ mod tests {
         let cycle_3_err = validate_plan_tasks("plan-x", &cycle_3_tasks).expect_err("3-node cycle");
         assert_eq!(cycle_3_err.code(), "dependency_cycle");
 
-        // Disallowed write scopes: absolute paths, parent traversal, wildcards, and protected control paths.
+        // Canonical directory scopes with a single trailing `/` are accepted and preserved verbatim.
+        for valid_dir_scope in [
+            "src/dir/",
+            "crates/threadlane-plans/",
+            "apps/desktop/src/approval/",
+        ] {
+            let checked =
+                validate_allowed_write_path("plan-x", "t1", valid_dir_scope).expect("valid dir");
+            assert_eq!(checked, valid_dir_scope);
+            let dir_scope_tasks = vec![sample_task(
+                "t1",
+                WorkflowRole::Coder,
+                Difficulty::Easy,
+                vec![],
+                vec![valid_dir_scope],
+            )];
+            assert_eq!(
+                validate_plan_tasks("plan-x", &dir_scope_tasks).expect("valid dir task"),
+                vec!["t1".to_string()]
+            );
+        }
+
+        // Disallowed write scopes: root/double slashes, absolute paths, parent/dot traversal, wildcards, and protected control paths.
         for bad_path in [
+            "/",
+            "src//",
+            "src//lib.rs",
             "/etc/nixos/configuration.nix",
             "../outside/file.rs",
+            "src/../lib.rs",
             "./src/lib.rs",
-            "src//lib.rs",
-            "src/dir/",
+            "src/.",
+            "src/./",
+            "src\\lib.rs",
             "src/*.rs",
+            ".git/",
             ".git/config",
             "AGENTS.md",
+            ".codex/",
             ".codex/config.toml",
             ".env.production",
             ".github/workflows/ci.yml",

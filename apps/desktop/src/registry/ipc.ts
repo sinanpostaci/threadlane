@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { hasTauriRuntime, isDevPreviewFixtureMode } from '../ipc.ts';
+export { hasTauriRuntime, isDevPreviewFixtureMode };
 import {
   createEmptyRegistrySnapshot,
   DIFFICULTIES,
@@ -432,6 +433,113 @@ function upsertModelIntoList(
   }
 }
 
+const PROTECTED_CONTROL_COMPONENTS = new Set([
+  '.git',
+  '.gitmodules',
+  '.gitattributes',
+  '.gitignore',
+  'agents.md',
+  'claude.md',
+  '.codex',
+  '.gemini',
+  '.opencode',
+  '.agents',
+  '.claude',
+]);
+
+export function isProtectedControlWriteScope(relPath: string): boolean {
+  const trimmed = relPath.replace(/^\/+|\/+$/g, '');
+  if (!trimmed) {
+    return true;
+  }
+  const lowerSegments = trimmed
+    .split('/')
+    .filter(Boolean)
+    .map((seg) => seg.toLowerCase());
+  if (lowerSegments.length === 0) {
+    return true;
+  }
+  for (const seg of lowerSegments) {
+    if (PROTECTED_CONTROL_COMPONENTS.has(seg)) {
+      return true;
+    }
+    if (seg === '.env' || seg.startsWith('.env.')) {
+      return true;
+    }
+  }
+  if (lowerSegments[0] === '.github') {
+    return true;
+  }
+  if (
+    lowerSegments[0] === '.cargo' &&
+    (lowerSegments[1] === 'config' || lowerSegments[1] === 'config.toml')
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function validateCanonicalWriteScopeEntry(
+  rawPath: string,
+  errorCode: string = 'invalid_scope'
+): string {
+  if (!rawPath || rawPath.length > 512) {
+    throw new AppIpcError(
+      errorCode,
+      'Write path must be between 1 and 512 characters.'
+    );
+  }
+  if (rawPath.trim() !== rawPath) {
+    throw new AppIpcError(
+      errorCode,
+      `Write path "${rawPath}" must not have leading or trailing whitespace.`
+    );
+  }
+  const stripped = rawPath.endsWith('/') ? rawPath.slice(0, -1) : rawPath;
+  if (
+    !stripped ||
+    rawPath.startsWith('/') ||
+    stripped.endsWith('/') ||
+    rawPath.includes('//') ||
+    rawPath.includes('\\') ||
+    rawPath.includes('\0')
+  ) {
+    throw new AppIpcError(
+      errorCode,
+      `Write path "${rawPath}" must be a normalized repository-relative file or directory ("dir/") path without leading slashes, double slashes, or backslashes.`
+    );
+  }
+  if (/[*?[\]{}!]/.test(rawPath)) {
+    throw new AppIpcError(
+      errorCode,
+      `Write path "${rawPath}" must not contain wildcard or glob characters.`
+    );
+  }
+  for (let i = 0; i < rawPath.length; i++) {
+    const code = rawPath.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) {
+      throw new AppIpcError(
+        errorCode,
+        `Write path "${rawPath}" must not contain control characters.`
+      );
+    }
+  }
+  const segments = stripped.split('/');
+  if (segments.some((seg) => !seg || seg === '.' || seg === '..')) {
+    throw new AppIpcError(
+      errorCode,
+      `Write path "${rawPath}" must not contain "." or ".." traversal components.`
+    );
+  }
+  if (isProtectedControlWriteScope(stripped)) {
+    throw new AppIpcError(
+      errorCode,
+      `Write path "${rawPath}" targets protected repository control or agent configuration files.`
+    );
+  }
+  return rawPath;
+}
+
 export function validatePlanTasksDag(tasks: readonly PlanTask[]): void {
   if (tasks.length === 0) {
     throw new AppIpcError('invalid_plan', 'A plan must contain at least one task.');
@@ -466,14 +574,22 @@ export function validatePlanTasksDag(tasks: readonly PlanTask[]): void {
         `Task "${id}" has invalid difficulty "${task.difficulty}".`
       );
     }
+    if (task.allowed_write_paths.length === 0 || task.allowed_write_paths.length > 64) {
+      throw new AppIpcError(
+        'invalid_scope',
+        `Task "${id}" must specify between 1 and 64 allowed write paths.`
+      );
+    }
+    const seenPaths = new Set<string>();
     for (const writePath of task.allowed_write_paths) {
-      const trimmedPath = writePath.trim();
-      if (!trimmedPath || trimmedPath.startsWith('/') || trimmedPath.includes('..')) {
+      const checked = validateCanonicalWriteScopeEntry(writePath, 'invalid_scope');
+      if (seenPaths.has(checked)) {
         throw new AppIpcError(
           'invalid_scope',
-          `Task "${id}" has invalid allowed write path "${writePath}". Use relative repository paths without "..".`
+          `Task "${id}" has duplicate allowed write path "${checked}".`
         );
       }
+      seenPaths.add(checked);
     }
   }
 
@@ -767,6 +883,16 @@ export function resetDevPreviewRegistryState(): void {
   previewRegistry = createEmptyRegistrySnapshot();
   previewSecrets.clear();
   previewPlans = [];
+}
+
+export function getDevPreviewContext(): {
+  registry: RegistrySnapshot;
+  plans: PlanRevision[];
+} {
+  return {
+    registry: structuredClone(previewRegistry),
+    plans: structuredClone(previewPlans),
+  };
 }
 
 export async function desktop_registry_snapshot(): Promise<RegistrySnapshot> {
