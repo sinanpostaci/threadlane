@@ -338,12 +338,19 @@ export function applyMutationSuccess(
     nextDetailSeq += 1;
   }
 
+  const isDemoAction =
+    ticket.kind === 'start_demo' ||
+    ticket.kind === 'answer_demo' ||
+    ticket.kind === 'cancel_demo';
+
   const nextPage: NavPage =
-    ticket.kind === 'start_demo' || ticket.kind === 'attach' ? 'activity' : state.page;
+    isDemoAction || ticket.kind === 'attach' ? 'activity' : state.page;
+  const nextCompletedExpanded = isDemoAction ? true : state.completedExpanded;
 
   return {
     ...state,
     page: nextPage,
+    completedExpanded: nextCompletedExpanded,
     snapshot,
     selectedBindingId: nextSelectedBindingId,
     snapshotLoading: false,

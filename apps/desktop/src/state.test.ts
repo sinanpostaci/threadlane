@@ -346,6 +346,69 @@ describe('demo controls & expected revision handling', () => {
     const afterStaleErr = applySnapshotPollError(failed, staleTicket, 'Old network error');
     assert.equal(afterStaleErr.actionError, 'Demo revision mismatch: expected 2, current is 3.');
   });
+
+  it('routes demo start/answer/cancel to Activity and expands Finished while keeping attach behavior unchanged', () => {
+    let state = navigateToPage(createInitialState(), 'settings');
+    assert.equal(state.page, 'settings');
+    assert.equal(state.completedExpanded, false);
+
+    // Attach from settings routes to Activity but preserves default collapsed Finished state
+    const attach = beginMutation(state, 'attach');
+    assert.ok(attach.ticket !== null);
+    state = applyMutationSuccess(
+      attach.state,
+      attach.ticket,
+      makeSnapshot({ selected_binding_id: 'bind-beta' })
+    );
+    assert.equal(state.page, 'activity');
+    assert.equal(state.completedExpanded, false);
+    assert.equal(state.selectedBindingId, 'bind-beta');
+
+    // Starting demo from Settings routes to Activity and expands Finished
+    state = navigateToPage(state, 'settings');
+    const startDemo = beginMutation(state, 'start_demo');
+    assert.ok(startDemo.ticket !== null);
+    state = applyMutationSuccess(
+      startDemo.state,
+      startDemo.ticket,
+      makeSnapshot({
+        selected_binding_id: 'bind-alpha',
+        tasks: [makeTask({ run_id: 'demo-1', status: 'waiting_input', kind: 'demo' })],
+      })
+    );
+    assert.equal(state.page, 'activity');
+    assert.equal(state.completedExpanded, true);
+    assert.equal(state.selectedBindingId, 'bind-alpha');
+
+    // Even if user collapsed Finished or navigated away, answer_demo and cancel_demo show Activity and expand Finished
+    state = { ...navigateToPage(state, 'chats'), completedExpanded: false };
+    const answerDemo = beginMutation(state, 'answer_demo');
+    assert.ok(answerDemo.ticket !== null);
+    state = applyMutationSuccess(
+      answerDemo.state,
+      answerDemo.ticket,
+      makeSnapshot({
+        selected_binding_id: 'bind-alpha',
+        tasks: [makeTask({ run_id: 'demo-1', status: 'completed', kind: 'demo' })],
+      })
+    );
+    assert.equal(state.page, 'activity');
+    assert.equal(state.completedExpanded, true);
+
+    state = { ...navigateToPage(state, 'settings'), completedExpanded: false };
+    const cancelDemo = beginMutation(state, 'cancel_demo');
+    assert.ok(cancelDemo.ticket !== null);
+    state = applyMutationSuccess(
+      cancelDemo.state,
+      cancelDemo.ticket,
+      makeSnapshot({
+        selected_binding_id: 'bind-alpha',
+        tasks: [makeTask({ run_id: 'demo-1', status: 'cancelled', kind: 'demo' })],
+      })
+    );
+    assert.equal(state.page, 'activity');
+    assert.equal(state.completedExpanded, true);
+  });
 });
 
 describe('task classification, profile derivation & appearance validation', () => {
