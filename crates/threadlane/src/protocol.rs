@@ -5,10 +5,10 @@ use threadlane_core::{
     DEFAULT_PAGE_LIMIT,
 };
 pub use threadlane_core::{
-    RunSummary, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerOutcomeSummary,
-    WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot, WorkerStatus,
-    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
-    MAX_SUMMARY_TEXT_PREVIEW_CHARS,
+    ActivityPage, Event, EventKind, EventPayload, RunSummary, WorkerAcceptanceState, WorkerClaim,
+    WorkerCompletionRecord, WorkerOutcomeSummary, WorkerProgressSummary, WorkerProgressUpdate,
+    WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate,
+    MAX_STATUS_RECENT_RUNS, MAX_SUMMARY_TEXT_PREVIEW_CHARS,
 };
 
 /// Trusted CLI request to bind a validated native Codex thread UUID and display label.
@@ -123,6 +123,24 @@ pub enum ScopedRequest {
         /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
         #[serde(default)]
         limit: Option<usize>,
+    },
+    /// List a bounded read-only page of durable activity events for the binding without mutating delivery or acknowledgement cursors.
+    ListActivity {
+        /// Optional sequence position (`seq`) to start after on the first page (defaults to `0`; mutually exclusive with `cursor`).
+        #[serde(default)]
+        after_seq: Option<u64>,
+        /// Optional opaque keyset cursor returned by a previous `ListActivity` page (mutually exclusive with `after_seq`).
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Optional run identifier filter (`run_<uuid>`).
+        #[serde(default)]
+        run_id: Option<String>,
+        /// Optional event kind filter.
+        #[serde(default)]
+        kind: Option<EventKind>,
     },
     /// Start a deterministic demo run (`Start -> Running`).
     StartDemo {
@@ -245,6 +263,19 @@ impl ScopedRequest {
                 run_id,
                 cursor,
                 limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            }),
+            Self::ListActivity {
+                after_seq,
+                cursor,
+                limit,
+                run_id,
+                kind,
+            } => Some(Command::ListActivity {
+                after_seq,
+                cursor,
+                limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+                run_id,
+                kind,
             }),
             Self::StartDemo {
                 command_key,
@@ -369,6 +400,9 @@ pub enum ScopedResponse {
     RevisionHistory(RevisionHistoryPage),
     /// Bounded keyset-paginated run question history page (`ListRunQuestions`).
     QuestionHistory(QuestionHistoryPage),
+    /// Bounded keyset-paginated read-only activity event page (`ListActivity`).
+    #[serde(alias = "activity_page", alias = "activity_history")]
+    Activity(ActivityPage),
     /// Ordered event delivery batch (`PullEvents`).
     EventBatch(EventBatch),
     /// Event batch acknowledgement result (`AckEvents`).
@@ -383,6 +417,7 @@ impl From<CommandOutput> for ScopedResponse {
             CommandOutput::RunList(page) => Self::RunList(page),
             CommandOutput::RevisionHistory(page) => Self::RevisionHistory(page),
             CommandOutput::QuestionHistory(page) => Self::QuestionHistory(page),
+            CommandOutput::Activity(page) => Self::Activity(page),
             CommandOutput::EventBatch(batch) => Self::EventBatch(batch),
             CommandOutput::AckResult(ack) => Self::AckResult(ack),
         }
@@ -436,6 +471,19 @@ impl ScopedResponse {
             Self::QuestionHistory(page) => Some(page),
             _ => None,
         }
+    }
+
+    /// Extracts the inner [`ActivityPage`] if this is `ScopedResponse::Activity`.
+    pub fn into_activity(self) -> Option<ActivityPage> {
+        match self {
+            Self::Activity(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`ActivityPage`] if this is `ScopedResponse::Activity`.
+    pub fn into_activity_page(self) -> Option<ActivityPage> {
+        self.into_activity()
     }
 
     /// Extracts the inner [`EventBatch`] if this is `ScopedResponse::EventBatch`.

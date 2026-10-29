@@ -381,7 +381,8 @@ impl EventKind {
         )
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    /// Returns the canonical `snake_case` wire string for this event kind.
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::RunStarted => "run_started",
             Self::RunProgress => "run_progress",
@@ -403,7 +404,9 @@ impl EventKind {
         }
     }
 
-    pub(crate) fn from_str(value: &str) -> Option<Self> {
+    /// Parses a canonical `snake_case` wire string into an [`EventKind`].
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "run_started" => Some(Self::RunStarted),
             "run_progress" => Some(Self::RunProgress),
@@ -481,6 +484,27 @@ pub struct Event {
     pub payload: EventPayload,
     /// Timestamp (ms) when the event was recorded.
     pub created_at_ms: i64,
+}
+
+/// Bounded keyset-paginated read-only page of durable [`Event`] records (`Command::ListActivity`).
+///
+/// Pagination is anchored to `high_water_mark_seq` in ascending `seq` order so events emitted after
+/// page 1 is opened never cause duplicate or skipped rows across pages. Reading activity pages never
+/// mutates `delivered_seq`, `acked_seq`, `event_batches`, or `wakeups`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityPage {
+    /// Binding ID that owns these events.
+    pub binding_id: String,
+    /// Ordered durable events (`seq` ascending) within this page.
+    pub events: Vec<Event>,
+    /// Opaque keyset cursor to pass on the next `ListActivity` call when `has_more == true`.
+    pub next_cursor: Option<String>,
+    /// `true` if additional matching events remain within `high_water_mark_seq` after this page.
+    pub has_more: bool,
+    /// Sequence high-water mark (`seq`) anchoring this pagination window (`0` when the binding has no events).
+    pub high_water_mark_seq: u64,
+    /// Sequence position (`seq`) that this page started after (`0` on the initial full-history page).
+    pub after_seq: u64,
 }
 
 /// Bounded batch of ordered events returned by `PullEvents`.
@@ -563,6 +587,23 @@ pub enum Command {
         cursor: Option<String>,
         /// Maximum number of questions to return (`1..=MAX_PAGE_LIMIT`).
         limit: usize,
+    },
+    /// List a bounded read-only page of durable activity events for the binding without mutating delivery or acknowledgement cursors.
+    ListActivity {
+        /// Optional sequence position (`seq`) to start after on the first page (defaults to `0`; mutually exclusive with `cursor`).
+        #[serde(default)]
+        after_seq: Option<u64>,
+        /// Optional opaque keyset cursor returned by a previous `ListActivity` page (mutually exclusive with `after_seq`).
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Maximum number of events to return (`1..=MAX_PAGE_LIMIT`).
+        limit: usize,
+        /// Optional run ID filter (`run_<uuid>`).
+        #[serde(default)]
+        run_id: Option<String>,
+        /// Optional event classification filter.
+        #[serde(default)]
+        kind: Option<EventKind>,
     },
     /// Pull a bounded batch of ordered events for the binding and record a delivery batch ID.
     PullEvents {
@@ -680,6 +721,9 @@ pub enum CommandOutput {
     RevisionHistory(RevisionHistoryPage),
     /// Bounded keyset-paginated page of run questions (returned by `ListRunQuestions`).
     QuestionHistory(QuestionHistoryPage),
+    /// Bounded keyset-paginated read-only page of binding activity events (returned by `ListActivity`).
+    #[serde(alias = "activity_page", alias = "activity_history")]
+    Activity(ActivityPage),
     /// Delivered event batch (returned by `PullEvents`).
     EventBatch(EventBatch),
     /// Event batch acknowledgement result (returned by `AcknowledgeEvents`).
@@ -765,6 +809,32 @@ impl CommandOutput {
             Self::QuestionHistory(page) => Some(page),
             _ => None,
         }
+    }
+
+    /// Extracts the inner [`ActivityPage`] if this output is `CommandOutput::Activity`.
+    pub fn into_activity(self) -> Option<ActivityPage> {
+        match self {
+            Self::Activity(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Borrows the inner [`ActivityPage`] if this output is `CommandOutput::Activity`.
+    pub fn as_activity(&self) -> Option<&ActivityPage> {
+        match self {
+            Self::Activity(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`ActivityPage`] if this output is `CommandOutput::Activity`.
+    pub fn into_activity_page(self) -> Option<ActivityPage> {
+        self.into_activity()
+    }
+
+    /// Borrows the inner [`ActivityPage`] if this output is `CommandOutput::Activity`.
+    pub fn as_activity_page(&self) -> Option<&ActivityPage> {
+        self.as_activity()
     }
 
     /// Extracts the inner [`EventBatch`] if this output is `CommandOutput::EventBatch`.

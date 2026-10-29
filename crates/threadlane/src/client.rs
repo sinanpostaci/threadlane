@@ -6,8 +6,8 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use threadlane_core::{
-    AckResult, Binding, CoreError, EventBatch, QuestionHistoryPage, RevisionHistoryPage, Run,
-    RunListPage, WakeupNotice, WorkerSnapshot, MAX_ID_LEN,
+    AckResult, ActivityPage, Binding, CoreError, EventBatch, EventKind, QuestionHistoryPage,
+    RevisionHistoryPage, Run, RunListPage, WakeupNotice, WorkerSnapshot, MAX_ID_LEN,
 };
 
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
@@ -351,6 +351,31 @@ impl ScopedClient {
             .await?;
         resp.into_question_history().ok_or_else(|| {
             Error::Transport("unexpected response kind for list_run_questions".to_string())
+        })
+    }
+
+    /// Fetches a bounded read-only keyset-paginated [`ActivityPage`] of durable events within the fixed binding.
+    ///
+    /// Never modifies `delivered_seq`, `acked_seq`, `event_batches`, or `wakeups`.
+    pub async fn list_activity(
+        &self,
+        after_seq: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+        run_id: Option<String>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, Error> {
+        let resp = self
+            .execute(&ScopedRequest::ListActivity {
+                after_seq,
+                cursor,
+                limit,
+                run_id,
+                kind,
+            })
+            .await?;
+        resp.into_activity().ok_or_else(|| {
+            Error::Transport("unexpected response kind for list_activity".to_string())
         })
     }
 

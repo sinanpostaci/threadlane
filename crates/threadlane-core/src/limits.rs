@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
 use crate::error::CoreError;
+use crate::types::EventKind;
 
 /// Current SQLite schema version owned by `threadlane-core`.
 ///
@@ -96,7 +97,7 @@ pub const MAX_CURSOR_LEN: usize = 256;
 pub const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Maximum serialized JSON byte budget (256 KiB, including outer protocol/MCP wrapper overhead)
-/// for bounded history and list pages (`ListRuns`, `ListRunRevisions`, `ListRunQuestions`).
+/// for bounded history and list pages (`ListRuns`, `ListRunRevisions`, `ListRunQuestions`, `ListActivity`).
 pub const MAX_PAGE_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Reserved byte budget for outer HTTP/MCP response envelope fields around a serialized
@@ -308,6 +309,7 @@ pub(crate) enum CursorKind {
     Runs,
     Revisions,
     Questions,
+    Activity,
 }
 
 impl CursorKind {
@@ -316,6 +318,7 @@ impl CursorKind {
             Self::Runs => "runs",
             Self::Revisions => "revisions",
             Self::Questions => "questions",
+            Self::Activity => "activity",
         }
     }
 }
@@ -324,6 +327,17 @@ impl CursorKind {
 pub(crate) struct ParsedCursor {
     pub(crate) after: u64,
     pub(crate) high_water_mark: u64,
+}
+
+pub(crate) fn validate_activity_run_id(raw: &str) -> Result<String, CoreError> {
+    let clean = validate_identifier("run_id", raw)?;
+    if clean == "-" || clean.contains(':') {
+        return Err(CoreError::Validation {
+            field: "run_id",
+            reason: "run_id contains invalid characters".to_string(),
+        });
+    }
+    Ok(clean)
 }
 
 pub(crate) fn encode_runs_cursor(binding_id: &str, after_rowid: u64, hwm_rowid: u64) -> String {
@@ -346,6 +360,18 @@ pub(crate) fn encode_questions_cursor(
     hwm_rowid: u64,
 ) -> String {
     format!("tlc1:questions:{binding_id}:{run_id}:{after_rowid}:{hwm_rowid}")
+}
+
+pub(crate) fn encode_activity_cursor(
+    binding_id: &str,
+    run_id: Option<&str>,
+    kind: Option<EventKind>,
+    after_seq: u64,
+    hwm_seq: u64,
+) -> String {
+    let run_part = run_id.unwrap_or("-");
+    let kind_part = kind.map(EventKind::as_str).unwrap_or("-");
+    format!("tlc1:activity:{binding_id}:{run_part}:{kind_part}:{after_seq}:{hwm_seq}")
 }
 
 fn parse_cursor_position(label: &str, raw: &str) -> Result<u64, CoreError> {
@@ -406,6 +432,7 @@ pub(crate) fn parse_and_validate_cursor(
         Some("runs") => CursorKind::Runs,
         Some("revisions") => CursorKind::Revisions,
         Some("questions") => CursorKind::Questions,
+        Some("activity") => CursorKind::Activity,
         _ => {
             return Err(CoreError::Validation {
                 field: "cursor",
@@ -472,6 +499,126 @@ pub(crate) fn parse_and_validate_cursor(
 
     let after = parse_cursor_position("position", after_raw)?;
     let high_water_mark = parse_cursor_position("high_water_mark", hwm_raw)?;
+    if after >= high_water_mark {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!(
+                "cursor position ({after}) must be strictly less than high_water_mark ({high_water_mark})"
+            ),
+        });
+    }
+
+    Ok(ParsedCursor {
+        after,
+        high_water_mark,
+    })
+}
+
+pub(crate) fn parse_and_validate_activity_cursor(
+    raw: &str,
+    expected_binding_id: &str,
+    expected_run_id: Option<&str>,
+    expected_event_kind: Option<EventKind>,
+) -> Result<ParsedCursor, CoreError> {
+    if raw.is_empty() {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor must not be empty".to_string(),
+        });
+    }
+    if raw.len() > MAX_CURSOR_LEN {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!("cursor exceeds maximum length of {MAX_CURSOR_LEN} bytes"),
+        });
+    }
+    if raw.trim() != raw || raw.chars().any(char::is_control) {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor must not contain control characters or surrounding whitespace"
+                .to_string(),
+        });
+    }
+
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.first().copied() != Some("tlc1") {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "unrecognized cursor version or format".to_string(),
+        });
+    }
+
+    let actual_kind = match parts.get(1).copied() {
+        Some("runs") => CursorKind::Runs,
+        Some("revisions") => CursorKind::Revisions,
+        Some("questions") => CursorKind::Questions,
+        Some("activity") => CursorKind::Activity,
+        _ => {
+            return Err(CoreError::Validation {
+                field: "cursor",
+                reason: "unrecognized cursor resource kind".to_string(),
+            });
+        }
+    };
+
+    if actual_kind != CursorKind::Activity {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!(
+                "cursor kind '{}' cannot be used for 'activity' pagination",
+                actual_kind.as_str()
+            ),
+        });
+    }
+
+    if parts.len() != 7 {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "malformed activity cursor structure".to_string(),
+        });
+    }
+
+    if parts[2] != expected_binding_id {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor binding_id does not match request scope".to_string(),
+        });
+    }
+
+    let cursor_run_id = if parts[3] == "-" {
+        None
+    } else {
+        let valid_run = validate_activity_run_id(parts[3]).map_err(|_| CoreError::Validation {
+            field: "cursor",
+            reason: "malformed activity cursor run_id filter".to_string(),
+        })?;
+        Some(valid_run)
+    };
+    if cursor_run_id.as_deref() != expected_run_id {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor run_id filter does not match requested run_id".to_string(),
+        });
+    }
+
+    let cursor_event_kind = if parts[4] == "-" {
+        None
+    } else {
+        let kind = EventKind::from_str(parts[4]).ok_or_else(|| CoreError::Validation {
+            field: "cursor",
+            reason: "malformed activity cursor event kind filter".to_string(),
+        })?;
+        Some(kind)
+    };
+    if cursor_event_kind != expected_event_kind {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor kind filter does not match requested kind".to_string(),
+        });
+    }
+
+    let after = parse_cursor_position("position", parts[5])?;
+    let high_water_mark = parse_cursor_position("high_water_mark", parts[6])?;
     if after >= high_water_mark {
         return Err(CoreError::Validation {
             field: "cursor",
