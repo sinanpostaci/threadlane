@@ -963,12 +963,9 @@ exit 0
         assert!(dispatched.run_id.is_some());
         assert!(!dispatched.accepted);
 
-        let completed = wait_for_task_status(
-            &client,
-            &approval_id,
-            "task-root-agy",
-            |st| st == TaskExecutionStatus::ReadyForReview,
-        )
+        let completed = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
         .await;
         assert_eq!(completed.status, TaskExecutionStatus::ReadyForReview);
         assert!(!completed.accepted);
@@ -1070,12 +1067,9 @@ exit 0
             .dispatch_task(&approval_id, "task-root-agy")
             .await
             .expect("first dispatch");
-        let completed = wait_for_task_status(
-            &client,
-            &approval_id,
-            "task-root-agy",
-            |st| st == TaskExecutionStatus::ReadyForReview,
-        )
+        let completed = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
         .await;
         assert_eq!(first.run_id, completed.run_id);
         assert_eq!(first.worker_id, completed.worker_id);
@@ -1260,12 +1254,9 @@ exit 0
             .dispatch_task(&approval_id, "task-root-oc")
             .await
             .expect("dispatch task-root-oc");
-        let oc_done = wait_for_task_status(
-            &client,
-            &approval_id,
-            "task-root-oc",
-            |st| st == TaskExecutionStatus::ReadyForReview,
-        )
+        let oc_done = wait_for_task_status(&client, &approval_id, "task-root-oc", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
         .await;
         assert_eq!(oc_done.status, TaskExecutionStatus::ReadyForReview);
         assert!(!oc_done.accepted);
@@ -1363,13 +1354,11 @@ exit 0
             THREAD_UUID_A,
         )
         .expect("open fresh client A");
-        let completed_a = wait_for_task_status(
-            &fresh_client_a,
-            &approval_a,
-            "task-root-agy",
-            |st| st == TaskExecutionStatus::ReadyForReview,
-        )
-        .await;
+        let completed_a =
+            wait_for_task_status(&fresh_client_a, &approval_a, "task-root-agy", |st| {
+                st == TaskExecutionStatus::ReadyForReview
+            })
+            .await;
         assert_eq!(completed_a.status, TaskExecutionStatus::ReadyForReview);
 
         let activity_page = fresh_client_a

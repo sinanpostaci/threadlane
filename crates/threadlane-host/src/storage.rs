@@ -298,10 +298,12 @@ pub fn ensure_private_dir(path: &Path) -> Result<PathBuf, HostError> {
                 use std::os::unix::fs::DirBuilderExt;
                 builder.mode(0o700);
             }
-            builder.create(&checked).map_err(|create_err| HostError::Io {
-                operation: "create_private_dir".to_string(),
-                reason: create_err.to_string(),
-            })?;
+            builder
+                .create(&checked)
+                .map_err(|create_err| HostError::Io {
+                    operation: "create_private_dir".to_string(),
+                    reason: create_err.to_string(),
+                })?;
         }
         Err(err) => {
             return Err(HostError::Io {
@@ -592,7 +594,9 @@ fn inspect_session_dir_entries(session_dir: &Path) -> Result<(), HostError> {
     {
         return Err(HostError::SecurityViolation {
             path: session_dir.display().to_string(),
-            reason: "pre-existing non-empty session directory lacks host.lock and host-manifest.json".to_string(),
+            reason:
+                "pre-existing non-empty session directory lacks host.lock and host-manifest.json"
+                    .to_string(),
         });
     }
 
@@ -754,10 +758,14 @@ pub fn write_host_manifest(
     manifest: &HostSessionManifest,
 ) -> Result<(), HostError> {
     validate_host_manifest_structure(manifest)?;
-    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|err| HostError::CorruptManifest {
-        path: session_dir.join(HOST_MANIFEST_FILENAME).display().to_string(),
-        reason: format!("failed to serialize host manifest: {err}"),
-    })?;
+    let mut bytes =
+        serde_json::to_vec_pretty(manifest).map_err(|err| HostError::CorruptManifest {
+            path: session_dir
+                .join(HOST_MANIFEST_FILENAME)
+                .display()
+                .to_string(),
+            reason: format!("failed to serialize host manifest: {err}"),
+        })?;
     bytes.push(b'\n');
     let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
     if bytes.len() > MAX_HOST_MANIFEST_BYTES {
@@ -1022,17 +1030,16 @@ pub fn record_task_receipt(
 
     let res = (|| -> Result<TaskRunReceipt, HostError> {
         let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
-        let mut ledger =
-            match read_task_receipts_locked(session_dir, record, session_binding_id)? {
-                Some(existing) => existing,
-                None => TaskReceiptsFile {
-                    schema_version: TASK_RECEIPTS_SCHEMA_VERSION,
-                    approval_id: record.approval_id.clone(),
-                    subject_digest: record.subject_digest.clone(),
-                    session_binding_id: session_binding_id.to_string(),
-                    receipts: Vec::new(),
-                },
-            };
+        let mut ledger = match read_task_receipts_locked(session_dir, record, session_binding_id)? {
+            Some(existing) => existing,
+            None => TaskReceiptsFile {
+                schema_version: TASK_RECEIPTS_SCHEMA_VERSION,
+                approval_id: record.approval_id.clone(),
+                subject_digest: record.subject_digest.clone(),
+                session_binding_id: session_binding_id.to_string(),
+                receipts: Vec::new(),
+            },
+        };
 
         if let Some(existing) = ledger
             .receipts

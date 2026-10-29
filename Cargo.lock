@@ -2474,6 +2474,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "threadlane",
+ "threadlane-authority",
+ "threadlane-core",
+ "threadlane-plans",
+ "threadlane-registry",
+ "threadlane-workers",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "threadlane-native"
 version = "0.1.0"
 dependencies = [

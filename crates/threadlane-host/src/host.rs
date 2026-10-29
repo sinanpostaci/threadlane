@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use threadlane::{
-    ScopedClient, Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle,
-};
+use threadlane::{ScopedClient, Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_authority::{ApprovalRecord, AuthorityStore, MaterializedPlan};
 use threadlane_core::Binding;
 use threadlane_plans::PlanStore;

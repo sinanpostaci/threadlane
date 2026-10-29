@@ -110,10 +110,8 @@ impl ApprovedHostClient {
         validate_identifier("control_binding_id", &control_binding_id)?;
         validate_canonical_thread_uuid("native_thread_uuid", &native_thread_uuid)?;
 
-        let canonical_sessions_dir = validate_sessions_root(
-            sessions_dir.as_ref(),
-            &[("authority_dir", authority.dir())],
-        )?;
+        let canonical_sessions_dir =
+            validate_sessions_root(sessions_dir.as_ref(), &[("authority_dir", authority.dir())])?;
 
         Ok(Self {
             authority,
@@ -260,7 +258,11 @@ impl ApprovedHostClient {
             receipt,
         )?;
 
-        let live_worker = match session.scoped_client.get_worker(sealed.run_id.clone()).await {
+        let live_worker = match session
+            .scoped_client
+            .get_worker(sealed.run_id.clone())
+            .await
+        {
             Ok(fresh) => fresh,
             Err(_) => started,
         };
@@ -359,7 +361,11 @@ impl ApprovedHostClient {
             ));
         };
 
-        match session.scoped_client.get_worker(receipt.run_id.clone()).await {
+        match session
+            .scoped_client
+            .get_worker(receipt.run_id.clone())
+            .await
+        {
             Ok(worker) => {
                 if worker.binding_id != session.live_binding.binding_id {
                     return Err(HostError::ScopeMismatch {
@@ -464,7 +470,11 @@ impl ApprovedHostClient {
             )
             .await?;
 
-        let live_worker = match session.scoped_client.get_worker(receipt.run_id.clone()).await {
+        let live_worker = match session
+            .scoped_client
+            .get_worker(receipt.run_id.clone())
+            .await
+        {
             Ok(fresh) => fresh,
             Err(_) => cancelled,
         };
@@ -633,7 +643,8 @@ impl ApprovedHostClient {
                     reason: "ready manifest is missing session_binding_id".to_string(),
                 })?;
 
-        let runtime_state_dir = verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
         let work_area_dir = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
 
         let sup_client =
@@ -678,8 +689,7 @@ impl ApprovedHostClient {
             });
         }
 
-        let scoped_client =
-            ScopedClient::from_state_dir(&runtime_state_dir, &session_binding_id)?;
+        let scoped_client = ScopedClient::from_state_dir(&runtime_state_dir, &session_binding_id)?;
 
         Ok(VerifiedSession {
             record,
