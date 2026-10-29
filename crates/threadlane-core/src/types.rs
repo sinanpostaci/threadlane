@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::worker::WorkerSnapshot;
+
 /// Trusted binding between a Threadlane scope and a native Codex thread UUID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Binding {
@@ -15,45 +17,72 @@ pub struct Binding {
     pub acked_seq: u64,
 }
 
-/// Lifecycle state of a deterministic demo run.
+/// Lifecycle state of a deterministic demo or worker-backed run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
-    /// Run has started (or been steered to a new revision) and is progressing toward a question.
+    /// Worker run has been admitted and is waiting in the durable queue for a dispatch slot.
+    Queued,
+    /// Worker run has been claimed by the dispatcher prior to external worktree/process launch.
+    Claimed,
+    /// Run has started (or been steered to a new revision) and is actively executing.
     Running,
-    /// Run is paused waiting for an answer to its active question.
+    /// Demo run is paused waiting for an answer to its active question.
     WaitingInput,
-    /// Run received a valid answer and is finishing its bounded completion step.
+    /// Demo run received a valid answer and is finishing its bounded completion step.
     Completing,
+    /// Worker cancellation has been requested; waiting for worker termination proof.
+    CancelRequested,
     /// Run finished normally (terminal).
     Completed,
+    /// Worker run terminated with an execution, provider, or diff-gate failure (terminal).
+    Failed,
     /// Run was cancelled by the caller (terminal).
     Cancelled,
+    /// Worker run exceeded its execution timeout budget (terminal).
+    TimedOut,
+    /// Worker run was left in an uncertain in-flight state across restart or shutdown (terminal).
+    Unknown,
 }
 
 impl RunStatus {
-    /// Returns `true` if the run is in a terminal state (`Completed` or `Cancelled`).
+    /// Returns `true` if the run is in a terminal state (`Completed`, `Failed`, `Cancelled`, `TimedOut`, or `Unknown`).
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Completed | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Unknown
+        )
     }
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
+            Self::Claimed => "claimed",
             Self::Running => "running",
             Self::WaitingInput => "waiting_input",
             Self::Completing => "completing",
+            Self::CancelRequested => "cancel_requested",
             Self::Completed => "completed",
+            Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Unknown => "unknown",
         }
     }
 
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value {
+            "queued" => Some(Self::Queued),
+            "claimed" => Some(Self::Claimed),
             "running" => Some(Self::Running),
             "waiting_input" => Some(Self::WaitingInput),
             "completing" => Some(Self::Completing),
+            "cancel_requested" => Some(Self::CancelRequested),
             "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
             "cancelled" => Some(Self::Cancelled),
+            "timed_out" => Some(Self::TimedOut),
+            "unknown" => Some(Self::Unknown),
             _ => None,
         }
     }
@@ -317,12 +346,39 @@ pub enum EventKind {
     /// Demo run was cancelled (`-> Cancelled`).
     /// Carries `summary` and optional `cancel_reason: Option<String>` (`instruction: None`).
     RunCancelled,
+    /// Worker run was admitted and queued (`-> Queued`).
+    WorkerQueued,
+    /// Worker run was claimed and began execution (`-> Running`).
+    WorkerStarted,
+    /// Worker run emitted bounded live progress (`Running`).
+    WorkerProgress,
+    /// Caller requested revision-checked cancellation of an active worker (`-> CancelRequested`).
+    WorkerCancelRequested,
+    /// Worker run completed execution and passed its diff gate (`-> Completed`, `important = true`).
+    WorkerCompleted,
+    /// Worker run failed execution, provider checks, or diff gate (`-> Failed`, `important = true`).
+    WorkerFailed,
+    /// Worker run was proven stopped after cancellation (`-> Cancelled`, `important = true`).
+    WorkerCancelled,
+    /// Worker run exceeded its execution timeout budget (`-> TimedOut`, `important = true`).
+    WorkerTimedOut,
+    /// Worker run became uncertain across restart or shutdown without automatic retry (`-> Unknown`, `important = true`).
+    WorkerUnknown,
 }
 
 impl EventKind {
     /// Returns `true` if this event kind triggers or coalesces into a wake-up notice.
     pub fn is_important(self) -> bool {
-        matches!(self, Self::QuestionAsked | Self::RunCompleted)
+        matches!(
+            self,
+            Self::QuestionAsked
+                | Self::RunCompleted
+                | Self::WorkerCompleted
+                | Self::WorkerFailed
+                | Self::WorkerCancelled
+                | Self::WorkerTimedOut
+                | Self::WorkerUnknown
+        )
     }
 
     pub(crate) fn as_str(self) -> &'static str {
@@ -335,6 +391,15 @@ impl EventKind {
             Self::RunSteered => "run_steered",
             Self::RunCompleted => "run_completed",
             Self::RunCancelled => "run_cancelled",
+            Self::WorkerQueued => "worker_queued",
+            Self::WorkerStarted => "worker_started",
+            Self::WorkerProgress => "worker_progress",
+            Self::WorkerCancelRequested => "worker_cancel_requested",
+            Self::WorkerCompleted => "worker_completed",
+            Self::WorkerFailed => "worker_failed",
+            Self::WorkerCancelled => "worker_cancelled",
+            Self::WorkerTimedOut => "worker_timed_out",
+            Self::WorkerUnknown => "worker_unknown",
         }
     }
 
@@ -348,6 +413,15 @@ impl EventKind {
             "run_steered" => Some(Self::RunSteered),
             "run_completed" => Some(Self::RunCompleted),
             "run_cancelled" => Some(Self::RunCancelled),
+            "worker_queued" => Some(Self::WorkerQueued),
+            "worker_started" => Some(Self::WorkerStarted),
+            "worker_progress" => Some(Self::WorkerProgress),
+            "worker_cancel_requested" => Some(Self::WorkerCancelRequested),
+            "worker_completed" => Some(Self::WorkerCompleted),
+            "worker_failed" => Some(Self::WorkerFailed),
+            "worker_cancelled" => Some(Self::WorkerCancelled),
+            "worker_timed_out" => Some(Self::WorkerTimedOut),
+            "worker_unknown" => Some(Self::WorkerUnknown),
             _ => None,
         }
     }
@@ -538,12 +612,53 @@ pub enum Command {
         /// Injected current timestamp in milliseconds.
         now_ms: i64,
     },
-    /// Terminally cancel a non-terminal run (`-> Cancelled`).
+    /// Terminally cancel a non-terminal demo run (`-> Cancelled`).
     Cancel {
         /// Caller-supplied idempotency key scoped to the binding.
         command_key: String,
         /// Target run ID.
         run_id: String,
+        /// Optional cancellation reason.
+        reason: Option<String>,
+        /// Injected current timestamp in milliseconds.
+        now_ms: i64,
+    },
+    /// Admit and queue a new worker run for a validated trusted profile (`-> Queued`).
+    StartWorker {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Validated trusted worker profile identifier.
+        profile_id: String,
+        /// Immutable SHA-256 hex digest of the complete trusted execution profile.
+        profile_digest: String,
+        /// Provider identifier fixed by the trusted profile.
+        provider: String,
+        /// Requested model identifier fixed by the trusted profile.
+        requested_model: String,
+        /// Requested reasoning effort fixed by the trusted profile.
+        requested_effort: String,
+        /// Base commit/ref fixed by the trusted profile.
+        base_commit: String,
+        /// Bounded task instruction supplied by the caller.
+        instruction: String,
+        /// Injected current timestamp in milliseconds.
+        now_ms: i64,
+    },
+    /// Fetch a compact durable [`WorkerSnapshot`] scoped to the binding by `run_id` or `worker_id`.
+    GetWorker {
+        /// Target worker run ID (`run_<uuid>`) or worker ID (`wrk_<uuid>`).
+        #[serde(alias = "worker_id")]
+        run_id: String,
+    },
+    /// Request revision-checked cancellation of a worker run scoped to the binding.
+    CancelWorker {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target worker run ID (`run_<uuid>`) or worker ID (`wrk_<uuid>`).
+        #[serde(alias = "worker_id")]
+        run_id: String,
+        /// Expected current revision of the worker run.
+        expected_revision: u64,
         /// Optional cancellation reason.
         reason: Option<String>,
         /// Injected current timestamp in milliseconds.
@@ -557,6 +672,8 @@ pub enum Command {
 pub enum CommandOutput {
     /// Single compact run snapshot (returned by `StartDemo`, `GetRun`, `Answer`, `Steer`, `Cancel`).
     Run(Box<Run>),
+    /// Single compact worker snapshot (returned by `StartWorker`, `GetWorker`, `CancelWorker`).
+    Worker(Box<WorkerSnapshot>),
     /// Bounded keyset-paginated page of runs on the binding (returned by `ListRuns`).
     RunList(RunListPage),
     /// Bounded keyset-paginated page of run revisions (returned by `ListRunRevisions`).
@@ -582,6 +699,22 @@ impl CommandOutput {
     pub fn as_run(&self) -> Option<&Run> {
         match self {
             Self::Run(run) => Some(run.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`WorkerSnapshot`] if this output is `CommandOutput::Worker`.
+    pub fn into_worker(self) -> Option<WorkerSnapshot> {
+        match self {
+            Self::Worker(worker) => Some(*worker),
+            _ => None,
+        }
+    }
+
+    /// Borrows the inner [`WorkerSnapshot`] if this output is `CommandOutput::Worker`.
+    pub fn as_worker(&self) -> Option<&WorkerSnapshot> {
+        match self {
+            Self::Worker(worker) => Some(worker.as_ref()),
             _ => None,
         }
     }
