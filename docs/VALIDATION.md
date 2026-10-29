@@ -113,7 +113,31 @@ Client setup reference: [Codex MCP configuration](https://learn.chatgpt.com/docs
 - The demo proves durable logical transitions, not recovery of real worker processes.
 - macOS and Windows have not been tested. Windows runtime startup fails closed
   until suitable private file ACL support is implemented.
-- Full run/mutation responses and retained history are not yet size-bounded;
-  pagination, compact mutation results and retention are a gate before real workers.
+- Run/history requests and compact mutation replay are bounded in Milestone 2A.
+  Total lifetime disk retention remains uncapped; source history and idempotency
+  keys are not silently deleted.
 - Secret files are private to the OS user. This does not isolate a malicious
   process already running as that same user.
+
+## Milestone 2A follow-up (2026-10-29)
+
+The primary agent ran 40 tests (17 core behavioural, 6 core review, 14 runtime
+integration and 3 runtime review), Rust formatting, Clippy with warnings denied,
+and the CLI smoke. All passed after implementation corrections.
+
+Independent temporary-fixture probes also passed:
+
+- After 40 Steer operations with 4,096-byte instructions, HTTP response size
+  remained 4,535-4,537 bytes. The baseline grew from 8,708 to 176,382 bytes.
+  Stored dedup responses fell from 3,794,240 to 185,999 bytes in this exact case;
+  these figures are not a general provider-token or cost estimate.
+- A database created by the actual old v1 binary upgraded to v2. Original Start
+  and Steer retries returned revisions 1 and 41 after further changes, with one
+  run and all 42 revision records preserved and readable across three pages.
+- A real stdio MCP client discovered all 11 tools and read 81 escaped-text
+  revisions across 11 pages. The largest serialized RPC response was 244,510
+  bytes against the 262,144-byte page budget. An append after page 1 was excluded
+  from that existing high-water-mark window, without duplicates or lost rows.
+
+These probes use disposable state and do not invoke paid models or user chats.
+Schema/API details and deferred retention are recorded in [BOUNDED-DATA.md](BOUNDED-DATA.md).
