@@ -671,3 +671,234 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
             .collect();
     assert_eq!(received_argv, built_argv);
 }
+
+#[tokio::test]
+async fn enforces_task_files_path_count_and_settings_byte_limits_without_affecting_inherit() {
+    let env = ScopedTestEnv::new();
+    let marker_file = env.root_dir.join("must_not_spawn_limits.marker");
+    let spy_bin = env.write_fake_executable(
+        "spy-limits-agy",
+        &format!(
+            "printf 'spawned\\n' > '{}'\nexit 0\n",
+            marker_file.display()
+        ),
+    );
+    let ok_bin = env.write_fake_executable(
+        "ok-limits-agy",
+        r#"
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"ok"}\n'
+"#,
+    );
+
+    let canonical_workdir = env.root_dir.join("limits-canonical-workdir");
+    fs::create_dir_all(&canonical_workdir).expect("create limits-canonical-workdir");
+
+    // 1. >128 allowed_write_paths entries must be rejected for TaskFiles with InvalidSpec before
+    // rule allocation or process spawn, while Inherit permits the exact same allowlist.
+    let over_limit_paths: BTreeSet<String> = (0..129)
+        .map(|i| format!("crates/threadlane-workers/src/module_{i:03}.rs"))
+        .collect();
+    assert_eq!(over_limit_paths.len(), 129);
+
+    let count_err = WorkerFilePermissions::TaskFiles
+        .validate_for_provider_and_paths(WorkerProvider::Antigravity, &over_limit_paths)
+        .expect_err(">128 TaskFiles paths must fail validate_for_provider_and_paths");
+    assert!(matches!(
+        count_err,
+        WorkerError::InvalidSpec(ref msg) if msg.contains("128") && msg.contains("129")
+    ));
+
+    let mut over_limit_task_spec = env.antigravity_spec(
+        spy_bin.clone(),
+        "Reject >128 TaskFiles paths",
+        WorkerFilePermissions::TaskFiles,
+    );
+    over_limit_task_spec.work_area_root = env.root_dir.join("uncreated-over-128-work-area");
+    over_limit_task_spec.allowed_write_paths = over_limit_paths.clone();
+
+    assert!(matches!(
+        over_limit_task_spec.validate(),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("128")
+    ));
+    assert!(matches!(
+        build_antigravity_task_files_settings_json(&canonical_workdir, &over_limit_paths),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("128")
+    ));
+    assert!(matches!(
+        over_limit_task_spec.build_argv_for_workdir(&canonical_workdir),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("128")
+    ));
+    assert!(matches!(
+        run_worker(&over_limit_task_spec, &canonical_workdir).await,
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("128")
+    ));
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    assert!(matches!(
+        execute_worker_task(
+            &over_limit_task_spec,
+            "run-limits",
+            "task-over-128",
+            None,
+            &mut cancel_rx
+        )
+        .await,
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("128")
+    ));
+    assert!(
+        !over_limit_task_spec.work_area_root.exists(),
+        "work_area_root must not be created when >128 TaskFiles paths are rejected"
+    );
+    assert!(!marker_file.exists(), "spy_bin must never be spawned");
+
+    // Inherit must remain unaffected and accept the exact same >128 allowlist.
+    WorkerFilePermissions::Inherit
+        .validate_for_provider_and_paths(WorkerProvider::Antigravity, &over_limit_paths)
+        .expect("Inherit must allow >128 valid paths");
+    let mut inherit_large_spec = env.antigravity_spec(
+        ok_bin.clone(),
+        "Allow >128 Inherit paths",
+        WorkerFilePermissions::Inherit,
+    );
+    inherit_large_spec.allowed_write_paths = over_limit_paths;
+    let inherit_report = inherit_large_spec
+        .validate()
+        .expect("Inherit spec with >128 paths must validate");
+    assert_eq!(inherit_report.allowed_write_paths.len(), 129);
+    let inherit_argv = inherit_large_spec
+        .build_argv()
+        .expect("Inherit build_argv with >128 paths");
+    let inherit_workdir_argv = inherit_large_spec
+        .build_argv_for_workdir(&canonical_workdir)
+        .expect("Inherit build_argv_for_workdir with >128 paths");
+    assert_eq!(inherit_argv, inherit_workdir_argv);
+    assert!(!inherit_argv.iter().any(|arg| arg == "--settings"));
+    let inherit_run = run_worker(&inherit_large_spec, &canonical_workdir)
+        .await
+        .expect("run_worker Inherit with >128 paths");
+    assert_eq!(inherit_run.status, WorkerRunStatus::Succeeded);
+
+    // 2. <=128 legitimate long entries + a real canonical workdir that exceed 65,536 serialized
+    // JSON bytes (both via long path segments and via JSON string escaping) must be rejected with
+    // InvalidSpec before returning argv or spawning a fake provider.
+    let deep_workdir = env
+        .root_dir
+        .join("canonical_workdir_segment_alpha_0123456789abcdef")
+        .join("canonical_workdir_segment_beta_0123456789abcdef");
+    fs::create_dir_all(&deep_workdir).expect("create deep_workdir");
+
+    // 2a. 32 legitimate long ASCII entries (<=128) + canonical workdir exceeding 65,536 bytes.
+    let a_seg = "a".repeat(80);
+    let long_ascii_paths: BTreeSet<String> = (0..32)
+        .map(|i| format!("crates/threadlane-workers/{a_seg}/{a_seg}/{a_seg}/mod_{i:02}.rs"))
+        .collect();
+    assert_eq!(long_ascii_paths.len(), 32);
+
+    let mut long_task_spec = env.antigravity_spec(
+        spy_bin.clone(),
+        "Reject >64KiB serialized settings from long paths",
+        WorkerFilePermissions::TaskFiles,
+    );
+    long_task_spec.allowed_write_paths = long_ascii_paths.clone();
+    long_task_spec
+        .validate()
+        .expect("<=128 valid long paths pass static count and pattern validation");
+
+    assert!(matches!(
+        build_antigravity_task_files_settings_json(&deep_workdir, &long_ascii_paths),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(matches!(
+        long_task_spec.build_argv_for_workdir(&deep_workdir),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(matches!(
+        run_worker(&long_task_spec, &deep_workdir).await,
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(matches!(
+        execute_worker_task(
+            &long_task_spec,
+            "run-limits",
+            "task-long-ascii",
+            None,
+            &mut cancel_rx
+        )
+        .await,
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(
+        !marker_file.exists(),
+        "spy_bin must not spawn when serialized settings exceed 65,536 bytes"
+    );
+
+    // 2b. 12 legitimate entries (<=128) whose unescaped rule strings are under 65,536 bytes,
+    // but exceed 65,536 serialized JSON bytes after serde_json escapes `"` to `\"`.
+    let q_seg = "q\"".repeat(45);
+    let escaped_overflow_paths: BTreeSet<String> = (0..12)
+        .map(|i| format!("crates/threadlane-workers/{q_seg}/{q_seg}/{q_seg}/mod_{i:02}.rs"))
+        .collect();
+    assert_eq!(escaped_overflow_paths.len(), 12);
+
+    let mut escaped_overflow_spec = env.antigravity_spec(
+        spy_bin,
+        "Reject >64KiB serialized settings after JSON escaping",
+        WorkerFilePermissions::TaskFiles,
+    );
+    escaped_overflow_spec.allowed_write_paths = escaped_overflow_paths.clone();
+    escaped_overflow_spec
+        .validate()
+        .expect("12 valid paths with quotes pass static validation");
+
+    assert!(matches!(
+        build_antigravity_task_files_settings_json(&deep_workdir, &escaped_overflow_paths),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(matches!(
+        escaped_overflow_spec.build_argv_for_workdir(&deep_workdir),
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(matches!(
+        run_worker(&escaped_overflow_spec, &deep_workdir).await,
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("65536")
+    ));
+    assert!(
+        !marker_file.exists(),
+        "spy_bin must not spawn when JSON escaping pushes settings past 65,536 bytes"
+    );
+
+    // 3. A normal small TaskFiles payload remains supported and preserves all grants without truncation.
+    let small_task_spec = env.antigravity_spec(
+        ok_bin,
+        "Small TaskFiles payload works",
+        WorkerFilePermissions::TaskFiles,
+    );
+    let small_json = build_antigravity_task_files_settings_json(
+        &canonical_workdir,
+        &small_task_spec.allowed_write_paths,
+    )
+    .expect("build small TaskFiles settings JSON");
+    assert!(small_json.len() <= 65_536);
+
+    let parsed_small: Value =
+        serde_json::from_str(&small_json).expect("parse small TaskFiles settings JSON");
+    let small_allow = parsed_small["permissions"]["allow"]
+        .as_array()
+        .expect("allow array");
+    assert_eq!(
+        small_allow.len(),
+        1 + small_task_spec.allowed_write_paths.len() * AGY_WRITE_PERMISSION_TOOLS.len() * 2,
+        "all grants must be preserved without silent truncation"
+    );
+
+    let small_argv = small_task_spec
+        .build_argv_for_workdir(&canonical_workdir)
+        .expect("build_argv_for_workdir for small TaskFiles spec");
+    assert_eq!(small_argv[10], "--settings");
+    assert_eq!(small_argv[11], small_json);
+
+    let small_run = run_worker(&small_task_spec, &canonical_workdir)
+        .await
+        .expect("run_worker for small TaskFiles spec");
+    assert_eq!(small_run.status, WorkerRunStatus::Succeeded);
+}
