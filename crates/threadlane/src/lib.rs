@@ -33,10 +33,11 @@ pub use descriptor::{
 pub use error::{ApiError, Error, ErrorCode};
 pub use mcp::ThreadlaneMcpServer;
 pub use protocol::{
-    BindingListResponse, CreateBindingRequest, RetryWakeupRequest, RunSummary, ScopedRequest,
-    ScopedResponse, StatusResponse, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord,
-    WorkerOutcomeSummary, WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot,
-    WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
+    ActivityPage, BindingListResponse, CreateBindingRequest, Event, EventKind, EventPayload,
+    RetryWakeupRequest, RunSummary, ScopedRequest, ScopedResponse, StatusResponse,
+    WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerOutcomeSummary,
+    WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot, WorkerStatus,
+    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
 };
 pub use supervisor::{
     Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,

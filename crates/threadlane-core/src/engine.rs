@@ -6,20 +6,21 @@ use uuid::Uuid;
 
 use crate::error::{AckErrorReason, CoreError};
 use crate::limits::{
-    encode_questions_cursor, encode_revisions_cursor, encode_runs_cursor,
-    estimate_wire_response_bytes, parse_and_validate_cursor, truncate_preview,
-    validate_batch_limit, validate_bounded_text, validate_command_key, validate_identifier,
-    validate_label, validate_optional_text, validate_page_limit, validate_step_delay_ms,
-    validate_thread_uuid, validate_timestamp_ms, CursorKind, FIXED_WAKEUP_MESSAGE,
-    LEGACY_SCHEMA_VERSION_V1, LEGACY_SCHEMA_VERSION_V2, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
-    MAX_COMPACT_RESPONSE_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN,
-    MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN, RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
+    encode_activity_cursor, encode_questions_cursor, encode_revisions_cursor, encode_runs_cursor,
+    estimate_wire_response_bytes, parse_and_validate_activity_cursor, parse_and_validate_cursor,
+    truncate_preview, validate_activity_run_id, validate_batch_limit, validate_bounded_text,
+    validate_command_key, validate_identifier, validate_label, validate_optional_text,
+    validate_page_limit, validate_step_delay_ms, validate_thread_uuid, validate_timestamp_ms,
+    CursorKind, FIXED_WAKEUP_MESSAGE, LEGACY_SCHEMA_VERSION_V1, LEGACY_SCHEMA_VERSION_V2,
+    MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMPACT_RESPONSE_BYTES, MAX_EVENT_PAYLOAD_BYTES,
+    MAX_INSTRUCTION_LEN, MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN,
+    RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
 };
 use crate::types::{
-    AckResult, Binding, Command, CommandOutput, Event, EventBatch, EventKind, EventPayload,
-    Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run, RunListPage,
-    RunRevision, RunStatus, RunSummary, TickReport, WakeupClaim, WakeupNotice, WakeupOutcome,
-    WakeupRetryRecord, WakeupStatus,
+    AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
+    EventPayload, Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run,
+    RunListPage, RunRevision, RunStatus, RunSummary, TickReport, WakeupClaim, WakeupNotice,
+    WakeupOutcome, WakeupRetryRecord, WakeupStatus,
 };
 use crate::worker::WorkerSnapshot;
 
@@ -186,6 +187,23 @@ impl Core {
                 )?;
                 tx.commit()?;
                 Ok(CommandOutput::QuestionHistory(page))
+            }
+            Command::ListActivity {
+                after_seq,
+                cursor,
+                limit,
+                run_id,
+                kind,
+            } => {
+                let page = self.list_activity(
+                    &clean_binding_id,
+                    after_seq,
+                    cursor.as_deref(),
+                    limit,
+                    run_id.as_deref(),
+                    kind,
+                )?;
+                Ok(CommandOutput::Activity(page))
             }
             Command::PullEvents {
                 after_seq,
@@ -1028,6 +1046,42 @@ impl Core {
             &clean_run_id,
             cursor,
             valid_limit,
+        )
+    }
+
+    /// Convenience helper to fetch a bounded, read-only keyset-paginated [`ActivityPage`] of durable events for `binding_id`.
+    ///
+    /// Never modifies `delivered_seq`, `acked_seq`, `event_batches`, or `wakeups`.
+    pub fn list_activity(
+        &self,
+        binding_id: &str,
+        after_seq: Option<u64>,
+        cursor: Option<&str>,
+        limit: usize,
+        run_id: Option<&str>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        if cursor.is_some() && after_seq.is_some() {
+            return Err(CoreError::Validation {
+                field: "cursor",
+                reason: "cursor and after_seq cannot be specified simultaneously".to_string(),
+            });
+        }
+        let valid_limit = validate_page_limit(limit)?;
+        let clean_run_id = match run_id {
+            Some(raw_run_id) => Some(validate_activity_run_id(raw_run_id)?),
+            None => None,
+        };
+        Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
+        Self::list_activity_conn(
+            &self.conn,
+            &clean_binding_id,
+            after_seq,
+            cursor,
+            valid_limit,
+            clean_run_id.as_deref(),
+            kind,
         )
     }
 
@@ -3145,6 +3199,189 @@ impl Core {
             questions: included_questions,
             next_cursor,
             has_more,
+        })
+    }
+
+    fn list_activity_conn(
+        conn: &Connection,
+        binding_id: &str,
+        after_seq: Option<u64>,
+        cursor: Option<&str>,
+        limit: usize,
+        run_id: Option<&str>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, CoreError> {
+        let max_seq_raw: Option<i64> = conn.query_row(
+            "SELECT MAX(seq) FROM events WHERE binding_id = ?1",
+            params![binding_id],
+            |row| row.get(0),
+        )?;
+        let current_max_seq = match max_seq_raw {
+            Some(raw) => i64_to_u64("high_water_mark_seq", raw)?,
+            None => 0,
+        };
+
+        let (effective_after_seq, hwm_seq) = match cursor {
+            Some(raw_cursor) => {
+                let parsed =
+                    parse_and_validate_activity_cursor(raw_cursor, binding_id, run_id, kind)?;
+                if parsed.high_water_mark > current_max_seq {
+                    return Err(CoreError::Validation {
+                        field: "cursor",
+                        reason: format!(
+                            "cursor high_water_mark ({}) exceeds binding high_water_mark_seq ({current_max_seq})",
+                            parsed.high_water_mark
+                        ),
+                    });
+                }
+                let anchor_count: i64 = conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM events
+                     WHERE binding_id = ?1 AND seq IN (?2, ?3)",
+                    params![
+                        binding_id,
+                        u64_to_i64("cursor", parsed.after)?,
+                        u64_to_i64("cursor", parsed.high_water_mark)?
+                    ],
+                    |row| row.get(0),
+                )?;
+                if anchor_count != 2 {
+                    return Err(CoreError::Validation {
+                        field: "cursor",
+                        reason:
+                            "cursor references unknown or out-of-range event sequence for this binding"
+                                .to_string(),
+                    });
+                }
+                (parsed.after, parsed.high_water_mark)
+            }
+            None => {
+                let start_after = after_seq.unwrap_or(0);
+                let _ = u64_to_i64("after_seq", start_after)?;
+                if start_after > current_max_seq {
+                    return Err(CoreError::Validation {
+                        field: "after_seq",
+                        reason: format!(
+                            "after_seq ({start_after}) exceeds binding high_water_mark_seq ({current_max_seq})"
+                        ),
+                    });
+                }
+                if current_max_seq == 0 || start_after == current_max_seq {
+                    return Ok(ActivityPage {
+                        binding_id: binding_id.to_string(),
+                        events: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                        high_water_mark_seq: current_max_seq,
+                        after_seq: start_after,
+                    });
+                }
+                (start_after, current_max_seq)
+            }
+        };
+
+        let fetch_limit = u64_to_i64("limit", (limit + 1) as u64)?;
+        let kind_filter = kind.map(EventKind::as_str);
+        let candidate_events: Vec<Event> = {
+            let mut stmt = conn.prepare(
+                "SELECT event_id, binding_id, seq, run_id, revision, step_seq,
+                        kind, important, payload_json, created_at_ms
+                 FROM events
+                 WHERE binding_id = ?1
+                   AND seq > ?2
+                   AND seq <= ?3
+                   AND (?4 IS NULL OR run_id = ?4)
+                   AND (?5 IS NULL OR kind = ?5)
+                 ORDER BY seq ASC
+                 LIMIT ?6",
+            )?;
+            let mut rows = stmt.query(params![
+                binding_id,
+                u64_to_i64("after_seq", effective_after_seq)?,
+                u64_to_i64("hwm_seq", hwm_seq)?,
+                run_id,
+                kind_filter,
+                fetch_limit
+            ])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                let kind_str: String = row.get(6)?;
+                let event_kind = EventKind::from_str(&kind_str).ok_or_else(|| {
+                    CoreError::CorruptState(format!("invalid event kind `{kind_str}`"))
+                })?;
+                let payload_json: String = row.get(8)?;
+                let payload: EventPayload = serde_json::from_str(&payload_json)?;
+                items.push(Event {
+                    event_id: row.get(0)?,
+                    binding_id: row.get(1)?,
+                    seq: i64_to_u64("seq", row.get(2)?)?,
+                    run_id: row.get(3)?,
+                    revision: i64_to_u64("revision", row.get(4)?)?,
+                    step_seq: i64_to_u64("step_seq", row.get(5)?)?,
+                    kind: event_kind,
+                    important: row.get::<_, i64>(7)? != 0,
+                    payload,
+                    created_at_ms: row.get(9)?,
+                });
+            }
+            items
+        };
+
+        let db_has_more = candidate_events.len() > limit;
+        let mut included_events = Vec::with_capacity(candidate_events.len().min(limit));
+        let mut last_included_seq = effective_after_seq;
+        let mut stopped_by_budget = false;
+
+        for event in candidate_events.into_iter().take(limit) {
+            let event_seq = event.seq;
+            included_events.push(event);
+
+            let probe_cursor = Some(encode_activity_cursor(
+                binding_id, run_id, kind, event_seq, hwm_seq,
+            ));
+            let probe_output = CommandOutput::Activity(ActivityPage {
+                binding_id: binding_id.to_string(),
+                events: included_events.clone(),
+                next_cursor: probe_cursor,
+                has_more: true,
+                high_water_mark_seq: hwm_seq,
+                after_seq: effective_after_seq,
+            });
+            let size_bytes = serialized_output_budget_bytes(&probe_output)?;
+            if size_bytes > MAX_PAGE_RESPONSE_BYTES {
+                if included_events.len() == 1 {
+                    return Err(CoreError::ResponseTooLarge {
+                        size_bytes,
+                        max_bytes: MAX_PAGE_RESPONSE_BYTES,
+                    });
+                }
+                included_events.pop();
+                stopped_by_budget = true;
+                break;
+            }
+            last_included_seq = event_seq;
+        }
+
+        let has_more = stopped_by_budget || db_has_more;
+        let next_cursor = if has_more {
+            Some(encode_activity_cursor(
+                binding_id,
+                run_id,
+                kind,
+                last_included_seq,
+                hwm_seq,
+            ))
+        } else {
+            None
+        };
+
+        Ok(ActivityPage {
+            binding_id: binding_id.to_string(),
+            events: included_events,
+            next_cursor,
+            has_more,
+            high_water_mark_seq: hwm_seq,
+            after_seq: effective_after_seq,
         })
     }
 }

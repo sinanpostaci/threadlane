@@ -766,12 +766,14 @@ async fn handle_scoped_command(
 
     let response = {
         let mut access = state.acquire_for_request().await?;
-        let report = access
-            .core_mut()
-            .tick(now)
-            .map_err(|err| map_core_error(&state, "demo tick persistence failed", err))?;
-        if report.emitted_events > 0 {
-            notify_worker = true;
+        if !matches!(req, ScopedRequest::ListActivity { .. }) {
+            let report = access
+                .core_mut()
+                .tick(now)
+                .map_err(|err| map_core_error(&state, "demo tick persistence failed", err))?;
+            if report.emitted_events > 0 {
+                notify_worker = true;
+            }
         }
 
         match req {
