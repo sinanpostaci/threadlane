@@ -20,4 +20,9 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri = { version = "2", features = ["macos-private-api"] }
+threadlane-connectors = { path = "../../../crates/threadlane-connectors" }
+threadlane-decisions = { path = "../../../crates/threadlane-decisions" }
 threadlane-desktop-bridge = { path = "../../../crates/threadlane-desktop-bridge" }
+threadlane-native = { path = "../../../crates/threadlane-native" }
+threadlane-plans = { path = "../../../crates/threadlane-plans" }
+threadlane-registry = { path = "../../../crates/threadlane-registry" }

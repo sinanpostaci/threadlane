@@ -11,6 +11,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 export type UiIconName =
   | 'activity'
   | 'messages-square'
+  | 'clipboard-list'
   | 'blocks'
   | 'sliders-horizontal'
   | 'settings-2'
@@ -115,6 +116,14 @@ export function createUiIcon(name: UiIconName): SVGSVGElement {
     case 'messages-square':
       appendPath(svg, 'M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z');
       appendPath(svg, 'M18 9h2a2 2 0 0 1 2 2v11l-4-4h-6a2 2 0 0 1-2-2v-1');
+      break;
+    case 'clipboard-list':
+      appendRect(svg, '8', '2', '8', '4', '1');
+      appendPath(svg, 'M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2');
+      appendPath(svg, 'M12 11h4');
+      appendPath(svg, 'M12 16h4');
+      appendPath(svg, 'M8 11h.01');
+      appendPath(svg, 'M8 16h.01');
       break;
     case 'blocks':
       appendRect(svg, '14', '2', '8', '8', '1');

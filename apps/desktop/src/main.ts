@@ -3,9 +3,12 @@ import './styles.css';
 import {
   ACCENT_PALETTES,
   DEFAULT_APPEARANCE,
+  DEFAULT_EXECUTION_PREFERENCES,
+  EXECUTION_PREFERENCE_BOUNDS,
   type AccentName,
   type AppearancePreferences,
   type DetailTab,
+  type ExecutionPreferences,
   type NavPage,
   type SurfaceMode,
   type TaskProviderFilter,
@@ -15,7 +18,6 @@ import {
 } from './types.ts';
 import {
   classifyTaskBucket,
-  deriveRecordedProfiles,
   formatAttachmentBadge,
   formatBindingLabel,
   formatEvidenceFieldCheck,
@@ -28,17 +30,23 @@ import {
   formatToolAvailability,
   matchesProviderFilter,
   resolveTaskBrand,
-  resolveToolBrand,
   sanitizeAppearancePreferences,
+  sanitizeExecutionPreferences,
 } from './format.ts';
 import {
   applyMutationError,
   applyMutationSuccess,
+  applyPlansRefreshError,
+  applyPlansRefreshSuccess,
+  applyRegistryRefreshError,
+  applyRegistryRefreshSuccess,
   applyRunDetailError,
   applyRunDetailSuccess,
   applySnapshotPollError,
   applySnapshotPollSuccess,
   beginMutation,
+  beginPlansRefresh,
+  beginRegistryRefresh,
   beginRunDetailRefresh,
   beginSnapshotPoll,
   createInitialState,
@@ -47,6 +55,7 @@ import {
   openRunDetail,
   resolveExpectedDemoRevision,
   selectBinding,
+  shouldRebuildMainOnPoll,
   type DesktopStoreState,
   type DetailTicket,
   type SnapshotTicket,
@@ -62,14 +71,31 @@ import {
   ipcDesktopWindowAction,
   isDevPreviewFixtureMode,
 } from './ipc.ts';
+import {
+  desktop_decision_models,
+  desktop_plans_snapshot,
+  desktop_registry_snapshot,
+  desktop_test_decision,
+  formatAppError,
+  type DecisionAdvice,
+  type DecisionProvider,
+  type ModelDefinition,
+} from './registry/ipc.ts';
 import { createBrandIconElement, createUiIcon, type UiIconName } from './icons.ts';
+import { createButton, h } from './ui/dom.ts';
+import { ToolsPage } from './pages/tools.ts';
+import { ProfilesPage } from './pages/profiles.ts';
+import { PlansPage } from './pages/plans.ts';
+import { NativeLinkingPanel } from './pages/native.ts';
 
 const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
+const EXECUTION_PREFS_STORAGE_KEY = 'threadlane.desktop.execution_prefs.v1';
 const POLL_INTERVAL_MS = 2000;
 
 const NAV_ITEMS: ReadonlyArray<{ page: NavPage; label: string; icon: UiIconName }> = [
   { page: 'activity', label: 'Activity', icon: 'activity' },
   { page: 'chats', label: 'Chats', icon: 'messages-square' },
+  { page: 'plans', label: 'Plans', icon: 'clipboard-list' },
   { page: 'tools', label: 'Tools', icon: 'blocks' },
   { page: 'profiles', label: 'Profiles', icon: 'sliders-horizontal' },
   { page: 'settings', label: 'Settings', icon: 'settings-2' },
@@ -111,39 +137,35 @@ function saveAppearance(prefs: AppearancePreferences): void {
   }
 }
 
-type ChildNodeSpec = Node | string | number | null | undefined | false;
+function loadSavedExecutionPreferences(): ExecutionPreferences {
+  try {
+    const raw = window.localStorage.getItem(EXECUTION_PREFS_STORAGE_KEY);
+    if (!raw) {
+      return { ...DEFAULT_EXECUTION_PREFERENCES };
+    }
+    return sanitizeExecutionPreferences(JSON.parse(raw));
+  } catch {
+    return { ...DEFAULT_EXECUTION_PREFERENCES };
+  }
+}
 
-function h<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  attrs?: Record<string, string | number | boolean | null | undefined>,
-  ...children: ChildNodeSpec[]
-): HTMLElementTagNameMap[K] {
-  const element = document.createElement(tag);
-  if (attrs) {
-    for (const [key, value] of Object.entries(attrs)) {
-      if (value === undefined || value === null || value === false) {
-        continue;
-      }
-      if (key === 'className') {
-        element.className = String(value);
-      } else if (value === true) {
-        element.setAttribute(key, '');
-      } else {
-        element.setAttribute(key, String(value));
-      }
-    }
+function saveExecutionPreferences(prefs: ExecutionPreferences): void {
+  try {
+    const sanitized = sanitizeExecutionPreferences(prefs);
+    window.localStorage.setItem(EXECUTION_PREFS_STORAGE_KEY, JSON.stringify(sanitized));
+  } catch {
+    // Ignore storage write errors in restricted webviews.
   }
-  for (const child of children) {
-    if (child === null || child === undefined || child === false) {
-      continue;
-    }
-    if (child instanceof Node) {
-      element.appendChild(child);
-    } else {
-      element.appendChild(document.createTextNode(String(child)));
-    }
-  }
-  return element;
+}
+
+interface DecisionTestUiState {
+  selectedToolId: string;
+  selectedModel: string;
+  fetchedModels: ModelDefinition[];
+  loadingModels: boolean;
+  runningTest: boolean;
+  advice: DecisionAdvice | null;
+  error: string | null;
 }
 
 class ThreadlaneDesktopApp {
@@ -153,13 +175,42 @@ class ThreadlaneDesktopApp {
   private readonly mainEl: HTMLElement;
   private readonly footerEl: HTMLElement;
   private readonly navEl: HTMLElement;
+  private readonly toolsPage: ToolsPage;
+  private readonly profilesPage: ProfilesPage;
+  private readonly plansPage: PlansPage;
+  private readonly nativeLinkingPanel: NativeLinkingPanel;
+  private decisionUi: DecisionTestUiState = {
+    selectedToolId: '',
+    selectedModel: '',
+    fetchedModels: [],
+    loadingModels: false,
+    runningTest: false,
+    advice: null,
+    error: null,
+  };
   private returnFocusKey: string | null = null;
   private pollTimerId: number | null = null;
 
   constructor(mountNode: HTMLElement) {
     const savedAppearance = loadSavedAppearance();
-    this.state = createInitialState(savedAppearance);
+    const savedExecPrefs = loadSavedExecutionPreferences();
+    this.state = createInitialState(savedAppearance, Date.now(), savedExecPrefs);
     this.state.isDevPreviewFixture = isDevPreviewFixtureMode();
+
+    this.toolsPage = new ToolsPage(() => {
+      void this.refreshRegistry();
+    });
+    this.profilesPage = new ProfilesPage(() => {
+      void this.refreshRegistry();
+    });
+    this.plansPage = new PlansPage(() => {
+      void this.refreshPlans();
+    });
+    this.nativeLinkingPanel = new NativeLinkingPanel(() => {
+      this.returnFocusKey = null;
+      this.state = navigateToPage(this.state, 'tools');
+      this.render('nav-tools');
+    });
 
     this.headerEl = h('header', { className: 'aq-top', 'data-tauri-drag-region': 'true' });
     this.mainEl = h('main', { className: 'aq-main' });
@@ -185,7 +236,12 @@ class ThreadlaneDesktopApp {
   }
 
   private async initialize(): Promise<void> {
-    await Promise.all([this.triggerSnapshotPoll(true), this.refreshTools()]);
+    await Promise.all([
+      this.triggerSnapshotPoll(true, false),
+      this.refreshTools(),
+      this.refreshRegistry(),
+      this.refreshPlans(),
+    ]);
     this.scheduleNextPoll();
   }
 
@@ -201,7 +257,7 @@ class ThreadlaneDesktopApp {
 
   private async runPollCycle(): Promise<void> {
     try {
-      await this.triggerSnapshotPoll(false);
+      await this.triggerSnapshotPoll(false, true);
       if (this.state.detailTarget !== null) {
         const refresh = beginRunDetailRefresh(this.state, false);
         this.state = refresh.state;
@@ -214,23 +270,88 @@ class ThreadlaneDesktopApp {
     }
   }
 
-  private async triggerSnapshotPoll(force: boolean): Promise<void> {
+  private async triggerSnapshotPoll(
+    force: boolean,
+    isBackgroundPoll: boolean = false
+  ): Promise<void> {
     const next = beginSnapshotPoll(this.state, force);
     this.state = next.state;
     if (!next.ticket) {
       return;
     }
-    await this.executeSnapshotTicket(next.ticket);
+    await this.executeSnapshotTicket(next.ticket, isBackgroundPoll);
   }
 
-  private async executeSnapshotTicket(ticket: SnapshotTicket): Promise<void> {
+  private async executeSnapshotTicket(
+    ticket: SnapshotTicket,
+    isBackgroundPoll: boolean = false
+  ): Promise<void> {
     try {
       const snapshot = await ipcDesktopSnapshot(ticket.requestedBindingId);
       this.state = applySnapshotPollSuccess(this.state, ticket, snapshot);
+      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
       this.renderPreserveActiveInput();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load desktop snapshot.';
       this.state = applySnapshotPollError(this.state, ticket, msg);
+      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
+      this.renderPreserveActiveInput();
+    }
+  }
+
+  private async refreshRegistry(): Promise<void> {
+    const started = beginRegistryRefresh(this.state, true);
+    this.state = started.state;
+    if (!started.ticket) {
+      return;
+    }
+    try {
+      const snapshot = await desktop_registry_snapshot();
+      this.state = applyRegistryRefreshSuccess(this.state, started.ticket, snapshot);
+    } catch (err) {
+      this.state = applyRegistryRefreshError(
+        this.state,
+        started.ticket,
+        formatAppError(err, 'Failed to load registry snapshot.')
+      );
+    }
+    if (
+      this.state.detailTarget === null &&
+      (this.state.page === 'tools' ||
+        this.state.page === 'profiles' ||
+        this.state.page === 'plans' ||
+        this.state.page === 'chats' ||
+        this.state.page === 'settings')
+    ) {
+      this.renderPreserveActiveInput();
+    }
+  }
+
+  private async refreshPlans(): Promise<void> {
+    const started = beginPlansRefresh(this.state, true);
+    this.state = started.state;
+    if (!started.ticket) {
+      return;
+    }
+    try {
+      const plans = await desktop_plans_snapshot();
+      this.state = applyPlansRefreshSuccess(this.state, started.ticket, plans);
+    } catch (err) {
+      this.state = applyPlansRefreshError(
+        this.state,
+        started.ticket,
+        formatAppError(err, 'Failed to load plans ledger.')
+      );
+    }
+    if (this.state.detailTarget === null && this.state.page === 'plans') {
       this.renderPreserveActiveInput();
     }
   }
@@ -256,7 +377,6 @@ class ThreadlaneDesktopApp {
       toolsLoading: true,
       toolsError: null,
     };
-    this.renderPreserveActiveInput();
     try {
       const tools = await ipcDesktopToolStatus();
       this.state = {
@@ -265,7 +385,6 @@ class ThreadlaneDesktopApp {
         toolsLoading: false,
         toolsError: null,
       };
-      this.renderPreserveActiveInput();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to check local PATH tools.';
       this.state = {
@@ -273,6 +392,8 @@ class ThreadlaneDesktopApp {
         toolsLoading: false,
         toolsError: msg,
       };
+    }
+    if (this.state.detailTarget === null && this.state.page === 'tools') {
       this.renderPreserveActiveInput();
     }
   }
@@ -291,7 +412,7 @@ class ThreadlaneDesktopApp {
       return;
     }
     this.render(focusTarget);
-    await this.executeSnapshotTicket(switched.ticket);
+    await this.executeSnapshotTicket(switched.ticket, false);
     this.scheduleNextPoll();
   }
 
@@ -460,15 +581,20 @@ class ThreadlaneDesktopApp {
 
   private renderPreserveActiveInput(): void {
     const active = document.activeElement as HTMLElement | null;
-    if (active && active instanceof HTMLInputElement && active.dataset.focus === 'state-dir-input') {
+    if (active && active instanceof HTMLInputElement && active.dataset.focus) {
+      const focusKey = active.dataset.focus;
       const selStart = active.selectionStart;
       const selEnd = active.selectionEnd;
-      this.render('state-dir-input');
+      this.render(focusKey);
       const restored = this.root.querySelector<HTMLInputElement>(
-        '[data-focus="state-dir-input"]'
+        `[data-focus="${focusKey}"]`
       );
       if (restored && selStart !== null && selEnd !== null) {
-        restored.setSelectionRange(selStart, selEnd);
+        try {
+          restored.setSelectionRange(selStart, selEnd);
+        } catch {
+          // Non-text inputs (e.g. number/range) do not support setSelectionRange.
+        }
       }
       return;
     }
@@ -478,11 +604,13 @@ class ThreadlaneDesktopApp {
   }
 
   private render(focusKey?: string): void {
+    const prevScrollTop = this.mainEl.scrollTop;
     this.applyAppearanceStyles();
     this.renderHeader();
     this.renderMain();
     this.renderFooter();
     this.renderNav();
+    this.mainEl.scrollTop = prevScrollTop;
 
     if (focusKey) {
       const target = this.root.querySelector<HTMLElement>(`[data-focus="${focusKey}"]`);
@@ -592,8 +720,6 @@ class ThreadlaneDesktopApp {
 
     if (this.state.detailTarget !== null) {
       nodes.push(this.buildRunDetailView());
-    } else if (this.state.selectedToolId !== null) {
-      nodes.push(this.buildToolDetailView(this.state.selectedToolId));
     } else {
       switch (this.state.page) {
         case 'activity':
@@ -601,6 +727,9 @@ class ThreadlaneDesktopApp {
           break;
         case 'chats':
           nodes.push(this.buildChatsView());
+          break;
+        case 'plans':
+          nodes.push(this.buildPlansView());
           break;
         case 'tools':
           nodes.push(this.buildToolsView());
@@ -621,10 +750,17 @@ class ThreadlaneDesktopApp {
     const frag = document.createDocumentFragment();
     const { snapshot, providerFilter, showFilters, completedExpanded, pendingMutation } =
       this.state;
-    const { bindings, selected_binding_id, tasks, active_runs, total_runs, has_more, demo_controls, attachment } =
-      snapshot;
+    const {
+      bindings,
+      selected_binding_id,
+      tasks,
+      active_runs,
+      total_runs,
+      has_more,
+      demo_controls,
+      attachment,
+    } = snapshot;
 
-    // Context bar: conversation selector + filter toggle + manual refresh
     const selectEl = h('select', {
       'data-change': 'binding',
       'data-focus': 'binding-select',
@@ -640,7 +776,8 @@ class ThreadlaneDesktopApp {
           'option',
           {
             value: binding.binding_id,
-            selected: binding.binding_id === ( this.state.selectedBindingId ?? selected_binding_id ),
+            selected:
+              binding.binding_id === (this.state.selectedBindingId ?? selected_binding_id),
           },
           formatBindingLabel(binding)
         );
@@ -700,7 +837,6 @@ class ThreadlaneDesktopApp {
       frag.appendChild(filterRow);
     }
 
-    // Scoped chat counts + bounded recent-10 limit label
     const activeBinding = bindings.find(
       (b) => b.binding_id === (this.state.selectedBindingId ?? selected_binding_id)
     );
@@ -719,12 +855,10 @@ class ThreadlaneDesktopApp {
       );
     }
 
-    // Local deterministic demo controls when available
     if (demo_controls.available) {
       frag.appendChild(this.buildDemoControlsBanner(demo_controls, pendingMutation));
     }
 
-    // Connection / unconfigured / blocked / offline states
     if (attachment.connection !== 'connected' || attachment.mode === 'unconfigured') {
       frag.appendChild(this.buildAttachmentNoticeCard());
     }
@@ -1306,13 +1440,20 @@ class ThreadlaneDesktopApp {
     const currentSelected = this.state.selectedBindingId ?? selected_binding_id;
 
     frag.appendChild(
-      h('p', { className: 'aq-kicker' }, `Linked conversations (${bindings.length})`)
+      h(
+        'div',
+        { className: 'aq-section', style: 'margin-top: 4px;' },
+        h('span', undefined, `Linked runtime conversations (${bindings.length})`),
+        createButton('Open Plans ledger', () => {
+          this.returnFocusKey = null;
+          this.state = navigateToPage(this.state, 'plans');
+          this.render('nav-plans');
+        })
+      )
     );
 
     if (bindings.length === 0) {
-      frag.appendChild(
-        h('p', { className: 'aq-note' }, 'No linked conversations yet.')
-      );
+      frag.appendChild(h('p', { className: 'aq-note' }, 'No linked conversations yet.'));
       if (this.state.snapshot.demo_controls.available) {
         frag.appendChild(
           this.buildDemoControlsBanner(
@@ -1321,261 +1462,169 @@ class ThreadlaneDesktopApp {
           )
         );
       }
-      return frag;
-    }
+    } else {
+      for (const binding of bindings) {
+        const isSelected = binding.binding_id === currentSelected;
+        const scopedStats = isSelected
+          ? `${active_runs} active · ${total_runs} total runs`
+          : 'Select to view activity';
 
-    for (const binding of bindings) {
-      const isSelected = binding.binding_id === currentSelected;
-      const scopedStats = isSelected
-        ? `${active_runs} active · ${total_runs} total runs`
-        : 'Select to view activity';
-
-      frag.appendChild(
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'aq-link',
-            'data-select-binding': binding.binding_id,
-            'data-focus': `chat-${binding.binding_id}`,
-            disabled: this.state.pendingMutation !== null,
-          },
+        frag.appendChild(
           h(
-            'span',
-            undefined,
+            'button',
+            {
+              type: 'button',
+              className: 'aq-link',
+              'data-select-binding': binding.binding_id,
+              'data-focus': `chat-${binding.binding_id}`,
+              disabled: this.state.pendingMutation !== null,
+            },
             h(
               'span',
-              { className: 'aq-row-head' },
-              h('span', { className: 'aq-task-name' }, formatBindingLabel(binding)),
-              isSelected
-                ? h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Selected')
-                : binding.is_local_demo
-                  ? h('span', { className: 'aq-badge' }, 'Local demo')
-                  : null
+              undefined,
+              h(
+                'span',
+                { className: 'aq-row-head' },
+                h('span', { className: 'aq-task-name' }, formatBindingLabel(binding)),
+                isSelected
+                  ? h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Selected')
+                  : binding.is_local_demo
+                    ? h('span', { className: 'aq-badge' }, 'Local demo')
+                    : null
+              ),
+              h('span', { className: 'aq-sub' }, scopedStats)
             ),
-            h('span', { className: 'aq-sub' }, scopedStats)
-          ),
-          createUiIcon('chevron-right')
-        )
-      );
-    }
+            createUiIcon('chevron-right')
+          )
+        );
+      }
 
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Only linked conversations appear here. Run counts are shown for the selected conversation.'
-      )
-    );
-
-    return frag;
-  }
-
-  private buildToolsView(): DocumentFragment {
-    const frag = document.createDocumentFragment();
-
-    frag.appendChild(
-      h(
-        'div',
-        { className: 'aq-section', style: 'margin-top: 4px;' },
-        h('span', undefined, 'Command availability'),
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'aq-btn',
-            'data-action': 'refresh-tools',
-            'data-focus': 'refresh-tools',
-            disabled: this.state.toolsLoading,
-          },
-          createUiIcon('refresh-cw'),
-          h('span', undefined, this.state.toolsLoading ? 'Checking…' : 'Recheck')
-        )
-      )
-    );
-
-    if (this.state.toolsError) {
-      frag.appendChild(
-        h('div', { className: 'aq-banner aq-banner-error', role: 'alert' }, this.state.toolsError)
-      );
-    }
-
-    if (this.state.toolsLoading && this.state.tools.length === 0) {
-      frag.appendChild(h('p', { className: 'aq-note' }, 'Checking installed commands…'));
-      return frag;
-    }
-
-    for (const tool of this.state.tools) {
-      frag.appendChild(this.buildToolRow(tool));
-    }
-
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Checks local command availability on PATH only. Accounts, credentials, and model access are not checked here.'
-      )
-    );
-
-    return frag;
-  }
-
-  private buildToolRow(tool: ToolStatus): HTMLElement {
-    const brand = resolveToolBrand(tool.id, tool.label);
-    const availabilityLabel = formatToolAvailability(tool.availability);
-    const detailSub = tool.executable_path
-      ? `${availabilityLabel} · ${tool.executable_path}`
-      : `${availabilityLabel} · ${tool.note}`;
-
-    return h(
-      'button',
-      {
-        type: 'button',
-        className: 'aq-link',
-        'data-tool-id': tool.id,
-        'data-focus': `tool-${tool.id}`,
-      },
-      h(
-        'span',
-        { className: 'aq-tool' },
-        createBrandIconElement(brand),
-        h(
-          'span',
-          undefined,
-          h(
-            'span',
-            { className: 'aq-row-head' },
-            h('span', { className: 'aq-task-name' }, tool.label),
-            h(
-              'span',
-              {
-                className: 'aq-badge',
-                'data-status': tool.availability === 'found' ? 'found' : 'default',
-              },
-              availabilityLabel
-            )
-          ),
-          h('span', { className: 'aq-sub' }, detailSub)
-        )
-      ),
-      createUiIcon('chevron-right')
-    );
-  }
-
-  private buildToolDetailView(toolId: string): DocumentFragment {
-    const frag = document.createDocumentFragment();
-    const tool = this.state.tools.find((t) => t.id === toolId);
-    if (!tool) {
-      frag.appendChild(h('p', { className: 'aq-note' }, 'Tool entry not found.'));
-      return frag;
-    }
-
-    frag.appendChild(h('p', { className: 'aq-kicker' }, 'Command availability'));
-    frag.appendChild(h('h2', { className: 'aq-page-title' }, tool.label));
-    frag.appendChild(
-      h(
-        'dl',
-        { className: 'aq-facts' },
-        h('div', undefined, h('dt', undefined, 'Tool ID'), h('dd', undefined, tool.id)),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Availability'),
-          h('dd', undefined, formatToolAvailability(tool.availability))
-        ),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Executable'),
-          h('dd', undefined, tool.executable_path ?? 'Not found on PATH')
-        ),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Check'),
-          h('dd', undefined, 'Local PATH lookup only')
-        )
-      )
-    );
-    frag.appendChild(h('p', { className: 'aq-note' }, tool.note));
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Checks command availability only. Accounts and model access are verified when a worker runs.'
-      )
-    );
-    return frag;
-  }
-
-  private buildProfilesView(): DocumentFragment {
-    const frag = document.createDocumentFragment();
-    const groups = deriveRecordedProfiles(this.state.snapshot.tasks);
-
-    frag.appendChild(h('p', { className: 'aq-kicker' }, 'Read-only'));
-    frag.appendChild(h('h2', { className: 'aq-page-title' }, 'Profiles'));
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Shows profiles recorded in the selected conversation. Profile editing comes later.'
-      )
-    );
-
-    if (groups.length === 0) {
       frag.appendChild(
         h(
           'p',
           { className: 'aq-note' },
-          'No profiles recorded in the selected conversation yet.'
+          'Only verified runtime bindings appear above. Native thread metadata discovery below is read-only and never fabricates pairing.'
         )
       );
-      return frag;
     }
 
-    for (const group of groups) {
-      const statsParts = [`${group.runCount} run${group.runCount === 1 ? '' : 's'}`];
-      if (group.activeCount > 0) {
-        statsParts.push(`${group.activeCount} active`);
-      }
-      if (group.needsEvidenceCount > 0) {
-        statsParts.push(`${group.needsEvidenceCount} missing evidence`);
-      }
+    frag.appendChild(
+      this.nativeLinkingPanel.render(this.state.registrySnapshot, bindings)
+    );
 
-      const roleCard = h(
-        'div',
-        { className: 'aq-role' },
+    return frag;
+  }
+
+  private buildPlansView(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(
+      this.plansPage.render(
+        this.state.plansSnapshot,
+        this.state.registrySnapshot,
+        this.state.snapshot.bindings,
+        this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
+        this.state.plansError
+      )
+    );
+    return frag;
+  }
+
+  private buildRegistryHeaderBar(): HTMLElement {
+    return h(
+      'div',
+      { className: 'aq-scope-bar' },
+      h(
+        'span',
+        undefined,
+        `Registry revision r${this.state.registrySnapshot.revision} · ${this.state.registrySnapshot.tools.length} tools · ${this.state.registrySnapshot.models.length} models · ${this.state.registrySnapshot.profiles.length} profiles`
+      ),
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'aq-icon-button',
+          'data-action': 'refresh-registry',
+          'data-focus': 'refresh-registry',
+          'aria-label': 'Refresh registry',
+          title: 'Refresh registry',
+          disabled: this.state.registryInFlight,
+        },
+        createUiIcon('refresh-cw')
+      )
+    );
+  }
+
+  private buildToolsView(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(this.buildRegistryHeaderBar());
+
+    if (this.state.registryError) {
+      frag.appendChild(
         h(
           'div',
-          { className: 'aq-role-head' },
-          h('span', undefined, group.profileId),
-          h(
-            'span',
-            {
-              className: 'aq-badge',
-              'data-status': group.needsEvidenceCount > 0 ? 'warn' : 'active',
-            },
-            statsParts.join(' · ')
-          )
-        ),
-        h(
-          'div',
-          { className: 'aq-role-line' },
-          h('span', undefined, `Providers: ${group.providers.join(', ')}`)
-        ),
-        ...group.models.map((m) =>
-          h('div', { className: 'aq-role-line' }, h('span', undefined, m))
+          { className: 'aq-banner aq-banner-error', role: 'alert' },
+          h('span', undefined, this.state.registryError)
         )
       );
-      frag.appendChild(roleCard);
     }
 
+    frag.appendChild(this.toolsPage.render(this.state.registrySnapshot));
+
+    if (this.state.tools.length > 0) {
+      frag.appendChild(this.buildPassivePathStatusDetails(this.state.tools));
+    }
+
+    return frag;
+  }
+
+  private buildPassivePathStatusDetails(tools: readonly ToolStatus[]): HTMLElement {
+    const details = h('details', { className: 'aq-technical' });
+    details.appendChild(
+      h(
+        'summary',
+        { 'data-focus': 'passive-path-summary' },
+        h('span', undefined, 'Passive PATH command lookup (no CLI execution)'),
+        createUiIcon('chevron-down')
+      )
+    );
+    const list = h('dl', { className: 'aq-technical-grid' });
+    for (const tool of tools) {
+      list.appendChild(h('dt', undefined, tool.label));
+      list.appendChild(
+        h(
+          'dd',
+          undefined,
+          `${formatToolAvailability(tool.availability)}${
+            tool.executable_path ? ` · ${tool.executable_path}` : ''
+          }`
+        )
+      );
+    }
+    details.appendChild(list);
+    return details;
+  }
+
+  private buildProfilesView(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    frag.appendChild(this.buildRegistryHeaderBar());
+
+    if (this.state.registryError) {
+      frag.appendChild(
+        h(
+          'div',
+          { className: 'aq-banner aq-banner-error', role: 'alert' },
+          h('span', undefined, this.state.registryError)
+        )
+      );
+    }
+
+    frag.appendChild(this.profilesPage.render(this.state.registrySnapshot));
     return frag;
   }
 
   private buildSettingsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
-    const { appearance, snapshot, pendingMutation } = this.state;
+    const { appearance, executionPrefs, snapshot, pendingMutation } = this.state;
     const busy = pendingMutation !== null;
 
     frag.appendChild(h('p', { className: 'aq-kicker' }, 'Appearance'));
@@ -1602,7 +1651,11 @@ class ThreadlaneDesktopApp {
           'label',
           { className: 'aq-label', for: opacitySliderId },
           h('span', undefined, 'Background opacity'),
-          h('output', { for: opacitySliderId, id: 'threadlane-opacity-output' }, `${appearance.opacity}%`)
+          h(
+            'output',
+            { for: opacitySliderId, id: 'threadlane-opacity-output' },
+            `${appearance.opacity}%`
+          )
         ),
         h('input', {
           id: opacitySliderId,
@@ -1644,15 +1697,9 @@ class ThreadlaneDesktopApp {
       )
     );
 
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Transparency changes the background only; text and icons stay solid. Desktop blur depends on your system.'
-      )
-    );
+    frag.appendChild(this.buildExecutionPreferencesSection(executionPrefs));
+    frag.appendChild(this.buildDecisionVerificationSection());
 
-    // Runtime observer attachment section
     frag.appendChild(
       h('p', { className: 'aq-kicker', style: 'margin-top: 18px;' }, 'Connection & local demo')
     );
@@ -1661,7 +1708,12 @@ class ThreadlaneDesktopApp {
       h(
         'dl',
         { className: 'aq-facts', style: 'margin: 8px 0 12px;' },
-        h('div', undefined, h('dt', undefined, 'Active mode'), h('dd', undefined, snapshot.attachment.mode)),
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'Active mode'),
+          h('dd', undefined, snapshot.attachment.mode)
+        ),
         h(
           'div',
           undefined,
@@ -1748,8 +1800,8 @@ class ThreadlaneDesktopApp {
               pendingMutation === 'start_demo'
                 ? 'Starting…'
                 : demoActive
-                  ? 'Local demo active'
-                  : 'Run local demo'
+                   ? 'Local demo active'
+                   : 'Run local demo'
             )
           )
         )
@@ -1760,11 +1812,401 @@ class ThreadlaneDesktopApp {
       h(
         'p',
         { className: 'aq-note' },
-        'Only appearance settings and an optional remembered folder path are saved locally. Prompts, run history, and credentials are never stored by the panel.'
+        'Only appearance, bounded execution preferences, and an optional remembered folder path are saved locally. Prompts, run history, and credentials are never stored in browser storage.'
       )
     );
 
     return frag;
+  }
+
+  private buildExecutionPreferencesSection(prefs: ExecutionPreferences): HTMLElement {
+    const updatePref = (patch: Partial<ExecutionPreferences>, focusKey?: string): void => {
+      const next = sanitizeExecutionPreferences({
+        ...this.state.executionPrefs,
+        ...patch,
+      });
+      this.state = {
+        ...this.state,
+        executionPrefs: next,
+      };
+      saveExecutionPreferences(next);
+      this.render(focusKey);
+    };
+
+    const workersInput = h('input', {
+      type: 'number',
+      className: 'aq-text-input',
+      min: String(EXECUTION_PREFERENCE_BOUNDS.maxConcurrentWorkers.min),
+      max: String(EXECUTION_PREFERENCE_BOUNDS.maxConcurrentWorkers.max),
+      value: String(prefs.maxConcurrentWorkers),
+      'data-focus': 'exec-max-workers',
+      'aria-label': 'Maximum concurrent workers',
+    });
+    workersInput.addEventListener('change', () => {
+      updatePref({ maxConcurrentWorkers: Number(workersInput.value) }, 'exec-max-workers');
+    });
+
+    const tasksInput = h('input', {
+      type: 'number',
+      className: 'aq-text-input',
+      min: String(EXECUTION_PREFERENCE_BOUNDS.maxTasksPerPlan.min),
+      max: String(EXECUTION_PREFERENCE_BOUNDS.maxTasksPerPlan.max),
+      value: String(prefs.maxTasksPerPlan),
+      'data-focus': 'exec-max-tasks',
+      'aria-label': 'Maximum tasks per plan',
+    });
+    tasksInput.addEventListener('change', () => {
+      updatePref({ maxTasksPerPlan: Number(tasksInput.value) }, 'exec-max-tasks');
+    });
+
+    const timeoutInput = h('input', {
+      type: 'number',
+      className: 'aq-text-input',
+      min: String(EXECUTION_PREFERENCE_BOUNDS.workerTimeoutSecs.min),
+      max: String(EXECUTION_PREFERENCE_BOUNDS.workerTimeoutSecs.max),
+      value: String(prefs.workerTimeoutSecs),
+      'data-focus': 'exec-timeout-secs',
+      'aria-label': 'Worker timeout in seconds',
+    });
+    timeoutInput.addEventListener('change', () => {
+      updatePref({ workerTimeoutSecs: Number(timeoutInput.value) }, 'exec-timeout-secs');
+    });
+
+    const budgetInput = h('input', {
+      type: 'number',
+      className: 'aq-text-input',
+      min: String(EXECUTION_PREFERENCE_BOUNDS.decisionBudgetTokens.min),
+      max: String(EXECUTION_PREFERENCE_BOUNDS.decisionBudgetTokens.max),
+      value: String(prefs.decisionBudgetTokens),
+      'data-focus': 'exec-decision-budget',
+      'aria-label': 'Decision token budget',
+    });
+    budgetInput.addEventListener('change', () => {
+      updatePref({ decisionBudgetTokens: Number(budgetInput.value) }, 'exec-decision-budget');
+    });
+
+    const redactToggle = h('input', {
+      type: 'checkbox',
+      checked: prefs.redactPathsInLogs,
+      'data-focus': 'exec-redact-paths',
+    });
+    redactToggle.addEventListener('change', () => {
+      updatePref({ redactPathsInLogs: redactToggle.checked }, 'exec-redact-paths');
+    });
+
+    const explicitPublishToggle = h('input', {
+      type: 'checkbox',
+      checked: prefs.requireExplicitPublish,
+      'data-focus': 'exec-explicit-publish',
+    });
+    explicitPublishToggle.addEventListener('change', () => {
+      updatePref({ requireExplicitPublish: explicitPublishToggle.checked }, 'exec-explicit-publish');
+    });
+
+    const resetBtn = createButton('Reset defaults', () => {
+      updatePref({ ...DEFAULT_EXECUTION_PREFERENCES });
+    });
+
+    return h(
+      'section',
+      { className: 'aq-setting', 'aria-label': 'Execution and privacy preferences' },
+      h(
+        'div',
+        { className: 'aq-row-head' },
+        h('p', { className: 'aq-kicker', style: 'margin: 0;' }, 'Execution & privacy bounds'),
+        resetBtn
+      ),
+      h(
+        'div',
+        { className: 'aq-form-grid', style: 'margin-top: 8px;' },
+        h(
+          'label',
+          { className: 'aq-field' },
+          h('span', { className: 'aq-field-label' }, 'Max concurrent workers (1–8)'),
+          workersInput
+        ),
+        h(
+          'label',
+          { className: 'aq-field' },
+          h('span', { className: 'aq-field-label' }, 'Max tasks per plan (1–32)'),
+          tasksInput
+        ),
+        h(
+          'label',
+          { className: 'aq-field' },
+          h('span', { className: 'aq-field-label' }, 'Worker timeout secs (30–3600)'),
+          timeoutInput
+        ),
+        h(
+          'label',
+          { className: 'aq-field' },
+          h('span', { className: 'aq-field-label' }, 'Decision budget tokens (128–8192)'),
+          budgetInput
+        )
+      ),
+      h(
+        'label',
+        { className: 'aq-toggle' },
+        h('span', undefined, 'Redact home and workspace paths in exported diagnostics'),
+        redactToggle
+      ),
+      h(
+        'label',
+        { className: 'aq-toggle' },
+        h('span', undefined, 'Require explicit operator publish before plan admission'),
+        explicitPublishToggle
+      ),
+      h(
+        'p',
+        { className: 'aq-note', style: 'margin-bottom: 0;' },
+        'Typed bounds only: arbitrary shell flags, custom CLI arguments, and raw environment variable overrides are prohibited. Editing preferences here never alters running tasks.'
+      )
+    );
+  }
+
+  private buildDecisionVerificationSection(): HTMLElement {
+    const apiTools = this.state.registrySnapshot.tools.filter(
+      (t) => t.adapter === 'jev_api' || t.adapter === 'openai_decisions_api'
+    );
+
+    if (
+      !this.decisionUi.selectedToolId ||
+      !apiTools.some((t) => t.id === this.decisionUi.selectedToolId)
+    ) {
+      this.decisionUi.selectedToolId = apiTools[0]?.id ?? '';
+    }
+
+    const selectedTool =
+      apiTools.find((t) => t.id === this.decisionUi.selectedToolId) ?? null;
+    const provider: DecisionProvider =
+      selectedTool?.adapter === 'openai_decisions_api' ? 'openai' : 'jev';
+
+    if (!this.decisionUi.selectedModel) {
+      this.decisionUi.selectedModel =
+        this.decisionUi.fetchedModels[0]?.model_arg ??
+        (provider === 'openai' ? 'gpt-6-luna' : 'jev-1.14.0');
+    }
+
+    const busy = this.decisionUi.loadingModels || this.decisionUi.runningTest;
+
+    if (apiTools.length === 0) {
+      return h(
+        'section',
+        { className: 'aq-setting', 'aria-label': 'Decision API verification' },
+        h('p', { className: 'aq-kicker' }, 'Decision shadow-mode verification'),
+        h(
+          'p',
+          { className: 'aq-note' },
+          'Configure a Jev API or OpenAI Decisions API tool and OS keychain secret on the Tools page to test synthetic classification.'
+        ),
+        createButton('Configure API tool in Tools', () => {
+          this.returnFocusKey = null;
+          this.state = navigateToPage(this.state, 'tools');
+          this.render('nav-tools');
+        })
+      );
+    }
+
+    const toolSelect = h(
+      'select',
+      {
+        className: 'aq-select-input',
+        'aria-label': 'Decision API tool',
+        disabled: busy,
+      },
+      ...apiTools.map((tool) =>
+        h(
+          'option',
+          { value: tool.id, selected: tool.id === this.decisionUi.selectedToolId },
+          `${tool.label} (${tool.adapter})`
+        )
+      )
+    );
+    toolSelect.addEventListener('change', () => {
+      const nextTool = apiTools.find((t) => t.id === toolSelect.value);
+      const nextProvider: DecisionProvider =
+        nextTool?.adapter === 'openai_decisions_api' ? 'openai' : 'jev';
+      this.decisionUi.selectedToolId = toolSelect.value;
+      this.decisionUi.fetchedModels = [];
+      this.decisionUi.selectedModel =
+        nextProvider === 'openai' ? 'gpt-6-luna' : 'jev-1.14.0';
+      this.decisionUi.advice = null;
+      this.decisionUi.error = null;
+      this.render();
+    });
+
+    const modelInput = h('input', {
+      type: 'text',
+      className: 'aq-text-input',
+      value: this.decisionUi.selectedModel,
+      placeholder: provider === 'openai' ? 'gpt-6-luna' : 'jev-1.14.0',
+      'aria-label': 'Decision model',
+      disabled: busy,
+    });
+    modelInput.addEventListener('input', () => {
+      this.decisionUi.selectedModel = modelInput.value;
+    });
+
+    const fetchModelsBtn = createButton(
+      this.decisionUi.loadingModels ? 'Loading models…' : 'Fetch decision models',
+      () => {
+        void this.handleFetchDecisionModels(toolSelect.value, provider);
+      },
+      busy
+    );
+
+    const runSyntheticBtn = createButton(
+      this.decisionUi.runningTest
+        ? 'Testing synthetic sample…'
+        : 'Run fixed synthetic decision test',
+      () => {
+        void this.handleRunSyntheticDecisionTest(
+          toolSelect.value,
+          provider,
+          this.decisionUi.selectedModel
+        );
+      },
+      busy
+    );
+    runSyntheticBtn.classList.add('aq-btn-primary');
+
+    const adviceEl = this.decisionUi.advice
+      ? h(
+          'dl',
+          { className: 'aq-facts', style: 'margin-top: 8px;' },
+          h(
+            'div',
+            undefined,
+            h('dt', undefined, 'Provider / Model'),
+            h(
+              'dd',
+              undefined,
+              `${this.decisionUi.advice.provider} · ${this.decisionUi.advice.model}`
+            )
+          ),
+          h(
+            'div',
+            undefined,
+            h('dt', undefined, 'Difficulty'),
+            h('dd', undefined, this.decisionUi.advice.difficulty ?? 'Unclassified')
+          ),
+          h(
+            'div',
+            undefined,
+            h('dt', undefined, 'Confidence'),
+            h(
+              'dd',
+              undefined,
+              this.decisionUi.advice.confidence !== null
+                ? this.decisionUi.advice.confidence.toFixed(2)
+                : 'N/A'
+            )
+          ),
+          h(
+            'div',
+            undefined,
+            h('dt', undefined, 'Reason / Review'),
+            h(
+              'dd',
+              undefined,
+              `${this.decisionUi.advice.reason_code} · needs_review=${String(
+                this.decisionUi.advice.needs_review
+              )}`
+            )
+          )
+        )
+      : null;
+
+    return h(
+      'section',
+      { className: 'aq-setting', 'aria-label': 'Decision API verification' },
+      h(
+        'div',
+        { className: 'aq-row-head' },
+        h('p', { className: 'aq-kicker', style: 'margin: 0;' }, 'Decision shadow-mode verification'),
+        h('span', { className: 'aq-badge' }, 'Explicit click only')
+      ),
+      this.decisionUi.error
+        ? h(
+            'div',
+            { className: 'aq-banner aq-banner-error', role: 'alert' },
+            h('span', undefined, this.decisionUi.error)
+          )
+        : null,
+      h(
+        'div',
+        { className: 'aq-form-grid', style: 'margin-top: 8px;' },
+        h(
+          'label',
+          { className: 'aq-field' },
+          h('span', { className: 'aq-field-label' }, 'API Tool'),
+          toolSelect
+        ),
+        h(
+          'label',
+          { className: 'aq-field' },
+          h('span', { className: 'aq-field-label' }, 'Decision model'),
+          modelInput
+        )
+      ),
+      h('div', { className: 'aq-actions' }, fetchModelsBtn, runSyntheticBtn),
+      adviceEl,
+      h(
+        'p',
+        { className: 'aq-note', style: 'margin-bottom: 0;' },
+        'Uses a fixed synthetic verification task in Rust. User prompts are never sent, and decision advice never triggers automatic approval or execution.'
+      )
+    );
+  }
+
+  private async handleFetchDecisionModels(
+    toolId: string,
+    provider: DecisionProvider
+  ): Promise<void> {
+    this.decisionUi.loadingModels = true;
+    this.decisionUi.error = null;
+    this.render();
+    try {
+      const models = await desktop_decision_models({ toolId, provider });
+      this.decisionUi.fetchedModels = models;
+      if (models[0]) {
+        this.decisionUi.selectedModel = models[0].model_arg;
+      }
+    } catch (err) {
+      this.decisionUi.error = formatAppError(
+        err,
+        'Failed to fetch decision models metadata.'
+      );
+    } finally {
+      this.decisionUi.loadingModels = false;
+      this.render();
+    }
+  }
+
+  private async handleRunSyntheticDecisionTest(
+    toolId: string,
+    provider: DecisionProvider,
+    model: string
+  ): Promise<void> {
+    this.decisionUi.runningTest = true;
+    this.decisionUi.error = null;
+    this.render();
+    try {
+      const advice = await desktop_test_decision({
+        toolId,
+        provider,
+        model: model.trim(),
+      });
+      this.decisionUi.advice = advice;
+    } catch (err) {
+      this.decisionUi.error = formatAppError(
+        err,
+        'Synthetic decision verification test failed.'
+      );
+    } finally {
+      this.decisionUi.runningTest = false;
+      this.render();
+    }
   }
 
   private buildSegmentControl<T extends string>(
@@ -1855,7 +2297,11 @@ class ThreadlaneDesktopApp {
         return;
       }
       if (action === 'refresh-snapshot') {
-        void this.triggerSnapshotPoll(true);
+        void this.triggerSnapshotPoll(true, false);
+        return;
+      }
+      if (action === 'refresh-registry') {
+        void this.refreshRegistry();
         return;
       }
       if (action === 'refresh-tools') {
@@ -1915,14 +2361,6 @@ class ThreadlaneDesktopApp {
       const selectBindingId = button.dataset.selectBinding;
       if (selectBindingId) {
         void this.handleSelectBinding(selectBindingId, true, 'binding-select');
-        return;
-      }
-
-      const toolId = button.dataset.toolId;
-      if (toolId) {
-        this.returnFocusKey = button.dataset.focus ?? `tool-${toolId}`;
-        this.state = { ...this.state, selectedToolId: toolId };
-        this.render('back');
         return;
       }
 

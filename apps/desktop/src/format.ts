@@ -1,11 +1,14 @@
 import {
   ACCENT_PALETTES,
   DEFAULT_APPEARANCE,
+  DEFAULT_EXECUTION_PREFERENCES,
+  EXECUTION_PREFERENCE_BOUNDS,
   type AccentName,
   type AppearancePreferences,
   type Attachment,
   type BindingSummary,
   type BrandKey,
+  type ExecutionPreferences,
   type QueueBucket,
   type RecordedProfileGroup,
   type SurfaceMode,
@@ -511,4 +514,77 @@ export function sanitizeAppearancePreferences(raw: unknown): AppearancePreferenc
   }
 
   return result;
+}
+
+const ALLOWED_EXECUTION_PREF_KEYS = new Set<string>([
+  'maxConcurrentWorkers',
+  'maxTasksPerPlan',
+  'workerTimeoutSecs',
+  'decisionBudgetTokens',
+  'redactPathsInLogs',
+  'requireExplicitPublish',
+]);
+
+function clampInt(value: unknown, min: number, max: number, fallback: number): number {
+  const num = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  if (!Number.isFinite(num)) {
+    return fallback;
+  }
+  return Math.round(Math.min(max, Math.max(min, num)));
+}
+
+export function sanitizeExecutionPreferences(raw: unknown): ExecutionPreferences {
+  const result: ExecutionPreferences = { ...DEFAULT_EXECUTION_PREFERENCES };
+  if (!raw || typeof raw !== 'object') {
+    return result;
+  }
+  const obj = raw as Record<string, unknown>;
+
+  result.maxConcurrentWorkers = clampInt(
+    obj.maxConcurrentWorkers,
+    EXECUTION_PREFERENCE_BOUNDS.maxConcurrentWorkers.min,
+    EXECUTION_PREFERENCE_BOUNDS.maxConcurrentWorkers.max,
+    DEFAULT_EXECUTION_PREFERENCES.maxConcurrentWorkers
+  );
+  result.maxTasksPerPlan = clampInt(
+    obj.maxTasksPerPlan,
+    EXECUTION_PREFERENCE_BOUNDS.maxTasksPerPlan.min,
+    EXECUTION_PREFERENCE_BOUNDS.maxTasksPerPlan.max,
+    DEFAULT_EXECUTION_PREFERENCES.maxTasksPerPlan
+  );
+  result.workerTimeoutSecs = clampInt(
+    obj.workerTimeoutSecs,
+    EXECUTION_PREFERENCE_BOUNDS.workerTimeoutSecs.min,
+    EXECUTION_PREFERENCE_BOUNDS.workerTimeoutSecs.max,
+    DEFAULT_EXECUTION_PREFERENCES.workerTimeoutSecs
+  );
+  result.decisionBudgetTokens = clampInt(
+    obj.decisionBudgetTokens,
+    EXECUTION_PREFERENCE_BOUNDS.decisionBudgetTokens.min,
+    EXECUTION_PREFERENCE_BOUNDS.decisionBudgetTokens.max,
+    DEFAULT_EXECUTION_PREFERENCES.decisionBudgetTokens
+  );
+
+  if (typeof obj.redactPathsInLogs === 'boolean') {
+    result.redactPathsInLogs = obj.redactPathsInLogs;
+  }
+  if (typeof obj.requireExplicitPublish === 'boolean') {
+    result.requireExplicitPublish = obj.requireExplicitPublish;
+  }
+
+  return result;
+}
+
+export function validateExecutionPreferencesInput(raw: unknown): {
+  prefs: ExecutionPreferences;
+  rejectedKeys: string[];
+} {
+  const prefs = sanitizeExecutionPreferences(raw);
+  if (!raw || typeof raw !== 'object') {
+    return { prefs, rejectedKeys: [] };
+  }
+  const rejectedKeys = Object.keys(raw as Record<string, unknown>).filter(
+    (key) => !ALLOWED_EXECUTION_PREF_KEYS.has(key)
+  );
+  return { prefs, rejectedKeys };
 }

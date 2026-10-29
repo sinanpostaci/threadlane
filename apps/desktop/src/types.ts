@@ -121,7 +121,7 @@ export interface DesktopWindowActionArgs {
   action: WindowAction;
 }
 
-export type NavPage = 'activity' | 'chats' | 'tools' | 'profiles' | 'settings';
+export type NavPage = 'activity' | 'chats' | 'plans' | 'tools' | 'profiles' | 'settings';
 export type DetailTab = 'overview' | 'prompt' | 'evidence';
 export type TaskProviderFilter = 'all' | 'opencode' | 'antigravity' | 'codex' | 'demo';
 
@@ -137,6 +137,31 @@ export interface AppearancePreferences {
   rememberStateDir: boolean;
   savedStateDir: string;
 }
+
+export interface ExecutionPreferences {
+  maxConcurrentWorkers: number;
+  maxTasksPerPlan: number;
+  workerTimeoutSecs: number;
+  decisionBudgetTokens: number;
+  redactPathsInLogs: boolean;
+  requireExplicitPublish: boolean;
+}
+
+export const EXECUTION_PREFERENCE_BOUNDS = {
+  maxConcurrentWorkers: { min: 1, max: 8 },
+  maxTasksPerPlan: { min: 1, max: 32 },
+  workerTimeoutSecs: { min: 30, max: 3600 },
+  decisionBudgetTokens: { min: 128, max: 8192 },
+} as const;
+
+export const DEFAULT_EXECUTION_PREFERENCES: ExecutionPreferences = {
+  maxConcurrentWorkers: 2,
+  maxTasksPerPlan: 8,
+  workerTimeoutSecs: 600,
+  decisionBudgetTokens: 1024,
+  redactPathsInLogs: true,
+  requireExplicitPublish: true,
+};
 
 export type BrandKey = 'openai' | 'opencode' | 'antigravity' | 'gemini' | 'deepseek' | 'demo' | 'generic';
 
