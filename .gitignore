@@ -20,3 +20,8 @@ supervisor.lock
 # Python operator harness bytecode
 __pycache__/
 *.py[cod]
+
+# Desktop frontend and standalone native build output
+/apps/desktop/node_modules/
+/apps/desktop/dist/
+/apps/desktop/src-tauri/target/
