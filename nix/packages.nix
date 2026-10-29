@@ -72,6 +72,7 @@ let
     inherit version;
     src = source;
     cargoRoot = "apps/desktop/src-tauri";
+    buildAndTestSubdir = "apps/desktop/src-tauri";
     cargoLock.lockFile = source + "/apps/desktop/src-tauri/Cargo.lock";
     cargoBuildFlags = [ "--locked" ];
     doCheck = false;

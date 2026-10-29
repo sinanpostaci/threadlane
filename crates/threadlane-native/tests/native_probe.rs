@@ -66,10 +66,7 @@ fn assert_no_secret_leaks(output: &Output, secrets: &[&str]) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     for secret in secrets {
-        assert!(
-            !secret.is_empty(),
-            "test secret to check must not be empty"
-        );
+        assert!(!secret.is_empty(), "test secret to check must not be empty");
         assert!(
             !stdout.contains(secret),
             "stdout leaked secret `{secret}`:\n{stdout}"
@@ -854,7 +851,10 @@ fi
     assert_eq!(report_2["distinct_epoch_ids"], true);
     assert_eq!(report_2["isolated_enrollment_observed"], true);
     assert_eq!(report_2["status_routing_verified"], true);
-    assert_eq!(report_2["per_call_binding_routing"], "status_binding_verified");
+    assert_eq!(
+        report_2["per_call_binding_routing"],
+        "status_binding_verified"
+    );
 
     let bnd_a = report_2["thread_a"]["created_binding_id"]
         .as_str()
@@ -879,8 +879,14 @@ fi
         report_2["thread_b"]["status_verified_binding_id"].as_str(),
         Some(bnd_b)
     );
-    assert_eq!(report_2["thread_a"]["binding_label"], "native-probe-thread-a");
-    assert_eq!(report_2["thread_b"]["binding_label"], "native-probe-thread-b");
+    assert_eq!(
+        report_2["thread_a"]["binding_label"],
+        "native-probe-thread-a"
+    );
+    assert_eq!(
+        report_2["thread_b"]["binding_label"],
+        "native-probe-thread-b"
+    );
 
     // Restart, busy-turn, and overall live gate must remain `needs_verification`.
     assert_eq!(report_2["two_chat_routing_gate"], "needs_verification");

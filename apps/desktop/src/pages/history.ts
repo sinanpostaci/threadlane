@@ -413,10 +413,10 @@ function renderEventDetailPanel(
     rows.push(['Cancel reason', event.payload.cancel_reason]);
   }
   rows.push([
-    'Data boundary',
+    'Source',
     event.payload.untrusted_data
-      ? 'untrusted_data: true (plain-text display only)'
-      : 'trusted metadata',
+      ? 'Agent output'
+      : 'System event',
   ]);
 
   let detailActions: HTMLElement | null = null;
@@ -480,7 +480,7 @@ export function renderActivityHistorySection(
     history.runIdDraft.trim() !== (history.runIdFilter ?? '');
 
   const headerBadgeText = history.hasLoadedOnce
-    ? `hwm #${history.highWaterMarkSeq} · ${history.events.length}${history.hasMore ? '+' : ''}`
+    ? `${history.events.length}${history.hasMore ? '+' : ''} events`
     : 'read-only';
 
   const toggleBtn = h(
@@ -633,7 +633,7 @@ export function renderActivityHistorySection(
       h(
         'span',
         { className: 'aq-history-status-meta' },
-        `hwm #${history.highWaterMarkSeq} · has_more: ${history.hasMore ? 'yes' : 'no'} · ${history.events.length}/${MAX_RETAINED_HISTORY_EVENTS}`
+        `${history.events.length} events${history.hasMore ? ' · More available' : ''}`
       ),
       h(
         'div',
@@ -653,7 +653,7 @@ export function renderActivityHistorySection(
         className: 'aq-history-notice aq-history-notice--warn',
         'data-history-bridge-disconnected': 'true',
       },
-      'bridge_disconnected: Tauri desktop bridge is not connected in this browser window. Launch inside Threadlane desktop or use DEV ?preview=1.'
+      'Open Threadlane desktop to connect to your activity history.'
     );
   } else if (attachment.connection !== 'connected' || !selectedBindingId) {
     bodyNode = h(
@@ -667,8 +667,8 @@ export function renderActivityHistorySection(
     const emptyText = history.inFlight
       ? 'Loading bounded activity history…'
       : hasActiveFilters
-        ? `No activity events matched filters (high-water #${history.highWaterMarkSeq}).`
-        : `No activity events recorded for this binding (high-water #${history.highWaterMarkSeq}).`;
+        ? 'No events match these filters.'
+        : 'No activity recorded for this chat yet.';
     bodyNode = h('div', { className: 'aq-history-empty' }, emptyText);
   } else {
     bodyNode = h(

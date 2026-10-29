@@ -540,7 +540,9 @@ async fn test_list_activity_mcp_256kib_wire_budget_splits_pages_without_truncati
         );
 
         let page_data = &resp["result"]["structuredContent"]["data"];
-        let high_water = page_data["high_water_mark_seq"].as_u64().expect("high water");
+        let high_water = page_data["high_water_mark_seq"]
+            .as_u64()
+            .expect("high water");
         assert_eq!(*anchored_high_water.get_or_insert(high_water), high_water);
         let page_events = page_data["events"].as_array().expect("events array");
         assert!(!page_events.is_empty());

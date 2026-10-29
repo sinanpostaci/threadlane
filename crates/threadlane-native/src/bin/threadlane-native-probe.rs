@@ -882,11 +882,8 @@ fn parse_connection_identity_result(
         }
     };
 
-    let clean_nonce = validate_bounded_identifier(
-        &identity.connection_nonce,
-        "connection_nonce",
-        MAX_ID_CHARS,
-    )?;
+    let clean_nonce =
+        validate_bounded_identifier(&identity.connection_nonce, "connection_nonce", MAX_ID_CHARS)?;
     let clean_epoch = validate_bounded_identifier(&identity.epoch_id, "epoch_id", MAX_ID_CHARS)?;
     if identity.server_pid == 0 {
         return Err(NativeError::new(
