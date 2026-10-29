@@ -572,6 +572,7 @@ export class ProfilesPage {
   private disposed = false;
   private focusTimer: ReturnType<typeof setTimeout> | null = null;
   private reloadGeneration = 0;
+  private overridesOpen = new Set<string>();
 
   constructor(onRegistryChanged: () => void) {
     this.onRegistryChanged = onRegistryChanged;
@@ -606,6 +607,7 @@ export class ProfilesPage {
     this.snapshot = null;
     this.index = null;
     this.draft = null;
+    this.overridesOpen.clear();
   }
 
   private build(snapshot: RegistrySnapshot): HTMLElement {
@@ -1127,6 +1129,38 @@ export class ProfilesPage {
     busy: boolean
   ): HTMLElement {
     const state = roleState(analysis, draft.assignments, role);
+    const overrideCount = DIFFICULTIES.filter(
+      (slot) => draft.assignments[role][slot].model_id
+    ).length;
+    const overrides = h('details', {
+      class: 'aq-profiles-overrides',
+    }) as HTMLDetailsElement;
+    overrides.open = this.overridesOpen.has(role);
+    overrides.append(
+      h(
+        'summary',
+        { class: 'aq-profiles-overrides-summary' },
+        h('span', {}, 'Difficulty overrides'),
+        h(
+          'span',
+          {
+            class: 'aq-profiles-overrides-count',
+            'data-override-count': role,
+            'data-tone': overrideCount > 0 ? 'accent' : 'muted',
+          },
+          `${overrideCount} assigned`
+        )
+      ),
+      h(
+        'div',
+        { class: 'aq-profiles-overrides-body' },
+        ...DIFFICULTIES.map((slot) => this.buildChoiceRow(role, slot, busy))
+      )
+    );
+    overrides.addEventListener('toggle', () => {
+      if (overrides.open) this.overridesOpen.add(role);
+      else this.overridesOpen.delete(role);
+    });
     return h(
       'fieldset',
       {
@@ -1148,7 +1182,8 @@ export class ProfilesPage {
           state.label
         )
       ),
-      ...SLOTS.map((slot) => this.buildChoiceRow(role, slot, busy))
+      this.buildChoiceRow(role, 'default', busy),
+      overrides
     );
   }
 
@@ -1380,6 +1415,10 @@ export class ProfilesPage {
 
     for (const role of ROLES) {
       const state = roleState(analysis, this.draft.assignments, role);
+      const assignments = this.draft.assignments;
+      const overrideCount = DIFFICULTIES.filter(
+        (slot) => assignments[role][slot].model_id
+      ).length;
       const fieldset = this.root.querySelector<HTMLElement>(
         `[data-profile-role="${role}"]`
       );
@@ -1392,6 +1431,13 @@ export class ProfilesPage {
       if (badge) {
         badge.dataset.tone = state.tone;
         badge.textContent = state.label;
+      }
+      const count = this.root.querySelector<HTMLElement>(
+        `[data-override-count="${role}"]`
+      );
+      if (count) {
+        count.textContent = `${overrideCount} assigned`;
+        count.dataset.tone = overrideCount > 0 ? 'accent' : 'muted';
       }
     }
   }
@@ -1518,6 +1564,7 @@ export class ProfilesPage {
     this.notice = null;
     this.error = null;
     this.conflict = false;
+    this.overridesOpen.clear();
   }
 
   private cancelDraft(): void {

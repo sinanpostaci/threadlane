@@ -395,6 +395,7 @@ export class ToolsPage {
   private secrets = new Map<string, SecretState>();
   private apiStates = new Map<string, ApiState>();
   private selections = new Map<string, Set<string>>();
+  private expanded = new Set<string>();
   private deleteConfirm: { kind: 'tool' | 'model'; id: string } | null = null;
 
   constructor(onRegistryChanged: () => void) {
@@ -436,6 +437,7 @@ export class ToolsPage {
     this.secrets.clear();
     this.apiStates.clear();
     this.selections.clear();
+    this.expanded.clear();
     this.deleteConfirm = null;
     this.snapshot = null;
     this.renderedRevision = null;
@@ -450,6 +452,12 @@ export class ToolsPage {
 
   private refresh(): void {
     if (!this.disposed) this.rewrite();
+  }
+
+  private toggleExpanded(key: string): void {
+    if (this.expanded.has(key)) this.expanded.delete(key);
+    else this.expanded.add(key);
+    this.refresh();
   }
 
   private rewrite(): void {
@@ -474,22 +482,8 @@ export class ToolsPage {
   private build(snapshot: RegistrySnapshot): Node[] {
     const nodes: Node[] = [this.buildHeader(snapshot)];
     if (this.notice) nodes.push(this.buildNotice(this.notice));
-    nodes.push(
-      h(
-        'p',
-        { className: 'aq-note aq-tools-guidance' },
-        'Saves use a registry revision check. Nothing is probed, imported, or sent until you choose an action. PATH discovery, CLI login state, credential status, and catalog metadata are separate from entitlement.'
-      )
-    );
     nodes.push(this.buildTools(snapshot));
     nodes.push(this.buildModels(snapshot));
-    nodes.push(
-      h(
-        'p',
-        { className: 'aq-note aq-tools-footer' },
-        'Deleting a referenced tool or model is rejected here and by the Rust registry. Revision 0 starts with no implicit model defaults.'
-      )
-    );
     return nodes;
   }
 
@@ -505,7 +499,7 @@ export class ToolsPage {
         h(
           'p',
           { className: 'aq-note' },
-          'Configure adapters, executable paths, manual model/effort entries, and explicit catalog imports. Editing preferences here does not change running jobs.'
+          'Configure adapters, executable paths, and manual model efforts. Registry actions are explicit and do not change running jobs.'
         )
       ),
       h(
@@ -594,6 +588,9 @@ export class ToolsPage {
     const draft = this.newTool;
     const duplicate =
       draft.id.trim() !== '' && snapshot.tools.some((tool) => tool.id === draft.id.trim());
+    const key = 'create-tool';
+    const open = this.expanded.has(key);
+    const bodyId = `${this.pageId}-create-tool-body`;
     const id = this.input('new-tool-id', draft.id, 'unique-tool-id');
     const label = this.input('new-tool-label', draft.label, 'Display label');
     const adapter = this.adapterSelect('new-tool-adapter', draft.adapter, (value) => {
@@ -622,48 +619,71 @@ export class ToolsPage {
       draft.enabled = enabled.checked;
       draft.dirty = true;
     });
+    const toggle = this.button(
+      open ? 'Hide form' : 'Add tool',
+      () => this.toggleExpanded(key),
+      'toggle-create-tool'
+    );
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-controls', bodyId);
+    toggle.setAttribute('aria-label', open ? 'Hide add tool form' : 'Show add tool form');
     return h(
       'div',
       {
-        className: 'aq-tools-form aq-tools-create',
+        className: `aq-tools-form aq-tools-create${open ? '' : ' aq-tools-create-collapsed'}`,
         role: 'group',
         'aria-labelledby': `${this.pageId}-add-tool`,
       },
       h(
         'div',
         { className: 'aq-tools-form-head' },
-        h('h4', { id: `${this.pageId}-add-tool` }, 'Add tool'),
         h(
-          'p',
-          { className: 'aq-note' },
-          'ID and label are required. The executable path is optional and is never executed by the registry.'
-        )
-      ),
-      h(
-        'div',
-        { className: 'aq-tools-form-grid' },
-        this.field('Tool ID', id, 'Unique registry key. Existing IDs are not overwritten here.'),
-        this.field('Label', label),
-        this.field('Adapter', adapter, 'API adapters use the Rust vault and never spawn a CLI.'),
-        this.field(
-          'Executable path',
-          executable,
-          'Optional absolute path for custom tools. PATH discovery is explicit.'
+          'div',
+          { className: 'aq-tools-create-heading' },
+          h('h4', { id: `${this.pageId}-add-tool` }, 'Add tool'),
+          open
+            ? h(
+                'p',
+                { className: 'aq-note' },
+                'ID and label are required. The executable path is optional and is never executed by the registry.'
+              )
+            : null
         ),
-        this.checkField('Enabled for profiles', enabled)
+        toggle
       ),
-      duplicate ? h('p', { className: 'aq-tools-inline-error' }, 'This tool ID already exists.') : null,
-      h(
-        'div',
-        { className: 'aq-tools-actions' },
-        this.button(
-          this.pending.has('tool-create') ? 'Adding…' : 'Add tool',
-          () => void this.createTool(),
-          'new-tool-submit',
-          'primary',
-          this.pending.has('tool-create')
-        )
-      )
+      open
+        ? h(
+            'div',
+            { className: 'aq-tools-create-body', id: bodyId },
+            h(
+              'div',
+              { className: 'aq-tools-form-grid' },
+              this.field('Tool ID', id, 'Unique registry key. Existing IDs are not overwritten here.'),
+              this.field('Label', label),
+              this.field('Adapter', adapter, 'API adapters use the Rust vault and never spawn a CLI.'),
+              this.field(
+                'Executable path',
+                executable,
+                'Optional absolute path for custom tools. PATH discovery is explicit.'
+              ),
+              this.checkField('Enabled for profiles', enabled)
+            ),
+            duplicate
+              ? h('p', { className: 'aq-tools-inline-error' }, 'This tool ID already exists.')
+              : null,
+            h(
+              'div',
+              { className: 'aq-tools-actions' },
+              this.button(
+                this.pending.has('tool-create') ? 'Adding…' : 'Add tool',
+                () => void this.createTool(),
+                'new-tool-submit',
+                'primary',
+                this.pending.has('tool-create')
+              )
+            )
+          )
+        : null
     );
   }
 
@@ -675,6 +695,9 @@ export class ToolsPage {
     const using = snapshot.models.filter((model) => model.tool_id === tool.id);
     const deleting = this.pending.has(`tool-delete:${tool.id}`);
     const confirming = this.deleteConfirm?.kind === 'tool' && this.deleteConfirm?.id === tool.id;
+    const cardKey = `tool:${tool.id}`;
+    const open = this.expanded.has(cardKey);
+    const bodyId = `${this.pageId}-tool-${token(tool.id)}-body`;
     const label = this.input(`tool-${tool.id}-label`, draft.label, 'Display label');
     const adapter = this.adapterSelect(`tool-${tool.id}-adapter`, draft.adapter, (value) => {
       draft.adapter = value;
@@ -700,6 +723,14 @@ export class ToolsPage {
     });
     const saveDisabled =
       this.pending.has(`tool-save:${tool.id}`) || (draft.conflict && !draft.overwrite);
+    const toggle = this.button(
+      open ? 'Close' : 'Details',
+      () => this.toggleExpanded(cardKey),
+      `tool-${tool.id}-details`
+    );
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-controls', bodyId);
+    toggle.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} details for ${tool.label}`);
     return h(
       'article',
       { className: `aq-tools-card${tool.enabled ? '' : ' aq-tools-card-disabled'}` },
@@ -715,127 +746,137 @@ export class ToolsPage {
         ),
         h(
           'div',
-          { className: 'aq-tools-badges' },
+          { className: 'aq-tools-card-controls' },
           h(
-            'span',
-            { className: 'aq-badge', 'data-status': tool.enabled ? 'active' : 'warn' },
-            tool.enabled ? 'Enabled' : 'Disabled'
+            'div',
+            { className: 'aq-tools-badges' },
+            h(
+              'span',
+              { className: 'aq-badge', 'data-status': tool.enabled ? 'active' : 'warn' },
+              tool.enabled ? 'Enabled' : 'Disabled'
+            ),
+            h('span', { className: 'aq-badge' }, ADAPTER_LABELS[tool.adapter]),
+            changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null
           ),
-          h('span', { className: 'aq-badge' }, ADAPTER_LABELS[tool.adapter]),
-          provider ? h('span', { className: 'aq-badge' }, 'API adapter') : null,
-          changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null
+          toggle
         )
       ),
-      h(
-        'div',
-        { className: 'aq-tools-form-grid aq-tools-edit-grid' },
-        this.field('Label', label),
-        this.field('Adapter', adapter),
-        this.field(
-          'Executable path',
-          executable,
-          'Custom path applies to this tool only. Save before probing a changed path.'
-        ),
-        this.checkField('Enabled for profiles', enabled)
-      ),
-      this.conflictBlock(
-        draft,
-        () => {
-          this.toolDrafts.delete(tool.id);
-          this.refresh();
-        },
-        `tool-${tool.id}-conflict`
-      ),
-      h(
-        'div',
-        { className: 'aq-tools-actions aq-tools-card-actions' },
-        this.button(
-          this.pending.has(`tool-save:${tool.id}`)
-            ? 'Saving…'
-            : draft.conflict && draft.overwrite
-              ? 'Overwrite tool'
-              : 'Save changes',
-          () => void this.saveTool(tool),
-          `tool-${tool.id}-save`,
-          draft.conflict && draft.overwrite ? 'danger' : 'primary',
-          saveDisabled
-        ),
-        this.button(
-          'Discard draft',
-          () => {
-            this.toolDrafts.delete(tool.id);
-            this.refresh();
-          },
-          `tool-${tool.id}-discard`,
-          undefined,
-          this.pending.has(`tool-save:${tool.id}`)
-        ),
-        provider === null
-          ? this.button(
-              this.pending.has(`probe:${tool.id}`) ? 'Probing…' : 'Probe saved tool',
-              () => void this.probe(tool),
-              `tool-${tool.id}-probe`,
-              undefined,
-              this.pending.has(`probe:${tool.id}`)
-            )
-          : null,
-        using.length > 0
-          ? h(
-              'span',
-              { className: 'aq-tools-hint aq-tools-delete-note' },
-              `Delete ${using.length} model${using.length === 1 ? '' : 's'} first.`
-            )
-          : confirming
-            ? h(
-                'span',
-                { className: 'aq-tools-delete-confirm' },
-                h('span', undefined, `Delete ${tool.label}?`),
-                provider
-                  ? h(
-                      'span',
-                      { className: 'aq-tools-hint' },
-                      'The OS vault credential is not removed by tool deletion.'
-                    )
-                  : null,
-                this.button(
-                  deleting ? 'Deleting…' : 'Confirm delete',
-                  () => void this.deleteTool(tool),
-                  `tool-${tool.id}-confirm-delete`,
-                  'danger',
-                  deleting
-                ),
-                this.button(
-                  'Cancel',
-                  () => {
-                    this.deleteConfirm = null;
-                    this.refresh();
-                  },
-                  `tool-${tool.id}-cancel-delete`
-                )
-              )
-            : this.button(
-                'Delete tool',
+      open
+        ? h(
+            'div',
+            { className: 'aq-tools-card-body', id: bodyId },
+            h(
+              'div',
+              { className: 'aq-tools-form-grid aq-tools-edit-grid' },
+              this.field('Label', label),
+              this.field('Adapter', adapter),
+              this.field(
+                'Executable path',
+                executable,
+                'Custom path applies to this tool only. Save before probing a changed path.'
+              ),
+              this.checkField('Enabled for profiles', enabled)
+            ),
+            this.conflictBlock(
+              draft,
+              () => {
+                this.toolDrafts.delete(tool.id);
+                this.refresh();
+              },
+              `tool-${tool.id}-conflict`
+            ),
+            h(
+              'div',
+              { className: 'aq-tools-actions aq-tools-card-actions' },
+              this.button(
+                this.pending.has(`tool-save:${tool.id}`)
+                  ? 'Saving…'
+                  : draft.conflict && draft.overwrite
+                    ? 'Overwrite tool'
+                    : 'Save changes',
+                () => void this.saveTool(tool),
+                `tool-${tool.id}-save`,
+                draft.conflict && draft.overwrite ? 'danger' : 'primary',
+                saveDisabled
+              ),
+              this.button(
+                'Discard draft',
                 () => {
-                  this.deleteConfirm = { kind: 'tool', id: tool.id };
+                  this.toolDrafts.delete(tool.id);
                   this.refresh();
                 },
-                `tool-${tool.id}-delete`,
-                'danger',
-                deleting
-              )
-      ),
-      h(
-        'p',
-        { className: 'aq-tools-hint' },
-        changed
-          ? 'Draft changes are not used by probing or API controls until saved.'
-          : provider === null
-            ? 'Probe uses the saved tool definition. A found executable is not login or subscription proof.'
-            : 'API adapters never spawn a CLI. Credential and synthetic controls use the saved tool definition.'
-      ),
-      this.buildStatus(provider, probe),
-      provider === null ? this.buildProbe(tool, probe) : null,
-      provider ? this.buildApi(tool, provider) : null
+                `tool-${tool.id}-discard`,
+                undefined,
+                this.pending.has(`tool-save:${tool.id}`)
+              ),
+              provider === null
+                ? this.button(
+                    this.pending.has(`probe:${tool.id}`) ? 'Probing…' : 'Probe saved tool',
+                    () => void this.probe(tool),
+                    `tool-${tool.id}-probe`,
+                    undefined,
+                    this.pending.has(`probe:${tool.id}`)
+                  )
+                : null,
+              using.length > 0
+                ? h(
+                    'span',
+                    { className: 'aq-tools-hint aq-tools-delete-note' },
+                    `Delete ${using.length} model${using.length === 1 ? '' : 's'} first.`
+                  )
+                : confirming
+                  ? h(
+                      'span',
+                      { className: 'aq-tools-delete-confirm' },
+                      h('span', undefined, `Delete ${tool.label}?`),
+                      provider
+                        ? h(
+                            'span',
+                            { className: 'aq-tools-hint' },
+                            'The OS vault credential is not removed by tool deletion.'
+                          )
+                        : null,
+                      this.button(
+                        deleting ? 'Deleting…' : 'Confirm delete',
+                        () => void this.deleteTool(tool),
+                        `tool-${tool.id}-confirm-delete`,
+                        'danger',
+                        deleting
+                      ),
+                      this.button(
+                        'Cancel',
+                        () => {
+                          this.deleteConfirm = null;
+                          this.refresh();
+                        },
+                        `tool-${tool.id}-cancel-delete`
+                      )
+                    )
+                  : this.button(
+                      'Delete tool',
+                      () => {
+                        this.deleteConfirm = { kind: 'tool', id: tool.id };
+                        this.refresh();
+                      },
+                      `tool-${tool.id}-delete`,
+                      'danger',
+                      deleting
+                    )
+            ),
+            h(
+              'p',
+              { className: 'aq-tools-hint' },
+              changed
+                ? 'Draft changes are not used by probing or API controls until saved.'
+                : provider === null
+                  ? 'Probe uses the saved tool definition. A found executable is not login or subscription proof.'
+                  : 'API adapters never spawn a CLI. Credential and synthetic controls use the saved tool definition.'
+            ),
+            this.buildStatus(provider, probe),
+            provider === null ? this.buildProbe(tool, probe) : null,
+            provider ? this.buildApi(tool, provider) : null
+          )
+        : null
     );
   }
 
@@ -1241,6 +1282,9 @@ export class ToolsPage {
 
   private buildCreateModel(snapshot: RegistrySnapshot): HTMLElement {
     const draft = this.newModel;
+    const key = 'create-model';
+    const open = this.expanded.has(key);
+    const bodyId = `${this.pageId}-create-model-body`;
     const tool = this.toolSelect('new-model-tool', draft.toolId, (value) => {
       draft.toolId = value;
       draft.dirty = true;
@@ -1273,49 +1317,84 @@ export class ToolsPage {
     const duplicate =
       draft.id.trim() !== '' && snapshot.models.some((model) => model.id === draft.id.trim());
     const noTools = snapshot.tools.length === 0;
+    const toggle = this.button(
+      open ? 'Hide form' : 'Add manual model',
+      () => this.toggleExpanded(key),
+      'toggle-create-model'
+    );
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-controls', bodyId);
+    toggle.setAttribute('aria-label', open ? 'Hide add model form' : 'Show add model form');
     return h(
       'div',
       {
-        className: 'aq-tools-form aq-tools-create',
+        className: `aq-tools-form aq-tools-create${open ? '' : ' aq-tools-create-collapsed'}`,
         role: 'group',
         'aria-labelledby': `${this.pageId}-add-model`,
       },
       h(
         'div',
         { className: 'aq-tools-form-head' },
-        h('h4', { id: `${this.pageId}-add-model` }, 'Add manual model'),
         h(
-          'p',
-          { className: 'aq-note' },
-          'Efforts are entered manually. Do not add an effort the provider may not support; catalog metadata is not verification.'
-        )
-      ),
-      h(
-        'div',
-        { className: 'aq-tools-form-grid' },
-        this.field('Tool', tool, noTools ? 'Add a tool before creating a model.' : undefined),
-        this.field('Model ID', id, 'Unique registry key. Existing IDs are not overwritten by this form.'),
-        this.field('Label', label),
-        this.field('Model arg', arg, 'Exact provider argument passed to the adapter when selected.'),
-        this.field(
-          'Efforts',
-          efforts,
-          'Comma or space separated manual entries. Leave empty only if this model should be saved without effort metadata.'
+          'div',
+          { className: 'aq-tools-create-heading' },
+          h('h4', { id: `${this.pageId}-add-model` }, 'Add manual model'),
+          open
+            ? h(
+                'p',
+                { className: 'aq-note' },
+                'Efforts are entered manually. Do not add an effort the provider may not support; catalog metadata is not verification.'
+              )
+            : null
         ),
-        this.checkField('Allow selection without effort', allow, 'This does not imply any specific effort is supported.')
+        toggle
       ),
-      duplicate ? h('p', { className: 'aq-tools-inline-error' }, 'This model ID already exists.') : null,
-      h(
-        'div',
-        { className: 'aq-tools-actions' },
-        this.button(
-          this.pending.has('model-create') ? 'Adding…' : 'Add model',
-          () => void this.createModel(),
-          'new-model-submit',
-          'primary',
-          noTools || this.pending.has('model-create')
-        )
-      )
+      open
+        ? h(
+            'div',
+            { className: 'aq-tools-create-body', id: bodyId },
+            h(
+              'div',
+              { className: 'aq-tools-form-grid' },
+              this.field('Tool', tool, noTools ? 'Add a tool before creating a model.' : undefined),
+              this.field(
+                'Model ID',
+                id,
+                'Unique registry key. Existing IDs are not overwritten by this form.'
+              ),
+              this.field('Label', label),
+              this.field(
+                'Model arg',
+                arg,
+                'Exact provider argument passed to the adapter when selected.'
+              ),
+              this.field(
+                'Efforts',
+                efforts,
+                'Comma or space separated manual entries. Leave empty only if this model should be saved without effort metadata.'
+              ),
+              this.checkField(
+                'Allow selection without effort',
+                allow,
+                'This does not imply any specific effort is supported.'
+              )
+            ),
+            duplicate
+              ? h('p', { className: 'aq-tools-inline-error' }, 'This model ID already exists.')
+              : null,
+            h(
+              'div',
+              { className: 'aq-tools-actions' },
+              this.button(
+                this.pending.has('model-create') ? 'Adding…' : 'Add model',
+                () => void this.createModel(),
+                'new-model-submit',
+                'primary',
+                noTools || this.pending.has('model-create')
+              )
+            )
+          )
+        : null
     );
   }
 
@@ -1326,6 +1405,10 @@ export class ToolsPage {
     const references = hasProfileReference(snapshot, model.id);
     const deleting = this.pending.has(`model-delete:${model.id}`);
     const confirming = this.deleteConfirm?.kind === 'model' && this.deleteConfirm?.id === model.id;
+    const modelTool = snapshot.tools.find((entry) => entry.id === model.tool_id) ?? null;
+    const cardKey = `model:${model.id}`;
+    const open = this.expanded.has(cardKey);
+    const bodyId = `${this.pageId}-model-${token(model.id)}-body`;
     const tool = this.toolSelect(`model-${model.id}-tool`, draft.toolId, (value) => {
       draft.toolId = value;
       draft.dirty = true;
@@ -1350,12 +1433,21 @@ export class ToolsPage {
       draft.allowNoEffort = allow.checked;
       draft.dirty = true;
     });
+    const toggle = this.button(
+      open ? 'Close' : 'Details',
+      () => this.toggleExpanded(cardKey),
+      `model-${model.id}-details`
+    );
+    toggle.setAttribute('aria-expanded', String(open));
+    toggle.setAttribute('aria-controls', bodyId);
+    toggle.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} details for ${model.label}`);
     return h(
       'article',
       { className: 'aq-tools-card aq-tools-model-card' },
       h(
         'div',
         { className: 'aq-tools-model-head' },
+        createBrandIconElement(modelTool ? brandFor(modelTool.adapter) : 'generic'),
         h(
           'div',
           { className: 'aq-tools-tool-title' },
@@ -1364,102 +1456,120 @@ export class ToolsPage {
           h(
             'span',
             { className: 'aq-tools-hint' },
-            `${snapshot.tools.find((entry) => entry.id === model.tool_id)?.label ?? 'Missing tool'} · ${model.model_arg} · ${effortText(model)}`
+            modelTool?.label ?? 'Missing tool'
           )
         ),
         h(
           'div',
-          { className: 'aq-tools-badges' },
-          h('span', { className: 'aq-badge' }, model.tool_id),
-          changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null,
-          references ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Referenced') : null
+          { className: 'aq-tools-card-controls' },
+          h(
+            'div',
+            { className: 'aq-tools-badges' },
+            modelTool ? h('span', { className: 'aq-badge' }, ADAPTER_LABELS[modelTool.adapter]) : null,
+            changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null,
+            references ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Referenced') : null
+          ),
+          toggle
         )
       ),
-      h(
-        'div',
-        { className: 'aq-tools-form-grid aq-tools-edit-grid' },
-        this.field(
-          'Tool',
-          tool,
-          toolMissing ? 'The referenced tool is missing. Choose a current tool or discard.' : undefined
-        ),
-        this.field('Label', label),
-        this.field('Model arg', arg),
-        this.field('Efforts', efforts, 'Manual entries only. No effort is inferred from a model name.'),
-        this.checkField('Allow selection without effort', allow)
-      ),
-      this.conflictBlock(
-        draft,
-        () => {
-          this.modelDrafts.delete(model.id);
-          this.refresh();
-        },
-        `model-${model.id}-conflict`
-      ),
-      h(
-        'div',
-        { className: 'aq-tools-actions aq-tools-card-actions' },
-        this.button(
-          this.pending.has(`model-save:${model.id}`)
-            ? 'Saving…'
-            : draft.conflict && draft.overwrite
-              ? 'Overwrite model'
-              : 'Save changes',
-          () => void this.saveModel(model),
-          `model-${model.id}-save`,
-          draft.conflict && draft.overwrite ? 'danger' : 'primary',
-          toolMissing ||
-            this.pending.has(`model-save:${model.id}`) ||
-            (draft.conflict && !draft.overwrite)
-        ),
-        this.button(
-          'Discard draft',
-          () => {
-            this.modelDrafts.delete(model.id);
-            this.refresh();
-          },
-          `model-${model.id}-discard`,
-          undefined,
-          this.pending.has(`model-save:${model.id}`)
-        ),
-        references
-          ? h(
-              'span',
-              { className: 'aq-tools-hint aq-tools-delete-note' },
-              'Referenced by a workflow profile; remove those assignments first.'
-            )
-          : confirming
-            ? h(
-                'span',
-                { className: 'aq-tools-delete-confirm' },
-                h('span', undefined, `Delete ${model.label}?`),
-                this.button(
-                  deleting ? 'Deleting…' : 'Confirm delete',
-                  () => void this.deleteModel(model),
-                  `model-${model.id}-confirm-delete`,
-                  'danger',
-                  deleting
-                ),
-                this.button(
-                  'Cancel',
-                  () => {
-                    this.deleteConfirm = null;
-                    this.refresh();
-                  },
-                  `model-${model.id}-cancel-delete`
-                )
-              )
-            : this.button(
-                'Delete model',
+      open
+        ? h(
+            'div',
+            { className: 'aq-tools-card-body', id: bodyId },
+            h(
+              'p',
+              { className: 'aq-tools-hint' },
+              `Model arg: ${safeText(model.model_arg, 'missing')} · ${effortText(model)}`
+            ),
+            h(
+              'div',
+              { className: 'aq-tools-form-grid aq-tools-edit-grid' },
+              this.field(
+                'Tool',
+                tool,
+                toolMissing
+                  ? 'The referenced tool is missing. Choose a current tool or discard.'
+                  : undefined
+              ),
+              this.field('Label', label),
+              this.field('Model arg', arg),
+              this.field('Efforts', efforts, 'Manual entries only. No effort is inferred from a model name.'),
+              this.checkField('Allow selection without effort', allow)
+            ),
+            this.conflictBlock(
+              draft,
+              () => {
+                this.modelDrafts.delete(model.id);
+                this.refresh();
+              },
+              `model-${model.id}-conflict`
+            ),
+            h(
+              'div',
+              { className: 'aq-tools-actions aq-tools-card-actions' },
+              this.button(
+                this.pending.has(`model-save:${model.id}`)
+                  ? 'Saving…'
+                  : draft.conflict && draft.overwrite
+                    ? 'Overwrite model'
+                    : 'Save changes',
+                () => void this.saveModel(model),
+                `model-${model.id}-save`,
+                draft.conflict && draft.overwrite ? 'danger' : 'primary',
+                toolMissing ||
+                  this.pending.has(`model-save:${model.id}`) ||
+                  (draft.conflict && !draft.overwrite)
+              ),
+              this.button(
+                'Discard draft',
                 () => {
-                  this.deleteConfirm = { kind: 'model', id: model.id };
+                  this.modelDrafts.delete(model.id);
                   this.refresh();
                 },
-                `model-${model.id}-delete`,
-                'danger',
-                deleting
-              )
-      )
+                `model-${model.id}-discard`,
+                undefined,
+                this.pending.has(`model-save:${model.id}`)
+              ),
+              references
+                ? h(
+                    'span',
+                    { className: 'aq-tools-hint aq-tools-delete-note' },
+                    'Referenced by a workflow profile; remove those assignments first.'
+                  )
+                : confirming
+                  ? h(
+                      'span',
+                      { className: 'aq-tools-delete-confirm' },
+                      h('span', undefined, `Delete ${model.label}?`),
+                      this.button(
+                        deleting ? 'Deleting…' : 'Confirm delete',
+                        () => void this.deleteModel(model),
+                        `model-${model.id}-confirm-delete`,
+                        'danger',
+                        deleting
+                      ),
+                      this.button(
+                        'Cancel',
+                        () => {
+                          this.deleteConfirm = null;
+                          this.refresh();
+                        },
+                        `model-${model.id}-cancel-delete`
+                      )
+                    )
+                  : this.button(
+                      'Delete model',
+                      () => {
+                        this.deleteConfirm = { kind: 'model', id: model.id };
+                        this.refresh();
+                      },
+                      `model-${model.id}-delete`,
+                      'danger',
+                      deleting
+                    )
+            )
+          )
+        : null
     );
   }
 
@@ -1709,6 +1819,7 @@ export class ToolsPage {
     if (existing.dirty && existing.baseRevision !== revision && !existing.conflict) {
       existing.conflict = true;
       existing.overwrite = false;
+      this.expanded.add(`tool:${tool.id}`);
     }
     return existing;
   }
@@ -1728,6 +1839,7 @@ export class ToolsPage {
     if (existing.dirty && existing.baseRevision !== revision && !existing.conflict) {
       existing.conflict = true;
       existing.overwrite = false;
+      this.expanded.add(`model:${model.id}`);
     }
     return existing;
   }
@@ -1893,6 +2005,7 @@ export class ToolsPage {
         if (isConflict(error)) {
           draft.conflict = true;
           draft.overwrite = false;
+          this.expanded.add(`tool:${tool.id}`);
         }
       }
     );
@@ -1937,7 +2050,10 @@ export class ToolsPage {
         this.selections.set(`probe:${tool.id}`, new Set());
       }
     } catch (err) {
-      if (!this.disposed) state.error = safeError(err);
+      if (!this.disposed) {
+        state.error = safeError(err);
+        this.expanded.add(`tool:${tool.id}`);
+      }
     } finally {
       if (!this.disposed) {
         state.loading = false;
@@ -2017,6 +2133,7 @@ export class ToolsPage {
         if (isConflict(error)) {
           draft.conflict = true;
           draft.overwrite = false;
+          this.expanded.add(`model:${model.id}`);
         }
       }
     );
@@ -2059,7 +2176,10 @@ export class ToolsPage {
       const status = await desktop_secret_status({ toolId });
       if (!this.disposed) state.status = safeText(status, 'Unknown');
     } catch (err) {
-      if (!this.disposed) state.error = safeError(err);
+      if (!this.disposed) {
+        state.error = safeError(err);
+        this.expanded.add(`tool:${toolId}`);
+      }
     } finally {
       if (!this.disposed) {
         state.loading = false;
@@ -2109,10 +2229,16 @@ export class ToolsPage {
           state.error = null;
         }
       } catch (err) {
-        if (!this.disposed) state.error = safeError(err);
+        if (!this.disposed) {
+          state.error = safeError(err);
+          this.expanded.add(`tool:${tool.id}`);
+        }
       }
     } catch (err) {
-      if (!this.disposed) state.error = safeError(err);
+      if (!this.disposed) {
+        state.error = safeError(err);
+        this.expanded.add(`tool:${tool.id}`);
+      }
     } finally {
       secret = '';
       if (!this.disposed) {
@@ -2156,10 +2282,16 @@ export class ToolsPage {
           state.error = null;
         }
       } catch (err) {
-        if (!this.disposed) state.error = safeError(err);
+        if (!this.disposed) {
+          state.error = safeError(err);
+          this.expanded.add(`tool:${tool.id}`);
+        }
       }
     } catch (err) {
-      if (!this.disposed) state.error = safeError(err);
+      if (!this.disposed) {
+        state.error = safeError(err);
+        this.expanded.add(`tool:${tool.id}`);
+      }
     } finally {
       if (!this.disposed) {
         state.loading = false;
@@ -2191,7 +2323,10 @@ export class ToolsPage {
         this.selections.set(`api:${tool.id}`, new Set());
       }
     } catch (err) {
-      if (!this.disposed) state.error = safeError(err);
+      if (!this.disposed) {
+        state.error = safeError(err);
+        this.expanded.add(`tool:${tool.id}`);
+      }
     } finally {
       if (!this.disposed) {
         state.loading = false;
@@ -2230,7 +2365,10 @@ export class ToolsPage {
         state.testError = null;
       }
     } catch (err) {
-      if (!this.disposed) state.testError = safeError(err);
+      if (!this.disposed) {
+        state.testError = safeError(err);
+        this.expanded.add(`tool:${tool.id}`);
+      }
     } finally {
       if (!this.disposed) {
         state.testLoading = false;
