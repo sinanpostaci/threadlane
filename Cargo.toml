@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/threadlane-authority",
+    "crates/threadlane-workflow",
     "crates/threadlane-core",
     "crates/threadlane",
     "crates/threadlane-workers",
@@ -38,6 +39,7 @@ tempfile = "3.10"
 thiserror = "1.0"
 threadlane = { path = "crates/threadlane" }
 threadlane-authority = { path = "crates/threadlane-authority" }
+threadlane-workflow = { path = "crates/threadlane-workflow" }
 threadlane-connectors = { path = "crates/threadlane-connectors" }
 threadlane-core = { path = "crates/threadlane-core" }
 threadlane-decisions = { path = "crates/threadlane-decisions" }

@@ -184,13 +184,7 @@ mod tests {
                             &["max"],
                             false,
                         ),
-                        sample_model(
-                            "luna-max",
-                            "codex",
-                            "gpt-6-luna",
-                            &["high", "max"],
-                            false,
-                        ),
+                        sample_model("luna-max", "codex", "gpt-6-luna", &["high", "max"], false),
                         sample_model("git-helper", "git", "git-cli", &[], true),
                     ],
                 },
@@ -262,8 +256,12 @@ mod tests {
     #[test]
     fn catalog_pagination_disabled_tools_and_no_executable_or_secret_exposure() {
         let (_tmp, registry, plans, rev) = setup_stores();
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("create workflow");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("create workflow");
 
         // Add 22 additional profiles (total 23) to verify default 20 and max 20 pagination.
         let mut current_rev = rev;
@@ -299,10 +297,7 @@ mod tests {
         // Default limit is 20.
         let page1 = wf.catalog(None, None).expect("catalog page 1");
         assert_eq!(page1.registry_revision, current_rev);
-        assert_eq!(
-            page1.default_profile_id.as_deref(),
-            Some("default-profile")
-        );
+        assert_eq!(page1.default_profile_id.as_deref(), Some("default-profile"));
         assert_eq!(page1.profiles.len(), 20);
         assert!(page1.has_more);
         assert!(page1.next_cursor.is_some());
@@ -521,8 +516,12 @@ mod tests {
         let reg_dir = registry.config_dir().to_path_buf();
         let plans_dir = plans.dir().to_path_buf();
 
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("wf");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
 
         let t1 = sample_task(
             "t1",
@@ -554,10 +553,7 @@ mod tests {
             .expect("idempotent retry expected 0");
         assert_eq!(retry_same_expected, created);
         assert_eq!(
-            plans
-                .plan_revisions(&created.plan_id)
-                .expect("revs")
-                .len(),
+            plans.plan_revisions(&created.plan_id).expect("revs").len(),
             1
         );
 
@@ -569,10 +565,7 @@ mod tests {
             .expect("idempotent retry expected 1");
         assert_eq!(retry_new_expected, created);
         assert_eq!(
-            plans
-                .plan_revisions(&created.plan_id)
-                .expect("revs")
-                .len(),
+            plans.plan_revisions(&created.plan_id).expect("revs").len(),
             1
         );
 
@@ -669,9 +662,12 @@ mod tests {
             tasks: vec![t1.clone()],
         };
 
-        let wf1 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf1");
+        let wf1 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf1");
         let rev1_summary = wf1.save_draft(initial_req.clone()).expect("save v1");
         assert_eq!(rev1_summary.revision, 1);
         assert_eq!(rev1_summary.summary, "Original v1 summary");
@@ -681,9 +677,12 @@ mod tests {
         // Reusing `cmd-durable-v1` with `expected_revision = 1` (the current revision!) and a CHANGED
         // summary, changed tasks, changed profile, or changed target `plan_id` MUST fail with
         // `idempotency_conflict` rather than being accepted as revision 2!
-        let wf2 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf2");
+        let wf2 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf2");
 
         let changed_summary_at_current_rev = SavePlanDraft {
             expected_revision: 1,
@@ -835,12 +834,18 @@ mod tests {
         );
 
         // 1. Two independent `ScopedWorkflow` instances concurrently submit the exact same `SavePlanDraft`.
-        let wf_same_1 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_same_1");
-        let wf_same_2 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_same_2");
+        let wf_same_1 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_same_1");
+        let wf_same_2 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_same_2");
 
         let same_req = SavePlanDraft {
             command_key: "cmd-concurrent-same".to_string(),
@@ -882,12 +887,18 @@ mod tests {
         // 2. Two independent `ScopedWorkflow` instances concurrently submit the same `command_key`
         // with different payloads at `expected_revision = 1`. Exactly one must succeed (creating rev 2)
         // and the other must fail with `idempotency_conflict`.
-        let wf_diff_1 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_diff_1");
-        let wf_diff_2 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_diff_2");
+        let wf_diff_1 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_diff_1");
+        let wf_diff_2 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_diff_2");
 
         let diff_req_a = SavePlanDraft {
             command_key: "cmd-concurrent-conflict".to_string(),
@@ -938,8 +949,12 @@ mod tests {
     #[test]
     fn crash_pending_journal_recovery_and_competing_revision_protection() {
         let (_tmp, registry, plans, reg_rev) = setup_stores();
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("wf");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
 
         let task_a = sample_task(
             "t1",
@@ -996,9 +1011,12 @@ mod tests {
         drop(wf);
 
         // Reopen workflow and verify changed payload reuse against `Pending` entry conflicts.
-        let wf_reopened =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_reopened");
+        let wf_reopened = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_reopened");
         assert_eq!(
             wf_reopened
                 .save_draft(SavePlanDraft {
@@ -1014,10 +1032,7 @@ mod tests {
                 .code(),
             "idempotency_conflict"
         );
-        assert!(plans
-            .plan_revisions(plan_before)
-            .expect("revs")
-            .is_empty());
+        assert!(plans.plan_revisions(plan_before).expect("revs").is_empty());
 
         // Exact retry of `cmd-crash-before` completes the mutation in `PlanStore` and marks `Completed`.
         let recovered_before = wf_reopened
@@ -1032,10 +1047,7 @@ mod tests {
             })
             .expect("recover pending command before store");
         assert_eq!(recovered_before.revision, 1);
-        assert_eq!(
-            plans.plan_revisions(plan_before).expect("revs").len(),
-            1
-        );
+        assert_eq!(plans.plan_revisions(plan_before).expect("revs").len(), 1);
 
         // --- Case 2: Crash AFTER `PlanStore::change` wrote rev 1, BEFORE journal updated to `Completed` ---
         let plan_after = "plan-crash-after-store";
@@ -1082,14 +1094,21 @@ mod tests {
             plans.dir(),
             &plans.dir().join("test-seed.lock"),
             |clean_dir| {
-                write_journal_locked(clean_dir, wf_reopened.command_journal_path(), &journal_after)
+                write_journal_locked(
+                    clean_dir,
+                    wf_reopened.command_journal_path(),
+                    &journal_after,
+                )
             },
         )
         .expect("write pending-after journal");
 
-        let wf_reopened_2 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_reopened_2");
+        let wf_reopened_2 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_reopened_2");
         let reconciled_after = wf_reopened_2
             .save_draft(SavePlanDraft {
                 command_key: "cmd-crash-after".to_string(),
@@ -1152,14 +1171,21 @@ mod tests {
             plans.dir(),
             &plans.dir().join("test-seed.lock"),
             |clean_dir| {
-                write_journal_locked(clean_dir, wf_reopened_2.command_journal_path(), &journal_comp)
+                write_journal_locked(
+                    clean_dir,
+                    wf_reopened_2.command_journal_path(),
+                    &journal_comp,
+                )
             },
         )
         .expect("write competing pending journal");
 
-        let wf_reopened_3 =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_reopened_3");
+        let wf_reopened_3 = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_reopened_3");
 
         // Retrying `cmd-competing-loser` must NOT overwrite rev 1 or fabricate success; it fails with `stale_revision`.
         let loser_err = wf_reopened_3
@@ -1199,8 +1225,12 @@ mod tests {
     #[test]
     fn dag_write_scope_and_registry_version_validated_before_mutation() {
         let (_tmp, registry, plans, reg_rev) = setup_stores();
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("wf");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
 
         // 1. Duplicate task IDs.
         let dup_err = wf
@@ -1385,8 +1415,12 @@ mod tests {
     #[test]
     fn publish_routes_receipts_no_auto_ack_or_approval_and_old_published_new_draft_coexist() {
         let (_tmp, registry, plans, reg_rev) = setup_stores();
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("wf");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
 
         let tasks_v1 = vec![
             sample_task(
@@ -1766,8 +1800,12 @@ mod tests {
     #[test]
     fn mcp_wire_budget_256kib_full_text_pagination_and_oversized_rejection() {
         let (_tmp, registry, plans, reg_rev) = setup_stores();
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("wf");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
 
         // 1. Create a plan with 5 tasks, each carrying a 45 KiB full instruction (~225 KiB raw,
         // which is ~450 KiB in the double-encoded `CallToolResult` envelope).
@@ -1912,8 +1950,12 @@ mod tests {
     #[test]
     fn corrupt_stores_and_command_journal_bounds_are_rejected_and_preserved_untouched() {
         let (_tmp, registry, plans, reg_rev) = setup_stores();
-        let wf = ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-            .expect("wf");
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
 
         let sample = sample_task(
             "t1",
@@ -1986,9 +2028,12 @@ mod tests {
                 .expect("chmod 0600 journal");
         }
 
-        let wf_reopened =
-            ScopedWorkflow::new(Arc::clone(&registry), Arc::clone(&plans), "binding-1".into())
-                .expect("wf_reopened");
+        let wf_reopened = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf_reopened");
         let journal_err = wf_reopened
             .save_draft(SavePlanDraft {
                 command_key: "cmd-on-corrupt-journal".to_string(),

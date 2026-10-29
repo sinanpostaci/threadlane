@@ -151,8 +151,7 @@ impl ScopedWorkflow {
         cursor: Option<String>,
         limit: Option<usize>,
     ) -> Result<CatalogPage, WorkflowError> {
-        let requested_limit =
-            validate_page_limit(limit, DEFAULT_CATALOG_LIMIT, MAX_CATALOG_LIMIT)?;
+        let requested_limit = validate_page_limit(limit, DEFAULT_CATALOG_LIMIT, MAX_CATALOG_LIMIT)?;
         let snapshot = self.registry.snapshot()?;
 
         let all_profiles: Vec<CatalogProfile> = snapshot
@@ -479,20 +478,16 @@ impl ScopedWorkflow {
             &request.tasks,
         )?;
 
-        with_journal_lock(
-            self.plans.dir(),
-            &self.journal_lock_path,
-            |clean_dir| {
-                self.save_draft_locked(
-                    clean_dir,
-                    request,
-                    explicit_plan_id,
-                    target_plan_id,
-                    tasks_digest,
-                    payload_digest,
-                )
-            },
-        )
+        with_journal_lock(self.plans.dir(), &self.journal_lock_path, |clean_dir| {
+            self.save_draft_locked(
+                clean_dir,
+                request,
+                explicit_plan_id,
+                target_plan_id,
+                tasks_digest,
+                payload_digest,
+            )
+        })
     }
 
     fn save_draft_locked(
@@ -706,7 +701,8 @@ impl ScopedWorkflow {
 
         let preview_summary =
             PlanSummary::from_revision(&preview_revision, Some(compiled.plan_digest.clone()));
-        if let Err(err) = ensure_mcp_response_budget(&self.binding_id, "save_draft", &preview_summary)
+        if let Err(err) =
+            ensure_mcp_response_budget(&self.binding_id, "save_draft", &preview_summary)
         {
             if let Some(slot) = journal.find_mut(&request.command_key) {
                 slot.state = CommandJournalState::Failed;

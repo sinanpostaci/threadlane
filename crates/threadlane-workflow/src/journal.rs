@@ -237,9 +237,8 @@ pub(crate) fn read_journal_locked(
         }
     };
 
-    let meta = fs::symlink_metadata(journal_path).map_err(|_| {
-        WorkflowError::Io("Failed to read workflow command journal metadata.")
-    })?;
+    let meta = fs::symlink_metadata(journal_path)
+        .map_err(|_| WorkflowError::Io("Failed to read workflow command journal metadata."))?;
     if meta.file_type().is_symlink() || !meta.file_type().is_file() {
         return Err(WorkflowError::SecurityViolation(
             "Workflow command journal must be a regular non-symlink file.",
@@ -296,17 +295,10 @@ pub(crate) fn write_journal_locked(
         ));
     }
 
-    let file_name = journal_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or(WorkflowError::SecurityViolation(
-            "Invalid workflow command journal file name.",
-        ))?;
-    let temp_name = format!(
-        ".{file_name}.tmp.{}.{}",
-        std::process::id(),
-        Uuid::new_v4()
-    );
+    let file_name = journal_path.file_name().and_then(|n| n.to_str()).ok_or(
+        WorkflowError::SecurityViolation("Invalid workflow command journal file name."),
+    )?;
+    let temp_name = format!(".{file_name}.tmp.{}.{}", std::process::id(), Uuid::new_v4());
     let temp_path = clean_dir.join(temp_name);
     let _ = validate_absolute_no_symlink_components(&temp_path)?;
 
@@ -338,20 +330,19 @@ pub(crate) fn write_journal_locked(
                 WorkflowError::Io("Failed to create temporary workflow command journal file.")
             })?;
 
-        temp_file
-            .write_all(&serialized)
-            .map_err(|_| WorkflowError::Io("Failed to write temporary workflow command journal."))?;
-        temp_file
-            .sync_all()
-            .map_err(|_| WorkflowError::Io("Failed to fsync temporary workflow command journal."))?;
+        temp_file.write_all(&serialized).map_err(|_| {
+            WorkflowError::Io("Failed to write temporary workflow command journal.")
+        })?;
+        temp_file.sync_all().map_err(|_| {
+            WorkflowError::Io("Failed to fsync temporary workflow command journal.")
+        })?;
         drop(temp_file);
 
         fs::rename(&temp_path, journal_path).map_err(|_| {
             WorkflowError::Io("Failed to atomically replace workflow command journal.")
         })?;
-        let dir_file = File::open(clean_dir).map_err(|_| {
-            WorkflowError::Io("Failed to open plan store directory for fsync.")
-        })?;
+        let dir_file = File::open(clean_dir)
+            .map_err(|_| WorkflowError::Io("Failed to open plan store directory for fsync."))?;
         dir_file.sync_all().map_err(|_| {
             WorkflowError::Io("Failed to fsync plan store directory after journal update.")
         })?;
@@ -559,9 +550,8 @@ fn ensure_private_dir(path: &Path) -> Result<PathBuf, WorkflowError> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let meta = fs::symlink_metadata(&checked).map_err(|_| {
-            WorkflowError::Io("Failed to inspect plan store directory metadata.")
-        })?;
+        let meta = fs::symlink_metadata(&checked)
+            .map_err(|_| WorkflowError::Io("Failed to inspect plan store directory metadata."))?;
         if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
             return Err(WorkflowError::SecurityViolation(
                 "Plan store path must be a non-symlink directory.",

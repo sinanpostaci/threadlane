@@ -2488,6 +2488,7 @@ dependencies = [
  "thiserror 1.0.69",
  "threadlane",
  "threadlane-core",
+ "threadlane-workflow",
  "tokio",
  "uuid",
 ]
@@ -2546,6 +2547,22 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "threadlane-workflow"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "threadlane",
+ "threadlane-plans",
+ "threadlane-registry",
  "uuid",
 ]
 

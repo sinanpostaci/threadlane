@@ -44,20 +44,18 @@ struct Cli {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    let workflow_stores = match open_workflow_stores(
-        cli.registry_dir.as_deref(),
-        cli.plans_dir.as_deref(),
-    ) {
-        Ok(stores) => stores,
-        Err(err) => {
-            eprintln!(
-                "threadlane-native-mcp error [{}]: {}",
-                err.code(),
-                err.message()
-            );
-            return ExitCode::from(1);
-        }
-    };
+    let workflow_stores =
+        match open_workflow_stores(cli.registry_dir.as_deref(), cli.plans_dir.as_deref()) {
+            Ok(stores) => stores,
+            Err(err) => {
+                eprintln!(
+                    "threadlane-native-mcp error [{}]: {}",
+                    err.code(),
+                    err.message()
+                );
+                return ExitCode::from(1);
+            }
+        };
 
     let pairing_store = match PairingStore::open(&cli.pairing_dir) {
         Ok(store) => store,

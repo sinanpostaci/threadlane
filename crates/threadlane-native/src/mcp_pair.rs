@@ -806,9 +806,7 @@ impl PairedMcpServer {
             return Err(Self::format_workflow_error(binding_id, tool_name, err));
         }
         Ok(ThreadlaneMcpServer::build_structured_tool_result(
-            binding_id,
-            tool_name,
-            data,
+            binding_id, tool_name, data,
         ))
     }
 

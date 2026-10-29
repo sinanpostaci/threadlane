@@ -962,7 +962,11 @@ fi
         sup_handle.shutdown().await;
     }
 
-    fn workflow_sample_tool(id: &str, adapter: ToolAdapter, enabled: bool) -> threadlane_workflow::ToolDefinition {
+    fn workflow_sample_tool(
+        id: &str,
+        adapter: ToolAdapter,
+        enabled: bool,
+    ) -> threadlane_workflow::ToolDefinition {
         threadlane_workflow::ToolDefinition {
             id: id.to_string(),
             label: format!("Tool {id}"),
@@ -1259,14 +1263,15 @@ fi
         let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
         let operator_token = pairing_store.operator_token().expect("operator token");
 
-        let mcp_base =
-            PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp");
+        let mcp_base = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp");
         let orig_nonce = mcp_base.connection_nonce().to_string();
         let orig_epoch = mcp_base.epoch_id().to_string();
         assert!(!mcp_base.has_workflow_stores());
 
-        let mut mcp =
-            mcp_base.with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+        let mut mcp = mcp_base.with_workflow_stores(
+            std::sync::Arc::clone(&registry),
+            std::sync::Arc::clone(&plans),
+        );
         assert!(mcp.has_workflow_stores());
         assert_eq!(mcp.connection_nonce(), orig_nonce);
         assert_eq!(mcp.epoch_id(), orig_epoch);
@@ -1488,7 +1493,10 @@ fi
 
         let mcp = PairedMcpServer::new(&state_dir, pairing_store.clone())
             .expect("create mcp")
-            .with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+            .with_workflow_stores(
+                std::sync::Arc::clone(&registry),
+                std::sync::Arc::clone(&plans),
+            );
 
         pairing_store
             .enroll(
@@ -1665,10 +1673,9 @@ fi
             .list_plans(Parameters(ListPlansParams::default()))
             .await
             .expect("list_plans");
-        let list_page: PlanSummaryPage = serde_json::from_value(
-            list_res.structured_content.unwrap()["data"].clone(),
-        )
-        .expect("decode PlanSummaryPage");
+        let list_page: PlanSummaryPage =
+            serde_json::from_value(list_res.structured_content.unwrap()["data"].clone())
+                .expect("decode PlanSummaryPage");
         assert_eq!(list_page.plans.len(), 1);
         assert_eq!(list_page.plans[0].status, PlanStatus::Published);
 
@@ -1769,10 +1776,16 @@ fi
 
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone())
             .expect("mcp A")
-            .with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+            .with_workflow_stores(
+                std::sync::Arc::clone(&registry),
+                std::sync::Arc::clone(&plans),
+            );
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone())
             .expect("mcp B")
-            .with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+            .with_workflow_stores(
+                std::sync::Arc::clone(&registry),
+                std::sync::Arc::clone(&plans),
+            );
 
         pairing_store
             .enroll(
