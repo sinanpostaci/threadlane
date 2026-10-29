@@ -55,6 +55,8 @@ import {
   beginSnapshotPoll,
   commitHistoryFilters,
   createInitialState,
+  hasPlansSnapshotChanged,
+  hasRegistrySnapshotChanged,
   navigateBack,
   navigateToPage,
   openRunDetail,
@@ -63,6 +65,7 @@ import {
   selectBinding,
   selectHistoryEvent,
   setHistoryExpanded,
+  shouldPollActivePlansStore,
   shouldPollHistory,
   shouldRebuildMainOnPoll,
   toActivityHistoryIpcArgs,
@@ -107,6 +110,9 @@ import { renderActivityHistorySection } from './pages/history.ts';
 const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
 const EXECUTION_PREFS_STORAGE_KEY = 'threadlane.desktop.execution_prefs.v1';
 const POLL_INTERVAL_MS = 2000;
+
+type StoreRenderMode = 'auto' | 'defer';
+type SnapshotRenderMode = 'preserve' | 'defer';
 
 const NAV_ITEMS: ReadonlyArray<{ page: NavPage; label: string; icon: UiIconName }> = [
   { page: 'activity', label: 'Activity', icon: 'activity' },
@@ -206,6 +212,7 @@ class ThreadlaneDesktopApp {
   };
   private returnFocusKey: string | null = null;
   private pollTimerId: number | null = null;
+  private sharedRefreshInFlight = false;
 
   constructor(mountNode: HTMLElement) {
     const savedAppearance = loadSavedAppearance();
@@ -220,7 +227,7 @@ class ThreadlaneDesktopApp {
       void this.refreshRegistry();
     });
     this.plansPage = new PlansPage(() => {
-      void this.refreshPlans();
+      void this.refreshPlansPageData(true);
     });
     this.nativeLinkingPanel = new NativeLinkingPanel(() => {
       this.returnFocusKey = null;
@@ -280,72 +287,207 @@ class ThreadlaneDesktopApp {
         if (refresh.ticket) {
           await this.executeDetailTicket(refresh.ticket, false);
         }
-      } else if (
-        shouldPollHistory(
-          this.state,
-          typeof document !== 'undefined' && Boolean(document.hidden)
-        )
-      ) {
-        await this.triggerHistoryQuery('poll', false);
+      } else {
+        if (this.canPollActivePlansStore()) {
+          await this.refreshPlansPageData(false);
+        }
+        if (this.isDocumentHidden()) {
+          return;
+        }
+        if (shouldPollHistory(this.state, false)) {
+          await this.triggerHistoryQuery('poll', false);
+        }
       }
     } finally {
       this.scheduleNextPoll();
     }
   }
 
+  private isDocumentHidden(): boolean {
+    return typeof document !== 'undefined' && Boolean(document.hidden);
+  }
+
+  private isPlansViewActive(): boolean {
+    return this.state.page === 'plans' && this.state.detailTarget === null;
+  }
+
+  private canPollActivePlansStore(): boolean {
+    if (!hasTauriRuntime() && !isDevPreviewFixtureMode()) {
+      return false;
+    }
+    return shouldPollActivePlansStore(this.state, this.isDocumentHidden());
+  }
+
+  private syncPlansStoredContext(deferView: boolean): void {
+    if (!this.isPlansViewActive()) {
+      return;
+    }
+    this.plansPage.syncStoredContext(
+      this.state.plansSnapshot,
+      this.state.registrySnapshot,
+      this.state.snapshot.bindings,
+      this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
+      this.state.snapshot.attachment,
+      { deferView }
+    );
+  }
+
+  private async refreshPlansPageData(force: boolean): Promise<void> {
+    if (!this.isPlansViewActive()) {
+      return;
+    }
+    const previousPlansError = this.state.plansError;
+    const previousRegistryError = this.state.registryError;
+    const [registryChanged, plansChanged] = await Promise.all([
+      this.refreshRegistry(force, 'defer'),
+      this.refreshPlans(force, 'defer'),
+    ]);
+    if (!this.isPlansViewActive()) {
+      return;
+    }
+    const editing = this.plansPage.hasEditableFocus();
+    const storeChanged = registryChanged || plansChanged;
+    const statusChanged =
+      previousPlansError !== this.state.plansError ||
+      previousRegistryError !== this.state.registryError;
+    if (!storeChanged) {
+      if ((statusChanged || this.plansPage.hasPendingStoredUpdates()) && !editing) {
+        this.syncPlansStoredContext(false);
+        this.renderPreserveActiveInput();
+      }
+      return;
+    }
+    this.syncPlansStoredContext(editing);
+    if (editing) {
+      this.renderHeader();
+      this.renderFooter();
+      return;
+    }
+    this.renderPreserveActiveInput();
+  }
+
   private async triggerSnapshotPoll(
     force: boolean,
-    isBackgroundPoll: boolean = false
+    isBackgroundPoll: boolean = false,
+    renderMode: SnapshotRenderMode = 'preserve'
   ): Promise<void> {
     const next = beginSnapshotPoll(this.state, force);
     this.state = next.state;
     if (!next.ticket) {
       return;
     }
-    await this.executeSnapshotTicket(next.ticket, isBackgroundPoll);
+    await this.executeSnapshotTicket(next.ticket, isBackgroundPoll, renderMode);
+  }
+
+  private executeAfterSnapshotSuccess(isBackgroundPoll: boolean): void {
+    if (
+      !isBackgroundPoll &&
+      this.state.page === 'activity' &&
+      this.state.detailTarget === null &&
+      this.state.history.expanded &&
+      !this.state.history.hasLoadedOnce &&
+      !this.state.history.inFlight
+    ) {
+      void this.triggerHistoryQuery('initial', false);
+    }
   }
 
   private async executeSnapshotTicket(
     ticket: SnapshotTicket,
-    isBackgroundPoll: boolean = false
+    isBackgroundPoll: boolean = false,
+    renderMode: SnapshotRenderMode = 'preserve'
   ): Promise<void> {
     try {
       const snapshot = await ipcDesktopSnapshot(ticket.requestedBindingId);
       this.state = applySnapshotPollSuccess(this.state, ticket, snapshot);
-      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+      const plansActive = this.isPlansViewActive();
+      if (plansActive) {
         this.plansPage.syncRuntimeContext(
           this.state.snapshot.bindings,
           this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
           this.state.snapshot.attachment
         );
+      }
+      this.executeAfterSnapshotSuccess(isBackgroundPoll);
+      if (renderMode === 'defer') {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
+      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
+      if (plansActive && this.plansPage.hasEditableFocus()) {
         this.renderHeader();
         this.renderFooter();
         return;
       }
       this.renderPreserveActiveInput();
-      if (
-        this.state.page === 'activity' &&
-        this.state.detailTarget === null &&
-        this.state.history.expanded &&
-        !this.state.history.hasLoadedOnce &&
-        !this.state.history.inFlight
-      ) {
-        void this.triggerHistoryQuery('initial', false);
-      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load desktop snapshot.';
       this.state = applySnapshotPollError(this.state, ticket, msg);
-      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+      const plansActive = this.isPlansViewActive();
+      if (plansActive) {
+        // The state now exposes a disconnected observer attachment, so approval
+        // confirmations and submit controls are invalidated in place.
         this.plansPage.syncRuntimeContext(
           this.state.snapshot.bindings,
           this.state.selectedBindingId ?? this.state.snapshot.selected_binding_id,
           this.state.snapshot.attachment
         );
+      }
+      if (renderMode === 'defer') {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
+      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
+      if (plansActive && this.plansPage.hasEditableFocus()) {
         this.renderHeader();
         this.renderFooter();
         return;
       }
       this.renderPreserveActiveInput();
+    }
+  }
+
+  private async handleSharedRefresh(): Promise<void> {
+    if (this.sharedRefreshInFlight) {
+      return;
+    }
+    const previousPlans = this.state.plansSnapshot;
+    const previousRegistry = this.state.registrySnapshot;
+    this.sharedRefreshInFlight = true;
+    try {
+      await Promise.all([
+        this.triggerSnapshotPoll(true, false, 'defer'),
+        this.refreshRegistry(true, 'defer'),
+        this.refreshPlans(true, 'defer'),
+      ]);
+      const storeChanged =
+        hasPlansSnapshotChanged(previousPlans, this.state.plansSnapshot) ||
+        hasRegistrySnapshotChanged(previousRegistry, this.state.registrySnapshot);
+      if (this.isPlansViewActive()) {
+        const editing = this.plansPage.hasEditableFocus();
+        if (editing) {
+          if (storeChanged) {
+            this.syncPlansStoredContext(true);
+          }
+          this.renderHeader();
+          this.renderFooter();
+          return;
+        }
+        this.syncPlansStoredContext(false);
+      }
+      this.renderPreserveActiveInput();
+    } finally {
+      this.sharedRefreshInFlight = false;
     }
   }
 
@@ -378,15 +520,47 @@ class ThreadlaneDesktopApp {
     }
   }
 
-  private async refreshRegistry(): Promise<void> {
-    const started = beginRegistryRefresh(this.state, true);
-    this.state = started.state;
-    if (!started.ticket) {
+  private renderAfterStoreRefresh(changed: boolean): void {
+    if (this.state.detailTarget !== null) {
       return;
     }
+    if (this.state.page === 'plans') {
+      const editing = this.plansPage.hasEditableFocus();
+      if (changed) {
+        this.syncPlansStoredContext(editing);
+      }
+      if (editing) {
+        this.renderHeader();
+        this.renderFooter();
+        return;
+      }
+    }
+    if (
+      this.state.page === 'tools' ||
+      this.state.page === 'profiles' ||
+      this.state.page === 'plans' ||
+      this.state.page === 'chats' ||
+      this.state.page === 'settings'
+    ) {
+      this.renderPreserveActiveInput();
+    }
+  }
+
+  private async refreshRegistry(
+    force: boolean = true,
+    renderMode: StoreRenderMode = 'auto'
+  ): Promise<boolean> {
+    const previous = this.state.registrySnapshot;
+    const started = beginRegistryRefresh(this.state, force);
+    this.state = started.state;
+    if (!started.ticket) {
+      return false;
+    }
+    let changed = false;
     try {
       const snapshot = await desktop_registry_snapshot();
       this.state = applyRegistryRefreshSuccess(this.state, started.ticket, snapshot);
+      changed = hasRegistrySnapshotChanged(previous, this.state.registrySnapshot);
     } catch (err) {
       this.state = applyRegistryRefreshError(
         this.state,
@@ -394,27 +568,27 @@ class ThreadlaneDesktopApp {
         formatAppError(err, 'Failed to load registry snapshot.')
       );
     }
-    if (
-      this.state.detailTarget === null &&
-      (this.state.page === 'tools' ||
-        this.state.page === 'profiles' ||
-        this.state.page === 'plans' ||
-        this.state.page === 'chats' ||
-        this.state.page === 'settings')
-    ) {
-      this.renderPreserveActiveInput();
+    if (renderMode === 'auto') {
+      this.renderAfterStoreRefresh(changed);
     }
+    return changed;
   }
 
-  private async refreshPlans(): Promise<void> {
-    const started = beginPlansRefresh(this.state, true);
+  private async refreshPlans(
+    force: boolean = true,
+    renderMode: StoreRenderMode = 'auto'
+  ): Promise<boolean> {
+    const previous = this.state.plansSnapshot;
+    const started = beginPlansRefresh(this.state, force);
     this.state = started.state;
     if (!started.ticket) {
-      return;
+      return false;
     }
+    let changed = false;
     try {
       const plans = await desktop_plans_snapshot();
       this.state = applyPlansRefreshSuccess(this.state, started.ticket, plans);
+      changed = hasPlansSnapshotChanged(previous, this.state.plansSnapshot);
     } catch (err) {
       this.state = applyPlansRefreshError(
         this.state,
@@ -422,9 +596,10 @@ class ThreadlaneDesktopApp {
         formatAppError(err, 'Failed to load plans ledger.')
       );
     }
-    if (this.state.detailTarget === null && this.state.page === 'plans') {
-      this.renderPreserveActiveInput();
+    if (renderMode === 'auto') {
+      this.renderAfterStoreRefresh(changed);
     }
+    return changed;
   }
 
   private async executeDetailTicket(
@@ -880,8 +1055,8 @@ class ThreadlaneDesktopApp {
           className: 'aq-icon-button',
           'data-action': 'refresh-snapshot',
           'data-focus': 'refresh-snapshot',
-          'aria-label': 'Refresh snapshot',
-          title: 'Refresh now',
+          'aria-label': 'Refresh runtime, registry, and plans',
+          title: 'Refresh runtime, registry & plans',
         },
         createUiIcon('refresh-cw')
       )
@@ -1574,6 +1749,7 @@ class ThreadlaneDesktopApp {
           this.returnFocusKey = null;
           this.state = navigateToPage(this.state, 'plans');
           this.render('nav-plans');
+          void this.refreshPlansPageData(true);
         })
       )
     );
@@ -2424,7 +2600,7 @@ class ThreadlaneDesktopApp {
         return;
       }
       if (action === 'refresh-snapshot') {
-        void this.triggerSnapshotPoll(true, false);
+        void this.handleSharedRefresh();
         return;
       }
       if (action === 'refresh-registry') {
@@ -2457,6 +2633,9 @@ class ThreadlaneDesktopApp {
         this.returnFocusKey = null;
         this.state = navigateToPage(this.state, navPage);
         this.render(`nav-${navPage}`);
+        if (navPage === 'plans') {
+          void this.refreshPlansPageData(true);
+        }
         return;
       }
 

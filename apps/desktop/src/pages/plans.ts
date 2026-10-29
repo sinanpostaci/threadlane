@@ -165,6 +165,18 @@ function approvalDraftKey(planId: string, revision: number): string {
   return `${planId}:${revision}`;
 }
 
+export function isEditablePlanFieldTagName(tagName: string | null | undefined): boolean {
+  return tagName === 'INPUT' || tagName === 'TEXTAREA' || tagName === 'SELECT';
+}
+
+const DEFERRED_STORE_UPDATE_NOTICE =
+  'New plan or registry updates are available. Your draft is unchanged; finish editing or use Refresh ledger to update this view.';
+
+export interface StoredPlanContextSyncOptions {
+  deferView?: boolean;
+  pendingNotice?: string;
+}
+
 export class PlansPage {
   private readonly onPlansChanged: () => void;
   private readonly container: HTMLElement;
@@ -178,6 +190,7 @@ export class PlansPage {
   private errorMessage: string | null = null;
   private hasCasConflict: boolean = false;
   private statusNotice: string | null = null;
+  private pendingStoredUpdatesNotice: string | null = null;
   private readonly approvalDrafts = new Map<string, ApprovalFormDraft>();
   private readonly approvalsByBinding = new Map<string, ApprovalSummary[]>();
   private readonly loadingBindings = new Set<string>();
@@ -211,6 +224,7 @@ export class PlansPage {
     this.latestBindings = bindings;
     this.selectedBindingId = selectedBindingId;
     this.latestAttachment = attachment;
+    this.pendingStoredUpdatesNotice = null;
 
     if (!this.draft.dirty) {
       if (!this.draft.bindingId && (selectedBindingId || bindings[0]?.binding_id)) {
@@ -239,6 +253,8 @@ export class PlansPage {
     selectedBindingId: string | null,
     attachment?: Attachment | null
   ): void {
+    const scroller = this.container.closest('.aq-main') as HTMLElement | null;
+    const scrollTop = scroller?.scrollTop ?? null;
     this.latestBindings = bindings;
     this.selectedBindingId = selectedBindingId;
     this.latestAttachment = attachment;
@@ -249,10 +265,115 @@ export class PlansPage {
 
     this.syncAllApprovalDrafts();
     this.patchLiveApprovalContextDom();
+    if (scroller && scrollTop !== null) {
+      scroller.scrollTop = scrollTop;
+    }
+  }
+
+  /**
+   * Refresh controller caches and approval validity from a local store snapshot without
+   * rebuilding editor DOM nodes or touching the user's plan draft and CAS revision.
+   * Callers decide whether the page body should be rebuilt outside an active edit.
+   */
+  public syncStoredContext(
+    plans: PlanRevision[],
+    registry: RegistrySnapshot,
+    bindings: BindingSummary[],
+    selectedBindingId: string | null,
+    attachment?: Attachment | null,
+    options: StoredPlanContextSyncOptions = {}
+  ): void {
+    const scroller = this.container.closest('.aq-main') as HTMLElement | null;
+    const scrollTop = scroller?.scrollTop ?? null;
+    this.latestPlans = plans;
+    this.latestRegistry = registry;
+    this.latestBindings = bindings;
+    this.selectedBindingId = selectedBindingId;
+    this.latestAttachment = attachment;
+
+    this.syncAllApprovalDrafts();
+    this.ensureBindingApprovalsLoaded(plans);
+    this.patchLiveApprovalContextDom();
+
+    if (options.deferView) {
+      this.pendingStoredUpdatesNotice =
+        options.pendingNotice?.trim() || DEFERRED_STORE_UPDATE_NOTICE;
+      this.patchStoredUpdatesNotice();
+    } else {
+      this.pendingStoredUpdatesNotice = null;
+      this.patchStoredUpdatesNotice();
+    }
+    if (scroller && scrollTop !== null) {
+      scroller.scrollTop = scrollTop;
+    }
+  }
+
+  public hasEditableFocus(): boolean {
+    if (typeof document === 'undefined') {
+      return false;
+    }
+    const active = document.activeElement;
+    return (
+      active !== null &&
+      this.container.contains(active) &&
+      isEditablePlanFieldTagName(active.tagName)
+    );
+  }
+
+  public hasPendingStoredUpdates(): boolean {
+    return this.pendingStoredUpdatesNotice !== null;
   }
 
   public dispose(): void {
     this.container.replaceChildren();
+  }
+
+  private buildPendingStoredUpdatesNotice(): HTMLElement {
+    return h(
+      'div',
+      {
+        className: 'aq-banner aq-banner-sub',
+        role: 'status',
+        'aria-live': 'polite',
+        'data-plan-pending-updates': 'true',
+      },
+      this.pendingStoredUpdatesNotice ?? ''
+    );
+  }
+
+  private patchStoredUpdatesNotice(): void {
+    const existing = this.container.querySelector<HTMLElement>(
+      '[data-plan-pending-updates]'
+    );
+    const scroller = this.container.closest('.aq-main') as HTMLElement | null;
+    const scrollTop = scroller?.scrollTop ?? null;
+    const restoreScroll = (): void => {
+      if (scroller && scrollTop !== null) {
+        scroller.scrollTop = scrollTop;
+      }
+    };
+
+    if (!this.pendingStoredUpdatesNotice) {
+      existing?.remove();
+      restoreScroll();
+      return;
+    }
+    if (existing) {
+      existing.textContent = this.pendingStoredUpdatesNotice;
+      restoreScroll();
+      return;
+    }
+    this.container.prepend(this.buildPendingStoredUpdatesNotice());
+    restoreScroll();
+  }
+
+  private refreshAfterBackgroundDataChange(): void {
+    if (this.hasEditableFocus()) {
+      this.pendingStoredUpdatesNotice ??= DEFERRED_STORE_UPDATE_NOTICE;
+      this.patchStoredUpdatesNotice();
+      return;
+    }
+    this.rebuildDom();
   }
 
   private syncAllApprovalDrafts(): void {
@@ -301,6 +422,7 @@ export class PlansPage {
 
   private patchLiveApprovalContextDom(): void {
     const pageBusy = this.busyAction !== null;
+    const preserveEditableLayout = this.hasEditableFocus();
     for (const [key, draft] of this.approvalDrafts.entries()) {
       if (!draft.expanded) {
         continue;
@@ -332,13 +454,17 @@ export class PlansPage {
         }
       }
 
+      const previewAvailable = draft.preview !== null;
       const checkEl = this.container.querySelector<HTMLInputElement>(
         `input[data-approval-confirm-check="${key}"]`
       );
       if (checkEl) {
         checkEl.checked = draft.reviewConfirmed;
         checkEl.disabled =
-          panelBusy || draft.previewIsSampleFixture || !bindingResolution.ok;
+          panelBusy ||
+          !previewAvailable ||
+          draft.previewIsSampleFixture ||
+          !bindingResolution.ok;
       }
 
       const reviewBoxEl = this.container.querySelector<HTMLElement>(
@@ -346,27 +472,41 @@ export class PlansPage {
       );
       if (reviewBoxEl) {
         reviewBoxEl.classList.toggle('is-confirmed', draft.reviewConfirmed);
+        reviewBoxEl.style.display =
+          previewAvailable || preserveEditableLayout ? '' : 'none';
+      }
+
+      const previewFormEl = this.container.querySelector<HTMLElement>(
+        `[data-approval-preview-form="${key}"]`
+      );
+      if (previewFormEl) {
+        previewFormEl.style.display =
+          previewAvailable || preserveEditableLayout ? '' : 'none';
       }
 
       const reviewTextEl = this.container.querySelector<HTMLElement>(
         `[data-approval-review-text="${key}"]`
       );
-      if (reviewTextEl && draft.preview) {
-        let inputsValidForCheckbox = false;
-        try {
-          validateApprovalDraftInputs(
+      if (reviewTextEl) {
+        if (!draft.preview) {
+          reviewTextEl.textContent = '';
+        } else {
+          let inputsValidForCheckbox = false;
+          try {
+            validateApprovalDraftInputs(
+              draft,
+              this.latestBindings,
+              this.latestAttachment
+            );
+            inputsValidForCheckbox = true;
+          } catch {
+            inputsValidForCheckbox = false;
+          }
+          reviewTextEl.textContent = this.formatReviewBoxInstructionText(
             draft,
-            this.latestBindings,
-            this.latestAttachment
+            inputsValidForCheckbox
           );
-          inputsValidForCheckbox = true;
-        } catch {
-          inputsValidForCheckbox = false;
         }
-        reviewTextEl.textContent = this.formatReviewBoxInstructionText(
-          draft,
-          inputsValidForCheckbox
-        );
       }
 
       const submitBtn = this.container.querySelector<HTMLButtonElement>(
@@ -411,9 +551,14 @@ export class PlansPage {
     this.loadingBindings.add(bindingId);
     try {
       const approvals = await desktop_plan_approvals({ bindingId });
+      const previousFingerprint = JSON.stringify(
+        this.approvalsByBinding.get(bindingId) ?? []
+      );
       this.approvalsByBinding.set(bindingId, approvals);
       this.loadedBindings.add(bindingId);
-      this.rebuildDom();
+      if (JSON.stringify(approvals) !== previousFingerprint) {
+        this.refreshAfterBackgroundDataChange();
+      }
     } catch {
       // Non-fatal background fetch; explicit preview/approve actions surface errors directly.
     } finally {
@@ -763,6 +908,9 @@ export class PlansPage {
   }
 
   private rebuildDom(externalError: string | null = null): void {
+    // A full rebuild always renders the latest cached store context, so any deferred
+    // update notice has been satisfied by this view.
+    this.pendingStoredUpdatesNotice = null;
     const activeEl =
       typeof document !== 'undefined' ? (document.activeElement as HTMLElement | null) : null;
     const focusKey =
@@ -1884,7 +2032,10 @@ export class PlansPage {
 
     return h(
       'div',
-      { className: 'aq-plan-approval-task-list' },
+      {
+        className: 'aq-plan-approval-task-list',
+        'data-approval-preview-form': key,
+      },
       draft.previewIsSampleFixture
         ? h(
             'div',
