@@ -8,8 +8,8 @@ worktrees with post-run diff gates and ownership-verified cleanup.
 ## Scope and Non-Claims
 
 - **Independent foundation crate**: `crates/threadlane-workers` is intentionally decoupled
-  from `threadlane-core` and `threadlane` so it can be tested and reviewed independently
-  before supervisor and MCP wiring.
+  from `threadlane-core` and `threadlane` so it can be tested and reviewed
+  independently of the durable supervisor/MCP dispatch described in [DISPATCH.md](DISPATCH.md).
 - **Not a public MCP launch permission**: The included `threadlane-worker` binary is a
   narrow local diagnostic CLI for exercising specs, worktrees, process supervision, diff
   gates, and cleanup. It does not expose an MCP server, install a persistent service, or
@@ -62,11 +62,13 @@ worktrees with post-run diff gates and ownership-verified cleanup.
   - `prompt`: Untrusted task prompt (`1..=65_536` bytes; `MAX_PROMPT_BYTES = 65_536` / 64 KiB,
     kept conservatively below Linux's 128 KiB per-argument `MAX_ARG_STRLEN` `E2BIG` ceiling)
     passed strictly as data in the argument array.
+  - `file_permissions`: `WorkerFilePermissions`, default `"inherit"`. Opt-in
+    `"task_files"` resolves session-only AGY grants from the actual task directory.
   - `budgets`: `ExecutionBudgets`.
 - `WorkerPolicy`: External allowlist of canonical executable paths (`allowed_executables`)
   and models (`allowed_models`), enforced via `WorkerSpec::validate_against_policy`.
 
-### 2. Exact Argument Array Construction (`WorkerSpec::build_argv`)
+### 2. Argument Array Construction (`WorkerSpec::build_argv`, `build_argv_for_workdir`)
 
 All processes are spawned with explicit argument arrays (`Command::new(&executable).args(&argv)`),
 never via a shell (`sh -c`). Neither `--dangerously-skip-permissions` nor `--auto` is ever
@@ -97,6 +99,31 @@ never be interpreted as a CLI flag.
     "<prompt>"
   ]
   ```
+
+### Scoped Antigravity file permissions (Milestone 2C)
+
+`file_permissions: "inherit"` preserves the previous argv and default runtime
+profile fingerprint. `"task_files"` is an operator-selected Antigravity-only
+option: it adds session-only `--settings <inline-json>` granting task-tree reads
+and exact/descendant file-edit rules for the existing write allowlist. It adds no
+shell, network or MCP grants and does not modify global provider settings.
+Inherited provider rules may still apply; this is not an OS sandbox or global
+deny isolation.
+
+The actual existing task working directory and existing components of each
+allowlisted target must be canonical non-symlink paths. Validation does not
+recursively scan all descendants for symlinks before granting a directory rule;
+post-run diff checks remain mandatory. Glob/rule metacharacters and control
+characters are rejected in interpolated paths. TaskFiles has at most 128 write
+entries and 65,536 serialized settings bytes; excess is rejected before spawn,
+not truncated. Inherit retains its previous path behavior.
+
+`validate()` stays side-effect free and marks TaskFiles argv as an incomplete
+static preview requiring working-directory resolution. `build_argv()` rejects
+that unresolved mode; `build_argv_for_workdir()` returns the actual argv. The
+supervisor executes and records this resolved argv, while private runtime report
+artifacts continue to clear prompt argv. Missing observed model/effort evidence
+is not repaired by the permission option.
 
 ### 3. Incremental NDJSON Evidence Parser (`threadlane_workers::stream`)
 
@@ -181,8 +208,8 @@ timeout/cancellation or final model/result verification. The final report's
 `dropped_live_events` counts undelivered live notifications separately from the
 parser's retained-event truncation counter. With no observer it remains zero.
 
-This is a library interface. The durable supervisor/MCP dispatch connection is
-still the next checkpoint described in [MILESTONE-2B.md](MILESTONE-2B.md).
+This library interface is connected to the durable supervisor/MCP dispatcher;
+see [DISPATCH.md](DISPATCH.md) for its runtime profile and lifecycle contract.
 
 ### 5. Git Worktree Manager, Diff Gate, and Safe Cleanup (`threadlane_workers::git`)
 
@@ -288,7 +315,7 @@ still the next checkpoint described in [MILESTONE-2B.md](MILESTONE-2B.md).
 ### Commands
 
 ```bash
-# 1. Validate a JSON worker spec and inspect the exact constructed argv
+# 1. Validate a JSON worker spec (TaskFiles shows a static preview/resolution note)
 cargo run -p threadlane-workers --bin threadlane-worker -- \
   validate-spec --spec /abs/path/to/worker-spec.json
 

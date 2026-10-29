@@ -51,9 +51,15 @@ HTTP/CLI/MCP, with bounded live progress, immutable profiles, cancellation and
 explicit restart uncertainty. Its primary-reviewed fixture gate passed 82 tests
 and independent process/migration/artifact probes. See [dispatch](DISPATCH.md).
 
-Next, verify native real-worker interaction and the [multi-chat routing gate](NATIVE-ROUTING.md).
-Live coding acceptance, provider-interactive question/Steer delivery, reconciliation
-of preserved uncertain artifacts, reviewed Git integration and accepted-result
+Milestone 2C adds operator-selected, finite AGY task-file grants while preserving
+legacy default profile identity. Its 89 Rust-test gate passed. A qualified native
+single-chat pilot now verifies start, real isolated file editing, return/wake-up,
+event acknowledgement and separate deterministic cancellation. Missing real
+provider effort telemetry correctly prevented acceptance.
+
+Next, resolve provider evidence/interactive continuation and the
+[multi-chat routing gate](NATIVE-ROUTING.md). Busy-turn delivery, reconciliation of
+preserved uncertain artifacts, reviewed Git integration and accepted-result
 cleanup still need their own end-to-end checkpoint. The desktop UI, profiles/Jev
 and release hardening remain later milestones. See [validation](VALIDATION.md).
 
@@ -64,7 +70,8 @@ the Codex follower, Sol 6.1 High for substantive orchestration, Sol 6.1 Max for
 architecture, OpenCode Go/DeepSeek 4.1 Flash Max for routine coding and AGY/Argon
 Medium for hard coding, Argon High for task review and Sol xhigh for one valid
 package closure. This is a future product profile, not the development staffing:
-the user now requests **Argon High implementation and review by the primary agent**.
+the user requests **Argon High implementation, ordinary review/validation by the
+primary agent, and one Astra Max package-closing review**.
 
 ## Non-negotiable invariants
 
