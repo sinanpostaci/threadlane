@@ -23,6 +23,8 @@
 //! - **Honest verification gates**: Live two-chat and busy-turn routing report
 //!   [`NativeVerificationStatus::NeedsVerification`] until an authorized live host experiment.
 
+/// Sealed approved-task MCP bridge parameters, response envelopes, and host/authority helpers.
+pub mod approved_mcp;
 /// Public `codex app-server proxy` client and native thread metadata types.
 pub mod client;
 /// Structured error codes and redacted error types.
@@ -38,6 +40,13 @@ pub mod rpc;
 /// Durable `Pending`/`Submitted`/`Unknown`/`Received` busy-turn wake-up store and `turn/steer` builder.
 pub mod wakeup;
 
+pub use approved_mcp::{
+    open_host_stores, open_host_stores_with_known_dirs, ApprovalSummaryPage, ApprovedActivityPage,
+    ApprovedActivityParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
+    HostStoreHandles, ListApprovalsParams, StartApprovedTaskParams, DEFAULT_APPROVAL_LIST_LIMIT,
+    DEFAULT_APPROVED_ACTIVITY_LIMIT, HOST_NOT_CONFIGURED_MESSAGE, MAX_APPROVAL_CURSOR_LEN,
+    MAX_APPROVAL_LIST_LIMIT, MAX_APPROVED_ACTIVITY_LIMIT, MAX_APPROVED_CANCEL_REASON_LEN,
+};
 pub use client::{
     NativeClient, NativeConfig, NativeDiagnosticReport, NativeMcpServerStatus,
     NativeMcpToolCallResult, NativeThread, NativeThreadPage,
@@ -46,7 +55,7 @@ pub use error::{NativeError, NativeErrorCode};
 pub use mcp_pair::{
     open_workflow_stores, CatalogParams, ConnectionIdentityParams, DraftTaskParams, GetPlanParams,
     ListPlansParams, PairedMcpServer, PlanTaskParams, PublishParams, PublishPlanParams,
-    SaveDraftParams, SavePlanDraftParams, WorkflowTaskParams,
+    SaveDraftParams, SavePlanDraftParams, WorkflowStoreHandles, WorkflowTaskParams,
 };
 pub use pairing::{
     ConnectionEpochState, ConnectionIdentity, EnrollmentRecord, NativeVerificationStatus,
@@ -55,6 +64,14 @@ pub use pairing::{
 pub use rpc::{
     build_proxy_args, is_process_alive, is_process_group_alive, InitializeResult, ProxyCallError,
     DEFAULT_PROXY_TIMEOUT, MAX_RPC_FRAME_BYTES, MAX_RPC_STDERR_BYTES, MAX_RPC_TOTAL_STDOUT_BYTES,
+};
+pub use threadlane_authority::{
+    ApprovalRecord, ApprovalSummary, AuthorityError, AuthorityStore, MaterializedPlan,
+    OperatorApprovalRequest,
+};
+pub use threadlane_host::{
+    ApprovedHostClient, HostError, HostExecutionGates, HostPhase, HostSessionManifest,
+    HostSessionSummary, TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot,
 };
 pub use threadlane_workflow::{
     CatalogAssignment, CatalogPage, CatalogProfile, CatalogRoleAssignment, DeliveryReceipt,
@@ -796,9 +813,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Verify capability count: `connection_identity` + 15 delegated runtime tools + 5 workflow tools = 21 tools.
+        // Verify capability count: `connection_identity` + 15 delegated runtime tools + 5 workflow tools + 6 approved-task tools = 27 tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 21, "PairedMcpServer must expose 21 tools");
+        assert_eq!(tools.len(), 27, "PairedMcpServer must expose 27 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1132,7 +1149,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 21);
+        assert_eq!(tools.len(), 27);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),
@@ -2232,3 +2249,6 @@ fi
         );
     }
 }
+
+#[cfg(test)]
+mod approved_tests;

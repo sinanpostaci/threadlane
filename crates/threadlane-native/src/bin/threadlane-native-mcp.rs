@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use threadlane_native::{open_workflow_stores, PairedMcpServer, PairingStore};
+use threadlane_native::{
+    open_host_stores_with_known_dirs, open_workflow_stores, PairedMcpServer, PairingStore,
+};
 
 /// Command-line arguments for `threadlane-native-mcp`.
 #[derive(Debug, Parser)]
@@ -38,6 +40,24 @@ struct Cli {
     /// Must be provided together with `--registry-dir`.
     #[arg(long, value_name = "DIR", requires = "registry_dir")]
     plans_dir: Option<PathBuf>,
+
+    /// Optional path to the private (`0700`) global operator approval authority directory (`approvals.json`).
+    /// Must be provided together with `--sessions-dir`, `--registry-dir`, and `--plans-dir`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires_all = ["sessions_dir", "registry_dir", "plans_dir"]
+    )]
+    authority_dir: Option<PathBuf>,
+
+    /// Optional path to the private (`0700`) operator-selected approved host sessions root directory.
+    /// Must be provided together with `--authority-dir`, `--registry-dir`, and `--plans-dir`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        requires_all = ["authority_dir", "registry_dir", "plans_dir"]
+    )]
+    sessions_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -81,8 +101,32 @@ async fn main() -> ExitCode {
         }
     };
 
+    let host_stores = match open_host_stores_with_known_dirs(
+        cli.authority_dir.as_deref(),
+        cli.sessions_dir.as_deref(),
+        workflow_stores.as_ref(),
+        &[
+            ("state_dir", &cli.state_dir),
+            ("pairing_dir", server.pairing_store().dir()),
+        ],
+    ) {
+        Ok(stores) => stores,
+        Err(err) => {
+            eprintln!(
+                "threadlane-native-mcp error [{}]: {}",
+                err.code(),
+                err.message()
+            );
+            return ExitCode::from(1);
+        }
+    };
+
     if let Some((registry, plans)) = workflow_stores {
         server = server.with_workflow_stores(registry, plans);
+    }
+
+    if let Some((authority, sessions_dir)) = host_stores {
+        server = server.with_host_stores(authority, sessions_dir);
     }
 
     if let Err(err) = server.run_stdio().await {

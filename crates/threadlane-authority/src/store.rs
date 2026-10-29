@@ -162,6 +162,22 @@ impl AuthorityStore {
         &self.dir
     }
 
+    /// Returns the shared [`RegistryStore`] handle backing this authority store.
+    ///
+    /// This is a trusted Rust-only handle for sharing the exact operator-configured store and
+    /// preserving `Arc` identity. It is never serialized or exposed through MCP responses.
+    pub fn registry(&self) -> &Arc<RegistryStore> {
+        &self.registry
+    }
+
+    /// Returns the shared [`PlanStore`] handle backing this authority store.
+    ///
+    /// This is a trusted Rust-only handle for sharing the exact operator-configured store and
+    /// preserving `Arc` identity. It is never serialized or exposed through MCP responses.
+    pub fn plans(&self) -> &Arc<PlanStore> {
+        &self.plans
+    }
+
     /// Returns the path to `approvals.json` inside [`Self::dir`].
     pub fn approvals_path(&self) -> &Path {
         &self.approvals_path
