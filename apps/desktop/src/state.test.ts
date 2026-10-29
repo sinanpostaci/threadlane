@@ -4,11 +4,17 @@ import assert from 'node:assert/strict';
 import {
   applyMutationError,
   applyMutationSuccess,
+  applyPlansRefreshError,
+  applyPlansRefreshSuccess,
+  applyRegistryRefreshError,
+  applyRegistryRefreshSuccess,
   applyRunDetailError,
   applyRunDetailSuccess,
   applySnapshotPollError,
   applySnapshotPollSuccess,
   beginMutation,
+  beginPlansRefresh,
+  beginRegistryRefresh,
   beginRunDetailRefresh,
   beginSnapshotPoll,
   createInitialSnapshot,
@@ -18,6 +24,7 @@ import {
   openRunDetail,
   resolveExpectedDemoRevision,
   selectBinding,
+  shouldRebuildMainOnPoll,
 } from './state.ts';
 import {
   classifyTaskBucket,
@@ -31,7 +38,19 @@ import {
   matchesProviderFilter,
   resolveTaskBrand,
   sanitizeAppearancePreferences,
+  sanitizeExecutionPreferences,
+  validateExecutionPreferencesInput,
 } from './format.ts';
+import {
+  applyPlanChangeLocally,
+  applyRegistryChangeLocally,
+  createEmptyRegistrySnapshot,
+  normalizeAppError,
+  resolve_choice,
+  validatePlanTasksDag,
+  type PlanRevision,
+} from './registry/ipc.ts';
+import { deriveDeliveryReceipts, toPlanTaskDto } from './pages/plans.ts';
 import type { DesktopSnapshot, QueueBucket, RunDetail, TaskKind, TaskSummary } from './types.ts';
 
 function makeTask(overrides: Partial<TaskSummary> = {}): TaskSummary {
@@ -726,5 +745,312 @@ describe('task classification, profile derivation & appearance validation', () =
       ),
       'Local demo'
     );
+  });
+});
+
+describe('M4 editable page poll isolation & independent registry/plans refresh', () => {
+  it('does not rebuild editable pages on 2s runtime snapshot polls unless run detail is open', () => {
+    let state = createInitialState();
+    assert.equal(state.page, 'activity');
+    assert.equal(shouldRebuildMainOnPoll(state), true);
+
+    for (const editablePage of ['tools', 'profiles', 'plans', 'settings', 'chats'] as const) {
+      state = navigateToPage(state, editablePage);
+      assert.equal(
+        shouldRebuildMainOnPoll(state),
+        false,
+        `expected shouldRebuildMainOnPoll=false on page ${editablePage}`
+      );
+    }
+
+    const withDetail = openRunDetail(state, 'bind-alpha', 'run-1').state;
+    assert.equal(shouldRebuildMainOnPoll(withDetail), true);
+  });
+
+  it('keeps registry and plans refresh state independent of runtime snapshot polling and stale tickets', () => {
+    let state = navigateToPage(createInitialState(), 'profiles');
+
+    const reg1 = beginRegistryRefresh(state);
+    assert.ok(reg1.ticket !== null);
+    const reg2 = beginRegistryRefresh(reg1.state, true);
+    assert.ok(reg2.ticket !== null);
+
+    const updatedRegistry = applyRegistryChangeLocally(createEmptyRegistrySnapshot(), 0, {
+      op: 'upsert_tool',
+      tool: {
+        id: 'agy',
+        label: 'Antigravity',
+        adapter: 'antigravity',
+        executable_path: '/usr/bin/agy',
+        enabled: true,
+      },
+    });
+
+    // Stale ticket reg1 is ignored after reg2 was issued
+    state = applyRegistryRefreshSuccess(reg2.state, reg1.ticket, updatedRegistry);
+    assert.equal(state.registrySnapshot.revision, 0);
+
+    // Latest ticket reg2 applies cleanly
+    state = applyRegistryRefreshSuccess(state, reg2.ticket, updatedRegistry);
+    assert.equal(state.registrySnapshot.revision, 1);
+    assert.equal(state.registrySnapshot.tools.length, 1);
+
+    // Runtime snapshot poll error does not corrupt registrySnapshot or registryError
+    const poll = beginSnapshotPoll(state);
+    assert.ok(poll.ticket !== null);
+    state = applySnapshotPollError(poll.state, poll.ticket, 'Runtime observer disconnected.');
+    assert.equal(state.registrySnapshot.revision, 1);
+    assert.equal(state.registryError, null);
+    assert.equal(shouldRebuildMainOnPoll(state), false);
+
+    // Stale registry error does not overwrite newer registry state
+    state = applyRegistryRefreshError(state, reg1.ticket, 'Stale read error');
+    assert.equal(state.registryError, null);
+  });
+});
+
+describe('M4 registry CRUD, CAS conflict protection, and strict role resolution', () => {
+  it('enforces CAS revisions, reference integrity, and exact/default role resolution without fallback', () => {
+    let snap = createEmptyRegistrySnapshot();
+    assert.equal(snap.revision, 0);
+
+    snap = applyRegistryChangeLocally(snap, 0, {
+      op: 'upsert_tool',
+      tool: {
+        id: 'agy',
+        label: 'Antigravity',
+        adapter: 'antigravity',
+        executable_path: '/usr/bin/agy',
+        enabled: true,
+      },
+    });
+    assert.equal(snap.revision, 1);
+
+    // Stale CAS revision 0 must fail with revision_conflict
+    assert.throws(
+      () =>
+        applyRegistryChangeLocally(snap, 0, {
+          op: 'upsert_tool',
+          tool: {
+            id: 'oc',
+            label: 'OpenCode',
+            adapter: 'opencode_v2',
+            executable_path: '/usr/bin/opencode',
+            enabled: true,
+          },
+        }),
+      (err: unknown) => (err as { code?: string }).code === 'revision_conflict'
+    );
+
+    snap = applyRegistryChangeLocally(snap, 1, {
+      op: 'upsert_models',
+      models: [
+        {
+          id: 'agy-argon',
+          tool_id: 'agy',
+          label: 'Gemini 4 Argon',
+          model_arg: 'gemini-4-argon-high',
+          efforts: ['high'],
+          allow_no_effort: false,
+        },
+      ],
+    });
+    assert.equal(snap.revision, 2);
+
+    // Cannot delete a tool while a model references it
+    assert.throws(
+      () =>
+        applyRegistryChangeLocally(snap, 2, {
+          op: 'delete_tool',
+          tool_id: 'agy',
+        }),
+      (err: unknown) => (err as { code?: string }).code === 'tool_in_use'
+    );
+
+    // Partial profile saves and resolves exact difficulty first, then role default, and errors on missing role
+    snap = applyRegistryChangeLocally(snap, 2, {
+      op: 'upsert_profile',
+      profile: {
+        id: 'm4-prof',
+        name: 'M4 Profile',
+        assignments: [
+          {
+            role: 'coder',
+            difficulty: 'hard',
+            choice: { model_id: 'agy-argon', effort: 'high' },
+          },
+          {
+            role: 'reviewer',
+            difficulty: null,
+            choice: { model_id: 'agy-argon', effort: 'high' },
+          },
+        ],
+      },
+    });
+    assert.equal(snap.revision, 3);
+
+    const hardCoder = resolve_choice(snap, 'm4-prof', 'coder', 'hard');
+    assert.deepEqual(hardCoder, { model_id: 'agy-argon', effort: 'high' });
+
+    const anyReviewer = resolve_choice(snap, 'm4-prof', 'reviewer', 'easy');
+    assert.deepEqual(anyReviewer, { model_id: 'agy-argon', effort: 'high' });
+
+    // Missing coder/easy with no coder default must fail explicitly (no model substitution)
+    assert.throws(
+      () => resolve_choice(snap, 'm4-prof', 'coder', 'easy'),
+      (err: unknown) => (err as { code?: string }).code === 'missing_assignment'
+    );
+  });
+});
+
+describe('M4 durable plan ledger, DAG validation, and execution preference bounds', () => {
+  it('validates plan task DAG, enforces CAS on draft/publish/receive/apply, and derives receipts', () => {
+    const validTask = toPlanTaskDto({
+      id: 'task-1',
+      title: 'Implement registry store',
+      instruction: 'Persist atomic JSON with lockfile.',
+      role: 'coder',
+      difficulty: 'hard',
+      dependsOnText: '',
+      allowedWritePathsText: 'crates/threadlane-registry',
+    });
+
+    // Rejects cyclic dependencies and unsafe write paths
+    assert.throws(
+      () =>
+        validatePlanTasksDag([
+          { ...validTask, id: 'a', depends_on: ['b'] },
+          { ...validTask, id: 'b', depends_on: ['a'] },
+        ]),
+      (err: unknown) => (err as { code?: string }).code === 'invalid_dag'
+    );
+    assert.throws(
+      () =>
+        validatePlanTasksDag([
+          { ...validTask, allowed_write_paths: ['/etc/nixos'] },
+        ]),
+      (err: unknown) => (err as { code?: string }).code === 'invalid_scope'
+    );
+
+    let ledger: PlanRevision[] = [];
+    const saved = applyPlanChangeLocally(
+      ledger,
+      0,
+      {
+        op: 'save_draft',
+        plan_id: 'plan-alpha',
+        binding_id: 'bind-alpha',
+        profile_id: 'default',
+        profile_revision: 3,
+        summary: 'Initial M4 slice plan',
+        tasks: [validTask],
+      },
+      1730000100000
+    );
+    ledger = saved.revisions;
+    assert.equal(saved.updated.revision, 1);
+    assert.equal(saved.updated.status, 'draft');
+
+    // Stale expectedRevision 0 rejected
+    assert.throws(
+      () =>
+        applyPlanChangeLocally(ledger, 0, {
+          op: 'publish',
+          plan_id: 'plan-alpha',
+          revision: 1,
+        }),
+      (err: unknown) => (err as { code?: string }).code === 'revision_conflict'
+    );
+
+    // Publish, idempotent repeat publish, receive, and apply keep revision 1
+    const published = applyPlanChangeLocally(ledger, 1, {
+      op: 'publish',
+      plan_id: 'plan-alpha',
+      revision: 1,
+    });
+    ledger = published.revisions;
+    assert.equal(published.updated.revision, 1);
+    assert.equal(published.updated.status, 'published');
+
+    const repeatPublish = applyPlanChangeLocally(ledger, 1, {
+      op: 'publish',
+      plan_id: 'plan-alpha',
+      revision: 1,
+    });
+    assert.equal(repeatPublish.updated.status, 'published');
+
+    const received = applyPlanChangeLocally(ledger, 1, {
+      op: 'receive',
+      plan_id: 'plan-alpha',
+      revision: 1,
+    });
+    ledger = received.revisions;
+    assert.equal(received.updated.status, 'received');
+
+    const applied = applyPlanChangeLocally(ledger, 1, {
+      op: 'apply',
+      plan_id: 'plan-alpha',
+      revision: 1,
+    });
+    ledger = applied.revisions;
+    assert.equal(applied.updated.status, 'applied');
+
+    const planRefresh = beginPlansRefresh(createInitialState());
+    assert.ok(planRefresh.ticket !== null);
+    const stateWithPlans = applyPlansRefreshSuccess(
+      planRefresh.state,
+      planRefresh.ticket,
+      ledger
+    );
+    const receipts = deriveDeliveryReceipts(stateWithPlans.plansSnapshot);
+    assert.deepEqual(receipts, [{ plan_id: 'plan-alpha', revision: 1, state: 'applied' }]);
+
+    const failedRefresh = beginPlansRefresh(stateWithPlans);
+    assert.ok(failedRefresh.ticket !== null);
+    const stateWithPlanErr = applyPlansRefreshError(
+      failedRefresh.state,
+      failedRefresh.ticket,
+      'Failed to read plans ledger.'
+    );
+    assert.equal(stateWithPlanErr.plansError, 'Failed to read plans ledger.');
+    assert.equal(stateWithPlanErr.plansSnapshot.length, 1);
+  });
+
+  it('clamps execution preferences to safe bounds, rejects arbitrary shell/env keys, and redacts secrets', () => {
+    const validated = validateExecutionPreferencesInput({
+      maxConcurrentWorkers: 99,
+      maxTasksPerPlan: 0,
+      workerTimeoutSecs: 5,
+      decisionBudgetTokens: 50000,
+      redactPathsInLogs: false,
+      requireExplicitPublish: true,
+      shellFlags: '--dangerous-flag',
+      env: { OPENAI_API_KEY: 'sk-secret' },
+    });
+
+    assert.equal(validated.prefs.maxConcurrentWorkers, 8);
+    assert.equal(validated.prefs.maxTasksPerPlan, 1);
+    assert.equal(validated.prefs.workerTimeoutSecs, 30);
+    assert.equal(validated.prefs.decisionBudgetTokens, 8192);
+    assert.equal(validated.prefs.redactPathsInLogs, false);
+    assert.equal(validated.prefs.requireExplicitPublish, true);
+    assert.deepEqual(validated.rejectedKeys, ['shellFlags', 'env']);
+
+    const sanitizedPrefs = sanitizeExecutionPreferences({
+      maxConcurrentWorkers: 4,
+      shellFlags: '--ignored',
+    });
+    assert.equal(sanitizedPrefs.maxConcurrentWorkers, 4);
+    assert.equal('shellFlags' in (sanitizedPrefs as unknown as Record<string, unknown>), false);
+
+    const err = normalizeAppError(
+      { code: 'vault_error', message: 'Failed storing key super-secret-val-99' },
+      'secret_set_failed',
+      'Failed to store credential in OS keychain.',
+      'super-secret-val-99'
+    );
+    assert.equal(err.code, 'vault_error');
+    assert.equal(err.message, 'Failed to store credential in OS keychain.');
+    assert.ok(!err.message.includes('super-secret-val-99'));
   });
 });

@@ -1,15 +1,22 @@
 import {
   DEFAULT_APPEARANCE,
+  DEFAULT_EXECUTION_PREFERENCES,
   type AppearancePreferences,
   type DesktopSnapshot,
   type DetailTab,
   type DetailTarget,
+  type ExecutionPreferences,
   type NavPage,
   type PendingMutation,
   type RunDetail,
   type TaskProviderFilter,
   type ToolStatus,
 } from './types.ts';
+import {
+  createEmptyRegistrySnapshot,
+  type PlanRevision,
+  type RegistrySnapshot,
+} from './registry/types.ts';
 
 export interface SnapshotTicket {
   readonly seq: number;
@@ -27,6 +34,14 @@ export interface DetailTicket {
   readonly seq: number;
   readonly bindingId: string;
   readonly runId: string;
+}
+
+export interface RegistryTicket {
+  readonly seq: number;
+}
+
+export interface PlansTicket {
+  readonly seq: number;
 }
 
 export interface DesktopStoreState {
@@ -51,10 +66,21 @@ export interface DesktopStoreState {
   tools: ToolStatus[];
   toolsLoading: boolean;
   toolsError: string | null;
+  registrySnapshot: RegistrySnapshot;
+  registryLoading: boolean;
+  registryInFlight: boolean;
+  registryRequestSeq: number;
+  registryError: string | null;
+  plansSnapshot: PlanRevision[];
+  plansLoading: boolean;
+  plansInFlight: boolean;
+  plansRequestSeq: number;
+  plansError: string | null;
   pendingMutation: PendingMutation;
   actionError: string | null;
   stateDirDraft: string;
   appearance: AppearancePreferences;
+  executionPrefs: ExecutionPreferences;
   isDevPreviewFixture: boolean;
 }
 
@@ -86,7 +112,8 @@ export function createInitialSnapshot(nowMs: number = Date.now()): DesktopSnapsh
 
 export function createInitialState(
   appearance: AppearancePreferences = { ...DEFAULT_APPEARANCE },
-  nowMs: number = Date.now()
+  nowMs: number = Date.now(),
+  executionPrefs: ExecutionPreferences = { ...DEFAULT_EXECUTION_PREFERENCES }
 ): DesktopStoreState {
   return {
     page: 'activity',
@@ -103,19 +130,42 @@ export function createInitialState(
     detailTab: 'overview',
     runDetail: null,
     detailLoading: false,
-    detailError: null,
     detailInFlight: false,
+    detailError: null,
     detailRequestSeq: 0,
     selectedToolId: null,
     tools: [],
     toolsLoading: true,
     toolsError: null,
+    registrySnapshot: createEmptyRegistrySnapshot(),
+    registryLoading: true,
+    registryInFlight: false,
+    registryRequestSeq: 0,
+    registryError: null,
+    plansSnapshot: [],
+    plansLoading: true,
+    plansInFlight: false,
+    plansRequestSeq: 0,
+    plansError: null,
     pendingMutation: null,
     actionError: null,
     stateDirDraft: appearance.rememberStateDir ? appearance.savedStateDir : '',
     appearance: { ...appearance },
+    executionPrefs: { ...executionPrefs },
     isDevPreviewFixture: false,
   };
+}
+
+/**
+ * Returns true only when a background 2s runtime observer poll should rebuild the main pane.
+ * Editable pages (`tools`, `profiles`, `plans`, `settings`, `chats`) are never rebuilt on background
+ * runtime polls so that form drafts, focus, and scroll positions remain intact.
+ */
+export function shouldRebuildMainOnPoll(state: DesktopStoreState): boolean {
+  if (state.detailTarget !== null) {
+    return true;
+  }
+  return state.page === 'activity';
 }
 
 function resolveScopedBindingId(
@@ -238,6 +288,108 @@ export function applySnapshotPollError(
     snapshotLoading: false,
     pollInFlight: false,
     actionError: errorMessage,
+  };
+}
+
+export function beginRegistryRefresh(
+  state: DesktopStoreState,
+  force: boolean = true
+): { state: DesktopStoreState; ticket: RegistryTicket | null } {
+  if (state.registryInFlight && !force) {
+    return { state, ticket: null };
+  }
+  const nextSeq = state.registryRequestSeq + 1;
+  return {
+    state: {
+      ...state,
+      registryInFlight: true,
+      registryRequestSeq: nextSeq,
+    },
+    ticket: { seq: nextSeq },
+  };
+}
+
+export function applyRegistryRefreshSuccess(
+  state: DesktopStoreState,
+  ticket: RegistryTicket,
+  registrySnapshot: RegistrySnapshot
+): DesktopStoreState {
+  if (ticket.seq < state.registryRequestSeq) {
+    return state;
+  }
+  return {
+    ...state,
+    registrySnapshot,
+    registryLoading: false,
+    registryInFlight: false,
+    registryError: null,
+  };
+}
+
+export function applyRegistryRefreshError(
+  state: DesktopStoreState,
+  ticket: RegistryTicket,
+  errorMessage: string
+): DesktopStoreState {
+  if (ticket.seq < state.registryRequestSeq) {
+    return state;
+  }
+  return {
+    ...state,
+    registryLoading: false,
+    registryInFlight: false,
+    registryError: errorMessage,
+  };
+}
+
+export function beginPlansRefresh(
+  state: DesktopStoreState,
+  force: boolean = true
+): { state: DesktopStoreState; ticket: PlansTicket | null } {
+  if (state.plansInFlight && !force) {
+    return { state, ticket: null };
+  }
+  const nextSeq = state.plansRequestSeq + 1;
+  return {
+    state: {
+      ...state,
+      plansInFlight: true,
+      plansRequestSeq: nextSeq,
+    },
+    ticket: { seq: nextSeq },
+  };
+}
+
+export function applyPlansRefreshSuccess(
+  state: DesktopStoreState,
+  ticket: PlansTicket,
+  plansSnapshot: PlanRevision[]
+): DesktopStoreState {
+  if (ticket.seq < state.plansRequestSeq) {
+    return state;
+  }
+  return {
+    ...state,
+    plansSnapshot,
+    plansLoading: false,
+    plansInFlight: false,
+    plansError: null,
+  };
+}
+
+export function applyPlansRefreshError(
+  state: DesktopStoreState,
+  ticket: PlansTicket,
+  errorMessage: string
+): DesktopStoreState {
+  if (ticket.seq < state.plansRequestSeq) {
+    return state;
+  }
+  return {
+    ...state,
+    plansLoading: false,
+    plansInFlight: false,
+    plansError: errorMessage,
   };
 }
 

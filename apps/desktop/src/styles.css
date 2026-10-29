@@ -801,6 +801,67 @@ summary::-webkit-details-marker {
   color: var(--aq-text);
 }
 
+.aq-select-input {
+  width: 100%;
+  min-width: 0;
+  background: var(--aq-field);
+  border: 1px solid var(--aq-line);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 12px;
+  color: var(--aq-text);
+}
+
+.aq-textarea-input {
+  width: 100%;
+  min-width: 0;
+  background: var(--aq-field);
+  border: 1px solid var(--aq-line);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--aq-text);
+  resize: vertical;
+}
+
+.aq-card {
+  margin: 10px 0;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--aq-line);
+}
+
+.aq-task-editor-card {
+  margin: 8px 0;
+  padding: 9px 10px;
+  border: 1px solid var(--aq-line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--aq-field) 55%, transparent);
+}
+
+.aq-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.aq-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.aq-field-full {
+  grid-column: 1 / -1;
+}
+
+.aq-field-label {
+  font-size: 11px;
+  color: var(--aq-muted);
+}
+
 .aq-swatches {
   display: flex;
   gap: 12px;
@@ -874,7 +935,7 @@ summary::-webkit-details-marker {
 .aq-nav {
   flex: none;
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   gap: 2px;
   padding: 3px 7px 7px;
   border-top: 1px solid var(--aq-line);
