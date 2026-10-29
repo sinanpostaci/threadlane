@@ -49,20 +49,26 @@ pub mod supervisor;
 pub use cli::{load_worker_spec_file, run_cli, CreatedWorktreesReport, WorkerCli, WorkerCommand};
 pub use error::{CleanupRefusalReason, WorkerApiError, WorkerError, WorkerErrorCode};
 pub use fs_safety::{
-    ensure_platform_supported, ensure_private_dir, sanitize_and_redact, truncate_utf8,
-    validate_absolute_no_symlink_components, validate_executable_file,
-    validate_existing_canonical_dir,
+    ensure_platform_supported, ensure_private_dir, open_private_lock_file, read_private_json,
+    sanitize_and_redact, truncate_utf8, validate_absolute_no_symlink_components,
+    validate_executable_file, validate_existing_canonical_dir, validate_preexisting_private_file,
+    write_private_json_atomic,
 };
 pub use git::{
-    begin_worktree_job, cleanup_worktree, evaluate_diff_gate, evaluate_diff_gate_with_limits,
-    evaluate_diff_gate_with_scan_limits, evaluate_diff_gate_with_timeout, execute_worker_task,
-    execute_worker_task_with_observer, load_and_verify_manifest, ChangedPathEntry, CleanupReport,
+    begin_worktree_job, cleanup_integrated_worktree, cleanup_worktree, evaluate_diff_gate,
+    evaluate_diff_gate_with_limits, evaluate_diff_gate_with_scan_limits,
+    evaluate_diff_gate_with_timeout, execute_worker_task, execute_worker_task_with_observer,
+    is_commit_ancestor, is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha,
+    resolve_exact_tree_sha, run_sanitized_git, run_sanitized_git_allow_nonzero,
+    run_sanitized_git_bytes, sanitize_git_command_env, sanitize_git_command_env_from,
+    validate_exact_40_hex_sha, validate_sha256_hex_digest, ChangedPathEntry, CleanupReport,
     CleanupRequest, DiffChangeKind, DiffGateReport, DiffViolation, DiffViolationKind,
-    IsolationLevel, TaskExecutionReport, WorkAcceptanceState, WorkAreaOwnershipMarker,
-    WorktreeJobGuard, WorktreeKind, WorktreeManager, WorktreeManifest, CHECKOUTS_SUBDIR,
+    IntegratedCleanupReport, IntegratedCleanupRequest, IsolationLevel, SupervisedGitOutput,
+    TaskExecutionReport, WorkAcceptanceState, WorkAreaOwnershipMarker, WorktreeJobGuard,
+    WorktreeKind, WorktreeManager, WorktreeManifest, CHECKOUTS_SUBDIR,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
     DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION,
-    WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
+    SANITIZED_GIT_ENV_OVERRIDES, WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
 };
 pub use permissions::{
     build_antigravity_task_files_settings_json, is_unsafe_permission_pattern_char,
