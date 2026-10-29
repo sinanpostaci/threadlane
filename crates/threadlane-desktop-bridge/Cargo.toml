@@ -1,0 +1,20 @@
+[package]
+name = "threadlane-desktop-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Pure Rust typed observer and local demo bridge for the Threadlane Milestone 3A desktop panel"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+threadlane = { path = "../threadlane" }
+threadlane-core = { path = "../threadlane-core" }
+tokio = { version = "1", features = ["sync", "time"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+
+[dev-dependencies]
+axum = "0.8"
+tempfile = "3.10"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync", "time"] }

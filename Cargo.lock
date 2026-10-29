@@ -1355,6 +1355,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-desktop-bridge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "threadlane",
+ "threadlane-core",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "threadlane-workers"
 version = "0.1.0"
 dependencies = [

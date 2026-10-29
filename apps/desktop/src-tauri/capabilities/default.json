@@ -1,0 +1,9 @@
+{
+  "identifier": "default",
+  "description": "Minimal capability for the local Threadlane desktop panel window without filesystem, shell, or network plugin permissions.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}
