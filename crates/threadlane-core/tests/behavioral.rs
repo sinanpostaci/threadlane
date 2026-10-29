@@ -2230,10 +2230,7 @@ fn manual_retry_wakeup_lifecycle_audit_isolation_and_ack_reconciliation() {
     assert_eq!(pending_after_reopen.attempt_count, 1);
     assert_eq!(pending_after_reopen.pending_since_seq, Some(3));
 
-    let claim_2 = core
-        .claim_wakeup(1_150)
-        .expect("claim 2")
-        .expect("claim_2");
+    let claim_2 = core.claim_wakeup(1_150).expect("claim 2").expect("claim_2");
     assert_ne!(claim_2.claim_id, claim_1.claim_id);
     assert_eq!(claim_2.pending_since_seq, 3);
     assert_eq!(claim_2.covered_up_to_seq, 3);
@@ -2316,10 +2313,7 @@ fn manual_retry_wakeup_lifecycle_audit_isolation_and_ack_reconciliation() {
     assert_eq!(rearmed_2.resolved_at_ms, None);
 
     // Claim claim_3 and record Submitted -> Reject retry on Submitted.
-    let claim_3 = core
-        .claim_wakeup(1_220)
-        .expect("claim 3")
-        .expect("claim_3");
+    let claim_3 = core.claim_wakeup(1_220).expect("claim 3").expect("claim_3");
     core.record_wakeup_result(&claim_3.claim_id, WakeupOutcome::Submitted, 1_230)
         .expect("submit claim 3");
     assert!(matches!(

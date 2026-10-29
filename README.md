@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early Milestone 1 foundation, developed with AI assistance and reviewed before checkpointing. This is **not production ready**. On Linux/NixOS, 25 automated tests and the CLI smoke check pass. A real Codex chat received a runtime wake-up, but that chat could not discover the new MCP server. The complete native conversation loop remains unverified. See [validation evidence](docs/VALIDATION.md).
+> **Status:** Early Milestone 1 foundation, developed with AI assistance and reviewed before checkpointing. This is **not production ready**. On Linux/NixOS, 34 automated tests and the CLI smoke check pass. A real Codex chat received a runtime wake-up. The installed Codex MCP client can discover all eight tools, but the already open desktop test chat still needs a supported MCP refresh. The complete native conversation loop remains unverified. See [validation evidence](docs/VALIDATION.md) and the [closure review](docs/CLOSURE-REVIEW.md).
 
 ---
 
@@ -12,8 +12,8 @@ Threadlane is a local execution middleware and control plane designed to work al
 - **`threadlane-core` (`crates/threadlane-core`)**: Transactional SQLite state engine (`SCHEMA_VERSION = 1`) with validated non-nil Codex thread UUID bindings, deterministic simulated demo runs, revision-checked `answer` / `steer` / `cancel` transitions, per-binding idempotent command deduplication, bounded event batches, high-water-mark event acknowledgements, and persistent wake-up notice coalescing and crash/reopen recovery.
 - **`threadlane` runtime (`crates/threadlane`)**:
   - **Single-owner supervisor (`threadlane serve`)**: Holds an exclusive process-lifetime file lock (`supervisor.lock`) tied to the active state engine, owns the SQLite database (`state.db`) and timed demo progression ticks, binds only `127.0.0.1:0`, and writes an atomic private runtime descriptor (`supervisor.json`) containing a fresh 64-hex-character bearer token (244 random bits from two v4 UUIDs).
-  - **Trusted CLI (`threadlane bind`, `list-bindings`, `status`, `call`)**: Configures chat bindings and executes binding-scoped operations over authenticated loopback HTTP with streamed response size enforcement.
-  - **Scoped stdio MCP server (`threadlane mcp`)**: Built on the official Rust MCP SDK (`rmcp = "=3.8.0"`). Launched for a single pre-configured `binding_id` and exposes `status`, `get_run`, `start_demo`, `pull_events`, `ack_events`, `answer`, `steer`, and `cancel`.
+  - **Trusted CLI (`threadlane bind`, `list-bindings`, `status`, `call`, `retry-wakeup`)**: Configures chat bindings and executes binding-scoped operations over authenticated loopback HTTP with streamed response size enforcement.
+  - **Scoped stdio MCP server (`threadlane mcp`)**: Built on the official Rust MCP SDK (`rmcp = "=3.8.0"`). Launched for a single pre-configured `binding_id`; discovery works while the supervisor is offline, and every tool call revalidates the current private descriptor. It exposes `status`, `get_run`, `start_demo`, `pull_events`, `ack_events`, `answer`, `steer`, and `cancel`.
   - **Opt-in Codex wake-up adapter (`--codex` + `--notify-binding`)**: Disabled by default. When explicitly configured with an absolute executable path and a binding allowlist, persists `InFlight` intent before invoking `["queue", "--thread", "<UUID>", "--message", FIXED_WAKEUP_MESSAGE]` with a bounded timeout and no model, effort, approval, or sandbox overrides.
   - **Self-contained CLI smoke script (`scripts/smoke.py`)**: Exercises the simulated loop in an isolated temporary directory without touching live chats or paid APIs.
 
@@ -30,11 +30,11 @@ Threadlane is a local execution middleware and control plane designed to work al
 1. **Single State Owner & Explicit Fault Handling**:
    - Only `threadlane serve` opens `state.db`. A non-blocking exclusive `flock` on `supervisor.lock` rejects concurrent supervisor instances on the same state directory.
    - `Core` ownership and `supervisor.lock` are bundled together inside the supervisor's active state guard. Shutdown stops acceptance, gives the worker a bounded opportunity to persist its final outcome, then retires pending requests. Dropping the handle retires it immediately. The old engine cannot mutate after a new owner acquires the lock; descriptor cleanup occurs while ownership is still held.
-   - If a background `tick`, wake-up claim, or wake-up result write encounters a SQLite persistence failure, the supervisor logs a bounded redacted diagnostic, stops the background loop without retrying uncertain external side effects, and fails subsequent requests closed with `storage_error`.
+   - If a background `tick`, wake-up claim, or wake-up result write encounters a SQLite persistence failure, the supervisor logs a bounded redacted diagnostic, stops the background loop without retrying uncertain external side effects, and fails subsequent requests closed with `storage_error`. The CLI then shuts down, releases ownership and exits nonzero; it does not stay alive as an apparently healthy service.
 2. **Loopback IPC & Private Descriptors**:
    - The supervisor binds `127.0.0.1:0` only and generates a fresh 64-hex-character bearer secret (two v4 UUIDs providing 244 random bits) on every start.
    - All HTTP endpoints require `Authorization: Bearer <token>`, compared with a non-short-circuiting fixed-length byte loop (`std::hint::black_box` accumulator, without claiming hardware/compiler-guaranteed side-channel immunity).
-   - On Unix, the state directory is enforced as `0700` and state/descriptor/lock/database files as `0600`. Symlink components anywhere along the state directory path (or on the state files themselves) and pre-existing files with group/world permissions are rejected before reads or writes.
+   - An unrelated non-empty directory is rejected before its permissions or contents are changed. On Unix, the dedicated state directory is enforced as `0700` and state/descriptor/lock/database files as `0600`. Symlink components anywhere along the state directory path (or on the state files themselves) and pre-existing files with group/world permissions are rejected before reads or writes.
    - **Canonical path note**: Because every component of `--state-dir` is checked with `symlink_metadata`, pass a canonical non-symlink path on systems where `/tmp` or `/var` is a platform symlink (for example on macOS where `/tmp` links to `/private/tmp`). Relative paths are resolved against the current working directory before checking components. These filesystem checks protect against accidental misconfiguration and other local users via standard Unix permissions (`0700`/`0600`), and do not claim isolation against malicious processes already running under the same OS user account.
    - Before sending a bearer token, the client verifies that the state directory (`0700`) and `supervisor.json` (`0600`) are private non-symlink paths, checks descriptor version `1` and loopback host `127.0.0.1`, bypasses environment HTTP proxies, disables HTTP redirects, and enforces request timeouts and streamed chunk response size limits (`2 MiB`).
    - Bearer tokens are redacted in `Debug` and `Display` formatting and never logged.
@@ -102,6 +102,27 @@ cargo build --workspace
 # 5. Launch the stdio MCP server for a single binding
 ./target/debug/threadlane mcp --state-dir /path/to/state_dir --binding bnd_<uuid>
 ```
+
+### Recovering a failed wake-up
+
+Inspect `threadlane status` first. Only an operator can re-arm a specific failed
+claim; MCP tools cannot perform this action:
+
+```sh
+threadlane retry-wakeup --state-dir /path/to/state_dir \
+  --binding bnd_<uuid> --expected-claim wcl_<uuid>
+```
+
+For an `unknown` outcome, add `--allow-unknown` only after deciding that a possible
+duplicate delivery is acceptable. Submitted, pending or in-flight claims cannot
+be forced through this command. A stale claim ID has no effect. The retry keeps
+the attempt history and audit record, and does not acknowledge any events.
+There are no automatic retries of failed or uncertain external effects.
+
+Timed demo events carry compact run/revision references rather than repeatedly
+copying the instruction. `get_run` retains the full instruction and history.
+Long-history pagination and compact mutation responses remain a prerequisite
+before real workers; event size limits alone do not bound full run snapshots.
 
 ### Running Tests and Smoke Check
 ```bash

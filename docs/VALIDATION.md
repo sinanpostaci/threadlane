@@ -24,14 +24,14 @@ was actually opened; the checks below ran inside that shell.
 
 | Check | Observed result |
 | --- | --- |
-| Core behavioural tests | 9 passed |
-| Independent core regressions | 5 passed |
-| HTTP, CLI, stdio MCP, and fake-Codex integration | 8 passed |
+| Core behavioural tests | 12 passed |
+| Core review regressions | 6 passed |
+| HTTP, CLI, stdio MCP, and fake-Codex integration | 13 passed |
 | Independent runtime regressions | 3 passed |
 | Formatting and Clippy with warnings denied | Passed |
 | CLI smoke with real local processes | Start, question, event delivery, acknowledgement, answer, completion, and idle wake state passed |
 
-The independent regressions initially reproduced failures and passed after
+The original independent regressions initially reproduced failures and passed after
 implementation fixes. They cover acknowledgement races, an empty-batch boundary,
 an old HTTP handler writing after its supervisor released ownership, symlinked
 parent directories, and a never-ending chunked response exceeding the byte budget.
@@ -41,6 +41,14 @@ The service reports a fault, rejects later operations, and does not repeat an
 external wake-up when recording its outcome fails. The stdio test initializes a
 real MCP process, lists and calls all eight tools, rejects injected scope/time
 arguments, and verifies that cross-binding requests have no effect.
+
+The closure pass adds coverage for escaped instructions through start/steer,
+completion and restart, additive v1 schema recovery, manual wake retry without
+cursor changes, stale claim rejection and durable retry history. Runtime checks
+cover offline MCP discovery followed by recovery in the same process, descriptor
+refresh/security, preserving unrelated directories and nonzero CLI exit on a
+fatal SQLite error. All 34 tests passed. A redundant `mut` in a new test was then
+removed to satisfy Clippy; formatting, Clippy, build and the CLI smoke all passed.
 
 ## Native Codex experiment
 
@@ -60,8 +68,15 @@ Per-invocation `codex queue -c mcp_servers...` options did not make the new tool
 appear in the already open chat. A temporary project-scoped MCP entry also did
 not appear there. These observations do not establish a general Codex limitation
 or a confirmed cause; configuration loading and client refresh still need an
-explicit setup check. No global Codex configuration was changed. Temporary test
-supervisors are stopped after verification, so no unsolicited wake-up remains.
+explicit setup check. During the follow-up, public `config/read` diagnostics identified the test
+project's local configuration as disabled because that project was not trusted.
+The user explicitly approved a temporary trust entry for only that test folder;
+the same API then showed the MCP entry enabled. The installed Codex app-server,
+given an explicit entry, listed all eight tools through its real MCP client
+without a model turn. The already open native chat still reported
+`MCP_UNAVAILABLE`. Its supported client refresh and callback test remain open.
+Test wake-up dispatch is off while waiting for that refresh. The temporary trust
+and project MCP entries are owned test fixtures to remove when the test ends.
 
 **Native round-trip acceptance remains open.** In a dedicated trusted test
 project, register the stdio command below through the client's supported MCP
@@ -71,7 +86,8 @@ configuration, refresh it, and first verify that `status` is actually callable:
 <absolute-threadlane-binary> mcp --state-dir <canonical-private-state-dir> --binding <test-binding-id>
 ```
 
-The supervisor must already be running. `threadlane bind` provides the binding
+The MCP process can initialize and list tools with the supervisor offline;
+actual tool calls require the supervisor. `threadlane bind` provides the binding
 ID. Its wake-up adapter must be enabled only for that same disposable chat.
 Complete a new demo using real MCP calls: start, receive the question wake-up,
 pull and acknowledge the delivered batch, answer the current revision, receive
@@ -88,6 +104,7 @@ Client setup reference: [Codex MCP configuration](https://learn.chatgpt.com/docs
 - The demo proves durable logical transitions, not recovery of real worker processes.
 - macOS and Windows have not been tested. Windows runtime startup fails closed
   until suitable private file ACL support is implemented.
-- Event retention and large-history performance have not been benchmarked.
+- Full run/mutation responses and retained history are not yet size-bounded;
+  pagination, compact mutation results and retention are a gate before real workers.
 - Secret files are private to the OS user. This does not isolate a malicious
   process already running as that same user.

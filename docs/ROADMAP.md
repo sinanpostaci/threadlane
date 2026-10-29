@@ -22,7 +22,8 @@ Threadlane -> affected worker. Software owns identity/correlation and lifecycle.
    duplicate safety and restart recovery in an isolated disposable chat.
 2. **Real workers and Git isolation.** OpenCode v2/Go and Antigravity adapters;
    requested/observed models and effort; per-task worktrees, per-run integration
-   worktree, scoped diff gates, process-tree supervision and evidence acceptance.
+   worktree, scoped diff gates, bounded/paginated run history and compact mutation
+   responses, process-tree supervision and evidence acceptance.
 3. **Desktop panel.** Tauri, a narrow TypeScript UI, Activity/Chats/Tools/Profiles/
    Settings, prompt and event inspection, system theme, accent, adjustable glass
    surface with an accessible opaque fallback. Choose the frontend library when

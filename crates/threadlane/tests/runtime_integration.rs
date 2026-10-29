@@ -1667,10 +1667,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
         Err(Error::Transport(_))
     ));
     assert!(matches!(
-        ScopedClient::from_state_dir(
-            &missing_state_dir,
-            "bnd_11111111222243338444555555555555"
-        ),
+        ScopedClient::from_state_dir(&missing_state_dir, "bnd_11111111222243338444555555555555"),
         Err(Error::Transport(_))
     ));
 
@@ -2260,7 +2257,10 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
         .send()
         .await
         .expect("send injected now_ms retry-wakeup");
-    assert_eq!(injected_field_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        injected_field_resp.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
 
     // Scoped `call` CLI must reject `retry_wakeup` operation.
     let scoped_call_out = Command::new(bin)
@@ -2321,8 +2321,7 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
     .await;
     let mcp_retry_resp = read_json_rpc_response(&mut reader, 2).await;
     assert!(
-        mcp_retry_resp.get("error").is_some()
-            || mcp_retry_resp["result"]["isError"] == json!(true),
+        mcp_retry_resp.get("error").is_some() || mcp_retry_resp["result"]["isError"] == json!(true),
         "MCP must reject retry_wakeup tool call: {mcp_retry_resp}"
     );
 
@@ -2384,7 +2383,11 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
 
     let unknown_st = wait_for_wakeup_status(&unknown_scoped, WakeupStatus::Unknown).await;
     assert_eq!(unknown_st.wakeup.attempt_count, 1);
-    let unknown_claim_id = unknown_st.wakeup.claim_id.clone().expect("unknown claim_id");
+    let unknown_claim_id = unknown_st
+        .wakeup
+        .claim_id
+        .clone()
+        .expect("unknown claim_id");
 
     // Remove hang_marker so future invocations succeed.
     fs::remove_file(&hang_marker).expect("remove hang_marker");
@@ -2477,7 +2480,7 @@ async fn test_serve_child_process_exits_nonzero_on_fatal_sqlite_error_and_releas
         b
     };
 
-    let mut serve_child = Command::new(bin)
+    let serve_child = Command::new(bin)
         .arg("serve")
         .arg("--state-dir")
         .arg(&state_dir)
@@ -2554,8 +2557,8 @@ async fn test_serve_child_process_exits_nonzero_on_fatal_sqlite_error_and_releas
     let new_owner = Supervisor::start(fast_supervisor_config(&state_dir))
         .await
         .expect("new supervisor owner must be able to start after fatal exit");
-    let new_scoped = ScopedClient::from_state_dir(&state_dir, &binding.binding_id)
-        .expect("new scoped client");
+    let new_scoped =
+        ScopedClient::from_state_dir(&state_dir, &binding.binding_id).expect("new scoped client");
     let recovered_status = new_scoped.status().await.expect("status on new owner");
     assert_eq!(
         recovered_status.wakeup.status,

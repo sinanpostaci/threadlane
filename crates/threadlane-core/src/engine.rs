@@ -860,9 +860,7 @@ impl Core {
         while let Some(row) = rows.next()? {
             let status_raw: String = row.get(3)?;
             let prior_status = WakeupStatus::from_str(&status_raw).ok_or_else(|| {
-                CoreError::CorruptState(format!(
-                    "invalid wakeup retry prior_status `{status_raw}`"
-                ))
+                CoreError::CorruptState(format!("invalid wakeup retry prior_status `{status_raw}`"))
             })?;
             records.push(WakeupRetryRecord {
                 retry_id: row.get(0)?,
