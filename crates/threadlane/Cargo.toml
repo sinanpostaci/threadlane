@@ -1,0 +1,28 @@
+[package]
+name = "threadlane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authenticated local supervisor, CLI, stdio MCP adapter, and Codex wake-up bridge for Threadlane Milestone 1"
+
+[[bin]]
+name = "threadlane"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+clap.workspace = true
+fs2.workspace = true
+reqwest.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+threadlane-core.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

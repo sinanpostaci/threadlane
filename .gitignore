@@ -6,4 +6,13 @@
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+*.db
+*.db-shm
+*.db-wal
+state.db
+state.db-shm
+state.db-wal
+supervisor.json
+.supervisor.json.tmp.*
+supervisor.lock
 /result

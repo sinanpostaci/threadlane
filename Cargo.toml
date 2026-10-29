@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/threadlane-core",
+    "crates/threadlane",
 ]
 
 [workspace.package]
@@ -10,10 +11,18 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
+rmcp = { version = "=3.8.0", default-features = false, features = ["server", "macros", "transport-io"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+schemars = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3.10"
 thiserror = "1.0"
+threadlane-core = { path = "crates/threadlane-core" }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
