@@ -1,0 +1,135 @@
+name: Packaging validation (manual)
+
+# Manual-only source-build validation. This workflow does not publish releases,
+# sign binaries, create installers, use repository secrets, or modify a host.
+# The action tags, hosted runner images, and stable Rust channel below have not
+# been executed from this checkout; record the first real run in docs/INSTALL.md.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packaging-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            label: linux-x86_64
+          - os: macos-14
+            label: macos-aarch64
+          - os: windows-2022
+            label: windows-x86_64
+
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Install Linux desktop build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            wget
+
+      - name: Report tool versions
+        run: |
+          rustc --version
+          cargo --version
+          node --version
+          npm --version
+          python --version
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix apps/desktop
+
+      - name: Type-check and build frontend
+        run: npm --prefix apps/desktop run build
+
+      - name: Run frontend tests
+        run: npm --prefix apps/desktop test
+
+      - name: Check Rust formatting
+        run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run Rust tests
+        run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: Run offline packaging wrapper tests
+        run: python -m unittest discover -s scripts -p test_build_desktop.py -v
+
+      - name: Build desktop binary through the packaging wrapper
+        run: python scripts/build-desktop.py --release --timeout-seconds 3600
+
+      - name: Build CLI binary
+        run: cargo build --release --locked --package threadlane
+
+      - name: Stage build artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          if [ -f target/release/threadlane ]; then cp target/release/threadlane artifacts/; fi
+          if [ -f target/release/threadlane.exe ]; then cp target/release/threadlane.exe artifacts/; fi
+          if [ ! -f target/release/threadlane ] && [ ! -f target/release/threadlane.exe ]; then
+            echo "CLI binary artifact is missing" >&2
+            exit 1
+          fi
+          if [ -f target/desktop/release/threadlane-desktop ]; then cp target/desktop/release/threadlane-desktop artifacts/; fi
+          if [ -f target/desktop/release/threadlane-desktop.exe ]; then cp target/desktop/release/threadlane-desktop.exe artifacts/; fi
+          if [ ! -f target/desktop/release/threadlane-desktop ] && [ ! -f target/desktop/release/threadlane-desktop.exe ]; then
+            echo "desktop binary artifact is missing" >&2
+            exit 1
+          fi
+          cp -r apps/desktop/dist artifacts/frontend-dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: threadlane-${{ matrix.label }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 7
