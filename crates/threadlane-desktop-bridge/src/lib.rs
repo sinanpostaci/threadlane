@@ -19,6 +19,7 @@ pub use bridge::{
     MAX_BINDINGS, MAX_RECENT_TASKS,
 };
 pub use error::BridgeError;
+pub use threadlane_core::{ActivityPage, Event, EventKind, EventPayload};
 pub use tools::{discover_tool_status, discover_tool_status_from_path};
 pub use types::{
     Attachment, AttachmentMode, BindingSummary, ConnectionState, DemoControls, DesktopSnapshot,

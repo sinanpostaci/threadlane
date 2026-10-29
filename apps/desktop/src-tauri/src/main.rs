@@ -16,7 +16,7 @@ use threadlane_decisions::{
     DecisionAdvice, DecisionClient, DecisionError, DecisionProvider, DecisionRequest,
 };
 use threadlane_desktop_bridge::{
-    DesktopBridge, DesktopSnapshot, RunDetail, ToolStatus, WindowAction,
+    ActivityPage, DesktopBridge, DesktopSnapshot, EventKind, RunDetail, ToolStatus, WindowAction,
 };
 use threadlane_native::{NativeClient, NativeConfig, NativeError, NativeThreadPage};
 use threadlane_plans::{PlanChange, PlanError, PlanRevision, PlanStore};
@@ -129,12 +129,16 @@ fn classify_error_code<'a>(raw: &str, default_code: &'a str) -> &'a str {
         "not_configured"
     } else if lower.contains("needs_verification") || lower.contains("needs verification") {
         "needs_verification"
-    } else if lower.contains("not found") || lower.contains("not_found") || lower.contains("missing")
+    } else if lower.contains("not found")
+        || lower.contains("not_found")
+        || lower.contains("missing")
     {
         "not_found"
     } else if lower.contains("locked") {
         "vault_locked"
-    } else if lower.contains("unavailable") || lower.contains("keychain") || lower.contains("keyring")
+    } else if lower.contains("unavailable")
+        || lower.contains("keychain")
+        || lower.contains("keyring")
     {
         "unavailable"
     } else if lower.contains("unauthorized")
@@ -288,6 +292,22 @@ async fn desktop_run_detail(
 ) -> Result<RunDetail, String> {
     bridge
         .run_detail(binding_id, run_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn desktop_activity_history(
+    bridge: State<'_, DesktopBridge>,
+    binding_id: String,
+    after_seq: Option<u64>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+    run_id: Option<String>,
+    kind: Option<EventKind>,
+) -> Result<ActivityPage, String> {
+    bridge
+        .activity_history(binding_id, after_seq, cursor, limit, run_id, kind)
         .await
         .map_err(|err| err.to_string())
 }
@@ -659,6 +679,7 @@ fn main() -> ExitCode {
             desktop_snapshot,
             desktop_attach,
             desktop_run_detail,
+            desktop_activity_history,
             desktop_start_demo,
             desktop_answer_demo,
             desktop_cancel_demo,
@@ -710,7 +731,11 @@ mod tests {
             fallback
         );
         assert_eq!(
-            sanitize_error_message("Keychain is locked by user.", fallback, Some("other-secret")),
+            sanitize_error_message(
+                "Keychain is locked by user.",
+                fallback,
+                Some("other-secret")
+            ),
             "Keychain is locked by user."
         );
     }

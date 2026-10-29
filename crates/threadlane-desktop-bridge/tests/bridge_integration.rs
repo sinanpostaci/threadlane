@@ -18,12 +18,13 @@ use threadlane::descriptor::{
 };
 use threadlane::{
     ApiError, BindingListResponse, CreateBindingRequest, ErrorCode, ScopedRequest, ScopedResponse,
-    StatusResponse,
+    StatusResponse, Supervisor, SupervisorClient, SupervisorConfig,
 };
 use threadlane_core::{
-    Binding, Question, QuestionStatus, Run, RunStatus, RunSummary, WakeupNotice, WakeupStatus,
-    WorkerAcceptanceState, WorkerOutcomeSummary, WorkerProgressSummary, WorkerSnapshot,
-    WorkerStatus, WorkerWorktreeSummary, FIXED_WAKEUP_MESSAGE,
+    ActivityPage, Binding, Event, EventKind, EventPayload, Question, QuestionStatus, Run,
+    RunStatus, RunSummary, WakeupNotice, WakeupStatus, WorkerAcceptanceState, WorkerOutcomeSummary,
+    WorkerProgressSummary, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
+    FIXED_WAKEUP_MESSAGE,
 };
 use threadlane_desktop_bridge::{
     discover_tool_status_from_path, AttachmentMode, BridgeError, ConnectionState, DesktopBridge,
@@ -31,8 +32,18 @@ use threadlane_desktop_bridge::{
     MAX_BINDINGS,
 };
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
+
+type ActivityCall = (
+    String,
+    Option<u64>,
+    Option<String>,
+    Option<usize>,
+    Option<String>,
+    Option<EventKind>,
+);
 
 #[derive(Default)]
 struct FakeServerData {
@@ -41,9 +52,13 @@ struct FakeServerData {
     statuses: BTreeMap<String, StatusResponse>,
     workers: BTreeMap<(String, String), Result<WorkerSnapshot, (StatusCode, ApiError)>>,
     runs: BTreeMap<(String, String), Result<Run, (StatusCode, ApiError)>>,
+    activities: BTreeMap<String, Vec<Event>>,
     status_calls: Vec<String>,
     get_worker_calls: Vec<(String, String)>,
     get_run_calls: Vec<(String, String)>,
+    list_activity_calls: Vec<ActivityCall>,
+    list_activity_entered_notify: Option<Arc<Notify>>,
+    delay_list_activity_notify: Option<Arc<Notify>>,
     pull_or_ack_calls: usize,
     start_demo_calls: Vec<(String, String)>,
     answer_calls: Vec<(String, String, String, u64, String)>,
@@ -208,6 +223,37 @@ async fn handle_command(
 ) -> Response {
     if let Err(resp) = check_auth(&headers, &state) {
         return *resp;
+    }
+
+    if let ScopedRequest::ListActivity {
+        after_seq,
+        cursor,
+        limit,
+        run_id,
+        kind,
+    } = &req
+    {
+        let (entered, delay) = {
+            let mut guard = state.inner.lock().unwrap();
+            guard.list_activity_calls.push((
+                binding_id.clone(),
+                *after_seq,
+                cursor.clone(),
+                *limit,
+                run_id.clone(),
+                *kind,
+            ));
+            (
+                guard.list_activity_entered_notify.clone(),
+                guard.delay_list_activity_notify.clone(),
+            )
+        };
+        if let Some(notify) = entered {
+            notify.notify_waiters();
+        }
+        if let Some(wait_notify) = delay {
+            wait_notify.notified().await;
+        }
     }
 
     let mut guard = state.inner.lock().unwrap();
@@ -414,6 +460,61 @@ async fn handle_command(
             }
             Json(ScopedResponse::Run(run)).into_response()
         }
+        ScopedRequest::ListActivity {
+            after_seq,
+            cursor,
+            limit,
+            run_id,
+            kind,
+        } => {
+            if !guard.bindings.iter().any(|b| b.binding_id == binding_id) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError::new(
+                        ErrorCode::BindingNotFound,
+                        "binding not found",
+                    )),
+                )
+                    .into_response();
+            }
+
+            let all_events = guard
+                .activities
+                .get(&binding_id)
+                .cloned()
+                .unwrap_or_default();
+            let high_water_mark_seq = all_events.last().map(|e| e.seq).unwrap_or(0);
+            let resolved_after_seq = match cursor.as_deref() {
+                Some(cur) => cur
+                    .strip_prefix("cur:")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0),
+                None => after_seq.unwrap_or(0),
+            };
+            let page_limit = limit.unwrap_or(20);
+            let filtered: Vec<Event> = all_events
+                .into_iter()
+                .filter(|e| e.seq > resolved_after_seq && e.seq <= high_water_mark_seq)
+                .filter(|e| run_id.as_ref().is_none_or(|r| &e.run_id == r))
+                .filter(|e| kind.is_none_or(|k| e.kind == k))
+                .collect();
+            let has_more = filtered.len() > page_limit;
+            let events: Vec<Event> = filtered.into_iter().take(page_limit).collect();
+            let next_cursor = if has_more {
+                events.last().map(|last| format!("cur:{}", last.seq))
+            } else {
+                None
+            };
+            Json(ScopedResponse::Activity(ActivityPage {
+                binding_id,
+                events,
+                next_cursor,
+                has_more,
+                high_water_mark_seq,
+                after_seq: resolved_after_seq,
+            }))
+            .into_response()
+        }
         ScopedRequest::PullEvents { .. } | ScopedRequest::AckEvents { .. } => {
             guard.pull_or_ack_calls += 1;
             (
@@ -558,6 +659,12 @@ async fn unconfigured_bridge_returns_honest_empty_state_and_rejects_mutations() 
     assert_eq!(
         bridge
             .run_detail("bnd_1".to_string(), "run_1".to_string())
+            .await,
+        Err(BridgeError::Unconfigured)
+    );
+    assert_eq!(
+        bridge
+            .activity_history("bnd_1".to_string(), None, None, None, None, None)
             .await,
         Err(BridgeError::Unconfigured)
     );
@@ -1255,4 +1362,453 @@ fn dto_serde_json_shapes_match_exact_contract() {
         serde_json::from_value(json!("minimize")).expect("deserialize minimize");
     assert_eq!(close, WindowAction::Close);
     assert_eq!(minimize, WindowAction::Minimize);
+}
+
+fn sample_activity_event(
+    binding_id: &str,
+    seq: u64,
+    run_id: &str,
+    kind: EventKind,
+    summary: &str,
+) -> Event {
+    Event {
+        event_id: format!("evt_{binding_id}_{seq}"),
+        binding_id: binding_id.to_string(),
+        seq,
+        run_id: run_id.to_string(),
+        revision: 1,
+        step_seq: seq,
+        kind,
+        important: matches!(
+            kind,
+            EventKind::QuestionAsked
+                | EventKind::RunCompleted
+                | EventKind::WorkerCompleted
+                | EventKind::WorkerFailed
+        ),
+        payload: EventPayload {
+            untrusted_data: true,
+            summary: summary.to_string(),
+            question_id: None,
+            question_prompt: None,
+            answer: None,
+            instruction: None,
+            cancel_reason: None,
+        },
+        created_at_ms: 1_700_000_000_000 + (seq as i64 * 100),
+    }
+}
+
+#[tokio::test]
+async fn activity_history_fake_supervisor_enforces_selection_isolation_no_ack_and_discards_stale_epoch(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let runtime_dir = temp.path().join("runtime-history");
+    let server = RunningFakeSupervisor::start(&runtime_dir).await;
+
+    {
+        let mut guard = server.state.inner.lock().unwrap();
+        for idx in 0..105 {
+            let binding_id = format!("bnd_{idx:03}");
+            let thread_uuid = Uuid::new_v4().to_string();
+            let binding = Binding {
+                binding_id: binding_id.clone(),
+                thread_uuid: thread_uuid.clone(),
+                label: format!("Chat {idx}"),
+                delivered_seq: 0,
+                acked_seq: 0,
+            };
+            guard.bindings.push(binding.clone());
+            guard.statuses.insert(
+                binding_id.clone(),
+                StatusResponse::from_summary_counts(
+                    binding,
+                    idle_wakeup(&binding_id, &thread_uuid),
+                    0,
+                    0,
+                    Vec::new(),
+                ),
+            );
+        }
+
+        guard.activities.insert(
+            "bnd_000".to_string(),
+            vec![sample_activity_event(
+                "bnd_000",
+                1,
+                "run_000_a",
+                EventKind::RunStarted,
+                "Started on bnd_000",
+            )],
+        );
+        guard.activities.insert(
+            "bnd_001".to_string(),
+            vec![
+                sample_activity_event(
+                    "bnd_001",
+                    1,
+                    "run_001_a",
+                    EventKind::WorkerStarted,
+                    "Worker started on bnd_001",
+                ),
+                sample_activity_event(
+                    "bnd_001",
+                    2,
+                    "run_001_a",
+                    EventKind::WorkerProgress,
+                    "Worker progress 1 on bnd_001",
+                ),
+                sample_activity_event(
+                    "bnd_001",
+                    3,
+                    "run_001_b",
+                    EventKind::WorkerProgress,
+                    "Worker progress on run_001_b",
+                ),
+                sample_activity_event(
+                    "bnd_001",
+                    4,
+                    "run_001_a",
+                    EventKind::WorkerProgress,
+                    "Worker progress 2 on bnd_001",
+                ),
+            ],
+        );
+    }
+
+    let bridge = Arc::new(
+        DesktopBridge::new(Some(runtime_dir.clone()), None).expect("create runtime bridge"),
+    );
+
+    // 1. Select `bnd_001` via snapshot.
+    let snap = bridge
+        .snapshot(Some("bnd_001".to_string()))
+        .await
+        .expect("select bnd_001");
+    assert_eq!(snap.selected_binding_id.as_deref(), Some("bnd_001"));
+
+    // 2. Requesting unselected binding `bnd_000`, capped binding `bnd_104`, or nonexistent binding
+    //    is rejected with `BridgeError::NotFound` and makes ZERO `ListActivity` calls on the server.
+    for forbidden_binding in ["bnd_000", "bnd_104", "bnd_nonexistent"] {
+        let err = bridge
+            .activity_history(forbidden_binding.to_string(), None, None, None, None, None)
+            .await
+            .expect_err("unselected or out-of-scope binding must be rejected");
+        assert!(
+            matches!(err, BridgeError::NotFound(_)),
+            "expected NotFound for {forbidden_binding}, got {err:?}"
+        );
+    }
+    {
+        let guard = server.state.inner.lock().unwrap();
+        assert!(
+            guard.list_activity_calls.is_empty(),
+            "rejected binding requests must never call ListActivity on the supervisor"
+        );
+        assert_eq!(guard.pull_or_ack_calls, 0);
+    }
+
+    // 3. Invalid arguments (both after_seq and cursor, out-of-range limit, invalid cursor) are rejected locally.
+    assert!(matches!(
+        bridge
+            .activity_history(
+                "bnd_001".to_string(),
+                Some(1),
+                Some("cur:1".to_string()),
+                None,
+                None,
+                None
+            )
+            .await,
+        Err(BridgeError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        bridge
+            .activity_history("bnd_001".to_string(), None, None, Some(0), None, None)
+            .await,
+        Err(BridgeError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        bridge
+            .activity_history("bnd_001".to_string(), None, None, Some(51), None, None)
+            .await,
+        Err(BridgeError::InvalidInput(_))
+    ));
+    assert!(matches!(
+        bridge
+            .activity_history(
+                "bnd_001".to_string(),
+                None,
+                Some("bad\ncursor".to_string()),
+                None,
+                None,
+                None
+            )
+            .await,
+        Err(BridgeError::InvalidInput(_))
+    ));
+
+    // 4. Valid `activity_history` on selected `bnd_001` forwards filters and cursor pagination without pull/ack.
+    let page_1 = bridge
+        .activity_history(
+            "bnd_001".to_string(),
+            Some(1),
+            None,
+            Some(1),
+            Some("run_001_a".to_string()),
+            Some(EventKind::WorkerProgress),
+        )
+        .await
+        .expect("page 1 for bnd_001");
+    assert_eq!(page_1.binding_id, "bnd_001");
+    assert_eq!(page_1.after_seq, 1);
+    assert_eq!(page_1.high_water_mark_seq, 4);
+    assert!(page_1.has_more);
+    assert_eq!(page_1.next_cursor.as_deref(), Some("cur:2"));
+    assert_eq!(page_1.events.len(), 1);
+    assert_eq!(page_1.events[0].seq, 2);
+    assert_eq!(page_1.events[0].run_id, "run_001_a");
+    assert_eq!(page_1.events[0].kind, EventKind::WorkerProgress);
+
+    let page_2 = bridge
+        .activity_history(
+            "bnd_001".to_string(),
+            None,
+            page_1.next_cursor.clone(),
+            Some(1),
+            Some("run_001_a".to_string()),
+            Some(EventKind::WorkerProgress),
+        )
+        .await
+        .expect("page 2 for bnd_001");
+    assert_eq!(page_2.binding_id, "bnd_001");
+    assert_eq!(page_2.after_seq, 2);
+    assert!(!page_2.has_more);
+    assert_eq!(page_2.next_cursor, None);
+    assert_eq!(page_2.events.len(), 1);
+    assert_eq!(page_2.events[0].seq, 4);
+
+    {
+        let guard = server.state.inner.lock().unwrap();
+        assert_eq!(guard.list_activity_calls.len(), 2);
+        assert_eq!(
+            guard.list_activity_calls[0],
+            (
+                "bnd_001".to_string(),
+                Some(1),
+                None,
+                Some(1),
+                Some("run_001_a".to_string()),
+                Some(EventKind::WorkerProgress),
+            )
+        );
+        assert_eq!(
+            guard.list_activity_calls[1],
+            (
+                "bnd_001".to_string(),
+                None,
+                Some("cur:2".to_string()),
+                Some(1),
+                Some("run_001_a".to_string()),
+                Some(EventKind::WorkerProgress),
+            )
+        );
+        assert_eq!(guard.pull_or_ack_calls, 0);
+    }
+
+    // 5. Stale observer context completion: pause `ListActivity` on `bnd_001`, switch selection
+    //    to `bnd_000` via `snapshot(Some("bnd_000"))`, release `ListActivity`, and verify the stale
+    //    `activity_history` completion is discarded with `BridgeError::InvalidState`.
+    let entered_notify = Arc::new(Notify::new());
+    let release_notify = Arc::new(Notify::new());
+    {
+        let mut guard = server.state.inner.lock().unwrap();
+        guard.list_activity_entered_notify = Some(entered_notify.clone());
+        guard.delay_list_activity_notify = Some(release_notify.clone());
+    }
+
+    let bridge_clone = bridge.clone();
+    let in_flight = tokio::spawn(async move {
+        bridge_clone
+            .activity_history("bnd_001".to_string(), None, None, None, None, None)
+            .await
+    });
+
+    entered_notify.notified().await;
+
+    // Switch selected binding to `bnd_000` while `in_flight` is still awaiting `ListActivity`.
+    let switched_snap = bridge
+        .snapshot(Some("bnd_000".to_string()))
+        .await
+        .expect("switch selection to bnd_000");
+    assert_eq!(
+        switched_snap.selected_binding_id.as_deref(),
+        Some("bnd_000")
+    );
+
+    {
+        let mut guard = server.state.inner.lock().unwrap();
+        guard.list_activity_entered_notify = None;
+        guard.delay_list_activity_notify = None;
+    }
+    release_notify.notify_waiters();
+
+    let stale_res = in_flight.await.expect("join in_flight");
+    assert!(
+        matches!(stale_res, Err(BridgeError::InvalidState(_))),
+        "stale observer context completion must be discarded: {stale_res:?}"
+    );
+
+    // Active selection is now `bnd_000`, so `activity_history` on `bnd_000` succeeds.
+    let page_000 = bridge
+        .activity_history("bnd_000".to_string(), None, None, None, None, None)
+        .await
+        .expect("activity_history for newly selected bnd_000");
+    assert_eq!(page_000.binding_id, "bnd_000");
+    assert_eq!(page_000.events.len(), 1);
+    assert_eq!(page_000.events[0].run_id, "run_000_a");
+
+    {
+        let guard = server.state.inner.lock().unwrap();
+        assert_eq!(guard.pull_or_ack_calls, 0);
+    }
+
+    server.stop();
+}
+
+#[tokio::test]
+async fn activity_history_real_supervisor_preserves_readonly_delivery_and_ack_cursors_across_pages()
+{
+    let temp = TempDir::new().expect("tempdir");
+    let state_dir = temp.path().join("real-supervisor-state");
+
+    let sup_handle = Supervisor::start(SupervisorConfig {
+        state_dir: state_dir.clone(),
+        tick_interval: std::time::Duration::from_millis(50),
+        codex: None,
+        workers: None,
+    })
+    .await
+    .expect("start real supervisor");
+
+    let sup_client = SupervisorClient::from_state_dir(&state_dir).expect("supervisor client");
+    let binding_a = sup_client
+        .create_binding("0196ed00-0000-7000-8000-00000000020a", "Chat A")
+        .await
+        .expect("create binding A");
+    let binding_b = sup_client
+        .create_binding("0196ed00-0000-7000-8000-00000000020b", "Chat B")
+        .await
+        .expect("create binding B");
+
+    let scoped_a = sup_client
+        .clone()
+        .scoped(binding_a.binding_id.clone())
+        .expect("scoped A");
+    let run_a = scoped_a
+        .start_demo(
+            "cmd-bridge-hist-start".to_string(),
+            "Bridge history integration test".to_string(),
+            Some(5000),
+        )
+        .await
+        .expect("start demo A");
+    let steered_a = scoped_a
+        .steer(
+            "cmd-bridge-hist-steer".to_string(),
+            run_a.run_id.clone(),
+            run_a.revision,
+            "Updated bridge history instruction".to_string(),
+        )
+        .await
+        .expect("steer demo A");
+    let _cancelled_a = scoped_a
+        .cancel(
+            "cmd-bridge-hist-cancel".to_string(),
+            run_a.run_id.clone(),
+            Some("Done testing".to_string()),
+        )
+        .await
+        .expect("cancel demo A");
+    assert_eq!(steered_a.revision, 2);
+
+    let bridge =
+        DesktopBridge::new(Some(state_dir.clone()), None).expect("create bridge for real runtime");
+    let snap_a = bridge
+        .snapshot(Some(binding_a.binding_id.clone()))
+        .await
+        .expect("select binding A");
+    assert_eq!(
+        snap_a.selected_binding_id.as_deref(),
+        Some(binding_a.binding_id.as_str())
+    );
+
+    // 1. Cross-binding call to `binding_b` while `binding_a` is selected is rejected.
+    let cross_err = bridge
+        .activity_history(binding_b.binding_id.clone(), None, None, None, None, None)
+        .await
+        .expect_err("unselected binding B must be rejected");
+    assert!(matches!(cross_err, BridgeError::NotFound(_)));
+
+    // 2. Page through binding A's activity with limit = 1 using keyset cursor.
+    let first_page = bridge
+        .activity_history(
+            binding_a.binding_id.clone(),
+            None,
+            None,
+            Some(1),
+            Some(run_a.run_id.clone()),
+            None,
+        )
+        .await
+        .expect("first page");
+    assert_eq!(first_page.binding_id, binding_a.binding_id);
+    assert_eq!(first_page.events.len(), 1);
+    assert_eq!(first_page.events[0].seq, 1);
+    assert_eq!(first_page.events[0].kind, EventKind::RunStarted);
+    assert!(first_page.has_more);
+    assert!(first_page.next_cursor.is_some());
+    assert!(first_page.high_water_mark_seq >= 3);
+
+    let second_page = bridge
+        .activity_history(
+            binding_a.binding_id.clone(),
+            None,
+            first_page.next_cursor.clone(),
+            Some(2),
+            Some(run_a.run_id.clone()),
+            None,
+        )
+        .await
+        .expect("second page");
+    assert_eq!(second_page.binding_id, binding_a.binding_id);
+    assert!(!second_page.events.is_empty());
+    assert!(second_page.events.iter().all(|e| e.seq > 1));
+    assert!(second_page.events.iter().all(|e| e.run_id == run_a.run_id));
+
+    // 3. Filter by specific `EventKind::RunCancelled`.
+    let cancelled_only = bridge
+        .activity_history(
+            binding_a.binding_id.clone(),
+            None,
+            None,
+            Some(10),
+            Some(run_a.run_id.clone()),
+            Some(EventKind::RunCancelled),
+        )
+        .await
+        .expect("cancelled kind filter");
+    assert_eq!(cancelled_only.events.len(), 1);
+    assert_eq!(cancelled_only.events[0].kind, EventKind::RunCancelled);
+
+    // 4. Verify read-only invariant: `delivered_seq`, `acked_seq`, and wakeup cursors are untouched!
+    let status_after = sup_client
+        .status(&binding_a.binding_id)
+        .await
+        .expect("status after activity_history");
+    assert_eq!(status_after.binding.delivered_seq, 0);
+    assert_eq!(status_after.binding.acked_seq, 0);
+    assert_eq!(status_after.wakeup.covered_up_to_seq, 0);
+
+    sup_handle.shutdown().await;
 }

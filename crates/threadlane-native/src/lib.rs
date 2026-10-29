@@ -752,4 +752,203 @@ fi
             .expect("mark_received");
         assert_eq!(received.status, NativeWakeupStatus::Received);
     }
+
+    #[tokio::test]
+    async fn paired_mcp_list_activity_enforces_unbound_lockout_same_binding_scope_and_readonly_cursors(
+    ) {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+
+        let sup_handle = Supervisor::start(SupervisorConfig {
+            state_dir: state_dir.clone(),
+            tick_interval: Duration::from_millis(50),
+            codex: None,
+            workers: None,
+        })
+        .await
+        .expect("start supervisor");
+
+        let sup_client =
+            SupervisorClient::from_state_dir(&state_dir).expect("connect supervisor client");
+        let binding_a = sup_client
+            .create_binding("0196ed00-0000-7000-8000-00000000010a", "Chat A")
+            .await
+            .expect("create binding A");
+        let binding_b = sup_client
+            .create_binding("0196ed00-0000-7000-8000-00000000010b", "Chat B")
+            .await
+            .expect("create binding B");
+
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+
+        let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
+        let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
+
+        // Verify capability count: `connection_identity` + 15 delegated runtime tools = 16 tools.
+        let tools = mcp_a.list_tools();
+        assert_eq!(tools.len(), 16, "PairedMcpServer must expose 16 tools");
+        let list_activity_tool = tools
+            .iter()
+            .find(|tool| tool.name == "list_activity")
+            .expect("list_activity tool registered in PairedMcpServer router");
+        let annotations = list_activity_tool
+            .annotations
+            .as_ref()
+            .expect("list_activity annotations");
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.destructive_hint, Some(false));
+        assert_eq!(annotations.idempotent_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        // 1. Unbound `list_activity` is blocked even if untrusted `_meta` supplies a binding/thread ID.
+        let unbound_err = mcp_a
+            .invoke_tool_json(
+                "list_activity",
+                json!({}),
+                Some(json!({
+                    "threadId": binding_a.thread_uuid,
+                    "binding_id": binding_a.binding_id
+                })),
+            )
+            .await
+            .expect_err("unbound list_activity must be blocked");
+        assert_eq!(
+            unbound_err.structured_content.unwrap()["error"]["code"],
+            "unbound_connection"
+        );
+
+        // 2. Enroll Connection A -> Chat A and Connection B -> Chat B.
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_a.connection_nonce().to_string(),
+                    epoch_id: mcp_a.epoch_id().to_string(),
+                    binding_id: binding_a.binding_id.clone(),
+                    thread_id: binding_a.thread_uuid.clone(),
+                    project_id: Some("proj-history".to_string()),
+                },
+            )
+            .expect("enroll chat A");
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_b.connection_nonce().to_string(),
+                    epoch_id: mcp_b.epoch_id().to_string(),
+                    binding_id: binding_b.binding_id.clone(),
+                    thread_id: binding_b.thread_uuid.clone(),
+                    project_id: Some("proj-history".to_string()),
+                },
+            )
+            .expect("enroll chat B");
+
+        // 3. Start a demo run on Chat A to generate durable activity events.
+        let start_a = mcp_a
+            .invoke_tool_json(
+                "start_demo",
+                json!({
+                    "command_key": "cmd-history-a-1",
+                    "instruction": "History test task for Chat A",
+                    "step_delay_ms": 5000
+                }),
+                None,
+            )
+            .await
+            .expect("start_demo on Chat A")
+            .structured_content
+            .expect("structured start_demo");
+        let run_a_id = start_a["data"]["run_id"]
+            .as_str()
+            .expect("run_id")
+            .to_string();
+
+        // 4. Caller-supplied identity fields on `list_activity` are rejected with `rebind_rejected`.
+        for forbidden_key in [
+            "binding_id",
+            "thread_id",
+            "session_id",
+            "connection_nonce",
+            "epoch_id",
+        ] {
+            let mut bad_args = serde_json::Map::new();
+            bad_args.insert(
+                forbidden_key.to_string(),
+                Value::String(binding_a.binding_id.clone()),
+            );
+            let smuggle_err = mcp_b
+                .invoke_tool_json("list_activity", Value::Object(bad_args), None)
+                .await
+                .expect_err("caller identity argument must be rejected");
+            assert_eq!(
+                smuggle_err.structured_content.unwrap()["error"]["code"],
+                "rebind_rejected",
+                "forbidden key {forbidden_key} must trigger rebind_rejected"
+            );
+        }
+
+        // 5. Authorized same-binding `list_activity` on Chat A returns Chat A's activity page
+        //    without advancing `delivered_seq` or `acked_seq`.
+        let page_a = mcp_a
+            .invoke_tool_json(
+                "list_activity",
+                json!({
+                    "run_id": run_a_id,
+                    "kind": "run_started",
+                    "limit": 10
+                }),
+                None,
+            )
+            .await
+            .expect("list_activity on Chat A")
+            .structured_content
+            .expect("structured list_activity");
+        assert_eq!(page_a["tool"], "list_activity");
+        assert_eq!(page_a["binding_id"], binding_a.binding_id);
+        assert_eq!(page_a["data"]["binding_id"], binding_a.binding_id);
+        let events_a = page_a["data"]["events"].as_array().expect("events array");
+        assert_eq!(events_a.len(), 1);
+        assert_eq!(events_a[0]["run_id"], run_a_id);
+        assert_eq!(events_a[0]["kind"], "run_started");
+        assert!(page_a["data"]["high_water_mark_seq"].as_u64().unwrap_or(0) >= 1);
+
+        let status_a = mcp_a
+            .invoke_tool_json("status", json!({}), None)
+            .await
+            .expect("status on Chat A")
+            .structured_content
+            .expect("structured status");
+        assert_eq!(status_a["data"]["binding"]["delivered_seq"], 0);
+        assert_eq!(status_a["data"]["binding"]["acked_seq"], 0);
+
+        // 6. Cross-binding isolation: Chat B calling `list_activity` with Chat A's `run_id`
+        //    only queries Chat B's binding and sees zero events from Chat A.
+        let page_b = mcp_b
+            .invoke_tool_json(
+                "list_activity",
+                json!({
+                    "run_id": run_a_id,
+                    "limit": 10
+                }),
+                Some(json!({
+                    "threadId": binding_a.thread_uuid,
+                    "binding_id": binding_a.binding_id
+                })),
+            )
+            .await
+            .expect("list_activity on Chat B")
+            .structured_content
+            .expect("structured list_activity on Chat B");
+        assert_eq!(page_b["binding_id"], binding_b.binding_id);
+        assert_eq!(page_b["data"]["binding_id"], binding_b.binding_id);
+        assert_eq!(
+            page_b["data"]["events"].as_array().expect("events").len(),
+            0,
+            "Chat B must never see Chat A's activity events"
+        );
+
+        sup_handle.shutdown().await;
+    }
 }

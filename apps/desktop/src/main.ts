@@ -8,6 +8,7 @@ import {
   type AccentName,
   type AppearancePreferences,
   type DetailTab,
+  type EventKind,
   type ExecutionPreferences,
   type NavPage,
   type SurfaceMode,
@@ -34,6 +35,8 @@ import {
   sanitizeExecutionPreferences,
 } from './format.ts';
 import {
+  applyHistoryPageError,
+  applyHistoryPageSuccess,
   applyMutationError,
   applyMutationSuccess,
   applyPlansRefreshError,
@@ -44,23 +47,35 @@ import {
   applyRunDetailSuccess,
   applySnapshotPollError,
   applySnapshotPollSuccess,
+  beginHistoryQuery,
   beginMutation,
   beginPlansRefresh,
   beginRegistryRefresh,
   beginRunDetailRefresh,
   beginSnapshotPoll,
+  commitHistoryFilters,
   createInitialState,
   navigateBack,
   navigateToPage,
   openRunDetail,
+  resetHistoryFilters,
   resolveExpectedDemoRevision,
   selectBinding,
+  selectHistoryEvent,
+  setHistoryExpanded,
+  shouldPollHistory,
   shouldRebuildMainOnPoll,
+  toActivityHistoryIpcArgs,
+  updateHistoryRunIdDraft,
   type DesktopStoreState,
   type DetailTicket,
+  type HistoryLoadingMode,
+  type HistoryQueryTicket,
   type SnapshotTicket,
 } from './state.ts';
 import {
+  hasTauriRuntime,
+  ipcDesktopActivityHistory,
   ipcDesktopAnswerDemo,
   ipcDesktopAttach,
   ipcDesktopCancelDemo,
@@ -87,6 +102,7 @@ import { ToolsPage } from './pages/tools.ts';
 import { ProfilesPage } from './pages/profiles.ts';
 import { PlansPage } from './pages/plans.ts';
 import { NativeLinkingPanel } from './pages/native.ts';
+import { renderActivityHistorySection } from './pages/history.ts';
 
 const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
 const EXECUTION_PREFS_STORAGE_KEY = 'threadlane.desktop.execution_prefs.v1';
@@ -264,6 +280,13 @@ class ThreadlaneDesktopApp {
         if (refresh.ticket) {
           await this.executeDetailTicket(refresh.ticket, false);
         }
+      } else if (
+        shouldPollHistory(
+          this.state,
+          typeof document !== 'undefined' && Boolean(document.hidden)
+        )
+      ) {
+        await this.triggerHistoryQuery('poll', false);
       }
     } finally {
       this.scheduleNextPoll();
@@ -295,6 +318,15 @@ class ThreadlaneDesktopApp {
         return;
       }
       this.renderPreserveActiveInput();
+      if (
+        this.state.page === 'activity' &&
+        this.state.detailTarget === null &&
+        this.state.history.expanded &&
+        !this.state.history.hasLoadedOnce &&
+        !this.state.history.inFlight
+      ) {
+        void this.triggerHistoryQuery('initial', false);
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to load desktop snapshot.';
       this.state = applySnapshotPollError(this.state, ticket, msg);
@@ -303,6 +335,35 @@ class ThreadlaneDesktopApp {
         this.renderFooter();
         return;
       }
+      this.renderPreserveActiveInput();
+    }
+  }
+
+  private async triggerHistoryQuery(
+    mode: Exclude<HistoryLoadingMode, null>,
+    force: boolean = false
+  ): Promise<void> {
+    const isHidden = typeof document !== 'undefined' && Boolean(document.hidden);
+    const started = beginHistoryQuery(this.state, mode, force, undefined, isHidden);
+    this.state = started.state;
+    if (!started.ticket) {
+      return;
+    }
+    if (mode !== 'poll') {
+      this.renderPreserveActiveInput();
+    }
+    await this.executeHistoryTicket(started.ticket);
+  }
+
+  private async executeHistoryTicket(ticket: HistoryQueryTicket): Promise<void> {
+    try {
+      const page = await ipcDesktopActivityHistory(toActivityHistoryIpcArgs(ticket));
+      this.state = applyHistoryPageSuccess(this.state, ticket, page);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to load activity history.';
+      this.state = applyHistoryPageError(this.state, ticket, msg);
+    }
+    if (this.state.page === 'activity' && this.state.detailTarget === null) {
       this.renderPreserveActiveInput();
     }
   }
@@ -937,6 +998,61 @@ class ThreadlaneDesktopApp {
       }
       frag.appendChild(detailsEl);
     }
+
+    const resolvedBindingId = this.state.selectedBindingId ?? selected_binding_id;
+    frag.appendChild(
+      renderActivityHistorySection({
+        history: this.state.history,
+        attachment,
+        selectedBindingId: resolvedBindingId,
+        isDevPreviewFixture: this.state.isDevPreviewFixture,
+        hasTauriRuntime: hasTauriRuntime(),
+        callbacks: {
+          onToggleExpanded: () => {
+            this.state = setHistoryExpanded(this.state);
+            this.renderPreserveActiveInput();
+            if (
+              this.state.history.expanded &&
+              !this.state.history.hasLoadedOnce &&
+              !this.state.history.inFlight
+            ) {
+              void this.triggerHistoryQuery('initial', false);
+            }
+          },
+          onRunIdDraftInput: (draft: string) => {
+            this.state = updateHistoryRunIdDraft(this.state, draft);
+          },
+          onApplyFilters: () => {
+            this.state = commitHistoryFilters(this.state);
+            this.renderPreserveActiveInput();
+            void this.triggerHistoryQuery('initial', true);
+          },
+          onClearFilters: () => {
+            this.state = resetHistoryFilters(this.state);
+            this.renderPreserveActiveInput();
+            void this.triggerHistoryQuery('initial', true);
+          },
+          onKindFilterChange: (kind: EventKind | null) => {
+            this.state = commitHistoryFilters(this.state, undefined, kind);
+            this.renderPreserveActiveInput();
+            void this.triggerHistoryQuery('initial', true);
+          },
+          onLoadMore: () => {
+            void this.triggerHistoryQuery('more', false);
+          },
+          onRefresh: () => {
+            void this.triggerHistoryQuery('refresh', true);
+          },
+          onSelectEvent: (eventId: string) => {
+            this.state = selectHistoryEvent(this.state, eventId);
+            this.renderPreserveActiveInput();
+          },
+          onOpenRunDetail: (bindingId: string, runId: string) => {
+            void this.handleOpenRunDetail(bindingId, runId, 'history-run-filter');
+          },
+        },
+      })
+    );
 
     return frag;
   }

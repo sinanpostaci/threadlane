@@ -1,10 +1,12 @@
 import {
   DEFAULT_APPEARANCE,
   DEFAULT_EXECUTION_PREFERENCES,
+  type ActivityPage,
   type AppearancePreferences,
   type DesktopSnapshot,
   type DetailTab,
   type DetailTarget,
+  type EventKind,
   type ExecutionPreferences,
   type NavPage,
   type PendingMutation,
@@ -17,6 +19,35 @@ import {
   type PlanRevision,
   type RegistrySnapshot,
 } from './registry/types.ts';
+import {
+  DEFAULT_HISTORY_PAGE_LIMIT,
+  MAX_RETAINED_HISTORY_EVENTS,
+  applyHistoryFilters,
+  clearHistoryFilters,
+  computeHistoryScopeKey,
+  createInitialHistoryState,
+  mergeAndCapHistoryEvents,
+  resolveNextHistoryCursorOrAfterSeq,
+  setHistoryRunIdDraft,
+  syncHistoryScope,
+  toActivityHistoryIpcArgs,
+  toggleHistoryEventDetail,
+  toggleHistoryExpanded,
+  type HistoryLoadingMode,
+  type HistoryQueryTicket,
+  type HistorySubViewState,
+} from './pages/history.ts';
+
+export {
+  DEFAULT_HISTORY_PAGE_LIMIT,
+  MAX_RETAINED_HISTORY_EVENTS,
+  computeHistoryScopeKey,
+  resolveNextHistoryCursorOrAfterSeq,
+  toActivityHistoryIpcArgs,
+  type HistoryLoadingMode,
+  type HistoryQueryTicket,
+  type HistorySubViewState,
+};
 
 export interface SnapshotTicket {
   readonly seq: number;
@@ -82,6 +113,7 @@ export interface DesktopStoreState {
   appearance: AppearancePreferences;
   executionPrefs: ExecutionPreferences;
   isDevPreviewFixture: boolean;
+  history: HistorySubViewState;
 }
 
 export function createInitialSnapshot(nowMs: number = Date.now()): DesktopSnapshot {
@@ -115,13 +147,14 @@ export function createInitialState(
   nowMs: number = Date.now(),
   executionPrefs: ExecutionPreferences = { ...DEFAULT_EXECUTION_PREFERENCES }
 ): DesktopStoreState {
+  const initialSnapshot = createInitialSnapshot(nowMs);
   return {
     page: 'activity',
     selectedBindingId: null,
     providerFilter: 'all',
     showFilters: false,
     completedExpanded: false,
-    snapshot: createInitialSnapshot(nowMs),
+    snapshot: initialSnapshot,
     snapshotLoading: true,
     pollInFlight: false,
     selectionEpoch: 1,
@@ -153,6 +186,7 @@ export function createInitialState(
     appearance: { ...appearance },
     executionPrefs: { ...executionPrefs },
     isDevPreviewFixture: false,
+    history: createInitialHistoryState(initialSnapshot.attachment, null),
   };
 }
 
@@ -268,6 +302,7 @@ export function applySnapshotPollSuccess(
     detailInFlight: nextDetailInFlight,
     detailError: nextDetailError,
     detailRequestSeq: nextDetailSeq,
+    history: syncHistoryScope(state.history, snapshot.attachment, nextSelectedBindingId),
   };
 }
 
@@ -420,6 +455,7 @@ export function selectBinding(
     detailInFlight: clearDetail ? false : state.detailInFlight,
     detailError: clearDetail ? null : state.detailError,
     detailRequestSeq: clearDetail ? state.detailRequestSeq + 1 : state.detailRequestSeq,
+    history: syncHistoryScope(state.history, state.snapshot.attachment, bindingId),
   };
 
   return {
@@ -516,6 +552,7 @@ export function applyMutationSuccess(
     detailInFlight: nextDetailInFlight,
     detailError: nextDetailError,
     detailRequestSeq: nextDetailSeq,
+    history: syncHistoryScope(state.history, snapshot.attachment, nextSelectedBindingId),
   };
 }
 
@@ -660,6 +697,7 @@ export function navigateBack(state: DesktopStoreState): DesktopStoreState {
 
 export function navigateToPage(state: DesktopStoreState, page: NavPage): DesktopStoreState {
   const clearDetail = state.detailTarget !== null;
+  const pauseHistoryPoll = page !== 'activity' && state.history.inFlight;
   return {
     ...state,
     page,
@@ -670,6 +708,14 @@ export function navigateToPage(state: DesktopStoreState, page: NavPage): Desktop
     detailInFlight: false,
     detailError: null,
     detailRequestSeq: clearDetail ? state.detailRequestSeq + 1 : state.detailRequestSeq,
+    history: pauseHistoryPoll
+      ? {
+          ...state.history,
+          inFlight: false,
+          loadingMode: null,
+          requestSeq: state.history.requestSeq + 1,
+        }
+      : state.history,
   };
 }
 
@@ -688,4 +734,258 @@ export function resolveExpectedDemoRevision(state: DesktopStoreState): number | 
     return state.snapshot.demo_controls.revision;
   }
   return null;
+}
+
+export function resolveActiveHistoryBindingId(state: DesktopStoreState): string | null {
+  return state.selectedBindingId ?? state.snapshot.selected_binding_id;
+}
+
+/**
+ * Returns true only when the Activity History subview should be polled in the background:
+ * - User is on the `activity` page (with no run detail overlay open)
+ * - The History subview toggle is expanded
+ * - Document/window is not hidden in the background
+ * - Runtime attachment is connected and a binding is selected
+ * - No mutation or history request is currently in flight
+ */
+export function shouldPollHistory(
+  state: DesktopStoreState,
+  isDocumentHidden: boolean = false
+): boolean {
+  if (isDocumentHidden) {
+    return false;
+  }
+  if (state.page !== 'activity' || state.detailTarget !== null) {
+    return false;
+  }
+  if (!state.history.expanded || state.history.inFlight) {
+    return false;
+  }
+  if (state.pendingMutation !== null) {
+    return false;
+  }
+  if (
+    state.snapshot.attachment.connection !== 'connected' ||
+    state.snapshot.attachment.mode === 'unconfigured'
+  ) {
+    return false;
+  }
+  return resolveActiveHistoryBindingId(state) !== null;
+}
+
+export function setHistoryExpanded(
+  state: DesktopStoreState,
+  expanded?: boolean
+): DesktopStoreState {
+  const synced = syncHistoryScope(
+    state.history,
+    state.snapshot.attachment,
+    resolveActiveHistoryBindingId(state)
+  );
+  return {
+    ...state,
+    history: toggleHistoryExpanded(synced, expanded),
+  };
+}
+
+export function updateHistoryRunIdDraft(
+  state: DesktopStoreState,
+  draft: string
+): DesktopStoreState {
+  const nextHistory = setHistoryRunIdDraft(state.history, draft);
+  if (nextHistory === state.history) {
+    return state;
+  }
+  return {
+    ...state,
+    history: nextHistory,
+  };
+}
+
+export function commitHistoryFilters(
+  state: DesktopStoreState,
+  runIdInput?: string | null,
+  kindFilter?: EventKind | null
+): DesktopStoreState {
+  return {
+    ...state,
+    history: applyHistoryFilters(
+      state.history,
+      state.snapshot.attachment,
+      resolveActiveHistoryBindingId(state),
+      runIdInput,
+      kindFilter
+    ),
+  };
+}
+
+export function resetHistoryFilters(state: DesktopStoreState): DesktopStoreState {
+  return {
+    ...state,
+    history: clearHistoryFilters(
+      state.history,
+      state.snapshot.attachment,
+      resolveActiveHistoryBindingId(state)
+    ),
+  };
+}
+
+export function selectHistoryEvent(
+  state: DesktopStoreState,
+  eventId: string | null
+): DesktopStoreState {
+  return {
+    ...state,
+    history: toggleHistoryEventDetail(state.history, eventId),
+  };
+}
+
+export function beginHistoryQuery(
+  state: DesktopStoreState,
+  mode: Exclude<HistoryLoadingMode, null> = 'refresh',
+  force: boolean = false,
+  limit: number = DEFAULT_HISTORY_PAGE_LIMIT,
+  isDocumentHidden: boolean = false
+): { state: DesktopStoreState; ticket: HistoryQueryTicket | null } {
+  const bindingId = resolveActiveHistoryBindingId(state);
+  const syncedHistory = syncHistoryScope(
+    state.history,
+    state.snapshot.attachment,
+    bindingId
+  );
+  const syncedState: DesktopStoreState =
+    syncedHistory === state.history ? state : { ...state, history: syncedHistory };
+
+  if (!bindingId || syncedState.pendingMutation !== null) {
+    return { state: syncedState, ticket: null };
+  }
+
+  if (mode === 'poll' && !shouldPollHistory(syncedState, isDocumentHidden)) {
+    return { state: syncedState, ticket: null };
+  }
+
+  if (syncedState.history.inFlight && !force) {
+    return { state: syncedState, ticket: null };
+  }
+
+  if (mode === 'more' && syncedState.history.nextCursor === null) {
+    return { state: syncedState, ticket: null };
+  }
+
+  const { cursor, afterSeq } = resolveNextHistoryCursorOrAfterSeq(syncedState.history);
+  const nextSeq = syncedState.history.requestSeq + 1;
+  const boundedLimit = Math.max(1, Math.min(50, limit));
+
+  const ticket: HistoryQueryTicket = {
+    seq: nextSeq,
+    queryEpoch: syncedState.history.queryEpoch,
+    scopeKey: syncedState.history.scopeKey,
+    bindingId,
+    afterSeq,
+    cursor,
+    limit: boundedLimit,
+    runId: syncedState.history.runIdFilter,
+    kind: syncedState.history.kindFilter,
+    mode,
+  };
+
+  return {
+    state: {
+      ...syncedState,
+      history: {
+        ...syncedState.history,
+        inFlight: true,
+        loadingMode: mode,
+        requestSeq: nextSeq,
+        error: mode === 'poll' ? syncedState.history.error : null,
+      },
+    },
+    ticket,
+  };
+}
+
+export function applyHistoryPageSuccess(
+  state: DesktopStoreState,
+  ticket: HistoryQueryTicket,
+  page: ActivityPage,
+  maxRetained: number = MAX_RETAINED_HISTORY_EVENTS
+): DesktopStoreState {
+  const activeBindingId = resolveActiveHistoryBindingId(state);
+  if (
+    ticket.queryEpoch !== state.history.queryEpoch ||
+    ticket.seq !== state.history.requestSeq ||
+    ticket.scopeKey !== state.history.scopeKey ||
+    ticket.bindingId !== page.binding_id ||
+    activeBindingId !== page.binding_id
+  ) {
+    return state;
+  }
+
+  const mergedEvents = mergeAndCapHistoryEvents(
+    state.history.events,
+    page.events,
+    page.binding_id,
+    maxRetained
+  );
+
+  const nextHasMore = Boolean(page.has_more && page.next_cursor);
+  const nextCursor = nextHasMore ? page.next_cursor : null;
+  const nextHighWater = Math.max(
+    state.history.highWaterMarkSeq,
+    page.high_water_mark_seq
+  );
+
+  // Only advance `completedHighWaterSeq` when the anchored window is completely drained
+  // (`nextHasMore === false` / `nextCursor === null`). When drained, even an empty filtered
+  // page advances `completedHighWaterSeq` to `page.high_water_mark_seq`.
+  const nextCompletedHighWater = nextHasMore
+    ? state.history.completedHighWaterSeq
+    : Math.max(state.history.completedHighWaterSeq, page.high_water_mark_seq);
+
+  const selectedStillRetained =
+    state.history.selectedEventId !== null &&
+    mergedEvents.some((event) => event.event_id === state.history.selectedEventId);
+
+  return {
+    ...state,
+    history: {
+      ...state.history,
+      inFlight: false,
+      loadingMode: null,
+      events: mergedEvents,
+      nextCursor,
+      hasMore: nextHasMore,
+      highWaterMarkSeq: nextHighWater,
+      completedHighWaterSeq: nextCompletedHighWater,
+      lastAfterSeq: page.after_seq,
+      error: null,
+      selectedEventId: selectedStillRetained ? state.history.selectedEventId : null,
+      hasLoadedOnce: true,
+    },
+  };
+}
+
+export function applyHistoryPageError(
+  state: DesktopStoreState,
+  ticket: HistoryQueryTicket,
+  errorMessage: string
+): DesktopStoreState {
+  if (
+    ticket.queryEpoch !== state.history.queryEpoch ||
+    ticket.seq !== state.history.requestSeq ||
+    ticket.scopeKey !== state.history.scopeKey
+  ) {
+    return state;
+  }
+
+  return {
+    ...state,
+    history: {
+      ...state.history,
+      inFlight: false,
+      loadingMode: null,
+      error: errorMessage,
+      hasLoadedOnce: true,
+    },
+  };
 }
