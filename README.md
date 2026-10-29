@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early foundation, developed with AI assistance and reviewed before checkpointing. Not production ready. All 89 Rust tests pass with the single-threaded fixture harness on Linux/NixOS, together with formatting, Clippy, build and CLI smoke. A qualified single-chat native pilot verified MCP worker start, a real isolated Argon file edit, fixed wake-up, event acknowledgement and terminal inspection; a separate fake-process run verified native cancellation. Real effort telemetry remained absent, so that patch was not accepted. Interactive provider continuation, authenticated multi-chat routing, reviewed result integration, the desktop UI and other platforms remain unfinished. See [validation evidence](docs/VALIDATION.md), [worker permissions](docs/WORKERS.md), and the [native routing gate](docs/NATIVE-ROUTING.md).
+> **Status:** Early foundation, developed with AI assistance and reviewed before checkpointing. Not production ready. All 89 Rust tests pass with the single-threaded fixture harness on Linux/NixOS, together with formatting, Clippy, build and CLI smoke. The operator harness also passes seven Python regressions and separate real-runtime/fake-provider probes. A qualified single-chat native pilot verified MCP worker start, a real isolated Argon file edit, fixed wake-up, event acknowledgement and terminal inspection; a separate fake-process run verified native cancellation. Real effort telemetry remained absent, so that patch was not accepted. Interactive provider continuation, authenticated multi-chat routing, reviewed result integration, the desktop UI and other platforms remain unfinished. See [validation evidence](docs/VALIDATION.md), the [M2C closing review](docs/M2C-REVIEW.md), [worker permissions](docs/WORKERS.md), and the [native routing gate](docs/NATIVE-ROUTING.md).
 
 ---
 
@@ -34,6 +34,8 @@ Threadlane is a local execution middleware and control plane designed to work al
 - **Explicit opt-in**: Trusted profiles may select `file_permissions: "task_files"` for Antigravity. Session-only grants use the actual task directory and write allowlist. Default Inherit preserves the original argv and profile fingerprint.
 - **Finite grants**: Ambiguous rule paths, existing symlink components, more than 128 write entries or 65,536 serialized settings bytes are rejected. These grants are not an OS sandbox; inherited provider policy and post-run diff checks still matter.
 - **Measured native loop**: One authorized native chat launched a real Argon task and received its terminal event through MCP/wake-up/ACK. A real one-file edit and unchanged source were independently confirmed. Missing effort stayed Failed/ExecutionFailed; no patch was automatically accepted or merged. A separate local fake-process cancellation loop also passed.
+
+- **Repeatable operator fixture**: [live_worker_pilot.py](scripts/live_worker_pilot.py) prints a plan by default and invokes a provider only with explicit `--allow-live`, executable, model and effort. It uses a new private disposable repository and preserves evidence; see [usage](docs/WORKERS.md#repeatable-operator-pilot).
 
 ### Remaining Milestones
 - **Milestone 2 remaining integration**: Interactive provider question/Steer delivery, busy-turn and multi-chat acceptance, reconciliation of preserved uncertain artifacts, and reviewed Git integration/cleanup. The durable fixture checkpoint is not the full native workflow.
@@ -148,6 +150,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=1
 python3 scripts/smoke.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_live_worker_pilot.py -v
 ```
 
 ---

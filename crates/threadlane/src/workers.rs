@@ -11,6 +11,7 @@ use threadlane_core::{
     MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN, MAX_WORKER_PATH_BYTES,
     MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
 };
+pub use threadlane_workers::WorkerFilePermissions;
 use threadlane_workers::{
     execute_worker_task_with_observer, sanitize_and_redact,
     validate_absolute_no_symlink_components, validate_simple_identifier, ExecutionBudgets,
@@ -83,6 +84,9 @@ pub struct WorkerSpecTemplate {
     pub work_area_root: PathBuf,
     /// Non-empty set of repository-relative paths or directory prefixes the worker may modify.
     pub allowed_write_paths: BTreeSet<String>,
+    /// Scoped provider file permission policy (`inherit` by default, or `task_files` for Antigravity).
+    #[serde(default)]
+    pub file_permissions: WorkerFilePermissions,
     /// Explicit execution, stream, and output budgets.
     #[serde(default)]
     pub budgets: ExecutionBudgets,
@@ -105,6 +109,7 @@ impl WorkerSpecTemplate {
             base_commit: self.base_commit.to_ascii_lowercase(),
             work_area_root: self.work_area_root.clone(),
             allowed_write_paths: self.allowed_write_paths.clone(),
+            file_permissions: self.file_permissions,
             budgets: self.budgets.clone(),
         }
     }
@@ -594,6 +599,43 @@ fn validate_work_area_side_effect_free(work_area_root: &Path) -> Result<PathBuf,
     Ok(checked)
 }
 
+fn contains_unsafe_permission_pattern_char(value: &str) -> bool {
+    value.chars().any(|ch| {
+        matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\\') || ch.is_control()
+    })
+}
+
+fn validate_task_files_profile_paths(
+    profile_id: &str,
+    provider: WorkerProvider,
+    work_area_root: &Path,
+    allowed_write_paths: &BTreeSet<String>,
+) -> Result<(), Error> {
+    if provider != WorkerProvider::Antigravity {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{profile_id}`: `file_permissions: \"task_files\"` is only supported for provider `antigravity`"
+        )));
+    }
+    let work_area_str = work_area_root.to_str().ok_or_else(|| {
+        Error::InvalidConfig(format!(
+            "profile `{profile_id}`: `work_area_root` must be valid UTF-8 when `file_permissions` is `task_files`"
+        ))
+    })?;
+    if contains_unsafe_permission_pattern_char(work_area_str) {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{profile_id}`: `work_area_root` `{work_area_str}` contains unsafe permission-pattern metacharacters or control characters"
+        )));
+    }
+    for path_entry in allowed_write_paths {
+        if contains_unsafe_permission_pattern_char(path_entry) {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{profile_id}`: `allowed_write_paths` entry `{path_entry}` contains unsafe permission-pattern metacharacters or control characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_profile_side_effect_free(
     profile: &WorkerProfileConfig,
 ) -> Result<ValidatedWorkerProfile, Error> {
@@ -621,6 +663,15 @@ fn validate_profile_side_effect_free(
         .validate()
         .map_err(|err| Error::InvalidConfig(format!("profile `{}`: {err}", profile.profile_id)))?;
 
+    if profile.spec.file_permissions == WorkerFilePermissions::TaskFiles {
+        validate_task_files_profile_paths(
+            &profile.profile_id,
+            profile.spec.provider,
+            &checked_work_area,
+            &profile.spec.allowed_write_paths,
+        )?;
+    }
+
     let git_entry = validation.canonical_repository_path.join(".git");
     if fs::symlink_metadata(&git_entry).is_err() {
         return Err(Error::InvalidConfig(format!(
@@ -642,6 +693,7 @@ fn validate_profile_side_effect_free(
     canonical_template.repository_path = validation.canonical_repository_path.clone();
     canonical_template.work_area_root = checked_work_area;
     canonical_template.base_commit = normalized_base_commit;
+    canonical_template.file_permissions = validation.file_permissions;
 
     let profile_digest = compute_profile_digest(
         &profile.profile_id,
@@ -668,7 +720,7 @@ fn compute_profile_digest(
     resolved_model: &ResolvedModelTarget,
     requested_effort: &str,
 ) -> Result<String, Error> {
-    let canonical = serde_json::json!({
+    let mut canonical = serde_json::json!({
         "profile_id": profile_id,
         "allowed_binding_ids": allowed_binding_ids,
         "provider": template.provider.as_str(),
@@ -691,6 +743,9 @@ fn compute_profile_digest(
             "max_events": template.budgets.max_events,
         }
     });
+    if template.file_permissions == WorkerFilePermissions::TaskFiles {
+        canonical["file_permissions"] = serde_json::json!("task_files");
+    }
     let bytes = serde_json::to_vec(&canonical)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);

@@ -19,8 +19,8 @@ use threadlane_workers::{
     run_worker_with_observer, BlockedKind, CleanupRefusalReason, CleanupRequest, DiffChangeKind,
     DiffViolationKind, ExecutionBudgets, FieldEvidence, IsolationLevel, NormalizedEventKind,
     OutputOverflowKind, WorkAcceptanceState, WorkerCli, WorkerCommand, WorkerError,
-    WorkerExecutionReport, WorkerPolicy, WorkerProvider, WorkerRunStatus, WorkerSpec,
-    WorktreeManager, MAX_PROMPT_BYTES, WORK_AREA_MARKER_FILENAME,
+    WorkerExecutionReport, WorkerFilePermissions, WorkerPolicy, WorkerProvider, WorkerRunStatus,
+    WorkerSpec, WorktreeManager, MAX_PROMPT_BYTES, WORK_AREA_MARKER_FILENAME,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -123,6 +123,7 @@ impl TestEnv {
             work_area_root: self.work_area.clone(),
             allowed_write_paths: self.default_allowed_paths(),
             prompt: prompt.to_string(),
+            file_permissions: WorkerFilePermissions::Inherit,
             budgets: ExecutionBudgets::default(),
         }
     }
@@ -144,6 +145,7 @@ impl TestEnv {
             work_area_root: self.work_area.clone(),
             allowed_write_paths: self.default_allowed_paths(),
             prompt: prompt.to_string(),
+            file_permissions: WorkerFilePermissions::Inherit,
             budgets: ExecutionBudgets::default(),
         }
     }

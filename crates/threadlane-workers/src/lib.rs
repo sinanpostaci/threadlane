@@ -37,6 +37,8 @@ pub mod error;
 pub mod fs_safety;
 /// Git worktree manager, private ownership manifests, post-run diff gate, and safe cleanup.
 pub mod git;
+/// Session-only provider file permission policies and Antigravity `--settings` builders.
+pub mod permissions;
 /// Typed worker specification, execution budgets, policy allowlists, and exact argv builders.
 pub mod spec;
 /// Incremental NDJSON stream parser, normalized events, and requested-vs-observed evidence checks.
@@ -61,6 +63,11 @@ pub use git::{
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
     DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION,
     WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
+};
+pub use permissions::{
+    build_antigravity_task_files_settings_json, is_unsafe_permission_pattern_char,
+    validate_permission_pattern_path, validate_permission_pattern_str, WorkerFilePermissions,
+    AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
 };
 pub use spec::{
     is_control_config_path, is_path_allowed, validate_commit_ref, validate_repo_relative_path,

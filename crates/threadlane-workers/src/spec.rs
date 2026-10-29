@@ -9,6 +9,10 @@ use crate::fs_safety::{
     ensure_platform_supported, validate_absolute_no_symlink_components, validate_executable_file,
     validate_existing_canonical_dir,
 };
+pub use crate::permissions::WorkerFilePermissions;
+use crate::permissions::{
+    build_antigravity_task_files_settings_json, validate_permission_pattern_path,
+};
 
 /// Default execution timeout (5 minutes in milliseconds).
 pub const DEFAULT_TIMEOUT_MS: u64 = 300_000;
@@ -236,16 +240,38 @@ pub struct WorkerSpec {
     pub allowed_write_paths: BTreeSet<String>,
     /// Untrusted task prompt passed as data in the argument array.
     pub prompt: String,
+    /// Trusted session-scoped provider file permission mode (`inherit` by default, or opt-in
+    /// `task_files` for Antigravity).
+    #[serde(default)]
+    pub file_permissions: WorkerFilePermissions,
     /// Finite execution timeout and output capture budgets.
     #[serde(default)]
     pub budgets: ExecutionBudgets,
 }
 
-/// Structured result of validating a [`WorkerSpec`] without launching the worker.
+/// Structured result of statically validating a [`WorkerSpec`] without launching the worker.
+///
+/// Static validation is side-effect-free and does not create or require the per-task checkout
+/// directory to exist yet. When `file_permissions` is [`WorkerFilePermissions::TaskFiles`],
+/// `constructed_argv` is the static base preview without `--settings`,
+/// `workdir_argv_resolution_required` is `true`, and `argv_resolution_note` documents that the
+/// actual launch argv is resolved against the canonical task working directory via
+/// [`WorkerSpec::build_argv_for_workdir`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpecValidationReport {
     /// Validated provider.
     pub provider: WorkerProvider,
+    /// Validated provider file permission mode (`inherit` or `task_files`).
+    #[serde(default)]
+    pub file_permissions: WorkerFilePermissions,
+    /// True when `constructed_argv` is only a static base preview and the actual launch argv
+    /// requires canonical working-directory resolution via [`WorkerSpec::build_argv_for_workdir`].
+    #[serde(default)]
+    pub workdir_argv_resolution_required: bool,
+    /// Explicit note when final launch argv depends on resolving the canonical task working
+    /// directory (`Some(...)` when `file_permissions == TaskFiles`, `None` when `Inherit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv_resolution_note: Option<String>,
     /// Canonical executable path.
     pub canonical_executable: PathBuf,
     /// Canonical repository path.
@@ -254,7 +280,12 @@ pub struct SpecValidationReport {
     pub work_area_root: PathBuf,
     /// Resolved model and effort/variant details.
     pub resolved_model: ResolvedModelTarget,
-    /// Exact argv array that will be passed to the executable (excluding argv[0]).
+    /// Static base argv array (excluding `argv[0]`).
+    ///
+    /// When `file_permissions` is [`WorkerFilePermissions::Inherit`], this is the full launch argv.
+    /// When `file_permissions` is [`WorkerFilePermissions::TaskFiles`], session-only
+    /// `--settings <inline-json>` is omitted here and resolved against the canonical working
+    /// directory by [`WorkerSpec::build_argv_for_workdir`].
     pub constructed_argv: Vec<String>,
     /// Validated repository-relative write allowlist.
     pub allowed_write_paths: BTreeSet<String>,
@@ -263,7 +294,7 @@ pub struct SpecValidationReport {
 }
 
 impl WorkerSpec {
-    /// Validates all fields of the worker spec before launch and returns a [`SpecValidationReport`].
+    /// Validates all static fields of the worker spec before launch and returns a [`SpecValidationReport`].
     pub fn validate(&self) -> Result<SpecValidationReport, WorkerError> {
         ensure_platform_supported()?;
         self.budgets.validate()?;
@@ -323,26 +354,24 @@ impl WorkerSpec {
             }
         }
 
-        if self.allowed_write_paths.is_empty() {
-            return Err(WorkerError::InvalidSpec(
-                "allowed_write_paths must contain at least one repository-relative path"
-                    .to_string(),
-            ));
-        }
-        for path_entry in &self.allowed_write_paths {
-            validate_repo_relative_path(path_entry, "allowed_write_paths entry")?;
-            if is_control_config_path(path_entry) {
-                return Err(WorkerError::InvalidSpec(format!(
-                    "allowed_write_paths entry `{path_entry}` targets protected repository or agent control configuration"
-                )));
-            }
+        self.file_permissions
+            .validate_for_provider_and_paths(self.provider, &self.allowed_write_paths)?;
+        if self.file_permissions == WorkerFilePermissions::TaskFiles {
+            let _ = validate_permission_pattern_path(&work_area_root, "work_area_root")?;
         }
 
         validate_prompt(&self.prompt)?;
-        let constructed_argv = self.build_argv_from_resolved(&resolved_model);
+        let constructed_argv = self.build_argv_from_resolved(&resolved_model, None);
+        let workdir_argv_resolution_required = self.file_permissions.requires_workdir_argv();
+        let argv_resolution_note = workdir_argv_resolution_required.then(|| {
+            "file_permissions is `task_files`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.".to_string()
+        });
 
         Ok(SpecValidationReport {
             provider: self.provider,
+            file_permissions: self.file_permissions,
+            workdir_argv_resolution_required,
+            argv_resolution_note,
             canonical_executable,
             canonical_repository_path,
             work_area_root,
@@ -463,36 +492,81 @@ impl WorkerSpec {
         }
     }
 
-    /// Validates the spec and constructs the exact CLI argument array (excluding `argv[0]`).
+    /// Validates the spec and constructs the static CLI argument array (excluding `argv[0]`)
+    /// when `file_permissions` is [`WorkerFilePermissions::Inherit`].
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] when `file_permissions` is
+    /// [`WorkerFilePermissions::TaskFiles`] because session-only `--settings <inline-json>`
+    /// requires validating and interpolating the actual canonical task working directory via
+    /// [`WorkerSpec::build_argv_for_workdir`].
     ///
     /// Never uses shell interpolation, never invents unsupported flags (such as `--variant`),
     /// and never adds `--dangerously-skip-permissions` or `--auto`.
     pub fn build_argv(&self) -> Result<Vec<String>, WorkerError> {
         let report = self.validate()?;
+        if report.workdir_argv_resolution_required {
+            return Err(WorkerError::InvalidSpec(
+                "`file_permissions: task_files` requires a canonical task working directory to construct session-only `--settings`; call `WorkerSpec::build_argv_for_workdir`"
+                    .to_string(),
+            ));
+        }
         Ok(report.constructed_argv)
     }
 
-    fn build_argv_from_resolved(&self, resolved: &ResolvedModelTarget) -> Vec<String> {
+    /// Validates the spec and `working_directory` and constructs the real launch CLI argument
+    /// array (excluding `argv[0]`) for `working_directory`.
+    ///
+    /// When `file_permissions` is [`WorkerFilePermissions::Inherit`], returns the base provider
+    /// argument array. When `file_permissions` is [`WorkerFilePermissions::TaskFiles`], validates
+    /// that the canonical `working_directory` and `allowed_write_paths` contain no unsafe
+    /// glob/rule metacharacters or symlinks and injects `--settings <inline-json>` scoped to
+    /// `working_directory`.
+    pub fn build_argv_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<Vec<String>, WorkerError> {
+        let report = self.validate()?;
+        let canonical_workdir =
+            validate_existing_canonical_dir(working_directory, "working_directory")?;
+        let settings_json = match self.file_permissions {
+            WorkerFilePermissions::Inherit => None,
+            WorkerFilePermissions::TaskFiles => Some(build_antigravity_task_files_settings_json(
+                &canonical_workdir,
+                &self.allowed_write_paths,
+            )?),
+        };
+        Ok(self.build_argv_from_resolved(&report.resolved_model, settings_json))
+    }
+
+    fn build_argv_from_resolved(
+        &self,
+        resolved: &ResolvedModelTarget,
+        settings_json: Option<String>,
+    ) -> Vec<String> {
         match self.provider {
             WorkerProvider::Antigravity => {
                 let effort = resolved
                     .effort
                     .as_deref()
                     .expect("Antigravity effort is verified during model target resolution");
-                vec![
-                    "--model".to_string(),
-                    resolved.cli_model_arg.clone(),
-                    "--effort".to_string(),
-                    effort.to_string(),
-                    "--mode".to_string(),
-                    "accept-edits".to_string(),
-                    "--output-format".to_string(),
-                    "stream-json".to_string(),
-                    "--print-timeout".to_string(),
-                    "0".to_string(),
-                    "--print".to_string(),
-                    self.prompt.clone(),
-                ]
+                let mut argv = Vec::with_capacity(if settings_json.is_some() { 14 } else { 12 });
+                argv.push("--model".to_string());
+                argv.push(resolved.cli_model_arg.clone());
+                argv.push("--effort".to_string());
+                argv.push(effort.to_string());
+                argv.push("--mode".to_string());
+                argv.push("accept-edits".to_string());
+                argv.push("--output-format".to_string());
+                argv.push("stream-json".to_string());
+                argv.push("--print-timeout".to_string());
+                argv.push("0".to_string());
+                if let Some(settings) = settings_json {
+                    argv.push("--settings".to_string());
+                    argv.push(settings);
+                }
+                argv.push("--print".to_string());
+                argv.push(self.prompt.clone());
+                argv
             }
             WorkerProvider::OpenCodeV2 => {
                 let mut argv = Vec::with_capacity(10);

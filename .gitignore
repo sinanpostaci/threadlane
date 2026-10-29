@@ -16,3 +16,7 @@ supervisor.json
 .supervisor.json.tmp.*
 supervisor.lock
 /result
+
+# Python operator harness bytecode
+__pycache__/
+*.py[cod]
