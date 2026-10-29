@@ -14,13 +14,15 @@ use tempfile::TempDir;
 use threadlane_workers::{
     cleanup_worktree, evaluate_diff_gate, evaluate_diff_gate_with_limits,
     evaluate_diff_gate_with_scan_limits, evaluate_diff_gate_with_timeout, execute_worker_task,
-    is_process_alive, is_process_group_alive, load_and_verify_manifest, run_cli, run_worker,
-    run_worker_with_cancel, BlockedKind, CleanupRefusalReason, CleanupRequest, DiffChangeKind,
-    DiffViolationKind, ExecutionBudgets, FieldEvidence, IsolationLevel, OutputOverflowKind,
-    WorkAcceptanceState, WorkerCli, WorkerCommand, WorkerError, WorkerPolicy, WorkerProvider,
-    WorkerRunStatus, WorkerSpec, WorktreeManager, MAX_PROMPT_BYTES, WORK_AREA_MARKER_FILENAME,
+    execute_worker_task_with_observer, is_process_alive, is_process_group_alive,
+    load_and_verify_manifest, run_cli, run_worker, run_worker_with_cancel,
+    run_worker_with_observer, BlockedKind, CleanupRefusalReason, CleanupRequest, DiffChangeKind,
+    DiffViolationKind, ExecutionBudgets, FieldEvidence, IsolationLevel, NormalizedEventKind,
+    OutputOverflowKind, WorkAcceptanceState, WorkerCli, WorkerCommand, WorkerError,
+    WorkerExecutionReport, WorkerPolicy, WorkerProvider, WorkerRunStatus, WorkerSpec,
+    WorktreeManager, MAX_PROMPT_BYTES, WORK_AREA_MARKER_FILENAME,
 };
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 struct TestEnv {
     _temp_dir: TempDir,
@@ -2162,4 +2164,535 @@ fn diff_gate_preserves_valid_unicode_fffd_rejects_raw_non_utf8_filename_and_boun
         v.kind == DiffViolationKind::DiffBudgetExceeded
             && v.detail.contains("max_scan_depth budget (3)")
     }));
+}
+
+#[tokio::test]
+async fn live_observer_receives_sanitized_bounded_progress_while_worker_is_still_running() {
+    let env = TestEnv::new();
+    let workdir = env.root_dir.join("live-observer-dir");
+    fs::create_dir_all(&workdir).expect("create workdir");
+
+    let long_tail = "x".repeat(320);
+    let live_bin = env.write_fake_executable(
+        "live-observer-worker",
+        &format!(
+            r#"
+printf '%s\n' "$$" > live_worker.pid
+printf '{{"type":"system","subtype":"init","session_id":"s-live","model":"gemini-4-argon-high","effort":"high"}}\n'
+printf '{{"type":"assistant","text":"progress with Bearer secret_live_token_abc123 and api_key=sk-live1234567890abcdef {long_tail}"}}\n'
+while [ ! -f release_worker.flag ]; do
+    sleep 0.01
+done
+printf '{{"type":"result","subtype":"success","session_id":"s-live","model":"gemini-4-argon-high","effort":"high","result":"completed"}}\n'
+"#
+        ),
+    );
+
+    let mut spec = env.antigravity_spec(live_bin, "Observe incremental progress");
+    spec.budgets.timeout_ms = 5_000;
+
+    let (progress_tx, mut progress_rx) = mpsc::channel(8);
+    let run_workdir = workdir.clone();
+    let run_spec = spec.clone();
+    let worker_join = tokio::spawn(async move {
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        run_worker_with_observer(&run_spec, &run_workdir, &mut cancel_rx, Some(progress_tx)).await
+    });
+
+    let ev1 = tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+        .await
+        .expect("receive init event before timeout")
+        .expect("init event present");
+    let ev2 = tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+        .await
+        .expect("receive progress event before timeout")
+        .expect("progress event present");
+
+    // Verify the worker future and OS child process are still running when progress arrives.
+    assert!(
+        !worker_join.is_finished(),
+        "worker future must still be running when live progress event arrives"
+    );
+    let live_pid: u32 = fs::read_to_string(workdir.join("live_worker.pid"))
+        .expect("read live_worker.pid")
+        .trim()
+        .parse()
+        .expect("parse live_pid");
+    assert!(
+        is_process_alive(live_pid),
+        "worker OS process {live_pid} must still be alive when live progress event arrives"
+    );
+
+    assert_eq!(ev1.line_number, 1);
+    assert_eq!(ev1.kind, NormalizedEventKind::Init);
+    assert_eq!(ev1.model.as_deref(), Some("gemini-4-argon-high"));
+    assert_eq!(ev1.effort.as_deref(), Some("high"));
+
+    assert_eq!(ev2.line_number, 2);
+    assert_eq!(ev2.kind, NormalizedEventKind::Progress);
+    let ev2_summary = ev2.summary.as_deref().expect("progress summary present");
+    assert!(
+        ev2_summary.len() <= 256,
+        "live progress summary must be bounded to 256 bytes (got {})",
+        ev2_summary.len()
+    );
+    assert!(ev2_summary.contains("[REDACTED]"));
+    assert!(ev2_summary.ends_with("...[truncated]"));
+    assert!(!ev2_summary.contains("secret_live_token_abc123"));
+    assert!(!ev2_summary.contains("sk-live1234567890abcdef"));
+
+    // Release the worker so it can emit its terminal result and exit.
+    fs::write(workdir.join("release_worker.flag"), "go\n").expect("write release_worker.flag");
+
+    let ev3 = tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+        .await
+        .expect("receive result event before timeout")
+        .expect("result event present");
+    assert_eq!(ev3.line_number, 3);
+    assert_eq!(ev3.kind, NormalizedEventKind::Result);
+    assert!(progress_rx.recv().await.is_none());
+
+    let report = worker_join
+        .await
+        .expect("join worker task")
+        .expect("run_worker_with_observer succeeded");
+    assert_eq!(report.status, WorkerRunStatus::Succeeded);
+    assert_eq!(report.dropped_live_events, 0);
+    assert_eq!(report.evidence.dropped_events_count, 0);
+    assert_eq!(report.evidence.retained_events, vec![ev1, ev2, ev3]);
+
+    // Also verify `execute_worker_task_with_observer` emits live events before process exit.
+    let task_gate_file = env.root_dir.join("release_task_worker.flag");
+    let task_pid_file = env.root_dir.join("task_live_worker.pid");
+    let task_bin = env.write_fake_executable(
+        "task-live-observer-worker",
+        &format!(
+            r#"
+printf 'pub fn live_observed_task() {{}}\n' >> crates/threadlane-workers/src/lib.rs
+printf '%s\n' "$$" > '{}'
+printf '{{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}}\n'
+printf '{{"type":"tool_use","name":"edit_file","message":"updating lib.rs with password=super_secret_pw"}}\n'
+while [ ! -f '{}' ]; do
+    sleep 0.01
+done
+printf '{{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"done"}}\n'
+"#,
+            task_pid_file.display(),
+            task_gate_file.display()
+        ),
+    );
+    let task_spec = env.antigravity_spec(task_bin, "Task live observer test");
+    let (task_tx, mut task_rx) = mpsc::channel(8);
+    let task_join = tokio::spawn(async move {
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        execute_worker_task_with_observer(
+            &task_spec,
+            "run-live-obs",
+            "task-1",
+            None,
+            &mut cancel_rx,
+            Some(task_tx),
+        )
+        .await
+    });
+
+    let task_ev1 = tokio::time::timeout(Duration::from_secs(2), task_rx.recv())
+        .await
+        .expect("receive task init")
+        .expect("task init event");
+    let task_ev2 = tokio::time::timeout(Duration::from_secs(2), task_rx.recv())
+        .await
+        .expect("receive task tool event")
+        .expect("task tool event");
+
+    assert!(!task_join.is_finished());
+    let task_pid: u32 = fs::read_to_string(&task_pid_file)
+        .expect("read task_live_worker.pid")
+        .trim()
+        .parse()
+        .expect("parse task_pid");
+    assert!(is_process_alive(task_pid));
+    assert_eq!(task_ev1.kind, NormalizedEventKind::Init);
+    assert_eq!(task_ev2.kind, NormalizedEventKind::Tool);
+    assert_eq!(task_ev2.tool_name.as_deref(), Some("edit_file"));
+    assert!(task_ev2
+        .summary
+        .as_deref()
+        .expect("tool summary")
+        .contains("[REDACTED]"));
+
+    fs::write(&task_gate_file, "go\n").expect("write release_task_worker.flag");
+
+    let task_ev3 = tokio::time::timeout(Duration::from_secs(2), task_rx.recv())
+        .await
+        .expect("receive task result")
+        .expect("task result event");
+    assert_eq!(task_ev3.kind, NormalizedEventKind::Result);
+
+    let task_report = task_join
+        .await
+        .expect("join task_join")
+        .expect("execute_worker_task_with_observer succeeded");
+    assert_eq!(task_report.worker_report.status, WorkerRunStatus::Succeeded);
+    assert_eq!(task_report.worker_report.dropped_live_events, 0);
+    assert!(task_report.diff_gate.passed);
+    assert_eq!(
+        task_report.overall_acceptance_state,
+        WorkAcceptanceState::DiffGatePassedPendingReview
+    );
+}
+
+#[tokio::test]
+async fn full_and_closed_observer_channels_never_hang_preserve_evidence_and_count_drops() {
+    let env = TestEnv::new();
+    let workdir = env.root_dir.join("drop-observer-dir");
+    fs::create_dir_all(&workdir).expect("create workdir");
+
+    // 1. Full observer channel (`capacity = 2`) with `max_events = 3` across 6 valid events.
+    // Proves `dropped_live_events` (4) and `evidence.dropped_events_count` (3) are tracked
+    // independently and that terminal `result` evidence is preserved even when observer is full.
+    let six_events_bin = env.write_fake_executable(
+        "six-events-worker",
+        r#"
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"assistant","text":"step 1"}\n'
+printf '{"type":"assistant","text":"step 2"}\n'
+printf '{"type":"assistant","text":"step 3"}\n'
+printf '{"type":"assistant","text":"step 4"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"done"}\n'
+"#,
+    );
+    let mut full_spec = env.antigravity_spec(six_events_bin, "Full observer test");
+    full_spec.budgets.max_events = 3;
+
+    let (full_tx, mut full_rx) = mpsc::channel(2);
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    let full_report = run_worker_with_observer(&full_spec, &workdir, &mut cancel_rx, Some(full_tx))
+        .await
+        .expect("run worker with full observer");
+
+    assert_eq!(full_report.status, WorkerRunStatus::Succeeded);
+    assert!(full_report.evidence.saw_init_event);
+    assert!(full_report.evidence.saw_result_event);
+    assert_eq!(full_report.evidence.valid_json_events, 6);
+    assert_eq!(full_report.dropped_live_events, 4);
+    assert_eq!(full_report.evidence.retained_events.len(), 3);
+    assert_eq!(full_report.evidence.dropped_events_count, 3);
+
+    let buffered_1 = full_rx.recv().await.expect("buffered event 1");
+    let buffered_2 = full_rx.recv().await.expect("buffered event 2");
+    assert_eq!(buffered_1.line_number, 1);
+    assert_eq!(buffered_2.line_number, 2);
+    assert!(full_rx.recv().await.is_none());
+
+    // 2. Full observer (`capacity = 1`) with malformed stdout line and redacted secrets.
+    let malformed_full_bin = env.write_fake_executable(
+        "malformed-full-worker",
+        r#"
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf 'NOT_JSON_LINE secret token=sk-malformedsecret123456\n'
+printf '{"type":"assistant","text":"progress with Bearer dropped_live_secret_token_999"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"done"}\n'
+"#,
+    );
+    let mal_spec = env.antigravity_spec(malformed_full_bin, "Malformed + full observer");
+    let (mal_tx, _mal_rx) = mpsc::channel(1);
+    let mal_report = run_worker_with_observer(&mal_spec, &workdir, &mut cancel_rx, Some(mal_tx))
+        .await
+        .expect("run malformed worker with full observer");
+
+    assert_eq!(mal_report.status, WorkerRunStatus::MalformedStream);
+    assert_eq!(mal_report.evidence.total_lines, 4);
+    assert_eq!(mal_report.evidence.valid_json_events, 3);
+    assert_eq!(mal_report.evidence.malformed_lines_count, 1);
+    assert_eq!(mal_report.dropped_live_events, 2);
+    assert!(mal_report.evidence.saw_result_event);
+    assert!(mal_report.evidence.malformed_diagnostics[0]
+        .redacted_snippet
+        .contains("[REDACTED]"));
+    assert!(!mal_report.evidence.malformed_diagnostics[0]
+        .redacted_snippet
+        .contains("sk-malformedsecret123456"));
+    assert!(mal_report.evidence.retained_events[1]
+        .summary
+        .as_deref()
+        .expect("retained progress summary")
+        .contains("[REDACTED]"));
+
+    // 3. Closed observer (`drop(rx)` before execution) via `execute_worker_task_with_observer`.
+    let closed_task_bin = env.write_fake_executable(
+        "closed-observer-task-worker",
+        r#"
+printf 'pub fn closed_observer_edit() {}\n' >> crates/threadlane-workers/src/lib.rs
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"assistant","text":"working while observer receiver is dropped"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"done"}\n'
+"#,
+    );
+    let closed_spec = env.antigravity_spec(closed_task_bin, "Closed observer task");
+    let (closed_tx, closed_rx) = mpsc::channel(4);
+    drop(closed_rx);
+
+    let closed_task_report = execute_worker_task_with_observer(
+        &closed_spec,
+        "run-closed-obs",
+        "task-1",
+        None,
+        &mut cancel_rx,
+        Some(closed_tx),
+    )
+    .await
+    .expect("execute_worker_task_with_observer with closed receiver");
+
+    assert_eq!(
+        closed_task_report.worker_report.status,
+        WorkerRunStatus::Succeeded
+    );
+    assert_eq!(closed_task_report.worker_report.dropped_live_events, 3);
+    assert_eq!(
+        closed_task_report
+            .worker_report
+            .evidence
+            .dropped_events_count,
+        0
+    );
+    assert_eq!(
+        closed_task_report
+            .worker_report
+            .evidence
+            .retained_events
+            .len(),
+        3
+    );
+    assert!(closed_task_report.diff_gate.passed);
+    assert_eq!(
+        closed_task_report.overall_acceptance_state,
+        WorkAcceptanceState::DiffGatePassedPendingReview
+    );
+
+    // 4. Output overflow under a full observer does not block overflow termination.
+    let overflow_full_bin = env.write_fake_executable(
+        "overflow-full-observer",
+        r#"
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"assistant","text":"short"}\n'
+printf '{"type":"assistant","text":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n'
+"#,
+    );
+    let mut overflow_spec = env.antigravity_spec(overflow_full_bin, "Overflow under full observer");
+    overflow_spec.budgets.max_line_bytes = 96;
+    overflow_spec.budgets.max_stdout_bytes = 4096;
+    let (ov_tx, _ov_rx) = mpsc::channel(1);
+    let ov_report = run_worker_with_observer(&overflow_spec, &workdir, &mut cancel_rx, Some(ov_tx))
+        .await
+        .expect("run overflow worker with full observer");
+    assert_eq!(ov_report.status, WorkerRunStatus::OutputOverflow);
+    assert_eq!(
+        ov_report.overflow,
+        Some(OutputOverflowKind::StdoutLineExceeded { max_line_bytes: 96 })
+    );
+    assert_eq!(ov_report.dropped_live_events, 1);
+}
+
+#[tokio::test]
+async fn timeout_and_cancel_work_promptly_under_slow_full_observer() {
+    let env = TestEnv::new();
+    let workdir = env.root_dir.join("slow-observer-timeout-cancel-dir");
+    fs::create_dir_all(&workdir).expect("create workdir");
+
+    // 1. Timeout when observer channel (capacity 1) is full and never drained during execution.
+    let timeout_bin = env.write_fake_executable(
+        "slow-obs-timeout-worker",
+        r#"
+sleep 30 &
+desc_pid=$!
+printf '%s\n' "$desc_pid" > slow_obs_timeout_desc.pid
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"assistant","text":"event 2"}\n'
+printf '{"type":"assistant","text":"event 3"}\n'
+printf '{"type":"assistant","text":"event 4"}\n'
+sleep 30
+"#,
+    );
+    let mut timeout_spec = env.antigravity_spec(timeout_bin, "Slow observer timeout test");
+    timeout_spec.budgets.timeout_ms = 200;
+
+    let (timeout_tx, mut timeout_rx) = mpsc::channel(1);
+    let (_cancel_tx, mut noop_cancel_rx) = watch::channel(false);
+    let timeout_report = run_worker_with_observer(
+        &timeout_spec,
+        &workdir,
+        &mut noop_cancel_rx,
+        Some(timeout_tx),
+    )
+    .await
+    .expect("run timeout worker under slow observer");
+
+    assert_eq!(timeout_report.status, WorkerRunStatus::TimedOut);
+    assert!(
+        timeout_report.duration_ms < 2_500,
+        "timeout under full observer must not hang (took {} ms)",
+        timeout_report.duration_ms
+    );
+    assert_eq!(timeout_report.dropped_live_events, 3);
+    assert_eq!(timeout_report.evidence.retained_events.len(), 4);
+    assert!(timeout_rx.recv().await.is_some());
+
+    let timeout_desc_pid: u32 = fs::read_to_string(workdir.join("slow_obs_timeout_desc.pid"))
+        .expect("read slow_obs_timeout_desc.pid")
+        .trim()
+        .parse()
+        .expect("parse timeout_desc_pid");
+    assert!(!is_process_alive(timeout_desc_pid));
+    if let Some(pgid) = timeout_report.process_group_id {
+        assert!(!is_process_group_alive(pgid));
+    }
+
+    // 2. Explicit cancellation when observer channel (capacity 1) is full and never drained.
+    let cancel_bin = env.write_fake_executable(
+        "slow-obs-cancel-worker",
+        r#"
+sleep 30 &
+desc_pid=$!
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"assistant","text":"event 2"}\n'
+printf '{"type":"assistant","text":"event 3"}\n'
+printf '%s\n' "$desc_pid" > slow_obs_cancel_desc.pid
+sleep 30
+"#,
+    );
+    let mut cancel_spec = env.antigravity_spec(cancel_bin, "Slow observer cancel test");
+    cancel_spec.budgets.timeout_ms = 10_000;
+
+    let (cancel_obs_tx, mut cancel_obs_rx) = mpsc::channel(1);
+    let (cancel_tx, mut cancel_watch_rx) = watch::channel(false);
+    let cancel_pid_file = workdir.join("slow_obs_cancel_desc.pid");
+    tokio::spawn(async move {
+        for _ in 0..100 {
+            if cancel_pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = cancel_tx.send(true);
+    });
+
+    let cancel_report = run_worker_with_observer(
+        &cancel_spec,
+        &workdir,
+        &mut cancel_watch_rx,
+        Some(cancel_obs_tx),
+    )
+    .await
+    .expect("run cancelled worker under slow observer");
+
+    assert_eq!(cancel_report.status, WorkerRunStatus::Cancelled);
+    assert!(
+        cancel_report.duration_ms < 2_500,
+        "cancellation under full observer must not hang (took {} ms)",
+        cancel_report.duration_ms
+    );
+    assert_eq!(cancel_report.dropped_live_events, 2);
+    assert_eq!(cancel_report.evidence.retained_events.len(), 3);
+    assert!(cancel_obs_rx.recv().await.is_some());
+
+    let cancel_desc_pid: u32 = fs::read_to_string(workdir.join("slow_obs_cancel_desc.pid"))
+        .expect("read slow_obs_cancel_desc.pid")
+        .trim()
+        .parse()
+        .expect("parse cancel_desc_pid");
+    assert!(!is_process_alive(cancel_desc_pid));
+    if let Some(pgid) = cancel_report.process_group_id {
+        assert!(!is_process_group_alive(pgid));
+    }
+}
+
+#[tokio::test]
+async fn none_observer_preserves_behavior_zero_live_drops_and_argon_missing_effort() {
+    let env = TestEnv::new();
+    let workdir = env.root_dir.join("none-observer-dir");
+    fs::create_dir_all(&workdir).expect("create workdir");
+
+    // 1. `None` observer with `max_events = 2` across 4 events never inflates `dropped_live_events`.
+    let four_events_bin = env.write_fake_executable(
+        "none-obs-four-events",
+        r#"
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"assistant","text":"msg 1"}\n'
+printf '{"type":"assistant","text":"msg 2"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"done"}\n'
+"#,
+    );
+    let mut spec = env.antigravity_spec(four_events_bin, "None observer test");
+    spec.budgets.max_events = 2;
+
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    let report_none = run_worker_with_observer(&spec, &workdir, &mut cancel_rx, None)
+        .await
+        .expect("run_worker_with_observer with None");
+    let report_wrapper = run_worker(&spec, &workdir).await.expect("run_worker");
+
+    for report in [&report_none, &report_wrapper] {
+        assert_eq!(report.status, WorkerRunStatus::Succeeded);
+        assert_eq!(report.dropped_live_events, 0);
+        assert_eq!(report.evidence.retained_events.len(), 2);
+        assert_eq!(report.evidence.dropped_events_count, 2);
+    }
+
+    // 2. Serde default compatibility when deserializing legacy JSON without `dropped_live_events`.
+    let mut json_val = serde_json::to_value(&report_none).expect("serialize report");
+    json_val
+        .as_object_mut()
+        .expect("report object")
+        .remove("dropped_live_events");
+    let deserialized: WorkerExecutionReport =
+        serde_json::from_value(json_val).expect("deserialize legacy report without field");
+    assert_eq!(deserialized.dropped_live_events, 0);
+
+    // 3. Existing Argon missing-effort stream schema remains `MissingEffortEvidence` /
+    // `FinishedNeedsEvidenceAndReview` both with `Some(progress_tx)` and `None`.
+    let argon_missing_effort_bin = env.write_fake_executable(
+        "argon-missing-effort-obs",
+        r#"
+printf 'pub fn argon_obs_check() {}\n' >> crates/threadlane-workers/src/lib.rs
+printf '{"event":"init","conversation_id":"s-argon","init":{"model":"gemini-4-argon-high","cwd":"/canonical/worktree","permission_mode":"accept-edits"}}\n'
+printf '{"event":"step_update","step_update":{"conversation_id":"s-argon","step_index":1,"state":"DONE","step_type":"agent_response","usage":{}}}\n'
+printf '{"event":"result","result":{"conversation_id":"s-argon","status":"SUCCESS","response":"Completed","num_turns":1}}\n'
+"#,
+    );
+    let argon_spec = env.antigravity_spec(argon_missing_effort_bin, "Argon missing effort check");
+    let (argon_tx, mut argon_rx) = mpsc::channel(8);
+    let argon_task_report = execute_worker_task_with_observer(
+        &argon_spec,
+        "run-argon-obs",
+        "task-1",
+        None,
+        &mut cancel_rx,
+        Some(argon_tx),
+    )
+    .await
+    .expect("execute_worker_task_with_observer on argon missing effort");
+
+    assert_eq!(
+        argon_task_report.worker_report.status,
+        WorkerRunStatus::MissingEffortEvidence
+    );
+    assert_eq!(argon_task_report.worker_report.dropped_live_events, 0);
+    assert_eq!(
+        argon_task_report.overall_acceptance_state,
+        WorkAcceptanceState::FinishedNeedsEvidenceAndReview
+    );
+
+    let mut observed_kinds = Vec::new();
+    while let Some(ev) = argon_rx.recv().await {
+        observed_kinds.push(ev.kind);
+    }
+    assert_eq!(
+        observed_kinds,
+        vec![
+            NormalizedEventKind::Init,
+            NormalizedEventKind::Progress,
+            NormalizedEventKind::Result,
+        ]
+    );
 }

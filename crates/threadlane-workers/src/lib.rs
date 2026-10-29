@@ -16,8 +16,11 @@
 //! - **Exact argument arrays**: Never invokes a shell, never invents unsupported flags (such as
 //!   `--variant`), and never adds `--dangerously-skip-permissions` or `--auto`.
 //! - **Incremental bounded NDJSON & evidence verification**: Captures stdout and stderr in bounded
-//!   chunks, parses init/model/session/blocked/error/result evidence, and rejects exit-zero runs
-//!   that lack model/effort/result evidence or report mismatches/errors/blocks.
+//!   chunks, parses init/model/session/blocked/error/result evidence, optionally forwards live
+//!   sanitized/bounded [`NormalizedWorkerEvent`] records before process exit via nonblocking
+//!   `try_send` (`run_worker_with_observer`, `execute_worker_task_with_observer`, recording
+//!   undelivered live sends in [`WorkerExecutionReport::dropped_live_events`]), and rejects
+//!   exit-zero runs that lack model/effort/result evidence or report mismatches/errors/blocks.
 //! - **Unix process-group supervision**: Spawns workers in a dedicated process group (`process_group(0)`),
 //!   enforces timeouts, explicit cancellation, and output overflow limits, and terminates/reaps
 //!   the entire descendant group so lingering children holding pipes cannot hang supervision.
@@ -51,13 +54,13 @@ pub use fs_safety::{
 pub use git::{
     begin_worktree_job, cleanup_worktree, evaluate_diff_gate, evaluate_diff_gate_with_limits,
     evaluate_diff_gate_with_scan_limits, evaluate_diff_gate_with_timeout, execute_worker_task,
-    load_and_verify_manifest, ChangedPathEntry, CleanupReport, CleanupRequest, DiffChangeKind,
-    DiffGateReport, DiffViolation, DiffViolationKind, IsolationLevel, TaskExecutionReport,
-    WorkAcceptanceState, WorkAreaOwnershipMarker, WorktreeJobGuard, WorktreeKind, WorktreeManager,
-    WorktreeManifest, CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES, DEFAULT_MAX_SCAN_DEPTH,
-    DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION, WORK_AREA_MARKER_FILENAME,
-    WORK_AREA_MARKER_VERSION,
+    execute_worker_task_with_observer, load_and_verify_manifest, ChangedPathEntry, CleanupReport,
+    CleanupRequest, DiffChangeKind, DiffGateReport, DiffViolation, DiffViolationKind,
+    IsolationLevel, TaskExecutionReport, WorkAcceptanceState, WorkAreaOwnershipMarker,
+    WorktreeJobGuard, WorktreeKind, WorktreeManager, WorktreeManifest, CHECKOUTS_SUBDIR,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
+    DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION,
+    WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
 };
 pub use spec::{
     is_control_config_path, is_path_allowed, validate_commit_ref, validate_repo_relative_path,
@@ -73,5 +76,6 @@ pub use stream::{
 };
 pub use supervisor::{
     is_process_alive, is_process_group_alive, run_worker, run_worker_with_cancel,
-    OutputOverflowKind, WorkerExecutionReport, WorkerRunStatus, POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
+    run_worker_with_observer, OutputOverflowKind, WorkerExecutionReport, WorkerRunStatus,
+    POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
 };

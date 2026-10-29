@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 use crate::error::{CleanupRefusalReason, WorkerError};
@@ -22,8 +22,9 @@ use crate::spec::{
     is_control_config_path, is_path_allowed, validate_commit_ref, validate_repo_relative_path,
     validate_simple_identifier, WorkerSpec,
 };
+use crate::stream::NormalizedWorkerEvent;
 use crate::supervisor::{
-    is_process_alive, run_worker_with_cancel, WorkerExecutionReport, WorkerRunStatus,
+    is_process_alive, run_worker_with_observer, WorkerExecutionReport, WorkerRunStatus,
 };
 #[cfg(unix)]
 use crate::supervisor::{unix_pgroup, ProcessGroupGuard, POST_EXIT_PIPE_DRAIN_TIMEOUT_MS};
@@ -1292,7 +1293,8 @@ fn evaluate_entry_violations(
 
 /// Executes a configured [`WorkerSpec`] inside an owned task worktree (either an existing one
 /// identified by `existing_worktree_id` or a newly created one for `(run_id, task_id)`),
-/// then evaluates the post-run Git diff gate and persists updated manifest metadata.
+/// then evaluates the post-run Git diff gate and persists updated manifest metadata,
+/// with no live event observer (`progress_tx = None`).
 ///
 /// Never performs auto-merge, auto-push, or automatic cleanup.
 pub async fn execute_worker_task(
@@ -1301,6 +1303,30 @@ pub async fn execute_worker_task(
     task_id: &str,
     existing_worktree_id: Option<&str>,
     cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<TaskExecutionReport, WorkerError> {
+    execute_worker_task_with_observer(spec, run_id, task_id, existing_worktree_id, cancel_rx, None)
+        .await
+}
+
+/// Executes a configured [`WorkerSpec`] inside an owned task worktree (either an existing one
+/// identified by `existing_worktree_id` or a newly created one for `(run_id, task_id)`),
+/// forwarding live normalized stdout events to `progress_tx` when provided, then evaluates the
+/// post-run Git diff gate and persists updated manifest metadata.
+///
+/// When `progress_tx` is `Some`, each sanitized, bounded [`NormalizedWorkerEvent`] parsed from
+/// stdout is emitted incrementally before process exit using [`mpsc::Sender::try_send`]. A full
+/// or closed observer channel never blocks pipe drainage, cancellation, timeout handling, or
+/// final evidence verification; undelivered live events are counted in
+/// [`WorkerExecutionReport::dropped_live_events`].
+///
+/// Never performs auto-merge, auto-push, or automatic cleanup.
+pub async fn execute_worker_task_with_observer(
+    spec: &WorkerSpec,
+    run_id: &str,
+    task_id: &str,
+    existing_worktree_id: Option<&str>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
 ) -> Result<TaskExecutionReport, WorkerError> {
     let _validation = spec.validate()?;
     let manager = WorktreeManager::new(
@@ -1337,7 +1363,8 @@ pub async fn execute_worker_task(
     };
 
     let guard = manager.begin_job(&manifest.worktree_id)?;
-    let worker_report = run_worker_with_cancel(spec, &manifest.checkout_path, cancel_rx).await?;
+    let worker_report =
+        run_worker_with_observer(spec, &manifest.checkout_path, cancel_rx, progress_tx).await?;
     let diff_gate = evaluate_diff_gate(manager.work_area_root(), &manifest.worktree_id)?;
     let updated_manifest = guard.finish()?;
 

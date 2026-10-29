@@ -239,9 +239,23 @@ impl NdjsonStreamParser {
 
     /// Processes a single complete line from stdout.
     pub fn ingest_line(&mut self, raw_line: &[u8]) {
+        let _ = self.ingest_line_internal(raw_line, false);
+    }
+
+    /// Processes a single complete line from stdout and returns the sanitized, bounded
+    /// [`NormalizedWorkerEvent`] when the line is a valid JSON object event.
+    pub fn ingest_line_with_event(&mut self, raw_line: &[u8]) -> Option<NormalizedWorkerEvent> {
+        self.ingest_line_internal(raw_line, true)
+    }
+
+    fn ingest_line_internal(
+        &mut self,
+        raw_line: &[u8],
+        emit_live_event: bool,
+    ) -> Option<NormalizedWorkerEvent> {
         let trimmed = trim_ascii_whitespace(raw_line);
         if trimmed.is_empty() {
-            return;
+            return None;
         }
         self.total_lines += 1;
         let line_number = self.total_lines;
@@ -254,7 +268,7 @@ impl NdjsonStreamParser {
                     format!("invalid UTF-8 on stdout line: {err}"),
                     &String::from_utf8_lossy(trimmed),
                 );
-                return;
+                return None;
             }
         };
 
@@ -266,7 +280,7 @@ impl NdjsonStreamParser {
                     format!("invalid JSON on stdout line: {err}"),
                     line_str,
                 );
-                return;
+                return None;
             }
         };
 
@@ -276,11 +290,12 @@ impl NdjsonStreamParser {
                 "stdout NDJSON line must be a JSON object".to_string(),
                 line_str,
             );
-            return;
+            return None;
         };
 
         self.valid_json_events += 1;
-        self.process_json_object(line_number, obj);
+        let event = self.process_json_object(line_number, obj);
+        self.retain_event(event, emit_live_event)
     }
 
     fn record_malformed(&mut self, line_number: usize, error: String, raw_snippet: &str) {
@@ -294,7 +309,11 @@ impl NdjsonStreamParser {
         }
     }
 
-    fn process_json_object(&mut self, line_number: usize, obj: &Map<String, Value>) {
+    fn process_json_object(
+        &mut self,
+        line_number: usize,
+        obj: &Map<String, Value>,
+    ) -> NormalizedWorkerEvent {
         let event_type = obj
             .get("event")
             .or_else(|| obj.get("type"))
@@ -387,7 +406,7 @@ impl NdjsonStreamParser {
                     summary: blocked_summary.clone(),
                 });
             }
-            self.retain_event(NormalizedWorkerEvent {
+            return NormalizedWorkerEvent {
                 line_number,
                 kind: NormalizedEventKind::Blocked,
                 raw_type,
@@ -396,8 +415,7 @@ impl NdjsonStreamParser {
                 effort: event_effort,
                 tool_name,
                 summary: Some(blocked_summary),
-            });
-            return;
+            };
         }
 
         // 2. Check for non-fatal recoverable step/tool errors (`step_update`, `tool_result`)
@@ -413,7 +431,7 @@ impl NdjsonStreamParser {
                     message: err_msg.clone(),
                 });
             }
-            self.retain_event(NormalizedWorkerEvent {
+            return NormalizedWorkerEvent {
                 line_number,
                 kind: NormalizedEventKind::Error,
                 raw_type,
@@ -422,8 +440,7 @@ impl NdjsonStreamParser {
                 effort: event_effort,
                 tool_name,
                 summary: Some(err_msg),
-            });
-            return;
+            };
         }
 
         // 3. Classify Init, Result, Tool, Progress, or Other.
@@ -461,7 +478,7 @@ impl NdjsonStreamParser {
 
         let summary = extract_summary(obj);
 
-        self.retain_event(NormalizedWorkerEvent {
+        NormalizedWorkerEvent {
             line_number,
             kind,
             raw_type,
@@ -470,14 +487,25 @@ impl NdjsonStreamParser {
             effort: event_effort,
             tool_name,
             summary,
-        });
+        }
     }
 
-    fn retain_event(&mut self, event: NormalizedWorkerEvent) {
+    fn retain_event(
+        &mut self,
+        event: NormalizedWorkerEvent,
+        emit_live_event: bool,
+    ) -> Option<NormalizedWorkerEvent> {
         if self.retained_events.len() < self.max_events {
-            self.retained_events.push(event);
+            if emit_live_event {
+                self.retained_events.push(event.clone());
+                Some(event)
+            } else {
+                self.retained_events.push(event);
+                None
+            }
         } else {
             self.dropped_events_count += 1;
+            emit_live_event.then_some(event)
         }
     }
 

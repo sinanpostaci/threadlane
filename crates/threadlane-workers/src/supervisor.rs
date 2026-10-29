@@ -12,7 +12,9 @@ use crate::fs_safety::{
     ensure_platform_supported, sanitize_and_redact, validate_existing_canonical_dir,
 };
 use crate::spec::{ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec};
-use crate::stream::{FieldEvidence, NdjsonStreamParser, StreamEvidenceSummary};
+use crate::stream::{
+    FieldEvidence, NdjsonStreamParser, NormalizedWorkerEvent, StreamEvidenceSummary,
+};
 
 /// Maximum byte length of the sanitized stderr diagnostic summary in [`WorkerExecutionReport`].
 pub const MAX_STDERR_SUMMARY_BYTES: usize = 512;
@@ -153,6 +155,10 @@ pub struct WorkerExecutionReport {
     /// Bounded, secret-redacted summary of stderr output (if non-empty).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_stderr_summary: Option<String>,
+    /// Number of live normalized events that could not be delivered to the optional
+    /// `progress_tx` observer channel because it was full or closed (`0` when `progress_tx` is `None`).
+    #[serde(default)]
+    pub dropped_live_events: usize,
     /// Parsed NDJSON stream evidence and bounded normalized events.
     pub evidence: StreamEvidenceSummary,
 }
@@ -384,23 +390,45 @@ async fn wait_for_cancellation(cancel_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Runs a pre-validated [`WorkerSpec`] inside `working_directory` with a no-op cancellation channel.
+/// Runs a pre-validated [`WorkerSpec`] inside `working_directory` with a no-op cancellation channel
+/// and no live event observer (`progress_tx = None`).
 pub async fn run_worker(
     spec: &WorkerSpec,
     working_directory: &Path,
 ) -> Result<WorkerExecutionReport, WorkerError> {
     let (_cancel_tx, mut cancel_rx) = watch::channel(false);
-    run_worker_with_cancel(spec, working_directory, &mut cancel_rx).await
+    run_worker_with_observer(spec, working_directory, &mut cancel_rx, None).await
 }
 
 /// Runs a [`WorkerSpec`] inside `working_directory` under Unix process-group supervision,
-/// concurrent incremental stdout/stderr drainage, and timeout/cancel/overflow enforcement.
+/// concurrent incremental stdout/stderr drainage, and timeout/cancel/overflow enforcement,
+/// with no live event observer (`progress_tx = None`).
 ///
 /// Never performs automatic replay if execution crashes or times out.
 pub async fn run_worker_with_cancel(
     spec: &WorkerSpec,
     working_directory: &Path,
     cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<WorkerExecutionReport, WorkerError> {
+    run_worker_with_observer(spec, working_directory, cancel_rx, None).await
+}
+
+/// Runs a [`WorkerSpec`] inside `working_directory` under Unix process-group supervision,
+/// concurrent incremental stdout/stderr drainage, timeout/cancel/overflow enforcement, and
+/// optional nonblocking live event observation via `progress_tx`.
+///
+/// When `progress_tx` is `Some`, each sanitized, bounded [`NormalizedWorkerEvent`] parsed from
+/// stdout is emitted incrementally before process exit using [`mpsc::Sender::try_send`]. A full
+/// or closed observer channel never blocks pipe drainage, overflow enforcement, cancellation,
+/// timeout handling, or final evidence verification; undelivered live events are counted in
+/// [`WorkerExecutionReport::dropped_live_events`].
+///
+/// Never performs automatic replay if execution crashes or times out.
+pub async fn run_worker_with_observer(
+    spec: &WorkerSpec,
+    working_directory: &Path,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
 ) -> Result<WorkerExecutionReport, WorkerError> {
     ensure_platform_supported()?;
     let validation = spec.validate()?;
@@ -466,6 +494,7 @@ pub async fn run_worker_with_cancel(
         spec.budgets.clone(),
         overflow_tx.clone(),
         drain_stop_rx.clone(),
+        progress_tx,
     ));
 
     let mut stderr_handle = tokio::spawn(drain_stderr_incremental(
@@ -522,13 +551,18 @@ pub async fn run_worker_with_cancel(
     }
     let mut cleanup_incomplete = pipe_drain_timed_out || group_still_alive;
 
-    let (stdout_bytes_captured, evidence, stdout_overflow) = match tokio::time::timeout(
+    let StdoutDrainOutput {
+        bytes_captured: stdout_bytes_captured,
+        evidence,
+        overflow: stdout_overflow,
+        dropped_live_events,
+    } = match tokio::time::timeout(
         Duration::from_millis(POST_EXIT_PIPE_DRAIN_TIMEOUT_MS),
         &mut stdout_handle,
     )
     .await
     {
-        Ok(Ok(tuple)) => tuple,
+        Ok(Ok(output)) => output,
         Ok(Err(err)) => {
             return Err(WorkerError::Io(std::io::Error::other(format!(
                 "stdout task join error: {err}"
@@ -542,7 +576,12 @@ pub async fn run_worker_with_cancel(
                 spec.session_id.clone(),
                 spec.budgets.max_events,
             );
-            (0, empty_parser.finalize(), None)
+            StdoutDrainOutput {
+                bytes_captured: 0,
+                evidence: empty_parser.finalize(),
+                overflow: None,
+                dropped_live_events: 0,
+            }
         }
     };
 
@@ -598,6 +637,7 @@ pub async fn run_worker_with_cancel(
         descendants_terminated_after_exit,
         cleanup_incomplete,
         redacted_stderr_summary,
+        dropped_live_events,
         evidence,
     })
 }
@@ -621,6 +661,30 @@ async fn wait_for_readers_or_signal_stop<T1, T2>(
     true
 }
 
+struct StdoutDrainOutput {
+    bytes_captured: usize,
+    evidence: StreamEvidenceSummary,
+    overflow: Option<OutputOverflowKind>,
+    dropped_live_events: usize,
+}
+
+fn ingest_and_observe_line(
+    parser: &mut NdjsonStreamParser,
+    raw_line: &[u8],
+    progress_tx: Option<&mpsc::Sender<NormalizedWorkerEvent>>,
+    dropped_live_events: &mut usize,
+) {
+    if let Some(tx) = progress_tx {
+        if let Some(event) = parser.ingest_line_with_event(raw_line) {
+            if tx.try_send(event).is_err() {
+                *dropped_live_events = dropped_live_events.saturating_add(1);
+            }
+        }
+    } else {
+        parser.ingest_line(raw_line);
+    }
+}
+
 async fn drain_stdout_incremental(
     mut reader: tokio::process::ChildStdout,
     requested_model: ResolvedModelTarget,
@@ -628,7 +692,8 @@ async fn drain_stdout_incremental(
     budgets: ExecutionBudgets,
     overflow_tx: mpsc::UnboundedSender<OutputOverflowKind>,
     mut drain_stop_rx: watch::Receiver<bool>,
-) -> (usize, StreamEvidenceSummary, Option<OutputOverflowKind>) {
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+) -> StdoutDrainOutput {
     let max_line_bytes = budgets.max_line_bytes;
     let max_stdout_bytes = budgets.max_stdout_bytes;
     let mut parser =
@@ -637,6 +702,7 @@ async fn drain_stdout_incremental(
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096.min(max_line_bytes));
     let mut chunk = [0u8; 4096];
     let mut overflow: Option<OutputOverflowKind> = None;
+    let mut dropped_live_events: usize = 0;
 
     loop {
         let read_res = tokio::select! {
@@ -646,7 +712,12 @@ async fn drain_stdout_incremental(
         };
         let Some(read_res) = read_res else {
             if overflow.is_none() && !line_buf.is_empty() {
-                parser.ingest_line(&line_buf);
+                ingest_and_observe_line(
+                    &mut parser,
+                    &line_buf,
+                    progress_tx.as_ref(),
+                    &mut dropped_live_events,
+                );
                 line_buf.clear();
             }
             break;
@@ -654,7 +725,12 @@ async fn drain_stdout_incremental(
         match read_res {
             Ok(0) => {
                 if overflow.is_none() && !line_buf.is_empty() {
-                    parser.ingest_line(&line_buf);
+                    ingest_and_observe_line(
+                        &mut parser,
+                        &line_buf,
+                        progress_tx.as_ref(),
+                        &mut dropped_live_events,
+                    );
                     line_buf.clear();
                 }
                 break;
@@ -686,7 +762,12 @@ async fn drain_stdout_incremental(
                     line_buf.extend_from_slice(segment);
 
                     if has_newline {
-                        parser.ingest_line(&line_buf);
+                        ingest_and_observe_line(
+                            &mut parser,
+                            &line_buf,
+                            progress_tx.as_ref(),
+                            &mut dropped_live_events,
+                        );
                         line_buf.clear();
                     }
 
@@ -701,7 +782,13 @@ async fn drain_stdout_incremental(
         }
     }
 
-    (total_bytes, parser.finalize(), overflow)
+    drop(progress_tx);
+    StdoutDrainOutput {
+        bytes_captured: total_bytes,
+        evidence: parser.finalize(),
+        overflow,
+        dropped_live_events,
+    }
 }
 
 async fn drain_stderr_incremental(
