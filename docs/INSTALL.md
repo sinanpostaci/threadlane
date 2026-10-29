@@ -9,24 +9,21 @@ checkout; the existing development shells remain the normal development path.
 
 | Area | State in this lane |
 | --- | --- |
-| Python desktop build wrapper | Source and offline fixture tests are included. The parent integration owner runs the tests; this lane did not execute builds. |
-| Nix CLI package | Expression added under `nix/`; uses the root `Cargo.lock`. It has not been built in this lane. |
-| Nix desktop package | Expression added for Linux only; uses the standalone Tauri `Cargo.lock` and a separately built frontend. Its npm dependency hash is pending parent integration. |
+| Python desktop build wrapper | Ten offline fixture tests pass. |
+| Nix CLI package | Uses the root `Cargo.lock`; source-build validation is in progress. Includes `threadlane` and the paired `threadlane-native-mcp` bootstrap. |
+| Nix desktop package | Linux expression uses the standalone Tauri lockfile and a separately built frontend. The real locked npm hash and frontend build are verified; the complete Nix desktop build remains unverified. |
 | GitHub Actions workflow | Manual `workflow_dispatch` source-build matrix added. It has not been dispatched from this checkout, so all three platform results remain unverified. |
-| Desktop runtime | The Milestone 3A preview was verified on Linux/NixOS. The packaged Nix desktop wrapper is new and unverified. |
+| Desktop runtime | The standalone M4 Linux binary builds and passes all-target Clippy. The earlier native Wayland preview rendered successfully. The packaged Nix desktop wrapper remains unverified. |
 
-The Nix desktop expression intentionally contains a clearly named pending npm
-dependency hash:
+The locked npm dependency hash is recorded in:
 
 ```text
-nix/packages.nix: pendingDesktopNpmDepsHash
+nix/packages.nix: desktopNpmDepsHash
 ```
 
-After source integration and any package-lock updates, the parent must replace
-that value with the hash Nix reports for the locked npm dependencies. Until it is
-replaced, a real desktop build fails with a hash mismatch instead of pretending
-the package was verified. The CLI package is lock-driven and does not use a
-fabricated fixed output hash.
+Only recompute it after `apps/desktop/package-lock.json` changes. Build
+`nix build .#threadlane-desktop.frontend --no-link` to verify the frontend
+independently. The Rust packages use their committed Cargo lockfiles.
 
 Flake evaluation follows the Git-tracked source set. Stage newly added packaging
 files and any new workspace crates before running the first Nix build; untracked
@@ -184,7 +181,7 @@ compositor, and platform combinations still need their own smoke tests.
 
 | Platform | Nix package | Source/CI build |
 | --- | --- | --- |
-| Linux x86_64 | CLI and desktop expressions added; desktop hash/build pending parent validation. | Manual workflow not yet run. |
+| Linux x86_64 | Locked frontend build passes; complete package validation is in progress. | Standalone desktop build and Clippy pass. Manual workflow not yet run. |
 | Linux aarch64 | Defined for CLI and desktop; not built. | No workflow matrix entry yet. |
 | macOS | CLI expression only; desktop Nix package not provided. | Manual workflow entry not yet run. |
 | Windows | No Nix package. | Manual workflow entry not yet run; Windows runtime ACL support remains a separate product concern. |

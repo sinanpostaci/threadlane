@@ -6,10 +6,8 @@ let
 
   source = import ./source.nix { inherit lib src; };
 
-  # The parent integration owner must replace this after the source set and
-  # package-lock are final. Nix reports the expected SRI hash on mismatch; this
-  # explicitly named pending value must never be presented as a verified build.
-  pendingDesktopNpmDepsHash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+  # Recompute only when apps/desktop/package-lock.json changes.
+  desktopNpmDepsHash = "sha256-X5rZ5gmquTWSPoHlMrAXKmJ72RDB+hki/RRWrrpLb9Q=";
 
   desktopLibs = with pkgs; [
     gtk3
@@ -31,7 +29,7 @@ let
     pname = "threadlane-desktop-frontend";
     inherit version;
     src = source + "/apps/desktop";
-    npmDepsHash = pendingDesktopNpmDepsHash;
+    npmDepsHash = desktopNpmDepsHash;
     npmBuildScript = "build";
 
     # The package only supplies the embedded web assets for the Tauri binary;
@@ -57,7 +55,7 @@ let
     inherit version;
     src = source;
     cargoLock.lockFile = source + "/Cargo.lock";
-    cargoBuildFlags = [ "--locked" "--package" "threadlane" ];
+    cargoBuildFlags = [ "--locked" "--package" "threadlane" "--package" "threadlane-native" ];
     nativeBuildInputs = [ pkgs.pkg-config ];
     doCheck = false;
 
@@ -77,6 +75,7 @@ let
     cargoLock.lockFile = source + "/apps/desktop/src-tauri/Cargo.lock";
     cargoBuildFlags = [ "--locked" ];
     doCheck = false;
+    passthru.frontend = desktopFrontend;
 
     nativeBuildInputs = [
       pkgs.pkg-config

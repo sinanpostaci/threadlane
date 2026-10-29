@@ -129,12 +129,16 @@ fn classify_error_code<'a>(raw: &str, default_code: &'a str) -> &'a str {
         "not_configured"
     } else if lower.contains("needs_verification") || lower.contains("needs verification") {
         "needs_verification"
-    } else if lower.contains("not found") || lower.contains("not_found") || lower.contains("missing")
+    } else if lower.contains("not found")
+        || lower.contains("not_found")
+        || lower.contains("missing")
     {
         "not_found"
     } else if lower.contains("locked") {
         "vault_locked"
-    } else if lower.contains("unavailable") || lower.contains("keychain") || lower.contains("keyring")
+    } else if lower.contains("unavailable")
+        || lower.contains("keychain")
+        || lower.contains("keyring")
     {
         "unavailable"
     } else if lower.contains("unauthorized")
@@ -710,7 +714,11 @@ mod tests {
             fallback
         );
         assert_eq!(
-            sanitize_error_message("Keychain is locked by user.", fallback, Some("other-secret")),
+            sanitize_error_message(
+                "Keychain is locked by user.",
+                fallback,
+                Some("other-secret")
+            ),
             "Keychain is locked by user."
         );
     }

@@ -10,6 +10,7 @@ members = [
     "crates/threadlane-decisions",
     "crates/threadlane-plans",
     "crates/threadlane-native",
+    "crates/threadlane-operations",
 ]
 exclude = [
     "apps/desktop/src-tauri",
@@ -40,6 +41,7 @@ threadlane-core = { path = "crates/threadlane-core" }
 threadlane-decisions = { path = "crates/threadlane-decisions" }
 threadlane-desktop-bridge = { path = "crates/threadlane-desktop-bridge" }
 threadlane-native = { path = "crates/threadlane-native" }
+threadlane-operations = { path = "crates/threadlane-operations" }
 threadlane-plans = { path = "crates/threadlane-plans" }
 threadlane-registry = { path = "crates/threadlane-registry" }
 threadlane-workers = { path = "crates/threadlane-workers" }

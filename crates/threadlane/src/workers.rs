@@ -11,6 +11,7 @@ use threadlane_core::{
     MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN, MAX_WORKER_PATH_BYTES,
     MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
 };
+use threadlane_workers::git::WORK_AREA_LOCK_FILENAME;
 pub use threadlane_workers::WorkerFilePermissions;
 use threadlane_workers::{
     execute_worker_task_with_observer, sanitize_and_redact,
@@ -577,14 +578,33 @@ fn validate_work_area_side_effect_free(work_area_root: &Path) -> Result<PathBuf,
                     checked.display()
                 ))
             })?;
-            entries.push(entry.file_name().to_string_lossy().to_string());
+            let entry_name = entry.file_name().to_string_lossy().to_string();
+            if entry_name == WORK_AREA_LOCK_FILENAME {
+                threadlane_workers::validate_preexisting_private_file(
+                    &entry.path(),
+                    "work area ownership lock",
+                )
+                .map_err(|err| Error::InvalidConfig(err.to_string()))?;
+                let lock_meta = fs::symlink_metadata(entry.path()).map_err(|err| {
+                    Error::InvalidConfig(format!("cannot inspect work area ownership lock: {err}"))
+                })?;
+                if lock_meta.len() != 0 {
+                    return Err(Error::InvalidConfig(
+                        "work area ownership lock must be empty".to_string(),
+                    ));
+                }
+            }
+            entries.push(entry_name);
         }
         if !entries.is_empty() {
             let has_marker = entries.iter().any(|n| n == ".threadlane-work-area.json");
             let has_unexpected = entries.iter().any(|n| {
                 !matches!(
                     n.as_str(),
-                    ".threadlane-work-area.json" | "manifests" | "checkouts"
+                    ".threadlane-work-area.json"
+                        | WORK_AREA_LOCK_FILENAME
+                        | "manifests"
+                        | "checkouts"
                 )
             });
             if !has_marker || has_unexpected {

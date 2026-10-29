@@ -464,6 +464,21 @@
     justify-content: flex-start;
   }
 
+  .aq-tools-tool-head,
+  .aq-tools-model-head {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .aq-tools-tool-title {
+    margin-right: 0;
+  }
+
+  .aq-tools-card-controls {
+    flex-basis: 100%;
+    justify-content: space-between;
+  }
+
   .aq-tools-form-grid,
   .aq-tools-status-grid,
   .aq-tools-facts {
