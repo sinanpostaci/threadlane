@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, and appearance settings. The integrated Rust workspace passes 158 tests and the frontend passes 19 focused tests. Native desktop compilation and the Nix frontend build pass. Production multi-chat onboarding, profile-to-runtime activation, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See [configuration](docs/CONFIGURATION.md), [desktop usage](docs/DESKTOP.md), and [validation evidence](docs/VALIDATION.md).
+> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. Production multi-chat onboarding, profile-to-runtime activation, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [current checkpoint and its validation limits](docs/M4-CHECKPOINT.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
 
 ---
 

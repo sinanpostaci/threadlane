@@ -79,3 +79,32 @@ remain in the OS keychain, outside those JSON stores.
 
 The runtime's `state.db`, supervisor descriptor, logs, and task worktrees remain
 separate from configuration preferences and source control.
+
+## Execution approval foundation
+
+An approval freezes the exact published revision, registry version, model/effort
+choices, repository, base commit, task instructions, write scopes, and budgets.
+It is an operator action, not an interpretation of worker text. The immutable
+approval foundation is implemented; desktop approval, host startup, and native
+workflow wiring are being integrated separately. Consult the current
+[checkpoint](M4-CHECKPOINT.md) before treating those paths as accepted end to end.
+
+AGY and OpenCode are the current headless worker providers. Codex roles use native
+conversation routes. Dependent tasks require verified predecessor inputs; worker
+completion alone does not establish that those inputs have been integrated.
+
+## Activity and settings
+
+**Activity** observes an attached runtime. Expand **History** to filter recorded
+events by run or event kind and inspect details. Reading history does not consume
+the follower's event delivery or acknowledgement cursor.
+
+**Settings** controls appearance and bounded execution preferences. Changing a
+preference does not rewrite a running worker's immutable startup configuration.
+Choose the system theme or an explicit theme, an accent, and an opaque or glass
+surface. Native blur availability depends on the desktop platform; text remains
+opaque when changing the surface opacity.
+
+The browser-only `?preview=1` mode is a development fixture. Its synthetic tools,
+profiles, demo runs, and history are not a connection to the real runtime. Ordinary
+browser windows without the Tauri bridge report that connection as unavailable.
