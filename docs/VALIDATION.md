@@ -370,3 +370,8 @@ the injected hook did not run. A non-secret auth sentinel also reached the fake
 worker, demonstrating preserved provider environment through the owned supervisor.
 No provider API was called by this regression. These are operator-harness changes;
 the previously verified Rust tree is unchanged.
+
+
+The single Astra Max package-closing review passed after the targeted Git-environment
+fix and recheck, with no open blockers. Its qualified scope and evidence are
+recorded in [M2C-REVIEW.md](M2C-REVIEW.md).
