@@ -1,0 +1,22 @@
+[package]
+name = "threadlane-workers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Isolated worker execution, NDJSON evidence parser, Unix process-group supervision, and Git worktree/diff-gate foundation for Threadlane Milestone 2"
+
+[[bin]]
+name = "threadlane-worker"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+fs2.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true

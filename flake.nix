@@ -1,5 +1,5 @@
 {
-  description = "Threadlane Milestone 1 development shell";
+  description = "Threadlane development shell";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -29,6 +29,7 @@
               clippy
               pkg-config
               gcc
+              git
               python3
             ];
           };
