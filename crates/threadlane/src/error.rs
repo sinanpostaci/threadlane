@@ -20,10 +20,14 @@ pub enum ErrorCode {
     RunNotFound,
     /// The specified `question_id` does not exist for `(binding_id, run_id)`.
     QuestionNotFound,
+    /// The specified `worker_id` does not exist within the configured binding scope.
+    WorkerNotFound,
     /// `expected_revision` did not match the run's current revision.
     StaleRevision,
     /// Question was already superseded, answered, cancelled, or belongs to a prior revision.
     StaleQuestion,
+    /// Worker claim or transition did not match the active worker attempt or state.
+    StaleWorkerClaim,
     /// Operation is invalid for the run's current lifecycle status.
     InvalidRunState,
     /// An idempotent `command_key` was reused on the same binding with different parameters or operation.
@@ -147,6 +151,20 @@ impl ApiError {
                     }),
                 ),
             ),
+            CoreError::WorkerNotFound {
+                binding_id,
+                worker_id,
+            } => (
+                StatusCode::NOT_FOUND,
+                Self::with_details(
+                    ErrorCode::WorkerNotFound,
+                    message,
+                    json!({
+                        "binding_id": binding_id,
+                        "worker_id": worker_id,
+                    }),
+                ),
+            ),
             CoreError::StaleRevision {
                 run_id,
                 expected_revision,
@@ -180,6 +198,26 @@ impl ApiError {
                         "question_status": question_status,
                         "question_revision": question_revision,
                         "current_revision": current_revision,
+                    }),
+                ),
+            ),
+            CoreError::StaleWorkerClaim {
+                binding_id,
+                run_id,
+                worker_id,
+                claim_id,
+                reason,
+            } => (
+                StatusCode::CONFLICT,
+                Self::with_details(
+                    ErrorCode::StaleWorkerClaim,
+                    message,
+                    json!({
+                        "binding_id": binding_id,
+                        "run_id": run_id,
+                        "worker_id": worker_id,
+                        "claim_id": claim_id,
+                        "reason": reason,
                     }),
                 ),
             ),

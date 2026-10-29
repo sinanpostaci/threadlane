@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use threadlane_core::{
     AckResult, Binding, CoreError, EventBatch, QuestionHistoryPage, RevisionHistoryPage, Run,
-    RunListPage, WakeupNotice, MAX_ID_LEN,
+    RunListPage, WakeupNotice, WorkerSnapshot, MAX_ID_LEN,
 };
 
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
@@ -459,6 +459,53 @@ impl ScopedClient {
             .await?;
         resp.into_run()
             .ok_or_else(|| Error::Transport("unexpected response kind for cancel".to_string()))
+    }
+
+    /// Starts a worker run for a startup-configured `profile_id` within the fixed binding.
+    pub async fn start_worker(
+        &self,
+        command_key: String,
+        profile_id: String,
+        instruction: String,
+    ) -> Result<WorkerSnapshot, Error> {
+        let resp = self
+            .execute(&ScopedRequest::StartWorker {
+                command_key,
+                profile_id,
+                instruction,
+            })
+            .await?;
+        resp.into_worker().ok_or_else(|| {
+            Error::Transport("unexpected response kind for start_worker".to_string())
+        })
+    }
+
+    /// Fetches a compact durable [`WorkerSnapshot`] for `run_id` (or `worker_id`) within the fixed binding.
+    pub async fn get_worker(&self, run_id: String) -> Result<WorkerSnapshot, Error> {
+        let resp = self.execute(&ScopedRequest::GetWorker { run_id }).await?;
+        resp.into_worker()
+            .ok_or_else(|| Error::Transport("unexpected response kind for get_worker".to_string()))
+    }
+
+    /// Requests revision-checked cancellation of a worker run within the fixed binding.
+    pub async fn cancel_worker(
+        &self,
+        command_key: String,
+        run_id: String,
+        expected_revision: u64,
+        reason: Option<String>,
+    ) -> Result<WorkerSnapshot, Error> {
+        let resp = self
+            .execute(&ScopedRequest::CancelWorker {
+                command_key,
+                run_id,
+                expected_revision,
+                reason,
+            })
+            .await?;
+        resp.into_worker().ok_or_else(|| {
+            Error::Transport("unexpected response kind for cancel_worker".to_string())
+        })
     }
 }
 

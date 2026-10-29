@@ -19,8 +19,10 @@ pub mod error;
 pub mod mcp;
 /// Wire protocol requests, compact status snapshots, and responses.
 pub mod protocol;
-/// Single-owner SQLite and demo tick supervisor over authenticated loopback HTTP.
+/// Single-owner SQLite, demo tick, and bounded worker dispatch supervisor over authenticated loopback HTTP.
 pub mod supervisor;
+/// Startup worker profile configuration, validation, and bounded worker execution adapter.
+pub mod workers;
 
 pub use client::{ScopedClient, SupervisorClient, MAX_CLIENT_RESPONSE_BYTES};
 pub use codex::{build_codex_queue_args, CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
@@ -32,8 +34,15 @@ pub use error::{ApiError, Error, ErrorCode};
 pub use mcp::ThreadlaneMcpServer;
 pub use protocol::{
     BindingListResponse, CreateBindingRequest, RetryWakeupRequest, RunSummary, ScopedRequest,
-    ScopedResponse, StatusResponse, MAX_STATUS_RECENT_RUNS,
+    ScopedResponse, StatusResponse, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord,
+    WorkerOutcomeSummary, WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot,
+    WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
 };
 pub use supervisor::{
     Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,
+};
+pub use workers::{
+    ValidatedWorkerProfile, ValidatedWorkersConfig, WorkerProfileConfig, WorkerSpecTemplate,
+    WorkersConfig, DEFAULT_MAX_PARALLEL, MAX_MAX_PARALLEL, MAX_WORKERS_CONFIG_FILE_BYTES,
+    MAX_WORKER_PROFILES, MIN_MAX_PARALLEL,
 };
