@@ -1,11 +1,16 @@
 /* Activity History Subview (compact 390px vertical layout) */
 
-.aq-history-section {
+.aq-section.aq-history-section {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   border-top: 1px solid var(--aq-line);
 }
 
 .aq-history-toggle {
   width: 100%;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -18,12 +23,19 @@
 }
 
 .aq-history-toggle-title {
+  flex: none;
   color: var(--aq-text);
   font-size: 12px;
   font-weight: 500;
+  white-space: nowrap;
 }
 
 .aq-history-toggle-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10.5px;
   color: var(--aq-muted);
@@ -38,6 +50,7 @@
   border: 1px solid var(--aq-border);
   background: var(--aq-field);
   color: var(--aq-text);
+  overflow-wrap: anywhere;
 }
 
 .aq-history-notice--warn {
@@ -61,27 +74,38 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
   padding: 2px var(--aq-pad) 8px;
   border-bottom: 1px solid var(--aq-line);
 }
 
 .aq-history-filter-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
+  min-width: 0;
+}
+
+.aq-history-filter-row > .aq-btn {
+  flex: none;
 }
 
 .aq-history-run-input {
-  flex: 1 1 110px;
+  flex: 1 1 90px;
   min-width: 0;
+  max-width: 100%;
   height: 26px;
   padding: 0 7px;
   font-size: 11.5px;
 }
 
 .aq-history-kind-select {
-  flex: 1 1 115px;
+  flex: 1 1 100px;
   min-width: 0;
+  max-width: 100%;
   height: 26px;
   padding: 0 6px;
   font-size: 11.5px;
@@ -89,12 +113,16 @@
 
 .aq-history-action-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px 8px;
+  min-width: 0;
 }
 
 .aq-history-status-meta {
+  flex: 1 1 120px;
+  min-width: 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10.5px;
   color: var(--aq-muted);
@@ -105,24 +133,30 @@
 
 .aq-history-action-buttons {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
+  justify-content: flex-end;
   gap: 5px;
   flex: none;
+  min-width: 0;
 }
 
 .aq-history-empty {
   padding: 12px var(--aq-pad);
   font-size: 11.5px;
   color: var(--aq-muted);
+  overflow-wrap: anywhere;
 }
 
 .aq-history-list {
   list-style: none;
+  min-width: 0;
   margin: 0;
   padding: 0;
 }
 
 .aq-history-item {
+  min-width: 0;
   border-bottom: 1px solid var(--aq-line);
 }
 
@@ -132,6 +166,8 @@
 
 .aq-history-row-btn {
   width: 100%;
+  max-width: 100%;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -144,9 +180,11 @@
 
 .aq-history-row-top {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
   font-size: 11px;
 }
 
@@ -198,6 +236,9 @@
 }
 
 .aq-history-run {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 115px;
   margin-left: auto;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10.5px;
@@ -205,10 +246,11 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  max-width: 115px;
 }
 
 .aq-history-summary {
+  max-width: 100%;
+  min-width: 0;
   font-size: 12px;
   color: var(--aq-text);
   overflow: hidden;
@@ -217,13 +259,17 @@
 }
 
 .aq-history-detail {
+  max-width: 100%;
+  min-width: 0;
   padding: 6px var(--aq-pad) 10px;
   background: var(--aq-field);
   border-top: 1px solid var(--aq-line);
+  overflow-wrap: anywhere;
   user-select: text;
 }
 
 .aq-history-detail-grid {
+  min-width: 0;
   margin: 0;
   display: flex;
   flex-direction: column;
@@ -232,20 +278,24 @@
 
 .aq-history-detail-row {
   display: grid;
-  grid-template-columns: 98px 1fr;
+  grid-template-columns: 98px minmax(0, 1fr);
   gap: 8px;
+  min-width: 0;
   font-size: 11px;
   line-height: 1.35;
 }
 
 .aq-history-detail-row dt {
+  min-width: 0;
   color: var(--aq-muted);
   font-weight: 500;
 }
 
 .aq-history-detail-row dd {
+  min-width: 0;
   margin: 0;
   color: var(--aq-text);
+  overflow-wrap: anywhere;
   word-break: break-word;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10.5px;
@@ -254,5 +304,16 @@
 .aq-history-detail-actions {
   margin-top: 7px;
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.aq-history-detail-actions .aq-btn {
+  max-width: 100%;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
 }
