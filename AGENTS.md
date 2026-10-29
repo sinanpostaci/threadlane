@@ -6,7 +6,8 @@ current milestone contract before editing.
 
 ## Working agreement
 
-- Implementation agent: AGY `gemini-4-argon-high`, effort `high`.
+- Hard implementation: AGY `gemini-4-argon-high`, effort `high`.
+- Easy/medium implementation may use OpenCode Go `opencode-go/deepseek-v4.1-flash#max`, explicitly authorized by the user. Pin primary and small/compaction models; never silently substitute another model.
 - The primary Codex agent performs implementation review and validation. The user
   authorizes one package-closing review by `gpt-6-astra` with effort `max`.
   Targeted rechecks after fixes are allowed; do not repeat full closing reviews
