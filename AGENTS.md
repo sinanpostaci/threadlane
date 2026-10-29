@@ -7,8 +7,10 @@ current milestone contract before editing.
 ## Working agreement
 
 - Implementation agent: AGY `gemini-4-argon-high`, effort `high`.
-- The primary Codex agent performs reviews and validation. Do not delegate reviews,
-  invoke other models, or substitute models without the user's authorization.
+- The primary Codex agent performs implementation review and validation. The user
+  authorizes one package-closing review by `gpt-6-astra` with effort `max`.
+  Targeted rechecks after fixes are allowed; do not repeat full closing reviews
+  without a new reason. Do not substitute other models without authorization.
 - One writer per checkout. Parallel writers need independent worktrees and clear
   ownership. The first foundation has one implementation writer.
 - Keep prose, comments, identifiers, and documentation in English.

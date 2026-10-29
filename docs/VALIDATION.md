@@ -269,3 +269,56 @@ cleanup and the desktop UI have not passed their acceptance gates. Provider
 permissions are not bypassed. See [DISPATCH.md](DISPATCH.md) and
 [NATIVE-ROUTING.md](NATIVE-ROUTING.md). Private raw logs, temporary binaries and
 fixture state are excluded from Git.
+
+
+## Milestone 2C scoped permissions and native pilot (2026-10-29)
+
+The primary ran 89 Rust tests (32 core,27 runtime,30 worker/process/Git) with
+`cargo test --workspace --locked -- --test-threads=1`. Formatting, Clippy with
+warnings denied, the locked build and deterministic CLI smoke all passed. The
+existing parallel fixture-harness limitation remains unchanged. Added coverage
+exercises actual task-directory settings argv, default/strict policy serde,
+OpenCode rejection, literal-path/rule validation, Unicode/spaces, existing target
+symlink rejection, grant-count/actual-JSON-byte ceilings, immutable policy identity
+and unchanged post-run scope/evidence gates.
+
+A separate probe created state with the actual prior M2B binary and restarted it
+with the candidate. An unchanged default Inherit profile retained its exact hash;
+retry returned the exact original StartWorker snapshot and launched no second
+process. Opt-in TaskFiles produces a different hash. This catches an upgrade
+compatibility issue found during primary review without weakening deduplication.
+
+Native evidence was checked against public desktop chat/tool records and private
+runtime state, not queue exit status alone:
+
+1. A fresh authorized disposable same-directory chat fork called real MCP `status`;
+   software-owned binding/thread identities matched. Project configuration and
+   private startup binding were prepared only for this test scope.
+2. The native chat called `start_worker` exactly once for a fixed Argon High profile,
+   then `get_worker`. The worker used file tools to change only `greeting.txt` from
+   `Hello` to `Hello from Threadlane` in its owned task worktree. The source HEAD,
+   status and original greeting were unchanged.
+3. The real provider emitted 18 durable live progress events, correct observed
+   model, exit 0 and a passing one-file diff. It did not emit effort. The runtime
+   correctly recorded Failed/ExecutionFailed with `missing_effort_evidence`, not
+   ReadyForReview or Accepted. Requested high is not observed-high proof.
+4. One fixed terminal wake-up reached that same native chat. It pulled/ACKed all 21
+   events and inspected the actual terminal worker outcome through MCP.
+5. A separate deterministic sleeping local process (no second model API call)
+   verified native start/get/revision-checked cancel, then terminal wake-up,
+   pull/ACK/get. Proven status was Cancelled with signal 15, no changed files and
+   no incomplete cleanup. Final binding delivery/ACK cursors were both 27, with
+   wake-up Idle and `active_runs = 0`.
+
+The temporary test-project trust/MCP entries and only owned supervisor/MCP
+processes were removed. Unrelated global model/effort/security settings and other
+chats were preserved. The initial projectless test chat used a separate directory
+and had no MCP; it was archived. The accepted same-directory fork is identified
+in private probe evidence. No raw conversation, provider log or real chat ID is
+committed. Dirty fixture task worktrees stay private for inspection; they are not
+force-cleaned or merged into product code.
+
+This is a qualified native coding/return and cancellation transport checkpoint,
+not full provider-effort/patch acceptance. Live OpenCode/Go, same-project
+multi-chat authenticated identity, busy-turn delivery, interactive provider
+Answer/Steer, reviewed result integration and the Tauri UI remain separate gates.

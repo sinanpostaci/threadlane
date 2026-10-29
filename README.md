@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early foundation, developed with AI assistance and reviewed before checkpointing. Not production ready. All 82 automated tests pass with the single-threaded fixture harness on Linux/NixOS, together with formatting, Clippy, build and CLI smoke. The deterministic native conversation loop, bounded history APIs and durable worker dispatch passed their respective checkpoints. Runtime dispatch now exposes real worker lifecycle operations over scoped HTTP/CLI/MCP; its acceptance fixtures use fake providers. Native real-worker interaction, the desktop UI and other platforms remain unfinished. See [validation evidence](docs/VALIDATION.md), the earlier [foundation review](docs/CLOSURE-REVIEW.md), and the [native routing gate](docs/NATIVE-ROUTING.md).
+> **Status:** Early foundation, developed with AI assistance and reviewed before checkpointing. Not production ready. All 89 Rust tests pass with the single-threaded fixture harness on Linux/NixOS, together with formatting, Clippy, build and CLI smoke. A qualified single-chat native pilot verified MCP worker start, a real isolated Argon file edit, fixed wake-up, event acknowledgement and terminal inspection; a separate fake-process run verified native cancellation. Real effort telemetry remained absent, so that patch was not accepted. Interactive provider continuation, authenticated multi-chat routing, reviewed result integration, the desktop UI and other platforms remain unfinished. See [validation evidence](docs/VALIDATION.md), [worker permissions](docs/WORKERS.md), and the [native routing gate](docs/NATIVE-ROUTING.md).
 
 ---
 
@@ -29,8 +29,14 @@ Threadlane is a local execution middleware and control plane designed to work al
 - **Scoped runtime operations**: `start_worker`, `get_worker` and `cancel_worker` support bounded live progress, per-task worktrees, configured concurrency (`1..=8`), private optional report artifacts and the existing event/ACK/wake-up path.
 - **Acceptance stays separate**: A successful execution is only ready for review. Native print-mode worker Answer/Steer, live provider coding acceptance and reviewed merge/cleanup remain separate gates. See [dispatch usage and limits](docs/DISPATCH.md).
 
+### Scoped Provider Permissions and Native Pilot (Milestone 2C)
+
+- **Explicit opt-in**: Trusted profiles may select `file_permissions: "task_files"` for Antigravity. Session-only grants use the actual task directory and write allowlist. Default Inherit preserves the original argv and profile fingerprint.
+- **Finite grants**: Ambiguous rule paths, existing symlink components, more than 128 write entries or 65,536 serialized settings bytes are rejected. These grants are not an OS sandbox; inherited provider policy and post-run diff checks still matter.
+- **Measured native loop**: One authorized native chat launched a real Argon task and received its terminal event through MCP/wake-up/ACK. A real one-file edit and unchanged source were independently confirmed. Missing effort stayed Failed/ExecutionFailed; no patch was automatically accepted or merged. A separate local fake-process cancellation loop also passed.
+
 ### Remaining Milestones
-- **Milestone 2 remaining integration**: Native real-worker question/Steer routing, busy-turn and multi-chat acceptance, reconciliation of preserved uncertain artifacts, and reviewed Git integration/cleanup. The durable fixture checkpoint is not the full native workflow.
+- **Milestone 2 remaining integration**: Interactive provider question/Steer delivery, busy-turn and multi-chat acceptance, reconciliation of preserved uncertain artifacts, and reviewed Git integration/cleanup. The durable fixture checkpoint is not the full native workflow.
 - **Milestone 3**: Tauri narrow smoked-glass desktop control panel (`Activity`, `Chats`, `Tools`, `Profiles`, `Settings`) with an accessible opaque fallback.
 - **Milestone 4**: Global tool/model/effort registry, role/difficulty profiles, and shadow-mode Jev classification.
 - **Milestone 5**: Cross-platform release hardening, macOS/Windows native ACLs and secret storage, optional background service/tray packaging, and measured cost/notification budgets.

@@ -30,3 +30,25 @@ inspect private application databases or invent undocumented IPC to fill the gap
 The Milestone 2B worker dispatch fixture remains a single configured binding.
 A passing HTTP/stdio fixture must not be reported as general native multi-chat
 acceptance.
+
+
+## Milestone 2C single-chat experiment
+
+The primary verified a real native worker edit/return loop and a separate
+process-only cancellation loop in one explicitly authorized disposable chat.
+The initial already-loaded chat retained its older MCP connection after project
+configuration changed; terminating that stale test child yielded `Transport closed`
+rather than automatic refresh. This observation is not a universal client rule.
+
+A fresh same-directory fork, created through the public desktop tools, loaded
+an owned test-only stdio launcher. Before MCP initialization completed, the
+operator sealed that new chat's known binding in a private file and the launcher
+executed the scoped Rust MCP server. Actual native tool records and the runtime
+ledger were compared. No application-private database, guessed IPC protocol,
+model/security override or app-wide restart was used.
+
+That launcher is a disposable probe, not production onboarding or authenticated
+per-call identity. Another chat sharing the same configured server could receive
+the same admitted scope. The same-project two-chat authority gate above therefore
+remains unresolved. All owned temporary trust/MCP entries and test processes were
+removed; bounded private fixture evidence and dirty task worktrees were preserved.

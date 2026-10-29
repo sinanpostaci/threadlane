@@ -75,6 +75,8 @@ At validation time, each `ValidatedWorkerProfile` computes a canonical 64-charac
 - `profile_id` and sorted `allowed_binding_ids`
 - `provider`, canonical `executable`, `base_model`, `requested_effort`, `cli_model_arg`, sorted `allowed_models`, `standalone`, and `session_id`
 - canonical `repository_path`, normalized 40-hex `base_commit`, `work_area_root`, and sorted `allowed_write_paths`
+- Opt-in `file_permissions: "task_files"` is fingerprinted; omitted or explicit
+  `"inherit"` retains the exact legacy fingerprint for unchanged profiles/replay.
 - `budgets` (`timeout_ms`, `max_line_bytes`, `max_stdout_bytes`, `max_stderr_bytes`, `max_events`)
 
 The `profile_digest` is persisted on the worker record at admission time (`StartWorker`) and verified on `claim_worker` and all subsequent worker callbacks. A changed startup configuration with the same `profile_id` produces a different `profile_digest` and cannot silently execute a request queued under an older profile definition.
@@ -93,7 +95,7 @@ The runtime exposes three binding-scoped worker operations across HTTP (`POST /v
 
 ### 3.1 Caller Restrictions
 
-- **No untrusted overrides**: Callers cannot specify or override `executable`, `model`, `effort`, `repository_path`, `work_area_root`, `allowed_write_paths`, `budgets`, `base_commit`, `profile_digest`, `binding_id`, or `now_ms`. Extra fields in HTTP/CLI payloads are rejected with `ErrorCode::ValidationFailed`. The MCP SDK rejects unknown arguments before executing the tool handler, returning `isError: true` with parameter-deserialization error text rather than a structured application error.
+- **No untrusted overrides**: Callers cannot specify or override `executable`, `model`, `effort`, `repository_path`, `work_area_root`, `allowed_write_paths`, `file_permissions`, arbitrary `settings`, `budgets`, `base_commit`, `profile_digest`, `binding_id`, or `now_ms`. Extra fields in HTTP/CLI payloads are rejected with `ErrorCode::ValidationFailed`. The MCP SDK rejects unknown arguments before executing the tool handler, returning `isError: true` with parameter-deserialization error text rather than a structured application error.
 - **Pre-admission authorization**: The supervisor verifies that worker dispatch is enabled, `profile_id` exists in the startup registry, and the request's `binding_id` is in `profile.allowed_binding_ids` before admitting a run into `Core`.
 - **No dynamic profile registration**: Registering or mutating worker profiles via HTTP or MCP is forbidden.
 - **Queue-independent idempotency**: Repeating `start_worker` with the same `(binding_id, command_key, profile_id, instruction)` returns the original `WorkerSnapshot` immediately without queuing a second run, even when all `max_parallel` worker slots are currently busy. Reusing a `command_key` with different parameters, a changed `profile_digest`, or a different operation fails with `ErrorCode::IdempotencyConflict`.
@@ -173,10 +175,12 @@ Startup profiles are an operator-controlled vertical slice, not the global
 Tools/Profiles UI. Write scopes are a post-run diff gate, not an OS filesystem
 sandbox. Provider file/tool permissions still apply; a fresh noninteractive AGY
 worktree can be blocked without appropriately scoped provider permissions. The
-current product adapter does not install the session-only settings used by the
-development runner, and does not bypass provider permission checks.
+product now supports operator-selected `file_permissions: "task_files"` to generate
+limited task-file session grants, described in [WORKERS.md](WORKERS.md). It accepts
+no arbitrary settings payload and does not bypass provider permission checks.
 
 The primary agent owns the acceptance report in [VALIDATION.md](VALIDATION.md).
 Fixture transport, parser, and lifecycle success do not establish a live paid
-OpenCode/Go run or native real-worker end-to-end acceptance. No provider's effort
+OpenCode/Go run or patch acceptance. The later Milestone 2C native pilot verified
+one real AGY edit/return loop while preserving its missing-effort failure state. No provider's effort
 is assumed from requested arguments alone.
