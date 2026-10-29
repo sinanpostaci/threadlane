@@ -109,8 +109,8 @@ Client setup reference: [Codex MCP configuration](https://learn.chatgpt.com/docs
 
 ## Deliberate limits
 
-- Durable native coding-worker dispatch, Jev and the Tauri UI remain later work.
-  The separate worker diagnostic foundation is covered below.
+- Durable HTTP/CLI/MCP worker dispatch passed the Milestone 2B fixture gate below.
+  Native real-worker interaction, Jev and the Tauri UI remain later work.
 - The demo proves durable logical transitions, not recovery of real worker processes.
 - macOS and Windows have not been tested. Windows runtime startup fails closed
   until suitable private file ACL support is implemented.
@@ -183,8 +183,9 @@ and branches were removed afterward. This is transport evidence, not a real
 coding-task acceptance test. No live OpenCode/Go model was invoked; OpenCode was
 checked against installed CLI help and deterministic fixtures.
 
-The worker library and `threadlane-worker` CLI are not connected to native MCP
-worker dispatch yet. Durable worker state/recovery, bidirectional native
+At this diagnostic checkpoint the worker library and `threadlane-worker` CLI
+were not yet connected to durable MCP worker dispatch; the later Milestone 2B
+checkpoint below supersedes that integration status. Durable worker state/recovery, bidirectional native
 Steer/question/cancel, reviewed merge/cleanup of accepted results and the desktop
 UI still need their own integration checkpoint. Diff checks are post-run
 inspection, not an OS filesystem sandbox. macOS and Windows remain untested.
@@ -209,4 +210,62 @@ The precise cause of the intermittent parallel fixture failure is unresolved.
 The standalone HTTP/stdio review fixtures were also verified against the actual
 supervisor and all 11 current MCP tools, without paid models or user chats.
 
-These observer changes do not yet wire real workers into durable native dispatch.
+The observer follow-up alone did not wire real workers into durable dispatch;
+the subsequent checkpoint below adds that connection.
+
+
+## Milestone 2B durable dispatch checkpoint (2026-10-29)
+
+The primary agent reviewed Argon High implementation and independently ran all
+82 workspace tests: 32 core, 26 runtime and 24 worker/process/Git tests. The
+verified command is `cargo test --workspace --locked -- --test-threads=1`.
+Formatting, Clippy with warnings denied, the locked workspace build and the
+CLI smoke all passed. The earlier parallel-harness `ETXTBSY` limitation remains
+unresolved; this report does not claim that command passed.
+
+The integrated runtime now exposes 14 MCP tools. Added fixtures verify disabled
+startup, side-effect-free private profile validation, forbidden overrides,
+binding isolation, exact base/digest identity, idempotent admission, configured
+parallelism, distinct task worktrees, live progress before process exit, bounded
+and redacted payloads, cancellation/completion races, stale callbacks, fault/drop
+and restart recovery without automatic worker replay.
+
+Additional primary-agent probes against the built HTTP/stdio runtime passed:
+
+- Actual process overlap was exactly 1 and 2 under the respective limits, using
+  disposable repositories with unchanged source checkouts.
+- A real stdio MCP client discovered 14 tools, observed pre-exit progress, replayed
+  duplicate admission without a second process, and cancelled with a current
+  revision. The same MCP process recovered its descriptor after supervisor restart.
+- A supervisor killed during a fixture worker reopened with an explicit `Unknown`
+  outcome and no automatic re-invocation. This does not prove an old process died;
+  the fixture separately cleaned up only its own verified process.
+- A database created by the actual prior schema-v2 binary upgraded to v3. Original
+  idempotent Start/Steer snapshots and both revision records remained exact, and
+  the newly introduced worker table was empty.
+- Maximal escaped instructions and path previews remained readable at terminal
+  state. The independent core regression first reproduced an oversized terminal
+  snapshot (106,564 bytes against 65,536), then verified the correction: public
+  optional previews shrink to fit while original instructions, counts, status
+  and complete bounded outcome data remain in SQLite.
+- Report-directory symlinks, artifact-file symlinks and insecure existing report
+  directories retained their original contents and modes. The report was omitted
+  and the genuine fixture worker still completed. The committed regression also
+  covers an existing regular artifact and successful private `0700`/`0600`
+  creation with cleared prompt argv.
+
+Review corrections included an invalid SQLite hidden-rowid index, a response
+budget failure that could prevent terminal persistence, runtime API mismatches,
+and report writing that could follow or chmod pre-existing paths. Two new tests
+were corrected to use the actual stale-claim and MCP parameter-error contracts;
+the behavioral rejection/preservation assertions remain in place.
+
+No probe invoked a paid provider or another user chat. Development coding used
+the explicitly selected Argon High; this is not evidence that a real worker task
+was accepted through the product. The earlier live AGY transport still lacks
+observed effort, and live OpenCode/Go remains unverified. Native real-worker
+Answer/Steer, busy-turn delivery, automatic multi-chat binding, reviewed merge/
+cleanup and the desktop UI have not passed their acceptance gates. Provider
+permissions are not bypassed. See [DISPATCH.md](DISPATCH.md) and
+[NATIVE-ROUTING.md](NATIVE-ROUTING.md). Private raw logs, temporary binaries and
+fixture state are excluded from Git.

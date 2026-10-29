@@ -1,6 +1,8 @@
 # Milestone 2B: durable worker dispatch
 
-This is the next implementation contract, not a completed acceptance report.
+This is the implemented durable-dispatch contract. The fixture checkpoint passed on
+2026-10-29; its evidence and remaining gates are recorded in [VALIDATION.md](VALIDATION.md)
+and [DISPATCH.md](DISPATCH.md). It is not full native real-worker acceptance.
 Native Codex remains the conversation interface. The existing demo and bounded
 history/replay contracts must continue to work.
 
@@ -60,7 +62,7 @@ UI require later integration checkpoints.
 
 ## Validation gate
 
-Preserve all 60 existing tests. Add behavioral coverage for scoped profiles,
+Preserve all existing behavioral regressions. Add behavioral coverage for scoped profiles,
 forbidden overrides, disabled dispatch, duplicate replay, concurrency limits,
 observable progress before exit, cancel/finish races, shutdown/drop, uncertain
 restart without replay, stale completions, bounded results, fake-provider errors

@@ -46,10 +46,16 @@ history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker
 library and diagnostic CLI provide provider evidence parsing, bounded process
 supervision and owned Git worktree/diff diagnostics independently of the runtime.
 
-Next, connect that foundation to durable worker dispatch and native bidirectional
-routing. Real coding acceptance, crash reconciliation, reviewed integration and
-cleanup of accepted results still need an end-to-end checkpoint. The desktop UI,
-profiles/Jev and release hardening remain later milestones. See [validation](VALIDATION.md).
+Milestone 2B now connects that foundation to durable worker dispatch over scoped
+HTTP/CLI/MCP, with bounded live progress, immutable profiles, cancellation and
+explicit restart uncertainty. Its primary-reviewed fixture gate passed 82 tests
+and independent process/migration/artifact probes. See [dispatch](DISPATCH.md).
+
+Next, verify native real-worker interaction and the [multi-chat routing gate](NATIVE-ROUTING.md).
+Live coding acceptance, provider-interactive question/Steer delivery, reconciliation
+of preserved uncertain artifacts, reviewed Git integration and accepted-result
+cleanup still need their own end-to-end checkpoint. The desktop UI, profiles/Jev
+and release hardening remain later milestones. See [validation](VALIDATION.md).
 
 ## Default workflow example
 
