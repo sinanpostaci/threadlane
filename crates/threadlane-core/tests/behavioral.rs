@@ -1,9 +1,9 @@
 use tempfile::TempDir;
 use threadlane_core::{
     AckErrorReason, Command, Core, CoreError, EventKind, QuestionStatus, RunStatus, WakeupOutcome,
-    WakeupStatus, FIXED_WAKEUP_MESSAGE, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMMAND_KEY_LEN,
-    MAX_DEMO_STEP_DELAY_MS, MAX_EVENT_BATCH_SIZE, MAX_INSTRUCTION_LEN, MAX_LABEL_LEN,
-    MAX_WAKEUP_ERROR_LEN,
+    WakeupRetryRecord, WakeupStatus, FIXED_WAKEUP_MESSAGE, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
+    MAX_COMMAND_KEY_LEN, MAX_DEMO_STEP_DELAY_MS, MAX_EVENT_BATCH_SIZE, MAX_EVENT_PAYLOAD_BYTES,
+    MAX_INSTRUCTION_LEN, MAX_LABEL_LEN, MAX_WAKEUP_ERROR_LEN,
 };
 
 const UUID_A: &str = "11111111-2222-4333-8444-555555555555";
@@ -131,8 +131,24 @@ fn full_demo_loop_with_events_and_wakeups() {
     assert_eq!(batch_1.acked_seq, 0);
     assert!(!batch_1.has_more);
     assert_eq!(batch_1.events[0].kind, EventKind::RunStarted);
+    assert_eq!(
+        batch_1.events[0].payload.instruction.as_deref(),
+        Some("Implement bounded conversation loop")
+    );
     assert_eq!(batch_1.events[1].kind, EventKind::RunProgress);
+    assert_eq!(batch_1.events[1].payload.instruction, None);
     assert_eq!(batch_1.events[2].kind, EventKind::QuestionAsked);
+    assert_eq!(batch_1.events[2].payload.instruction, None);
+    let asked_prompt = batch_1.events[2]
+        .payload
+        .question_prompt
+        .as_deref()
+        .expect("question prompt");
+    assert!(asked_prompt.contains(&started.run_id));
+    assert!(asked_prompt.contains("revision 1"));
+    assert!(asked_prompt.contains("confirm the current instruction"));
+    assert!(asked_prompt.contains("get_run"));
+    assert!(!asked_prompt.contains("Implement bounded conversation loop"));
     assert!(batch_1.events.iter().all(|e| e.payload.untrusted_data));
 
     // Reading events is NOT acknowledgement: wake-up remains Submitted until acknowledged.
@@ -231,7 +247,14 @@ fn full_demo_loop_with_events_and_wakeups() {
     assert_eq!(batch_2.to_seq, 5);
     assert_eq!(batch_2.events.len(), 2);
     assert_eq!(batch_2.events[0].kind, EventKind::QuestionAnswered);
+    assert_eq!(batch_2.events[0].payload.instruction, None);
+    assert_eq!(
+        batch_2.events[0].payload.answer.as_deref(),
+        Some("Approved for execution")
+    );
     assert_eq!(batch_2.events[1].kind, EventKind::RunCompleted);
+    assert_eq!(batch_2.events[1].payload.instruction, None);
+    assert_eq!(batch_2.events[1].payload.answer, None);
 
     let ack_2 = core
         .execute(
@@ -1507,4 +1530,998 @@ fn wakeup_coalescing_partial_ack_coverage_and_inflight_recovery_to_unknown() {
     let claim_9 = core.claim_wakeup(2_240).expect("claim 9").expect("claim_9");
     assert_eq!(claim_9.pending_since_seq, 9);
     assert_eq!(claim_9.covered_up_to_seq, 9);
+}
+
+#[test]
+fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane.db");
+    let mut core = Core::open(&db_path).expect("open");
+
+    let binding_a = core
+        .create_binding(UUID_A, "Escaped Instruction A")
+        .expect("binding a");
+    let binding_b = core
+        .create_binding(UUID_B, "Companion Binding B")
+        .expect("binding b");
+
+    // 1. Exact reproduction of the 4,096-byte control-character instruction that previously
+    // passed `start_demo` (16,344 escaped JSON bytes <= 16,384) and then failed forever on
+    // `tick` when `QuestionAsked` expanded to 16,420 bytes > 16,384.
+    let repro_instruction = "\u{1}".repeat(2_411) + &"a".repeat(1_685);
+    assert_eq!(repro_instruction.len(), MAX_INSTRUCTION_LEN);
+
+    let started_a = core
+        .execute(
+            &binding_a.binding_id,
+            Command::StartDemo {
+                command_key: "repro-start".to_string(),
+                instruction: repro_instruction.clone(),
+                step_delay_ms: Some(100),
+                now_ms: 1_000,
+            },
+        )
+        .expect("start repro instruction")
+        .into_run()
+        .expect("run a");
+    assert_eq!(started_a.instruction, repro_instruction);
+    assert_eq!(started_a.revision_history[0].instruction, repro_instruction);
+
+    let started_b = core
+        .execute(
+            &binding_b.binding_id,
+            Command::StartDemo {
+                command_key: "b-start".to_string(),
+                instruction: "Sibling binding run".to_string(),
+                step_delay_ms: Some(100),
+                now_ms: 1_000,
+            },
+        )
+        .expect("start b")
+        .into_run()
+        .expect("run b");
+
+    // 2. Both bindings advance cleanly on tick without EventPayloadTooLarge.
+    let tick_1 = core.tick(1_100).expect("tick 1 must succeed");
+    assert_eq!(
+        tick_1.advanced_runs,
+        vec![started_a.run_id.clone(), started_b.run_id.clone()]
+    );
+    assert_eq!(tick_1.emitted_events, 4);
+
+    let waiting_a_v1 = core
+        .get_run(&binding_a.binding_id, &started_a.run_id)
+        .expect("get waiting a v1");
+    assert_eq!(waiting_a_v1.status, RunStatus::WaitingInput);
+    assert_eq!(waiting_a_v1.instruction, repro_instruction);
+    assert_eq!(
+        waiting_a_v1.revision_history[0].instruction,
+        repro_instruction
+    );
+    let q1 = &waiting_a_v1.questions[0];
+    assert!(q1.prompt.contains(&started_a.run_id));
+    assert!(q1.prompt.contains("revision 1"));
+    assert!(q1.prompt.contains("confirm the current instruction"));
+    assert!(q1.prompt.contains("get_run"));
+    assert!(!q1.prompt.contains('\u{1}'));
+
+    // 3. Steer with another 4,096-byte control-character instruction and advance via tick.
+    let steered_instruction = "\u{1}".repeat(2_411) + &"b".repeat(1_685);
+    assert_eq!(steered_instruction.len(), MAX_INSTRUCTION_LEN);
+
+    let steered_a = core
+        .execute(
+            &binding_a.binding_id,
+            Command::Steer {
+                command_key: "repro-steer".to_string(),
+                run_id: started_a.run_id.clone(),
+                expected_revision: 1,
+                instruction: steered_instruction.clone(),
+                now_ms: 1_200,
+            },
+        )
+        .expect("steer repro instruction")
+        .into_run()
+        .expect("steered run a");
+    assert_eq!(steered_a.revision, 2);
+    assert_eq!(steered_a.instruction, steered_instruction);
+    assert_eq!(steered_a.revision_history.len(), 2);
+    assert_eq!(steered_a.revision_history[0].instruction, repro_instruction);
+    assert_eq!(
+        steered_a.revision_history[1].instruction,
+        steered_instruction
+    );
+
+    let tick_2 = core.tick(1_300).expect("tick 2 after steer must succeed");
+    assert_eq!(tick_2.advanced_runs, vec![started_a.run_id.clone()]);
+    assert_eq!(tick_2.emitted_events, 2);
+
+    let waiting_a_v2 = core
+        .get_run(&binding_a.binding_id, &started_a.run_id)
+        .expect("waiting a v2");
+    assert_eq!(waiting_a_v2.status, RunStatus::WaitingInput);
+    let q2_id = waiting_a_v2.active_question_id.clone().expect("q2 id");
+    assert!(waiting_a_v2.questions[1].prompt.contains("revision 2"));
+    assert!(!waiting_a_v2.questions[1].prompt.contains('\u{1}'));
+
+    // 4. Answer with a 4,096-byte escaped quote payload and tick to completion.
+    let max_quote_answer = "\"".repeat(MAX_ANSWER_LEN);
+    core.execute(
+        &binding_a.binding_id,
+        Command::Answer {
+            command_key: "repro-answer".to_string(),
+            run_id: started_a.run_id.clone(),
+            question_id: q2_id,
+            expected_revision: 2,
+            answer: max_quote_answer.clone(),
+            now_ms: 1_400,
+        },
+    )
+    .expect("answer v2");
+
+    let tick_3 = core.tick(1_500).expect("tick 3 to completed must succeed");
+    assert_eq!(tick_3.advanced_runs, vec![started_a.run_id.clone()]);
+    assert_eq!(tick_3.emitted_events, 1);
+
+    let completed_a = core
+        .get_run(&binding_a.binding_id, &started_a.run_id)
+        .expect("completed a");
+    assert_eq!(completed_a.status, RunStatus::Completed);
+    assert_eq!(completed_a.instruction, steered_instruction);
+    assert_eq!(
+        completed_a.revision_history[0].instruction,
+        repro_instruction
+    );
+    assert_eq!(
+        completed_a.revision_history[1].instruction,
+        steered_instruction
+    );
+    assert_eq!(
+        completed_a.questions[1].answer.as_deref(),
+        Some(max_quote_answer.as_str())
+    );
+
+    let batch_a = core
+        .execute(
+            &binding_a.binding_id,
+            Command::PullEvents {
+                after_seq: None,
+                limit: 50,
+                now_ms: 1_510,
+            },
+        )
+        .expect("pull a events")
+        .into_event_batch()
+        .expect("batch a");
+    assert_eq!(batch_a.events.len(), 9);
+    for event in &batch_a.events {
+        let json = serde_json::to_string(&event.payload).expect("serialize payload");
+        assert!(json.len() <= MAX_EVENT_PAYLOAD_BYTES);
+        match event.kind {
+            EventKind::RunStarted => {
+                assert_eq!(
+                    event.payload.instruction.as_deref(),
+                    Some(repro_instruction.as_str())
+                );
+            }
+            EventKind::RunSteered => {
+                assert_eq!(
+                    event.payload.instruction.as_deref(),
+                    Some(steered_instruction.as_str())
+                );
+            }
+            EventKind::RunProgress
+            | EventKind::QuestionAsked
+            | EventKind::QuestionAnswered
+            | EventKind::QuestionSuperseded
+            | EventKind::RunCompleted
+            | EventKind::RunCancelled => {
+                assert_eq!(event.payload.instruction, None);
+            }
+        }
+    }
+
+    // 5. Verify maximum quotes, backslashes, and multibyte Unicode instructions all progress to completion.
+    let edge_instructions = [
+        "\"".repeat(MAX_INSTRUCTION_LEN),
+        "\\".repeat(MAX_INSTRUCTION_LEN),
+        "🦀".repeat(MAX_INSTRUCTION_LEN / 4),
+        "\u{2028}".repeat(MAX_INSTRUCTION_LEN / 3) + "z",
+    ];
+    for (idx, edge_inst) in edge_instructions.iter().enumerate() {
+        assert_eq!(edge_inst.len(), MAX_INSTRUCTION_LEN);
+        let run = core
+            .execute(
+                &binding_b.binding_id,
+                Command::StartDemo {
+                    command_key: format!("edge-start-{idx}"),
+                    instruction: edge_inst.clone(),
+                    step_delay_ms: Some(10),
+                    now_ms: 2_000,
+                },
+            )
+            .expect("start edge instruction")
+            .into_run()
+            .expect("edge run");
+        core.tick(2_010).expect("tick edge to question");
+        let waiting = core
+            .get_run(&binding_b.binding_id, &run.run_id)
+            .expect("waiting edge");
+        assert_eq!(waiting.instruction, *edge_inst);
+        let q_id = waiting.active_question_id.expect("edge q_id");
+        core.execute(
+            &binding_b.binding_id,
+            Command::Answer {
+                command_key: format!("edge-ans-{idx}"),
+                run_id: run.run_id.clone(),
+                question_id: q_id,
+                expected_revision: 1,
+                answer: "ok".to_string(),
+                now_ms: 2_020,
+            },
+        )
+        .expect("answer edge");
+        core.tick(2_030).expect("tick edge to completion");
+        let done = core
+            .get_run(&binding_b.binding_id, &run.run_id)
+            .expect("done edge");
+        assert_eq!(done.status, RunStatus::Completed);
+        assert_eq!(done.instruction, *edge_inst);
+    }
+
+    // 6. Oversized immediate event payload (<= 4,096 raw bytes, > 16,384 escaped JSON bytes)
+    // is rejected transactionally before commit with NO partial write.
+    let dir_reject = TempDir::new().expect("tempdir");
+    let mut core_reject = Core::open(dir_reject.path().join("reject.db")).expect("open reject");
+    let b_reject = core_reject
+        .create_binding(UUID_A, "Reject Chat")
+        .expect("binding reject");
+
+    // 2,730 * 6 = 16,380 escaped bytes (+ envelope > 16,384), while raw byte length is 2,730 <= 4,096.
+    let oversized_escaped = "\u{1}".repeat(2_730);
+    assert!(oversized_escaped.len() <= MAX_INSTRUCTION_LEN);
+
+    let start_err = core_reject
+        .execute(
+            &b_reject.binding_id,
+            Command::StartDemo {
+                command_key: "atomic-key-1".to_string(),
+                instruction: oversized_escaped.clone(),
+                step_delay_ms: Some(50),
+                now_ms: 100,
+            },
+        )
+        .expect_err("oversized immediate RunStarted event must fail");
+    assert!(matches!(
+        start_err,
+        CoreError::EventPayloadTooLarge {
+            max_bytes: MAX_EVENT_PAYLOAD_BYTES,
+            ..
+        }
+    ));
+
+    // Verify no partial write occurred on StartDemo failure.
+    let runs_after_reject = core_reject
+        .execute(&b_reject.binding_id, Command::ListRuns)
+        .expect("list runs")
+        .into_run_list()
+        .expect("runs");
+    assert!(runs_after_reject.is_empty());
+    let events_after_reject = core_reject
+        .execute(
+            &b_reject.binding_id,
+            Command::PullEvents {
+                after_seq: None,
+                limit: 10,
+                now_ms: 101,
+            },
+        )
+        .expect("pull")
+        .into_event_batch()
+        .expect("batch");
+    assert!(events_after_reject.events.is_empty());
+
+    // Because the transaction rolled back, `atomic-key-1` was not committed to `command_dedup`
+    // and can now be used for a valid StartDemo.
+    let valid_run = core_reject
+        .execute(
+            &b_reject.binding_id,
+            Command::StartDemo {
+                command_key: "atomic-key-1".to_string(),
+                instruction: "Valid instruction".to_string(),
+                step_delay_ms: Some(50),
+                now_ms: 105,
+            },
+        )
+        .expect("valid start with same key")
+        .into_run()
+        .expect("valid run");
+    core_reject.tick(155).expect("tick valid run");
+    let waiting_valid = core_reject
+        .get_run(&b_reject.binding_id, &valid_run.run_id)
+        .expect("waiting valid");
+    let valid_q_id = waiting_valid.active_question_id.clone().expect("q_id");
+
+    // Oversized immediate Steer fails transactionally without superseding the pending question or advancing revision.
+    let steer_err = core_reject
+        .execute(
+            &b_reject.binding_id,
+            Command::Steer {
+                command_key: "atomic-steer-key".to_string(),
+                run_id: valid_run.run_id.clone(),
+                expected_revision: 1,
+                instruction: oversized_escaped.clone(),
+                now_ms: 160,
+            },
+        )
+        .expect_err("oversized immediate RunSteered event must fail");
+    assert!(matches!(steer_err, CoreError::EventPayloadTooLarge { .. }));
+
+    let after_failed_steer = core_reject
+        .get_run(&b_reject.binding_id, &valid_run.run_id)
+        .expect("after failed steer");
+    assert_eq!(after_failed_steer.revision, 1);
+    assert_eq!(after_failed_steer.status, RunStatus::WaitingInput);
+    assert_eq!(after_failed_steer.instruction, "Valid instruction");
+    assert_eq!(after_failed_steer.revision_history.len(), 1);
+    assert_eq!(
+        after_failed_steer.questions[0].status,
+        QuestionStatus::Pending
+    );
+
+    // Oversized immediate Answer fails transactionally without marking the question Answered.
+    let answer_err = core_reject
+        .execute(
+            &b_reject.binding_id,
+            Command::Answer {
+                command_key: "atomic-answer-key".to_string(),
+                run_id: valid_run.run_id.clone(),
+                question_id: valid_q_id.clone(),
+                expected_revision: 1,
+                answer: oversized_escaped,
+                now_ms: 165,
+            },
+        )
+        .expect_err("oversized immediate QuestionAnswered event must fail");
+    assert!(matches!(answer_err, CoreError::EventPayloadTooLarge { .. }));
+
+    let after_failed_answer = core_reject
+        .get_run(&b_reject.binding_id, &valid_run.run_id)
+        .expect("after failed answer");
+    assert_eq!(after_failed_answer.status, RunStatus::WaitingInput);
+    assert_eq!(
+        after_failed_answer.active_question_id.as_deref(),
+        Some(valid_q_id.as_str())
+    );
+    assert_eq!(
+        after_failed_answer.questions[0].status,
+        QuestionStatus::Pending
+    );
+    assert_eq!(after_failed_answer.questions[0].answer, None);
+}
+
+#[test]
+fn restart_with_already_persisted_raw_control_instructions_advances_cleanly() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("legacy_state.db");
+
+    let repro_instruction = "\u{1}".repeat(2_411) + &"a".repeat(1_685);
+    let all_control_instruction = "\u{1}".repeat(MAX_INSTRUCTION_LEN);
+
+    let (binding_a_id, binding_b_id, run_1_id, run_2_id, run_b_id) = {
+        let mut core = Core::open(&db_path).expect("open");
+        let b_a = core.create_binding(UUID_A, "Legacy A").expect("b_a");
+        let b_b = core.create_binding(UUID_B, "Legacy B").expect("b_b");
+
+        let r1 = core
+            .execute(
+                &b_a.binding_id,
+                Command::StartDemo {
+                    command_key: "r1".to_string(),
+                    instruction: "placeholder 1".to_string(),
+                    step_delay_ms: Some(100),
+                    now_ms: 1_000,
+                },
+            )
+            .expect("r1")
+            .into_run()
+            .expect("r1");
+        let r2 = core
+            .execute(
+                &b_a.binding_id,
+                Command::StartDemo {
+                    command_key: "r2".to_string(),
+                    instruction: "placeholder 2".to_string(),
+                    step_delay_ms: Some(100),
+                    now_ms: 1_000,
+                },
+            )
+            .expect("r2")
+            .into_run()
+            .expect("r2");
+        let rb = core
+            .execute(
+                &b_b.binding_id,
+                Command::StartDemo {
+                    command_key: "rb".to_string(),
+                    instruction: "normal companion".to_string(),
+                    step_delay_ms: Some(100),
+                    now_ms: 1_000,
+                },
+            )
+            .expect("rb")
+            .into_run()
+            .expect("rb");
+        (
+            b_a.binding_id,
+            b_b.binding_id,
+            r1.run_id,
+            r2.run_id,
+            rb.run_id,
+        )
+    };
+
+    // Simulate a database persisted by the previous build containing both the 2,411-control
+    // instruction and a full 4,096-control instruction (24,576 escaped bytes) in `runs` and `run_revisions`.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+        conn.execute(
+            "UPDATE runs SET instruction = ?1 WHERE run_id = ?2",
+            rusqlite::params![repro_instruction, run_1_id],
+        )
+        .expect("update r1 instruction");
+        conn.execute(
+            "UPDATE run_revisions SET instruction = ?1 WHERE run_id = ?2 AND revision = 1",
+            rusqlite::params![repro_instruction, run_1_id],
+        )
+        .expect("update r1 revision");
+        conn.execute(
+            "UPDATE runs SET instruction = ?1 WHERE run_id = ?2",
+            rusqlite::params![all_control_instruction, run_2_id],
+        )
+        .expect("update r2 instruction");
+        conn.execute(
+            "UPDATE run_revisions SET instruction = ?1 WHERE run_id = ?2 AND revision = 1",
+            rusqlite::params![all_control_instruction, run_2_id],
+        )
+        .expect("update r2 revision");
+    }
+
+    // Reopen and tick: all runs across both bindings advance to WaitingInput and then Completed!
+    let mut core = Core::open(&db_path).expect("reopen");
+    let tick_report = core.tick(1_100).expect("tick legacy runs");
+    assert_eq!(
+        tick_report.advanced_runs,
+        vec![run_1_id.clone(), run_2_id.clone(), run_b_id.clone()]
+    );
+    assert_eq!(tick_report.emitted_events, 6);
+
+    let r1 = core.get_run(&binding_a_id, &run_1_id).expect("get r1");
+    assert_eq!(r1.status, RunStatus::WaitingInput);
+    assert_eq!(r1.instruction, repro_instruction);
+    assert_eq!(r1.revision_history[0].instruction, repro_instruction);
+    let q1_id = r1.active_question_id.expect("q1");
+
+    let r2 = core.get_run(&binding_a_id, &run_2_id).expect("get r2");
+    assert_eq!(r2.status, RunStatus::WaitingInput);
+    assert_eq!(r2.instruction, all_control_instruction);
+    assert_eq!(r2.revision_history[0].instruction, all_control_instruction);
+    let q2_id = r2.active_question_id.expect("q2");
+
+    let rb = core.get_run(&binding_b_id, &run_b_id).expect("get rb");
+    assert_eq!(rb.status, RunStatus::WaitingInput);
+
+    // Answer both legacy runs on binding_a and tick to Completed across another reopen.
+    core.execute(
+        &binding_a_id,
+        Command::Answer {
+            command_key: "ans-r1".to_string(),
+            run_id: run_1_id.clone(),
+            question_id: q1_id,
+            expected_revision: 1,
+            answer: "confirm r1".to_string(),
+            now_ms: 1_200,
+        },
+    )
+    .expect("answer r1");
+    core.execute(
+        &binding_a_id,
+        Command::Answer {
+            command_key: "ans-r2".to_string(),
+            run_id: run_2_id.clone(),
+            question_id: q2_id,
+            expected_revision: 1,
+            answer: "confirm r2".to_string(),
+            now_ms: 1_200,
+        },
+    )
+    .expect("answer r2");
+
+    drop(core);
+    let mut core = Core::open(&db_path).expect("reopen before completion");
+    let complete_report = core.tick(1_300).expect("complete legacy runs");
+    assert_eq!(
+        complete_report.advanced_runs,
+        vec![run_1_id.clone(), run_2_id.clone()]
+    );
+
+    let r1_done = core.get_run(&binding_a_id, &run_1_id).expect("r1 done");
+    let r2_done = core.get_run(&binding_a_id, &run_2_id).expect("r2 done");
+    assert_eq!(r1_done.status, RunStatus::Completed);
+    assert_eq!(r1_done.instruction, repro_instruction);
+    assert_eq!(r2_done.status, RunStatus::Completed);
+    assert_eq!(r2_done.instruction, all_control_instruction);
+}
+
+#[test]
+fn manual_retry_wakeup_lifecycle_audit_isolation_and_ack_reconciliation() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane.db");
+    let mut core = Core::open(&db_path).expect("open");
+
+    let binding_a = core.create_binding(UUID_A, "Retry A").expect("binding a");
+    let binding_b = core.create_binding(UUID_B, "Retry B").expect("binding b");
+
+    // 1. Reject Idle state.
+    let err_idle = core
+        .retry_wakeup(&binding_a.binding_id, "wcl_nonexistent", true, 900)
+        .expect_err("Idle wakeup cannot be retried");
+    assert!(matches!(
+        err_idle,
+        CoreError::InvalidWakeupState {
+            status: WakeupStatus::Idle,
+            action: "retry_wakeup",
+            ..
+        }
+    ));
+
+    // Emit an important event on binding_a (seq = 3).
+    core.execute(
+        &binding_a.binding_id,
+        Command::StartDemo {
+            command_key: "start-a1".to_string(),
+            instruction: "Run A1".to_string(),
+            step_delay_ms: Some(100),
+            now_ms: 1_000,
+        },
+    )
+    .expect("start a1");
+    core.tick(1_100).expect("tick a1");
+
+    // 2. Reject Pending state.
+    let err_pending = core
+        .retry_wakeup(&binding_a.binding_id, "wcl_nonexistent", true, 1_105)
+        .expect_err("Pending wakeup cannot be retried");
+    assert!(matches!(
+        err_pending,
+        CoreError::InvalidWakeupState {
+            status: WakeupStatus::Pending,
+            action: "retry_wakeup",
+            ..
+        }
+    ));
+
+    // Claim wake-up -> InFlight (claim_1, attempt_count = 1).
+    let claim_1 = core
+        .claim_wakeup_for_binding(&binding_a.binding_id, 1_110)
+        .expect("claim 1")
+        .expect("claim_1");
+    assert_eq!(claim_1.pending_since_seq, 3);
+    assert_eq!(claim_1.covered_up_to_seq, 3);
+    assert_eq!(claim_1.coalesced_count, 1);
+
+    // 3. Reject InFlight state (with matching claim_id) and stale claim_id while InFlight.
+    let err_inflight = core
+        .retry_wakeup(&binding_a.binding_id, &claim_1.claim_id, true, 1_115)
+        .expect_err("InFlight wakeup cannot be retried");
+    assert!(matches!(
+        err_inflight,
+        CoreError::InvalidWakeupState {
+            status: WakeupStatus::InFlight,
+            action: "retry_wakeup",
+            ..
+        }
+    ));
+    let err_stale_inflight = core
+        .retry_wakeup(&binding_a.binding_id, "wcl_stale", true, 1_115)
+        .expect_err("Unmatched claim while InFlight must fail");
+    assert!(matches!(
+        err_stale_inflight,
+        CoreError::WakeupClaimNotFound { .. }
+    ));
+
+    // Record Failed outcome on claim_1.
+    let failed_notice = core
+        .record_wakeup_result(
+            &claim_1.claim_id,
+            WakeupOutcome::Failed {
+                error: "codex binary missing".to_string(),
+            },
+            1_120,
+        )
+        .expect("record failed");
+    assert_eq!(failed_notice.status, WakeupStatus::Failed);
+    assert_eq!(failed_notice.attempt_count, 1);
+    assert_eq!(
+        failed_notice.claim_id.as_deref(),
+        Some(claim_1.claim_id.as_str())
+    );
+    assert_eq!(
+        core.claim_wakeup(1_125).expect("no auto retry"),
+        None,
+        "Failed wake-up must never be automatically retried"
+    );
+
+    // 4. Cross-binding and stale claim rejections when Failed.
+    let err_missing_binding = core
+        .retry_wakeup("bnd_missing", &claim_1.claim_id, false, 1_130)
+        .expect_err("missing binding");
+    assert!(matches!(
+        err_missing_binding,
+        CoreError::BindingNotFound { .. }
+    ));
+
+    // Cross-binding: binding_b is Idle, claim_1 belongs to binding_a.
+    let err_cross_idle = core
+        .retry_wakeup(&binding_b.binding_id, &claim_1.claim_id, true, 1_130)
+        .expect_err("cross-binding retry on Idle binding_b must fail");
+    assert!(matches!(
+        err_cross_idle,
+        CoreError::WakeupClaimNotFound { .. }
+    ));
+
+    // Stale/wrong expected_claim_id on binding_a does not alter Failed state.
+    let err_wrong_claim = core
+        .retry_wakeup(&binding_a.binding_id, "wcl_wrong_id", false, 1_130)
+        .expect_err("wrong expected_claim_id must fail");
+    assert!(matches!(
+        err_wrong_claim,
+        CoreError::WakeupClaimNotFound { .. }
+    ));
+    let still_failed = core
+        .get_wakeup(&binding_a.binding_id)
+        .expect("still failed");
+    assert_eq!(still_failed.status, WakeupStatus::Failed);
+
+    // 5. Rearm Failed wake-up with matching expected_claim_id (allow_unknown = false).
+    let rearmed_1 = core
+        .retry_wakeup(&binding_a.binding_id, &claim_1.claim_id, false, 1_140)
+        .expect("rearm failed claim_1");
+    assert_eq!(rearmed_1.status, WakeupStatus::Pending);
+    assert_eq!(rearmed_1.claim_id, None);
+    assert_eq!(rearmed_1.covered_up_to_seq, 0);
+    assert_eq!(rearmed_1.pending_since_seq, Some(3));
+    assert_eq!(rearmed_1.latest_important_seq, 3);
+    assert_eq!(rearmed_1.coalesced_count, 1);
+    assert_eq!(rearmed_1.attempt_count, 1);
+    assert_eq!(rearmed_1.last_error, None);
+    assert_eq!(rearmed_1.claimed_at_ms, None);
+    assert_eq!(rearmed_1.resolved_at_ms, None);
+
+    // Binding delivered_seq and acked_seq are untouched.
+    let b_a_state = core.get_binding(&binding_a.binding_id).expect("binding a");
+    assert_eq!(b_a_state.delivered_seq, 0);
+    assert_eq!(b_a_state.acked_seq, 0);
+
+    // 6. Repeated retry with the same expected_claim_id causes no second side effect.
+    let err_repeat = core
+        .retry_wakeup(&binding_a.binding_id, &claim_1.claim_id, false, 1_145)
+        .expect_err("repeated retry must fail");
+    assert!(matches!(
+        err_repeat,
+        CoreError::InvalidWakeupState {
+            status: WakeupStatus::Pending,
+            action: "retry_wakeup",
+            ..
+        }
+    ));
+    let retries_after_repeat = core
+        .list_wakeup_retries(&binding_a.binding_id)
+        .expect("retries");
+    assert_eq!(retries_after_repeat.len(), 1);
+
+    // 7. Durability across reopen while Pending, then claim exactly one additional claim (claim_2).
+    drop(core);
+    let mut core = Core::open(&db_path).expect("reopen while pending");
+    let pending_after_reopen = core
+        .get_wakeup(&binding_a.binding_id)
+        .expect("pending after reopen");
+    assert_eq!(pending_after_reopen.status, WakeupStatus::Pending);
+    assert_eq!(pending_after_reopen.attempt_count, 1);
+    assert_eq!(pending_after_reopen.pending_since_seq, Some(3));
+
+    let claim_2 = core
+        .claim_wakeup(1_150)
+        .expect("claim 2")
+        .expect("claim_2");
+    assert_ne!(claim_2.claim_id, claim_1.claim_id);
+    assert_eq!(claim_2.pending_since_seq, 3);
+    assert_eq!(claim_2.covered_up_to_seq, 3);
+    assert_eq!(claim_2.coalesced_count, 1);
+    assert_eq!(
+        core.claim_wakeup(1_155).expect("no extra claim"),
+        None,
+        "One retry must allow only one additional claim"
+    );
+    let inflight_2 = core.get_wakeup(&binding_a.binding_id).expect("inflight 2");
+    assert_eq!(inflight_2.attempt_count, 2);
+
+    // Old retry with claim_1 while claim_2 is InFlight must never release claim_2!
+    let err_old_on_inflight = core
+        .retry_wakeup(&binding_a.binding_id, &claim_1.claim_id, true, 1_160)
+        .expect_err("stale retry must not release newer InFlight claim");
+    assert!(matches!(
+        err_old_on_inflight,
+        CoreError::WakeupClaimNotFound { .. }
+    ));
+    let still_inflight_2 = core
+        .get_wakeup(&binding_a.binding_id)
+        .expect("still inflight 2");
+    assert_eq!(
+        still_inflight_2.claim_id.as_deref(),
+        Some(claim_2.claim_id.as_str())
+    );
+
+    // 8. Reopen while claim_2 is InFlight -> recovers to Unknown.
+    drop(core);
+    let mut core = Core::open(&db_path).expect("reopen to unknown");
+    let unknown_notice = core
+        .get_wakeup(&binding_a.binding_id)
+        .expect("unknown notice");
+    assert_eq!(unknown_notice.status, WakeupStatus::Unknown);
+    assert_eq!(
+        unknown_notice.claim_id.as_deref(),
+        Some(claim_2.claim_id.as_str())
+    );
+
+    // Stale claim_1 is still rejected when claim_2 is Unknown.
+    assert!(matches!(
+        core.retry_wakeup(&binding_a.binding_id, &claim_1.claim_id, true, 1_200),
+        Err(CoreError::WakeupClaimNotFound { .. })
+    ));
+
+    // Unknown is refused without explicit `allow_unknown == true`.
+    let err_unknown_disallowed = core
+        .retry_wakeup(&binding_a.binding_id, &claim_2.claim_id, false, 1_205)
+        .expect_err("Unknown wakeup must be refused when allow_unknown is false");
+    assert!(matches!(
+        err_unknown_disallowed,
+        CoreError::InvalidWakeupState {
+            status: WakeupStatus::Unknown,
+            action: "retry_wakeup",
+            ..
+        }
+    ));
+    let still_unknown = core
+        .get_wakeup(&binding_a.binding_id)
+        .expect("still unknown");
+    assert_eq!(still_unknown.status, WakeupStatus::Unknown);
+    let retries_still_1 = core
+        .list_wakeup_retries(&binding_a.binding_id)
+        .expect("retries still 1");
+    assert_eq!(retries_still_1.len(), 1);
+
+    // Unknown is rearmed when `allow_unknown == true`.
+    let rearmed_2 = core
+        .retry_wakeup(&binding_a.binding_id, &claim_2.claim_id, true, 1_210)
+        .expect("rearm unknown with allow_unknown=true");
+    assert_eq!(rearmed_2.status, WakeupStatus::Pending);
+    assert_eq!(rearmed_2.claim_id, None);
+    assert_eq!(rearmed_2.covered_up_to_seq, 0);
+    assert_eq!(rearmed_2.pending_since_seq, Some(3));
+    assert_eq!(rearmed_2.coalesced_count, 1);
+    assert_eq!(rearmed_2.attempt_count, 2);
+    assert_eq!(rearmed_2.last_error, None);
+    assert_eq!(rearmed_2.claimed_at_ms, None);
+    assert_eq!(rearmed_2.resolved_at_ms, None);
+
+    // Claim claim_3 and record Submitted -> Reject retry on Submitted.
+    let claim_3 = core
+        .claim_wakeup(1_220)
+        .expect("claim 3")
+        .expect("claim_3");
+    core.record_wakeup_result(&claim_3.claim_id, WakeupOutcome::Submitted, 1_230)
+        .expect("submit claim 3");
+    assert!(matches!(
+        core.retry_wakeup(&binding_a.binding_id, &claim_3.claim_id, true, 1_235),
+        Err(CoreError::InvalidWakeupState {
+            status: WakeupStatus::Submitted,
+            action: "retry_wakeup",
+            ..
+        })
+    ));
+
+    // 9. Verify audit retention and immutable historical wakeup_claims across restarts.
+    drop(core);
+    let mut core = Core::open(&db_path).expect("reopen for audit check");
+    let retries: Vec<WakeupRetryRecord> = core
+        .list_wakeup_retries(&binding_a.binding_id)
+        .expect("list retries");
+    assert_eq!(retries.len(), 2);
+    assert!(retries[0].retry_id.starts_with("wrt_"));
+    assert_eq!(retries[0].binding_id, binding_a.binding_id);
+    assert_eq!(retries[0].prior_claim_id, claim_1.claim_id);
+    assert_eq!(retries[0].prior_status, WakeupStatus::Failed);
+    assert!(!retries[0].allow_unknown);
+    assert_eq!(retries[0].retried_at_ms, 1_140);
+
+    assert!(retries[1].retry_id.starts_with("wrt_"));
+    assert_eq!(retries[1].binding_id, binding_a.binding_id);
+    assert_eq!(retries[1].prior_claim_id, claim_2.claim_id);
+    assert_eq!(retries[1].prior_status, WakeupStatus::Unknown);
+    assert!(retries[1].allow_unknown);
+    assert_eq!(retries[1].retried_at_ms, 1_210);
+
+    // Check historical `wakeup_claims` rows in SQLite are preserved immutably.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("raw sqlite");
+        let mut stmt = conn
+            .prepare(
+                "SELECT claim_id, status, error_detail
+                 FROM wakeup_claims
+                 WHERE binding_id = ?1
+                 ORDER BY rowid ASC",
+            )
+            .expect("prepare claims query");
+        let rows: Vec<(String, String, Option<String>)> = stmt
+            .query_map(rusqlite::params![binding_a.binding_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .expect("query claims")
+            .map(|r| r.expect("row"))
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, claim_1.claim_id);
+        assert_eq!(rows[0].1, "failed");
+        assert_eq!(rows[0].2.as_deref(), Some("codex binary missing"));
+        assert_eq!(rows[1].0, claim_2.claim_id);
+        assert_eq!(rows[1].1, "unknown");
+        assert!(rows[1].2.is_some());
+        assert_eq!(rows[2].0, claim_3.claim_id);
+        assert_eq!(rows[2].1, "submitted");
+        assert_eq!(rows[2].2, None);
+    }
+
+    // 10. Verify ACK after Unknown transitions to Idle when no newer important events exist,
+    // and to Pending when newer important events exist.
+    core.execute(
+        &binding_b.binding_id,
+        Command::StartDemo {
+            command_key: "b-run-1".to_string(),
+            instruction: "Run B1".to_string(),
+            step_delay_ms: Some(50),
+            now_ms: 2_000,
+        },
+    )
+    .expect("start b1");
+    core.tick(2_050).expect("tick b1");
+    assert!(matches!(
+        core.retry_wakeup(&binding_b.binding_id, &claim_1.claim_id, true, 2_055),
+        Err(CoreError::WakeupClaimNotFound { .. })
+    ));
+    let claim_b1 = core
+        .claim_wakeup_for_binding(&binding_b.binding_id, 2_060)
+        .expect("claim b1")
+        .expect("claim_b1");
+    core.record_wakeup_result(
+        &claim_b1.claim_id,
+        WakeupOutcome::Unknown {
+            reason: "codex queue timed out".to_string(),
+        },
+        2_070,
+    )
+    .expect("unknown b1");
+    assert!(matches!(
+        core.retry_wakeup(&binding_b.binding_id, &claim_1.claim_id, true, 2_075),
+        Err(CoreError::WakeupClaimNotFound { .. })
+    ));
+
+    // Pull and ACK 1..=3 on binding_b with no newer important events -> Unknown transitions to Idle.
+    let batch_b1 = core
+        .execute(
+            &binding_b.binding_id,
+            Command::PullEvents {
+                after_seq: None,
+                limit: 10,
+                now_ms: 2_080,
+            },
+        )
+        .expect("pull b1")
+        .into_event_batch()
+        .expect("batch b1");
+    let ack_b1 = core
+        .execute(
+            &binding_b.binding_id,
+            Command::AcknowledgeEvents {
+                command_key: "ack-b1".to_string(),
+                batch_id: batch_b1.batch_id,
+                now_ms: 2_090,
+            },
+        )
+        .expect("ack b1")
+        .into_ack_result()
+        .expect("ack result b1");
+    assert_eq!(ack_b1.wakeup_status, WakeupStatus::Idle);
+    let idle_b = core.get_wakeup(&binding_b.binding_id).expect("idle b");
+    assert_eq!(idle_b.status, WakeupStatus::Idle);
+    assert_eq!(idle_b.claim_id, None);
+    assert_eq!(idle_b.claimed_at_ms, None);
+    assert_eq!(idle_b.resolved_at_ms, None);
+
+    // Now emit important event at seq 6 (Run B2), claim and mark Unknown, then emit newer
+    // important event at seq 9 (Run B3) before acknowledging 4..=6.
+    core.execute(
+        &binding_b.binding_id,
+        Command::StartDemo {
+            command_key: "b-run-2".to_string(),
+            instruction: "Run B2".to_string(),
+            step_delay_ms: Some(50),
+            now_ms: 2_100,
+        },
+    )
+    .expect("start b2");
+    core.tick(2_150).expect("tick b2");
+    let claim_b2 = core
+        .claim_wakeup_for_binding(&binding_b.binding_id, 2_160)
+        .expect("claim b2")
+        .expect("claim_b2");
+    assert_eq!(claim_b2.covered_up_to_seq, 6);
+    core.record_wakeup_result(
+        &claim_b2.claim_id,
+        WakeupOutcome::Unknown {
+            reason: "timeout 2".to_string(),
+        },
+        2_170,
+    )
+    .expect("unknown b2");
+
+    // Emit newer important event at seq 9 while binding_b is in Unknown (covered_up_to_seq = 6).
+    core.execute(
+        &binding_b.binding_id,
+        Command::StartDemo {
+            command_key: "b-run-3".to_string(),
+            instruction: "Run B3".to_string(),
+            step_delay_ms: Some(50),
+            now_ms: 2_200,
+        },
+    )
+    .expect("start b3");
+    core.tick(2_250).expect("tick b3");
+
+    // Pull and ACK 4..=6 (covering covered_up_to_seq = 6) -> Unknown transitions to Pending for seq 9!
+    let batch_b2 = core
+        .execute(
+            &binding_b.binding_id,
+            Command::PullEvents {
+                after_seq: None,
+                limit: 3,
+                now_ms: 2_260,
+            },
+        )
+        .expect("pull 4..6")
+        .into_event_batch()
+        .expect("batch 4..6");
+    assert_eq!(batch_b2.from_seq, 4);
+    assert_eq!(batch_b2.to_seq, 6);
+    let ack_b2 = core
+        .execute(
+            &binding_b.binding_id,
+            Command::AcknowledgeEvents {
+                command_key: "ack-b2".to_string(),
+                batch_id: batch_b2.batch_id,
+                now_ms: 2_270,
+            },
+        )
+        .expect("ack 4..6")
+        .into_ack_result()
+        .expect("ack result 4..6");
+    assert_eq!(ack_b2.wakeup_status, WakeupStatus::Pending);
+    let pending_b3 = core.get_wakeup(&binding_b.binding_id).expect("pending b3");
+    assert_eq!(pending_b3.status, WakeupStatus::Pending);
+    assert_eq!(pending_b3.claim_id, None);
+    assert_eq!(pending_b3.pending_since_seq, Some(9));
+    assert_eq!(pending_b3.covered_up_to_seq, 0);
+    assert_eq!(pending_b3.coalesced_count, 1);
+    assert_eq!(pending_b3.claimed_at_ms, None);
+    assert_eq!(pending_b3.resolved_at_ms, None);
 }

@@ -27,5 +27,5 @@ pub use limits::{
 pub use types::{
     AckResult, Binding, Command, CommandOutput, Event, EventBatch, EventKind, EventPayload,
     Question, QuestionStatus, Run, RunRevision, RunStatus, TickReport, WakeupClaim, WakeupNotice,
-    WakeupOutcome, WakeupStatus,
+    WakeupOutcome, WakeupRetryRecord, WakeupStatus,
 };

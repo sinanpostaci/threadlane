@@ -170,24 +170,34 @@ pub struct Run {
 }
 
 /// Classification of a durable binding event.
+///
+/// Timed and derived events (`RunProgress`, `QuestionAsked`, `QuestionSuperseded`, `RunCompleted`)
+/// never duplicate the full task instruction; callers retrieve full instruction and revision
+/// history via `get_run` (`Command::GetRun`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
-    /// Demo run started (`Start -> Running`).
+    /// Demo run started (`Start -> Running`). Carries `summary` and `instruction: Some(instruction)`.
     RunStarted,
-    /// Demo run emitted progress before requesting input.
+    /// Demo run emitted progress before requesting input. Carries `summary` only (`instruction: None`).
     RunProgress,
-    /// Demo run transitioned to `WaitingInput` and posed a question (`important = true`).
+    /// Demo run transitioned to `WaitingInput` and posed a compact demo question (`important = true`).
+    /// Carries `summary`, `question_id: Some(question_id)`, and `question_prompt: Some(prompt)` (`instruction: None`).
     QuestionAsked,
     /// Caller answered the active question (`WaitingInput -> Completing`).
+    /// Carries `summary`, `question_id: Some(question_id)`, and `answer: Some(answer)` (`instruction: None`).
     QuestionAnswered,
     /// Prior pending question was superseded by `Steer`.
+    /// Carries `summary` and `question_id: Some(question_id)` (`instruction: None`).
     QuestionSuperseded,
     /// Caller steered the run to a new instruction and revision.
+    /// Carries `summary` and `instruction: Some(instruction)`.
     RunSteered,
     /// Demo run finished (`Completing -> Completed`, `important = true`).
+    /// Carries `summary` only (`instruction: None`, `answer: None`).
     RunCompleted,
     /// Demo run was cancelled (`-> Cancelled`).
+    /// Carries `summary` and optional `cancel_reason: Option<String>` (`instruction: None`).
     RunCancelled,
 }
 
@@ -228,21 +238,31 @@ impl EventKind {
 /// Structured, bounded payload carried by a durable [`Event`].
 ///
 /// Always tagged with `untrusted_data: true` so downstream MCP/CLI consumers treat worker/event text as untrusted data.
+///
+/// Payload field population by [`EventKind`]:
+/// - [`EventKind::RunStarted`]: `summary`, `instruction: Some(instruction)`.
+/// - [`EventKind::RunProgress`]: `summary` only (`instruction: None`).
+/// - [`EventKind::QuestionAsked`]: `summary`, `question_id: Some(question_id)`, and compact `question_prompt: Some(prompt)` referencing `(run_id, revision)` and `get_run` (`instruction: None`).
+/// - [`EventKind::QuestionAnswered`]: `summary`, `question_id: Some(question_id)`, `answer: Some(answer)` (`instruction: None`).
+/// - [`EventKind::QuestionSuperseded`]: `summary`, `question_id: Some(question_id)` (`instruction: None`).
+/// - [`EventKind::RunSteered`]: `summary`, `instruction: Some(instruction)`.
+/// - [`EventKind::RunCompleted`]: `summary` only (`instruction: None`, `answer: None`).
+/// - [`EventKind::RunCancelled`]: `summary`, `cancel_reason: Option<String>` (`instruction: None`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventPayload {
     /// Explicit marker indicating that text fields inside event payloads are untrusted data.
     pub untrusted_data: bool,
-    /// Human-readable summary of the transition or step.
+    /// Human-readable summary of the transition or step (present on all event kinds).
     pub summary: String,
-    /// Associated question ID when relevant (`QuestionAsked`, `QuestionAnswered`, `QuestionSuperseded`).
+    /// Associated question ID when `kind` is `QuestionAsked`, `QuestionAnswered`, or `QuestionSuperseded` (`None` otherwise).
     pub question_id: Option<String>,
-    /// Question prompt when `kind == EventKind::QuestionAsked`.
+    /// Compact demo question prompt referencing `(run_id, revision)` and `get_run` when `kind == EventKind::QuestionAsked` (`None` otherwise).
     pub question_prompt: Option<String>,
-    /// Answer text when `kind == EventKind::QuestionAnswered`.
+    /// Answer text when `kind == EventKind::QuestionAnswered` (`None` otherwise).
     pub answer: Option<String>,
-    /// Task instruction when `kind == EventKind::RunStarted` or `EventKind::RunSteered`.
+    /// Full task instruction when `kind == EventKind::RunStarted` or `EventKind::RunSteered` (`None` on `RunProgress`, `QuestionAsked`, `RunCompleted`, and all other events).
     pub instruction: Option<String>,
-    /// Cancellation reason when `kind == EventKind::RunCancelled`.
+    /// Cancellation reason when `kind == EventKind::RunCancelled` (`None` otherwise).
     pub cancel_reason: Option<String>,
 }
 
@@ -469,9 +489,9 @@ pub enum WakeupStatus {
     InFlight,
     /// External queue invocation succeeded; waiting for valid event acknowledgement covering `covered_up_to_seq`.
     Submitted,
-    /// External queue invocation failed; will not be automatically retried.
+    /// External queue invocation failed; never automatically retried (may be explicitly rearmed via `Core::retry_wakeup` or released by acknowledging `covered_up_to_seq`).
     Failed,
-    /// External queue invocation timed out or supervisor reopened while `InFlight`; will not be automatically retried.
+    /// External queue invocation timed out or supervisor reopened while `InFlight`; never automatically retried (may be explicitly rearmed via `Core::retry_wakeup` with `allow_unknown == true` or released by acknowledging `covered_up_to_seq`).
     Unknown,
 }
 
@@ -568,4 +588,24 @@ pub struct WakeupNotice {
     pub claimed_at_ms: Option<i64>,
     /// Timestamp (ms) when the most recent claim outcome was recorded.
     pub resolved_at_ms: Option<i64>,
+}
+
+/// Minimal persisted audit record for an explicit manual wake-up retry ([`crate::Core::retry_wakeup`]).
+///
+/// Contains only binding and claim metadata (`binding_id`, `prior_claim_id`, `prior_status`,
+/// `allow_unknown`, `retried_at_ms`) and never stores bearer tokens or raw chat/task text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeupRetryRecord {
+    /// Software-generated retry audit identifier (`wrt_<uuid>`).
+    pub retry_id: String,
+    /// Binding whose wake-up notice was manually rearmed.
+    pub binding_id: String,
+    /// Claim identifier that was active on the notice prior to the manual retry.
+    pub prior_claim_id: String,
+    /// Wake-up status (`Failed` or `Unknown`) prior to the manual retry.
+    pub prior_status: WakeupStatus,
+    /// Whether the caller explicitly opted into retrying an `Unknown` wake-up claim.
+    pub allow_unknown: bool,
+    /// Timestamp (ms) when the manual retry was recorded.
+    pub retried_at_ms: i64,
 }

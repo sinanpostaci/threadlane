@@ -14,7 +14,7 @@ use crate::limits::{
 use crate::types::{
     AckResult, Binding, Command, CommandOutput, Event, EventBatch, EventKind, EventPayload,
     Question, QuestionStatus, Run, RunRevision, RunStatus, TickReport, WakeupClaim, WakeupNotice,
-    WakeupOutcome, WakeupStatus,
+    WakeupOutcome, WakeupRetryRecord, WakeupStatus,
 };
 
 /// Transactional, persistent SQLite domain engine for Threadlane Milestone 1.
@@ -401,10 +401,14 @@ impl Core {
 
     /// Advances all deterministic demo runs whose scheduled `next_step_at_ms <= now_ms`.
     ///
-    /// - Runs in `RunStatus::Running` emit progress, pose a revision-scoped question,
-    ///   transition to `RunStatus::WaitingInput`, and schedule a pending wake-up notice.
-    /// - Runs in `RunStatus::Completing` transition to `RunStatus::Completed`, emit a
-    ///   completion event, and schedule/coalesce a pending wake-up notice.
+    /// - Runs in `RunStatus::Running` emit `RunProgress` (`instruction: None`), pose a compact
+    ///   revision-scoped demo question referencing `(run_id, revision)` and `get_run` (`QuestionAsked`
+    ///   with `instruction: None`), transition to `RunStatus::WaitingInput`, and schedule/coalesce a
+    ///   pending wake-up notice.
+    /// - Runs in `RunStatus::Completing` transition to `RunStatus::Completed`, emit `RunCompleted`
+    ///   (`instruction: None`), and schedule/coalesce a pending wake-up notice.
+    /// - Timed/derived events never duplicate the full instruction text; full original instruction
+    ///   and revision history remain in [`Run`] (`get_run`).
     /// - Cancelled or superseded steps never complete.
     pub fn tick(&mut self, now_ms: i64) -> Result<TickReport, CoreError> {
         let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
@@ -412,7 +416,7 @@ impl Core {
 
         let due_runs = {
             let mut stmt = tx.prepare(
-                "SELECT run_id, binding_id, revision, status, instruction, step_seq
+                "SELECT run_id, binding_id, revision, status, step_seq
                  FROM runs
                  WHERE next_step_at_ms IS NOT NULL
                    AND next_step_at_ms <= ?1
@@ -431,8 +435,7 @@ impl Core {
                     row.get::<_, String>(1)?,
                     i64_to_u64("revision", row.get(2)?)?,
                     status,
-                    row.get::<_, String>(4)?,
-                    i64_to_u64("step_seq", row.get(5)?)?,
+                    i64_to_u64("step_seq", row.get(4)?)?,
                 ));
             }
             items
@@ -441,7 +444,7 @@ impl Core {
         let mut advanced_runs = Vec::with_capacity(due_runs.len());
         let mut emitted_events = 0usize;
 
-        for (run_id, binding_id, revision, status, instruction, step_seq) in due_runs {
+        for (run_id, binding_id, revision, status, step_seq) in due_runs {
             match status {
                 RunStatus::Running => {
                     let progress_step = step_seq + 1;
@@ -460,7 +463,7 @@ impl Core {
                             question_id: None,
                             question_prompt: None,
                             answer: None,
-                            instruction: Some(instruction.clone()),
+                            instruction: None,
                             cancel_reason: None,
                         },
                         valid_now,
@@ -469,8 +472,9 @@ impl Core {
 
                     let question_step = progress_step + 1;
                     let question_id = generate_id("qst");
-                    let prompt =
-                        format!("Confirm execution for revision {revision}: {instruction}");
+                    let prompt = format!(
+                        "Demo confirmation for run {run_id} (revision {revision}): confirm the current instruction (retrieve get_run for full text)."
+                    );
                     tx.execute(
                         "INSERT INTO questions (
                             question_id, binding_id, run_id, revision, status, prompt,
@@ -561,7 +565,7 @@ impl Core {
                             question_id: None,
                             question_prompt: None,
                             answer: None,
-                            instruction: Some(instruction),
+                            instruction: None,
                             cancel_reason: None,
                         },
                         valid_now,
@@ -711,6 +715,167 @@ impl Core {
         Ok(notice)
     }
 
+    /// Explicitly rearms a `Failed` (or `Unknown` when `allow_unknown == true`) wake-up notice
+    /// back to `WakeupStatus::Pending` when `expected_claim_id` matches the binding's current live claim.
+    ///
+    /// - Rejects `Idle`, `Pending`, `InFlight`, and `Submitted` notices with [`CoreError::InvalidWakeupState`].
+    /// - Rejects `Unknown` notices when `allow_unknown == false` with [`CoreError::InvalidWakeupState`].
+    /// - Rejects stale, repeated, or cross-binding claim IDs without releasing any newer claim.
+    /// - Preserves `delivered_seq`, `acked_seq`, `pending_since_seq`, `latest_important_seq`,
+    ///   `coalesced_count`, and cumulative `attempt_count`.
+    /// - Clears active claim fields (`claim_id`, `covered_up_to_seq`, `last_error`, `claimed_at_ms`,
+    ///   `resolved_at_ms`) on the live notice, keeps historical `wakeup_claims` outcomes immutable,
+    ///   and records a minimal persisted audit row in `wakeup_retries`.
+    pub fn retry_wakeup(
+        &mut self,
+        binding_id: &str,
+        expected_claim_id: &str,
+        allow_unknown: bool,
+        now_ms: i64,
+    ) -> Result<WakeupNotice, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_expected_claim_id = validate_identifier("expected_claim_id", expected_claim_id)?;
+        let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
+
+        let tx = self.conn.transaction()?;
+        let wakeup = Self::load_wakeup_tx(&tx, &clean_binding_id)?;
+
+        // Reject cross-binding claim IDs regardless of the target binding's current status.
+        let claim_owner: Option<String> = tx
+            .query_row(
+                "SELECT binding_id FROM wakeup_claims WHERE claim_id = ?1",
+                params![clean_expected_claim_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(owner_binding_id) = claim_owner {
+            if owner_binding_id != clean_binding_id {
+                return Err(CoreError::WakeupClaimNotFound {
+                    claim_id: clean_expected_claim_id,
+                });
+            }
+        }
+
+        // If this binding currently has a live claim that differs from `expected_claim_id`,
+        // reject as stale/unmatched without releasing the newer claim.
+        if wakeup.claim_id.is_some()
+            && wakeup.claim_id.as_deref() != Some(clean_expected_claim_id.as_str())
+        {
+            return Err(CoreError::WakeupClaimNotFound {
+                claim_id: clean_expected_claim_id,
+            });
+        }
+
+        match wakeup.status {
+            WakeupStatus::Idle
+            | WakeupStatus::Pending
+            | WakeupStatus::InFlight
+            | WakeupStatus::Submitted => {
+                return Err(CoreError::InvalidWakeupState {
+                    binding_id: clean_binding_id,
+                    status: wakeup.status,
+                    action: "retry_wakeup",
+                });
+            }
+            WakeupStatus::Unknown if !allow_unknown => {
+                return Err(CoreError::InvalidWakeupState {
+                    binding_id: clean_binding_id,
+                    status: WakeupStatus::Unknown,
+                    action: "retry_wakeup",
+                });
+            }
+            WakeupStatus::Failed | WakeupStatus::Unknown => {}
+        }
+
+        if wakeup.claim_id.as_deref() != Some(clean_expected_claim_id.as_str()) {
+            return Err(CoreError::WakeupClaimNotFound {
+                claim_id: clean_expected_claim_id,
+            });
+        }
+
+        if wakeup.pending_since_seq.is_none() || wakeup.coalesced_count == 0 {
+            return Err(CoreError::CorruptState(format!(
+                "wakeup for binding `{clean_binding_id}` in status `{:?}` has no pending range",
+                wakeup.status
+            )));
+        }
+
+        let retry_id = generate_id("wrt");
+        tx.execute(
+            "INSERT INTO wakeup_retries (
+                retry_id, binding_id, prior_claim_id, prior_status, allow_unknown, retried_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                retry_id,
+                clean_binding_id,
+                clean_expected_claim_id,
+                wakeup.status.as_str(),
+                i64::from(allow_unknown),
+                valid_now
+            ],
+        )?;
+
+        let updated = tx.execute(
+            "UPDATE wakeups
+             SET status = ?1,
+                 claim_id = NULL,
+                 covered_up_to_seq = 0,
+                 last_error = NULL,
+                 claimed_at_ms = NULL,
+                 resolved_at_ms = NULL
+             WHERE binding_id = ?2 AND claim_id = ?3 AND status = ?4",
+            params![
+                WakeupStatus::Pending.as_str(),
+                clean_binding_id,
+                clean_expected_claim_id,
+                wakeup.status.as_str()
+            ],
+        )?;
+        if updated != 1 {
+            return Err(CoreError::WakeupClaimNotFound {
+                claim_id: clean_expected_claim_id,
+            });
+        }
+
+        let notice = Self::load_wakeup_tx(&tx, &clean_binding_id)?;
+        tx.commit()?;
+        Ok(notice)
+    }
+
+    /// Lists persisted manual wake-up retry audit records for `binding_id` in chronological order.
+    pub fn list_wakeup_retries(
+        &self,
+        binding_id: &str,
+    ) -> Result<Vec<WakeupRetryRecord>, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
+        let mut stmt = self.conn.prepare(
+            "SELECT retry_id, binding_id, prior_claim_id, prior_status, allow_unknown, retried_at_ms
+             FROM wakeup_retries
+             WHERE binding_id = ?1
+             ORDER BY rowid ASC",
+        )?;
+        let mut rows = stmt.query(params![clean_binding_id])?;
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            let status_raw: String = row.get(3)?;
+            let prior_status = WakeupStatus::from_str(&status_raw).ok_or_else(|| {
+                CoreError::CorruptState(format!(
+                    "invalid wakeup retry prior_status `{status_raw}`"
+                ))
+            })?;
+            records.push(WakeupRetryRecord {
+                retry_id: row.get(0)?,
+                binding_id: row.get(1)?,
+                prior_claim_id: row.get(2)?,
+                prior_status,
+                allow_unknown: row.get::<_, i64>(4)? != 0,
+                retried_at_ms: row.get(5)?,
+            });
+        }
+        Ok(records)
+    }
+
     /// Inspects the current persisted [`WakeupNotice`] state for `binding_id`.
     pub fn get_wakeup(&self, binding_id: &str) -> Result<WakeupNotice, CoreError> {
         let clean_binding_id = validate_identifier("binding_id", binding_id)?;
@@ -846,7 +1011,18 @@ impl Core {
                 error_detail TEXT,
                 claimed_at_ms INTEGER NOT NULL,
                 resolved_at_ms INTEGER
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS wakeup_retries (
+                retry_id TEXT PRIMARY KEY,
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                prior_claim_id TEXT NOT NULL REFERENCES wakeup_claims(claim_id),
+                prior_status TEXT NOT NULL,
+                allow_unknown INTEGER NOT NULL,
+                retried_at_ms INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_wakeup_retries_binding
+                ON wakeup_retries(binding_id, retried_at_ms, retry_id);",
         )?;
 
         let existing_version: Option<u32> = tx
@@ -1533,7 +1709,9 @@ impl Core {
                          pending_since_seq = NULL,
                          covered_up_to_seq = ?2,
                          coalesced_count = 0,
-                         last_error = NULL
+                         last_error = NULL,
+                         claimed_at_ms = NULL,
+                         resolved_at_ms = NULL
                      WHERE binding_id = ?3",
                     params![
                         WakeupStatus::Idle.as_str(),
@@ -1576,7 +1754,9 @@ impl Core {
                              pending_since_seq = ?2,
                              covered_up_to_seq = 0,
                              coalesced_count = ?3,
-                             last_error = NULL
+                             last_error = NULL,
+                             claimed_at_ms = NULL,
+                             resolved_at_ms = NULL
                          WHERE binding_id = ?4",
                         params![
                             WakeupStatus::Pending.as_str(),

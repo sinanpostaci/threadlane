@@ -234,3 +234,57 @@ fn reopen_reconciles_acked_old_coverage_to_pending_for_new_events_and_keeps_unac
     assert_eq!(claim_new.covered_up_to_seq, 6);
     assert_eq!(claim_new.coalesced_count, 1);
 }
+
+#[test]
+fn v1_database_without_wakeup_retries_upgrades_additively_for_retry_and_escaped_ticks() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("state.sqlite");
+
+    let instruction = "\u{1}".repeat(2_411) + &"a".repeat(1_685);
+    let (binding_id, run_id, claim_id) = {
+        let mut core = Core::open(&db).unwrap();
+        let binding = core.create_binding(THREAD, "v1-compat").unwrap().binding_id;
+        let run = core
+            .execute(
+                &binding,
+                Command::StartDemo {
+                    command_key: "start-v1".into(),
+                    instruction: instruction.clone(),
+                    step_delay_ms: Some(10),
+                    now_ms: 100,
+                },
+            )
+            .unwrap()
+            .into_run()
+            .unwrap();
+        core.tick(110).unwrap();
+        let claim = core.claim_wakeup(115).unwrap().unwrap();
+        core.record_wakeup_result(
+            &claim.claim_id,
+            WakeupOutcome::Failed {
+                error: "initial failure".into(),
+            },
+            120,
+        )
+        .unwrap();
+        (binding, run.run_id, claim.claim_id)
+    };
+
+    // Simulate a database from the earlier v1 build before `wakeup_retries` existed.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("DROP TABLE wakeup_retries", []).unwrap();
+    }
+
+    // Reopening at SCHEMA_VERSION = 1 recreates `wakeup_retries` via CREATE TABLE IF NOT EXISTS.
+    let mut core = Core::open(&db).unwrap();
+    let rearmed = core
+        .retry_wakeup(&binding_id, &claim_id, false, 130)
+        .unwrap();
+    assert_eq!(rearmed.status, WakeupStatus::Pending);
+    assert_eq!(rearmed.claim_id, None);
+    assert_eq!(core.list_wakeup_retries(&binding_id).unwrap().len(), 1);
+
+    let run = core.get_run(&binding_id, &run_id).unwrap();
+    assert_eq!(run.instruction, instruction);
+}
