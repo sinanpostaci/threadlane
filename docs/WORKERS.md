@@ -368,3 +368,35 @@ cargo run -p threadlane-workers --bin threadlane-worker -- \
    macOS behavior has not been tested. Windows process-tree lifecycle support (such as
    Job Objects) and native ACL enforcement are not implemented; non-Unix execution returns
    `WorkerError::UnsupportedPlatform`. No cross-platform build or runtime claim is made.
+
+
+## Repeatable operator pilot
+
+`scripts/live_worker_pilot.py` is a small Python-stdlib/Git operator fixture for
+Antigravity. It uses the trusted Threadlane CLI; it does not configure MCP, send
+native chat messages, install services or select a replacement model. Pass every
+executable and model/effort explicitly. Without `--allow-live`, it only prints a
+plan and performs no subprocess or filesystem mutation:
+
+```sh
+python3 scripts/live_worker_pilot.py \
+  --threadlane /absolute/path/to/threadlane \
+  --provider-executable /absolute/canonical/path/to/agy \
+  --model gemini-4-argon-high --effort high \
+  --output /absolute/path/to/new-private-pilot
+```
+
+Inspect the plan first, then add `--allow-live` only to deliberately invoke the
+provider. The output path must be new, with an existing parent; existing files,
+directories and symlinks are refused. A private fixture source repository, state,
+work area, fixed TaskFiles profile and diagnostics are preserved under that root.
+The harness stops/reaps only its owned supervisor and does not force-delete dirty
+worktrees. Git, Python and the already authenticated provider CLI are required.
+
+Exit zero means Completed + ReadyForReview, matched observed model/effort, the
+expected one-file edit, passing diff evidence and unchanged source. It never means
+patch acceptance. Missing effort returns nonzero even if the file changed; this
+is expected with the currently observed AGY stream. Printed JSON selects bounded
+known fields rather than copying raw provider prose or command diagnostics.
+Private diagnostics remain available for inspection. This harness does not prove
+native-chat or multi-chat acceptance, and has been tested on Linux/NixOS only.
