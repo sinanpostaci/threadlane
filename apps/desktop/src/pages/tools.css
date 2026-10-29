@@ -70,6 +70,39 @@
   gap: 12px;
 }
 
+.aq-tools-create-heading {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.aq-tools-create-body,
+.aq-tools-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  min-width: 0;
+}
+
+.aq-tools-form-head > .aq-btn {
+  align-self: flex-start;
+}
+
+.aq-tools-card-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.aq-tools-card-controls .aq-btn {
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 0.76rem;
+}
+
 .aq-tools-form-head h4,
 .aq-tools-tool-head h4,
 .aq-tools-model-head h4,
@@ -229,6 +262,7 @@
   display: flex;
   align-items: baseline;
   gap: 8px;
+  flex: 1 1 160px;
   flex-wrap: wrap;
   min-width: 0;
   margin-right: auto;
@@ -409,11 +443,6 @@
   margin: 2px 0 0;
   font-size: 0.82rem;
   overflow-wrap: anywhere;
-}
-
-.aq-tools-guidance,
-.aq-tools-footer {
-  max-width: 82ch;
 }
 
 .aq-tools-empty {
