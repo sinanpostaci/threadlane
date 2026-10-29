@@ -21,7 +21,7 @@ use threadlane_core::{
     WorkerOutcomeSummary, WorkerProgressUpdate, WorkerWorktreeUpdate, FIXED_WAKEUP_MESSAGE,
     MAX_COMPACT_RESPONSE_BYTES, MAX_PAGE_RESPONSE_BYTES, MAX_WORKER_PROGRESS_EVENTS_PER_ATTEMPT,
 };
-use threadlane_workers::{ExecutionBudgets, WorkerProvider};
+use threadlane_workers::{ExecutionBudgets, WorkerFilePermissions, WorkerProvider};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -125,6 +125,7 @@ fn make_profile_config(
             base_commit: repo.base_commit.clone(),
             work_area_root: work_area_root.to_path_buf(),
             allowed_write_paths: BTreeSet::from(["src".to_string()]),
+            file_permissions: WorkerFilePermissions::Inherit,
             budgets: default_test_budgets(timeout_ms),
         },
     }
@@ -1009,6 +1010,20 @@ async fn test_forbidden_overrides_and_cross_binding_profile_isolation() {
             "instruction": "Task",
             "now_ms": 100
         }),
+        json!({
+            "op": "start_worker",
+            "command_key": "inj-10",
+            "profile_id": "prof_only_a",
+            "instruction": "Task",
+            "file_permissions": "task_files"
+        }),
+        json!({
+            "op": "start_worker",
+            "command_key": "inj-11",
+            "profile_id": "prof_only_a",
+            "instruction": "Task",
+            "settings": { "permissions": { "allow": ["read_file(**)"] } }
+        }),
     ] {
         let resp = raw_http
             .post(format!(
@@ -1084,6 +1099,44 @@ async fn test_forbidden_overrides_and_cross_binding_profile_isolation() {
         .expect("MCP parameter error text");
     assert!(injection_error.contains("failed to deserialize parameters"));
     assert!(injection_error.contains("unknown field") && injection_error.contains("model"));
+
+    for (req_id, field_name, field_val) in [
+        (21, "file_permissions", json!("task_files")),
+        (
+            22,
+            "settings",
+            json!({ "permissions": { "allow": ["read_file(**)"] } }),
+        ),
+    ] {
+        send_json_rpc(
+            &mut mcp_stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "start_worker",
+                    "arguments": {
+                        "command_key": format!("mcp-inj-{req_id}"),
+                        "profile_id": "prof_only_a",
+                        "instruction": "Task",
+                        field_name: field_val
+                    }
+                }
+            }),
+        )
+        .await;
+        let mcp_field_resp = read_json_rpc_response(&mut mcp_reader, req_id).await;
+        assert_eq!(mcp_field_resp["result"]["isError"], json!(true));
+        let field_err = mcp_field_resp["result"]["content"][0]["text"]
+            .as_str()
+            .expect("MCP parameter error text");
+        assert!(field_err.contains("failed to deserialize parameters"));
+        assert!(
+            field_err.contains("unknown field") && field_err.contains(field_name),
+            "expected unknown field `{field_name}` rejection in: {field_err}"
+        );
+    }
 
     // Profile registration via MCP is forbidden.
     send_json_rpc(
@@ -2529,4 +2582,475 @@ printf '%s\n' '{{"type":"result","subtype":"success","status":"completed","summa
         );
         handle.shutdown().await;
     }
+}
+
+#[tokio::test]
+async fn test_worker_file_permissions_profile_digest_validation_and_task_files_dispatch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = init_git_repo(temp.path());
+
+    let never_spawn_marker = temp.path().join("validate_must_not_spawn.flag");
+    let fake_validate_bin = temp.path().join("fake_agy_perm_validate.sh");
+    write_executable_script(
+        &fake_validate_bin,
+        &format!(
+            "#!/bin/sh\necho spawned > \"{}\"\nexit 0\n",
+            never_spawn_marker.display()
+        ),
+    );
+
+    let uncreated_work_area = temp.path().join("uncreated_perm_work_area");
+    let cfg_omitted_path = temp.path().join("workers_omitted.json");
+    let cfg_explicit_path = temp.path().join("workers_explicit_inherit.json");
+    let cfg_task_files_path = temp.path().join("workers_task_files.json");
+
+    // 1. Omitted vs explicit `inherit` equality and default preservation.
+    assert_eq!(
+        WorkerFilePermissions::default(),
+        WorkerFilePermissions::Inherit
+    );
+
+    let omitted_profile_json = json!({
+        "profile_id": "prof_perm",
+        "allowed_binding_ids": ["bind_perm_1"],
+        "spec": {
+            "provider": "antigravity",
+            "executable": fake_validate_bin,
+            "model": "gemini-4-argon-high",
+            "effort": "high",
+            "allowed_models": ["gemini-4-argon-high"],
+            "standalone": false,
+            "repository_path": repo.repo_dir,
+            "base_commit": repo.base_commit,
+            "work_area_root": uncreated_work_area,
+            "allowed_write_paths": ["src"]
+        }
+    });
+
+    let mut explicit_inherit_profile_json = omitted_profile_json.clone();
+    explicit_inherit_profile_json["spec"]["file_permissions"] = json!("inherit");
+
+    let mut task_files_profile_json = omitted_profile_json.clone();
+    task_files_profile_json["spec"]["file_permissions"] = json!("task_files");
+
+    write_private_workers_config(
+        &cfg_omitted_path,
+        &json!({
+            "max_parallel": 2,
+            "profiles": [omitted_profile_json]
+        }),
+    );
+    write_private_workers_config(
+        &cfg_explicit_path,
+        &json!({
+            "max_parallel": 2,
+            "profiles": [explicit_inherit_profile_json]
+        }),
+    );
+    write_private_workers_config(
+        &cfg_task_files_path,
+        &json!({
+            "max_parallel": 2,
+            "profiles": [task_files_profile_json]
+        }),
+    );
+
+    let loaded_omitted =
+        WorkersConfig::load_from_path(&cfg_omitted_path).expect("load omitted file_permissions");
+    let loaded_explicit =
+        WorkersConfig::load_from_path(&cfg_explicit_path).expect("load explicit inherit");
+    let loaded_task_files =
+        WorkersConfig::load_from_path(&cfg_task_files_path).expect("load task_files");
+
+    assert_eq!(
+        loaded_omitted.profiles[0].spec.file_permissions,
+        WorkerFilePermissions::Inherit
+    );
+    assert_eq!(loaded_omitted, loaded_explicit);
+
+    let val_omitted = loaded_omitted.validate().expect("validate omitted");
+    let val_explicit = loaded_explicit
+        .validate()
+        .expect("validate explicit inherit");
+    let val_task_files = loaded_task_files.validate().expect("validate task_files");
+
+    let prof_omitted = val_omitted.profiles.get("prof_perm").expect("prof_perm");
+    let prof_explicit = val_explicit.profiles.get("prof_perm").expect("prof_perm");
+    let prof_task_files = val_task_files.profiles.get("prof_perm").expect("prof_perm");
+
+    assert_eq!(
+        prof_omitted.template.file_permissions,
+        WorkerFilePermissions::Inherit
+    );
+    assert_eq!(
+        prof_omitted
+            .build_spec("Check".to_string())
+            .file_permissions,
+        WorkerFilePermissions::Inherit
+    );
+    let legacy_canonical = json!({
+        "profile_id": prof_omitted.profile_id,
+        "allowed_binding_ids": prof_omitted.allowed_binding_ids,
+        "provider": prof_omitted.template.provider.as_str(),
+        "executable": prof_omitted.template.executable.to_string_lossy(),
+        "base_model": prof_omitted.resolved_model.base_model,
+        "requested_effort": prof_omitted.requested_effort,
+        "cli_model_arg": prof_omitted.resolved_model.cli_model_arg,
+        "allowed_models": prof_omitted.template.allowed_models,
+        "standalone": prof_omitted.template.standalone,
+        "session_id": prof_omitted.template.session_id,
+        "repository_path": prof_omitted.template.repository_path.to_string_lossy(),
+        "base_commit": prof_omitted.template.base_commit,
+        "work_area_root": prof_omitted.template.work_area_root.to_string_lossy(),
+        "allowed_write_paths": prof_omitted.template.allowed_write_paths,
+        "budgets": {
+            "timeout_ms": prof_omitted.template.budgets.timeout_ms,
+            "max_line_bytes": prof_omitted.template.budgets.max_line_bytes,
+            "max_stdout_bytes": prof_omitted.template.budgets.max_stdout_bytes,
+            "max_stderr_bytes": prof_omitted.template.budgets.max_stderr_bytes,
+            "max_events": prof_omitted.template.budgets.max_events,
+        }
+    });
+    let legacy_digest = {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+        let bytes = serde_json::to_vec(&legacy_canonical).expect("serialize legacy canonical");
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let mut hex = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            let _ = write!(&mut hex, "{byte:02x}");
+        }
+        hex
+    };
+    assert_eq!(
+        prof_omitted.profile_digest, legacy_digest,
+        "inherit profile_digest must match legacy M2B canonical digest without file_permissions"
+    );
+    assert_eq!(
+        prof_omitted.profile_digest, prof_explicit.profile_digest,
+        "omitted file_permissions must produce the exact same profile_digest as explicit inherit"
+    );
+
+    // 2. `TaskFiles` preserves canonical template field, copies into `WorkerSpec`, and changes `profile_digest`.
+    assert_eq!(
+        prof_task_files.template.file_permissions,
+        WorkerFilePermissions::TaskFiles
+    );
+    assert_eq!(
+        prof_task_files
+            .build_spec("Check".to_string())
+            .file_permissions,
+        WorkerFilePermissions::TaskFiles
+    );
+    assert_ne!(
+        prof_task_files.profile_digest, prof_omitted.profile_digest,
+        "task_files must change the immutable profile_digest"
+    );
+
+    // 3. Strict variant validation and rejection of arbitrary `settings` in startup profile config.
+    let bad_cfg_path = temp.path().join("workers_bad_perm.json");
+    for invalid_spec_patch in [
+        json!({ "file_permissions": "all" }),
+        json!({ "file_permissions": "Inherit" }),
+        json!({ "file_permissions": "task-files" }),
+        json!({ "file_permissions": true }),
+        json!({ "settings": { "permissions": { "allow": ["read_file(**)"] } } }),
+    ] {
+        let mut bad_prof = omitted_profile_json.clone();
+        for (k, v) in invalid_spec_patch.as_object().unwrap() {
+            bad_prof["spec"][k] = v.clone();
+        }
+        write_private_workers_config(
+            &bad_cfg_path,
+            &json!({
+                "max_parallel": 1,
+                "profiles": [bad_prof]
+            }),
+        );
+        assert!(
+            WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
+            "expected startup config rejection for patch {invalid_spec_patch}"
+        );
+    }
+
+    // 4. Unsupported OpenCode policy (`opencode_v2` with `task_files`) is rejected before side effects.
+    write_private_workers_config(
+        &bad_cfg_path,
+        &json!({
+            "max_parallel": 1,
+            "profiles": [{
+                "profile_id": "prof_opencode_bad",
+                "allowed_binding_ids": ["bind_perm_1"],
+                "spec": {
+                    "provider": "opencode_v2",
+                    "executable": fake_validate_bin,
+                    "model": "openai/gpt-5",
+                    "effort": "high",
+                    "allowed_models": ["openai/gpt-5"],
+                    "standalone": true,
+                    "repository_path": repo.repo_dir,
+                    "base_commit": repo.base_commit,
+                    "work_area_root": uncreated_work_area,
+                    "allowed_write_paths": ["src"],
+                    "file_permissions": "task_files"
+                }
+            }]
+        }),
+    );
+    assert!(
+        WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
+        "task_files must be rejected for provider opencode_v2"
+    );
+
+    // 5. Unsafe permission-pattern metacharacters in `allowed_write_paths` and `work_area_root`
+    // are rejected before any filesystem or process side effects when `file_permissions` is `task_files`.
+    for unsafe_write_path in [
+        "src/*",
+        "src/file?.rs",
+        "src/[a-z].rs",
+        "src/lib].rs",
+        "src/{a,b}.rs",
+        "src/lib}.rs",
+        "src/(group).rs",
+        "src/lib).rs",
+        "src\\lib.rs",
+        "src/bad\x07ctrl.rs",
+    ] {
+        let mut bad_prof = task_files_profile_json.clone();
+        bad_prof["spec"]["allowed_write_paths"] = json!([unsafe_write_path]);
+        write_private_workers_config(
+            &bad_cfg_path,
+            &json!({
+                "max_parallel": 1,
+                "profiles": [bad_prof]
+            }),
+        );
+        assert!(
+            WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
+            "expected rejection of unsafe write path `{unsafe_write_path}` under task_files"
+        );
+    }
+
+    for unsafe_work_area_name in [
+        "work_area_*",
+        "work_area_?",
+        "work_area_[1]",
+        "work_area_{a}",
+        "work_area_(x)",
+        "work_area_\\bad",
+    ] {
+        let mut bad_prof = task_files_profile_json.clone();
+        bad_prof["spec"]["work_area_root"] = json!(temp.path().join(unsafe_work_area_name));
+        write_private_workers_config(
+            &bad_cfg_path,
+            &json!({
+                "max_parallel": 1,
+                "profiles": [bad_prof]
+            }),
+        );
+        assert!(
+            WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
+            "expected rejection of unsafe work_area_root `{unsafe_work_area_name}` under task_files"
+        );
+    }
+
+    // Clean Unicode and spaces in paths must remain valid with `task_files` without side effects.
+    let unicode_work_area = temp.path().join("work area café Δ");
+    let mut unicode_prof = task_files_profile_json.clone();
+    unicode_prof["spec"]["work_area_root"] = json!(unicode_work_area);
+    unicode_prof["spec"]["allowed_write_paths"] = json!(["src", "docs/notes café.md"]);
+    write_private_workers_config(
+        &bad_cfg_path,
+        &json!({
+            "max_parallel": 1,
+            "profiles": [unicode_prof]
+        }),
+    );
+    let loaded_unicode = WorkersConfig::load_from_path(&bad_cfg_path)
+        .expect("clean Unicode and spaces must be accepted with task_files");
+    assert_eq!(
+        loaded_unicode.profiles[0].spec.file_permissions,
+        WorkerFilePermissions::TaskFiles
+    );
+
+    assert!(
+        !uncreated_work_area.exists() && !unicode_work_area.exists(),
+        "startup validation must remain side-effect free and never create work_area_root"
+    );
+    assert!(
+        !never_spawn_marker.exists(),
+        "startup validation must never spawn worker executable"
+    );
+
+    // 6. End-to-end supervisor dispatch with `Inherit` vs `TaskFiles` and idempotency digest conflict.
+    let state_dir = temp.path().join("state_perm_e2e");
+    let work_area = temp.path().join("work_area_perm_e2e");
+    let argv_log_dir = temp.path().join("argv_logs");
+    fs::create_dir_all(&argv_log_dir).expect("create argv_log_dir");
+
+    let fake_perm_worker = temp.path().join("fake_agy_perm_e2e.sh");
+    write_executable_script(
+        &fake_perm_worker,
+        &format!(
+            r#"#!/bin/sh
+out_file="{log_dir}/$(basename "$PWD").argv"
+: > "$out_file"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$out_file"
+done
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"sess-perm","model":"gemini-4-argon-high","effort":"high"}}'
+cat << 'EOF' > src/lib.rs
+pub fn value() -> u32 {{
+    99
+}}
+EOF
+printf '%s\n' '{{"type":"result","subtype":"success","status":"completed","summary":"Updated src/lib.rs under scoped permissions"}}'
+exit 0
+"#,
+            log_dir = argv_log_dir.display(),
+        ),
+    );
+
+    let binding = {
+        let db_path = threadlane::descriptor::prepare_database_path(&state_dir).expect("prep db");
+        let mut core = Core::open(&db_path).expect("open core");
+        let b = core
+            .create_binding(THREAD_UUID_A, "File Permissions E2E Chat")
+            .expect("create binding");
+        threadlane::descriptor::enforce_database_permissions(&state_dir).expect("enforce perms");
+        b
+    };
+
+    let prof_inherit_cfg = make_profile_config(
+        "prof_inherit",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_perm_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    let mut prof_task_files_cfg = make_profile_config(
+        "prof_task_files",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_perm_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    prof_task_files_cfg.spec.file_permissions = WorkerFilePermissions::TaskFiles;
+
+    let handle = Supervisor::start(SupervisorConfig {
+        state_dir: state_dir.clone(),
+        tick_interval: Duration::from_millis(15),
+        codex: None,
+        workers: Some(WorkersConfig {
+            max_parallel: 2,
+            profiles: vec![prof_inherit_cfg, prof_task_files_cfg],
+        }),
+    })
+    .await
+    .expect("start supervisor");
+
+    let scoped = SupervisorClient::from_state_dir(&state_dir)
+        .expect("client")
+        .scoped(&binding.binding_id)
+        .expect("scoped");
+
+    let run_inherit = scoped
+        .start_worker(
+            "perm-inherit-1".to_string(),
+            "prof_inherit".to_string(),
+            "Run with inherit permissions".to_string(),
+        )
+        .await
+        .expect("start inherit worker");
+    let done_inherit =
+        wait_for_worker_status(&scoped, &run_inherit.run_id, |s| s.status.is_terminal()).await;
+    assert_eq!(done_inherit.status, WorkerStatus::Completed);
+
+    let inherit_wt = PathBuf::from(
+        done_inherit
+            .worktree
+            .task_worktree_path
+            .as_deref()
+            .expect("inherit task_worktree_path"),
+    );
+    let inherit_argv_lines: Vec<String> = fs::read_to_string(argv_log_dir.join(format!(
+        "{}.argv",
+        inherit_wt.file_name().unwrap().to_string_lossy()
+    )))
+    .expect("read inherit argv log")
+    .lines()
+    .map(str::to_string)
+    .collect();
+    assert!(
+        !inherit_argv_lines.iter().any(|a| a == "--settings"),
+        "inherit profile must not pass --settings: {inherit_argv_lines:?}"
+    );
+
+    let run_tf = scoped
+        .start_worker(
+            "perm-tf-1".to_string(),
+            "prof_task_files".to_string(),
+            "Run with task_files permissions".to_string(),
+        )
+        .await
+        .expect("start task_files worker");
+    let done_tf = wait_for_worker_status(&scoped, &run_tf.run_id, |s| s.status.is_terminal()).await;
+    assert_eq!(done_tf.status, WorkerStatus::Completed);
+    let tf_outcome = done_tf.outcome.as_ref().expect("tf outcome");
+    assert_eq!(
+        tf_outcome.acceptance_state,
+        WorkerAcceptanceState::ReadyForReview
+    );
+
+    let tf_wt = PathBuf::from(
+        done_tf
+            .worktree
+            .task_worktree_path
+            .as_deref()
+            .expect("task_files task_worktree_path"),
+    );
+    let tf_argv_lines: Vec<String> = fs::read_to_string(argv_log_dir.join(format!(
+        "{}.argv",
+        tf_wt.file_name().unwrap().to_string_lossy()
+    )))
+    .expect("read task_files argv log")
+    .lines()
+    .map(str::to_string)
+    .collect();
+    let settings_idx = tf_argv_lines
+        .iter()
+        .position(|a| a == "--settings")
+        .expect("task_files profile must pass --settings");
+    let settings_json: Value =
+        serde_json::from_str(&tf_argv_lines[settings_idx + 1]).expect("valid --settings JSON");
+    let allow_rules: Vec<&str> = settings_json["permissions"]["allow"]
+        .as_array()
+        .expect("permissions.allow array")
+        .iter()
+        .map(|v| v.as_str().expect("string rule"))
+        .collect();
+    let canonical_tf_wt = fs::canonicalize(&tf_wt).expect("canonicalize tf_wt");
+    let expected_read_rule = format!("read_file({}/**)", canonical_tf_wt.display());
+    let expected_edit_exact = format!("edit_file({}/src)", canonical_tf_wt.display());
+    let expected_edit_desc = format!("edit_file({}/src/**)", canonical_tf_wt.display());
+    assert!(
+        allow_rules.contains(&expected_read_rule.as_str()),
+        "expected `{expected_read_rule}` in {allow_rules:?}"
+    );
+    assert!(
+        allow_rules.contains(&expected_edit_exact.as_str())
+            && allow_rules.contains(&expected_edit_desc.as_str()),
+        "expected exact + descendant edit_file rules in {allow_rules:?}"
+    );
+    assert!(
+        !tf_argv_lines
+            .iter()
+            .any(|a| a == "--auto" || a == "--dangerously-skip-permissions"),
+        "task_files must never pass --auto or --dangerously-skip-permissions"
+    );
+
+    handle.shutdown().await;
 }
