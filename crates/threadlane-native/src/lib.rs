@@ -43,7 +43,11 @@ pub use client::{
     NativeMcpToolCallResult, NativeThread, NativeThreadPage,
 };
 pub use error::{NativeError, NativeErrorCode};
-pub use mcp_pair::{ConnectionIdentityParams, PairedMcpServer};
+pub use mcp_pair::{
+    open_workflow_stores, CatalogParams, ConnectionIdentityParams, DraftTaskParams, GetPlanParams,
+    ListPlansParams, PairedMcpServer, PlanTaskParams, PublishParams, PublishPlanParams,
+    SaveDraftParams, SavePlanDraftParams, WorkflowTaskParams,
+};
 pub use pairing::{
     ConnectionEpochState, ConnectionIdentity, EnrollmentRecord, NativeVerificationStatus,
     OperatorEnrollRequest, PairingStore, CONNECTION_IDENTITY_TOOL, MCP_SERVER_NAME,
@@ -51,6 +55,12 @@ pub use pairing::{
 pub use rpc::{
     build_proxy_args, is_process_alive, is_process_group_alive, InitializeResult, ProxyCallError,
     DEFAULT_PROXY_TIMEOUT, MAX_RPC_FRAME_BYTES, MAX_RPC_STDERR_BYTES, MAX_RPC_TOTAL_STDOUT_BYTES,
+};
+pub use threadlane_workflow::{
+    CatalogAssignment, CatalogPage, CatalogProfile, CatalogRoleAssignment, DeliveryReceipt,
+    Difficulty, PlanHeader, PlanPage, PlanStatus, PlanStore, PlanSummary, PlanSummaryPage,
+    PlanTask, PublicTaskRoute, PublishedPlanView, RegistryStore, SavePlanDraft, ScopedWorkflow,
+    TaskExecutionRoute, TaskRoute, ToolAdapter, WorkflowError, WorkflowProfile, WorkflowRole,
 };
 pub use wakeup::{
     build_native_queue_fallback_args, build_turn_steer_params, NativeWakeupRecord,
@@ -786,9 +796,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Verify capability count: `connection_identity` + 15 delegated runtime tools = 16 tools.
+        // Verify capability count: `connection_identity` + 15 delegated runtime tools + 5 workflow tools = 21 tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 16, "PairedMcpServer must expose 16 tools");
+        assert_eq!(tools.len(), 21, "PairedMcpServer must expose 21 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -950,5 +960,1262 @@ fi
         );
 
         sup_handle.shutdown().await;
+    }
+
+    fn workflow_sample_tool(id: &str, adapter: ToolAdapter, enabled: bool) -> threadlane_workflow::ToolDefinition {
+        threadlane_workflow::ToolDefinition {
+            id: id.to_string(),
+            label: format!("Tool {id}"),
+            adapter,
+            executable_path: if adapter.is_cli_adapter() {
+                Some(PathBuf::from(format!("/opt/secret-cli-paths/{id}-bin")))
+            } else {
+                None
+            },
+            enabled,
+        }
+    }
+
+    fn workflow_sample_model(
+        id: &str,
+        tool_id: &str,
+        model_arg: &str,
+        efforts: &[&str],
+        allow_no_effort: bool,
+    ) -> threadlane_workflow::ModelDefinition {
+        threadlane_workflow::ModelDefinition {
+            id: id.to_string(),
+            tool_id: tool_id.to_string(),
+            label: format!("Model {id}"),
+            model_arg: model_arg.to_string(),
+            efforts: efforts.iter().map(|s| (*s).to_string()).collect(),
+            allow_no_effort,
+        }
+    }
+
+    fn setup_workflow_stores(
+        tmp: &TempDir,
+    ) -> (
+        std::sync::Arc<RegistryStore>,
+        std::sync::Arc<PlanStore>,
+        u64,
+    ) {
+        use std::sync::Arc;
+        use threadlane_workflow::{ModelChoice, RegistryChange, RoleAssignment};
+
+        let reg_dir = tmp.path().join("workflow-registry");
+        let plans_dir = tmp.path().join("workflow-plans");
+
+        let (registry, plans) = open_workflow_stores(Some(&reg_dir), Some(&plans_dir))
+            .expect("open workflow stores")
+            .expect("stores configured");
+
+        let s1 = registry
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: workflow_sample_tool("agy", ToolAdapter::Antigravity, true),
+                },
+            )
+            .expect("upsert agy");
+        let s2 = registry
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertTool {
+                    tool: workflow_sample_tool("opencode", ToolAdapter::OpencodeV2, true),
+                },
+            )
+            .expect("upsert opencode");
+        let s3 = registry
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertTool {
+                    tool: workflow_sample_tool("codex", ToolAdapter::CodexCli, true),
+                },
+            )
+            .expect("upsert codex");
+        let s4 = registry
+            .apply(
+                s3.revision,
+                RegistryChange::UpsertModels {
+                    models: vec![
+                        workflow_sample_model(
+                            "argon-high",
+                            "agy",
+                            "gemini-4-argon-high",
+                            &["medium", "high"],
+                            false,
+                        ),
+                        workflow_sample_model(
+                            "deepseek-flash",
+                            "opencode",
+                            "opencode-go/deepseek-v4.1-flash",
+                            &["max"],
+                            false,
+                        ),
+                        workflow_sample_model(
+                            "astra-max",
+                            "codex",
+                            "gpt-6-astra",
+                            &["high", "max"],
+                            false,
+                        ),
+                    ],
+                },
+            )
+            .expect("upsert models");
+
+        let profile = WorkflowProfile {
+            id: "default-profile".to_string(),
+            name: "Default M4 Workflow Profile".to_string(),
+            assignments: vec![
+                RoleAssignment {
+                    role: WorkflowRole::Follower,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "astra-max".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Coder,
+                    difficulty: Some(Difficulty::Easy),
+                    choice: ModelChoice {
+                        model_id: "deepseek-flash".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Coder,
+                    difficulty: Some(Difficulty::Hard),
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+            ],
+        };
+
+        let s5 = registry
+            .apply(s4.revision, RegistryChange::UpsertProfile { profile })
+            .expect("upsert profile");
+        let s6 = registry
+            .apply(
+                s5.revision,
+                RegistryChange::SetDefaultProfile {
+                    profile_id: Some("default-profile".to_string()),
+                },
+            )
+            .expect("set default profile");
+
+        (Arc::clone(&registry), Arc::clone(&plans), s6.revision)
+    }
+
+    #[tokio::test]
+    async fn paired_mcp_workflow_registered_tools_and_strict_json_schemas() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
+
+        let tools = mcp.list_tools();
+        assert_eq!(tools.len(), 21);
+
+        for (tool_name, expected_read_only, expected_props) in [
+            ("catalog", true, &["cursor", "limit"][..]),
+            ("list_plans", true, &["cursor", "limit"][..]),
+            (
+                "get_plan",
+                true,
+                &["plan_id", "revision", "task_cursor", "task_limit"][..],
+            ),
+            (
+                "save_draft",
+                false,
+                &[
+                    "command_key",
+                    "plan_id",
+                    "expected_revision",
+                    "profile_id",
+                    "profile_revision",
+                    "summary",
+                    "tasks",
+                ][..],
+            ),
+            ("publish", false, &["plan_id", "revision"][..]),
+        ] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name == tool_name)
+                .unwrap_or_else(|| panic!("missing workflow tool `{tool_name}`"));
+            let ann = tool.annotations.as_ref().expect("tool annotations");
+            assert_eq!(ann.read_only_hint, Some(expected_read_only));
+            assert_eq!(ann.destructive_hint, Some(false));
+            assert_eq!(ann.idempotent_hint, Some(true));
+            assert_eq!(ann.open_world_hint, Some(false));
+
+            let schema_val = serde_json::to_value(&tool.input_schema).expect("schema json");
+            let schema_str = serde_json::to_string(&schema_val).expect("schema string");
+            let props = schema_val["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{tool_name} schema must have properties object"));
+            for &prop in expected_props {
+                assert!(
+                    props.contains_key(prop),
+                    "{tool_name} schema missing expected property `{prop}`"
+                );
+            }
+            for forbidden in [
+                "binding_id",
+                "thread_id",
+                "session_id",
+                "connection_nonce",
+                "epoch_id",
+                "registry_dir",
+                "plans_dir",
+                "executable",
+                "executable_path",
+                "approved",
+                "operator_approved",
+            ] {
+                assert!(
+                    !props.contains_key(forbidden),
+                    "{tool_name} schema must not expose `{forbidden}`"
+                );
+                assert!(
+                    !schema_str.contains(&format!("\"{forbidden}\"")),
+                    "{tool_name} schema definition must not mention `{forbidden}`"
+                );
+            }
+            assert_eq!(
+                schema_val["additionalProperties"],
+                Value::Bool(false),
+                "{tool_name} schema must enforce deny_unknown_fields"
+            );
+
+            if tool_name == "save_draft" {
+                for task_prop in [
+                    "id",
+                    "title",
+                    "role",
+                    "difficulty",
+                    "instruction",
+                    "depends_on",
+                    "allowed_write_paths",
+                ] {
+                    assert!(
+                        schema_str.contains(&format!("\"{task_prop}\"")),
+                        "save_draft task schema must include `{task_prop}`"
+                    );
+                }
+                for enum_val in [
+                    "follower",
+                    "orchestrator",
+                    "architect",
+                    "coder",
+                    "reviewer",
+                    "closure",
+                    "easy",
+                    "medium",
+                    "hard",
+                    "extreme",
+                ] {
+                    assert!(
+                        schema_str.contains(&format!("\"{enum_val}\"")),
+                        "save_draft schema must include enum value `{enum_val}`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_mcp_workflow_unbound_expired_quarantined_and_not_configured_guards() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+        let (registry, plans, reg_rev) = setup_workflow_stores(&tmp);
+
+        // Verify bootstrap store opening requires both --registry-dir and --plans-dir together.
+        assert!(open_workflow_stores(None, None)
+            .expect("none stores")
+            .is_none());
+        let only_reg_err = open_workflow_stores(Some(registry.config_dir()), None)
+            .expect_err("registry-dir without plans-dir must fail");
+        assert_eq!(only_reg_err.code(), "invalid_config");
+        let only_plans_err = open_workflow_stores(None, Some(plans.dir()))
+            .expect_err("plans-dir without registry-dir must fail");
+        assert_eq!(only_plans_err.code(), "invalid_config");
+
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+
+        let mcp_base =
+            PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp");
+        let orig_nonce = mcp_base.connection_nonce().to_string();
+        let orig_epoch = mcp_base.epoch_id().to_string();
+        assert!(!mcp_base.has_workflow_stores());
+
+        let mut mcp =
+            mcp_base.with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+        assert!(mcp.has_workflow_stores());
+        assert_eq!(mcp.connection_nonce(), orig_nonce);
+        assert_eq!(mcp.epoch_id(), orig_epoch);
+
+        let spoofed_meta = Some(json!({
+            "threadId": "0196ed00-0000-7000-8000-000000000001",
+            "binding_id": "bnd_spoofed"
+        }));
+
+        // 1. Unbound server rejects all 5 workflow tools before accessing registry/plan data,
+        //    ignoring `_meta`.
+        for (tool, args) in [
+            ("catalog", json!({})),
+            ("list_plans", json!({})),
+            ("get_plan", json!({ "plan_id": "plan-1" })),
+            (
+                "save_draft",
+                json!({
+                    "command_key": "cmd-1",
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Unbound attempt",
+                    "tasks": [{
+                        "id": "t1",
+                        "title": "Task 1",
+                        "role": "coder",
+                        "difficulty": "easy",
+                        "instruction": "Should not be saved",
+                        "depends_on": [],
+                        "allowed_write_paths": ["src/lib.rs"]
+                    }]
+                }),
+            ),
+            ("publish", json!({ "plan_id": "plan-1", "revision": 1 })),
+        ] {
+            let err = mcp
+                .invoke_tool_json(tool, args, spoofed_meta.clone())
+                .await
+                .expect_err("unbound workflow call must fail");
+            let err_json = err.structured_content.expect("structured error");
+            assert_eq!(err_json["error"]["code"], "unbound_connection");
+            let serialized = serde_json::to_string(&err_json).expect("serialize err");
+            assert!(!serialized.contains("default-profile"));
+            assert!(!serialized.contains("gemini-4-argon-high"));
+            assert!(!serialized.contains("/opt/secret-cli-paths"));
+        }
+        assert!(plans.snapshot().expect("plans snapshot").is_empty());
+
+        // 2. Enrolled server WITHOUT workflow stores fails honestly with `workflow_not_configured`.
+        let mcp_unconfigured =
+            PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("unconfigured mcp");
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_unconfigured.connection_nonce().to_string(),
+                    epoch_id: mcp_unconfigured.epoch_id().to_string(),
+                    binding_id: "bnd_unconfigured".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-000000000090".to_string(),
+                    project_id: Some("proj-wf".to_string()),
+                },
+            )
+            .expect("enroll unconfigured");
+
+        for (tool, args) in [
+            ("catalog", json!({})),
+            ("list_plans", json!({})),
+            ("get_plan", json!({ "plan_id": "plan-1" })),
+            (
+                "save_draft",
+                json!({
+                    "command_key": "cmd-1",
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Unconfigured attempt",
+                    "tasks": [{
+                        "id": "t1",
+                        "title": "Task 1",
+                        "role": "coder",
+                        "difficulty": "easy",
+                        "instruction": "Should fail not configured",
+                        "depends_on": [],
+                        "allowed_write_paths": ["src/lib.rs"]
+                    }]
+                }),
+            ),
+            ("publish", json!({ "plan_id": "plan-1", "revision": 1 })),
+        ] {
+            let err = mcp_unconfigured
+                .invoke_tool_json(tool, args, None)
+                .await
+                .expect_err("unconfigured workflow tool must fail");
+            let err_json = err.structured_content.expect("structured error");
+            assert_eq!(err_json["binding_id"], "bnd_unconfigured");
+            assert_eq!(err_json["tool"], tool);
+            assert_eq!(err_json["error"]["code"], "workflow_not_configured");
+        }
+
+        // 3. Enroll `mcp`, verify `catalog` works, then restart epoch and expire/quarantine connections.
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp.connection_nonce().to_string(),
+                    epoch_id: mcp.epoch_id().to_string(),
+                    binding_id: "bnd_active".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-000000000091".to_string(),
+                    project_id: Some("proj-wf".to_string()),
+                },
+            )
+            .expect("enroll active");
+
+        let ok_cat = mcp
+            .invoke_tool_json("catalog", json!({}), None)
+            .await
+            .expect("enrolled catalog succeeds");
+        assert_eq!(
+            ok_cat.structured_content.unwrap()["binding_id"],
+            "bnd_active"
+        );
+
+        // Restarting the connection expires the prior epoch and returns `mcp` to `Unbound`.
+        let old_nonce = mcp.connection_nonce().to_string();
+        let old_epoch = mcp.epoch_id().to_string();
+        mcp.restart_epoch().expect("restart epoch");
+        assert_eq!(
+            pairing_store
+                .verify_enrolled_binding(&old_nonce, &old_epoch)
+                .unwrap_err()
+                .code(),
+            "expired_epoch"
+        );
+        let post_restart_err = mcp
+            .invoke_tool_json("catalog", json!({}), None)
+            .await
+            .expect_err("restarted connection must not inherit enrollment");
+        assert_eq!(
+            post_restart_err.structured_content.unwrap()["error"]["code"],
+            "unbound_connection"
+        );
+
+        // Explicitly expiring an enrolled connection rejects all workflow tools with `expired_epoch`.
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp.connection_nonce().to_string(),
+                    epoch_id: mcp.epoch_id().to_string(),
+                    binding_id: "bnd_active".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-000000000091".to_string(),
+                    project_id: Some("proj-wf".to_string()),
+                },
+            )
+            .expect("re-enroll");
+        pairing_store
+            .expire_epoch(&operator_token, mcp.epoch_id())
+            .expect("expire epoch");
+        let expired_err = mcp
+            .invoke_tool_json("list_plans", json!({}), None)
+            .await
+            .expect_err("expired connection must fail");
+        assert_eq!(
+            expired_err.structured_content.unwrap()["error"]["code"],
+            "expired_epoch"
+        );
+
+        // Shared connection across two threads is quarantined and rejects workflow tools.
+        let shared_mcp = PairedMcpServer::new(&state_dir, pairing_store.clone())
+            .expect("shared mcp")
+            .with_workflow_stores(registry, plans);
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: shared_mcp.connection_nonce().to_string(),
+                    epoch_id: shared_mcp.epoch_id().to_string(),
+                    binding_id: "bnd_shared_1".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-000000000092".to_string(),
+                    project_id: Some("proj-wf".to_string()),
+                },
+            )
+            .expect("enroll thread 1");
+        let _ = pairing_store.enroll(
+            &operator_token,
+            OperatorEnrollRequest {
+                connection_nonce: shared_mcp.connection_nonce().to_string(),
+                epoch_id: shared_mcp.epoch_id().to_string(),
+                binding_id: "bnd_shared_2".to_string(),
+                thread_id: "0196ed00-0000-7000-8000-000000000093".to_string(),
+                project_id: Some("proj-wf".to_string()),
+            },
+        );
+        for tool in ["catalog", "list_plans", "get_plan", "save_draft", "publish"] {
+            let q_err = shared_mcp
+                .invoke_tool_json(tool, json!({}), None)
+                .await
+                .expect_err("quarantined connection must reject workflow tool");
+            assert_eq!(
+                q_err.structured_content.unwrap()["error"]["code"],
+                "shared_connection_rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_mcp_workflow_catalog_draft_retry_publish_and_disabled_tool_honesty() {
+        use rmcp::handler::server::wrapper::Parameters;
+        use threadlane_workflow::RegistryChange;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+        let (registry, plans, reg_rev) = setup_workflow_stores(&tmp);
+
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+
+        let mcp = PairedMcpServer::new(&state_dir, pairing_store.clone())
+            .expect("create mcp")
+            .with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp.connection_nonce().to_string(),
+                    epoch_id: mcp.epoch_id().to_string(),
+                    binding_id: "bnd_workflow_a".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-0000000000a1".to_string(),
+                    project_id: Some("proj-wf".to_string()),
+                },
+            )
+            .expect("enroll workflow A");
+
+        // 1. Enrolled `catalog` returns safe full model/effort assignments without executable paths or tokens.
+        let cat_res = mcp
+            .invoke_tool_json("catalog", json!({ "limit": 10 }), None)
+            .await
+            .expect("catalog call");
+        let cat_raw = serde_json::to_string(&cat_res).expect("serialize catalog result");
+        assert!(!cat_raw.contains("/opt/secret-cli-paths"));
+        assert!(!cat_raw.contains("executable_path"));
+        assert!(!cat_raw.contains(&operator_token));
+
+        let cat_env = cat_res.structured_content.expect("catalog structured");
+        assert_eq!(cat_env["untrusted_data"], true);
+        assert_eq!(cat_env["demo_only"], false);
+        assert_eq!(cat_env["binding_id"], "bnd_workflow_a");
+        assert_eq!(cat_env["tool"], "catalog");
+
+        let cat_page: CatalogPage =
+            serde_json::from_value(cat_env["data"].clone()).expect("decode CatalogPage");
+        assert_eq!(cat_page.registry_revision, reg_rev);
+        assert_eq!(
+            cat_page.default_profile_id.as_deref(),
+            Some("default-profile")
+        );
+        assert_eq!(cat_page.profiles.len(), 1);
+        let prof = &cat_page.profiles[0];
+        assert!(prof.is_default);
+        assert!(prof.available);
+        assert_eq!(prof.assignments.len(), 4);
+        let hard_coder = prof
+            .assignments
+            .iter()
+            .find(|a| a.role == WorkflowRole::Coder && a.difficulty == Some(Difficulty::Hard))
+            .expect("hard coder assignment");
+        assert_eq!(hard_coder.model_id, "argon-high");
+        assert_eq!(hard_coder.model_arg, "gemini-4-argon-high");
+        assert_eq!(hard_coder.effort.as_deref(), Some("high"));
+        assert_eq!(hard_coder.adapter, ToolAdapter::Antigravity);
+        assert_eq!(hard_coder.route, TaskExecutionRoute::HeadlessWorker);
+        assert!(hard_coder.tool_enabled);
+        assert!(hard_coder.available);
+
+        // 2. `save_draft` creates rev 1 and supports idempotent retry without creating rev 2.
+        let draft_args = json!({
+            "command_key": "cmd-save-1",
+            "expected_revision": 0,
+            "profile_id": "default-profile",
+            "profile_revision": reg_rev,
+            "summary": "Initial M4 workflow plan",
+            "tasks": [
+                {
+                    "id": "task-easy",
+                    "title": "Easy slice",
+                    "role": "coder",
+                    "difficulty": "easy",
+                    "instruction": "Implement easy helper",
+                    "depends_on": [],
+                    "allowed_write_paths": ["crates/threadlane-native/src/error.rs"]
+                },
+                {
+                    "id": "task-hard",
+                    "title": "Hard slice",
+                    "role": "coder",
+                    "difficulty": "hard",
+                    "instruction": "Implement paired MCP workflow handler",
+                    "depends_on": ["task-easy"],
+                    "allowed_write_paths": ["crates/threadlane-native/src/mcp_pair.rs"]
+                }
+            ]
+        });
+
+        let saved_env = mcp
+            .invoke_tool_json("save_draft", draft_args.clone(), None)
+            .await
+            .expect("save_draft rev 1")
+            .structured_content
+            .expect("structured save_draft");
+        assert_eq!(saved_env["binding_id"], "bnd_workflow_a");
+        assert_eq!(saved_env["tool"], "save_draft");
+        let saved_summary: PlanSummary =
+            serde_json::from_value(saved_env["data"].clone()).expect("decode PlanSummary");
+        assert_eq!(saved_summary.binding_id, "bnd_workflow_a");
+        assert_eq!(saved_summary.revision, 1);
+        assert_eq!(saved_summary.status, PlanStatus::Draft);
+        assert_eq!(saved_summary.task_count, 2);
+        assert!(saved_summary.plan_digest.is_some());
+
+        // Exact retry at expected_revision 0 and expected_revision 1 returns rev 1 idempotently.
+        let retry_0: PlanSummary = serde_json::from_value(
+            mcp.invoke_tool_json("save_draft", draft_args.clone(), None)
+                .await
+                .expect("retry at expected_revision 0")
+                .structured_content
+                .unwrap()["data"]
+                .clone(),
+        )
+        .expect("decode retry 0");
+        assert_eq!(retry_0, saved_summary);
+        assert_eq!(
+            plans
+                .plan_revisions(&saved_summary.plan_id)
+                .expect("revs")
+                .len(),
+            1
+        );
+
+        let mut retry_1_args = draft_args.clone();
+        retry_1_args["expected_revision"] = json!(1);
+        let retry_1: PlanSummary = serde_json::from_value(
+            mcp.invoke_tool_json("save_draft", retry_1_args, None)
+                .await
+                .expect("retry at expected_revision 1")
+                .structured_content
+                .unwrap()["data"]
+                .clone(),
+        )
+        .expect("decode retry 1");
+        assert_eq!(retry_1, saved_summary);
+
+        // Reusing `cmd-save-1` with a different summary fails with `idempotency_conflict`.
+        let mut conflict_args = draft_args.clone();
+        conflict_args["summary"] = json!("Mutated summary with same command_key");
+        let conflict_err = mcp
+            .invoke_tool_json("save_draft", conflict_args, None)
+            .await
+            .expect_err("reused command_key with different payload must fail");
+        assert_eq!(
+            conflict_err.structured_content.unwrap()["error"]["code"],
+            "idempotency_conflict"
+        );
+
+        // 3. `publish` transitions Draft -> Published (never Received or Applied).
+        //    Also exercise direct `#[tool]` handler method on `PairedMcpServer`.
+        let pub_res = mcp
+            .publish(Parameters(PublishParams {
+                plan_id: saved_summary.plan_id.clone(),
+                revision: 1,
+            }))
+            .await
+            .expect("publish rev 1");
+        let pub_raw = serde_json::to_string(&pub_res).expect("serialize publish");
+        assert!(!pub_raw.contains("/opt/secret-cli-paths"));
+        assert!(!pub_raw.contains("executable_path"));
+        assert!(!pub_raw.contains("Implement paired MCP workflow handler"));
+
+        let pub_view: PublishedPlanView = serde_json::from_value(
+            pub_res.structured_content.expect("structured publish")["data"].clone(),
+        )
+        .expect("decode PublishedPlanView");
+        assert_eq!(pub_view.header.status, PlanStatus::Published);
+        assert_eq!(pub_view.receipt.state, PlanStatus::Published);
+        assert_eq!(pub_view.header.plan_digest, saved_summary.plan_digest);
+        assert_eq!(pub_view.tasks.len(), 2);
+        assert_eq!(pub_view.tasks[0].model_id, "deepseek-flash");
+        assert_eq!(pub_view.tasks[0].effort.as_deref(), Some("max"));
+        assert_eq!(pub_view.tasks[1].model_id, "argon-high");
+        assert_eq!(pub_view.tasks[1].effort.as_deref(), Some("high"));
+
+        // `list_plans` and `get_plan` must NOT advance receipt to `received` or `applied`.
+        let list_res = mcp
+            .list_plans(Parameters(ListPlansParams::default()))
+            .await
+            .expect("list_plans");
+        let list_page: PlanSummaryPage = serde_json::from_value(
+            list_res.structured_content.unwrap()["data"].clone(),
+        )
+        .expect("decode PlanSummaryPage");
+        assert_eq!(list_page.plans.len(), 1);
+        assert_eq!(list_page.plans[0].status, PlanStatus::Published);
+
+        let get_res = mcp
+            .get_plan(Parameters(GetPlanParams {
+                plan_id: saved_summary.plan_id.clone(),
+                revision: Some(1),
+                task_cursor: None,
+                task_limit: None,
+            }))
+            .await
+            .expect("get_plan");
+        let plan_page: PlanPage =
+            serde_json::from_value(get_res.structured_content.unwrap()["data"].clone())
+                .expect("decode PlanPage");
+        assert_eq!(plan_page.header.status, PlanStatus::Published);
+        assert_eq!(plan_page.tasks.len(), 2);
+        assert_eq!(
+            plans
+                .delivery_receipt(&saved_summary.plan_id, 1)
+                .expect("receipt")
+                .expect("exists")
+                .state,
+            PlanStatus::Published
+        );
+
+        // 4. Disabling `opencode` tool in `RegistryStore` is honestly reported in `catalog`
+        //    (fresh snapshot per call, no silent caching of old registry revision) and blocks `save_draft`.
+        let disabled_snap = registry
+            .apply(
+                reg_rev,
+                RegistryChange::UpsertTool {
+                    tool: workflow_sample_tool("opencode", ToolAdapter::OpencodeV2, false),
+                },
+            )
+            .expect("disable opencode");
+
+        let refreshed_cat: CatalogPage = serde_json::from_value(
+            mcp.invoke_tool_json("catalog", json!({}), None)
+                .await
+                .expect("refreshed catalog")
+                .structured_content
+                .unwrap()["data"]
+                .clone(),
+        )
+        .expect("decode refreshed catalog");
+        assert_eq!(refreshed_cat.registry_revision, disabled_snap.revision);
+        assert!(!refreshed_cat.profiles[0].available);
+        let easy_assign = refreshed_cat.profiles[0]
+            .assignments
+            .iter()
+            .find(|a| a.role == WorkflowRole::Coder && a.difficulty == Some(Difficulty::Easy))
+            .expect("easy coder assignment");
+        assert_eq!(easy_assign.model_id, "deepseek-flash");
+        assert!(!easy_assign.tool_enabled);
+        assert!(!easy_assign.available);
+
+        let disabled_draft_err = mcp
+            .invoke_tool_json(
+                "save_draft",
+                json!({
+                    "command_key": "cmd-disabled-tool",
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": disabled_snap.revision,
+                    "summary": "Plan referencing disabled opencode tool",
+                    "tasks": [{
+                        "id": "t-easy",
+                        "title": "Uses disabled easy coder",
+                        "role": "coder",
+                        "difficulty": "easy",
+                        "instruction": "Should fail resolution",
+                        "depends_on": [],
+                        "allowed_write_paths": ["src/lib.rs"]
+                    }]
+                }),
+                None,
+            )
+            .await
+            .expect_err("disabled tool must fail draft compilation");
+        assert_eq!(
+            disabled_draft_err.structured_content.unwrap()["error"]["code"],
+            "registry_resolution_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_mcp_workflow_two_chat_isolation_spoof_rejection_and_256kib_budget() {
+        use threadlane_workflow::MAX_MCP_RESPONSE_BYTES;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+        let (registry, plans, reg_rev) = setup_workflow_stores(&tmp);
+
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+
+        let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone())
+            .expect("mcp A")
+            .with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+        let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone())
+            .expect("mcp B")
+            .with_workflow_stores(std::sync::Arc::clone(&registry), std::sync::Arc::clone(&plans));
+
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_a.connection_nonce().to_string(),
+                    epoch_id: mcp_a.epoch_id().to_string(),
+                    binding_id: "bnd_chat_alpha".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-0000000000b1".to_string(),
+                    project_id: Some("proj-shared".to_string()),
+                },
+            )
+            .expect("enroll alpha");
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_b.connection_nonce().to_string(),
+                    epoch_id: mcp_b.epoch_id().to_string(),
+                    binding_id: "bnd_chat_beta".to_string(),
+                    thread_id: "0196ed00-0000-7000-8000-0000000000b2".to_string(),
+                    project_id: Some("proj-shared".to_string()),
+                },
+            )
+            .expect("enroll beta");
+
+        // 1. Both chats save a draft with `plan_id: None` and the same `command_key`.
+        let shared_key_draft = json!({
+            "command_key": "shared-cmd-key",
+            "expected_revision": 0,
+            "profile_id": "default-profile",
+            "profile_revision": reg_rev,
+            "summary": "Per-binding isolated plan",
+            "tasks": [{
+                "id": "t1",
+                "title": "Task 1",
+                "role": "coder",
+                "difficulty": "hard",
+                "instruction": "Isolated task instruction",
+                "depends_on": [],
+                "allowed_write_paths": ["crates/threadlane-native/src/lib.rs"]
+            }]
+        });
+
+        let sum_a: PlanSummary = serde_json::from_value(
+            mcp_a
+                .invoke_tool_json("save_draft", shared_key_draft.clone(), None)
+                .await
+                .expect("save on alpha")
+                .structured_content
+                .unwrap()["data"]
+                .clone(),
+        )
+        .expect("sum_a");
+        let sum_b: PlanSummary = serde_json::from_value(
+            mcp_b
+                .invoke_tool_json(
+                    "save_draft",
+                    shared_key_draft.clone(),
+                    Some(json!({
+                        "binding_id": "bnd_chat_alpha",
+                        "threadId": "0196ed00-0000-7000-8000-0000000000b1"
+                    })),
+                )
+                .await
+                .expect("save on beta ignoring _meta")
+                .structured_content
+                .unwrap()["data"]
+                .clone(),
+        )
+        .expect("sum_b");
+        assert_ne!(sum_a.plan_id, sum_b.plan_id);
+        assert_eq!(sum_a.binding_id, "bnd_chat_alpha");
+        assert_eq!(sum_b.binding_id, "bnd_chat_beta");
+
+        // 2. Chat B cannot get, update, or publish Chat A's plan; receives metadata-safe `not_found`
+        //    identical to a completely nonexistent plan.
+        let baseline_missing_err = mcp_b
+            .invoke_tool_json(
+                "get_plan",
+                json!({ "plan_id": "plan-does-not-exist" }),
+                None,
+            )
+            .await
+            .expect_err("missing plan on beta")
+            .structured_content
+            .expect("structured missing error");
+        assert_eq!(baseline_missing_err["error"]["code"], "not_found");
+
+        let cross_get_latest = mcp_b
+            .invoke_tool_json(
+                "get_plan",
+                json!({ "plan_id": sum_a.plan_id }),
+                Some(json!({ "binding_id": "bnd_chat_alpha" })),
+            )
+            .await
+            .expect_err("cross get latest")
+            .structured_content
+            .unwrap();
+        let cross_get_rev1 = mcp_b
+            .invoke_tool_json(
+                "get_plan",
+                json!({ "plan_id": sum_a.plan_id, "revision": 1 }),
+                None,
+            )
+            .await
+            .expect_err("cross get rev 1")
+            .structured_content
+            .unwrap();
+        let cross_save_rev0 = mcp_b
+            .invoke_tool_json(
+                "save_draft",
+                json!({
+                    "command_key": "hijack-0",
+                    "plan_id": sum_a.plan_id,
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Hijack rev 0",
+                    "tasks": shared_key_draft["tasks"]
+                }),
+                None,
+            )
+            .await
+            .expect_err("cross save rev 0")
+            .structured_content
+            .unwrap();
+        let cross_save_rev1 = mcp_b
+            .invoke_tool_json(
+                "save_draft",
+                json!({
+                    "command_key": "hijack-1",
+                    "plan_id": sum_a.plan_id,
+                    "expected_revision": 1,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Hijack rev 1",
+                    "tasks": shared_key_draft["tasks"]
+                }),
+                None,
+            )
+            .await
+            .expect_err("cross save rev 1")
+            .structured_content
+            .unwrap();
+        let cross_publish = mcp_b
+            .invoke_tool_json(
+                "publish",
+                json!({ "plan_id": sum_a.plan_id, "revision": 1 }),
+                None,
+            )
+            .await
+            .expect_err("cross publish")
+            .structured_content
+            .unwrap();
+
+        for cross_err in [
+            &cross_get_latest,
+            &cross_get_rev1,
+            &cross_save_rev0,
+            &cross_save_rev1,
+            &cross_publish,
+        ] {
+            assert_eq!(cross_err["error"], baseline_missing_err["error"]);
+            let s = serde_json::to_string(cross_err).expect("serialize cross err");
+            assert!(!s.contains("bnd_chat_alpha"));
+            assert!(!s.contains(&sum_a.plan_id));
+        }
+
+        // 3. Caller-supplied spoofed identity, path, executable, and approval fields are denied.
+        for rebind_key in [
+            "binding_id",
+            "thread_id",
+            "session_id",
+            "connection_nonce",
+            "epoch_id",
+        ] {
+            let mut bad_top = serde_json::Map::new();
+            bad_top.insert(rebind_key.to_string(), json!("bnd_chat_alpha"));
+            let top_err = mcp_b
+                .invoke_tool_json("list_plans", Value::Object(bad_top), None)
+                .await
+                .expect_err("top-level rebind key must fail");
+            assert_eq!(
+                top_err.structured_content.unwrap()["error"]["code"],
+                "rebind_rejected"
+            );
+
+            let mut bad_task = shared_key_draft["tasks"][0].clone();
+            bad_task
+                .as_object_mut()
+                .unwrap()
+                .insert(rebind_key.to_string(), json!("bnd_chat_alpha"));
+            let mut nested_draft = shared_key_draft.clone();
+            nested_draft["tasks"] = json!([bad_task]);
+            let nested_err = mcp_b
+                .invoke_tool_json("save_draft", nested_draft, None)
+                .await
+                .expect_err("nested task rebind key must fail");
+            assert_eq!(
+                nested_err.structured_content.unwrap()["error"]["code"],
+                "rebind_rejected"
+            );
+        }
+
+        for unknown_key in [
+            "registry_dir",
+            "plans_dir",
+            "state_dir",
+            "pairing_dir",
+            "executable",
+            "executable_path",
+            "approved",
+            "operator_approved",
+            "status",
+            "receipt",
+        ] {
+            let mut bad_top = serde_json::Map::new();
+            bad_top.insert(unknown_key.to_string(), json!("/tmp/evil"));
+            let top_err = mcp_a
+                .invoke_tool_json("catalog", Value::Object(bad_top), None)
+                .await
+                .expect_err("unknown top-level field must fail");
+            assert_eq!(
+                top_err.structured_content.unwrap()["error"]["code"],
+                "validation_failed"
+            );
+
+            let mut bad_task = shared_key_draft["tasks"][0].clone();
+            bad_task
+                .as_object_mut()
+                .unwrap()
+                .insert(unknown_key.to_string(), json!("/tmp/evil"));
+            let mut nested_draft = shared_key_draft.clone();
+            nested_draft["command_key"] = json!(format!("bad-nested-{unknown_key}"));
+            nested_draft["tasks"] = json!([bad_task]);
+            let nested_err = mcp_a
+                .invoke_tool_json("save_draft", nested_draft, None)
+                .await
+                .expect_err("unknown nested task field must fail");
+            assert_eq!(
+                nested_err.structured_content.unwrap()["error"]["code"],
+                "validation_failed"
+            );
+        }
+
+        for bad_write_path in [
+            "/etc/nixos/configuration.nix",
+            "../outside.rs",
+            "AGENTS.md",
+            ".git/config",
+        ] {
+            let mut bad_scope_draft = shared_key_draft.clone();
+            bad_scope_draft["command_key"] = json!(format!("bad-scope-{}", bad_write_path.len()));
+            bad_scope_draft["tasks"][0]["allowed_write_paths"] = json!([bad_write_path]);
+            let scope_err = mcp_a
+                .invoke_tool_json("save_draft", bad_scope_draft, None)
+                .await
+                .expect_err("disallowed write path must fail");
+            assert_eq!(
+                scope_err.structured_content.unwrap()["error"]["code"],
+                "invalid_write_scope"
+            );
+        }
+
+        // 4. 256 KiB wire budget: multi-page untruncated instructions, single-item overflow,
+        //    and oversized publish rejection without mutating `PlanStore`.
+        let large_tasks: Vec<Value> = (1..=5)
+            .map(|idx| {
+                json!({
+                    "id": format!("big-task-{idx}"),
+                    "title": format!("Big Task {idx}"),
+                    "role": "coder",
+                    "difficulty": "hard",
+                    "instruction": format!("Instruction-{idx}:{}", "x".repeat(45_000)),
+                    "depends_on": if idx == 1 { vec![] } else { vec![format!("big-task-{}", idx - 1)] },
+                    "allowed_write_paths": [format!("crates/threadlane-native/src/part_{idx}.rs")]
+                })
+            })
+            .collect();
+
+        mcp_a
+            .invoke_tool_json(
+                "save_draft",
+                json!({
+                    "command_key": "cmd-big-paged",
+                    "plan_id": "plan-big-paged",
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Multi-page 45 KiB task instructions",
+                    "tasks": large_tasks
+                }),
+                None,
+            )
+            .await
+            .expect("save big paged plan");
+
+        let mut paged_tasks = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+        loop {
+            let res = mcp_a
+                .invoke_tool_json(
+                    "get_plan",
+                    json!({
+                        "plan_id": "plan-big-paged",
+                        "task_cursor": cursor,
+                        "task_limit": 10
+                    }),
+                    None,
+                )
+                .await
+                .expect("get_plan page within 256 KiB");
+            let wire_bytes = serde_json::to_vec(&res).expect("encode CallToolResult");
+            assert!(
+                wire_bytes.len() <= MAX_MCP_RESPONSE_BYTES,
+                "page wire bytes {} exceeded {}",
+                wire_bytes.len(),
+                MAX_MCP_RESPONSE_BYTES
+            );
+            pages += 1;
+            let page: PlanPage =
+                serde_json::from_value(res.structured_content.unwrap()["data"].clone())
+                    .expect("decode PlanPage");
+            paged_tasks.extend(page.tasks);
+            if let Some(next) = page.next_task_cursor {
+                assert!(page.has_more);
+                cursor = Some(next);
+            } else {
+                assert!(!page.has_more);
+                break;
+            }
+        }
+        assert!(pages >= 2, "5 x 45 KiB tasks must span multiple pages");
+        assert_eq!(paged_tasks.len(), 5);
+        for (idx, task) in paged_tasks.iter().enumerate() {
+            let expected_inst = format!("Instruction-{}:{}", idx + 1, "x".repeat(45_000));
+            assert_eq!(
+                task.instruction, expected_inst,
+                "task instruction must never be truncated"
+            );
+        }
+
+        // Single task whose double-encoded MCP envelope exceeds 256 KiB fails `get_plan` with `response_too_large`.
+        mcp_a
+            .invoke_tool_json(
+                "save_draft",
+                json!({
+                    "command_key": "cmd-quote-heavy",
+                    "plan_id": "plan-quote-heavy",
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Single task > 256 KiB MCP envelope",
+                    "tasks": [{
+                        "id": "quote-task",
+                        "title": "Quote heavy task",
+                        "role": "coder",
+                        "difficulty": "easy",
+                        "instruction": "\"".repeat(50_000),
+                        "depends_on": [],
+                        "allowed_write_paths": ["src/lib.rs"]
+                    }]
+                }),
+                None,
+            )
+            .await
+            .expect("save quote-heavy draft");
+
+        let get_overbudget_err = mcp_a
+            .invoke_tool_json(
+                "get_plan",
+                json!({ "plan_id": "plan-quote-heavy", "task_limit": 1 }),
+                None,
+            )
+            .await
+            .expect_err("single task over 256 KiB must fail");
+        assert_eq!(
+            get_overbudget_err.structured_content.unwrap()["error"]["code"],
+            "response_too_large"
+        );
+
+        // Draft whose `PublishedPlanView` exceeds 256 KiB fails `publish` with `response_too_large`
+        // BEFORE mutating `PlanStore` (revision stays `Draft`).
+        let many_route_tasks: Vec<Value> = (1..=60)
+            .map(|idx| {
+                let paths: Vec<String> = (1..=8)
+                    .map(|p_idx| {
+                        format!(
+                            "crates/threadlane-native/src/deep_mod_{idx:02}/sub_{p_idx:02}/{}",
+                            "segment_".repeat(45)
+                        )
+                    })
+                    .collect();
+                json!({
+                    "id": format!("route-task-{idx:02}"),
+                    "title": format!("Route Task {idx}"),
+                    "role": "coder",
+                    "difficulty": "hard",
+                    "instruction": "Short instruction",
+                    "depends_on": [],
+                    "allowed_write_paths": paths
+                })
+            })
+            .collect();
+
+        mcp_a
+            .invoke_tool_json(
+                "save_draft",
+                json!({
+                    "command_key": "cmd-oversized-publish",
+                    "plan_id": "plan-oversized-publish",
+                    "expected_revision": 0,
+                    "profile_id": "default-profile",
+                    "profile_revision": reg_rev,
+                    "summary": "Oversized publish view",
+                    "tasks": many_route_tasks
+                }),
+                None,
+            )
+            .await
+            .expect("save draft with large route view");
+
+        let pub_overbudget_err = mcp_a
+            .invoke_tool_json(
+                "publish",
+                json!({ "plan_id": "plan-oversized-publish", "revision": 1 }),
+                None,
+            )
+            .await
+            .expect_err("oversized publish must fail before mutation");
+        assert_eq!(
+            pub_overbudget_err.structured_content.unwrap()["error"]["code"],
+            "response_too_large"
+        );
+        assert_eq!(
+            plans
+                .latest_revision("plan-oversized-publish")
+                .expect("latest")
+                .expect("exists")
+                .status,
+            PlanStatus::Draft
+        );
     }
 }
