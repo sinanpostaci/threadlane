@@ -161,6 +161,71 @@ export function deriveDeliveryReceipts(revisions: readonly PlanRevision[]): Deli
     }));
 }
 
+function findLatestPlanRevision(
+  planId: string,
+  revisions: readonly PlanRevision[]
+): PlanRevision | null {
+  const trimmed = planId.trim();
+  let latest: PlanRevision | null = null;
+  for (const revision of revisions) {
+    if (revision.plan_id !== trimmed) {
+      continue;
+    }
+    if (!latest || revision.revision > latest.revision) {
+      latest = revision;
+    }
+  }
+  return latest;
+}
+
+export function createPlanDraftFromRevision(
+  revision: PlanRevision,
+  expectedRevision: number = revision.revision
+): PlanFormDraft {
+  return {
+    planId: revision.plan_id,
+    bindingId: revision.binding_id,
+    profileId: revision.profile_id,
+    summary: revision.summary,
+    expectedRevision,
+    tasks:
+      revision.tasks.length > 0
+        ? revision.tasks.map((task) => ({
+            id: task.id,
+            title: task.title,
+            instruction: task.instruction,
+            role: task.role,
+            difficulty: task.difficulty,
+            dependsOnText: task.depends_on.join(', '),
+            allowedWritePathsText: task.allowed_write_paths.join(', '),
+          }))
+        : [createDefaultTaskDraft(1)],
+    dirty: revision.revision !== expectedRevision,
+  };
+}
+
+/**
+ * A clean editor follows its own plan's latest stored revision atomically, so the
+ * CAS base and visible payload can never describe different revisions. Dirty or
+ * historical-intent drafts keep their payload and captured base untouched.
+ */
+export function reconcileCleanPlanDraft(
+  draft: PlanFormDraft,
+  revisions: readonly PlanRevision[]
+): PlanFormDraft {
+  if (draft.dirty) {
+    return draft;
+  }
+  const latest = findLatestPlanRevision(draft.planId, revisions);
+  if (!latest) {
+    return draft;
+  }
+  if (latest.revision <= draft.expectedRevision) {
+    return draft;
+  }
+  return createPlanDraftFromRevision(latest, latest.revision);
+}
+
 function approvalDraftKey(planId: string, revision: number): string {
   return `${planId}:${revision}`;
 }
@@ -235,10 +300,6 @@ export class PlansPage {
         (registry.default_profile_id || registry.profiles[0]?.id)
       ) {
         this.draft.profileId = registry.default_profile_id ?? registry.profiles[0]!.id;
-      }
-      const latestForPlan = this.findLatestRevision(this.draft.planId);
-      if (latestForPlan) {
-        this.draft.expectedRevision = latestForPlan.revision;
       }
     }
 
@@ -593,38 +654,18 @@ export class PlansPage {
   }
 
   private findLatestRevision(planId: string): PlanRevision | null {
-    const trimmed = planId.trim();
-    const matches = this.latestPlans
-      .filter((p) => p.plan_id === trimmed)
-      .sort((a, b) => b.revision - a.revision);
-    return matches[0] ?? null;
+    return findLatestPlanRevision(planId, this.latestPlans);
   }
 
   private loadRevisionIntoDraft(rev: PlanRevision): void {
     const latest = this.findLatestRevision(rev.plan_id) ?? rev;
-    this.draft = {
-      planId: rev.plan_id,
-      bindingId: rev.binding_id,
-      profileId: rev.profile_id,
-      summary: rev.summary,
-      expectedRevision: latest.revision,
-      tasks:
-        rev.tasks.length > 0
-          ? rev.tasks.map((t) => ({
-              id: t.id,
-              title: t.title,
-              instruction: t.instruction,
-              role: t.role,
-              difficulty: t.difficulty,
-              dependsOnText: t.depends_on.join(', '),
-              allowedWritePathsText: t.allowed_write_paths.join(', '),
-            }))
-          : [createDefaultTaskDraft(1)],
-      dirty: false,
-    };
+    const historical = rev.revision !== latest.revision;
+    this.draft = createPlanDraftFromRevision(rev, latest.revision);
     this.hasCasConflict = false;
     this.errorMessage = null;
-    this.statusNotice = `Loaded ${rev.plan_id} (rev ${rev.revision}) into draft editor.`;
+    this.statusNotice = historical
+      ? `Loaded historical ${rev.plan_id} r${rev.revision} into draft editor against base r${latest.revision}. Local edits stay on this historical content until saved explicitly.`
+      : `Loaded ${rev.plan_id} (rev ${rev.revision}) into draft editor.`;
     this.rebuildDom();
   }
 
@@ -911,6 +952,9 @@ export class PlansPage {
     // A full rebuild always renders the latest cached store context, so any deferred
     // update notice has been satisfied by this view.
     this.pendingStoredUpdatesNotice = null;
+    if (!this.hasEditableFocus()) {
+      this.draft = reconcileCleanPlanDraft(this.draft, this.latestPlans);
+    }
     const activeEl =
       typeof document !== 'undefined' ? (document.activeElement as HTMLElement | null) : null;
     const focusKey =

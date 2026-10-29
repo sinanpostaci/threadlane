@@ -35,7 +35,12 @@ import {
   syncApprovalDraftWithContext,
   updateApprovalDraftField,
 } from './ipc.ts';
-import { isEditablePlanFieldTagName } from '../pages/plans.ts';
+import {
+  createInitialPlanDraft,
+  createPlanDraftFromRevision,
+  isEditablePlanFieldTagName,
+  reconcileCleanPlanDraft,
+} from '../pages/plans.ts';
 import type { Attachment, BindingSummary, DesktopSnapshot, TaskSummary } from '../types.ts';
 
 const NOW_MS = 1_730_000_000_000;
@@ -193,6 +198,39 @@ function makePublishedPlan(registry: RegistrySnapshot): PlanRevision {
       revision: saved.updated.revision,
     },
     NOW_MS + 1
+  ).updated;
+}
+
+function saveExternalDraftRevision(
+  revisions: readonly PlanRevision[],
+  expectedRevision: number,
+  summary: string,
+  taskTitle: string,
+  bindingId: string = BINDING_ID
+): PlanRevision {
+  return applyPlanChangeLocally(
+    revisions,
+    expectedRevision,
+    {
+      op: 'save_draft',
+      plan_id: 'plan-live',
+      binding_id: bindingId,
+      profile_id: 'profile-live',
+      profile_revision: 3,
+      summary,
+      tasks: [
+        {
+          id: 'task-live',
+          title: taskTitle,
+          instruction: `${taskTitle} instruction`,
+          role: 'coder',
+          difficulty: 'hard',
+          depends_on: [],
+          allowed_write_paths: ['apps/desktop/src/pages/plans.ts'],
+        },
+      ],
+    },
+    NOW_MS + 10 + expectedRevision
   ).updated;
 }
 
@@ -436,6 +474,91 @@ describe('live plan and registry store refresh', () => {
     assert.equal(afterPlanChange.confirmedSubjectSignature, null);
     assert.equal(afterPlanChange.repositoryPath, REPOSITORY_PATH);
     assert.equal(afterPlanChange.baseCommit, BASE_COMMIT);
+  });
+
+  it('reloads a clean plan draft payload and CAS base atomically when its stored revision advances', () => {
+    const registry = makeRegistry();
+    const r1 = makePublishedPlan(registry);
+    const r2 = saveExternalDraftRevision(
+      [r1],
+      r1.revision,
+      'External MCP revision',
+      'External MCP task update',
+      'bind-beta'
+    );
+
+    const clean = createPlanDraftFromRevision(r1);
+    assert.equal(clean.expectedRevision, r1.revision);
+    assert.equal(clean.summary, r1.summary);
+    assert.equal(clean.bindingId, BINDING_ID);
+
+    const reconciled = reconcileCleanPlanDraft(clean, [r1, r2]);
+    assert.equal(reconciled.dirty, false);
+    assert.equal(reconciled.expectedRevision, r2.revision);
+    assert.equal(reconciled.bindingId, 'bind-beta');
+    assert.equal(reconciled.summary, 'External MCP revision');
+    assert.equal(reconciled.tasks[0]?.title, 'External MCP task update');
+
+    // The clean source draft is untouched until the caller commits the atomic result.
+    assert.equal(clean.expectedRevision, r1.revision);
+    assert.equal(clean.bindingId, BINDING_ID);
+    assert.equal(clean.summary, r1.summary);
+
+    const unrelated: PlanRevision = {
+      ...r2,
+      plan_id: 'plan-unrelated',
+      revision: 9,
+      summary: 'Unrelated plan revision',
+    };
+    assert.deepEqual(reconcileCleanPlanDraft(clean, [r1, unrelated]), clean);
+    assert.equal(reconcileCleanPlanDraft(createInitialPlanDraft(), [r1, r2]).expectedRevision, 0);
+  });
+
+  it('preserves dirty and historical draft payloads with their captured CAS base across refreshes', () => {
+    const registry = makeRegistry();
+    const r1 = makePublishedPlan(registry);
+    const r2 = saveExternalDraftRevision(
+      [r1],
+      r1.revision,
+      'External r2 summary',
+      'External r2 task',
+      'bind-beta'
+    );
+    const r3 = saveExternalDraftRevision(
+      [r1, r2],
+      r2.revision,
+      'External r3 summary',
+      'External r3 task'
+    );
+
+    const dirty = createPlanDraftFromRevision(r1);
+    dirty.dirty = true;
+    dirty.summary = 'Local unsaved summary';
+    dirty.tasks[0]!.title = 'Local unsaved task';
+
+    const dirtyAfterRefresh = reconcileCleanPlanDraft(dirty, [r1, r2, r3]);
+    assert.equal(dirtyAfterRefresh, dirty);
+    assert.equal(dirtyAfterRefresh.expectedRevision, r1.revision);
+    assert.equal(dirtyAfterRefresh.bindingId, BINDING_ID);
+    assert.equal(dirtyAfterRefresh.summary, 'Local unsaved summary');
+    assert.equal(dirtyAfterRefresh.tasks[0]?.title, 'Local unsaved task');
+
+    const historical = createPlanDraftFromRevision(r1, r2.revision);
+    assert.equal(historical.dirty, true);
+
+    const historicalAfterR2 = reconcileCleanPlanDraft(historical, [r1, r2]);
+    assert.equal(historicalAfterR2.expectedRevision, r2.revision);
+    assert.equal(historicalAfterR2.bindingId, BINDING_ID);
+    assert.equal(historicalAfterR2.summary, r1.summary);
+    assert.equal(historicalAfterR2.tasks[0]?.title, r1.tasks[0]?.title);
+    assert.equal(historicalAfterR2.dirty, true);
+
+    const historicalAfterR3 = reconcileCleanPlanDraft(historicalAfterR2, [r1, r2, r3]);
+    assert.equal(historicalAfterR3.expectedRevision, r2.revision);
+    assert.equal(historicalAfterR3.bindingId, BINDING_ID);
+    assert.equal(historicalAfterR3.summary, r1.summary);
+    assert.equal(historicalAfterR3.tasks[0]?.title, r1.tasks[0]?.title);
+    assert.equal(historicalAfterR3.dirty, true);
   });
 
   it('preserves focus only for editable Plans controls during background updates', () => {
