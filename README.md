@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early Milestone 1 foundation, developed with AI assistance and reviewed before checkpointing. This is **not production ready**. On Linux/NixOS, 34 automated tests and the CLI smoke check pass. A real Codex chat received a runtime wake-up. The installed Codex MCP client can discover all eight tools, but the already open desktop test chat still needs a supported MCP refresh. The complete native conversation loop remains unverified. See [validation evidence](docs/VALIDATION.md) and the [closure review](docs/CLOSURE-REVIEW.md).
+> **Status:** Early Milestone 1 foundation, developed with AI assistance and reviewed before checkpointing. This is **not production ready**. On Linux/NixOS, 34 automated tests and the CLI smoke check pass. An isolated native Codex chat completed the deterministic demo loop through real MCP calls: start, question wake-up, event pull/acknowledgement, revision-matched answer, completion wake-up and final acknowledgement. Real coding workers and other platforms remain unverified. See [validation evidence](docs/VALIDATION.md) and the [closure review](docs/CLOSURE-REVIEW.md).
 
 ---
 
@@ -57,7 +57,7 @@ Threadlane is a local execution middleware and control plane designed to work al
 ## Demo Limits and Platform Support
 
 - **Deterministic Simulation Only**: Milestone 1 runs a simulated state machine (`Running -> WaitingInput -> Completing -> Completed` or `Cancelled`). It does not invoke real coding agents or prove external worker crash recovery.
-- **Live Native Codex Acceptance**: The real runtime submitted exactly one wake-up and the intended disposable desktop chat produced a reply. The chat reported that Threadlane MCP tools were unavailable, so native pull/answer/ack and full round-trip acceptance are still pending. CLI or synthetic MCP results are not counted as native chat delivery proof. See [validation evidence](docs/VALIDATION.md).
+- **Live Native Codex Acceptance**: Passed on Linux/NixOS in one explicitly authorized disposable chat. Native chat history records real MCP calls and both question/completion wake-ups; final runtime state has no active runs, equal delivered/acknowledged cursors and an idle wake-up notice. The answer was preauthorized synthetic demo input, not a production user decision. Temporary configuration and test processes were removed afterward. See [validation evidence](docs/VALIDATION.md).
 - **Linux / NixOS First**: Runtime permission checks (`0700` directories, `0600` files, symlink component rejection) are implemented for Unix and tested on Linux/NixOS. Non-Unix platforms fail closed with an explicit `unsupported_platform` error until native platform ACL enforcement (e.g., Windows DACLs) is implemented and verified in a later milestone. macOS and Windows have not yet been tested.
 
 ---

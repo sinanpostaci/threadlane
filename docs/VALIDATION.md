@@ -52,49 +52,58 @@ removed to satisfy Clippy; formatting, Clippy, build and the CLI smoke all passe
 
 ## Native Codex experiment
 
-An existing disposable chat was used with explicit user authorization. No active
-project chat was modified and no model, effort, approval, or sandbox override was
-sent by the Threadlane wake-up adapter.
+**The deterministic native conversation loop passed on Linux/NixOS on 2026-10-29.**
+The test used one disposable native Codex chat with explicit user authorization.
+No other project chat or model, effort, approval or sandbox setting was changed.
 
-1. A simulated run reached its question and generated one pending wake-up.
-2. The real adapter invoked the explicitly configured installed Codex executable.
-3. The durable outcome became `submitted`, with `attempt_count = 1`.
-4. Desktop chat history independently showed the fixed wake-up message and a new
-   completed reply. Thus delivery was observed, not inferred from exit status.
-5. The chat reported that Threadlane MCP tools were unavailable. It did not pull,
-   answer, or acknowledge events through MCP.
+Initial attempts delivered the fixed wake-up but the open chat reported
+`MCP_UNAVAILABLE`. Public `config/read` diagnostics showed that its project-local
+MCP configuration was disabled because the project was not trusted. A temporary,
+user-approved trust entry enabled that layer. A standalone installed Codex
+app-server could then discover all eight tools; that alone was not native proof.
 
-Per-invocation `codex queue -c mcp_servers...` options did not make the new tools
-appear in the already open chat. A temporary project-scoped MCP entry also did
-not appear there. These observations do not establish a general Codex limitation
-or a confirmed cause; configuration loading and client refresh still need an
-explicit setup check. During the follow-up, public `config/read` diagnostics identified the test
-project's local configuration as disabled because that project was not trusted.
-The user explicitly approved a temporary trust entry for only that test folder;
-the same API then showed the MCP entry enabled. The installed Codex app-server,
-given an explicit entry, listed all eight tools through its real MCP client
-without a model turn. The already open native chat still reported
-`MCP_UNAVAILABLE`. Its supported client refresh and callback test remain open.
-Test wake-up dispatch is off while waiting for that refresh. The temporary trust
-and project MCP entries are owned test fixtures to remove when the test ends.
+After the user restarted the desktop app, its app-server launched the scoped
+Threadlane MCP process for the test project. Although the user still did not see
+it in the `/mcp` menu, a new turn in the existing test chat successfully called
+`threadlane_probe.status`. The menu observation did not establish tool failure.
+No NixOS package, library or system configuration fix was needed for this test.
+The complete reason for the earlier UI omission was not established.
 
-**Native round-trip acceptance remains open.** In a dedicated trusted test
-project, register the stdio command below through the client's supported MCP
-configuration, refresh it, and first verify that `status` is actually callable:
+The final experiment independently verified native chat tool records and runtime
+state, not only the exit status of the queue command:
+
+1. The native chat cancelled the old waiting demo through MCP, pulled its four
+   events and acknowledged the returned batch.
+2. It started a new deterministic demo with `start_demo`, then ended its turn.
+3. The supervisor was restarted with wake-up dispatch allowlisted to that same
+   disposable chat. The already running MCP process recovered with the new private
+   descriptor. The waiting run persisted across this restart.
+4. The real queue adapter delivered the fixed question wake-up. The chat used
+   `pull_events`, `ack_events`, `get_run` and revision-matched `answer` through MCP.
+   Its answer was a preauthorized synthetic test response, not real task approval.
+5. A second fixed wake-up delivered completion. The chat used `pull_events`,
+   `ack_events` and `status` through MCP and confirmed the run was completed.
+6. Final independent CLI status showed `active_runs = 0`, `delivered_seq = 9`,
+   `acked_seq = 9`, wake-up `idle` and no last error. The cumulative submission
+   count rose from one earlier failed-discovery experiment to three: two additional
+   wake-ups for the accepted question/completion loop.
+
+The owned supervisor/MCP processes and only the owned temporary trust/project
+configuration entries were removed after the test. No persistent service was
+installed, and unrelated Codex configuration was preserved.
+
+To repeat in a dedicated trusted test project, configure the scoped stdio command
+and verify a real native `status` call before running the loop:
 
 ```text
 <absolute-threadlane-binary> mcp --state-dir <canonical-private-state-dir> --binding <test-binding-id>
 ```
 
-The MCP process can initialize and list tools with the supervisor offline;
-actual tool calls require the supervisor. `threadlane bind` provides the binding
-ID. Its wake-up adapter must be enabled only for that same disposable chat.
-Complete a new demo using real MCP calls: start, receive the question wake-up,
-pull and acknowledge the delivered batch, answer the current revision, receive
-completion, and acknowledge it. Never fabricate a successful callback from CLI
-state. A project-scoped configuration can be shared by chats in that project;
-this fixture is deliberately limited to one chat, and general per-chat routing
-is a later integration concern.
+Discovery works with the supervisor offline; actual calls require the supervisor.
+A project configuration can be shared by chats in that project, so this fixture
+was deliberately restricted to one chat. General per-chat routing remains later
+integration work. Busy-turn steering and real external worker/process recovery
+were not established by this deterministic native test.
 
 Client setup reference: [Codex MCP configuration](https://learn.chatgpt.com/docs/extend/mcp).
 

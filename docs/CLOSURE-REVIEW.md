@@ -23,26 +23,31 @@ not runtime evidence, and the baseline review is not a review of the later patch
 
 ## Native connection investigation
 
-The public Codex `config/read` API, with configuration layers included, showed
-that the disposable test project's local MCP entry was disabled because the
-project was not trusted. With explicit user approval, a temporary trust entry
-was added for that one test folder. The same API then reported the local entry
-enabled and present in effective configuration.
+Public Codex `config/read` diagnostics showed that the disposable test project's
+local MCP entry was disabled because the project was not trusted. With explicit
+user approval, a temporary trust entry enabled only that test folder. Standalone
+Codex MCP discovery then passed, but it was not counted as native acceptance.
 
-An isolated installed Codex app-server, given the explicit MCP entry, successfully
-listed all eight Threadlane tools through its real MCP client without starting a
-model turn. This establishes client/protocol discovery compatibility; it does
-not establish that an existing native desktop conversation loaded the tools.
-The already open disposable chat still reported `MCP_UNAVAILABLE`. The public
-local control socket was absent, so a supported client refresh is still needed.
+After the user restarted the desktop app, the existing test chat successfully
+called the scoped MCP tools despite the reported menu omission. It completed a
+new deterministic run through actual start, question wake-up, pull/acknowledgement,
+revision-matched answer, completion wake-up and final acknowledgement. Native
+chat tool records and final runtime state independently confirmed the result.
+The waiting demo also survived a supervisor restart; real worker-process recovery
+remains unproven. See [the validation record](VALIDATION.md) for the exact scope.
+
+Only owned temporary trust/MCP entries and test processes were removed afterward.
 No private Codex database or undocumented IPC was used, and no model, effort,
-approval policy or sandbox setting was changed.
+approval policy or sandbox setting was changed. No NixOS package change was needed
+for the connection. The precise UI listing behavior remains undiagnosed.
 
 ## Closure gate
 
 The primary agent verified all 34 tests, formatting, Clippy with warnings denied,
-the workspace build and process-based CLI smoke. The corrected foundation is
-ready for a private checkpoint. Native acceptance still
-requires actual MCP calls from the disposable native chat: status, event pull,
-acknowledgement, revision-matched answer, completion and final acknowledgement.
-A successful queue submission or an independent API client is not a substitute.
+the workspace build and process-based CLI smoke. The deterministic native Codex
+question/answer/completion loop now also passes. No code changed after those
+checks; this follow-up records runtime evidence and cleanup.
+
+Milestone 1's native round-trip gate is satisfied on the tested Linux/NixOS host.
+The bounded history/response gate, real workers, busy-turn behavior and other
+platforms remain outstanding work; this is not production or cross-platform proof.

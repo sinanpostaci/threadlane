@@ -69,8 +69,10 @@ the user now requests **Argon High implementation and review by the primary agen
 On 2026-10-29 an external Python script successfully queued two messages into a
 disposable native Codex desktop chat, including from a clean environment. Both
 caused completed replies. The CLI was 0.165.0-alpha.1.2 and the desktop was open.
-One reply changed the echoed tag: software must own correlation IDs. Busy-turn,
-MCP return, app-closed and cross-platform behaviour remain unverified.
+One reply changed the echoed tag: software must own correlation IDs. A later isolated native MCP test completed the deterministic
+question/answer/completion loop with both wake-ups and final acknowledgements;
+see [validation](VALIDATION.md). Busy-turn, real-worker recovery, app-closed and
+cross-platform behaviour remain unverified.
 
 The independent Argon High and Opus 5.5 High design reviews were completed before
 implementation. They motivated the invariants above; their agreement is not
