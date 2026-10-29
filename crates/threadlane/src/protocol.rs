@@ -4,7 +4,12 @@ use threadlane_core::{
     RevisionHistoryPage, Run, RunListPage, WakeupNotice, DEFAULT_EVENT_BATCH_SIZE,
     DEFAULT_PAGE_LIMIT,
 };
-pub use threadlane_core::{RunSummary, MAX_STATUS_RECENT_RUNS, MAX_SUMMARY_TEXT_PREVIEW_CHARS};
+pub use threadlane_core::{
+    RunSummary, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerOutcomeSummary,
+    WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot, WorkerStatus,
+    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
+    MAX_SUMMARY_TEXT_PREVIEW_CHARS,
+};
 
 /// Trusted CLI request to bind a validated native Codex thread UUID and display label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,15 +185,44 @@ pub enum ScopedRequest {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// Admit and queue a new worker run using a startup-configured profile (`-> Queued`).
+    StartWorker {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Startup-configured worker profile identifier.
+        profile_id: String,
+        /// Bounded task instruction for the worker.
+        instruction: String,
+    },
+    /// Fetch a compact durable [`WorkerSnapshot`] for `run_id` (or `worker_id`) within the binding.
+    GetWorker {
+        /// Target worker run identifier (`run_<uuid>`) or worker identifier (`wrk_<uuid>`).
+        #[serde(alias = "worker_id")]
+        run_id: String,
+    },
+    /// Request revision-checked cancellation of a worker run within the binding.
+    CancelWorker {
+        /// Caller-supplied idempotency key scoped to the binding.
+        command_key: String,
+        /// Target worker run identifier (`run_<uuid>`) or worker identifier (`wrk_<uuid>`).
+        #[serde(alias = "worker_id")]
+        run_id: String,
+        /// Expected current 1-based revision of the worker run.
+        expected_revision: u64,
+        /// Optional cancellation reason.
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 impl ScopedRequest {
     /// Converts this [`ScopedRequest`] into a [`threadlane_core::Command`] using supervisor-injected `now_ms`.
     ///
-    /// Returns `None` for [`ScopedRequest::Status`], which aggregates binding, wake-up, and bounded run summaries.
+    /// Returns `None` for [`ScopedRequest::Status`] and [`ScopedRequest::StartWorker`], which require
+    /// supervisor-level aggregation or startup profile resolution prior to core execution.
     pub fn into_core_command(self, now_ms: i64) -> Option<Command> {
         match self {
-            Self::Status => None,
+            Self::Status | Self::StartWorker { .. } => None,
             Self::GetRun { run_id } => Some(Command::GetRun { run_id }),
             Self::ListRuns { cursor, limit } => Some(Command::ListRuns {
                 cursor,
@@ -271,10 +305,23 @@ impl ScopedRequest {
                 reason,
                 now_ms,
             }),
+            Self::GetWorker { run_id } => Some(Command::GetWorker { run_id }),
+            Self::CancelWorker {
+                command_key,
+                run_id,
+                expected_revision,
+                reason,
+            } => Some(Command::CancelWorker {
+                command_key,
+                run_id,
+                expected_revision,
+                reason,
+                now_ms,
+            }),
         }
     }
 
-    /// Returns `true` if executing this request can create or release wake-up work.
+    /// Returns `true` if executing this request can create or release wake-up or worker dispatch work.
     pub fn may_affect_scheduling(&self) -> bool {
         matches!(
             self,
@@ -283,11 +330,30 @@ impl ScopedRequest {
                 | Self::Answer { .. }
                 | Self::Steer { .. }
                 | Self::Cancel { .. }
+                | Self::StartWorker { .. }
+                | Self::CancelWorker { .. }
         )
     }
 }
 
+trait IntoWorkerSnapshot {
+    fn into_worker_snapshot(self) -> WorkerSnapshot;
+}
+
+impl IntoWorkerSnapshot for WorkerSnapshot {
+    fn into_worker_snapshot(self) -> WorkerSnapshot {
+        self
+    }
+}
+
+impl IntoWorkerSnapshot for Box<WorkerSnapshot> {
+    fn into_worker_snapshot(self) -> WorkerSnapshot {
+        *self
+    }
+}
+
 /// Serializable response returned by the supervisor for a [`ScopedRequest`].
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum ScopedResponse {
@@ -295,6 +361,8 @@ pub enum ScopedResponse {
     Status(StatusResponse),
     /// Constant-size current run snapshot (`GetRun`, `StartDemo`, `Answer`, `Steer`, `Cancel`).
     Run(Run),
+    /// Compact durable worker snapshot (`StartWorker`, `GetWorker`, `CancelWorker`).
+    Worker(WorkerSnapshot),
     /// Bounded keyset-paginated run list page (`ListRuns`).
     RunList(RunListPage),
     /// Bounded keyset-paginated run revision history page (`ListRunRevisions`).
@@ -311,6 +379,7 @@ impl From<CommandOutput> for ScopedResponse {
     fn from(output: CommandOutput) -> Self {
         match output {
             CommandOutput::Run(run) => Self::Run(*run),
+            CommandOutput::Worker(worker) => Self::Worker(worker.into_worker_snapshot()),
             CommandOutput::RunList(page) => Self::RunList(page),
             CommandOutput::RevisionHistory(page) => Self::RevisionHistory(page),
             CommandOutput::QuestionHistory(page) => Self::QuestionHistory(page),
@@ -333,6 +402,14 @@ impl ScopedResponse {
     pub fn into_run(self) -> Option<Run> {
         match self {
             Self::Run(run) => Some(run),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`WorkerSnapshot`] if this is `ScopedResponse::Worker`.
+    pub fn into_worker(self) -> Option<WorkerSnapshot> {
+        match self {
+            Self::Worker(worker) => Some(worker),
             _ => None,
         }
     }

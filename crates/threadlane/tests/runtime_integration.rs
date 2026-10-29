@@ -27,6 +27,7 @@ fn fast_supervisor_config(state_dir: &Path) -> SupervisorConfig {
         state_dir: state_dir.to_path_buf(),
         tick_interval: Duration::from_millis(15),
         codex: None,
+        workers: None,
     }
 }
 
@@ -647,6 +648,9 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
         "answer",
         "steer",
         "cancel",
+        "start_worker",
+        "get_worker",
+        "cancel_worker",
     ]
     .into_iter()
     .collect();
@@ -1154,6 +1158,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
             notify_bindings: BTreeSet::from([binding_allowed.binding_id.clone()]),
             timeout: Duration::from_millis(2_000),
         }),
+        workers: None,
     };
     let handle = Supervisor::start(sup_cfg)
         .await
@@ -1317,6 +1322,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
             notify_bindings: BTreeSet::from([binding_timeout.binding_id.clone()]),
             timeout: Duration::from_millis(80),
         }),
+        workers: None,
     })
     .await
     .expect("start timeout supervisor");
@@ -1376,6 +1382,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
             notify_bindings: BTreeSet::from([binding_fail.binding_id.clone()]),
             timeout: Duration::from_millis(500),
         }),
+        workers: None,
     })
     .await
     .expect("start fail supervisor");
@@ -1602,6 +1609,7 @@ async fn test_persistence_failure_stops_mutations_and_does_not_retry_wakeup() {
             notify_bindings: BTreeSet::from([binding.binding_id.clone()]),
             timeout: Duration::from_millis(500),
         }),
+        workers: None,
     })
     .await
     .expect("start supervisor");
@@ -1820,7 +1828,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
         let missing_list = read_json_rpc_response(&mut missing_reader, 2).await;
         assert_eq!(
             missing_list["result"]["tools"].as_array().map(Vec::len),
-            Some(11)
+            Some(14)
         );
         assert!(
             !missing_state_dir.exists(),
@@ -1913,7 +1921,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 11, "MCP tool count must remain 11");
+    assert_eq!(tools.len(), 14, "MCP tool count must remain 14");
 
     // 5. Calling `status` while supervisor is offline returns a structured transport_error tool result.
     send_json_rpc(
@@ -2205,6 +2213,7 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
             notify_bindings: BTreeSet::from([binding.binding_id.clone()]),
             timeout: Duration::from_millis(1_000),
         }),
+        workers: None,
     })
     .await
     .expect("start supervisor");
@@ -2451,6 +2460,7 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
             notify_bindings: BTreeSet::from([unknown_binding.binding_id.clone()]),
             timeout: Duration::from_millis(80),
         }),
+        workers: None,
     })
     .await
     .expect("start unknown supervisor");

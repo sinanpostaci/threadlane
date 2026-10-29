@@ -75,6 +75,32 @@ pub enum CoreError {
         question_id: String,
     },
 
+    /// The specified worker (`run_id` or `worker_id`) does not exist within `binding_id`.
+    #[error("worker `{worker_id}` not found for binding `{binding_id}`")]
+    WorkerNotFound {
+        /// Binding scope used for the lookup.
+        binding_id: String,
+        /// Missing worker or run identifier.
+        worker_id: String,
+    },
+
+    /// A worker claim or callback did not match the live `(binding_id, run_id, worker_id, revision, claim_id, attempt_count, profile_digest)` state.
+    #[error(
+        "stale or mismatched worker claim `{claim_id}` for worker `{worker_id}` on run `{run_id}` (binding `{binding_id}`): {reason}"
+    )]
+    StaleWorkerClaim {
+        /// Binding scope owning the worker.
+        binding_id: String,
+        /// Run identifier owning the worker.
+        run_id: String,
+        /// Worker identifier.
+        worker_id: String,
+        /// Claim identifier supplied by the caller.
+        claim_id: String,
+        /// Detailed mismatch or stale-state reason.
+        reason: String,
+    },
+
     /// `expected_revision` did not match the run's current revision.
     #[error(
         "stale revision for run `{run_id}`: expected revision {expected_revision}, actual revision is {actual_revision}"

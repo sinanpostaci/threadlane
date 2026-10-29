@@ -10,6 +10,7 @@ use crate::error::Error;
 use crate::mcp::ThreadlaneMcpServer;
 use crate::protocol::ScopedRequest;
 use crate::supervisor::{Supervisor, SupervisorConfig, DEFAULT_TICK_INTERVAL_MS};
+use crate::workers::WorkersConfig;
 
 /// Threadlane Milestone 1 local execution supervisor, CLI, and scoped MCP adapter.
 #[derive(Debug, Parser)]
@@ -48,6 +49,10 @@ pub enum Subcommands {
         /// Bounded timeout in milliseconds for each Codex queue invocation.
         #[arg(long, default_value_t = DEFAULT_CODEX_TIMEOUT_MS)]
         codex_timeout_ms: u64,
+
+        /// Optional path to a private (0600) startup worker profile configuration JSON file (OFF by default).
+        #[arg(long = "workers-config")]
+        workers_config: Option<PathBuf>,
     },
 
     /// Create a trusted binding between a validated Codex thread UUID and a display label.
@@ -129,13 +134,33 @@ pub enum Subcommands {
     },
 }
 
-/// Builds a validated [`SupervisorConfig`] from CLI `serve` arguments.
+/// Builds a validated [`SupervisorConfig`] from CLI `serve` arguments (without worker profiles).
 pub fn build_supervisor_config(
     state_dir: PathBuf,
     codex: Option<PathBuf>,
     notify_bindings: Vec<String>,
     tick_interval_ms: u64,
     codex_timeout_ms: u64,
+) -> Result<SupervisorConfig, Error> {
+    build_supervisor_config_with_workers(
+        state_dir,
+        codex,
+        notify_bindings,
+        tick_interval_ms,
+        codex_timeout_ms,
+        None,
+    )
+}
+
+/// Builds a validated [`SupervisorConfig`] from CLI `serve` arguments including optional
+/// private `--workers-config` startup worker profiles.
+pub fn build_supervisor_config_with_workers(
+    state_dir: PathBuf,
+    codex: Option<PathBuf>,
+    notify_bindings: Vec<String>,
+    tick_interval_ms: u64,
+    codex_timeout_ms: u64,
+    workers_config_path: Option<PathBuf>,
 ) -> Result<SupervisorConfig, Error> {
     let codex_config = match (codex, notify_bindings.is_empty()) {
         (None, true) => None,
@@ -161,10 +186,16 @@ pub fn build_supervisor_config(
         }
     };
 
+    let workers = match workers_config_path {
+        Some(path) => Some(WorkersConfig::load_from_path(&path)?),
+        None => None,
+    };
+
     let config = SupervisorConfig {
         state_dir,
         tick_interval: Duration::from_millis(tick_interval_ms),
         codex: codex_config,
+        workers,
     };
     config.validate()?;
     Ok(config)
@@ -179,13 +210,15 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             notify_bindings,
             tick_interval_ms,
             codex_timeout_ms,
+            workers_config,
         } => {
-            let config = build_supervisor_config(
+            let config = build_supervisor_config_with_workers(
                 state_dir,
                 codex,
                 notify_bindings,
                 tick_interval_ms,
                 codex_timeout_ms,
+                workers_config,
             )?;
             let handle = Supervisor::start(config).await?;
             tokio::select! {

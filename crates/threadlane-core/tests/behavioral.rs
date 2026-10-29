@@ -1826,6 +1826,7 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
             | EventKind::RunCancelled => {
                 assert_eq!(event.payload.instruction, None);
             }
+            unexpected => panic!("demo run emitted unexpected non-demo event: {unexpected:?}"),
         }
     }
 

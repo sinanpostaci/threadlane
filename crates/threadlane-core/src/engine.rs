@@ -11,9 +11,9 @@ use crate::limits::{
     validate_batch_limit, validate_bounded_text, validate_command_key, validate_identifier,
     validate_label, validate_optional_text, validate_page_limit, validate_step_delay_ms,
     validate_thread_uuid, validate_timestamp_ms, CursorKind, FIXED_WAKEUP_MESSAGE,
-    LEGACY_SCHEMA_VERSION_V1, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMPACT_RESPONSE_BYTES,
-    MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN, MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN,
-    RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
+    LEGACY_SCHEMA_VERSION_V1, LEGACY_SCHEMA_VERSION_V2, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
+    MAX_COMPACT_RESPONSE_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN,
+    MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN, RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
 };
 use crate::types::{
     AckResult, Binding, Command, CommandOutput, Event, EventBatch, EventKind, EventPayload,
@@ -21,14 +21,15 @@ use crate::types::{
     RunRevision, RunStatus, RunSummary, TickReport, WakeupClaim, WakeupNotice, WakeupOutcome,
     WakeupRetryRecord, WakeupStatus,
 };
+use crate::worker::WorkerSnapshot;
 
-/// Transactional, persistent SQLite domain engine for Threadlane Milestone 1.
+/// Transactional, persistent SQLite domain engine for Threadlane.
 ///
 /// Owned by a single supervisor process; all mutating operations execute inside atomic
 /// SQLite transactions.
 #[derive(Debug)]
 pub struct Core {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl Core {
@@ -443,6 +444,43 @@ impl Core {
                 tx.commit()?;
                 Ok(output)
             }
+            Command::StartWorker {
+                command_key,
+                profile_id,
+                profile_digest,
+                provider,
+                requested_model,
+                requested_effort,
+                base_commit,
+                instruction,
+                now_ms,
+            } => self.execute_start_worker(
+                &clean_binding_id,
+                command_key,
+                profile_id,
+                profile_digest,
+                provider,
+                requested_model,
+                requested_effort,
+                base_commit,
+                instruction,
+                now_ms,
+            ),
+            Command::GetWorker { run_id } => self.execute_get_worker(&clean_binding_id, run_id),
+            Command::CancelWorker {
+                command_key,
+                run_id,
+                expected_revision,
+                reason,
+                now_ms,
+            } => self.execute_cancel_worker(
+                &clean_binding_id,
+                command_key,
+                run_id,
+                expected_revision,
+                reason,
+                now_ms,
+            ),
         }
     }
 
@@ -456,7 +494,7 @@ impl Core {
     ///   (`instruction: None`), and schedule/coalesce a pending wake-up notice.
     /// - Timed/derived events never duplicate the full instruction text; full original instruction
     ///   and revision history remain in [`Run`] (`get_run`).
-    /// - Cancelled or superseded steps never complete.
+    /// - Cancelled, superseded, or worker-backed runs are never advanced by `tick`.
     pub fn tick(&mut self, now_ms: i64) -> Result<TickReport, CoreError> {
         let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
         let tx = self.conn.transaction()?;
@@ -468,6 +506,7 @@ impl Core {
                  WHERE next_step_at_ms IS NOT NULL
                    AND next_step_at_ms <= ?1
                    AND status IN ('running', 'completing')
+                   AND NOT EXISTS (SELECT 1 FROM workers w WHERE w.run_id = runs.run_id)
                  ORDER BY next_step_at_ms ASC, rowid ASC",
             )?;
             let mut rows = stmt.query(params![valid_now])?;
@@ -1006,7 +1045,7 @@ impl Core {
         let (total_raw, active_raw): (i64, i64) = self.conn.query_row(
             "SELECT
                 COUNT(*),
-                COALESCE(SUM(CASE WHEN status NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN status NOT IN ('completed', 'failed', 'cancelled', 'timed_out', 'unknown') THEN 1 ELSE 0 END), 0)
              FROM runs
              WHERE binding_id = ?1",
             params![clean_binding_id],
@@ -1188,7 +1227,38 @@ impl Core {
                 retried_at_ms INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_wakeup_retries_binding
-                ON wakeup_retries(binding_id, retried_at_ms, retry_id);",
+                ON wakeup_retries(binding_id, retried_at_ms, retry_id);
+
+            CREATE TABLE IF NOT EXISTS workers (
+                worker_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+                binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                revision INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                profile_digest TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                requested_model TEXT NOT NULL,
+                requested_effort TEXT NOT NULL,
+                observed_model TEXT,
+                observed_effort TEXT,
+                instruction TEXT NOT NULL,
+                claim_id TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                worktree_json TEXT NOT NULL,
+                progress_json TEXT NOT NULL,
+                outcome_json TEXT,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                started_at_ms INTEGER,
+                completed_at_ms INTEGER,
+                cancel_requested_at_ms INTEGER,
+                cancel_reason TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_workers_binding_run
+                ON workers(binding_id, run_id);
+            CREATE INDEX IF NOT EXISTS idx_workers_status_order
+                ON workers(status);",
         )?;
 
         let existing_version: Option<u32> = tx
@@ -1205,6 +1275,12 @@ impl Core {
                 )?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) if version == LEGACY_SCHEMA_VERSION_V2 => {
+                tx.execute(
+                    "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+                    params![SCHEMA_VERSION],
+                )?;
+            }
             Some(version) if version == LEGACY_SCHEMA_VERSION_V1 => {
                 Self::migrate_legacy_command_dedup_tx(tx)?;
                 tx.execute(
@@ -1237,6 +1313,11 @@ impl Core {
              WHERE status = 'in_flight'",
             [],
         )?;
+
+        // Any worker that was queued, claimed, running, or cancel_requested when the previous
+        // owner exited has an uncertain execution state and must transition to `unknown` with
+        // an important event and wake-up notice, without automatic retry or PID kills.
+        Self::recover_in_flight_workers_tx(tx)?;
 
         let bindings_acked: Vec<(String, u64)> = {
             let mut stmt = tx.prepare("SELECT binding_id, acked_seq FROM bindings")?;
@@ -1327,6 +1408,13 @@ impl Core {
         now_ms: i64,
     ) -> Result<Run, CoreError> {
         let run = Self::load_run_tx(tx, binding_id, run_id)?;
+        if Self::is_worker_run_tx(tx, run_id)? {
+            return Err(CoreError::InvalidRunState {
+                run_id: run_id.to_string(),
+                status: run.status,
+                action: "answer",
+            });
+        }
         if run.status.is_terminal() {
             return Err(CoreError::InvalidRunState {
                 run_id: run_id.to_string(),
@@ -1438,6 +1526,13 @@ impl Core {
         now_ms: i64,
     ) -> Result<Run, CoreError> {
         let run = Self::load_run_tx(tx, binding_id, run_id)?;
+        if Self::is_worker_run_tx(tx, run_id)? {
+            return Err(CoreError::InvalidRunState {
+                run_id: run_id.to_string(),
+                status: run.status,
+                action: "steer",
+            });
+        }
         if run.status.is_terminal() {
             return Err(CoreError::InvalidRunState {
                 run_id: run_id.to_string(),
@@ -1585,6 +1680,13 @@ impl Core {
         now_ms: i64,
     ) -> Result<Run, CoreError> {
         let run = Self::load_run_tx(tx, binding_id, run_id)?;
+        if Self::is_worker_run_tx(tx, run_id)? {
+            return Err(CoreError::InvalidRunState {
+                run_id: run_id.to_string(),
+                status: run.status,
+                action: "cancel",
+            });
+        }
         if run.status.is_terminal() {
             return Err(CoreError::InvalidRunState {
                 run_id: run_id.to_string(),
@@ -2026,7 +2128,7 @@ impl Core {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn emit_event_tx(
+    pub(crate) fn emit_event_tx(
         tx: &Transaction<'_>,
         binding_id: &str,
         run_id: &str,
@@ -2165,7 +2267,7 @@ impl Core {
         Ok(())
     }
 
-    fn check_dedup(
+    pub(crate) fn check_dedup(
         tx: &Transaction<'_>,
         binding_id: &str,
         command_key: &str,
@@ -2198,7 +2300,7 @@ impl Core {
         Ok(Some(output))
     }
 
-    fn record_dedup(
+    pub(crate) fn record_dedup(
         tx: &Transaction<'_>,
         binding_id: &str,
         command_key: &str,
@@ -2224,11 +2326,17 @@ impl Core {
         Ok(())
     }
 
-    fn ensure_binding_exists(tx: &Transaction<'_>, binding_id: &str) -> Result<(), CoreError> {
+    pub(crate) fn ensure_binding_exists(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+    ) -> Result<(), CoreError> {
         Self::ensure_binding_exists_conn(tx, binding_id)
     }
 
-    fn ensure_binding_exists_conn(conn: &Connection, binding_id: &str) -> Result<(), CoreError> {
+    pub(crate) fn ensure_binding_exists_conn(
+        conn: &Connection,
+        binding_id: &str,
+    ) -> Result<(), CoreError> {
         let exists: Option<i64> = conn
             .query_row(
                 "SELECT 1 FROM bindings WHERE binding_id = ?1",
@@ -2459,7 +2567,11 @@ impl Core {
         })
     }
 
-    fn load_run_tx(tx: &Transaction<'_>, binding_id: &str, run_id: &str) -> Result<Run, CoreError> {
+    pub(crate) fn load_run_tx(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+        run_id: &str,
+    ) -> Result<Run, CoreError> {
         Self::load_run_conn(tx, binding_id, run_id)
     }
 
@@ -3041,6 +3153,7 @@ impl Core {
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 enum StoredDedupOutput {
     Run(Box<LegacyStoredRun>),
+    Worker(Box<WorkerSnapshot>),
     AckResult(AckResult),
 }
 
@@ -3161,6 +3274,11 @@ fn parse_dedup_command_output(response_json: &str) -> Result<(CommandOutput, boo
     let parsed: StoredDedupOutput = serde_json::from_str(response_json)?;
     match parsed {
         StoredDedupOutput::AckResult(ack) => Ok((CommandOutput::AckResult(ack), false)),
+        StoredDedupOutput::Worker(mut worker) => {
+            let needs_rewrite = !worker.untrusted_data;
+            worker.untrusted_data = true;
+            Ok((CommandOutput::Worker(worker), needs_rewrite))
+        }
         StoredDedupOutput::Run(legacy) => {
             let legacy = *legacy;
             let needs_rewrite = legacy.revision_history.0
@@ -3204,7 +3322,7 @@ fn serialized_output_budget_bytes(output: &CommandOutput) -> Result<usize, CoreE
     estimate_wire_response_bytes(output)
 }
 
-fn enforce_compact_response_budget(output: &CommandOutput) -> Result<String, CoreError> {
+pub(crate) fn enforce_compact_response_budget(output: &CommandOutput) -> Result<String, CoreError> {
     let json = serde_json::to_string(output)?;
     let second_level_string = serde_json::to_string(&json)?;
     let size_bytes = json
@@ -3220,11 +3338,11 @@ fn enforce_compact_response_budget(output: &CommandOutput) -> Result<String, Cor
     Ok(json)
 }
 
-fn generate_id(prefix: &str) -> String {
+pub(crate) fn generate_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::new_v4().simple())
 }
 
-fn hash_dedup_payload<T: serde::Serialize>(value: &T) -> Result<String, CoreError> {
+pub(crate) fn hash_dedup_payload<T: serde::Serialize>(value: &T) -> Result<String, CoreError> {
     let bytes = serde_json::to_vec(value)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -3237,14 +3355,14 @@ fn hash_dedup_payload<T: serde::Serialize>(value: &T) -> Result<String, CoreErro
     Ok(hex)
 }
 
-fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, CoreError> {
+pub(crate) fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, CoreError> {
     i64::try_from(value).map_err(|_| CoreError::Validation {
         field,
         reason: format!("{field} value {value} exceeds i64::MAX"),
     })
 }
 
-fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, CoreError> {
+pub(crate) fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, CoreError> {
     u64::try_from(value).map_err(|_| {
         CoreError::CorruptState(format!("negative integer {value} stored in `{field}`"))
     })
