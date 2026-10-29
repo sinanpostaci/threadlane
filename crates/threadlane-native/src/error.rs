@@ -7,6 +7,8 @@ use thiserror::Error;
 pub enum NativeErrorCode {
     /// Native Codex executable or adapter is not configured.
     NotConfigured,
+    /// Optional workflow registry and plan stores are not configured on this MCP server instance.
+    WorkflowNotConfigured,
     /// Native configuration or caller parameter failed validation.
     InvalidConfig,
     /// Input parameter failed format, length, or scope validation.
@@ -64,6 +66,7 @@ impl NativeErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotConfigured => "not_configured",
+            Self::WorkflowNotConfigured => "workflow_not_configured",
             Self::InvalidConfig => "invalid_config",
             Self::ValidationFailed => "validation_failed",
             Self::UnsupportedPlatform => "unsupported_platform",
