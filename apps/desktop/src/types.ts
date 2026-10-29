@@ -109,6 +109,86 @@ export interface DesktopRunDetailArgs {
   runId: string;
 }
 
+export type EventKind =
+  | 'run_started'
+  | 'run_progress'
+  | 'question_asked'
+  | 'question_answered'
+  | 'question_superseded'
+  | 'run_steered'
+  | 'run_completed'
+  | 'run_cancelled'
+  | 'worker_queued'
+  | 'worker_started'
+  | 'worker_progress'
+  | 'worker_cancel_requested'
+  | 'worker_completed'
+  | 'worker_failed'
+  | 'worker_cancelled'
+  | 'worker_timed_out'
+  | 'worker_unknown';
+
+export const EVENT_KINDS: readonly EventKind[] = [
+  'run_started',
+  'run_progress',
+  'question_asked',
+  'question_answered',
+  'question_superseded',
+  'run_steered',
+  'run_completed',
+  'run_cancelled',
+  'worker_queued',
+  'worker_started',
+  'worker_progress',
+  'worker_cancel_requested',
+  'worker_completed',
+  'worker_failed',
+  'worker_cancelled',
+  'worker_timed_out',
+  'worker_unknown',
+] as const;
+
+export interface EventPayload {
+  untrusted_data: boolean;
+  summary: string;
+  question_id: string | null;
+  question_prompt: string | null;
+  answer: string | null;
+  instruction: string | null;
+  cancel_reason: string | null;
+}
+
+export interface ActivityEvent {
+  event_id: string;
+  binding_id: string;
+  seq: number;
+  run_id: string;
+  revision: number;
+  step_seq: number;
+  kind: EventKind;
+  important: boolean;
+  payload: EventPayload;
+  created_at_ms: number;
+}
+
+export interface ActivityPage {
+  binding_id: string;
+  events: ActivityEvent[];
+  next_cursor: string | null;
+  has_more: boolean;
+  high_water_mark_seq: number;
+  after_seq: number;
+}
+
+export interface DesktopActivityHistoryArgs {
+  bindingId: string;
+  afterSeq?: number | null;
+  cursor?: string | null;
+  limit?: number | null;
+  runId?: string | null;
+  kind?: EventKind | null;
+}
+
 export interface DesktopAnswerDemoArgs {
   expectedRevision: number;
 }

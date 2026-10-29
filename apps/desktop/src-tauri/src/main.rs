@@ -16,7 +16,7 @@ use threadlane_decisions::{
     DecisionAdvice, DecisionClient, DecisionError, DecisionProvider, DecisionRequest,
 };
 use threadlane_desktop_bridge::{
-    DesktopBridge, DesktopSnapshot, RunDetail, ToolStatus, WindowAction,
+    ActivityPage, DesktopBridge, DesktopSnapshot, EventKind, RunDetail, ToolStatus, WindowAction,
 };
 use threadlane_native::{NativeClient, NativeConfig, NativeError, NativeThreadPage};
 use threadlane_plans::{PlanChange, PlanError, PlanRevision, PlanStore};
@@ -292,6 +292,22 @@ async fn desktop_run_detail(
 ) -> Result<RunDetail, String> {
     bridge
         .run_detail(binding_id, run_id)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn desktop_activity_history(
+    bridge: State<'_, DesktopBridge>,
+    binding_id: String,
+    after_seq: Option<u64>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+    run_id: Option<String>,
+    kind: Option<EventKind>,
+) -> Result<ActivityPage, String> {
+    bridge
+        .activity_history(binding_id, after_seq, cursor, limit, run_id, kind)
         .await
         .map_err(|err| err.to_string())
 }
@@ -663,6 +679,7 @@ fn main() -> ExitCode {
             desktop_snapshot,
             desktop_attach,
             desktop_run_detail,
+            desktop_activity_history,
             desktop_start_demo,
             desktop_answer_demo,
             desktop_cancel_demo,

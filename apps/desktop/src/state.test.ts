@@ -1054,3 +1054,5 @@ describe('M4 durable plan ledger, DAG validation, and execution preference bound
     assert.ok(!err.message.includes('super-secret-val-99'));
   });
 });
+
+import './pages/history.test.ts';

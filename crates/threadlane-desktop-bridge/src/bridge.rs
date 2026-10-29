@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use threadlane::{ScopedClient, SupervisorClient};
 use threadlane_core::{
-    Binding, QuestionStatus, Run, RunStatus, MAX_ID_LEN, MAX_STATUS_RECENT_RUNS,
+    ActivityPage, Binding, EventKind, QuestionStatus, Run, RunStatus, MAX_CURSOR_LEN, MAX_ID_LEN,
+    MAX_PAGE_LIMIT, MAX_STATUS_RECENT_RUNS,
 };
 use uuid::Uuid;
 
@@ -548,25 +549,16 @@ impl DesktopBridge {
         let clean_binding_id = validate_id_input(&binding_id, "Invalid binding identifier.")?;
         let clean_run_id = validate_id_input(&run_id, "Invalid task run identifier.")?;
 
-        let (mode, target, demo_available) = {
+        let ctx = {
             let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let target = match guard.observer_mode {
-                AttachmentMode::Demo => guard.demo_target.clone(),
-                AttachmentMode::Runtime => guard.runtime_target.clone(),
-                AttachmentMode::Unconfigured => None,
-            };
-            (
-                guard.observer_mode,
-                target,
-                guard.demo_target.as_ref().is_some_and(|t| t.client.is_ok()),
-            )
+            self.capture_observer_context(&guard)
         };
 
-        if mode == AttachmentMode::Unconfigured {
+        if ctx.mode == AttachmentMode::Unconfigured {
             return Err(BridgeError::Unconfigured);
         }
 
-        let target = target.ok_or(BridgeError::Unconfigured)?;
+        let target = ctx.target.ok_or(BridgeError::Unconfigured)?;
         let client = target.client?;
         let scoped = client
             .scoped(clean_binding_id.clone())
@@ -579,7 +571,18 @@ impl DesktopBridge {
                         "Runtime supervisor returned a mismatched task scope.",
                     ));
                 }
-                let demo_controls = self.build_demo_controls(demo_available);
+                let demo_controls = {
+                    let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.observer_epoch != ctx.observer_epoch
+                        || guard.selection_epoch != ctx.selection_epoch
+                        || guard.observer_mode != ctx.mode
+                    {
+                        return Err(BridgeError::InvalidState(
+                            "Observer attachment or binding selection changed during request.",
+                        ));
+                    }
+                    Self::compute_demo_controls_locked(&guard, ctx.demo_available)
+                };
                 Ok(RunDetail::from_worker(&worker, demo_controls))
             }
             Err(err) if BridgeError::is_worker_not_found(&err) => {
@@ -594,15 +597,176 @@ impl DesktopBridge {
                 }
                 let demo_controls = {
                     let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if guard.observer_epoch != ctx.observer_epoch
+                        || guard.selection_epoch != ctx.selection_epoch
+                        || guard.observer_mode != ctx.mode
+                    {
+                        return Err(BridgeError::InvalidState(
+                            "Observer attachment or binding selection changed during request.",
+                        ));
+                    }
                     if let Some(ref mut owned) = guard.owned_demo {
                         owned.update_from_run(&run);
                     }
-                    Self::compute_demo_controls_locked(&guard, demo_available)
+                    Self::compute_demo_controls_locked(&guard, ctx.demo_available)
                 };
                 Ok(RunDetail::from_demo_run(&run, demo_controls))
             }
             Err(err) => Err(BridgeError::from_threadlane_error(&err)),
         }
+    }
+
+    /// Fetches a bounded, read-only keyset-paginated [`ActivityPage`] of durable activity events
+    /// for the active selected binding in the currently attached runtime.
+    ///
+    /// Resolves the active binding exclusively from the captured trusted observer attachment
+    /// context, validates that `binding_id` is a member of the active attachment's binding list
+    /// (capped to [`MAX_BINDINGS`]) and matches the resolved selected binding, and discards
+    /// stale completions if the observer or selection epoch changes while the request is in flight.
+    /// Never opens `state.db`, calls `pull_events` or `ack_events`, modifies wake-up cursors, or
+    /// probes executables.
+    pub async fn activity_history(
+        &self,
+        binding_id: String,
+        after_seq: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+        run_id: Option<String>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, BridgeError> {
+        let clean_binding_id = validate_id_input(&binding_id, "Invalid binding identifier.")?;
+        let clean_run_id = normalize_optional_id_input(run_id, "Invalid task run identifier.")?;
+        let clean_cursor = normalize_optional_cursor_input(cursor)?;
+
+        if after_seq.is_some() && clean_cursor.is_some() {
+            return Err(BridgeError::InvalidInput(
+                "Cannot specify both after_seq and cursor.",
+            ));
+        }
+
+        if let Some(lim) = limit {
+            if !(1..=MAX_PAGE_LIMIT).contains(&lim) {
+                return Err(BridgeError::InvalidInput(
+                    "Activity page limit must be between 1 and 50.",
+                ));
+            }
+        }
+
+        let ctx = {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            self.capture_observer_context(&guard)
+        };
+
+        if ctx.mode == AttachmentMode::Unconfigured {
+            return Err(BridgeError::Unconfigured);
+        }
+
+        if let Some(ref selected_id) = ctx.selected_binding_id {
+            if selected_id != &clean_binding_id {
+                return Err(BridgeError::NotFound(
+                    "Selected chat binding was not found.",
+                ));
+            }
+        }
+
+        let target = ctx.target.ok_or(BridgeError::Unconfigured)?;
+        let client = target.client?;
+
+        let raw_bindings = client
+            .list_bindings()
+            .await
+            .map_err(|err| BridgeError::from_threadlane_error(&err))?;
+        let capped_bindings: Vec<Binding> = raw_bindings.into_iter().take(MAX_BINDINGS).collect();
+
+        if !capped_bindings
+            .iter()
+            .any(|b| b.binding_id == clean_binding_id)
+        {
+            return Err(BridgeError::NotFound(
+                "Selected chat binding was not found.",
+            ));
+        }
+
+        let resolved_binding_id = resolve_selected_binding_id(
+            &capped_bindings,
+            None,
+            ctx.selected_binding_id.as_deref(),
+            ctx.owned_demo.as_ref().map(|d| d.binding_id.as_str()),
+            ctx.mode,
+        );
+
+        let Some(selected_binding_id) = resolved_binding_id else {
+            return Err(BridgeError::NotFound(
+                "Selected chat binding was not found.",
+            ));
+        };
+
+        if selected_binding_id != clean_binding_id {
+            return Err(BridgeError::NotFound(
+                "Selected chat binding was not found.",
+            ));
+        }
+
+        let scoped = client
+            .scoped(selected_binding_id.clone())
+            .map_err(|err| BridgeError::from_threadlane_error(&err))?;
+
+        let page = scoped
+            .list_activity(after_seq, clean_cursor, limit, clean_run_id.clone(), kind)
+            .await
+            .map_err(|err| BridgeError::from_threadlane_error(&err))?;
+
+        if page.binding_id != selected_binding_id
+            || page
+                .events
+                .iter()
+                .any(|event| event.binding_id != selected_binding_id)
+        {
+            return Err(BridgeError::Protocol(
+                "Runtime supervisor returned a mismatched binding scope.",
+            ));
+        }
+
+        if let Some(ref expected_run_id) = clean_run_id {
+            if page
+                .events
+                .iter()
+                .any(|event| &event.run_id != expected_run_id)
+            {
+                return Err(BridgeError::Protocol(
+                    "Runtime supervisor returned a mismatched task scope.",
+                ));
+            }
+        }
+
+        if let Some(expected_kind) = kind {
+            if page.events.iter().any(|event| event.kind != expected_kind) {
+                return Err(BridgeError::Protocol(
+                    "Runtime supervisor returned a mismatched event kind.",
+                ));
+            }
+        }
+
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.observer_epoch != ctx.observer_epoch
+                || guard.selection_epoch != ctx.selection_epoch
+                || guard.observer_mode != ctx.mode
+                || guard
+                    .selected_binding_id
+                    .as_deref()
+                    .is_some_and(|current| current != selected_binding_id)
+            {
+                return Err(BridgeError::InvalidState(
+                    "Observer attachment or binding selection changed during request.",
+                ));
+            }
+            if guard.selected_binding_id.is_none() {
+                guard.selected_binding_id = Some(selected_binding_id);
+            }
+        }
+
+        Ok(page)
     }
 
     /// Starts a new deterministic local demo run on the dedicated demo runtime:
@@ -1073,6 +1237,13 @@ fn resolve_selected_binding_id(
 }
 
 fn normalize_optional_binding_id(raw: Option<String>) -> Result<Option<String>, BridgeError> {
+    normalize_optional_id_input(raw, "Invalid binding identifier.")
+}
+
+fn normalize_optional_id_input(
+    raw: Option<String>,
+    err_msg: &'static str,
+) -> Result<Option<String>, BridgeError> {
     let Some(value) = raw else {
         return Ok(None);
     };
@@ -1080,8 +1251,22 @@ fn normalize_optional_binding_id(raw: Option<String>) -> Result<Option<String>, 
     if trimmed.is_empty() {
         return Ok(None);
     }
-    let validated = validate_id_input(trimmed, "Invalid binding identifier.")?;
+    let validated = validate_id_input(trimmed, err_msg)?;
     Ok(Some(validated))
+}
+
+fn normalize_optional_cursor_input(raw: Option<String>) -> Result<Option<String>, BridgeError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > MAX_CURSOR_LEN || trimmed != value || trimmed.chars().any(char::is_control) {
+        return Err(BridgeError::InvalidInput("Invalid pagination cursor."));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 fn validate_id_input(raw: &str, err_msg: &'static str) -> Result<String, BridgeError> {

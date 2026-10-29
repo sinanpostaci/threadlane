@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import type {
+  ActivityEvent,
+  ActivityPage,
+  DesktopActivityHistoryArgs,
   DesktopAnswerDemoArgs,
   DesktopAttachArgs,
   DesktopCancelDemoArgs,
@@ -330,6 +333,194 @@ export async function ipcDesktopRunDetail(
     throw new Error(normalizeIpcError(err));
   }
 }
+
+function getDevPreviewActivityPage(args: DesktopActivityHistoryArgs): ActivityPage {
+  const now = Date.now();
+  const bindingId = args.bindingId;
+  const fixtureEvents: ActivityEvent[] =
+    bindingId === 'binding-demo-local'
+      ? [
+          {
+            event_id: 'evt-preview-demo-1',
+            binding_id: bindingId,
+            seq: 1,
+            run_id: 'run-demo-01',
+            revision: 1,
+            step_seq: 1,
+            kind: 'run_started',
+            important: false,
+            payload: {
+              untrusted_data: true,
+              summary:
+                'DEV preview fixture (?preview=1) — not live: Started deterministic local demo run.',
+              question_id: null,
+              question_prompt: null,
+              answer: null,
+              instruction: 'Local deterministic lifecycle verification',
+              cancel_reason: null,
+            },
+            created_at_ms: now - 35_000,
+          },
+          {
+            event_id: 'evt-preview-demo-2',
+            binding_id: bindingId,
+            seq: 2,
+            run_id: 'run-demo-01',
+            revision: devPreview.demoRev,
+            step_seq: 2,
+            kind: 'question_asked',
+            important: true,
+            payload: {
+              untrusted_data: true,
+              summary:
+                'DEV preview fixture (?preview=1) — not live: Awaiting deterministic Continue confirmation.',
+              question_id: 'q-demo-1',
+              question_prompt:
+                'Ready to advance the deterministic local demo with fixed answer Continue?',
+              answer: null,
+              instruction: null,
+              cancel_reason: null,
+            },
+            created_at_ms: now - 18_000,
+          },
+        ]
+      : [
+          {
+            event_id: 'evt-preview-rt-1',
+            binding_id: bindingId,
+            seq: 1,
+            run_id: 'run-worker-agy-01',
+            revision: 1,
+            step_seq: 1,
+            kind: 'worker_started',
+            important: false,
+            payload: {
+              untrusted_data: true,
+              summary:
+                'DEV preview fixture (?preview=1) — not live: Started scoped worktree diff gate review.',
+              question_id: null,
+              question_prompt: null,
+              answer: null,
+              instruction: 'Scoped worktree diff gate review',
+              cancel_reason: null,
+            },
+            created_at_ms: now - 60_000,
+          },
+          {
+            event_id: 'evt-preview-rt-2',
+            binding_id: bindingId,
+            seq: 2,
+            run_id: 'run-worker-agy-01',
+            revision: 4,
+            step_seq: 4,
+            kind: 'worker_progress',
+            important: false,
+            payload: {
+              untrusted_data: true,
+              summary:
+                'DEV preview fixture (?preview=1) — not live: Inspecting isolated worktree diff against base revision.',
+              question_id: null,
+              question_prompt: null,
+              answer: null,
+              instruction: null,
+              cancel_reason: null,
+            },
+            created_at_ms: now - 12_000,
+          },
+          {
+            event_id: 'evt-preview-rt-3',
+            binding_id: bindingId,
+            seq: 3,
+            run_id: 'run-worker-oc-02',
+            revision: 3,
+            step_seq: 3,
+            kind: 'worker_failed',
+            important: true,
+            payload: {
+              untrusted_data: true,
+              summary:
+                'DEV preview fixture (?preview=1) — not live: Provider effort telemetry missing from worker report.',
+              question_id: null,
+              question_prompt: null,
+              answer: null,
+              instruction: null,
+              cancel_reason: null,
+            },
+            created_at_ms: now - 5_000,
+          },
+        ];
+
+  const highWater = fixtureEvents.length > 0 ? fixtureEvents[fixtureEvents.length - 1].seq : 0;
+  const cursorAfter =
+    typeof args.cursor === 'string' && args.cursor.startsWith('preview:')
+      ? Number.parseInt(args.cursor.slice('preview:'.length), 10) || 0
+      : null;
+  const afterSeq = cursorAfter !== null ? cursorAfter : Math.max(0, args.afterSeq ?? 0);
+  const limit = Math.max(1, Math.min(50, args.limit ?? 20));
+  const runIdFilter = args.runId?.trim() || null;
+  const kindFilter = args.kind ?? null;
+
+  const filtered = fixtureEvents.filter((event) => {
+    if (event.seq <= afterSeq || event.seq > highWater) {
+      return false;
+    }
+    if (runIdFilter && event.run_id !== runIdFilter) {
+      return false;
+    }
+    if (kindFilter && event.kind !== kindFilter) {
+      return false;
+    }
+    return true;
+  });
+
+  const hasMore = filtered.length > limit;
+  const pageEvents = filtered.slice(0, limit);
+  const nextCursor =
+    hasMore && pageEvents.length > 0
+      ? `preview:${pageEvents[pageEvents.length - 1].seq}`
+      : null;
+
+  return {
+    binding_id: bindingId,
+    events: pageEvents,
+    next_cursor: nextCursor,
+    has_more: hasMore,
+    high_water_mark_seq: highWater,
+    after_seq: afterSeq,
+  };
+}
+
+export async function ipcDesktopActivityHistory(
+  args: DesktopActivityHistoryArgs
+): Promise<ActivityPage> {
+  const payload = {
+    bindingId: args.bindingId,
+    afterSeq: args.afterSeq ?? null,
+    cursor: args.cursor ?? null,
+    limit: args.limit ?? null,
+    runId: args.runId ?? null,
+    kind: args.kind ?? null,
+  };
+
+  if (!hasTauriRuntime()) {
+    if (isDevPreviewFixtureMode()) {
+      return getDevPreviewActivityPage(payload);
+    }
+    const err = new Error(
+      'bridge_disconnected: Tauri desktop bridge is not connected in this browser window.'
+    ) as Error & { code?: string };
+    err.code = 'bridge_disconnected';
+    throw err;
+  }
+
+  try {
+    return await invoke<ActivityPage>('desktop_activity_history', payload);
+  } catch (err) {
+    throw new Error(normalizeIpcError(err));
+  }
+}
+
+export const desktop_activity_history = ipcDesktopActivityHistory;
 
 export async function ipcDesktopStartDemo(): Promise<DesktopSnapshot> {
   if (!hasTauriRuntime()) {
