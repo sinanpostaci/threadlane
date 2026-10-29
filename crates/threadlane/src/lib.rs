@@ -25,13 +25,13 @@ pub mod supervisor;
 pub use client::{ScopedClient, SupervisorClient};
 pub use codex::{build_codex_queue_args, CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
 pub use descriptor::{
-    RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME, DESCRIPTOR_FILENAME,
-    DESCRIPTOR_VERSION, LOCK_FILENAME, LOOPBACK_HOST,
+    prepare_state_dir, RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME,
+    DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION, LOCK_FILENAME, LOOPBACK_HOST,
 };
 pub use error::{ApiError, Error, ErrorCode};
 pub use mcp::ThreadlaneMcpServer;
 pub use protocol::{
-    BindingListResponse, CreateBindingRequest, RunSummary, ScopedRequest, ScopedResponse,
-    StatusResponse, MAX_STATUS_RECENT_RUNS,
+    BindingListResponse, CreateBindingRequest, RetryWakeupRequest, RunSummary, ScopedRequest,
+    ScopedResponse, StatusResponse, MAX_STATUS_RECENT_RUNS,
 };
 pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS};

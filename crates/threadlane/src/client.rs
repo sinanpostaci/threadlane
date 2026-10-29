@@ -5,12 +5,13 @@ use std::time::Duration;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use threadlane_core::{AckResult, Binding, CoreError, EventBatch, Run, MAX_ID_LEN};
+use threadlane_core::{AckResult, Binding, CoreError, EventBatch, Run, WakeupNotice, MAX_ID_LEN};
 
-use crate::descriptor::{read_and_validate_descriptor, RuntimeDescriptor};
+use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
 use crate::error::{ApiError, Error};
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, ScopedRequest, ScopedResponse, StatusResponse,
+    BindingListResponse, CreateBindingRequest, RetryWakeupRequest, ScopedRequest, ScopedResponse,
+    StatusResponse,
 };
 
 /// Maximum response body size accepted by [`SupervisorClient`] (2 MiB).
@@ -61,6 +62,22 @@ impl SupervisorClient {
     pub fn from_state_dir(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
         let dir = state_dir.as_ref().to_path_buf();
         let _ = read_and_validate_descriptor(&dir)?;
+        let http = build_http_client()?;
+        Ok(Self {
+            source: DescriptorSource::StateDir(dir),
+            http,
+        })
+    }
+
+    /// Creates a lazy client backed by `<state_dir>/supervisor.json` for the stdio MCP server.
+    ///
+    /// Validates static path safety and existing ancestor components immediately without
+    /// requiring `state_dir` or `supervisor.json` to exist at startup. Every subsequent request
+    /// resolves and fully validates `state_dir` and `supervisor.json` before transmitting the
+    /// bearer token.
+    pub fn from_state_dir_lazy(state_dir: impl AsRef<Path>) -> Result<Self, Error> {
+        let dir = state_dir.as_ref().to_path_buf();
+        let _ = validate_lazy_state_dir(&dir)?;
         let http = build_http_client()?;
         Ok(Self {
             source: DescriptorSource::StateDir(dir),
@@ -130,6 +147,23 @@ impl SupervisorClient {
             .await?;
         resp.into_status()
             .ok_or_else(|| Error::Transport("unexpected response kind for status".to_string()))
+    }
+
+    /// Manually re-arms a `Failed` (or `Unknown` when `allow_unknown` is `true`) wake-up claim
+    /// matching `expected_claim_id` on `binding_id` (trusted CLI only).
+    pub async fn retry_wakeup(
+        &self,
+        binding_id: &str,
+        expected_claim_id: &str,
+        allow_unknown: bool,
+    ) -> Result<WakeupNotice, Error> {
+        let clean_id = validate_client_binding_id(binding_id)?;
+        let req = RetryWakeupRequest {
+            expected_claim_id: expected_claim_id.to_string(),
+            allow_unknown,
+        };
+        let path = format!("/v1/bindings/{clean_id}/retry-wakeup");
+        self.send_json(Method::POST, &path, Some(&req)).await
     }
 
     fn resolve_descriptor(&self) -> Result<RuntimeDescriptor, Error> {
@@ -228,6 +262,19 @@ impl ScopedClient {
         binding_id: impl Into<String>,
     ) -> Result<Self, Error> {
         let client = SupervisorClient::from_state_dir(state_dir)?;
+        client.scoped(binding_id)
+    }
+
+    /// Creates a [`ScopedClient`] for `binding_id` with lazy `<state_dir>/supervisor.json`
+    /// resolution for the stdio MCP server.
+    ///
+    /// Validates `binding_id` format and static `state_dir` path safety immediately without
+    /// requiring the supervisor to be running during MCP discovery (`initialize` / `tools/list`).
+    pub fn from_state_dir_lazy(
+        state_dir: impl AsRef<Path>,
+        binding_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let client = SupervisorClient::from_state_dir_lazy(state_dir)?;
         client.scoped(binding_id)
     }
 

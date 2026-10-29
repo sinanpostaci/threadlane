@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use threadlane::{
-    CodexWakeupConfig, Error, ErrorCode, RuntimeDescriptor, ScopedRequest, SecretToken, Supervisor,
-    SupervisorClient, SupervisorConfig, DATABASE_FILENAME, DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION,
-    LOCK_FILENAME, LOOPBACK_HOST,
+    prepare_state_dir, CodexWakeupConfig, Error, ErrorCode, RuntimeDescriptor, ScopedClient,
+    ScopedRequest, SecretToken, Supervisor, SupervisorClient, SupervisorConfig, DATABASE_FILENAME,
+    DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION, LOCK_FILENAME, LOOPBACK_HOST,
 };
 use threadlane_core::{Core, QuestionStatus, RunStatus, WakeupStatus, FIXED_WAKEUP_MESSAGE};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1645,6 +1645,1027 @@ async fn test_persistence_failure_stops_mutations_and_does_not_retry_wakeup() {
     }
 
     tick_handle.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor_security() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_state_dir = temp.path().join("missing_mcp_state");
+    let state_dir = temp.path().join("offline_mcp_state");
+
+    assert!(
+        !missing_state_dir.exists(),
+        "missing_state_dir must not exist before offline MCP discovery"
+    );
+
+    // 1. Eager CLI client constructors must still fail when supervisor/state_dir is missing.
+    assert!(matches!(
+        SupervisorClient::from_state_dir(&missing_state_dir),
+        Err(Error::Transport(_))
+    ));
+    assert!(matches!(
+        ScopedClient::from_state_dir(
+            &missing_state_dir,
+            "bnd_11111111222243338444555555555555"
+        ),
+        Err(Error::Transport(_))
+    ));
+
+    // 2. Lazy MCP constructor validates binding_id format and static path safety immediately.
+    assert!(matches!(
+        ScopedClient::from_state_dir_lazy(&missing_state_dir, "bad/binding"),
+        Err(Error::Core(_))
+    ));
+    assert!(matches!(
+        ScopedClient::from_state_dir_lazy(
+            temp.path().join("../escape"),
+            "bnd_11111111222243338444555555555555"
+        ),
+        Err(Error::SecurityViolation(_))
+    ));
+    let real_parent = temp.path().join("real_parent");
+    fs::create_dir(&real_parent).expect("create real_parent");
+    let symlink_parent = temp.path().join("symlink_parent");
+    symlink(&real_parent, &symlink_parent).expect("create symlink_parent");
+    assert!(matches!(
+        ScopedClient::from_state_dir_lazy(
+            symlink_parent.join("state"),
+            "bnd_11111111222243338444555555555555"
+        ),
+        Err(Error::SecurityViolation(_))
+    ));
+
+    // 3. Offline discovery when `missing_state_dir` does not exist on disk at all.
+    {
+        let mut missing_mcp =
+            spawn_mcp_child(&missing_state_dir, "bnd_11111111222243338444555555555555");
+        let mut missing_stdin = missing_mcp.stdin.take().expect("missing mcp stdin");
+        let missing_stdout = missing_mcp.stdout.take().expect("missing mcp stdout");
+        let mut missing_reader = BufReader::new(missing_stdout);
+
+        send_json_rpc(
+            &mut missing_stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "missing-dir-mcp-client", "version": "0.1.0" }
+                }
+            }),
+        )
+        .await;
+        let _ = read_json_rpc_response(&mut missing_reader, 1).await;
+        send_json_rpc(
+            &mut missing_stdin,
+            &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+
+        send_json_rpc(
+            &mut missing_stdin,
+            &json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
+        )
+        .await;
+        let missing_list = read_json_rpc_response(&mut missing_reader, 2).await;
+        assert_eq!(
+            missing_list["result"]["tools"].as_array().map(Vec::len),
+            Some(8)
+        );
+        assert!(
+            !missing_state_dir.exists(),
+            "initialize and tools/list must not create or require state_dir"
+        );
+
+        send_json_rpc(
+            &mut missing_stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "status", "arguments": {} }
+            }),
+        )
+        .await;
+        let missing_status = read_json_rpc_response(&mut missing_reader, 3).await;
+        assert_eq!(missing_status["result"]["isError"], json!(true));
+        assert_eq!(
+            missing_status["result"]["structuredContent"]["error"]["code"],
+            json!("transport_error")
+        );
+
+        drop(missing_stdin);
+        cleanup_child(&mut missing_mcp).await;
+    }
+
+    // 4. Seed a real generated binding in `state_dir` using `Core` (while no supervisor is running
+    // and no `supervisor.json` exists), then launch a long-running MCP process offline.
+    let seeded_binding = {
+        let db_path = threadlane::descriptor::prepare_database_path(&state_dir).expect("prep db");
+        let mut core = Core::open(&db_path).expect("open core");
+        let b = core
+            .create_binding(THREAD_UUID_A, "Offline MCP Chat")
+            .expect("create binding");
+        threadlane::descriptor::enforce_database_permissions(&state_dir).expect("enforce perms");
+        b
+    };
+    let desc_path = state_dir.join(DESCRIPTOR_FILENAME);
+    assert!(
+        !desc_path.exists(),
+        "supervisor.json must not exist while supervisor is offline"
+    );
+
+    let mut mcp_child = spawn_mcp_child(&state_dir, &seeded_binding.binding_id);
+    let mut stdin = mcp_child.stdin.take().expect("mcp stdin");
+    let stdout = mcp_child.stdout.take().expect("mcp stdout");
+    let mut reader = BufReader::new(stdout);
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "offline-discovery-client", "version": "0.1.0" }
+            }
+        }),
+    )
+    .await;
+    let init_resp = read_json_rpc_response(&mut reader, 1).await;
+    assert_eq!(
+        init_resp["result"]["serverInfo"]["name"],
+        json!("threadlane")
+    );
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    )
+    .await;
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }),
+    )
+    .await;
+    let list_resp = read_json_rpc_response(&mut reader, 2).await;
+    let tools = list_resp["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert_eq!(tools.len(), 8, "MCP tool count must remain 8");
+
+    // 5. Calling `status` while supervisor is offline returns a structured transport_error tool result.
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let offline_status_resp = read_json_rpc_response(&mut reader, 3).await;
+    assert_eq!(offline_status_resp["result"]["isError"], json!(true));
+    assert_eq!(
+        offline_status_resp["result"]["structuredContent"]["error"]["code"],
+        json!("transport_error")
+    );
+
+    // 6. Descriptor security is never weakened on tool calls: an insecure (0644) descriptor
+    // placed in state_dir before supervisor starts is rejected with `security_violation`.
+    fs::write(
+        &desc_path,
+        serde_json::to_vec(&RuntimeDescriptor {
+            version: DESCRIPTOR_VERSION,
+            host: LOOPBACK_HOST.to_string(),
+            port: 6553,
+            pid: 999,
+            token: SecretToken::generate(),
+        })
+        .unwrap(),
+    )
+    .expect("write insecure descriptor");
+    fs::set_permissions(&desc_path, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let insecure_desc_resp = read_json_rpc_response(&mut reader, 4).await;
+    assert_eq!(insecure_desc_resp["result"]["isError"], json!(true));
+    assert_eq!(
+        insecure_desc_resp["result"]["structuredContent"]["error"]["code"],
+        json!("security_violation")
+    );
+    fs::remove_file(&desc_path).expect("remove insecure descriptor");
+
+    // 7. Start the supervisor and verify `status` and `start_demo` succeed in the SAME
+    // long-running MCP process.
+    let handle_1 = Supervisor::start(fast_supervisor_config(&state_dir))
+        .await
+        .expect("start supervisor 1");
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let online_status_resp = read_json_rpc_response(&mut reader, 5).await;
+    assert_eq!(online_status_resp["result"]["isError"], json!(false));
+    assert_eq!(
+        online_status_resp["result"]["structuredContent"]["data"]["binding"]["binding_id"],
+        json!(seeded_binding.binding_id)
+    );
+    assert_eq!(
+        online_status_resp["result"]["structuredContent"]["data"]["binding"]["thread_uuid"],
+        json!(THREAD_UUID_A)
+    );
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "start_demo",
+                "arguments": {
+                    "command_key": "offline-mcp-start-1",
+                    "instruction": "Task started after supervisor came online",
+                    "step_delay_ms": 25
+                }
+            }
+        }),
+    )
+    .await;
+    let start_resp = read_json_rpc_response(&mut reader, 6).await;
+    assert_eq!(start_resp["result"]["isError"], json!(false));
+
+    // 8. Restart supervisor (new port and bearer token) and verify the SAME MCP process refreshes
+    // the descriptor and continues working.
+    let old_token = handle_1.descriptor().token.as_str().to_string();
+    handle_1.shutdown().await;
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let mid_restart_resp = read_json_rpc_response(&mut reader, 7).await;
+    assert_eq!(mid_restart_resp["result"]["isError"], json!(true));
+    assert_eq!(
+        mid_restart_resp["result"]["structuredContent"]["error"]["code"],
+        json!("transport_error")
+    );
+
+    let handle_2 = Supervisor::start(fast_supervisor_config(&state_dir))
+        .await
+        .expect("start supervisor 2");
+    assert_ne!(handle_2.descriptor().token.as_str(), old_token);
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "status",
+                "arguments": {}
+            }
+        }),
+    )
+    .await;
+    let restarted_status_resp = read_json_rpc_response(&mut reader, 8).await;
+    assert_eq!(restarted_status_resp["result"]["isError"], json!(false));
+    assert_eq!(
+        restarted_status_resp["result"]["structuredContent"]["data"]["total_runs"],
+        json!(1)
+    );
+
+    drop(stdin);
+    cleanup_child(&mut mcp_child).await;
+    handle_2.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_arbitrary_non_empty_directory_is_rejected_without_chmod_or_writes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+
+    // 1. Pre-existing non-empty directory with 0755 permissions and unrelated contents must be
+    // rejected before chmod or writing any Threadlane files.
+    let arbitrary_dir = temp.path().join("arbitrary_project_dir");
+    fs::create_dir(&arbitrary_dir).expect("create arbitrary_dir");
+    fs::set_permissions(&arbitrary_dir, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let user_file = arbitrary_dir.join("README.txt");
+    fs::write(&user_file, b"important user content").expect("write user_file");
+    let user_subdir = arbitrary_dir.join("src");
+    fs::create_dir(&user_subdir).expect("create user_subdir");
+
+    match prepare_state_dir(&arbitrary_dir) {
+        Err(Error::SecurityViolation(msg)) => {
+            assert!(msg.contains("non-empty"), "unexpected message: {msg}");
+        }
+        other => panic!("expected SecurityViolation for arbitrary non-empty dir, got {other:?}"),
+    }
+
+    match Supervisor::start(fast_supervisor_config(&arbitrary_dir)).await {
+        Err(Error::SecurityViolation(msg)) => {
+            assert!(msg.contains("non-empty"), "unexpected message: {msg}");
+        }
+        other => panic!("expected SecurityViolation on Supervisor::start, got {other:?}"),
+    }
+
+    let preserved_mode = fs::symlink_metadata(&arbitrary_dir)
+        .expect("stat arbitrary_dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        preserved_mode, 0o755,
+        "arbitrary directory permissions must not be changed to 0700"
+    );
+    assert_eq!(
+        fs::read(&user_file).expect("read user_file"),
+        b"important user content"
+    );
+    assert!(user_subdir.is_dir());
+    assert!(!arbitrary_dir.join(LOCK_FILENAME).exists());
+    assert!(!arbitrary_dir.join(DATABASE_FILENAME).exists());
+    assert!(!arbitrary_dir.join(DESCRIPTOR_FILENAME).exists());
+
+    // 2. Even if a pre-existing non-empty directory already has 0700 permissions, if it contains
+    // none of the known Threadlane state entries it must still be rejected without writing files.
+    let private_unrelated = temp.path().join("private_unrelated");
+    fs::create_dir(&private_unrelated).expect("create private_unrelated");
+    fs::set_permissions(&private_unrelated, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    fs::write(private_unrelated.join("notes.txt"), b"private notes").expect("write notes");
+
+    assert!(matches!(
+        Supervisor::start(fast_supervisor_config(&private_unrelated)).await,
+        Err(Error::SecurityViolation(_))
+    ));
+    assert!(!private_unrelated.join(LOCK_FILENAME).exists());
+    assert!(!private_unrelated.join(DATABASE_FILENAME).exists());
+    assert!(!private_unrelated.join(DESCRIPTOR_FILENAME).exists());
+
+    // 3. A pre-existing EMPTY directory (even with 0755 permissions) may be initialized into a
+    // 0700 private state directory, and then reopened as a genuine private state directory.
+    let empty_state_dir = temp.path().join("empty_state_dir");
+    fs::create_dir(&empty_state_dir).expect("create empty_state_dir");
+    fs::set_permissions(&empty_state_dir, fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+
+    let handle = Supervisor::start(fast_supervisor_config(&empty_state_dir))
+        .await
+        .expect("initialize empty state dir");
+    let initialized_mode = fs::symlink_metadata(&empty_state_dir)
+        .expect("stat empty_state_dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(initialized_mode, 0o700);
+    handle.shutdown().await;
+
+    let handle_reopen = Supervisor::start(fast_supervisor_config(&empty_state_dir))
+        .await
+        .expect("reopen genuine private state dir");
+    handle_reopen.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_threadlane");
+
+    // Part 1: Failed wake-up -> CLI `retry-wakeup` -> exactly one more dispatch, unchanged ack cursor.
+    let fail_state_dir = temp.path().join("retry_fail_state");
+    let fail_log = temp.path().join("retry_fail_invocations.txt");
+    let fake_codex = temp.path().join("retry_codex.sh");
+    let script = format!(
+        "#!/bin/sh\necho \"$1|$2|$3|$4|$5\" >> \"{}\"\nexit 0\n",
+        fail_log.display()
+    );
+    fs::write(&fake_codex, script).expect("write fake_codex");
+    // Start non-executable (0600) so the first wake-up attempt fails to spawn -> `Failed`.
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+    let binding = {
+        let db_path =
+            threadlane::descriptor::prepare_database_path(&fail_state_dir).expect("prep db");
+        let mut core = Core::open(&db_path).expect("open core");
+        let b = core
+            .create_binding(THREAD_UUID_A, "Retry Fail Chat")
+            .expect("create binding");
+        threadlane::descriptor::enforce_database_permissions(&fail_state_dir)
+            .expect("enforce perms");
+        b
+    };
+
+    let handle = Supervisor::start(SupervisorConfig {
+        state_dir: fail_state_dir.clone(),
+        tick_interval: Duration::from_millis(15),
+        codex: Some(CodexWakeupConfig {
+            executable: fake_codex.clone(),
+            notify_bindings: BTreeSet::from([binding.binding_id.clone()]),
+            timeout: Duration::from_millis(1_000),
+        }),
+    })
+    .await
+    .expect("start supervisor");
+
+    let client = SupervisorClient::from_state_dir(&fail_state_dir).expect("client");
+    let scoped = client
+        .clone()
+        .scoped(&binding.binding_id)
+        .expect("scoped client");
+
+    let _ = scoped
+        .start_demo(
+            "rf-start".to_string(),
+            "Retry failed wake".to_string(),
+            Some(10),
+        )
+        .await
+        .expect("start demo");
+
+    let failed_status = wait_for_wakeup_status(&scoped, WakeupStatus::Failed).await;
+    assert_eq!(failed_status.wakeup.attempt_count, 1);
+    let failed_claim_id = failed_status
+        .wakeup
+        .claim_id
+        .clone()
+        .expect("failed claim_id");
+
+    // Pull 1 event (without acknowledging) so delivered_seq = 1, acked_seq = 0.
+    let pulled = scoped
+        .pull_events(None, Some(1))
+        .await
+        .expect("pull 1 event");
+    assert_eq!(pulled.delivered_seq, 1);
+    assert_eq!(pulled.acked_seq, 0);
+
+    // Fix executable permissions to 0700 before manual retry.
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+
+    // Wrong expected_claim_id via CLI must fail and not dispatch.
+    let bad_cas_out = Command::new(bin)
+        .args([
+            "retry-wakeup",
+            "--state-dir",
+            fail_state_dir.to_str().unwrap(),
+            "--binding",
+            &binding.binding_id,
+            "--expected-claim",
+            "wcl_00000000000000000000000000000000",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run bad CAS retry-wakeup");
+    assert!(!bad_cas_out.status.success());
+
+    // Valid CLI `retry-wakeup` re-arms the Failed notice and triggers exactly one more dispatch.
+    let retry_out = run_cli_cmd(
+        bin,
+        &[
+            "retry-wakeup",
+            "--state-dir",
+            fail_state_dir.to_str().unwrap(),
+            "--binding",
+            &binding.binding_id,
+            "--expected-claim",
+            &failed_claim_id,
+        ],
+    )
+    .await;
+    assert_eq!(retry_out["binding_id"], json!(binding.binding_id));
+
+    let submitted_status = wait_for_wakeup_status(&scoped, WakeupStatus::Submitted).await;
+    assert_eq!(submitted_status.wakeup.attempt_count, 2);
+    assert_eq!(submitted_status.binding.delivered_seq, 1);
+    assert_eq!(
+        submitted_status.binding.acked_seq, 0,
+        "retry-wakeup must not alter acked_seq cursor"
+    );
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let logged = fs::read_to_string(&fail_log).expect("read fail_log");
+    assert_eq!(
+        logged.lines().count(),
+        1,
+        "expected exactly one dispatch after manual retry of Failed claim"
+    );
+
+    // Repeating retry-wakeup with the stale failed_claim_id or on Submitted state must fail.
+    let repeat_out = Command::new(bin)
+        .args([
+            "retry-wakeup",
+            "--state-dir",
+            fail_state_dir.to_str().unwrap(),
+            "--binding",
+            &binding.binding_id,
+            "--expected-claim",
+            &failed_claim_id,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run stale repeat retry-wakeup");
+    assert!(!repeat_out.status.success());
+
+    // Auth rejection and unknown-field rejection on POST /v1/bindings/{id}/retry-wakeup.
+    let base_url = handle.descriptor().base_url().expect("base_url");
+    let raw_http = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("raw client");
+
+    let unauth_resp = raw_http
+        .post(format!(
+            "{base_url}/v1/bindings/{}/retry-wakeup",
+            binding.binding_id
+        ))
+        .json(&json!({ "expected_claim_id": failed_claim_id }))
+        .send()
+        .await
+        .expect("send unauth retry-wakeup");
+    assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let injected_field_resp = raw_http
+        .post(format!(
+            "{base_url}/v1/bindings/{}/retry-wakeup",
+            binding.binding_id
+        ))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", handle.descriptor().token.as_str()),
+        )
+        .json(&json!({
+            "expected_claim_id": failed_claim_id,
+            "allow_unknown": false,
+            "now_ms": 12345
+        }))
+        .send()
+        .await
+        .expect("send injected now_ms retry-wakeup");
+    assert_eq!(injected_field_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Scoped `call` CLI must reject `retry_wakeup` operation.
+    let scoped_call_out = Command::new(bin)
+        .args([
+            "call",
+            "--state-dir",
+            fail_state_dir.to_str().unwrap(),
+            "--binding",
+            &binding.binding_id,
+            "--request",
+            r#"{"op":"retry_wakeup","expected_claim_id":"wcl_123"}"#,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run scoped call retry_wakeup");
+    assert!(!scoped_call_out.status.success());
+
+    // MCP server must reject `retry_wakeup` tool call and any injected retry fields.
+    let mut mcp_child = spawn_mcp_child(&fail_state_dir, &binding.binding_id);
+    let mut stdin = mcp_child.stdin.take().expect("mcp stdin");
+    let stdout = mcp_child.stdout.take().expect("mcp stdout");
+    let mut reader = BufReader::new(stdout);
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "retry-check-mcp", "version": "0.1.0" }
+            }
+        }),
+    )
+    .await;
+    let _ = read_json_rpc_response(&mut reader, 1).await;
+    send_json_rpc(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "retry_wakeup",
+                "arguments": { "expected_claim_id": failed_claim_id }
+            }
+        }),
+    )
+    .await;
+    let mcp_retry_resp = read_json_rpc_response(&mut reader, 2).await;
+    assert!(
+        mcp_retry_resp.get("error").is_some()
+            || mcp_retry_resp["result"]["isError"] == json!(true),
+        "MCP must reject retry_wakeup tool call: {mcp_retry_resp}"
+    );
+
+    drop(stdin);
+    cleanup_child(&mut mcp_child).await;
+    handle.shutdown().await;
+
+    // Part 2: `Unknown` wake-up requires explicit `--allow-unknown` flag.
+    let unknown_state_dir = temp.path().join("retry_unknown_state");
+    let hang_marker = temp.path().join("hang_marker");
+    let unknown_log = temp.path().join("retry_unknown_invocations.txt");
+    let toggle_codex = temp.path().join("toggle_codex.sh");
+    fs::write(&hang_marker, b"1").expect("write hang_marker");
+    let toggle_script = format!(
+        "#!/bin/sh\nif [ -f \"{}\" ]; then\n  exec sleep 30\nfi\necho invoked >> \"{}\"\nexit 0\n",
+        hang_marker.display(),
+        unknown_log.display()
+    );
+    fs::write(&toggle_codex, toggle_script).expect("write toggle_codex");
+    fs::set_permissions(&toggle_codex, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+
+    let unknown_binding = {
+        let db_path =
+            threadlane::descriptor::prepare_database_path(&unknown_state_dir).expect("prep db");
+        let mut core = Core::open(&db_path).expect("open core");
+        let b = core
+            .create_binding(THREAD_UUID_B, "Retry Unknown Chat")
+            .expect("create binding");
+        threadlane::descriptor::enforce_database_permissions(&unknown_state_dir)
+            .expect("enforce perms");
+        b
+    };
+
+    let unknown_handle = Supervisor::start(SupervisorConfig {
+        state_dir: unknown_state_dir.clone(),
+        tick_interval: Duration::from_millis(15),
+        codex: Some(CodexWakeupConfig {
+            executable: toggle_codex,
+            notify_bindings: BTreeSet::from([unknown_binding.binding_id.clone()]),
+            timeout: Duration::from_millis(80),
+        }),
+    })
+    .await
+    .expect("start unknown supervisor");
+
+    let unknown_scoped = SupervisorClient::from_state_dir(&unknown_state_dir)
+        .expect("unknown client")
+        .scoped(&unknown_binding.binding_id)
+        .expect("unknown scoped");
+
+    let _ = unknown_scoped
+        .start_demo(
+            "ru-start".to_string(),
+            "Trigger timeout".to_string(),
+            Some(10),
+        )
+        .await
+        .expect("start unknown demo");
+
+    let unknown_st = wait_for_wakeup_status(&unknown_scoped, WakeupStatus::Unknown).await;
+    assert_eq!(unknown_st.wakeup.attempt_count, 1);
+    let unknown_claim_id = unknown_st.wakeup.claim_id.clone().expect("unknown claim_id");
+
+    // Remove hang_marker so future invocations succeed.
+    fs::remove_file(&hang_marker).expect("remove hang_marker");
+
+    // Without `--allow-unknown`, CLI `retry-wakeup` must be rejected.
+    let without_flag = Command::new(bin)
+        .args([
+            "retry-wakeup",
+            "--state-dir",
+            unknown_state_dir.to_str().unwrap(),
+            "--binding",
+            &unknown_binding.binding_id,
+            "--expected-claim",
+            &unknown_claim_id,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .expect("run retry-wakeup without --allow-unknown");
+    assert!(
+        !without_flag.status.success(),
+        "retry-wakeup on Unknown must fail without --allow-unknown"
+    );
+    let st_still_unknown = unknown_scoped.status().await.expect("status still unknown");
+    assert_eq!(st_still_unknown.wakeup.status, WakeupStatus::Unknown);
+    assert_eq!(st_still_unknown.wakeup.attempt_count, 1);
+
+    // With `--allow-unknown`, CLI `retry-wakeup` succeeds and dispatches once.
+    let _ = run_cli_cmd(
+        bin,
+        &[
+            "retry-wakeup",
+            "--state-dir",
+            unknown_state_dir.to_str().unwrap(),
+            "--binding",
+            &unknown_binding.binding_id,
+            "--expected-claim",
+            &unknown_claim_id,
+            "--allow-unknown",
+        ],
+    )
+    .await;
+
+    let st_after_allow = wait_for_wakeup_status(&unknown_scoped, WakeupStatus::Submitted).await;
+    assert_eq!(st_after_allow.wakeup.attempt_count, 2);
+    let unknown_lines = fs::read_to_string(&unknown_log).expect("read unknown_log");
+    assert_eq!(unknown_lines.lines().count(), 1);
+
+    unknown_handle.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn test_serve_child_process_exits_nonzero_on_fatal_sqlite_error_and_releases_lock() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("child_fatal_state");
+    let count_file = temp.path().join("child_fatal_count.txt");
+    let fake_codex = temp.path().join("child_fake_codex.sh");
+    let bin = env!("CARGO_BIN_EXE_threadlane");
+
+    let script = format!(
+        "#!/bin/sh\necho invoked >> \"{}\"\nexit 0\n",
+        count_file.display()
+    );
+    fs::write(&fake_codex, script).expect("write fake_codex");
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+
+    let binding = {
+        let db_path = threadlane::descriptor::prepare_database_path(&state_dir).expect("prep db");
+        let mut core = Core::open(&db_path).expect("open core");
+        let b = core
+            .create_binding(THREAD_UUID_A, "Child Fatal Chat")
+            .expect("create binding");
+        drop(core);
+
+        let conn = rusqlite::Connection::open(&db_path).expect("open sqlite for trigger");
+        conn.execute_batch(
+            "CREATE TRIGGER fail_child_wakeup_result
+             BEFORE UPDATE ON wakeups
+             WHEN NEW.resolved_at_ms IS NOT NULL
+             BEGIN
+                 SELECT RAISE(ABORT, 'simulated child disk failure on wakeup result');
+             END;",
+        )
+        .expect("create trigger");
+        drop(conn);
+        threadlane::descriptor::enforce_database_permissions(&state_dir).expect("enforce perms");
+        b
+    };
+
+    let mut serve_child = Command::new(bin)
+        .arg("serve")
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--codex")
+        .arg(&fake_codex)
+        .arg("--notify-binding")
+        .arg(&binding.binding_id)
+        .arg("--tick-interval-ms")
+        .arg("15")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn threadlane serve");
+
+    let desc_path = state_dir.join(DESCRIPTOR_FILENAME);
+    for _ in 0..100 {
+        if desc_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(desc_path.exists(), "supervisor.json should appear");
+
+    let scoped = ScopedClient::from_state_dir(&state_dir, &binding.binding_id).expect("scoped");
+    let _ = scoped
+        .start_demo(
+            "cf-start".to_string(),
+            "Trigger fatal wakeup result failure in child serve".to_string(),
+            Some(10),
+        )
+        .await
+        .expect("start demo");
+
+    // Wait for `threadlane serve` child process to exit on its own (without sending a signal).
+    let output = tokio::time::timeout(Duration::from_secs(5), serve_child.wait_with_output())
+        .await
+        .expect("serve child must exit within bounded timeout after fatal error")
+        .expect("wait_with_output");
+
+    assert!(
+        !output.status.success(),
+        "serve must exit nonzero on fatal persistence error, got {:?}",
+        output.status
+    );
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr_text.contains("storage_error")
+            && stderr_text.contains("simulated child disk failure"),
+        "stderr must preserve the actual fatal diagnostic, got: {stderr_text}"
+    );
+
+    // Descriptor must be cleaned up and fake Codex must have been invoked only once.
+    assert!(
+        !desc_path.exists(),
+        "supervisor.json must be removed on fatal shutdown"
+    );
+    let invocations = fs::read_to_string(&count_file).expect("read count_file");
+    assert_eq!(
+        invocations.lines().count(),
+        1,
+        "external wake-up must not be repeated on fatal error"
+    );
+
+    // Drop the test trigger and prove a new supervisor owner can immediately acquire the lock and start.
+    {
+        let conn =
+            rusqlite::Connection::open(state_dir.join(DATABASE_FILENAME)).expect("open sqlite");
+        conn.execute_batch("DROP TRIGGER fail_child_wakeup_result;")
+            .expect("drop trigger");
+    }
+
+    let new_owner = Supervisor::start(fast_supervisor_config(&state_dir))
+        .await
+        .expect("new supervisor owner must be able to start after fatal exit");
+    let new_scoped = ScopedClient::from_state_dir(&state_dir, &binding.binding_id)
+        .expect("new scoped client");
+    let recovered_status = new_scoped.status().await.expect("status on new owner");
+    assert_eq!(
+        recovered_status.wakeup.status,
+        WakeupStatus::Unknown,
+        "in-flight claim left by faulted owner must recover to Unknown without auto-retry"
+    );
+    new_owner.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_oversized_derived_event_instruction_does_not_fault_supervisor_or_other_binding() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("oversized_derived_state");
+
+    let handle = Supervisor::start(fast_supervisor_config(&state_dir))
+        .await
+        .expect("start supervisor");
+    let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+
+    let binding_a = client
+        .create_binding(THREAD_UUID_A, "Oversized Instruction Binding A")
+        .await
+        .expect("bind A");
+    let binding_b = client
+        .create_binding(THREAD_UUID_B, "Healthy Sibling Binding B")
+        .await
+        .expect("bind B");
+
+    let scoped_a = client
+        .clone()
+        .scoped(&binding_a.binding_id)
+        .expect("scoped A");
+    let scoped_b = client
+        .clone()
+        .scoped(&binding_b.binding_id)
+        .expect("scoped B");
+
+    // Exact reproduced input: 2411 '\u{1}' bytes + 1685 'a' bytes = 4096 bytes.
+    let exact_instruction = format!("{}{}", "\u{1}".repeat(2411), "a".repeat(1685));
+    assert_eq!(exact_instruction.len(), 4096);
+
+    let started = scoped_a
+        .start_demo(
+            "over-start-1".to_string(),
+            exact_instruction.clone(),
+            Some(15),
+        )
+        .await
+        .expect("start_demo with 4096-byte control-heavy instruction");
+    assert_eq!(
+        started.instruction, exact_instruction,
+        "accepted raw instruction must remain full in Run"
+    );
+
+    // Wait for tick to emit derived progress + question events and transition to WaitingInput.
+    let waiting_a = wait_for_run_status(&scoped_a, &started.run_id, RunStatus::WaitingInput).await;
+    assert!(
+        handle.fatal_error().is_none(),
+        "supervisor must not fault on tick with control-heavy 4096-byte instruction"
+    );
+    assert_eq!(waiting_a.instruction, exact_instruction);
+    assert_eq!(waiting_a.revision_history[0].instruction, exact_instruction);
+
+    // Sibling binding B must remain completely functional.
+    let run_b = scoped_b
+        .start_demo(
+            "b-start-1".to_string(),
+            "Sibling task on B".to_string(),
+            Some(15),
+        )
+        .await
+        .expect("start demo on B after A ticked");
+    let _waiting_b = wait_for_run_status(&scoped_b, &run_b.run_id, RunStatus::WaitingInput).await;
+
+    // Restart supervisor and verify neither A nor B faults after restart, and A can complete.
+    handle.shutdown().await;
+    let handle_restarted = Supervisor::start(fast_supervisor_config(&state_dir))
+        .await
+        .expect("restart supervisor");
+
+    let status_b = scoped_b.status().await.expect("status B after restart");
+    assert_eq!(status_b.total_runs, 1);
+
+    let q_id = waiting_a.active_question_id.expect("question_id on A");
+    let _ = scoped_a
+        .answer(
+            "over-ans-1".to_string(),
+            started.run_id.clone(),
+            q_id,
+            1,
+            "Proceed after compact derived question".to_string(),
+        )
+        .await
+        .expect("answer A after restart");
+
+    let completed_a = wait_for_run_status(&scoped_a, &started.run_id, RunStatus::Completed).await;
+    assert_eq!(completed_a.instruction, exact_instruction);
+    assert!(handle_restarted.fatal_error().is_none());
+
+    let batch_a = scoped_a
+        .pull_events(None, Some(20))
+        .await
+        .expect("pull events on A");
+    assert_eq!(batch_a.events.len(), 5);
+    assert_eq!(
+        batch_a.events[0].payload.instruction.as_deref(),
+        Some(exact_instruction.as_str())
+    );
+
+    handle_restarted.shutdown().await;
 }
 
 async fn wait_for_run_status(

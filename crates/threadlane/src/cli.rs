@@ -98,6 +98,25 @@ pub enum Subcommands {
         request: String,
     },
 
+    /// Manually re-arm a failed (or explicitly unknown) wake-up claim for a binding (trusted CLI only).
+    RetryWakeup {
+        /// Private state directory path where the supervisor is running.
+        #[arg(long)]
+        state_dir: PathBuf,
+
+        /// Target binding identifier (`bnd_<uuid>`).
+        #[arg(long)]
+        binding: String,
+
+        /// Expected active claim identifier (`wcl_<uuid>`) to re-arm.
+        #[arg(long = "expected-claim")]
+        expected_claim: String,
+
+        /// Explicitly allow retrying a claim in `unknown` status (may cause duplicate wake-up delivery).
+        #[arg(long)]
+        allow_unknown: bool,
+    },
+
     /// Run the stdio MCP server scoped to a single binding.
     Mcp {
         /// Private state directory path where the supervisor is running.
@@ -169,8 +188,13 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
                 codex_timeout_ms,
             )?;
             let handle = Supervisor::start(config).await?;
-            wait_for_shutdown_signal().await;
-            handle.shutdown().await;
+            tokio::select! {
+                _ = wait_for_shutdown_signal() => {}
+                _ = handle.wait_for_fatal() => {}
+            }
+            if let Some(api_err) = handle.shutdown_and_take_fatal().await {
+                return Err(Error::Remote(api_err));
+            }
             Ok(())
         }
         Subcommands::Bind {
@@ -206,8 +230,21 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             println!("{}", serde_json::to_string_pretty(&response)?);
             Ok(())
         }
+        Subcommands::RetryWakeup {
+            state_dir,
+            binding,
+            expected_claim,
+            allow_unknown,
+        } => {
+            let client = SupervisorClient::from_state_dir(&state_dir)?;
+            let notice = client
+                .retry_wakeup(&binding, &expected_claim, allow_unknown)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&notice)?);
+            Ok(())
+        }
         Subcommands::Mcp { state_dir, binding } => {
-            let scoped = ScopedClient::from_state_dir(&state_dir, binding)?;
+            let scoped = ScopedClient::from_state_dir_lazy(&state_dir, binding)?;
             let server = ThreadlaneMcpServer::new(scoped);
             server.run_stdio().await
         }

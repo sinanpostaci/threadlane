@@ -288,7 +288,30 @@ pub fn validate_no_symlink_components(path: &Path, label: &str) -> Result<PathBu
     Ok(resolved)
 }
 
-/// Prepares and validates the state directory (`0700` on Unix, rejecting symlinks in any component).
+/// Validates static path safety and existing ancestor components for a lazy client `state_dir`
+/// without requiring the directory or `supervisor.json` to exist yet.
+pub fn validate_lazy_state_dir(state_dir: &Path) -> Result<PathBuf, Error> {
+    let resolved = validate_no_symlink_components(state_dir, "state directory")?;
+    if let Ok(meta) = fs::symlink_metadata(&resolved) {
+        if meta.file_type().is_symlink() {
+            return Err(Error::SecurityViolation(format!(
+                "state directory `{}` must not be a symlink",
+                state_dir.display()
+            )));
+        }
+        if !meta.file_type().is_dir() {
+            return Err(Error::SecurityViolation(format!(
+                "state directory `{}` is not a directory",
+                state_dir.display()
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+/// Prepares and validates the state directory (`0700` on Unix, rejecting symlinks in any
+/// component and refusing to modify pre-existing non-empty directories that contain no Threadlane
+/// state entries).
 pub fn prepare_state_dir(state_dir: &Path) -> Result<(), Error> {
     let resolved = validate_no_symlink_components(state_dir, "state directory")?;
 
@@ -342,6 +365,13 @@ pub fn prepare_state_dir(state_dir: &Path) -> Result<(), Error> {
         if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
             return Err(Error::SecurityViolation(format!(
                 "state directory `{}` must be a non-symlink directory",
+                state_dir.display()
+            )));
+        }
+        let is_non_empty = fs::read_dir(&resolved)?.next().transpose()?.is_some();
+        if is_non_empty && !has_any_state_entry(&resolved) {
+            return Err(Error::SecurityViolation(format!(
+                "state directory `{}` is a pre-existing non-empty directory with no Threadlane runtime state entries",
                 state_dir.display()
             )));
         }

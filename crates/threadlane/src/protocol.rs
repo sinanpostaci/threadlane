@@ -28,6 +28,19 @@ pub struct BindingListResponse {
     pub bindings: Vec<Binding>,
 }
 
+/// Trusted CLI request to manually re-arm a `Failed` (or explicitly `Unknown`) wake-up claim.
+///
+/// Explicitly excluded from [`ScopedRequest`] and MCP tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetryWakeupRequest {
+    /// Expected claim identifier (`wcl_<uuid>`) currently recorded on the binding's wake-up notice.
+    pub expected_claim_id: String,
+    /// Explicitly allow retrying a wake-up claim in `WakeupStatus::Unknown` (may cause duplicate wake-up delivery).
+    #[serde(default)]
+    pub allow_unknown: bool,
+}
+
 /// Compact summary of a single run for [`StatusResponse`].
 ///
 /// Omits historical `revision_history` and `questions` lists to keep `status` compact;

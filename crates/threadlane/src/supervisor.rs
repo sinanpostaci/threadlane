@@ -23,7 +23,8 @@ use crate::descriptor::{
 };
 use crate::error::{ApiError, Error, ErrorCode};
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, ScopedRequest, ScopedResponse, StatusResponse,
+    BindingListResponse, CreateBindingRequest, RetryWakeupRequest, ScopedRequest, ScopedResponse,
+    StatusResponse,
 };
 
 /// Default background tick interval (ms) for advancing due demo runs and checking wake-up claims.
@@ -98,6 +99,7 @@ struct SharedState {
     active: Mutex<Option<ActiveCore>>,
     retired: AtomicBool,
     fatal_error: std::sync::Mutex<Option<ApiError>>,
+    fatal_tx: watch::Sender<Option<ApiError>>,
     token: SecretToken,
     tick_interval: Duration,
     codex: Option<CodexWakeupConfig>,
@@ -146,6 +148,7 @@ impl SharedState {
             api_err.code, redacted_msg
         );
         *slot = Some(api_err.clone());
+        let _ = self.fatal_tx.send_replace(Some(api_err.clone()));
         self.wake_notify.notify_waiters();
         api_err
     }
@@ -274,6 +277,32 @@ impl SupervisorHandle {
         self.shared.fatal_error()
     }
 
+    /// Waits until the supervisor records a fatal persistence or runtime error and returns it.
+    pub async fn wait_for_fatal(&self) -> ApiError {
+        let mut rx = self.shared.fatal_tx.subscribe();
+        if let Some(err) = self.fatal_error() {
+            return err;
+        }
+        loop {
+            if let Some(err) = rx.borrow_and_update().clone() {
+                return err;
+            }
+            if rx.changed().await.is_err() {
+                if let Some(err) = self.fatal_error() {
+                    return err;
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Gracefully shuts down the supervisor and returns any recorded fatal error.
+    pub async fn shutdown_and_take_fatal(self) -> Option<ApiError> {
+        let shared = Arc::clone(&self.shared);
+        self.shutdown().await;
+        shared.fatal_error()
+    }
+
     /// Gracefully stops the HTTP server and background worker, reaps any in-flight Codex
     /// sender process, removes `supervisor.json`, and releases the state directory lock.
     pub async fn shutdown(mut self) {
@@ -366,10 +395,13 @@ impl Supervisor {
             _lock: lock,
         };
 
+        let (fatal_tx, _fatal_rx) = watch::channel(None);
+
         let shared = Arc::new(SharedState {
             active: Mutex::new(Some(active_core)),
             retired: AtomicBool::new(false),
             fatal_error: std::sync::Mutex::new(None),
+            fatal_tx,
             token,
             tick_interval: config.tick_interval,
             codex: config.codex,
@@ -426,6 +458,10 @@ fn build_router(state: Arc<SharedState>) -> Router {
         .route(
             "/v1/bindings/{binding_id}/command",
             post(handle_scoped_command),
+        )
+        .route(
+            "/v1/bindings/{binding_id}/retry-wakeup",
+            post(handle_retry_wakeup),
         )
         .fallback(handle_fallback)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -616,6 +652,28 @@ async fn handle_scoped_command(
     }
 
     Ok(Json(response))
+}
+
+async fn handle_retry_wakeup(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    AxumPath(binding_id): AxumPath<String>,
+    body: Bytes,
+) -> Result<Json<threadlane_core::WakeupNotice>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: RetryWakeupRequest = parse_json_body(&body)?;
+    let now = current_time_ms();
+
+    let notice = {
+        let mut access = state.acquire_for_request().await?;
+        access
+            .core_mut()
+            .retry_wakeup(&binding_id, &req.expected_claim_id, req.allow_unknown, now)
+            .map_err(|err| map_core_error(&state, "retry_wakeup failed", err))?
+    };
+
+    state.wake_notify.notify_one();
+    Ok(Json(notice))
 }
 
 async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::Receiver<bool>) {
