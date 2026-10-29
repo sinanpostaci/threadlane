@@ -38,6 +38,9 @@ pub const WORK_AREA_MARKER_VERSION: u32 = 1;
 /// Filename of the private (`0600`) ownership marker inside `work_area_root`.
 pub const WORK_AREA_MARKER_FILENAME: &str = ".threadlane-work-area.json";
 
+/// Filename of the private (`0600`) cross-process initialization lock inside `work_area_root`.
+pub const WORK_AREA_LOCK_FILENAME: &str = ".threadlane-work-area.lock";
+
 /// Maximum permitted byte size when reading a worktree ownership manifest or work-area marker.
 pub const MAX_MANIFEST_BYTES: u64 = 65_536;
 
@@ -155,6 +158,11 @@ pub struct WorktreeManifest {
     /// PID of the supervisor/runner currently executing a job in this worktree, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_job_pid: Option<u32>,
+    /// Set when `cleanup_integrated_worktree` removed the clean checkout at this verified
+    /// `accepted_head_commit`, but safe `git branch -d` refused because the primary source
+    /// checkout `HEAD` did not yet contain `accepted_head_commit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_cleanup_accepted_head: Option<String>,
 }
 
 /// Classification of a file change detected in a worktree relative to `base_commit`.
@@ -283,6 +291,96 @@ pub struct CleanupReport {
     /// Removed private ownership manifest path.
     pub removed_manifest_path: PathBuf,
 }
+
+/// Explicit ownership, ancestry, and receipt proof required to clean up a productive
+/// worktree whose `HEAD` has advanced beyond `base_commit` and been integrated into a
+/// target commit.
+///
+/// Unlike [`cleanup_worktree`], which strictly refuses any worktree where `HEAD != base_commit`,
+/// [`cleanup_integrated_worktree`] verifies ownership, clean checkout state, inactive job locks,
+/// exact primary source `HEAD` match, `accepted_head_commit` ancestry inside `expected_target_commit`,
+/// and non-empty review/integration receipt proof without rewriting `base_commit` or using
+/// `--force` / `-D`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegratedCleanupRequest {
+    /// Trusted private work-area root directory.
+    pub work_area_root: PathBuf,
+    /// Software-generated worktree identifier whose manifest resides in `<work_area_root>/manifests/`.
+    pub worktree_id: String,
+    /// Expected 40-character hex base commit SHA recorded in the worktree manifest.
+    pub expected_base_commit: String,
+    /// Reviewed and accepted 40-character hex commit SHA that must match the worktree's current `HEAD`.
+    pub accepted_head_commit: String,
+    /// Target 40-character hex commit SHA (e.g. integration branch head) that must contain `accepted_head_commit` in its ancestry.
+    pub expected_target_commit: String,
+    /// Expected 40-character hex commit SHA of the primary source repository's current `HEAD`.
+    pub expected_source_head_commit: String,
+    /// 64-character hex SHA-256 digest of the approved review subject.
+    pub review_subject_digest: String,
+    /// Identifier of the operator review acceptance receipt.
+    pub review_receipt_id: String,
+    /// Identifier of the operator integration receipt.
+    pub integration_receipt_id: String,
+}
+
+/// Structured confirmation returned when [`cleanup_integrated_worktree`] completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegratedCleanupReport {
+    /// Cleaned worktree identifier.
+    pub worktree_id: String,
+    /// Worktree kind.
+    pub kind: WorktreeKind,
+    /// Canonical checkout directory path that was removed.
+    pub removed_checkout_path: PathBuf,
+    /// Software branch name associated with the worktree.
+    pub branch_name: String,
+    /// Path to the private ownership manifest.
+    pub manifest_path: PathBuf,
+    /// Verified accepted task `HEAD` commit SHA.
+    pub accepted_head_commit: String,
+    /// Verified target commit SHA that contains `accepted_head_commit` in its ancestry.
+    pub verified_target_commit: String,
+    /// Verified primary source checkout `HEAD` commit SHA.
+    pub verified_source_head_commit: String,
+    /// Approved review subject SHA-256 digest bound to this cleanup.
+    pub review_subject_digest: String,
+    /// Approved review receipt identifier bound to this cleanup.
+    pub review_receipt_id: String,
+    /// Integration receipt identifier bound to this cleanup.
+    pub integration_receipt_id: String,
+    /// True when the worktree checkout directory was removed via `git worktree remove`.
+    pub checkout_removed: bool,
+    /// True when the software branch was deleted via safe `git branch -d`.
+    pub branch_removed: bool,
+    /// True when the private ownership manifest was removed (only when `branch_removed` is also true).
+    pub manifest_removed: bool,
+    /// True when the checkout directory was removed, but safe `git branch -d` refused to delete
+    /// the branch (preserving the branch ref and manifest).
+    pub partial_cleanup: bool,
+    /// Diagnostic explanation when `partial_cleanup` is `true` and the branch was preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_preserved_reason: Option<String>,
+}
+
+/// Bounded output from a supervised, environment-sanitized Git subprocess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SupervisedGitOutput {
+    /// Raw stdout bytes captured within the configured byte budget.
+    pub stdout_bytes: Vec<u8>,
+    /// Sanitized and secret-redacted stderr diagnostic summary.
+    pub stderr: String,
+    /// Process exit code, if exited normally.
+    pub exit_code: Option<i32>,
+}
+
+/// Controlled Git environment overrides applied after stripping all inherited `GIT_*` variables.
+pub const SANITIZED_GIT_ENV_OVERRIDES: &[(&str, &str)] = &[
+    ("GIT_TERMINAL_PROMPT", "0"),
+    ("GIT_CONFIG_NOSYSTEM", "1"),
+    ("GIT_CONFIG_SYSTEM", "/dev/null"),
+    ("GIT_CONFIG_GLOBAL", "/dev/null"),
+];
 
 /// Combined report of running a worker inside an owned task worktree and evaluating the post-run diff gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,14 +639,21 @@ impl WorktreeManager {
         let manifest_path = manifests_dir.join(&manifest_filename);
         let _ = validate_absolute_no_symlink_components(&manifest_path, "manifest_path")?;
 
+        let area_lock_path = self.work_area_root.join(WORK_AREA_LOCK_FILENAME);
+        let area_lock_file = open_work_area_lock_file(&area_lock_path)?;
+        area_lock_file.lock_exclusive().map_err(WorkerError::Io)?;
+
         // Refuse if target checkout path or manifest already exists; never reset or overwrite!
         if fs::symlink_metadata(&checkout_path).is_ok() {
+            let _ = area_lock_file.unlock();
             return Err(WorkerError::TargetAlreadyExists(checkout_path));
         }
         if fs::symlink_metadata(&manifest_path).is_ok() {
+            let _ = area_lock_file.unlock();
             return Err(WorkerError::TargetAlreadyExists(manifest_path));
         }
         if branch_exists(&self.repository_path, &branch_name, self.git_timeout_ms)? {
+            let _ = area_lock_file.unlock();
             return Err(WorkerError::TargetAlreadyExists(PathBuf::from(format!(
                 "refs/heads/{branch_name}"
             ))));
@@ -590,6 +695,7 @@ impl WorktreeManager {
             allowed_write_paths,
             job_active: false,
             active_job_pid: None,
+            partial_cleanup_accepted_head: None,
         };
 
         write_private_json_atomic(
@@ -598,6 +704,7 @@ impl WorktreeManager {
             &manifest,
             "worktree manifest",
         )?;
+        let _ = area_lock_file.unlock();
 
         Ok(manifest)
     }
@@ -1576,6 +1683,643 @@ pub fn cleanup_worktree(request: &CleanupRequest) -> Result<CleanupReport, Worke
     })
 }
 
+/// Performs explicit, proof-verified cleanup of an owned worktree whose reviewed changes
+/// (`accepted_head_commit`) have been integrated into `expected_target_commit`.
+///
+/// Unlike [`cleanup_worktree`], which refuses any worktree where `HEAD != base_commit`,
+/// this function preserves `manifest.base_commit` without modification and verifies:
+/// - The private ownership manifest in `<work_area_root>/manifests/<worktree_id>.json` is valid
+///   and its `base_commit` matches `request.expected_base_commit`;
+/// - No worker job is active (`job_active == false`, no live `active_job_pid`, and `.lock` is free);
+/// - The primary source repository's `git-common-dir` matches the manifest and its current `HEAD`
+///   equals `request.expected_source_head_commit`;
+/// - `manifest.base_commit` is an ancestor of `request.accepted_head_commit`, and
+///   `request.accepted_head_commit` is an ancestor of `request.expected_target_commit`;
+/// - Non-empty validated `review_subject_digest` (64-hex SHA-256), `review_receipt_id`, and
+///   `integration_receipt_id` are supplied;
+/// - The worktree checkout is on `manifest.branch_name`, has no uncommitted, staged, untracked,
+///   or ignored files, and its `HEAD` equals `request.accepted_head_commit` (or was already
+///   removed by a prior verified partial cleanup for the exact same `accepted_head_commit`).
+///
+/// Never uses `git worktree remove --force` or `git branch -D`. If safe `git branch -d`
+/// refuses to delete the branch (for example, because `expected_target_commit` is on an
+/// integration branch not yet merged into the primary source repository's `HEAD`), records
+/// `partial_cleanup: true` and preserves both the Git branch ref and the ownership manifest.
+pub fn cleanup_integrated_worktree(
+    request: &IntegratedCleanupRequest,
+) -> Result<IntegratedCleanupReport, WorkerError> {
+    let mut manifest = load_and_verify_manifest(&request.work_area_root, &request.worktree_id)?;
+
+    // 1. Refuse if a job is active (manifest flag, live PID, or held flock).
+    if manifest.job_active {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::ActiveJob,
+            detail: "manifest indicates `job_active == true`".to_string(),
+        });
+    }
+    if let Some(pid) = manifest.active_job_pid.filter(|&pid| is_process_alive(pid)) {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::ActiveJob,
+            detail: format!("active_job_pid {pid} is still running"),
+        });
+    }
+
+    let manifests_dir = manifest.work_area_root.join(MANIFESTS_SUBDIR);
+    let lock_path = manifests_dir.join(format!("{}.lock", manifest.worktree_id));
+    let lock_file = open_private_lock_file(&lock_path, "worktree job lock")?;
+    lock_file
+        .try_lock_exclusive()
+        .map_err(|_| WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::ActiveJob,
+            detail: "worktree job lock is held by an active process".to_string(),
+        })?;
+
+    // 2. Validate proof fields (40-hex commit SHAs, 64-hex review subject digest, receipt IDs).
+    let expected_base =
+        validate_exact_40_hex_sha(&request.expected_base_commit, "expected_base_commit").map_err(
+            |err| WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::MissingOrInvalidManifest,
+                detail: err.to_string(),
+            },
+        )?;
+    let accepted_head =
+        validate_exact_40_hex_sha(&request.accepted_head_commit, "accepted_head_commit").map_err(
+            |err| WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::MissingOrInvalidManifest,
+                detail: err.to_string(),
+            },
+        )?;
+    let expected_target =
+        validate_exact_40_hex_sha(&request.expected_target_commit, "expected_target_commit")
+            .map_err(|err| WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::MissingOrInvalidManifest,
+                detail: err.to_string(),
+            })?;
+    let expected_source_head = validate_exact_40_hex_sha(
+        &request.expected_source_head_commit,
+        "expected_source_head_commit",
+    )
+    .map_err(|err| WorkerError::CleanupRefused {
+        worktree_id: manifest.worktree_id.clone(),
+        reason: CleanupRefusalReason::MissingOrInvalidManifest,
+        detail: err.to_string(),
+    })?;
+    let review_subject_digest =
+        validate_sha256_hex_digest(&request.review_subject_digest, "review_subject_digest")
+            .map_err(|err| WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::MissingOrInvalidManifest,
+                detail: err.to_string(),
+            })?;
+    validate_simple_identifier(&request.review_receipt_id, "review_receipt_id").map_err(|err| {
+        WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::MissingOrInvalidManifest,
+            detail: err.to_string(),
+        }
+    })?;
+    validate_simple_identifier(&request.integration_receipt_id, "integration_receipt_id").map_err(
+        |err| WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::MissingOrInvalidManifest,
+            detail: err.to_string(),
+        },
+    )?;
+
+    if manifest.base_commit != expected_base {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+            detail: format!(
+                "manifest base_commit `{}` does not match expected_base_commit `{expected_base}`",
+                manifest.base_commit
+            ),
+        });
+    }
+
+    // 3. Verify primary source repository ownership and current source HEAD.
+    let expected_git_dir =
+        resolve_repository_common_git_dir(&manifest.repository_path).map_err(|err| {
+            WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                detail: format!("failed to resolve expected repository git-common-dir: {err}"),
+            }
+        })?;
+    if let Some(manifest_common_dir) = manifest
+        .repository_common_git_dir
+        .as_ref()
+        .filter(|&dir| dir != &expected_git_dir)
+    {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+            detail: format!(
+                "repository git-common-dir `{}` does not match manifest `{}`",
+                expected_git_dir.display(),
+                manifest_common_dir.display()
+            ),
+        });
+    }
+
+    let current_source_head =
+        resolve_commit_sha(&manifest.repository_path, "HEAD").map_err(|err| {
+            WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                detail: format!("failed to resolve primary source repository HEAD: {err}"),
+            }
+        })?;
+    if current_source_head != expected_source_head {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+            detail: format!(
+                "primary source repository HEAD `{current_source_head}` does not match expected_source_head_commit `{expected_source_head}`"
+            ),
+        });
+    }
+
+    // 4. Verify commit existence and ancestry (`base_commit <= accepted_head <= expected_target`).
+    let resolved_target =
+        resolve_commit_sha(&manifest.repository_path, &expected_target).map_err(|err| {
+            WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::DirtyWorktree,
+                detail: format!(
+                "expected_target_commit `{expected_target}` does not exist in repository: {err}"
+            ),
+            }
+        })?;
+    if resolved_target != expected_target {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::DirtyWorktree,
+            detail: format!(
+                "expected_target_commit resolved to `{resolved_target}`, expected `{expected_target}`"
+            ),
+        });
+    }
+
+    let base_is_ancestor = is_commit_ancestor(
+        &manifest.repository_path,
+        &manifest.base_commit,
+        &accepted_head,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .map_err(|err| WorkerError::CleanupRefused {
+        worktree_id: manifest.worktree_id.clone(),
+        reason: CleanupRefusalReason::DirtyWorktree,
+        detail: format!("failed to verify base_commit ancestry of accepted_head_commit: {err}"),
+    })?;
+    if !base_is_ancestor {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::DirtyWorktree,
+            detail: format!(
+                "manifest base_commit `{}` is not an ancestor of accepted_head_commit `{accepted_head}`",
+                manifest.base_commit
+            ),
+        });
+    }
+
+    let accepted_in_target = is_commit_ancestor(
+        &manifest.repository_path,
+        &accepted_head,
+        &expected_target,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .map_err(|err| WorkerError::CleanupRefused {
+        worktree_id: manifest.worktree_id.clone(),
+        reason: CleanupRefusalReason::DirtyWorktree,
+        detail: format!(
+            "failed to verify accepted_head_commit ancestry in expected_target_commit: {err}"
+        ),
+    })?;
+    if !accepted_in_target {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id,
+            reason: CleanupRefusalReason::DirtyWorktree,
+            detail: format!(
+                "accepted_head_commit `{accepted_head}` is not an ancestor of expected_target_commit `{expected_target}`; refusing to delete unmerged worktree"
+            ),
+        });
+    }
+
+    // 5. Verify and remove the worktree checkout (or verify a prior partial cleanup where the
+    // checkout was already cleanly removed at this exact `accepted_head`).
+    let resuming_partial_cleanup = manifest.partial_cleanup_accepted_head.as_deref()
+        == Some(accepted_head.as_str())
+        && fs::symlink_metadata(&manifest.checkout_path).is_err();
+
+    let removed_checkout_path = if resuming_partial_cleanup {
+        let branch_ref = format!("refs/heads/{}", manifest.branch_name);
+        let branch_tip = resolve_commit_sha(&manifest.repository_path, &branch_ref).map_err(
+            |err| WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id.clone(),
+                reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                detail: format!(
+                    "failed to resolve preserved branch `{branch_ref}` during partial cleanup completion: {err}"
+                ),
+            },
+        )?;
+        if branch_tip != accepted_head {
+            return Err(WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id,
+                reason: CleanupRefusalReason::DirtyWorktree,
+                detail: format!(
+                    "preserved branch `{}` tip `{branch_tip}` diverges from accepted_head_commit `{accepted_head}`",
+                    manifest.branch_name
+                ),
+            });
+        }
+        manifest.checkout_path.clone()
+    } else {
+        let canonical_checkout =
+            validate_existing_canonical_dir(&manifest.checkout_path, "worktree checkout_path")
+                .map_err(|err| WorkerError::CleanupRefused {
+                    worktree_id: manifest.worktree_id.clone(),
+                    reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                    detail: format!("checkout_path validation failed: {err}"),
+                })?;
+        if canonical_checkout != manifest.checkout_path {
+            return Err(WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id,
+                reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                detail: "checkout_path canonicalization mismatch".to_string(),
+            });
+        }
+
+        let canonical_common_dir =
+            resolve_repository_common_git_dir(&canonical_checkout).map_err(|err| {
+                WorkerError::CleanupRefused {
+                    worktree_id: manifest.worktree_id.clone(),
+                    reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                    detail: format!("failed to resolve worktree git-common-dir: {err}"),
+                }
+            })?;
+        if canonical_common_dir != expected_git_dir {
+            return Err(WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id,
+                reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                detail: format!(
+                    "worktree git-common-dir `{}` does not belong to repository `{}`",
+                    canonical_common_dir.display(),
+                    expected_git_dir.display()
+                ),
+            });
+        }
+
+        let current_branch = run_git(
+            &canonical_checkout,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        )
+        .map_err(|_| WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+            detail: "worktree HEAD is detached or not on expected software branch".to_string(),
+        })?;
+        if current_branch.trim() != manifest.branch_name {
+            return Err(WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id,
+                reason: CleanupRefusalReason::UnexpectedBranchOrOwner,
+                detail: format!(
+                    "worktree is on branch `{}`, expected `{}`",
+                    current_branch.trim(),
+                    manifest.branch_name
+                ),
+            });
+        }
+
+        if !is_worktree_clean(&canonical_checkout, DEFAULT_GIT_COMMAND_TIMEOUT_MS)? {
+            return Err(WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id,
+                reason: CleanupRefusalReason::DirtyWorktree,
+                detail: concat!(
+                    "worktree has uncommitted, untracked, or ignored files; ",
+                    "preserving artifacts for review"
+                )
+                .to_string(),
+            });
+        }
+
+        let head_sha = resolve_commit_sha(&canonical_checkout, "HEAD")?;
+        if head_sha != accepted_head {
+            return Err(WorkerError::CleanupRefused {
+                worktree_id: manifest.worktree_id,
+                reason: CleanupRefusalReason::DirtyWorktree,
+                detail: format!(
+                    "worktree HEAD `{head_sha}` does not match accepted_head_commit `{accepted_head}`; preserving worktree"
+                ),
+            });
+        }
+
+        let checkout_str = canonical_checkout.to_str().ok_or_else(|| {
+            WorkerError::InvalidSpec("checkout_path must be valid UTF-8".to_string())
+        })?;
+        run_git(
+            &manifest.repository_path,
+            &["worktree", "remove", "--", checkout_str],
+        )?;
+        canonical_checkout
+    };
+
+    // 6. Attempt safe branch deletion (`git branch -d`, never `-D`).
+    let branch_out = run_git_bytes_bounded_raw(
+        &manifest.repository_path,
+        &["branch", "-d", "--", &manifest.branch_name],
+        MAX_GIT_STDERR_BYTES,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )?;
+    if let Some(reason) =
+        branch_out.failure_reason(MAX_GIT_STDERR_BYTES, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+    {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git branch -d -- {}", manifest.branch_name),
+            status: branch_out.exit_code,
+            stderr: reason,
+        });
+    }
+
+    if branch_out.exit_code == Some(0) {
+        let _ = fs::remove_file(&manifest.manifest_path);
+        let _ = lock_file.unlock();
+        let _ = fs::remove_file(&lock_path);
+
+        Ok(IntegratedCleanupReport {
+            worktree_id: manifest.worktree_id,
+            kind: manifest.kind,
+            removed_checkout_path,
+            branch_name: manifest.branch_name,
+            manifest_path: manifest.manifest_path,
+            accepted_head_commit: accepted_head,
+            verified_target_commit: expected_target,
+            verified_source_head_commit: expected_source_head,
+            review_subject_digest,
+            review_receipt_id: request.review_receipt_id.clone(),
+            integration_receipt_id: request.integration_receipt_id.clone(),
+            checkout_removed: true,
+            branch_removed: true,
+            manifest_removed: true,
+            partial_cleanup: false,
+            branch_preserved_reason: None,
+        })
+    } else {
+        manifest.partial_cleanup_accepted_head = Some(accepted_head.clone());
+        let manifest_filename = format!("{}.json", manifest.worktree_id);
+        write_private_json_atomic(
+            &manifests_dir,
+            &manifest_filename,
+            &manifest,
+            "worktree manifest",
+        )?;
+        let _ = lock_file.unlock();
+
+        let reason = if branch_out.stderr.trim().is_empty() {
+            format!(
+                "safe `git branch -d` refused to delete branch `{}` (exit {:?}); branch and manifest preserved",
+                manifest.branch_name, branch_out.exit_code
+            )
+        } else {
+            branch_out.stderr
+        };
+
+        Ok(IntegratedCleanupReport {
+            worktree_id: manifest.worktree_id,
+            kind: manifest.kind,
+            removed_checkout_path,
+            branch_name: manifest.branch_name,
+            manifest_path: manifest.manifest_path,
+            accepted_head_commit: accepted_head,
+            verified_target_commit: expected_target,
+            verified_source_head_commit: expected_source_head,
+            review_subject_digest,
+            review_receipt_id: request.review_receipt_id.clone(),
+            integration_receipt_id: request.integration_receipt_id.clone(),
+            checkout_removed: true,
+            branch_removed: false,
+            manifest_removed: false,
+            partial_cleanup: true,
+            branch_preserved_reason: Some(reason),
+        })
+    }
+}
+
+/// Validates an exact 40-character hexadecimal Git object SHA and normalizes it to lowercase.
+pub fn validate_exact_40_hex_sha(value: &str, label: &str) -> Result<String, WorkerError> {
+    if value.len() != 40 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WorkerError::InvalidSpec(format!(
+            "{label} must be an exact 40-character hexadecimal SHA (got `{value}`)"
+        )));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// Validates an exact 64-character hexadecimal SHA-256 digest and normalizes it to lowercase.
+pub fn validate_sha256_hex_digest(value: &str, label: &str) -> Result<String, WorkerError> {
+    if value.len() != 64 || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WorkerError::InvalidSpec(format!(
+            "{label} must be an exact 64-character hexadecimal SHA-256 digest (got `{value}`)"
+        )));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// Resolves `rev` in `repo_or_worktree` to an exact 40-character lowercase hexadecimal commit SHA.
+pub fn resolve_exact_commit_sha(
+    repo_or_worktree: &Path,
+    rev: &str,
+    timeout_ms: u64,
+) -> Result<String, WorkerError> {
+    validate_commit_ref(rev)?;
+    resolve_commit_sha_with_timeout(repo_or_worktree, rev, timeout_ms)
+}
+
+/// Resolves `rev^{tree}` in `repo_or_worktree` to an exact 40-character lowercase hexadecimal tree SHA.
+pub fn resolve_exact_tree_sha(
+    repo_or_worktree: &Path,
+    rev: &str,
+    timeout_ms: u64,
+) -> Result<String, WorkerError> {
+    validate_commit_ref(rev)?;
+    let rev_arg = format!("{rev}^{{tree}}");
+    let out = run_git_with_timeout(
+        repo_or_worktree,
+        &["rev-parse", "--verify", &rev_arg],
+        timeout_ms,
+    )?;
+    let sha = out.trim();
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("rev-parse --verify {rev_arg}"),
+            status: Some(0),
+            stderr: format!("expected 40-hex tree SHA, got `{sha}`"),
+        });
+    }
+    Ok(sha.to_ascii_lowercase())
+}
+
+/// Returns `true` if `ancestor_rev` is an ancestor of (or equal to) `descendant_rev` in `repo_or_worktree`.
+pub fn is_commit_ancestor(
+    repo_or_worktree: &Path,
+    ancestor_rev: &str,
+    descendant_rev: &str,
+    timeout_ms: u64,
+) -> Result<bool, WorkerError> {
+    validate_commit_ref(ancestor_rev)?;
+    validate_commit_ref(descendant_rev)?;
+    let out = run_git_bytes_bounded_raw(
+        repo_or_worktree,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            "--",
+            ancestor_rev,
+            descendant_rev,
+        ],
+        MAX_GIT_STDERR_BYTES,
+        timeout_ms,
+    )?;
+    if let Some(reason) = out.failure_reason(MAX_GIT_STDERR_BYTES, timeout_ms) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git merge-base --is-ancestor -- {ancestor_rev} {descendant_rev}"),
+            status: out.exit_code,
+            stderr: reason,
+        });
+    }
+    match out.exit_code {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        other => Err(WorkerError::GitCommandFailed {
+            command: format!("git merge-base --is-ancestor -- {ancestor_rev} {descendant_rev}"),
+            status: other,
+            stderr: out.stderr,
+        }),
+    }
+}
+
+/// Returns `true` if `checkout_path` has no uncommitted, staged, untracked, or ignored files.
+pub fn is_worktree_clean(checkout_path: &Path, timeout_ms: u64) -> Result<bool, WorkerError> {
+    let status_out = run_git_bytes_bounded_with_timeout(
+        checkout_path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        timeout_ms,
+    )?;
+    if status_out
+        .failure_reason(DEFAULT_MAX_GIT_OUTPUT_BYTES, timeout_ms)
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(status_out.bytes.is_empty())
+}
+
+/// Removes all inherited `GIT_*` environment variables (case-insensitive) from `cmd`
+/// and installs controlled `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`,
+/// `GIT_CONFIG_SYSTEM=/dev/null`, and `GIT_CONFIG_GLOBAL=/dev/null` overrides.
+pub fn sanitize_git_command_env(cmd: &mut std::process::Command) {
+    sanitize_git_command_env_from(cmd, std::env::vars_os());
+}
+
+/// Removes all `GIT_*` environment variables (case-insensitive) present in `vars` from `cmd`
+/// and installs controlled `SANITIZED_GIT_ENV_OVERRIDES`.
+pub fn sanitize_git_command_env_from<I, K, V>(cmd: &mut std::process::Command, vars: I)
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: AsRef<std::ffi::OsStr>,
+{
+    for (key, _) in vars {
+        let key_os = key.as_ref();
+        if key_os
+            .to_string_lossy()
+            .to_ascii_uppercase()
+            .starts_with("GIT_")
+        {
+            cmd.env_remove(key_os);
+        }
+    }
+    for &(k, v) in SANITIZED_GIT_ENV_OVERRIDES {
+        cmd.env(k, v);
+    }
+}
+
+/// Runs a supervised, environment-sanitized `git -C <dir> <args...>` command with bounded output
+/// and returns its UTF-8 stdout on exit code 0.
+pub fn run_sanitized_git(
+    dir: &Path,
+    args: &[&str],
+    timeout_ms: u64,
+) -> Result<String, WorkerError> {
+    run_git_with_timeout(dir, args, timeout_ms)
+}
+
+/// Runs a supervised, environment-sanitized `git -C <dir> <args...>` command with an explicit
+/// stdout byte cap and returns its raw stdout bytes on exit code 0.
+pub fn run_sanitized_git_bytes(
+    dir: &Path,
+    args: &[&str],
+    max_stdout_bytes: usize,
+    timeout_ms: u64,
+) -> Result<SupervisedGitOutput, WorkerError> {
+    let out = run_git_bytes_bounded_raw(dir, args, max_stdout_bytes, timeout_ms)?;
+    if let Some(reason) = out.failure_overflow_or_timeout_reason(max_stdout_bytes, timeout_ms) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git {}", args.join(" ")),
+            status: out.exit_code,
+            stderr: reason,
+        });
+    }
+    if out.exit_code != Some(0) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git {}", args.join(" ")),
+            status: out.exit_code,
+            stderr: out.stderr,
+        });
+    }
+    Ok(SupervisedGitOutput {
+        stdout_bytes: out.bytes,
+        stderr: out.stderr,
+        exit_code: out.exit_code,
+    })
+}
+
+/// Runs a supervised, environment-sanitized `git -C <dir> <args...>` command and returns its
+/// bounded output even when the exit code is non-zero (still failing if stdout/stderr overflows,
+/// times out, or has incomplete process-group cleanup).
+pub fn run_sanitized_git_allow_nonzero(
+    dir: &Path,
+    args: &[&str],
+    max_stdout_bytes: usize,
+    timeout_ms: u64,
+) -> Result<SupervisedGitOutput, WorkerError> {
+    let out = run_git_bytes_bounded_raw(dir, args, max_stdout_bytes, timeout_ms)?;
+    if let Some(reason) = out.failure_overflow_or_timeout_reason(max_stdout_bytes, timeout_ms) {
+        return Err(WorkerError::GitCommandFailed {
+            command: format!("git {}", args.join(" ")),
+            status: out.exit_code,
+            stderr: reason,
+        });
+    }
+    Ok(SupervisedGitOutput {
+        stdout_bytes: out.bytes,
+        stderr: out.stderr,
+        exit_code: out.exit_code,
+    })
+}
+
 fn prepare_owned_work_area(
     checked_work_area: &Path,
     repository_common_git_dir: &Path,
@@ -1598,34 +2342,35 @@ fn prepare_owned_work_area(
                 )));
             }
 
-            let mut entry_names = Vec::new();
-            for entry_res in fs::read_dir(checked_work_area)? {
-                let entry = entry_res?;
-                entry_names.push(entry.file_name().to_string_lossy().to_string());
-            }
-
-            // Refuse unrelated non-empty roots BEFORE any chmod or subdirectory creation.
-            if !entry_names.is_empty() {
-                let has_marker = entry_names.iter().any(|n| n == WORK_AREA_MARKER_FILENAME);
-                let unexpected = entry_names.iter().find(|n| {
-                    !matches!(
-                        n.as_str(),
-                        WORK_AREA_MARKER_FILENAME | MANIFESTS_SUBDIR | CHECKOUTS_SUBDIR
-                    )
-                });
-                if !has_marker || unexpected.is_some() {
-                    return Err(WorkerError::SecurityViolation(format!(
-                        "refusing existing non-empty work_area_root `{}` without valid Threadlane ownership marker (found entries: {:?})",
-                        checked_work_area.display(),
-                        entry_names
-                    )));
-                }
-            }
-
             #[cfg(unix)]
             {
                 let mode = meta.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
+                    let mut entry_names = Vec::new();
+                    for entry_res in fs::read_dir(checked_work_area)? {
+                        let entry = entry_res?;
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name != WORK_AREA_LOCK_FILENAME {
+                            entry_names.push(name);
+                        }
+                    }
+                    entry_names.sort();
+                    if !entry_names.is_empty() {
+                        let has_marker = entry_names.iter().any(|n| n == WORK_AREA_MARKER_FILENAME);
+                        let unexpected = entry_names.iter().find(|n| {
+                            !matches!(
+                                n.as_str(),
+                                WORK_AREA_MARKER_FILENAME | MANIFESTS_SUBDIR | CHECKOUTS_SUBDIR
+                            )
+                        });
+                        if !has_marker || unexpected.is_some() {
+                            return Err(WorkerError::SecurityViolation(format!(
+                                "refusing existing non-empty work_area_root `{}` without valid Threadlane ownership marker (found entries: {:?})",
+                                checked_work_area.display(),
+                                entry_names
+                            )));
+                        }
+                    }
                     return Err(WorkerError::SecurityViolation(format!(
                         "existing work_area_root `{}` has non-private permissions {:04o} (expected 0700); refusing to chmod existing directory",
                         checked_work_area.display(),
@@ -1633,71 +2378,283 @@ fn prepare_owned_work_area(
                     )));
                 }
             }
-
-            let canonical_work_area = fs::canonicalize(checked_work_area)?;
-            if canonical_work_area != checked_work_area {
-                return Err(WorkerError::SecurityViolation(format!(
-                    "work_area_root `{}` resolved to unexpected canonical path `{}`",
-                    checked_work_area.display(),
-                    canonical_work_area.display()
-                )));
-            }
-
-            if !entry_names.is_empty() {
-                let marker = verify_existing_work_area_marker(&canonical_work_area)?;
-                if marker.repository_common_git_dir != repository_common_git_dir {
-                    return Err(WorkerError::SecurityViolation(format!(
-                        "work_area_root `{}` is owned by repository `{}` (cannot reuse for `{}`)",
-                        canonical_work_area.display(),
-                        marker.repository_common_git_dir.display(),
-                        repository_common_git_dir.display()
-                    )));
-                }
-            } else {
-                let marker = WorkAreaOwnershipMarker {
-                    marker_version: WORK_AREA_MARKER_VERSION,
-                    work_area_root: canonical_work_area.clone(),
-                    repository_common_git_dir: repository_common_git_dir.to_path_buf(),
-                };
-                write_private_json_atomic(
-                    &canonical_work_area,
-                    WORK_AREA_MARKER_FILENAME,
-                    &marker,
-                    "work area ownership marker",
-                )?;
-            }
-
-            let _ =
-                ensure_private_dir(&canonical_work_area.join(MANIFESTS_SUBDIR), "manifests dir")?;
-            let checkouts_dir =
-                ensure_private_dir(&canonical_work_area.join(CHECKOUTS_SUBDIR), "checkouts dir")?;
-            let _ = ensure_private_dir(&checkouts_dir.join("runs"), "run checkouts dir")?;
-            let _ = ensure_private_dir(&checkouts_dir.join("tasks"), "task checkouts dir")?;
-            Ok(canonical_work_area)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let created = ensure_private_dir(checked_work_area, "work_area_root")?;
-            let canonical_work_area = fs::canonicalize(&created)?;
-            let marker = WorkAreaOwnershipMarker {
-                marker_version: WORK_AREA_MARKER_VERSION,
-                work_area_root: canonical_work_area.clone(),
-                repository_common_git_dir: repository_common_git_dir.to_path_buf(),
-            };
-            write_private_json_atomic(
-                &canonical_work_area,
-                WORK_AREA_MARKER_FILENAME,
-                &marker,
-                "work area ownership marker",
-            )?;
-            let _ =
-                ensure_private_dir(&canonical_work_area.join(MANIFESTS_SUBDIR), "manifests dir")?;
-            let checkouts_dir =
-                ensure_private_dir(&canonical_work_area.join(CHECKOUTS_SUBDIR), "checkouts dir")?;
-            let _ = ensure_private_dir(&checkouts_dir.join("runs"), "run checkouts dir")?;
-            let _ = ensure_private_dir(&checkouts_dir.join("tasks"), "task checkouts dir")?;
-            Ok(canonical_work_area)
+            let _ = ensure_work_area_root_dir(checked_work_area)?;
         }
-        Err(err) => Err(WorkerError::Io(err)),
+        Err(err) => return Err(WorkerError::Io(err)),
+    }
+
+    let canonical_work_area = fs::canonicalize(checked_work_area)?;
+    if canonical_work_area != checked_work_area {
+        return Err(WorkerError::SecurityViolation(format!(
+            "work_area_root `{}` resolved to unexpected canonical path `{}`",
+            checked_work_area.display(),
+            canonical_work_area.display()
+        )));
+    }
+
+    // Serialize initial work_area_root ownership initialization and verification across processes
+    // BEFORE inspecting directory entries or writing the atomic ownership marker.
+    let lock_path = canonical_work_area.join(WORK_AREA_LOCK_FILENAME);
+    let lock_existed_before = fs::symlink_metadata(&lock_path).is_ok();
+    let lock_file = open_work_area_lock_file(&lock_path)?;
+    lock_file.lock_exclusive().map_err(WorkerError::Io)?;
+
+    let mut entry_names = Vec::new();
+    for entry_res in fs::read_dir(&canonical_work_area)? {
+        let entry = entry_res?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == WORK_AREA_LOCK_FILENAME {
+            continue;
+        }
+        entry_names.push(name);
+    }
+    entry_names.sort();
+
+    // Refuse unrelated non-empty roots (including arbitrary tempfiles) BEFORE any subdirectory creation.
+    if !entry_names.is_empty() {
+        let has_marker = entry_names.iter().any(|n| n == WORK_AREA_MARKER_FILENAME);
+        let unexpected = entry_names.iter().find(|n| {
+            !matches!(
+                n.as_str(),
+                WORK_AREA_MARKER_FILENAME | MANIFESTS_SUBDIR | CHECKOUTS_SUBDIR
+            )
+        });
+        if !has_marker || unexpected.is_some() {
+            if !lock_existed_before {
+                let _ = fs::remove_file(&lock_path);
+            }
+            let _ = lock_file.unlock();
+            return Err(WorkerError::SecurityViolation(format!(
+                "refusing existing non-empty work_area_root `{}` without valid Threadlane ownership marker (found entries: {:?})",
+                checked_work_area.display(),
+                entry_names
+            )));
+        }
+
+        let marker = verify_existing_work_area_marker(&canonical_work_area)?;
+        if marker.repository_common_git_dir != repository_common_git_dir {
+            let _ = lock_file.unlock();
+            return Err(WorkerError::SecurityViolation(format!(
+                "work_area_root `{}` is owned by repository `{}` (cannot reuse for `{}`)",
+                canonical_work_area.display(),
+                marker.repository_common_git_dir.display(),
+                repository_common_git_dir.display()
+            )));
+        }
+    } else {
+        let marker = WorkAreaOwnershipMarker {
+            marker_version: WORK_AREA_MARKER_VERSION,
+            work_area_root: canonical_work_area.clone(),
+            repository_common_git_dir: repository_common_git_dir.to_path_buf(),
+        };
+        write_private_json_atomic(
+            &canonical_work_area,
+            WORK_AREA_MARKER_FILENAME,
+            &marker,
+            "work area ownership marker",
+        )?;
+    }
+
+    let _ = ensure_private_dir(&canonical_work_area.join(MANIFESTS_SUBDIR), "manifests dir")?;
+    let checkouts_dir =
+        ensure_private_dir(&canonical_work_area.join(CHECKOUTS_SUBDIR), "checkouts dir")?;
+    let _ = ensure_private_dir(&checkouts_dir.join("runs"), "run checkouts dir")?;
+    let _ = ensure_private_dir(&checkouts_dir.join("tasks"), "task checkouts dir")?;
+    let _ = lock_file.unlock();
+    Ok(canonical_work_area)
+}
+
+fn ensure_work_area_root_dir(checked_work_area: &Path) -> Result<PathBuf, WorkerError> {
+    let checked = validate_absolute_no_symlink_components(checked_work_area, "work_area_root")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        use std::path::Component;
+
+        let mut current = PathBuf::new();
+        for comp in checked.components() {
+            match comp {
+                Component::Prefix(prefix) => current.push(prefix.as_os_str()),
+                Component::RootDir => current.push(comp.as_os_str()),
+                Component::CurDir | Component::ParentDir => {
+                    return Err(WorkerError::SecurityViolation(format!(
+                        "work_area_root path `{}` must not contain relative traversal components",
+                        checked_work_area.display()
+                    )));
+                }
+                Component::Normal(part) => {
+                    current.push(part);
+                    match fs::symlink_metadata(&current) {
+                        Ok(meta) => {
+                            if meta.file_type().is_symlink() {
+                                return Err(WorkerError::SecurityViolation(format!(
+                                    "work_area_root path `{}` traverses symlink `{}`",
+                                    checked_work_area.display(),
+                                    current.display()
+                                )));
+                            }
+                            if !meta.file_type().is_dir() {
+                                return Err(WorkerError::SecurityViolation(format!(
+                                    "work_area_root component `{}` is not a directory",
+                                    current.display()
+                                )));
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            let mut builder = fs::DirBuilder::new();
+                            builder.mode(0o700);
+                            match builder.create(&current) {
+                                Ok(()) => {
+                                    fs::set_permissions(
+                                        &current,
+                                        fs::Permissions::from_mode(0o700),
+                                    )?;
+                                }
+                                Err(create_err)
+                                    if create_err.kind() == std::io::ErrorKind::AlreadyExists =>
+                                {
+                                    let meta = fs::symlink_metadata(&current)?;
+                                    if meta.file_type().is_symlink() {
+                                        return Err(WorkerError::SecurityViolation(format!(
+                                            "work_area_root path `{}` traverses symlink `{}`",
+                                            checked_work_area.display(),
+                                            current.display()
+                                        )));
+                                    }
+                                    if !meta.file_type().is_dir() {
+                                        return Err(WorkerError::SecurityViolation(format!(
+                                            "work_area_root component `{}` is not a directory",
+                                            current.display()
+                                        )));
+                                    }
+                                }
+                                Err(create_err) => return Err(WorkerError::Io(create_err)),
+                            }
+                        }
+                        Err(err) => return Err(WorkerError::Io(err)),
+                    }
+                }
+            }
+        }
+
+        let meta = fs::symlink_metadata(&checked)?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(WorkerError::SecurityViolation(format!(
+                "work_area_root `{}` must be a non-symlink directory",
+                checked.display()
+            )));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(WorkerError::SecurityViolation(format!(
+                "existing work_area_root `{}` has non-private permissions {:04o} (expected 0700); refusing to chmod existing directory",
+                checked.display(),
+                mode
+            )));
+        }
+    }
+
+    Ok(checked)
+}
+
+fn open_work_area_lock_file(lock_path: &Path) -> Result<File, WorkerError> {
+    let _ = validate_absolute_no_symlink_components(lock_path, "work area ownership lock")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        match fs::symlink_metadata(lock_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(WorkerError::SecurityViolation(format!(
+                        "work area ownership lock `{}` must not be a symlink",
+                        lock_path.display()
+                    )));
+                }
+                if !meta.file_type().is_file() {
+                    return Err(WorkerError::SecurityViolation(format!(
+                        "work area ownership lock `{}` must be a regular file",
+                        lock_path.display()
+                    )));
+                }
+                let mode = meta.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    return Err(WorkerError::SecurityViolation(format!(
+                        "work area ownership lock `{}` has insecure permissions {:04o} (expected 0600)",
+                        lock_path.display(),
+                        mode
+                    )));
+                }
+                if meta.len() != 0 {
+                    return Err(WorkerError::SecurityViolation(format!(
+                        "work area ownership lock `{}` must be an empty 0-byte lock file (found {} bytes)",
+                        lock_path.display(),
+                        meta.len()
+                    )));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(WorkerError::Io(err)),
+        }
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(lock_path)
+            .map_err(|err| {
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    WorkerError::SecurityViolation(format!(
+                        "work area ownership lock `{}` must not be a symlink",
+                        lock_path.display()
+                    ))
+                } else {
+                    WorkerError::Io(err)
+                }
+            })?;
+
+        let sym_meta = fs::symlink_metadata(lock_path)?;
+        let file_meta = file.metadata()?;
+        if sym_meta.file_type().is_symlink()
+            || !sym_meta.file_type().is_file()
+            || !file_meta.file_type().is_file()
+        {
+            return Err(WorkerError::SecurityViolation(format!(
+                "work area ownership lock `{}` must be a regular non-symlink file",
+                lock_path.display()
+            )));
+        }
+        let mode = file_meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(WorkerError::SecurityViolation(format!(
+                "work area ownership lock `{}` has insecure permissions {:04o} (expected 0600)",
+                lock_path.display(),
+                mode
+            )));
+        }
+        if file_meta.len() != 0 {
+            return Err(WorkerError::SecurityViolation(format!(
+                "work area ownership lock `{}` must be an empty 0-byte lock file (found {} bytes)",
+                lock_path.display(),
+                file_meta.len()
+            )));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = lock_path;
+        ensure_platform_supported()?;
+        unreachable!()
     }
 }
 
@@ -1838,7 +2795,11 @@ struct GitBoundedOutput {
 }
 
 impl GitBoundedOutput {
-    fn failure_reason(&self, max_stdout_bytes: usize, timeout_ms: u64) -> Option<String> {
+    fn failure_overflow_or_timeout_reason(
+        &self,
+        max_stdout_bytes: usize,
+        timeout_ms: u64,
+    ) -> Option<String> {
         if self.stdout_overflowed {
             Some(format!(
                 "git command stdout exceeded bounded limit ({max_stdout_bytes} bytes)"
@@ -1856,6 +2817,15 @@ impl GitBoundedOutput {
                 "git command had incomplete cleanup (a descendant or hook held stdout/stderr pipes open after exit or escaped the process group)"
                     .to_string(),
             )
+        } else {
+            None
+        }
+    }
+
+    fn failure_reason(&self, max_stdout_bytes: usize, timeout_ms: u64) -> Option<String> {
+        if let Some(reason) = self.failure_overflow_or_timeout_reason(max_stdout_bytes, timeout_ms)
+        {
+            Some(reason)
         } else if self.stdout_invalid_utf8 {
             Some(
                 "git command stdout contained invalid UTF-8 path bytes (non-UTF-8 repository paths are unsupported)"
@@ -1926,10 +2896,10 @@ fn run_git_bytes_bounded_raw(
         use std::os::unix::process::CommandExt;
 
         let mut cmd = Command::new("git");
+        sanitize_git_command_env(&mut cmd);
         cmd.arg("-C")
             .arg(dir)
             .args(args)
-            .env("GIT_TERMINAL_PROMPT", "0")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
