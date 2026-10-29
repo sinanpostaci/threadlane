@@ -312,17 +312,18 @@ cargo run -p threadlane-workers --bin threadlane-worker -- \
    job is in flight, `job_active: true` remains persisted in
    `<work_area_root>/manifests/<worktree_id>.json`, causing `cleanup_worktree` and
    `begin_worktree_job` to refuse further mutation until the worktree is inspected.
-3. **Unverified live provider behavior**:
+3. **Provider verification boundary**:
    Automated tests in this crate use deterministic fake executable fixtures modeling the
    documented CLI flags and NDJSON schemas for `agy` (`--output-format stream-json`) and
    `opencode` (`run --model provider/model#variant --format json`). If a live provider CLI
    version omits `model` or `effort`/`variant` metadata from its JSON stream events,
    `threadlane-workers` will report `MissingModelEvidence` or `MissingEffortEvidence` rather
-   than assuming unverified compliance. Live Argon smoke verification is performed by the
-   primary reviewing agent.
+   than assuming unverified compliance. One live Argon transport smoke confirmed the model
+   but returned `MissingEffortEvidence`, because effort was absent from the stream. Live
+   OpenCode/Go execution is unverified. See [validation evidence](VALIDATION.md).
 4. **Platform support**:
    Unix process-group signaling (`setpgid` / `kill(-pgid, ...)`) and `0700`/`0600` manifest
    permission checks are implemented for Unix and verified target-side on Linux/NixOS.
-   macOS and Windows process-tree lifecycle semantics (such as Windows Job Objects) and
-   ACL enforcement are not yet implemented or verified; non-Unix builds fail explicitly with
-   `WorkerError::UnsupportedPlatform`.
+   macOS behavior has not been tested. Windows process-tree lifecycle support (such as
+   Job Objects) and native ACL enforcement are not implemented; non-Unix execution returns
+   `WorkerError::UnsupportedPlatform`. No cross-platform build or runtime claim is made.

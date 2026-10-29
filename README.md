@@ -2,13 +2,13 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early Milestone 1 foundation, developed with AI assistance and reviewed before checkpointing. This is **not production ready**. On Linux/NixOS, 40 automated tests and the CLI smoke check pass. Bounded run/history APIs and compact replay snapshots now pass the Milestone 2A prerequisite. An isolated native Codex chat completed the deterministic demo loop through real MCP calls: start, question wake-up, event pull/acknowledgement, revision-matched answer, completion wake-up and final acknowledgement. Real coding workers and other platforms remain unverified. See [validation evidence](docs/VALIDATION.md) and the [closure review](docs/CLOSURE-REVIEW.md).
+> **Status:** Early foundation, developed with AI assistance and reviewed before checkpointing. This is **not production ready**. All 60 automated tests, formatting, Clippy and the CLI smoke pass on Linux/NixOS. The deterministic conversation loop and bounded run/history APIs pass their checkpoints. An isolated native Codex chat completed the deterministic demo loop through real MCP calls: start, question wake-up, event pull/acknowledgement, revision-matched answer, completion wake-up and final acknowledgement. The separate worker diagnostic foundation is documented below; durable native worker dispatch, the desktop UI and other platforms remain unfinished. See [validation evidence](docs/VALIDATION.md) and the [closure review](docs/CLOSURE-REVIEW.md).
 
 ---
 
-## Working Now (Milestone 1) vs. Planned Milestones
+## Working Now and Remaining Milestones
 
-### Working in Milestone 1
+### Conversation Runtime and Bounded History (Milestones 1 and 2A)
 - **`threadlane-core` (`crates/threadlane-core`)**: Transactional SQLite state engine (`SCHEMA_VERSION = 2`, with one-time v1 migration) with validated non-nil Codex thread UUID bindings, deterministic simulated demo runs, revision-checked `answer` / `steer` / `cancel` transitions, per-binding compact idempotent command replay, bounded keyset-paginated run/revision/question history, bounded event batches, high-water-mark event acknowledgements, and persistent wake-up notice coalescing and crash/reopen recovery.
 - **`threadlane` runtime (`crates/threadlane`)**:
   - **Single-owner supervisor (`threadlane serve`)**: Holds an exclusive process-lifetime file lock (`supervisor.lock`) tied to the active state engine, owns the SQLite database (`state.db`) and timed demo progression ticks, binds only `127.0.0.1:0`, and writes an atomic private runtime descriptor (`supervisor.json`) containing a fresh 64-hex-character bearer token (244 random bits from two v4 UUIDs).
@@ -17,8 +17,13 @@ Threadlane is a local execution middleware and control plane designed to work al
   - **Opt-in Codex wake-up adapter (`--codex` + `--notify-binding`)**: Disabled by default. When explicitly configured with an absolute executable path and a binding allowlist, persists `InFlight` intent before invoking `["queue", "--thread", "<UUID>", "--message", FIXED_WAKEUP_MESSAGE]` with a bounded timeout and no model, effort, approval, or sandbox overrides.
   - **Self-contained CLI smoke script (`scripts/smoke.py`)**: Exercises the simulated loop in an isolated temporary directory without touching live chats or paid APIs.
 
-### Planned for Later Milestones (Not Implemented Yet)
-- **Milestone 2**: Real coding worker adapters (OpenCode v2/Go and Antigravity), requested/observed model and effort tracking, per-task and integration Git worktrees, scoped diff gates, and process-tree supervision.
+### Worker Diagnostics (Milestone 2 Foundation)
+- **`threadlane-workers`**: Separate library and trusted `threadlane-worker` diagnostic CLI for exact provider argv, incremental bounded output, requested/observed model and effort evidence, Unix process-group supervision, owned task/integration worktrees and post-run diff checks.
+- **Acceptance stays explicit**: Exit zero and a passing diff are insufficient to accept a patch. Missing provider evidence, blocked work, incomplete cleanup and incomplete diff reports remain visible. Diff checks do not prevent filesystem writes while a worker runs.
+- **Validation scope**: Linux process/Git regressions use isolated fixtures. One live Antigravity transport smoke confirmed the requested model; the provider did not report effort, so it remained unverified. OpenCode uses fixture and installed-CLI checks; live Go execution is still unverified. See [worker usage and limits](docs/WORKERS.md).
+
+### Remaining Milestones
+- **Milestone 2 integration**: Connect real workers to durable supervisor/MCP state, native question/Steer/cancel routing, restart reconciliation and reviewed Git integration. The diagnostic CLI does not implement this end-to-end workflow.
 - **Milestone 3**: Tauri narrow smoked-glass desktop control panel (`Activity`, `Chats`, `Tools`, `Profiles`, `Settings`) with an accessible opaque fallback.
 - **Milestone 4**: Global tool/model/effort registry, role/difficulty profiles, and shadow-mode Jev classification.
 - **Milestone 5**: Cross-platform release hardening, macOS/Windows native ACLs and secret storage, optional background service/tray packaging, and measured cost/notification budgets.
@@ -42,7 +47,7 @@ Threadlane is a local execution middleware and control plane designed to work al
    - Chat bindings (`bnd_<uuid>`) are created exclusively via the trusted CLI (`threadlane bind`), never via MCP tools.
    - Each `threadlane mcp` process is locked to one `binding_id` at launch. MCP tool schemas reject unknown fields (`deny_unknown_fields`) and never accept `binding_id`, `thread_uuid`, or caller-supplied `now_ms`.
    - All run and event text payloads carry `"untrusted_data": true`. Worker output and event text are untrusted data and never grant permissions.
-   - `status` returns a compact snapshot (binding metadata, wake-up notice state, and short recent run summaries without historical prompts/questions); full revision and question history is fetched via `get_run`.
+   - `status` returns a compact snapshot (binding metadata, wake-up notice state, and short recent run summaries without historical prompts/questions); the current snapshot is fetched via `get_run`, and historical records use the paginated history tools.
 4. **Idempotency & Injected Time**:
    - The supervisor injects current wall-clock `now_ms` on all commands.
    - Mutating commands (`start_demo`, `ack_events`, `answer`, `steer`, `cancel`) deduplicate by `(binding_id, command_key)` excluding `now_ms`. Retrying the same key and parameters returns the original result (including across supervisor restarts); reusing a key with different parameters returns `idempotency_conflict`.
@@ -120,15 +125,15 @@ the attempt history and audit record, and does not acknowledge any events.
 There are no automatic retries of failed or uncertain external effects.
 
 Timed demo events carry compact run/revision references rather than repeatedly
-copying the instruction. `get_run` retains the full instruction and history.
-Long-history pagination and compact mutation responses remain a prerequisite
-before real workers; event size limits alone do not bound full run snapshots.
+copying the instruction. `get_run` returns the current instruction and bounded active-question detail.
+Use `list_run_revisions` and `list_run_questions` for historical records.
+See [the bounded-data contract](docs/BOUNDED-DATA.md) for pagination and replay limits.
 
 ### Running Tests and Smoke Check
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 python3 scripts/smoke.py
 ```
 

@@ -39,6 +39,18 @@ Threadlane -> affected worker. Software owns identity/correlation and lifecycle.
 Linux/NixOS is the first test host, not a product restriction. Jev, glass and
 cross-platform support remain in scope. Staging work must not erase those goals.
 
+## Current checkpoint
+
+Milestone 1's deterministic native conversation loop and Milestone 2A's bounded
+history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker
+library and diagnostic CLI provide provider evidence parsing, bounded process
+supervision and owned Git worktree/diff diagnostics independently of the runtime.
+
+Next, connect that foundation to durable worker dispatch and native bidirectional
+routing. Real coding acceptance, crash reconciliation, reviewed integration and
+cleanup of accepted results still need an end-to-end checkpoint. The desktop UI,
+profiles/Jev and release hardening remain later milestones. See [validation](VALIDATION.md).
+
 ## Default workflow example
 
 Profiles remain configurable. The current desired usage profile is Luna Max for

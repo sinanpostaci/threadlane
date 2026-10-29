@@ -20,7 +20,7 @@ The committed Nix lock resolves Rust/Cargo 1.99.0. `Cargo.lock` pins the Rust
 dependencies, including the official `rmcp` SDK at 3.8.0. The development shell
 was actually opened; the checks below ran inside that shell.
 
-## Results
+## Original foundation checkpoint
 
 | Check | Observed result |
 | --- | --- |
@@ -109,7 +109,8 @@ Client setup reference: [Codex MCP configuration](https://learn.chatgpt.com/docs
 
 ## Deliberate limits
 
-- External coding agents, Jev, worktree automation, and the Tauri UI are later work.
+- Durable native coding-worker dispatch, Jev and the Tauri UI remain later work.
+  The separate worker diagnostic foundation is covered below.
 - The demo proves durable logical transitions, not recovery of real worker processes.
 - macOS and Windows have not been tested. Windows runtime startup fails closed
   until suitable private file ACL support is implemented.
@@ -141,3 +142,50 @@ Independent temporary-fixture probes also passed:
 
 These probes use disposable state and do not invoke paid models or user chats.
 Schema/API details and deferred retention are recorded in [BOUNDED-DATA.md](BOUNDED-DATA.md).
+
+
+## Milestone 2 worker diagnostic checkpoint (2026-10-29)
+
+After merging the independent history and worker branches, the primary agent ran
+all 60 tests on the integrated workspace: 17 core behavioural, 6 core review,
+14 runtime integration, 3 runtime review and 20 worker/process/Git regressions.
+Formatting, Clippy with warnings denied, the locked workspace build and the
+process-based CLI smoke all passed. The Nix lock was unchanged; the development
+shell now also supplies Git for disposable repository fixtures.
+
+The worker tests exercise exact argument construction, model/effort evidence,
+permission blocks, malformed/oversized output, timeouts, cancellation, aborted
+supervising futures and bounded cleanup of pipe-holding descendants. Git fixtures
+cover source repositories that are themselves linked worktrees, unrelated-folder
+preservation, ignored/untracked files, renames, deletes, binaries, symlinks,
+protected paths and refusal to delete dirty/active/unexpected worktrees.
+
+Additional primary-agent probes confirmed:
+
+- An unrelated pre-existing directory retained mode `0755` and its sentinel file
+  when initialization was refused. No private work-area ownership was fabricated.
+- An OpenCode prompt beginning with `--auto` followed the `--` option terminator;
+  its text did not become a command-line option. OpenCode requires standalone
+  mode so the runner does not attach to an unowned shared backend.
+- Two distinct Unix filenames, valid UTF-8 `U+FFFD.rs` and raw bytes `ff 2e 72 73`,
+  no longer collapse onto one allowed path. The independent probe now reports
+  `passed = false` with two violations. The regression also verifies that the
+  valid Unicode filename alone passes and that entry/depth budget exhaustion
+  rejects incomplete scans. No fixture invokes a model.
+
+One live Antigravity transport smoke used the requested `gemini-4-argon-high`
+model with `--effort high` in a throwaway owned worktree. Real init/result events
+confirmed the model, but the stream did not report effort. The runner therefore
+returned `missing_effort_evidence`; work was not automatically accepted. The
+prompt requested only a fixed reply with no tools or edits. The unchanged diff
+passed, the source HEAD was preserved, and the owned task/integration worktrees
+and branches were removed afterward. This is transport evidence, not a real
+coding-task acceptance test. No live OpenCode/Go model was invoked; OpenCode was
+checked against installed CLI help and deterministic fixtures.
+
+The worker library and `threadlane-worker` CLI are not connected to native MCP
+worker dispatch yet. Durable worker state/recovery, bidirectional native
+Steer/question/cancel, reviewed merge/cleanup of accepted results and the desktop
+UI still need their own integration checkpoint. Diff checks are post-run
+inspection, not an OS filesystem sandbox. macOS and Windows remain untested.
+Raw provider logs and runtime data remain private and outside version control.

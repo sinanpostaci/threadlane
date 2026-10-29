@@ -16,7 +16,7 @@ not runtime evidence, and the baseline review is not a review of the later patch
 | --- | --- |
 | Accepted instruction can poison every subsequent demo tick | Confirmed against the baseline binary. A 4,096-byte instruction containing 2,411 U+0001 characters and 1,685 ASCII characters starts successfully, then produces a 16,420-byte question event against the 16,384-byte limit. Another binding fails too, including after restart. Fixed: timed events use compact references, and the original instruction stays in the run record. Regression and restart checks passed. |
 | Failed or unknown wake can block future notification indefinitely | Confirmed from the durable state machine. Avoiding automatic replay is correct; the missing part is explicit operator recovery with claim correlation and a duplicate-risk acknowledgement for unknown outcomes. Implemented explicit claim-matched retry with durable audit, no automatic replay and no fabricated event acknowledgement; regression checks passed. |
-| Run histories and stored mutation responses grow without bound | Valid design limitation for long sessions. Compact summaries alone do not bound full run responses. Bounded/paginated history, compact mutation results and result-size regression coverage are a gate before real workers, not a completed feature. |
+| Run histories and stored mutation responses grow without bound | Valid design limitation for long sessions. Compact summaries alone do not bound full run responses. Resolved in the later Milestone 2A checkpoint: bounded pages, compact replay and migration/paging probes pass. Lifetime disk retention remains deliberately uncapped; see BOUNDED-DATA.md and VALIDATION.md. |
 | Arbitrary existing directories can be chmodded by state initialization | Confirmed from initialization code. Fixed: unrelated non-empty directories are refused before chmod or file creation; preservation checks passed. |
 | Fatal `serve` remains alive holding ownership | Confirmed from the signal-only CLI wait. Fixed and tested: nonzero CLI exit after orderly cleanup, retaining diagnostics and uncertain wake history. Primary review also caught and corrected a watch-channel notification race before validation. |
 | MCP initialization requires an already running supervisor | Confirmed lifecycle coupling. Fixed and tested: discovery works offline; every call validates the descriptor and the same MCP process recovers after supervisor start/restart. This was not proven to cause the native desktop discovery failure. |
@@ -49,5 +49,7 @@ question/answer/completion loop now also passes. No code changed after those
 checks; this follow-up records runtime evidence and cleanup.
 
 Milestone 1's native round-trip gate is satisfied on the tested Linux/NixOS host.
-The bounded history/response gate, real workers, busy-turn behavior and other
-platforms remain outstanding work; this is not production or cross-platform proof.
+The later Milestone 2A checkpoint satisfies the bounded history/response gate.
+Durable native real-worker dispatch, busy-turn behavior and other platforms remain
+outstanding; the separate worker diagnostic foundation does not establish those
+end-to-end guarantees. This is not production or cross-platform proof.
