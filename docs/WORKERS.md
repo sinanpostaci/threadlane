@@ -391,7 +391,9 @@ provider. The output path must be new, with an existing parent; existing files,
 directories and symlinks are refused. A private fixture source repository, state,
 work area, fixed TaskFiles profile and diagnostics are preserved under that root.
 The harness stops/reaps only its owned supervisor and does not force-delete dirty
-worktrees. Git, Python and the already authenticated provider CLI are required.
+worktrees. Its Git/CLI/supervisor children use a sanitized Git environment with
+inherited routing/config overrides removed; non-Git provider authentication and
+HOME/PATH remain available. Git, Python and the already authenticated provider CLI are required.
 
 Exit zero means Completed + ReadyForReview, matched observed model/effort, the
 expected one-file edit, passing diff evidence and unchanged source. It never means

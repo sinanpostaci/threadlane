@@ -326,7 +326,7 @@ Answer/Steer, reviewed result integration and the Tauri UI remain separate gates
 
 ### Operator harness verification
 
-Five Python unittest cases passed after the harness was simplified and corrected
+Seven Python unittest cases passed after the harness was simplified and corrected
 to the real runtime contract. They cover no-effect dry-run, CLI argument bounds,
 pre-existing/symlink output preservation, evidence classification/whitelisting,
 private fixture output and a deterministic fake local supervisor. The fake
@@ -349,3 +349,24 @@ it. Primary review also corrected invented lifecycle/acceptance/event labels and
 normal help handling. The fixed harness now sends TaskFiles and preserves actual
 ExecutionFailed evidence. This operator utility is not native-chat acceptance;
 the separate native experiment above supplies that qualified transport evidence.
+
+
+### Closing-review Git environment correction
+
+The Astra Max closing reviewer reproduced a blocking operator-harness issue using
+only disposable repositories: inherited `GIT_DIR`, `GIT_WORK_TREE`, index and
+config-injection variables could redirect fixture Git commands into an unrelated
+repository and commit its staged change. The primary delegated the targeted fix
+to Argon; the harness now builds one sanitized environment for Git, Threadlane CLI
+and owned supervisor children, removing inherited `GIT_*` overrides and installing
+controlled no-global/no-system/no-prompt Git configuration. Non-Git provider auth,
+HOME and PATH are preserved without mutating the parent environment.
+
+Two focused Python regressions cover the poisoned repository and both child-spawn
+APIs. The primary separately ran the actual Rust runtime plus harness and a local
+fake provider with poisoned Git routing/config/hooks. It completed the isolated
+fixture while preserving the unrelated HEAD, index and config byte-for-byte;
+the injected hook did not run. A non-secret auth sentinel also reached the fake
+worker, demonstrating preserved provider environment through the owned supervisor.
+No provider API was called by this regression. These are operator-harness changes;
+the previously verified Rust tree is unchanged.
