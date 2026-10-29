@@ -32,7 +32,7 @@ use crate::validation::{
     resolve_and_validate_worker_executable, sha256_hex, validate_canonical_thread_uuid,
     validate_identifier, validate_repository_and_base_commit, validate_revision,
     validate_sha256_hex, validate_work_area_for_materialization, validate_worker_task_static,
-    validate_write_scope_entry, verify_approval_record_integrity,
+    validate_write_scope_entry_at_base_commit, verify_approval_record_integrity,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +354,27 @@ impl AuthorityStore {
             });
         }
 
+        let (canonical_repo, normalized_base_commit) =
+            validate_repository_and_base_commit(&record.repository_path, &record.base_commit)?;
+        if canonical_repo != record.repository_path || normalized_base_commit != record.base_commit
+        {
+            return Err(AuthorityError::CorruptStore {
+                path: self.approvals_path.display().to_string(),
+                reason: format!(
+                    "approval `{}` repository_path or base_commit no longer matches canonical target",
+                    record.approval_id
+                ),
+            });
+        }
+        for op_path in &record.approved_write_paths {
+            validate_write_scope_entry_at_base_commit(
+                op_path,
+                &canonical_repo,
+                &normalized_base_commit,
+                "approved_write_paths entry",
+            )?;
+        }
+
         let checked_work_area = validate_work_area_for_materialization(
             work_area_root,
             &record.repository_path,
@@ -368,6 +389,24 @@ impl AuthorityStore {
         let mut native_routes = Vec::new();
 
         for task in &record.tasks {
+            for task_path in &task.allowed_write_paths {
+                validate_write_scope_entry_at_base_commit(
+                    task_path,
+                    &canonical_repo,
+                    &normalized_base_commit,
+                    "task allowed_write_paths entry",
+                )?;
+                if !is_task_scope_contained_in_operator_allowlist(
+                    task_path,
+                    &record.approved_write_paths,
+                ) {
+                    return Err(AuthorityError::UnapprovedTaskWriteScope {
+                        task_id: task.task_id.clone(),
+                        task_path: task_path.clone(),
+                        reason: "task write scope is not covered componentwise by operator approved_write_paths".to_string(),
+                    });
+                }
+            }
             if let Some(provider) = task.provider {
                 let executable = task.canonical_executable.clone().ok_or_else(|| {
                     AuthorityError::CorruptStore {
@@ -623,8 +662,12 @@ impl AuthorityStore {
             Vec::with_capacity(request.approved_write_paths.len());
         let mut seen_op_paths = BTreeSet::new();
         for op_path in &request.approved_write_paths {
-            let validated =
-                validate_write_scope_entry(op_path, &canonical_repo, "approved_write_paths entry")?;
+            let validated = validate_write_scope_entry_at_base_commit(
+                op_path,
+                &canonical_repo,
+                &normalized_base_commit,
+                "approved_write_paths entry",
+            )?;
             if !seen_op_paths.insert(validated.clone()) {
                 return Err(AuthorityError::InvalidWriteScope {
                     path: op_path.clone(),
@@ -667,9 +710,10 @@ impl AuthorityStore {
             let mut validated_task_write_paths =
                 Vec::with_capacity(compiled_task.allowed_write_paths.len());
             for task_path in &compiled_task.allowed_write_paths {
-                let checked_task_path = validate_write_scope_entry(
+                let checked_task_path = validate_write_scope_entry_at_base_commit(
                     task_path,
                     &canonical_repo,
+                    &normalized_base_commit,
                     "task allowed_write_paths entry",
                 )?;
                 if !is_task_scope_contained_in_operator_allowlist(

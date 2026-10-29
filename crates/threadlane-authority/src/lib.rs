@@ -51,7 +51,7 @@ pub use validation::{
     derive_command_key, derive_profile_id, is_task_scope_contained_in_operator_allowlist,
     resolve_and_validate_worker_executable, validate_canonical_thread_uuid,
     validate_repository_and_base_commit, validate_write_scope_entry,
-    verify_approval_record_integrity,
+    validate_write_scope_entry_at_base_commit, verify_approval_record_integrity,
 };
 
 #[cfg(test)]
@@ -1720,5 +1720,325 @@ mod tests {
             .materialize(&summary.approval_id, &session_binding, &work_area)
             .expect("materialize after registry edits");
         assert_eq!(after_mat, before_mat);
+    }
+
+    #[test]
+    fn base_commit_directory_scope_validation_prevents_bare_directory_expansion_when_worktree_differs(
+    ) {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().expect("snap").revision;
+
+        // Create a plan with a task targeting bare "src/sub" (which is a directory at base_commit)
+        // and another plan targeting "src/sub/mod.rs" (an exact file inside "src/sub/").
+        let (bare_task_rev, bare_task_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-bare-dir-task",
+            "binding-1",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-bare-dir".to_string(),
+                title: "Bare Dir Task".to_string(),
+                instruction: "Attempt bare directory scope".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/sub".to_string()],
+            }],
+        );
+
+        let (file_task_rev, file_task_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-sub-file-task",
+            "binding-1",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-sub-file".to_string(),
+                title: "Sub File Task".to_string(),
+                instruction: "Modify src/sub/mod.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/sub/mod.rs".to_string()],
+            }],
+        );
+
+        // Mutate the mutable working tree of `repo_dir`:
+        // 1) Delete directory `src/sub` so it is absent in the mutable working tree.
+        fs::remove_dir_all(fixture.repo_dir.join("src/sub"))
+            .expect("remove src/sub from mutable working tree");
+
+        // Even though `src/sub` is now absent in the mutable working tree, at `fixture.base_commit`
+        // `src/sub` is a directory (`040000 tree`). Approving bare `"src/sub"` must be rejected!
+        let absent_bare_op_err = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-bare-dir-task".to_string(),
+                plan_revision: bare_task_rev,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: bare_task_digest.clone(),
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-bare-dir".to_string()],
+                approved_write_paths: vec!["src/sub".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect_err("bare scope that is a directory at base_commit must fail even when absent in working tree");
+        assert_eq!(absent_bare_op_err.code(), "invalid_write_scope");
+
+        // Even if operator passes explicit `"src/"`, a task with bare `"src/sub"` (directory at base_commit)
+        // must also be rejected!
+        let absent_bare_task_err = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-bare-dir-task".to_string(),
+                plan_revision: bare_task_rev,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: bare_task_digest.clone(),
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-bare-dir".to_string()],
+                approved_write_paths: vec!["src/".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect_err("task bare scope that is a directory at base_commit must fail");
+        assert_eq!(absent_bare_task_err.code(), "invalid_write_scope");
+
+        // 2) Replace `src/sub` in the mutable working tree with a regular file `src/sub`.
+        fs::write(
+            fixture.repo_dir.join("src/sub"),
+            "replaced by regular file in dirty checkout\n",
+        )
+        .expect("write regular file at src/sub in working tree");
+
+        // Approving bare `"src/sub"` against `fixture.base_commit` must STILL be rejected because
+        // `src/sub` is a directory at `fixture.base_commit`!
+        let file_in_wt_bare_err = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-bare-dir-task".to_string(),
+                plan_revision: bare_task_rev,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: bare_task_digest,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-bare-dir".to_string()],
+                approved_write_paths: vec!["src/sub".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect_err("bare scope that is a directory at base_commit must fail even when regular file in working tree");
+        assert_eq!(file_in_wt_bare_err.code(), "invalid_write_scope");
+
+        // Meanwhile, explicit `"src/sub/"` (with trailing slash) retains directory intent at `base_commit`
+        // and covers exact-file task `"src/sub/mod.rs"` when `src/sub` is absent in the working tree.
+        fs::remove_file(fixture.repo_dir.join("src/sub")).expect("remove regular file src/sub");
+        let explicit_dir_summary = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-sub-file-task".to_string(),
+                plan_revision: file_task_rev,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: file_task_digest,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-sub-file".to_string()],
+                approved_write_paths: vec!["src/sub/".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect("explicit trailing-slash directory scope at base_commit must succeed");
+        assert_eq!(
+            explicit_dir_summary.approved_write_paths,
+            vec!["src/sub/".to_string()]
+        );
+
+        // Static stored-record integrity rejects uncontained task scopes or protected control paths
+        // without running Git subprocess probes on metadata reads.
+        let mut uncontained_record = fixture
+            .authority
+            .get_for_operator(&explicit_dir_summary.approval_id)
+            .expect("get valid record");
+        uncontained_record.approved_write_paths = vec!["src/lib.rs".to_string()];
+        let core_digest = compute_authority_core_digest(&uncontained_record).expect("core digest");
+        uncontained_record.tasks[0].profile_id = Some(derive_profile_id(
+            &core_digest,
+            &uncontained_record.tasks[0].task_id,
+            &uncontained_record.tasks[0].task_digest,
+        ));
+        uncontained_record.tasks[0].command_key = Some(derive_command_key(
+            &core_digest,
+            &uncontained_record.tasks[0].task_id,
+            &uncontained_record.tasks[0].task_digest,
+        ));
+        let subj = compute_record_subject_digest(&uncontained_record).expect("subject digest");
+        uncontained_record.approval_id = derive_approval_id(&subj);
+        uncontained_record.subject_digest = subj;
+
+        let integrity_err = verify_approval_record_integrity(
+            &uncontained_record,
+            fixture.authority.approvals_path(),
+        )
+        .expect_err(
+            "stored record with uncontained task write path must fail static integrity check",
+        );
+        assert_eq!(integrity_err.code(), "corrupt_store");
+    }
+
+    #[test]
+    fn metadata_reads_remain_available_when_one_historical_repo_git_dir_is_moved_while_materialize_fails_closed(
+    ) {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().expect("snap").revision;
+
+        // Create a second independent repository for binding-2.
+        let repo_dir_b = fixture.root.join("repo-b");
+        let (base_commit_b, _) = init_disposable_git_repo(&repo_dir_b);
+
+        let (rev_a, digest_a) = save_and_publish_plan(
+            &fixture,
+            "plan-history-a",
+            "binding-1",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-a".to_string(),
+                title: "Task A".to_string(),
+                instruction: "Modify src/lib.rs in repo A".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+        );
+
+        let (rev_b, digest_b) = save_and_publish_plan(
+            &fixture,
+            "plan-history-b",
+            "binding-2",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-b".to_string(),
+                title: "Task B".to_string(),
+                instruction: "Modify src/lib.rs in repo B".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+        );
+
+        let summary_a = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-history-a".to_string(),
+                plan_revision: rev_a,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: digest_a,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-a".to_string()],
+                approved_write_paths: vec!["src/lib.rs".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect("approve plan A");
+
+        let summary_b = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-2".to_string(),
+                thread_uuid: THREAD_UUID_B.to_string(),
+                plan_id: "plan-history-b".to_string(),
+                plan_revision: rev_b,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: digest_b,
+                repository_path: repo_dir_b.clone(),
+                base_commit: base_commit_b,
+                approved_task_ids: vec!["task-b".to_string()],
+                approved_write_paths: vec!["src/lib.rs".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            })
+            .expect("approve plan B");
+
+        let ledger_bytes_before =
+            fs::read(fixture.authority.approvals_path()).expect("read ledger bytes before");
+
+        // Hide repo_dir_b's `.git` directory under a different name while `repo_dir_b` still exists.
+        fs::rename(repo_dir_b.join(".git"), repo_dir_b.join(".git.hidden"))
+            .expect("hide repo B .git directory");
+
+        // Metadata reads (`get_for_operator` and `list_for_binding`) must remain available for
+        // BOTH approvals and bindings without classifying the store as `CorruptStore`.
+        let record_a = fixture
+            .authority
+            .get_for_operator(&summary_a.approval_id)
+            .expect("get_for_operator for unaffected approval A must succeed");
+        assert_eq!(record_a.approval_id, summary_a.approval_id);
+
+        let record_b = fixture
+            .authority
+            .get_for_operator(&summary_b.approval_id)
+            .expect("get_for_operator for historical approval B must still return cached metadata");
+        assert_eq!(record_b.approval_id, summary_b.approval_id);
+
+        let list_a = fixture
+            .authority
+            .list_for_binding("binding-1")
+            .expect("list_for_binding for binding-1 must succeed");
+        assert_eq!(list_a, vec![summary_a.clone()]);
+
+        let list_b = fixture
+            .authority
+            .list_for_binding("binding-2")
+            .expect("list_for_binding for binding-2 must succeed");
+        assert_eq!(list_b, vec![summary_b.clone()]);
+
+        // Materializing the affected approval B must fail closed without creating worktrees or
+        // mutating the ledger, while materializing unaffected approval A succeeds.
+        let work_area_b = fixture.root.join("work-area-b-not-created");
+        let mat_b_err = fixture
+            .authority
+            .materialize(
+                &summary_b.approval_id,
+                &sample_binding("bnd_session_b", THREAD_UUID_B),
+                &work_area_b,
+            )
+            .expect_err("materialize on approval B with missing .git must fail closed");
+        assert_eq!(mat_b_err.code(), "invalid_repository");
+        assert!(
+            !work_area_b.exists(),
+            "failed materialization must not create work_area_root"
+        );
+
+        let work_area_a = fixture.root.join("work-area-a-not-created");
+        let mat_a = fixture
+            .authority
+            .materialize(
+                &summary_a.approval_id,
+                &sample_binding("bnd_session_a", THREAD_UUID_A),
+                &work_area_a,
+            )
+            .expect("materialize on unaffected approval A must succeed");
+        assert_eq!(mat_a.approval_id, summary_a.approval_id);
+        assert!(!work_area_a.exists());
+
+        let ledger_bytes_after =
+            fs::read(fixture.authority.approvals_path()).expect("read ledger bytes after");
+        assert_eq!(
+            ledger_bytes_after, ledger_bytes_before,
+            "ledger bytes on disk must remain unchanged"
+        );
     }
 }
