@@ -477,26 +477,54 @@ async fn rejects_opencode_task_files_and_unsafe_glob_or_rule_metacharacters_befo
         ),
     );
 
-    // 1. OpenCodeV2 with TaskFiles must fail validation, build_argv_for_workdir, and execute_worker_task
-    // without creating work_area_root or spawning the process.
-    let mut oc_task_files = env.opencode_spec(
+    // 1. OpenCodeV2 with valid TaskFiles passes static validation and builds clean argv (without
+    // Antigravity `--settings`), whereas OpenCodeV2 TaskFiles with unsafe metacharacters or
+    // protected control paths fails before creating work_area_root or spawning the process.
+    let clean_workdir = env.root_dir.join("clean-workdir");
+    fs::create_dir_all(&clean_workdir).expect("create clean_workdir");
+
+    let valid_oc_task_files = env.opencode_spec(
         spy_bin.clone(),
-        "Reject OpenCode TaskFiles",
+        "Valid OpenCode TaskFiles",
         WorkerFilePermissions::TaskFiles,
     );
-    oc_task_files.work_area_root = env.root_dir.join("uncreated-oc-work-area");
+    let oc_report = valid_oc_task_files
+        .validate()
+        .expect("OpenCodeV2 TaskFiles must pass static validation");
+    assert_eq!(oc_report.file_permissions, WorkerFilePermissions::TaskFiles);
+    assert!(!oc_report.workdir_argv_resolution_required);
+    assert!(oc_report.argv_resolution_note.is_none());
+    let oc_argv = valid_oc_task_files
+        .build_argv_for_workdir(&clean_workdir)
+        .expect("OpenCodeV2 build_argv_for_workdir");
+    assert!(!oc_argv.iter().any(|arg| arg == "--settings"));
+
+    let mut oc_bad_task_files = env.opencode_spec(
+        spy_bin.clone(),
+        "Reject invalid OpenCode TaskFiles",
+        WorkerFilePermissions::TaskFiles,
+    );
+    oc_bad_task_files.work_area_root = env.root_dir.join("uncreated-oc-work-area");
+    oc_bad_task_files.allowed_write_paths = BTreeSet::from(["crates/threadlane-*".to_string()]);
     assert!(matches!(
-        oc_task_files.validate(),
-        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("antigravity")
+        oc_bad_task_files.validate(),
+        Err(WorkerError::InvalidSpec(_))
     ));
     let (_cancel_tx, mut cancel_rx) = watch::channel(false);
     assert!(matches!(
-        execute_worker_task(&oc_task_files, "run-oc", "task-oc", None, &mut cancel_rx).await,
+        execute_worker_task(
+            &oc_bad_task_files,
+            "run-oc",
+            "task-oc",
+            None,
+            &mut cancel_rx
+        )
+        .await,
         Err(WorkerError::InvalidSpec(_))
     ));
     assert!(
-        !oc_task_files.work_area_root.exists(),
-        "work_area_root must not be created when OpenCode TaskFiles is rejected"
+        !oc_bad_task_files.work_area_root.exists(),
+        "work_area_root must not be created when invalid OpenCode TaskFiles is rejected"
     );
     assert!(!marker_file.exists(), "worker must not be spawned");
 
@@ -515,8 +543,6 @@ async fn rejects_opencode_task_files_and_unsafe_glob_or_rule_metacharacters_befo
         "crates/thread\tlane",
         "crates/thread\x07lane",
     ];
-    let clean_workdir = env.root_dir.join("clean-workdir");
-    fs::create_dir_all(&clean_workdir).expect("create clean_workdir");
 
     for bad_entry in unsafe_write_entries {
         let mut bad_spec = env.antigravity_spec(

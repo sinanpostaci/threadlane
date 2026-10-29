@@ -435,11 +435,13 @@ pub async fn run_worker_with_observer(
     let canonical_workdir =
         validate_existing_canonical_dir(working_directory, "working_directory")?;
     let constructed_argv = spec.build_argv_for_workdir(&canonical_workdir)?;
+    let child_env = spec.build_child_env_for_workdir(&canonical_workdir)?;
 
     let start_instant = Instant::now();
 
     let mut cmd = Command::new(&validation.canonical_executable);
     cmd.args(&constructed_argv)
+        .envs(child_env)
         .current_dir(&canonical_workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

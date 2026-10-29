@@ -9,9 +9,15 @@ use crate::fs_safety::{
     ensure_platform_supported, validate_absolute_no_symlink_components, validate_executable_file,
     validate_existing_canonical_dir,
 };
-pub use crate::permissions::WorkerFilePermissions;
 use crate::permissions::{
     build_antigravity_task_files_settings_json, validate_permission_pattern_path,
+};
+pub use crate::permissions::{
+    build_opencode_config_content, build_opencode_config_content_json, evaluate_opencode_rules,
+    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
+    OpenCodeRuleEffect, WorkerFilePermissions, MAX_OPENCODE_CONFIG_BYTES,
+    MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
+    OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS,
 };
 
 /// Default execution timeout (5 minutes in milliseconds).
@@ -362,7 +368,8 @@ impl WorkerSpec {
 
         validate_prompt(&self.prompt)?;
         let constructed_argv = self.build_argv_from_resolved(&resolved_model, None);
-        let workdir_argv_resolution_required = self.file_permissions.requires_workdir_argv();
+        let workdir_argv_resolution_required = self.provider == WorkerProvider::Antigravity
+            && self.file_permissions.requires_workdir_argv();
         let argv_resolution_note = workdir_argv_resolution_required.then(|| {
             "file_permissions is `task_files`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.".to_string()
         });
@@ -517,9 +524,11 @@ impl WorkerSpec {
     /// array (excluding `argv[0]`) for `working_directory`.
     ///
     /// When `file_permissions` is [`WorkerFilePermissions::Inherit`], returns the base provider
-    /// argument array. When `file_permissions` is [`WorkerFilePermissions::TaskFiles`], validates
-    /// that the canonical `working_directory` and `allowed_write_paths` contain no unsafe
-    /// glob/rule metacharacters or symlinks and injects `--settings <inline-json>` scoped to
+    /// argument array (while still validating OpenCode V2 per-child configuration when the
+    /// provider is [`WorkerProvider::OpenCodeV2`]). When `file_permissions` is
+    /// [`WorkerFilePermissions::TaskFiles`], validates that the canonical `working_directory` and
+    /// `allowed_write_paths` contain no unsafe glob/rule metacharacters or symlinks and, for
+    /// [`WorkerProvider::Antigravity`], injects `--settings <inline-json>` scoped to
     /// `working_directory`.
     pub fn build_argv_for_workdir(
         &self,
@@ -528,14 +537,90 @@ impl WorkerSpec {
         let report = self.validate()?;
         let canonical_workdir =
             validate_existing_canonical_dir(working_directory, "working_directory")?;
-        let settings_json = match self.file_permissions {
-            WorkerFilePermissions::Inherit => None,
-            WorkerFilePermissions::TaskFiles => Some(build_antigravity_task_files_settings_json(
-                &canonical_workdir,
-                &self.allowed_write_paths,
-            )?),
+        let settings_json = match (self.provider, self.file_permissions) {
+            (WorkerProvider::Antigravity, WorkerFilePermissions::Inherit) => None,
+            (WorkerProvider::Antigravity, WorkerFilePermissions::TaskFiles) => {
+                Some(build_antigravity_task_files_settings_json(
+                    &canonical_workdir,
+                    &self.allowed_write_paths,
+                )?)
+            }
+            (WorkerProvider::OpenCodeV2, _) => {
+                let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
+                None
+            }
         };
         Ok(self.build_argv_from_resolved(&report.resolved_model, settings_json))
+    }
+
+    /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for this spec and
+    /// `working_directory`.
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] if `self.provider` is not [`WorkerProvider::OpenCodeV2`].
+    pub fn build_opencode_config_content_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<OpenCodeConfigContent, WorkerError> {
+        let report = self.validate()?;
+        if self.provider != WorkerProvider::OpenCodeV2 {
+            return Err(WorkerError::InvalidSpec(format!(
+                "`build_opencode_config_content_for_workdir` is only supported for provider `opencode_v2` (got `{}`)",
+                self.provider.as_str()
+            )));
+        }
+        build_opencode_config_content(
+            &report.resolved_model,
+            self.file_permissions,
+            working_directory,
+            &self.allowed_write_paths,
+        )
+    }
+
+    /// Builds and serializes the bounded per-child `OPENCODE_CONFIG_CONTENT` JSON string for this
+    /// spec and `working_directory`, enforcing [`MAX_OPENCODE_CONFIG_BYTES`] (`65_536` bytes).
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] if `self.provider` is not [`WorkerProvider::OpenCodeV2`].
+    pub fn build_opencode_config_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<String, WorkerError> {
+        let report = self.validate()?;
+        if self.provider != WorkerProvider::OpenCodeV2 {
+            return Err(WorkerError::InvalidSpec(format!(
+                "`build_opencode_config_for_workdir` is only supported for provider `opencode_v2` (got `{}`)",
+                self.provider.as_str()
+            )));
+        }
+        build_opencode_config_content_json(
+            &report.resolved_model,
+            self.file_permissions,
+            working_directory,
+            &self.allowed_write_paths,
+        )
+    }
+
+    /// Builds the per-child environment variable overrides for spawning this worker inside
+    /// `working_directory`.
+    ///
+    /// For [`WorkerProvider::Antigravity`], returns an empty vector so legacy Antigravity launch
+    /// behavior is completely unchanged. For [`WorkerProvider::OpenCodeV2`], returns
+    /// `[("OPENCODE_CONFIG_CONTENT", <json>)]` so the child process receives bounded model/agent/
+    /// policy (and optional V2 `TaskFiles` permission) configuration overriding any inherited
+    /// `OPENCODE_CONFIG_CONTENT` in the child environment only.
+    pub fn build_child_env_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<Vec<(String, String)>, WorkerError> {
+        let _report = self.validate()?;
+        let canonical_workdir =
+            validate_existing_canonical_dir(working_directory, "working_directory")?;
+        match self.provider {
+            WorkerProvider::Antigravity => Ok(Vec::new()),
+            WorkerProvider::OpenCodeV2 => {
+                let config_json = self.build_opencode_config_for_workdir(&canonical_workdir)?;
+                Ok(vec![(OPENCODE_CONFIG_ENV_VAR.to_string(), config_json)])
+            }
+        }
     }
 
     fn build_argv_from_resolved(
@@ -679,24 +764,34 @@ fn validate_prompt(prompt: &str) -> Result<(), WorkerError> {
 
 /// Validates that `rel_path` is a safe, normalized repository-relative path without
 /// leading slashes, backslashes, NUL bytes, or `.` / `..` components.
+///
+/// Entries in `allowed_write_paths` (`label.contains("allowed_write_paths")`) may end with a
+/// single trailing `/` to explicitly mark a directory scope (for example `"crates/foo/"`).
 pub fn validate_repo_relative_path(rel_path: &str, label: &str) -> Result<(), WorkerError> {
     if rel_path.is_empty() || rel_path.len() > MAX_PATH_ENTRY_LEN {
         return Err(WorkerError::InvalidSpec(format!(
             "{label} must be between 1 and {MAX_PATH_ENTRY_LEN} bytes"
         )));
     }
-    if rel_path.starts_with('/')
-        || rel_path.ends_with('/')
-        || rel_path.contains('\\')
-        || rel_path.contains('\0')
-        || rel_path.contains("//")
+    let allow_dir_trailing_slash = label.contains("allowed_write_paths");
+    let stripped = if allow_dir_trailing_slash {
+        rel_path.strip_suffix('/').unwrap_or(rel_path)
+    } else {
+        rel_path
+    };
+    if stripped.is_empty()
+        || stripped.starts_with('/')
+        || stripped.ends_with('/')
+        || stripped.contains('\\')
+        || stripped.contains('\0')
+        || stripped.contains("//")
     {
         return Err(WorkerError::SecurityViolation(format!(
             "{label} `{rel_path}` must be a clean repository-relative path without leading/trailing slashes or backslashes"
         )));
     }
 
-    let path = Path::new(rel_path);
+    let path = Path::new(stripped);
     if path.is_absolute() {
         return Err(WorkerError::SecurityViolation(format!(
             "{label} `{rel_path}` must be relative, not absolute"
@@ -752,7 +847,7 @@ pub fn is_control_config_path(rel_path: &str) -> bool {
         return true;
     }
 
-    // Any component matching `.git`, `.gitmodules`, `.gitattributes`, `.gitignore`, `agents.md`, `claude.md`
+    // Any component matching `.git`, `.gitmodules`, `.gitattributes`, `.gitignore`, `agents.md`, `claude.md`, `opencode.json`, `opencode.jsonc`
     for comp in &components {
         if matches!(
             comp.as_str(),
@@ -762,6 +857,8 @@ pub fn is_control_config_path(rel_path: &str) -> bool {
                 | ".gitignore"
                 | "agents.md"
                 | "claude.md"
+                | "opencode.json"
+                | "opencode.jsonc"
                 | ".codex"
                 | ".gemini"
                 | ".opencode"
@@ -800,7 +897,8 @@ pub fn is_path_allowed(rel_path: &str, allowed_write_paths: &BTreeSet<String>) -
         return false;
     }
     let candidate = Path::new(rel_path);
-    allowed_write_paths
-        .iter()
-        .any(|allowed| candidate.starts_with(Path::new(allowed)))
+    allowed_write_paths.iter().any(|allowed| {
+        let clean = allowed.strip_suffix('/').unwrap_or(allowed.as_str());
+        candidate.starts_with(Path::new(clean))
+    })
 }
