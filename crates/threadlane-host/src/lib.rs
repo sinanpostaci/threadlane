@@ -1,0 +1,1610 @@
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+//! `threadlane-host`: separately owned per-approval local execution host, durable session
+//! manifest, and authoritative caller-scoped task dispatch client for Threadlane Milestone 4.
+//!
+//! ## Core Architecture & Security Invariants
+//!
+//! - **One separately owned local host per operator-approved immutable plan**: Each running
+//!   [`ApprovedHost`] owns a private `<sessions_dir>/<approval_id>` directory protected by an
+//!   exclusive OS-level [`HostSessionLock`] (`host.lock`) held for the entire host lifetime,
+//!   along with a private `runtime-state` directory and `work-area` directory. Closing or
+//!   dropping a desktop GUI or [`ApprovedHostClient`] never drops the host's supervisor handle or
+//!   stops in-flight jobs.
+//! - **Two-phase bootstrap & persisted single-binding recovery**: Because `threadlane`
+//!   supervisors accept `WorkersConfig` at startup, [`ApprovedHost::start`] first starts a
+//!   temporary bootstrap supervisor with `workers: None` (ensuring no worker can start during
+//!   bootstrap and marking any prior in-flight runs `Unknown`), creates or recovers the **single**
+//!   runtime session binding matching the approval's canonical `thread_uuid`, shuts down the
+//!   bootstrap supervisor cleanly, calls [`threadlane_authority::AuthorityStore::materialize`]
+//!   against that binding and private work area, starts the final supervisor with the frozen
+//!   `WorkersConfig`, and commits [`HostPhase::Ready`] to `host-manifest.json` only after
+//!   authenticated supervisor readiness succeeds.
+//! - **Authoritative caller scope & root-only deterministic dispatch**: [`ApprovedHostClient`]
+//!   is constructed from trusted stores and the caller's authoritative `control_binding_id` and
+//!   `native_thread_uuid`. Every operation resolves the persisted [`ApprovalRecord`] and verifies
+//!   both `binding_id` and `thread_uuid` before accessing the session directory.
+//!   [`ApprovedHostClient::dispatch_task`] accepts only `(approval_id, task_id)`—no caller
+//!   instruction, model, effort, executable, write scope, or idempotency key override is
+//!   permitted. Dependent tasks (`!depends_on.is_empty()`) are rejected with
+//!   [`HostError::DependencyInputsUnverified`], and manual `codex_cli` routes are rejected with
+//!   [`HostError::NativeRouteRequired`].
+//! - **ReadyForReview completion boundary**: Completed worker runs map to
+//!   [`TaskExecutionStatus::ReadyForReview`] (`accepted: false`) and never automatically accept,
+//!   merge, push, clean up, or mutate plan status to `Received` or `Applied`.
+
+/// Command-line parser and `serve` runner for the `threadlane-host` binary.
+pub mod cli;
+/// Authoritative caller-scoped client (`ApprovedHostClient`) for task dispatch, inspection, and cancellation.
+pub mod client;
+/// Structured domain, security, scope, and runtime error types (`HostError`).
+pub mod error;
+/// Per-approval host lifecycle (`ApprovedHost`, `ApprovedHostConfig`, `ApprovedHostHandle`).
+pub mod host;
+/// Private `0700`/`0600` filesystem validation, atomic manifest/receipt I/O, and `host.lock` management.
+pub mod storage;
+/// Serializable manifest, summary, receipt, and task state snapshot types.
+pub mod types;
+
+pub use cli::{run_cli, run_serve, HostCli, HostCommand, ServeArgs};
+pub use client::ApprovedHostClient;
+pub use error::HostError;
+pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
+pub use storage::{
+    derive_cancel_command_key, ensure_no_symlink_components, ensure_private_dir, is_host_lock_held,
+    paths_overlap, prepare_session_dir, read_and_verify_host_manifest, read_host_manifest_optional,
+    read_task_receipt, record_task_receipt, validate_approval_id, validate_canonical_thread_uuid,
+    validate_hex_digest, validate_identifier, validate_sessions_root, verify_existing_private_dir,
+    verify_existing_session_dir, write_host_manifest, HostSessionLock,
+};
+pub use types::{
+    HostExecutionGates, HostPhase, HostSessionManifest, HostSessionSummary, TaskExecutionStatus,
+    TaskRunReceipt, TaskStateSnapshot, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
+    HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES, MAX_TASK_RECEIPTS_BYTES,
+    RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_LOCK_FILENAME,
+    TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
+};
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::io::Write;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use clap::Parser;
+    use tempfile::TempDir;
+    use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
+    use threadlane_plans::{
+        compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStatus,
+        PlanStore, PlanTask, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
+        WorkflowRole,
+    };
+    use threadlane_registry::{RegistryChange, RegistryStore};
+    use threadlane_workers::{
+        resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    };
+
+    use super::*;
+
+    const THREAD_UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const THREAD_UUID_B: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+    const BINDING_A: &str = "bnd_control_alpha";
+    const BINDING_B: &str = "bnd_control_beta";
+
+    struct HostTestFixture {
+        _tmp: TempDir,
+        root: PathBuf,
+        repo_dir: PathBuf,
+        base_commit: String,
+        registry_dir: PathBuf,
+        plans_dir: PathBuf,
+        authority_dir: PathBuf,
+        sessions_dir: PathBuf,
+        fake_agy_exe: PathBuf,
+        fake_oc_exe: PathBuf,
+        agy_count_file: PathBuf,
+        agy_prompt_file: PathBuf,
+        oc_count_file: PathBuf,
+        oc_prompt_file: PathBuf,
+        registry: Arc<RegistryStore>,
+        plans: Arc<PlanStore>,
+        authority: Arc<AuthorityStore>,
+    }
+
+    fn write_fake_agy_script(script_path: &Path, count_file: &Path, prompt_file: &Path) {
+        if let Some(parent) = script_path.parent() {
+            fs::create_dir_all(parent).expect("create script parent dir");
+        }
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+COUNT_FILE="{count_file}"
+PROMPT_FILE="{prompt_file}"
+c=0
+if [ -f "$COUNT_FILE" ]; then
+    c=$(cat "$COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$COUNT_FILE"
+
+MODEL=""
+EFFORT=""
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --effort)
+            EFFORT="$2"
+            shift 2
+            ;;
+        --print)
+            PROMPT="$2"
+            shift 2
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
+done
+
+printf "%s" "$PROMPT" > "$PROMPT_FILE"
+printf '{{"type":"init","session_id":"sess-agy-1","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
+
+case "$PROMPT" in
+    *SLOW_WAIT_FOR_CANCEL*)
+        trap 'exit 0' TERM INT
+        i=0
+        while [ "$i" -lt 200 ]; do
+            sleep 0.05
+            i=$((i + 1))
+        done
+        ;;
+    *SHORT_DELAY_FOR_CLIENT_DROP*)
+        sleep 0.15
+        ;;
+esac
+
+if [ -d "src" ]; then
+    printf "// updated by fake-agy\npub fn alpha() -> u32 {{ 42 }}\n" > "src/lib.rs"
+fi
+
+printf '{{"type":"result","subtype":"success","session_id":"sess-agy-1","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
+exit 0
+"#,
+            count_file = count_file.display(),
+            prompt_file = prompt_file.display(),
+        );
+
+        let mut f = File::create(script_path).expect("create fake-agy");
+        f.write_all(script.as_bytes()).expect("write fake-agy");
+        f.sync_all().expect("sync fake-agy");
+        fs::set_permissions(script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 fake-agy");
+    }
+
+    fn write_fake_oc_script(script_path: &Path, count_file: &Path, prompt_file: &Path) {
+        if let Some(parent) = script_path.parent() {
+            fs::create_dir_all(parent).expect("create script parent dir");
+        }
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+COUNT_FILE="{count_file}"
+PROMPT_FILE="{prompt_file}"
+c=0
+if [ -f "$COUNT_FILE" ]; then
+    c=$(cat "$COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$COUNT_FILE"
+
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --)
+            shift 1
+            PROMPT="${{1:-}}"
+            break
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
+done
+
+printf "%s" "$PROMPT" > "$PROMPT_FILE"
+printf '{{"type":"init","session_id":"sess-oc-1","model":"opencode-go/deepseek-v4.1-flash","effort":"max"}}\n'
+
+if [ -d "src" ]; then
+    printf "// updated by fake-oc\npub fn extra() {{}}\n" > "src/extra.rs"
+fi
+
+printf '{{"type":"result","subtype":"success","session_id":"sess-oc-1","model":"opencode-go/deepseek-v4.1-flash","effort":"max"}}\n'
+exit 0
+"#,
+            count_file = count_file.display(),
+            prompt_file = prompt_file.display(),
+        );
+
+        let mut f = File::create(script_path).expect("create fake-oc");
+        f.write_all(script.as_bytes()).expect("write fake-oc");
+        f.sync_all().expect("sync fake-oc");
+        fs::set_permissions(script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 fake-oc");
+    }
+
+    fn init_disposable_git_repo(repo_dir: &Path) -> String {
+        fs::create_dir_all(repo_dir.join("src")).expect("create repo src");
+        fs::write(repo_dir.join("src/lib.rs"), "pub fn alpha() -> u32 { 1 }\n")
+            .expect("write src/lib.rs");
+        fs::write(repo_dir.join("src/extra.rs"), "pub fn extra() {}\n")
+            .expect("write src/extra.rs");
+
+        run_sanitized_git(
+            repo_dir,
+            &["init", "--quiet"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git init");
+        run_sanitized_git(
+            repo_dir,
+            &["config", "user.email", "test@threadlane.local"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git config email");
+        run_sanitized_git(
+            repo_dir,
+            &["config", "user.name", "Threadlane Test"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git config name");
+        run_sanitized_git(repo_dir, &["add", "."], DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("git add");
+        run_sanitized_git(
+            repo_dir,
+            &["commit", "-m", "initial commit", "--quiet"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git commit");
+
+        resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve HEAD")
+    }
+
+    fn setup_fixture() -> HostTestFixture {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize temp root");
+
+        let repo_dir = root.join("repo");
+        let base_commit = init_disposable_git_repo(&repo_dir);
+
+        let bin_dir = root.join("bin");
+        let fake_agy_exe = bin_dir.join("fake-agy");
+        let fake_oc_exe = bin_dir.join("fake-opencode");
+        let agy_count_file = root.join("agy-invocations.txt");
+        let agy_prompt_file = root.join("agy-last-prompt.txt");
+        let oc_count_file = root.join("oc-invocations.txt");
+        let oc_prompt_file = root.join("oc-last-prompt.txt");
+
+        write_fake_agy_script(&fake_agy_exe, &agy_count_file, &agy_prompt_file);
+        write_fake_oc_script(&fake_oc_exe, &oc_count_file, &oc_prompt_file);
+
+        let registry_dir = root.join("registry-store");
+        let plans_dir = root.join("plans-store");
+        let authority_dir = root.join("authority-store");
+        let sessions_dir = root.join("sessions-store");
+
+        let registry = Arc::new(RegistryStore::open(&registry_dir).expect("open registry"));
+        let plans = Arc::new(PlanStore::open(&plans_dir).expect("open plans"));
+
+        registry
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-agy".to_string(),
+                        label: "Antigravity CLI".to_string(),
+                        adapter: ToolAdapter::Antigravity,
+                        executable_path: Some(fake_agy_exe.clone()),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert tool-agy");
+
+        registry
+            .apply(
+                1,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-oc".to_string(),
+                        label: "OpenCode v2 CLI".to_string(),
+                        adapter: ToolAdapter::OpencodeV2,
+                        executable_path: Some(fake_oc_exe.clone()),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert tool-oc");
+
+        registry
+            .apply(
+                2,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-codex".to_string(),
+                        label: "Native Codex".to_string(),
+                        adapter: ToolAdapter::CodexCli,
+                        executable_path: None,
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert tool-codex");
+
+        registry
+            .apply(
+                3,
+                RegistryChange::UpsertModels {
+                    models: vec![
+                        ModelDefinition {
+                            id: "model-argon".to_string(),
+                            tool_id: "tool-agy".to_string(),
+                            label: "Gemini 4 Argon High".to_string(),
+                            model_arg: "gemini-4-argon-high".to_string(),
+                            efforts: vec!["medium".to_string(), "high".to_string()],
+                            allow_no_effort: false,
+                        },
+                        ModelDefinition {
+                            id: "model-deepseek".to_string(),
+                            tool_id: "tool-oc".to_string(),
+                            label: "DeepSeek v4.1 Flash".to_string(),
+                            model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                            efforts: vec!["max".to_string()],
+                            allow_no_effort: false,
+                        },
+                        ModelDefinition {
+                            id: "model-codex-native".to_string(),
+                            tool_id: "tool-codex".to_string(),
+                            label: "Native Codex Follower".to_string(),
+                            model_arg: "gpt-5-codex".to_string(),
+                            efforts: vec!["high".to_string()],
+                            allow_no_effort: true,
+                        },
+                    ],
+                },
+            )
+            .expect("upsert models");
+
+        registry
+            .apply(
+                4,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-main".to_string(),
+                        name: "Main M4 Profile".to_string(),
+                        assignments: vec![
+                            RoleAssignment {
+                                role: WorkflowRole::Coder,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: "model-argon".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Coder,
+                                difficulty: Some(Difficulty::Easy),
+                                choice: ModelChoice {
+                                    model_id: "model-deepseek".to_string(),
+                                    effort: Some("max".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Follower,
+                                difficulty: None,
+                                choice: ModelChoice {
+                                    model_id: "model-codex-native".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                        ],
+                    },
+                },
+            )
+            .expect("upsert profile");
+
+        let authority = Arc::new(
+            AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plans))
+                .expect("open authority"),
+        );
+
+        HostTestFixture {
+            _tmp: tmp,
+            root,
+            repo_dir,
+            base_commit,
+            registry_dir,
+            plans_dir,
+            authority_dir,
+            sessions_dir,
+            fake_agy_exe,
+            fake_oc_exe,
+            agy_count_file,
+            agy_prompt_file,
+            oc_count_file,
+            oc_prompt_file,
+            registry,
+            plans,
+            authority,
+        }
+    }
+
+    fn default_tasks(agy_instruction: &str) -> Vec<PlanTask> {
+        vec![
+            PlanTask {
+                id: "task-root-agy".to_string(),
+                title: "Root AGY implementation".to_string(),
+                instruction: agy_instruction.to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-root-oc".to_string(),
+                title: "Root OpenCode helper".to_string(),
+                instruction: "Implement extra helper in src/extra.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Easy,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/extra.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-dep-agy".to_string(),
+                title: "Dependent AGY task".to_string(),
+                instruction: "Follow up after task-root-agy".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-root-agy".to_string()],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-native-codex".to_string(),
+                title: "Manual Codex conversation task".to_string(),
+                instruction: "Coordinate with operator in native Codex chat".to_string(),
+                role: WorkflowRole::Follower,
+                difficulty: Difficulty::Medium,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+        ]
+    }
+
+    fn create_approved_plan(
+        fixture: &HostTestFixture,
+        plan_id: &str,
+        binding_id: &str,
+        thread_uuid: &str,
+        tasks: Vec<PlanTask>,
+    ) -> String {
+        let draft = fixture
+            .plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: plan_id.to_string(),
+                    binding_id: binding_id.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 5,
+                    summary: format!("Plan {plan_id}"),
+                    tasks: tasks.clone(),
+                },
+                1_700_000_000_000,
+            )
+            .expect("save draft");
+
+        let published = fixture
+            .plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: plan_id.to_string(),
+                    revision: draft.revision,
+                },
+            )
+            .expect("publish plan");
+
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+        let compiled =
+            compile_plan_revision(&published, &reg_snap).expect("compile published plan");
+
+        let approved_task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let summary = fixture
+            .authority
+            .approve_at(
+                OperatorApprovalRequest {
+                    binding_id: binding_id.to_string(),
+                    thread_uuid: thread_uuid.to_string(),
+                    plan_id: plan_id.to_string(),
+                    plan_revision: published.revision,
+                    expected_registry_revision: reg_snap.revision,
+                    expected_plan_digest: compiled.plan_digest,
+                    repository_path: fixture.repo_dir.clone(),
+                    base_commit: fixture.base_commit.clone(),
+                    approved_task_ids,
+                    approved_write_paths: vec!["src/".to_string()],
+                    max_parallel: 2,
+                    budgets: ExecutionBudgets::default(),
+                },
+                1_700_000_001_000,
+            )
+            .expect("approve plan");
+
+        summary.approval_id
+    }
+
+    fn read_invocation_count(path: &Path) -> u32 {
+        match fs::read_to_string(path) {
+            Ok(s) => s.trim().parse::<u32>().unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+
+    async fn wait_for_task_status(
+        client: &ApprovedHostClient,
+        approval_id: &str,
+        task_id: &str,
+        predicate: impl Fn(TaskExecutionStatus) -> bool,
+    ) -> TaskStateSnapshot {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let snap = client
+                .get_task(approval_id, task_id)
+                .await
+                .expect("get_task during wait");
+            if predicate(snap.status) {
+                return snap;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for task `{task_id}` status; last snapshot: {snap:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[test]
+    fn cli_serve_requires_explicit_flags_and_rejects_unknown_overrides() {
+        let parsed = HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            "/tmp/reg",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/auth",
+            "--sessions-dir",
+            "/tmp/sess",
+            "--approval-id",
+            "apr_0123456789abcdef0123456789abcdef",
+        ])
+        .expect("parse valid serve args");
+
+        match parsed.command {
+            HostCommand::Serve(args) => {
+                assert_eq!(args.registry_dir, PathBuf::from("/tmp/reg"));
+                assert_eq!(args.plans_dir, PathBuf::from("/tmp/plans"));
+                assert_eq!(args.authority_dir, PathBuf::from("/tmp/auth"));
+                assert_eq!(args.sessions_dir, PathBuf::from("/tmp/sess"));
+                assert_eq!(args.approval_id, "apr_0123456789abcdef0123456789abcdef");
+            }
+        }
+
+        // Missing required flag (--approval-id) must be rejected.
+        assert!(HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            "/tmp/reg",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/auth",
+            "--sessions-dir",
+            "/tmp/sess",
+        ])
+        .is_err());
+
+        // Arbitrary model, prompt, or config override flags must be rejected.
+        for forbidden_flag in ["--model", "--instruction", "--config", "--auto"] {
+            assert!(HostCli::try_parse_from([
+                "threadlane-host",
+                "serve",
+                "--registry-dir",
+                "/tmp/reg",
+                "--plans-dir",
+                "/tmp/plans",
+                "--authority-dir",
+                "/tmp/auth",
+                "--sessions-dir",
+                "/tmp/sess",
+                "--approval-id",
+                "apr_0123456789abcdef0123456789abcdef",
+                forbidden_flag,
+                "override",
+            ])
+            .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn private_permissions_symlinks_foreign_files_overlap_and_corruption_refused() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-sec",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Implement security test"),
+        );
+
+        // 1. Overlapping sessions_dir with authority_dir or repository_path is refused.
+        let overlap_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            fixture.authority_dir.join("nested-sessions"),
+            &approval_id,
+        ))
+        .await
+        .expect_err("overlapping authority_dir must fail");
+        assert_eq!(overlap_err.code(), "security_violation");
+
+        let repo_overlap_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            fixture.repo_dir.join("sessions"),
+            &approval_id,
+        ))
+        .await
+        .expect_err("overlapping repository_path must fail");
+        assert_eq!(repo_overlap_err.code(), "security_violation");
+
+        // 2. Symlink sessions_dir is refused.
+        let real_alt = fixture.root.join("real-alt-sessions");
+        fs::create_dir_all(&real_alt).expect("create real-alt");
+        fs::set_permissions(&real_alt, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        let symlink_sessions = fixture.root.join("symlink-sessions");
+        symlink(&real_alt, &symlink_sessions).expect("create symlink sessions_dir");
+
+        let sym_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &symlink_sessions,
+            &approval_id,
+        ))
+        .await
+        .expect_err("symlink sessions_dir must fail");
+        assert_eq!(sym_err.code(), "security_violation");
+
+        // 3. Foreign file directly inside sessions_dir is refused.
+        ensure_private_dir(&fixture.sessions_dir).expect("create private sessions_dir");
+        let foreign_root_file = fixture.sessions_dir.join("unexpected.txt");
+        fs::write(&foreign_root_file, "foreign").expect("write foreign file");
+        let foreign_root_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect_err("foreign file in sessions_dir must fail");
+        assert_eq!(foreign_root_err.code(), "security_violation");
+        fs::remove_file(&foreign_root_file).expect("remove foreign root file");
+
+        // 4. Pre-existing non-empty session directory without host.lock/host-manifest.json is refused.
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        ensure_private_dir(&session_dir).expect("create session_dir");
+        ensure_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))
+            .expect("create premature runtime-state");
+        let premature_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect_err("premature non-empty session dir must fail");
+        assert_eq!(premature_err.code(), "security_violation");
+        fs::remove_dir_all(&session_dir).expect("clean premature session dir");
+
+        // 5. Normal start creates 0700 directories and 0600 files, and never leaks tokens/paths in summary/Debug.
+        let handle = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start valid host");
+
+        let sess_mode = fs::symlink_metadata(&session_dir)
+            .expect("stat session_dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(sess_mode, 0o700);
+
+        let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+        let manifest_mode = fs::symlink_metadata(&manifest_path)
+            .expect("stat host-manifest.json")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(manifest_mode, 0o600);
+
+        let lock_path = session_dir.join(HOST_LOCK_FILENAME);
+        let lock_mode = fs::symlink_metadata(&lock_path)
+            .expect("stat host.lock")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(lock_mode, 0o600);
+
+        let summary_json =
+            serde_json::to_string(&handle.summary()).expect("serialize HostSessionSummary");
+        assert!(!summary_json.contains("tl_"));
+        assert!(!summary_json.contains(&fixture.root.display().to_string()));
+        let handle_debug = format!("{handle:?}");
+        assert!(!handle_debug.contains("tl_"));
+        assert!(!handle_debug.contains(&fixture.root.display().to_string()));
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+        let client_debug = format!("{client:?}");
+        assert!(!client_debug.contains("tl_"));
+        assert!(!client_debug.contains(&fixture.root.display().to_string()));
+
+        handle.shutdown().await.expect("graceful shutdown");
+
+        // 6. Corrupt host-manifest.json is preserved untouched and rejected with corrupt_manifest.
+        let corrupt_bytes = b"{corrupt-json-manifest";
+        fs::write(&manifest_path, corrupt_bytes).expect("write corrupt manifest");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 corrupt manifest");
+
+        let corrupt_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect_err("corrupt manifest must fail closed");
+        assert_eq!(corrupt_err.code(), "corrupt_manifest");
+        assert_eq!(
+            fs::read(&manifest_path).expect("read preserved corrupt manifest"),
+            corrupt_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn second_host_for_same_approval_fails_closed_with_lock_busy() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-lock",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Lock contention check"),
+        );
+
+        let host1 = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host 1");
+
+        assert!(is_host_lock_held(host1.session_dir()).expect("check host lock held"));
+
+        let err2 = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect_err("second host for same approval must fail with lock_busy");
+        assert_eq!(err2.code(), "lock_busy");
+
+        // Host 1 remains ready and usable after contended startup attempt.
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+        let summary = client
+            .session_summary(&approval_id)
+            .expect("session summary");
+        assert_eq!(summary.phase, HostPhase::Ready);
+        assert!(summary.gates.supervisor_authenticated_ready);
+
+        host1.shutdown().await.expect("shutdown host 1");
+        assert!(!is_host_lock_held(&fixture.sessions_dir.join(&approval_id))
+            .expect("lock released after shutdown"));
+    }
+
+    #[tokio::test]
+    async fn no_auto_start_registry_mutations_ignored_draft_allowed_superseded_blocked() {
+        let fixture = setup_fixture();
+        let frozen_prompt = "Frozen instruction from approved revision 2";
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-freeze",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks(frozen_prompt),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        // No provider starts automatically on host startup.
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
+        assert_eq!(read_invocation_count(&fixture.oc_count_file), 0);
+        assert!(!host.summary().gates.workers_auto_started_on_boot);
+
+        let frozen_revision = host.approval().plan_revision;
+
+        // Mutate RegistryStore after approval to point tool-agy to a broken path and different model.
+        let bogus_exe = fixture.root.join("bin/nonexistent-agy");
+        let cur_reg_rev = fixture.registry.snapshot().expect("reg snap").revision;
+        fixture
+            .registry
+            .apply(
+                cur_reg_rev,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-agy".to_string(),
+                        label: "Mutated AGY".to_string(),
+                        adapter: ToolAdapter::Antigravity,
+                        executable_path: Some(bogus_exe),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("mutate registry tool-agy");
+
+        // Save a newer unpublished Draft revision on the same plan: must NOT cancel the published approval.
+        let latest_plan = fixture
+            .plans
+            .latest_revision("plan-freeze")
+            .expect("get plan")
+            .expect("plan exists");
+        let draft_rev = fixture
+            .plans
+            .change(
+                latest_plan.revision,
+                PlanChange::SaveDraft {
+                    plan_id: "plan-freeze".to_string(),
+                    binding_id: BINDING_A.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 5,
+                    summary: "Newer draft revision".to_string(),
+                    tasks: default_tasks("Mutated draft instruction"),
+                },
+            )
+            .expect("save newer draft");
+        assert_eq!(draft_rev.status, PlanStatus::Draft);
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // Dispatch uses the frozen executable, model, and instruction despite registry mutation and newer Draft.
+        let dispatched = client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+        assert!(dispatched.run_id.is_some());
+        assert!(!dispatched.accepted);
+
+        let completed = wait_for_task_status(
+            &client,
+            &approval_id,
+            "task-root-agy",
+            |st| st == TaskExecutionStatus::ReadyForReview,
+        )
+        .await;
+        assert_eq!(completed.status, TaskExecutionStatus::ReadyForReview);
+        assert!(!completed.accepted);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        assert_eq!(
+            fs::read_to_string(&fixture.agy_prompt_file).expect("read captured prompt"),
+            frozen_prompt
+        );
+
+        // The frozen source revision stays Published while a newer draft exists.
+        let approved_rev = fixture
+            .plans
+            .get_revision("plan-freeze", frozen_revision)
+            .expect("get frozen revision")
+            .expect("frozen revision exists");
+        assert_eq!(approved_rev.status, PlanStatus::Published);
+
+        // Main repository checkout is untouched (no auto-merge/apply).
+        assert_eq!(
+            fs::read_to_string(fixture.repo_dir.join("src/lib.rs")).expect("read main repo lib.rs"),
+            "pub fn alpha() -> u32 { 1 }\n"
+        );
+
+        // Publishing the newer draft supersedes the frozen source revision.
+        fixture
+            .plans
+            .change(
+                draft_rev.revision,
+                PlanChange::Publish {
+                    plan_id: "plan-freeze".to_string(),
+                    revision: draft_rev.revision,
+                },
+            )
+            .expect("publish newer revision");
+        let superseded_rev = fixture
+            .plans
+            .get_revision("plan-freeze", frozen_revision)
+            .expect("get frozen revision")
+            .expect("frozen revision exists");
+        assert_eq!(superseded_rev.status, PlanStatus::Superseded);
+
+        // Dispatching another task on the superseded plan revision is blocked.
+        let sup_dispatch_err = client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect_err("superseded plan must reject new dispatch/materialization");
+        assert_eq!(sup_dispatch_err.code(), "unpublished_or_superseded_plan");
+
+        host.shutdown().await.expect("shutdown host");
+
+        // Starting a host for a superseded plan revision is also blocked.
+        let sup_start_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect_err("superseded plan must reject host startup");
+        assert_eq!(sup_start_err.code(), "unpublished_or_superseded_plan");
+    }
+
+    #[tokio::test]
+    async fn deterministic_dispatch_idempotent_replay_and_receipt_recovery() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-dedup",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Deterministic idempotent instruction"),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        let first = client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("first dispatch");
+        let completed = wait_for_task_status(
+            &client,
+            &approval_id,
+            "task-root-agy",
+            |st| st == TaskExecutionStatus::ReadyForReview,
+        )
+        .await;
+        assert_eq!(first.run_id, completed.run_id);
+        assert_eq!(first.worker_id, completed.worker_id);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        // Retrying dispatch_task with the same (approval_id, task_id) replays the exact same
+        // deterministic command_key and returns the same run_id/worker_id without spawning again.
+        let second = client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("second idempotent dispatch");
+        assert_eq!(second.run_id, first.run_id);
+        assert_eq!(second.worker_id, first.worker_id);
+        assert_eq!(second.status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        // Simulate a lost receipt file after start_worker succeeded: re-calling dispatch_task
+        // recovers the exact same run_id from runtime command deduplication without respawning.
+        let receipts_path = host.session_dir().join(TASK_RECEIPTS_FILENAME);
+        fs::remove_file(&receipts_path).expect("remove task-receipts.json to simulate loss");
+        assert_eq!(
+            client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect("get_task without receipt")
+                .status,
+            TaskExecutionStatus::NotStarted
+        );
+
+        let recovered = client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("recover dispatch via deterministic command_key replay");
+        assert_eq!(recovered.run_id, first.run_id);
+        assert_eq!(recovered.worker_id, first.worker_id);
+        assert_eq!(recovered.status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        // Corrupting task-receipts.json must fail closed with corrupt_receipts and preserve the file.
+        let corrupt_receipt_bytes = b"{broken-receipts-json";
+        fs::write(&receipts_path, corrupt_receipt_bytes).expect("write corrupt task-receipts.json");
+        fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 corrupt receipts");
+        let receipt_err = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect_err("corrupt task-receipts.json must fail closed");
+        assert_eq!(receipt_err.code(), "corrupt_receipts");
+        assert_eq!(
+            fs::read(&receipts_path).expect("read preserved corrupt receipts"),
+            corrupt_receipt_bytes
+        );
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn scope_mismatch_denials_and_dependent_or_native_routes_blocked() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-gates",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Root AGY task"),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        // Wrong control_binding_id is rejected before accessing session.
+        let wrong_binding_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+        )
+        .expect("open wrong binding client");
+        let err_binding = wrong_binding_client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect_err("wrong control_binding_id must be denied");
+        assert_eq!(err_binding.code(), "scope_mismatch");
+
+        // Wrong native_thread_uuid is rejected before accessing session.
+        let wrong_thread_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_B,
+        )
+        .expect("open wrong thread client");
+        let err_thread = wrong_thread_client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect_err("wrong native_thread_uuid must be denied");
+        assert_eq!(err_thread.code(), "scope_mismatch");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open valid client");
+
+        // Unknown task ID is rejected with unknown_task.
+        let unknown_err = client
+            .dispatch_task(&approval_id, "task-does-not-exist")
+            .await
+            .expect_err("unknown task must fail");
+        assert_eq!(unknown_err.code(), "unknown_task");
+
+        // Dependent task is blocked with dependency_inputs_unverified.
+        let dep_err = client
+            .dispatch_task(&approval_id, "task-dep-agy")
+            .await
+            .expect_err("dependent task must fail with dependency_inputs_unverified");
+        assert_eq!(dep_err.code(), "dependency_inputs_unverified");
+        let dep_state = client
+            .get_task(&approval_id, "task-dep-agy")
+            .await
+            .expect("get_task on dependent task");
+        assert_eq!(
+            dep_state.status,
+            TaskExecutionStatus::DependencyInputsUnverified
+        );
+
+        // Manual native route (codex_cli) is blocked with native_route_required.
+        let native_err = client
+            .dispatch_task(&approval_id, "task-native-codex")
+            .await
+            .expect_err("native route must fail with native_route_required");
+        assert_eq!(native_err.code(), "native_route_required");
+        let native_state = client
+            .get_task(&approval_id, "task-native-codex")
+            .await
+            .expect("get_task on native route");
+        assert_eq!(
+            native_state.status,
+            TaskExecutionStatus::NativeRouteRequired
+        );
+
+        // Unstarted root worker task reports NotStarted on get_task and not_started on cancel/activity.
+        let unstarted = client
+            .get_task(&approval_id, "task-root-oc")
+            .await
+            .expect("get_task on unstarted root task");
+        assert_eq!(unstarted.status, TaskExecutionStatus::NotStarted);
+        assert!(unstarted.run_id.is_none());
+
+        let cancel_unstarted_err = client
+            .cancel_task(&approval_id, "task-root-oc", 1, None)
+            .await
+            .expect_err("cancel unstarted task must fail");
+        assert_eq!(cancel_unstarted_err.code(), "not_started");
+
+        let activity_unstarted_err = client
+            .list_task_activity(&approval_id, "task-root-oc", None, None, None, None)
+            .await
+            .expect_err("list_task_activity on unstarted task must fail");
+        assert_eq!(activity_unstarted_err.code(), "not_started");
+
+        // Dispatch OpenCodeV2 root task and verify ReadyForReview completion.
+        client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect("dispatch task-root-oc");
+        let oc_done = wait_for_task_status(
+            &client,
+            &approval_id,
+            "task-root-oc",
+            |st| st == TaskExecutionStatus::ReadyForReview,
+        )
+        .await;
+        assert_eq!(oc_done.status, TaskExecutionStatus::ReadyForReview);
+        assert!(!oc_done.accepted);
+        assert_eq!(read_invocation_count(&fixture.oc_count_file), 1);
+        let frozen_oc = host
+            .approval()
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task-root-oc")
+            .expect("frozen OpenCode task");
+        assert_eq!(
+            frozen_oc.canonical_executable.as_ref(),
+            Some(&fs::canonicalize(&fixture.fake_oc_exe).expect("canonical fake executable"))
+        );
+        assert_eq!(
+            fs::read_to_string(&fixture.oc_prompt_file).expect("captured OpenCode instruction"),
+            frozen_oc.instruction
+        );
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn separate_sessions_and_client_drop_leaves_host_running_to_completion() {
+        let fixture = setup_fixture();
+        let approval_a = create_approved_plan(
+            &fixture,
+            "plan-session-a",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("SHORT_DELAY_FOR_CLIENT_DROP session A"),
+        );
+        let approval_b = create_approved_plan(
+            &fixture,
+            "plan-session-b",
+            BINDING_B,
+            THREAD_UUID_B,
+            default_tasks("Session B root task"),
+        );
+
+        let host_a = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_a,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host A");
+
+        let host_b = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_b,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host B");
+
+        assert_ne!(host_a.session_dir(), host_b.session_dir());
+        assert_ne!(host_a.runtime_state_dir(), host_b.runtime_state_dir());
+        assert_ne!(host_a.work_area_dir(), host_b.work_area_dir());
+
+        // Start task in session A using a short-lived client, then immediately drop the client!
+        {
+            let ephemeral_client_a = ApprovedHostClient::open(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                BINDING_A,
+                THREAD_UUID_A,
+            )
+            .expect("open ephemeral client A");
+            ephemeral_client_a
+                .dispatch_task(&approval_a, "task-root-agy")
+                .await
+                .expect("dispatch on ephemeral client A");
+        }
+
+        // Host A continues running the job to ReadyForReview after the client was dropped.
+        let fresh_client_a = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open fresh client A");
+        let completed_a = wait_for_task_status(
+            &fresh_client_a,
+            &approval_a,
+            "task-root-agy",
+            |st| st == TaskExecutionStatus::ReadyForReview,
+        )
+        .await;
+        assert_eq!(completed_a.status, TaskExecutionStatus::ReadyForReview);
+
+        let activity_page = fresh_client_a
+            .list_task_activity(&approval_a, "task-root-agy", None, None, Some(10), None)
+            .await
+            .expect("list_task_activity for completed task");
+        assert!(!activity_page.events.is_empty());
+
+        // Client A cannot access Session B's approval.
+        let cross_err = fresh_client_a
+            .get_task(&approval_b, "task-root-agy")
+            .await
+            .expect_err("cross-session access must fail");
+        assert_eq!(cross_err.code(), "scope_mismatch");
+
+        host_a.shutdown().await.expect("shutdown host A");
+        host_b.shutdown().await.expect("shutdown host B");
+    }
+
+    #[tokio::test]
+    async fn startup_failure_leaves_failed_manifest_and_releases_lock() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-fail-boot",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Boot failure test"),
+        );
+
+        // Remove the frozen executable file before starting the host so materialization fails.
+        fs::remove_file(&fixture.fake_agy_exe).expect("remove fake-agy executable");
+
+        let start_err = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect_err("startup with missing frozen executable must fail");
+        assert_eq!(start_err.code(), "authority_error");
+
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        assert!(
+            !is_host_lock_held(&session_dir).expect("check lock after failed startup"),
+            "host.lock must be released when startup fails"
+        );
+
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get record");
+        let failed_manifest = read_host_manifest_optional(&session_dir, &record)
+            .expect("read manifest")
+            .expect("failed manifest recorded");
+        assert_eq!(failed_manifest.phase, HostPhase::Failed);
+        assert!(!failed_manifest.gates.supervisor_authenticated_ready);
+        assert!(failed_manifest.last_error.is_some());
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+        let not_ready_err = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect_err("failed host must reject client calls with host_not_ready");
+        assert_eq!(not_ready_err.code(), "host_not_ready");
+    }
+
+    #[tokio::test]
+    async fn graceful_restart_preserves_binding_marks_inflight_unknown_and_never_replays() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-restart",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("SLOW_WAIT_FOR_CANCEL restart test"),
+        );
+
+        let host1 = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host 1");
+
+        let original_session_binding_id = host1.session_binding_id().to_string();
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        let started = client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch slow task");
+        let running = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::Running
+        })
+        .await;
+        assert_eq!(running.run_id, started.run_id);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        // Gracefully shut down host 1 while the worker is in-flight.
+        host1.shutdown().await.expect("shutdown host 1");
+
+        // Restart host on the same session directory after the graceful shutdown.
+        let host2 = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("restart host 2");
+
+        // Must preserve the single existing session_binding_id and never replay the worker.
+        assert_eq!(host2.session_binding_id(), original_session_binding_id);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        let after_restart = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task after restart");
+        assert_eq!(after_restart.run_id, started.run_id);
+        assert_eq!(after_restart.status, TaskExecutionStatus::Unknown);
+        assert!(!after_restart.accepted);
+
+        host2.shutdown().await.expect("shutdown host 2");
+    }
+
+    #[tokio::test]
+    async fn revision_checked_cancellation_rejects_stale_and_cancels_matching_revision() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-cancel",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("SLOW_WAIT_FOR_CANCEL cancellation test"),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch slow task");
+
+        let running = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::Running
+        })
+        .await;
+        let current_revision = running
+            .worker
+            .as_ref()
+            .expect("worker snapshot present")
+            .revision;
+
+        // Stale expected_revision must fail closed with stale_revision.
+        let stale_err = client
+            .cancel_task(
+                &approval_id,
+                "task-root-agy",
+                current_revision + 50,
+                Some("stale revision test".to_string()),
+            )
+            .await
+            .expect_err("stale revision must fail");
+        assert_eq!(stale_err.code(), "stale_revision");
+
+        // Matching expected_revision requests cancellation and transitions the worker to Cancelled.
+        client
+            .cancel_task(
+                &approval_id,
+                "task-root-agy",
+                current_revision,
+                Some("operator requested cancellation".to_string()),
+            )
+            .await
+            .expect("cancel with matching revision");
+
+        let cancelled = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::Cancelled
+        })
+        .await;
+        assert_eq!(cancelled.status, TaskExecutionStatus::Cancelled);
+        assert!(!cancelled.accepted);
+
+        host.shutdown().await.expect("shutdown host");
+    }
+}
