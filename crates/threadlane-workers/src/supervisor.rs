@@ -434,11 +434,12 @@ pub async fn run_worker_with_observer(
     let validation = spec.validate()?;
     let canonical_workdir =
         validate_existing_canonical_dir(working_directory, "working_directory")?;
+    let constructed_argv = spec.build_argv_for_workdir(&canonical_workdir)?;
 
     let start_instant = Instant::now();
 
     let mut cmd = Command::new(&validation.canonical_executable);
-    cmd.args(&validation.constructed_argv)
+    cmd.args(&constructed_argv)
         .current_dir(&canonical_workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -624,7 +625,7 @@ pub async fn run_worker_with_observer(
         provider: spec.provider,
         requested_model: validation.resolved_model,
         requested_session_id: spec.session_id.clone(),
-        constructed_argv: validation.constructed_argv,
+        constructed_argv,
         working_directory: canonical_workdir,
         status,
         exit_code,
