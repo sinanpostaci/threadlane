@@ -2774,33 +2774,140 @@ async fn test_worker_file_permissions_profile_digest_validation_and_task_files_d
         );
     }
 
-    // 4. Unsupported OpenCode policy (`opencode_v2` with `task_files`) is rejected before side effects.
+    // 4. OpenCode v2 `task_files` is a supported policy that preserves the scoped template and
+    // exact profile digest input, while unsafe OpenCode scopes remain rejected without provider calls.
+    let opencode_task_files_profile_json = json!({
+        "profile_id": "prof_opencode_task_files",
+        "allowed_binding_ids": ["bind_perm_1"],
+        "spec": {
+            "provider": "opencode_v2",
+            "executable": fake_validate_bin,
+            "model": "openai/gpt-5",
+            "effort": "high",
+            "allowed_models": ["openai/gpt-5"],
+            "standalone": true,
+            "repository_path": repo.repo_dir,
+            "base_commit": repo.base_commit,
+            "work_area_root": uncreated_work_area,
+            "allowed_write_paths": ["src"],
+            "file_permissions": "task_files"
+        }
+    });
     write_private_workers_config(
         &bad_cfg_path,
         &json!({
             "max_parallel": 1,
-            "profiles": [{
-                "profile_id": "prof_opencode_bad",
-                "allowed_binding_ids": ["bind_perm_1"],
-                "spec": {
-                    "provider": "opencode_v2",
-                    "executable": fake_validate_bin,
-                    "model": "openai/gpt-5",
-                    "effort": "high",
-                    "allowed_models": ["openai/gpt-5"],
-                    "standalone": true,
-                    "repository_path": repo.repo_dir,
-                    "base_commit": repo.base_commit,
-                    "work_area_root": uncreated_work_area,
-                    "allowed_write_paths": ["src"],
-                    "file_permissions": "task_files"
-                }
-            }]
+            "profiles": [opencode_task_files_profile_json]
         }),
     );
+    let loaded_opencode_task_files = WorkersConfig::load_from_path(&bad_cfg_path)
+        .expect("load OpenCode v2 task_files profile");
+    let validated_opencode_task_files = loaded_opencode_task_files
+        .validate()
+        .expect("validate OpenCode v2 task_files profile");
+    let prof_opencode_task_files = validated_opencode_task_files
+        .profiles
+        .get("prof_opencode_task_files")
+        .expect("prof_opencode_task_files");
+    assert_eq!(
+        prof_opencode_task_files.template.file_permissions,
+        WorkerFilePermissions::TaskFiles,
+        "OpenCode v2 task_files must remain in the validated template"
+    );
+    assert_eq!(
+        prof_opencode_task_files
+            .build_spec("Check".to_string())
+            .file_permissions,
+        WorkerFilePermissions::TaskFiles,
+        "OpenCode v2 task_files must copy into the full WorkerSpec"
+    );
+    assert_eq!(
+        prof_opencode_task_files.template.allowed_write_paths,
+        BTreeSet::from(["src".to_string()]),
+        "OpenCode v2 task_files must preserve the exact scoped write paths"
+    );
+
+    let mut opencode_inherit_profile_json = opencode_task_files_profile_json.clone();
+    opencode_inherit_profile_json["spec"]["file_permissions"] = json!("inherit");
+    write_private_workers_config(
+        &bad_cfg_path,
+        &json!({
+            "max_parallel": 1,
+            "profiles": [opencode_inherit_profile_json]
+        }),
+    );
+    let validated_opencode_inherit = WorkersConfig::load_from_path(&bad_cfg_path)
+        .expect("load OpenCode v2 inherit profile")
+        .validate()
+        .expect("validate OpenCode v2 inherit profile");
+    let prof_opencode_inherit = validated_opencode_inherit
+        .profiles
+        .get("prof_opencode_task_files")
+        .expect("prof_opencode_task_files inherit");
+    assert_ne!(
+        prof_opencode_task_files.profile_digest, prof_opencode_inherit.profile_digest,
+        "OpenCode v2 task_files must change the immutable profile_digest"
+    );
+
+    // Negative OpenCode scope coverage: `task_files` must not broaden permissions or invoke the
+    // provider when write paths or `work_area_root` contain unsafe permission-pattern characters.
+    for unsafe_write_path in [
+        "src/*",
+        "src/file?.rs",
+        "src/[a-z].rs",
+        "src/lib].rs",
+        "src/{a,b}.rs",
+        "src/lib}.rs",
+        "src/(group).rs",
+        "src/lib).rs",
+        "src\\lib.rs",
+        "src/bad\x07ctrl.rs",
+    ] {
+        let mut bad_prof = opencode_task_files_profile_json.clone();
+        bad_prof["spec"]["allowed_write_paths"] = json!([unsafe_write_path]);
+        write_private_workers_config(
+            &bad_cfg_path,
+            &json!({
+                "max_parallel": 1,
+                "profiles": [bad_prof]
+            }),
+        );
+        assert!(
+            WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
+            "OpenCode task_files must reject unsafe write path `{unsafe_write_path}`"
+        );
+    }
+
+    for unsafe_work_area_name in [
+        "work_area_*",
+        "work_area_?",
+        "work_area_[1]",
+        "work_area_{a}",
+        "work_area_(x)",
+        "work_area_\\bad",
+    ] {
+        let mut bad_prof = opencode_task_files_profile_json.clone();
+        bad_prof["spec"]["work_area_root"] = json!(temp.path().join(unsafe_work_area_name));
+        write_private_workers_config(
+            &bad_cfg_path,
+            &json!({
+                "max_parallel": 1,
+                "profiles": [bad_prof]
+            }),
+        );
+        assert!(
+            WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
+            "OpenCode task_files must reject unsafe work_area_root `{unsafe_work_area_name}`"
+        );
+    }
+
     assert!(
-        WorkersConfig::load_from_path(&bad_cfg_path).is_err(),
-        "task_files must be rejected for provider opencode_v2"
+        !uncreated_work_area.exists(),
+        "OpenCode task_files validation must not create work_area_root"
+    );
+    assert!(
+        !never_spawn_marker.exists(),
+        "OpenCode task_files validation must never invoke the provider executable"
     );
 
     // 5. Unsafe permission-pattern metacharacters in `allowed_write_paths` and `work_area_root`

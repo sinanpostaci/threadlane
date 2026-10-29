@@ -85,7 +85,8 @@ pub struct WorkerSpecTemplate {
     pub work_area_root: PathBuf,
     /// Non-empty set of repository-relative paths or directory prefixes the worker may modify.
     pub allowed_write_paths: BTreeSet<String>,
-    /// Scoped provider file permission policy (`inherit` by default, or `task_files` for Antigravity).
+    /// Scoped provider file permission policy (`inherit` by default, or `task_files` for
+    /// Antigravity and OpenCode v2).
     #[serde(default)]
     pub file_permissions: WorkerFilePermissions,
     /// Explicit execution, stream, and output budgets.
@@ -631,9 +632,9 @@ fn validate_task_files_profile_paths(
     work_area_root: &Path,
     allowed_write_paths: &BTreeSet<String>,
 ) -> Result<(), Error> {
-    if provider != WorkerProvider::Antigravity {
+    if !matches!(provider, WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2) {
         return Err(Error::InvalidConfig(format!(
-            "profile `{profile_id}`: `file_permissions: \"task_files\"` is only supported for provider `antigravity`"
+            "profile `{profile_id}`: `file_permissions: \"task_files\"` is only supported for providers `antigravity` and `opencode_v2`"
         )));
     }
     let work_area_str = work_area_root.to_str().ok_or_else(|| {
