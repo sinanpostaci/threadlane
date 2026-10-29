@@ -202,6 +202,126 @@ export function shouldRebuildMainOnPoll(state: DesktopStoreState): boolean {
   return state.page === 'activity';
 }
 
+function compareCodeUnits(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+/**
+ * Canonical content fingerprint for the local plan ledger. Plan entries have per-plan
+ * revisions but no ledger-wide version, so compare the complete persisted content.
+ */
+export function plansSnapshotFingerprint(plans: readonly PlanRevision[]): string {
+  const ordered = [...plans].sort(
+    (left, right) =>
+      compareCodeUnits(left.plan_id, right.plan_id) || left.revision - right.revision
+  );
+  return JSON.stringify(
+    ordered.map((plan) => ({
+      plan_id: plan.plan_id,
+      binding_id: plan.binding_id,
+      revision: plan.revision,
+      profile_id: plan.profile_id,
+      profile_revision: plan.profile_revision,
+      summary: plan.summary,
+      status: plan.status,
+      created_at_ms: plan.created_at_ms,
+      tasks: plan.tasks.map((task) => ({
+        id: task.id,
+        title: task.title,
+        instruction: task.instruction,
+        role: task.role,
+        difficulty: task.difficulty,
+        depends_on: [...task.depends_on],
+        allowed_write_paths: [...task.allowed_write_paths],
+      })),
+    }))
+  );
+}
+
+/** Canonical registry fingerprint including the persisted store revision. */
+export function registrySnapshotFingerprint(snapshot: RegistrySnapshot): string {
+  const tools = [...snapshot.tools]
+    .sort((left, right) => compareCodeUnits(left.id, right.id))
+    .map((tool) => ({
+      id: tool.id,
+      label: tool.label,
+      adapter: tool.adapter,
+      executable_path: tool.executable_path,
+      enabled: tool.enabled,
+    }));
+  const models = [...snapshot.models]
+    .sort((left, right) => compareCodeUnits(left.id, right.id))
+    .map((model) => ({
+      id: model.id,
+      tool_id: model.tool_id,
+      label: model.label,
+      model_arg: model.model_arg,
+      efforts: [...model.efforts],
+      allow_no_effort: model.allow_no_effort,
+    }));
+  const profiles = [...snapshot.profiles]
+    .sort((left, right) => compareCodeUnits(left.id, right.id))
+    .map((profile) => ({
+      id: profile.id,
+      name: profile.name,
+      assignments: [...profile.assignments]
+        .sort(
+          (left, right) =>
+            compareCodeUnits(left.role, right.role) ||
+            compareCodeUnits(left.difficulty ?? '', right.difficulty ?? '')
+        )
+        .map((assignment) => ({
+          role: assignment.role,
+          difficulty: assignment.difficulty,
+          model_id: assignment.choice.model_id,
+          effort: assignment.choice.effort,
+        })),
+    }));
+
+  return JSON.stringify({
+    schema_version: snapshot.schema_version,
+    revision: snapshot.revision,
+    tools,
+    models,
+    profiles,
+    default_profile_id: snapshot.default_profile_id,
+  });
+}
+
+export function hasPlansSnapshotChanged(
+  previous: readonly PlanRevision[],
+  next: readonly PlanRevision[]
+): boolean {
+  return plansSnapshotFingerprint(previous) !== plansSnapshotFingerprint(next);
+}
+
+export function hasRegistrySnapshotChanged(
+  previous: RegistrySnapshot,
+  next: RegistrySnapshot
+): boolean {
+  return registrySnapshotFingerprint(previous) !== registrySnapshotFingerprint(next);
+}
+
+/**
+ * Background refresh is limited to the active, visible Plans page and never overlaps an
+ * already-running local registry/plans read or a runtime mutation.
+ */
+export function shouldPollActivePlansStore(
+  state: DesktopStoreState,
+  isDocumentHidden: boolean = false
+): boolean {
+  if (isDocumentHidden) {
+    return false;
+  }
+  if (state.page !== 'plans' || state.detailTarget !== null) {
+    return false;
+  }
+  if (state.pendingMutation !== null) {
+    return false;
+  }
+  return !state.registryInFlight && !state.plansInFlight;
+}
+
 function resolveScopedBindingId(
   snapshot: DesktopSnapshot,
   preferredBindingId: string | null
@@ -318,8 +438,20 @@ export function applySnapshotPollError(
   ) {
     return state;
   }
+
+  // Observer status only: retain the last visible runs and bindings for inspection, but
+  // never keep cached freshness that would let stale approval UI remain actionable.
+  const failedAttachment = {
+    ...state.snapshot.attachment,
+    connection: 'disconnected' as const,
+  };
+
   return {
     ...state,
+    snapshot: {
+      ...state.snapshot,
+      attachment: failedAttachment,
+    },
     snapshotLoading: false,
     pollInFlight: false,
     actionError: errorMessage,
