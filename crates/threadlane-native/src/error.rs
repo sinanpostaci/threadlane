@@ -9,6 +9,8 @@ pub enum NativeErrorCode {
     NotConfigured,
     /// Optional workflow registry and plan stores are not configured on this MCP server instance.
     WorkflowNotConfigured,
+    /// Optional approved-task authority store and host sessions root are not configured on this MCP server instance.
+    HostNotConfigured,
     /// Native configuration or caller parameter failed validation.
     InvalidConfig,
     /// Input parameter failed format, length, or scope validation.
@@ -67,6 +69,7 @@ impl NativeErrorCode {
         match self {
             Self::NotConfigured => "not_configured",
             Self::WorkflowNotConfigured => "workflow_not_configured",
+            Self::HostNotConfigured => "host_not_configured",
             Self::InvalidConfig => "invalid_config",
             Self::ValidationFailed => "validation_failed",
             Self::UnsupportedPlatform => "unsupported_platform",
