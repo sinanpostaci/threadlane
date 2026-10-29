@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/threadlane-authority",
     "crates/threadlane-core",
     "crates/threadlane",
     "crates/threadlane-workers",
@@ -36,6 +37,7 @@ sha2 = "0.10"
 tempfile = "3.10"
 thiserror = "1.0"
 threadlane = { path = "crates/threadlane" }
+threadlane-authority = { path = "crates/threadlane-authority" }
 threadlane-connectors = { path = "crates/threadlane-connectors" }
 threadlane-core = { path = "crates/threadlane-core" }
 threadlane-decisions = { path = "crates/threadlane-decisions" }

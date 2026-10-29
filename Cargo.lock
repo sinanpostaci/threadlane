@@ -2401,6 +2401,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-authority"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "threadlane",
+ "threadlane-core",
+ "threadlane-plans",
+ "threadlane-registry",
+ "threadlane-workers",
+ "uuid",
+]
+
+[[package]]
 name = "threadlane-connectors"
 version = "0.1.0"
 dependencies = [

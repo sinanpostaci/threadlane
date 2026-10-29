@@ -101,12 +101,13 @@ impl AuthorityStore {
             std::env::current_dir()?.join(raw_dir)
         };
 
-        let dir_path = ensure_private_dir(&resolved_input, "authority store directory").map_err(
-            |err| AuthorityError::SecurityViolation {
-                path: resolved_input.display().to_string(),
-                reason: err.to_string(),
-            },
-        )?;
+        let dir_path =
+            ensure_private_dir(&resolved_input, "authority store directory").map_err(|err| {
+                AuthorityError::SecurityViolation {
+                    path: resolved_input.display().to_string(),
+                    reason: err.to_string(),
+                }
+            })?;
 
         if dir_path.starts_with(registry.config_dir())
             || registry.config_dir().starts_with(&dir_path)
@@ -382,10 +383,7 @@ impl AuthorityStore {
                         .clone()
                         .ok_or_else(|| AuthorityError::CorruptStore {
                             path: self.approvals_path.display().to_string(),
-                            reason: format!(
-                                "worker task `{}` is missing profile_id",
-                                task.task_id
-                            ),
+                            reason: format!("worker task `{}` is missing profile_id", task.task_id),
                         })?;
                 let command_key =
                     task.command_key
@@ -421,11 +419,11 @@ impl AuthorityStore {
 
                 // Validate full WorkerSpec (including TaskFiles permission rules for both AGY and OC).
                 let full_spec = spec_template.to_worker_spec(task.instruction.clone());
-                full_spec.validate().map_err(|err| {
-                    AuthorityError::WorkersConfigInvalid {
+                full_spec
+                    .validate()
+                    .map_err(|err| AuthorityError::WorkersConfigInvalid {
                         reason: format!("profile `{profile_id}` spec validation failed: {err}"),
-                    }
-                })?;
+                    })?;
 
                 profiles.push(WorkerProfileConfig {
                     profile_id: profile_id.clone(),
@@ -508,9 +506,10 @@ impl AuthorityStore {
             ));
         }
 
-        request.budgets.validate().map_err(|err| {
-            AuthorityError::validation("budgets", err.to_string())
-        })?;
+        request
+            .budgets
+            .validate()
+            .map_err(|err| AuthorityError::validation("budgets", err.to_string()))?;
 
         if request.approved_task_ids.is_empty()
             || request.approved_task_ids.len() > MAX_APPROVED_TASKS
@@ -571,12 +570,12 @@ impl AuthorityStore {
             });
         }
 
-        let registry_snapshot = self
-            .registry
-            .snapshot()
-            .map_err(|err| AuthorityError::Registry {
-                reason: err.to_string(),
-            })?;
+        let registry_snapshot =
+            self.registry
+                .snapshot()
+                .map_err(|err| AuthorityError::Registry {
+                    reason: err.to_string(),
+                })?;
 
         if expected_registry_revision != plan.profile_revision
             || registry_snapshot.revision != expected_registry_revision
@@ -620,7 +619,8 @@ impl AuthorityStore {
             }
         }
 
-        let mut validated_operator_write_paths = Vec::with_capacity(request.approved_write_paths.len());
+        let mut validated_operator_write_paths =
+            Vec::with_capacity(request.approved_write_paths.len());
         let mut seen_op_paths = BTreeSet::new();
         for op_path in &request.approved_write_paths {
             let validated =
@@ -705,12 +705,13 @@ impl AuthorityStore {
                         ));
                     }
 
-                    let (resolved_provider, canonical_exe) = resolve_and_validate_worker_executable(
-                        &compiled_task.tool_id,
-                        &compiled_task.id,
-                        compiled_task.adapter,
-                        compiled_task.executable_path.as_deref(),
-                    )?;
+                    let (resolved_provider, canonical_exe) =
+                        resolve_and_validate_worker_executable(
+                            &compiled_task.tool_id,
+                            &compiled_task.id,
+                            compiled_task.adapter,
+                            compiled_task.executable_path.as_deref(),
+                        )?;
 
                     let (resolved_base_model, resolved_effort, resolved_cli_arg) =
                         validate_worker_task_static(
@@ -832,12 +833,10 @@ impl AuthorityStore {
     }
 
     fn acquire_exclusive_lock(&self) -> Result<ExclusiveLockGuard, AuthorityError> {
-        let lock_file =
-            open_private_lock_file(&self.lock_path, "authority store lock file").map_err(|err| {
-                AuthorityError::SecurityViolation {
-                    path: self.lock_path.display().to_string(),
-                    reason: err.to_string(),
-                }
+        let lock_file = open_private_lock_file(&self.lock_path, "authority store lock file")
+            .map_err(|err| AuthorityError::SecurityViolation {
+                path: self.lock_path.display().to_string(),
+                reason: err.to_string(),
             })?;
         lock_file
             .lock_exclusive()
@@ -1022,9 +1021,9 @@ impl AuthorityStore {
         let temp_path = self.dir.join(temp_name);
         let _ = validate_absolute_no_symlink_components(&temp_path, "temporary authority ledger")
             .map_err(|err| AuthorityError::SecurityViolation {
-                path: temp_path.display().to_string(),
-                reason: err.to_string(),
-            })?;
+            path: temp_path.display().to_string(),
+            reason: err.to_string(),
+        })?;
 
         let write_result = (|| -> Result<(), AuthorityError> {
             #[cfg(unix)]

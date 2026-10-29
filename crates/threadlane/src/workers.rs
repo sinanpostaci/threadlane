@@ -632,7 +632,10 @@ fn validate_task_files_profile_paths(
     work_area_root: &Path,
     allowed_write_paths: &BTreeSet<String>,
 ) -> Result<(), Error> {
-    if !matches!(provider, WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2) {
+    if !matches!(
+        provider,
+        WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2
+    ) {
         return Err(Error::InvalidConfig(format!(
             "profile `{profile_id}`: `file_permissions: \"task_files\"` is only supported for providers `antigravity` and `opencode_v2`"
         )));

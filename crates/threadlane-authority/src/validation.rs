@@ -12,10 +12,9 @@ use threadlane_workers::git::WORK_AREA_LOCK_FILENAME;
 use threadlane_workers::{
     is_control_config_path, resolve_exact_commit_sha, validate_absolute_no_symlink_components,
     validate_exact_40_hex_sha, validate_executable_file, validate_existing_canonical_dir,
-    validate_permission_pattern_path, validate_permission_pattern_str,
-    validate_repo_relative_path, validate_simple_identifier,
-    ExecutionBudgets, WorkerFilePermissions, WorkerProvider, WorkerSpec,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PATH_ENTRY_LEN,
+    validate_permission_pattern_path, validate_permission_pattern_str, validate_repo_relative_path,
+    validate_simple_identifier, ExecutionBudgets, WorkerFilePermissions, WorkerProvider,
+    WorkerSpec, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PATH_ENTRY_LEN,
 };
 use uuid::Uuid;
 
@@ -48,10 +47,7 @@ pub fn validate_canonical_thread_uuid(
     raw: &str,
 ) -> Result<String, AuthorityError> {
     let parsed = Uuid::parse_str(raw).map_err(|err| {
-        AuthorityError::validation(
-            field,
-            format!("`{raw}` is not a valid UUID: {err}"),
-        )
+        AuthorityError::validation(field, format!("`{raw}` is not a valid UUID: {err}"))
     })?;
     if parsed.is_nil() {
         return Err(AuthorityError::validation(
@@ -63,7 +59,9 @@ pub fn validate_canonical_thread_uuid(
     if raw != canonical {
         return Err(AuthorityError::validation(
             field,
-            format!("thread UUID `{raw}` must use canonical lowercase hyphenated form `{canonical}`"),
+            format!(
+                "thread UUID `{raw}` must use canonical lowercase hyphenated form `{canonical}`"
+            ),
         ));
     }
     Ok(canonical)
@@ -71,11 +69,7 @@ pub fn validate_canonical_thread_uuid(
 
 /// Validates a 64-character lowercase hexadecimal SHA-256 digest string.
 pub fn validate_sha256_hex(field: &'static str, raw: &str) -> Result<String, AuthorityError> {
-    if raw.len() != 64
-        || !raw
-            .chars()
-            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
-    {
+    if raw.len() != 64 || !raw.chars().all(|ch| matches!(ch, '0'..='9' | 'a'..='f')) {
         return Err(AuthorityError::validation(
             field,
             format!("`{raw}` must be a 64-character lowercase hexadecimal SHA-256 digest"),
@@ -98,12 +92,11 @@ pub fn validate_repository_and_base_commit(
         })?;
 
     let git_entry = canonical_repo.join(".git");
-    let git_meta = fs::symlink_metadata(&git_entry).map_err(|err| {
-        AuthorityError::InvalidRepository {
+    let git_meta =
+        fs::symlink_metadata(&git_entry).map_err(|err| AuthorityError::InvalidRepository {
             path: canonical_repo.display().to_string(),
             reason: format!("repository does not contain a `.git` entry: {err}"),
-        }
-    })?;
+        })?;
     if git_meta.file_type().is_symlink() {
         return Err(AuthorityError::SecurityViolation {
             path: git_entry.display().to_string(),
@@ -111,12 +104,13 @@ pub fn validate_repository_and_base_commit(
         });
     }
 
-    let normalized_commit = validate_exact_40_hex_sha(base_commit, "base_commit").map_err(|err| {
-        AuthorityError::InvalidBaseCommit {
-            base_commit: base_commit.to_string(),
-            reason: err.to_string(),
-        }
-    })?;
+    let normalized_commit =
+        validate_exact_40_hex_sha(base_commit, "base_commit").map_err(|err| {
+            AuthorityError::InvalidBaseCommit {
+                base_commit: base_commit.to_string(),
+                reason: err.to_string(),
+            }
+        })?;
 
     let resolved_commit = resolve_exact_commit_sha(
         &canonical_repo,
@@ -329,16 +323,15 @@ pub fn resolve_and_validate_worker_executable(
         None => resolve_binary_in_path(std::ffi::OsStr::new(default_bin_name), tool_id, task_id)?,
     };
 
-    let canonical = fs::canonicalize(&candidate_path).map_err(|err| {
-        AuthorityError::InvalidExecutable {
+    let canonical =
+        fs::canonicalize(&candidate_path).map_err(|err| AuthorityError::InvalidExecutable {
             tool_id: tool_id.to_string(),
             task_id: task_id.to_string(),
             reason: format!(
                 "failed to canonicalize CLI executable `{}`: {err}",
                 candidate_path.display()
             ),
-        }
-    })?;
+        })?;
 
     let validated = validate_executable_file(&canonical).map_err(|err| {
         AuthorityError::InvalidExecutable {
@@ -438,12 +431,10 @@ pub fn validate_worker_task_static(
         budgets: budgets.clone(),
     };
 
-    let report = spec
-        .validate()
-        .map_err(|err| AuthorityError::Validation {
-            field: "task_worker_spec".to_string(),
-            reason: err.to_string(),
-        })?;
+    let report = spec.validate().map_err(|err| AuthorityError::Validation {
+        field: "task_worker_spec".to_string(),
+        reason: err.to_string(),
+    })?;
 
     Ok((
         report.resolved_model.base_model,
@@ -506,9 +497,7 @@ pub fn validate_work_area_for_materialization(
     #[cfg(unix)]
     let expected_uid = {
         use std::os::unix::fs::MetadataExt;
-        fs::symlink_metadata(authority_dir)
-            .map(|m| m.uid())
-            .ok()
+        fs::symlink_metadata(authority_dir).map(|m| m.uid()).ok()
     };
 
     if let Ok(meta) = fs::symlink_metadata(&checked) {
@@ -570,11 +559,12 @@ pub fn validate_work_area_for_materialization(
                     path: checked.display().to_string(),
                     reason: err.to_string(),
                 })?;
-                let lock_meta =
-                    fs::symlink_metadata(entry.path()).map_err(|err| AuthorityError::InvalidWorkArea {
+                let lock_meta = fs::symlink_metadata(entry.path()).map_err(|err| {
+                    AuthorityError::InvalidWorkArea {
                         path: checked.display().to_string(),
                         reason: format!("cannot inspect work area ownership lock: {err}"),
-                    })?;
+                    }
+                })?;
                 if lock_meta.len() != 0 {
                     return Err(AuthorityError::InvalidWorkArea {
                         path: checked.display().to_string(),
@@ -717,7 +707,10 @@ pub fn compute_authority_core_digest(record: &ApprovalRecord) -> Result<String, 
     });
 
     let bytes = serde_json::to_vec(&canonical).map_err(|err| {
-        AuthorityError::validation("subject_digest", format!("JSON serialization failed: {err}"))
+        AuthorityError::validation(
+            "subject_digest",
+            format!("JSON serialization failed: {err}"),
+        )
     })?;
     Ok(sha256_hex(&bytes))
 }
@@ -783,7 +776,10 @@ pub fn compute_record_subject_digest(record: &ApprovalRecord) -> Result<String, 
     });
 
     let bytes = serde_json::to_vec(&canonical).map_err(|err| {
-        AuthorityError::validation("subject_digest", format!("JSON serialization failed: {err}"))
+        AuthorityError::validation(
+            "subject_digest",
+            format!("JSON serialization failed: {err}"),
+        )
     })?;
     Ok(sha256_hex(&bytes))
 }
@@ -796,14 +792,9 @@ pub fn derive_approval_id(subject_digest: &str) -> String {
 
 /// Derives a deterministic worker `profile_id` (`<= 64` chars) from the authority core digest,
 /// `task_id`, and `task_digest`.
-pub fn derive_profile_id(
-    authority_core_digest: &str,
-    task_id: &str,
-    task_digest: &str,
-) -> String {
-    let material = format!(
-        "threadlane-authority-profile-v1:{authority_core_digest}:{task_id}:{task_digest}"
-    );
+pub fn derive_profile_id(authority_core_digest: &str, task_id: &str, task_digest: &str) -> String {
+    let material =
+        format!("threadlane-authority-profile-v1:{authority_core_digest}:{task_id}:{task_digest}");
     let digest = sha256_hex(material.as_bytes());
     let core_tag = &authority_core_digest[..12.min(authority_core_digest.len())];
     let task_tag = &digest[..20];
@@ -812,14 +803,9 @@ pub fn derive_profile_id(
 
 /// Derives a deterministic idempotency `command_key` (`<= 64` chars) from the authority core
 /// digest, `task_id`, and `task_digest`.
-pub fn derive_command_key(
-    authority_core_digest: &str,
-    task_id: &str,
-    task_digest: &str,
-) -> String {
-    let material = format!(
-        "threadlane-authority-cmd-v1:{authority_core_digest}:{task_id}:{task_digest}"
-    );
+pub fn derive_command_key(authority_core_digest: &str, task_id: &str, task_digest: &str) -> String {
+    let material =
+        format!("threadlane-authority-cmd-v1:{authority_core_digest}:{task_id}:{task_digest}");
     let digest = sha256_hex(material.as_bytes());
     let core_tag = &authority_core_digest[..12.min(authority_core_digest.len())];
     let task_tag = &digest[..20];
@@ -877,12 +863,13 @@ pub fn verify_approval_record_integrity(
             reason: err.to_string(),
         }
     })?;
-    let normalized_base = validate_exact_40_hex_sha(&record.base_commit, "base_commit").map_err(
-        |err| AuthorityError::CorruptStore {
-            path: store_path.display().to_string(),
-            reason: err.to_string(),
-        },
-    )?;
+    let normalized_base =
+        validate_exact_40_hex_sha(&record.base_commit, "base_commit").map_err(|err| {
+            AuthorityError::CorruptStore {
+                path: store_path.display().to_string(),
+                reason: err.to_string(),
+            }
+        })?;
     if record.base_commit != normalized_base {
         return Err(AuthorityError::CorruptStore {
             path: store_path.display().to_string(),
@@ -960,12 +947,11 @@ pub fn verify_approval_record_integrity(
         verify_task_record_structure(task, &record.approval_id, store_path)?;
     }
 
-    let core_digest = compute_authority_core_digest(record).map_err(|err| {
-        AuthorityError::CorruptStore {
+    let core_digest =
+        compute_authority_core_digest(record).map_err(|err| AuthorityError::CorruptStore {
             path: store_path.display().to_string(),
             reason: err.to_string(),
-        }
-    })?;
+        })?;
 
     for task in &record.tasks {
         if task.provider.is_some() {
@@ -1002,12 +988,11 @@ pub fn verify_approval_record_integrity(
         }
     }
 
-    let computed_subject = compute_record_subject_digest(record).map_err(|err| {
-        AuthorityError::CorruptStore {
+    let computed_subject =
+        compute_record_subject_digest(record).map_err(|err| AuthorityError::CorruptStore {
             path: store_path.display().to_string(),
             reason: err.to_string(),
-        }
-    })?;
+        })?;
     if record.subject_digest != computed_subject {
         return Err(AuthorityError::CorruptStore {
             path: store_path.display().to_string(),

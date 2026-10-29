@@ -2800,8 +2800,8 @@ async fn test_worker_file_permissions_profile_digest_validation_and_task_files_d
             "profiles": [opencode_task_files_profile_json]
         }),
     );
-    let loaded_opencode_task_files = WorkersConfig::load_from_path(&bad_cfg_path)
-        .expect("load OpenCode v2 task_files profile");
+    let loaded_opencode_task_files =
+        WorkersConfig::load_from_path(&bad_cfg_path).expect("load OpenCode v2 task_files profile");
     let validated_opencode_task_files = loaded_opencode_task_files
         .validate()
         .expect("validate OpenCode v2 task_files profile");

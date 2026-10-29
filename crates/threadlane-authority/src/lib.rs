@@ -67,8 +67,8 @@ mod tests {
     use threadlane_core::Binding;
     use threadlane_plans::{
         compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStatus,
-        PlanStore, PlanTask, RoleAssignment, ToolAdapter,
-        ToolDefinition, WorkflowProfile, WorkflowRole,
+        PlanStore, PlanTask, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
+        WorkflowRole,
     };
     use threadlane_registry::{RegistryChange, RegistryStore};
     use threadlane_workers::{
@@ -145,9 +145,8 @@ mod tests {
         )
         .expect("git commit 1");
 
-        let commit1 =
-            resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
-                .expect("resolve HEAD commit 1");
+        let commit1 = resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve HEAD commit 1");
 
         fs::write(repo_dir.join("src/lib.rs"), "pub fn alpha() -> u32 { 2 }\n")
             .expect("update src/lib.rs");
@@ -160,9 +159,8 @@ mod tests {
         )
         .expect("git commit 2");
 
-        let commit2 =
-            resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
-                .expect("resolve HEAD commit 2");
+        let commit2 = resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve HEAD commit 2");
 
         (commit1, commit2)
     }
@@ -313,12 +311,9 @@ mod tests {
             )
             .expect("upsert profile");
 
-        let authority = AuthorityStore::open(
-            &authority_dir,
-            Arc::clone(&registry),
-            Arc::clone(&plans),
-        )
-        .expect("open authority store");
+        let authority =
+            AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plans))
+                .expect("open authority store");
 
         TestFixture {
             _tmp: tmp,
@@ -865,11 +860,9 @@ mod tests {
             workers.profiles[0].allowed_binding_ids,
             BTreeSet::from(["bnd_runtime_session_99".to_string()])
         );
-        assert!(
-            !workers.profiles[0]
-                .allowed_binding_ids
-                .contains("paired-chat-binding")
-        );
+        assert!(!workers.profiles[0]
+            .allowed_binding_ids
+            .contains("paired-chat-binding"));
     }
 
     #[test]
@@ -1168,8 +1161,7 @@ mod tests {
         // Also create a non-executable regular file to verify rejection.
         let non_exec_file = fixture.root.join("bin/not-executable");
         fs::write(&non_exec_file, b"#!/bin/sh\n").expect("write non-executable");
-        fs::set_permissions(&non_exec_file, fs::Permissions::from_mode(0o600))
-            .expect("chmod 0600");
+        fs::set_permissions(&non_exec_file, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
 
         let s1 = fixture
             .registry

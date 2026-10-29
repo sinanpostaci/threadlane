@@ -118,9 +118,7 @@ pub enum AuthorityError {
 
     /// Selected task uses an adapter that is unsupported for headless worker execution or
     /// native follower routing.
-    #[error(
-        "unsupported adapter `{adapter}` on task `{task_id}` in plan `{plan_id}`: {reason}"
-    )]
+    #[error("unsupported adapter `{adapter}` on task `{task_id}` in plan `{plan_id}`: {reason}")]
     UnsupportedTaskAdapter {
         /// Target plan identifier.
         plan_id: String,
