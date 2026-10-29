@@ -6,15 +6,20 @@ use uuid::Uuid;
 
 use crate::error::{AckErrorReason, CoreError};
 use crate::limits::{
+    encode_questions_cursor, encode_revisions_cursor, encode_runs_cursor,
+    estimate_wire_response_bytes, parse_and_validate_cursor, truncate_preview,
     validate_batch_limit, validate_bounded_text, validate_command_key, validate_identifier,
-    validate_label, validate_optional_text, validate_step_delay_ms, validate_thread_uuid,
-    validate_timestamp_ms, FIXED_WAKEUP_MESSAGE, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
-    MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN, MAX_WAKEUP_ERROR_LEN, SCHEMA_VERSION,
+    validate_label, validate_optional_text, validate_page_limit, validate_step_delay_ms,
+    validate_thread_uuid, validate_timestamp_ms, CursorKind, FIXED_WAKEUP_MESSAGE,
+    LEGACY_SCHEMA_VERSION_V1, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMPACT_RESPONSE_BYTES,
+    MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN, MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN,
+    RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
 };
 use crate::types::{
     AckResult, Binding, Command, CommandOutput, Event, EventBatch, EventKind, EventPayload,
-    Question, QuestionStatus, Run, RunRevision, RunStatus, TickReport, WakeupClaim, WakeupNotice,
-    WakeupOutcome, WakeupRetryRecord, WakeupStatus,
+    Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run, RunListPage,
+    RunRevision, RunStatus, RunSummary, TickReport, WakeupClaim, WakeupNotice, WakeupOutcome,
+    WakeupRetryRecord, WakeupStatus,
 };
 
 /// Transactional, persistent SQLite domain engine for Threadlane Milestone 1.
@@ -129,15 +134,57 @@ impl Core {
                 let tx = self.conn.transaction()?;
                 Self::ensure_binding_exists(&tx, &clean_binding_id)?;
                 let run = Self::load_run_tx(&tx, &clean_binding_id, &clean_run_id)?;
+                let output = CommandOutput::Run(Box::new(run));
+                enforce_compact_response_budget(&output)?;
                 tx.commit()?;
-                Ok(CommandOutput::Run(run))
+                Ok(output)
             }
-            Command::ListRuns => {
+            Command::ListRuns { cursor, limit } => {
+                let valid_limit = validate_page_limit(limit)?;
                 let tx = self.conn.transaction()?;
                 Self::ensure_binding_exists(&tx, &clean_binding_id)?;
-                let runs = Self::list_runs_tx(&tx, &clean_binding_id)?;
+                let page =
+                    Self::list_runs_tx(&tx, &clean_binding_id, cursor.as_deref(), valid_limit)?;
                 tx.commit()?;
-                Ok(CommandOutput::RunList(runs))
+                Ok(CommandOutput::RunList(page))
+            }
+            Command::ListRunRevisions {
+                run_id,
+                cursor,
+                limit,
+            } => {
+                let clean_run_id = validate_identifier("run_id", &run_id)?;
+                let valid_limit = validate_page_limit(limit)?;
+                let tx = self.conn.transaction()?;
+                Self::ensure_binding_exists(&tx, &clean_binding_id)?;
+                let page = Self::list_run_revisions_tx(
+                    &tx,
+                    &clean_binding_id,
+                    &clean_run_id,
+                    cursor.as_deref(),
+                    valid_limit,
+                )?;
+                tx.commit()?;
+                Ok(CommandOutput::RevisionHistory(page))
+            }
+            Command::ListRunQuestions {
+                run_id,
+                cursor,
+                limit,
+            } => {
+                let clean_run_id = validate_identifier("run_id", &run_id)?;
+                let valid_limit = validate_page_limit(limit)?;
+                let tx = self.conn.transaction()?;
+                Self::ensure_binding_exists(&tx, &clean_binding_id)?;
+                let page = Self::list_run_questions_tx(
+                    &tx,
+                    &clean_binding_id,
+                    &clean_run_id,
+                    cursor.as_deref(),
+                    valid_limit,
+                )?;
+                tx.commit()?;
+                Ok(CommandOutput::QuestionHistory(page))
             }
             Command::PullEvents {
                 after_seq,
@@ -190,7 +237,7 @@ impl Core {
                     valid_delay,
                     valid_now,
                 )?;
-                let output = CommandOutput::Run(run);
+                let output = CommandOutput::Run(Box::new(run));
                 Self::record_dedup(
                     &tx,
                     &clean_binding_id,
@@ -247,7 +294,7 @@ impl Core {
                     &clean_answer,
                     valid_now,
                 )?;
-                let output = CommandOutput::Run(run);
+                let output = CommandOutput::Run(Box::new(run));
                 Self::record_dedup(
                     &tx,
                     &clean_binding_id,
@@ -301,7 +348,7 @@ impl Core {
                     &clean_instruction,
                     valid_now,
                 )?;
-                let output = CommandOutput::Run(run);
+                let output = CommandOutput::Run(Box::new(run));
                 Self::record_dedup(
                     &tx,
                     &clean_binding_id,
@@ -342,7 +389,7 @@ impl Core {
                     clean_reason.as_deref(),
                     valid_now,
                 )?;
-                let output = CommandOutput::Run(run);
+                let output = CommandOutput::Run(Box::new(run));
                 Self::record_dedup(
                     &tx,
                     &clean_binding_id,
@@ -880,12 +927,129 @@ impl Core {
         Self::load_wakeup_conn(&self.conn, &clean_binding_id)
     }
 
-    /// Convenience helper to fetch a [`Run`] scoped to `binding_id`.
+    /// Convenience helper to fetch a constant-size [`Run`] snapshot scoped to `binding_id`.
     pub fn get_run(&self, binding_id: &str, run_id: &str) -> Result<Run, CoreError> {
         let clean_binding_id = validate_identifier("binding_id", binding_id)?;
         let clean_run_id = validate_identifier("run_id", run_id)?;
         Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
-        Self::load_run_conn(&self.conn, &clean_binding_id, &clean_run_id)
+        let run = Self::load_run_conn(&self.conn, &clean_binding_id, &clean_run_id)?;
+        enforce_compact_response_budget(&CommandOutput::Run(Box::new(run.clone())))?;
+        Ok(run)
+    }
+
+    /// Convenience helper to fetch a bounded keyset-paginated [`RunListPage`] scoped to `binding_id`.
+    pub fn list_runs(
+        &self,
+        binding_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RunListPage, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let valid_limit = validate_page_limit(limit)?;
+        Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
+        Self::list_runs_conn(&self.conn, &clean_binding_id, cursor, valid_limit)
+    }
+
+    /// Convenience helper to fetch a bounded keyset-paginated [`RevisionHistoryPage`] for `(binding_id, run_id)`.
+    pub fn list_run_revisions(
+        &self,
+        binding_id: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RevisionHistoryPage, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_run_id = validate_identifier("run_id", run_id)?;
+        let valid_limit = validate_page_limit(limit)?;
+        Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
+        Self::list_run_revisions_conn(
+            &self.conn,
+            &clean_binding_id,
+            &clean_run_id,
+            cursor,
+            valid_limit,
+        )
+    }
+
+    /// Convenience helper to fetch a bounded keyset-paginated [`QuestionHistoryPage`] for `(binding_id, run_id)`.
+    pub fn list_run_questions(
+        &self,
+        binding_id: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<QuestionHistoryPage, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_run_id = validate_identifier("run_id", run_id)?;
+        let valid_limit = validate_page_limit(limit)?;
+        Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
+        Self::list_run_questions_conn(
+            &self.conn,
+            &clean_binding_id,
+            &clean_run_id,
+            cursor,
+            valid_limit,
+        )
+    }
+
+    /// Computes SQL aggregate counts (`total_runs`, `active_runs`) and returns at most `recent_limit`
+    /// recent [`RunSummary`] records for `binding_id` without materializing all runs, revisions, or questions.
+    pub fn get_status_run_summaries(
+        &self,
+        binding_id: &str,
+        recent_limit: usize,
+    ) -> Result<(usize, usize, Vec<RunSummary>), CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let valid_limit = validate_page_limit(recent_limit)?;
+        Self::ensure_binding_exists_conn(&self.conn, &clean_binding_id)?;
+
+        let (total_raw, active_raw): (i64, i64) = self.conn.query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN status NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END), 0)
+             FROM runs
+             WHERE binding_id = ?1",
+            params![clean_binding_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+
+        let total_runs = i64_to_u64("total_runs", total_raw)? as usize;
+        let active_runs = i64_to_u64("active_runs", active_raw)? as usize;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, revision, status, instruction, active_question_id, started_at_ms, updated_at_ms
+             FROM runs
+             WHERE binding_id = ?1
+             ORDER BY rowid DESC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![
+            clean_binding_id,
+            u64_to_i64("limit", valid_limit as u64)?
+        ])?;
+        let mut recent_runs = Vec::with_capacity(valid_limit.min(total_runs));
+        while let Some(row) = rows.next()? {
+            let status_raw: String = row.get(2)?;
+            let status = RunStatus::from_str(&status_raw).ok_or_else(|| {
+                CoreError::CorruptState(format!("invalid run status `{status_raw}`"))
+            })?;
+            let instruction: String = row.get(3)?;
+            let (instruction_preview, instruction_truncated) = truncate_preview(&instruction);
+            recent_runs.push(RunSummary {
+                untrusted_data: true,
+                run_id: row.get(0)?,
+                binding_id: clean_binding_id.clone(),
+                revision: i64_to_u64("revision", row.get(1)?)?,
+                status,
+                instruction_preview,
+                instruction_truncated,
+                active_question_id: row.get(4)?,
+                started_at_ms: row.get(5)?,
+                updated_at_ms: row.get(6)?,
+            });
+        }
+
+        Ok((total_runs, active_runs, recent_runs))
     }
 
     fn init_schema_and_recover(tx: &Transaction<'_>) -> Result<(), CoreError> {
@@ -922,6 +1086,8 @@ impl Core {
             );
             CREATE INDEX IF NOT EXISTS idx_runs_binding
                 ON runs(binding_id, started_at_ms, run_id);
+            CREATE INDEX IF NOT EXISTS idx_runs_binding_order
+                ON runs(binding_id);
 
             CREATE TABLE IF NOT EXISTS run_revisions (
                 run_id TEXT NOT NULL REFERENCES runs(run_id),
@@ -946,6 +1112,8 @@ impl Core {
             );
             CREATE INDEX IF NOT EXISTS idx_questions_run
                 ON questions(run_id, revision, question_id);
+            CREATE INDEX IF NOT EXISTS idx_questions_binding_run_order
+                ON questions(binding_id, run_id);
 
             CREATE TABLE IF NOT EXISTS events (
                 event_id TEXT PRIMARY KEY,
@@ -1037,6 +1205,13 @@ impl Core {
                 )?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) if version == LEGACY_SCHEMA_VERSION_V1 => {
+                Self::migrate_legacy_command_dedup_tx(tx)?;
+                tx.execute(
+                    "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+                    params![SCHEMA_VERSION],
+                )?;
+            }
             Some(found) => {
                 return Err(CoreError::IncompatibleSchemaVersion {
                     found,
@@ -1953,6 +2128,43 @@ impl Core {
         Ok(())
     }
 
+    fn migrate_legacy_command_dedup_tx(tx: &Transaction<'_>) -> Result<(), CoreError> {
+        let mut select_stmt = tx.prepare(
+            "SELECT rowid, binding_id, command_key, response_json
+             FROM command_dedup
+             WHERE rowid > ?1
+             ORDER BY rowid ASC
+             LIMIT 1",
+        )?;
+        let mut update_stmt = tx.prepare(
+            "UPDATE command_dedup
+             SET response_json = ?1
+             WHERE rowid = ?2 AND binding_id = ?3 AND command_key = ?4",
+        )?;
+
+        let mut after_rowid: i64 = 0;
+        loop {
+            let next_row: Option<(i64, String, String, String)> = select_stmt
+                .query_row(params![after_rowid], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .optional()?;
+
+            let Some((rowid, binding_id, command_key, response_json)) = next_row else {
+                break;
+            };
+
+            let (compact_output, needs_rewrite) = parse_dedup_command_output(&response_json)?;
+            let compact_json = enforce_compact_response_budget(&compact_output)?;
+            if needs_rewrite {
+                update_stmt.execute(params![compact_json, rowid, binding_id, command_key])?;
+            }
+            after_rowid = rowid;
+        }
+
+        Ok(())
+    }
+
     fn check_dedup(
         tx: &Transaction<'_>,
         binding_id: &str,
@@ -1981,7 +2193,8 @@ impl Core {
             });
         }
 
-        let output: CommandOutput = serde_json::from_str(&response_json)?;
+        let (output, _) = parse_dedup_command_output(&response_json)?;
+        enforce_compact_response_budget(&output)?;
         Ok(Some(output))
     }
 
@@ -1994,7 +2207,7 @@ impl Core {
         output: &CommandOutput,
         now_ms: i64,
     ) -> Result<(), CoreError> {
-        let response_json = serde_json::to_string(output)?;
+        let response_json = enforce_compact_response_budget(output)?;
         tx.execute(
             "INSERT INTO command_dedup (
                 binding_id, command_key, operation, payload_hash, response_json, created_at_ms
@@ -2158,6 +2371,15 @@ impl Core {
         run_id: &str,
         question_id: &str,
     ) -> Result<Question, CoreError> {
+        Self::load_question_conn(tx, binding_id, run_id, question_id)
+    }
+
+    fn load_question_conn(
+        conn: &Connection,
+        binding_id: &str,
+        run_id: &str,
+        question_id: &str,
+    ) -> Result<Question, CoreError> {
         #[allow(clippy::type_complexity)]
         let row: Option<(
             String,
@@ -2170,7 +2392,7 @@ impl Core {
             Option<i64>,
             i64,
             Option<i64>,
-        )> = tx
+        )> = conn
             .query_row(
                 "SELECT question_id, binding_id, run_id, revision, status, prompt,
                         answer, superseded_by_revision, created_at_ms, resolved_at_ms
@@ -2223,6 +2445,7 @@ impl Core {
         };
 
         Ok(Question {
+            untrusted_data: true,
             question_id: q_id,
             binding_id: b_id,
             run_id: r_id,
@@ -2312,63 +2535,13 @@ impl Core {
         let status = RunStatus::from_str(&status_raw)
             .ok_or_else(|| CoreError::CorruptState(format!("invalid run status `{status_raw}`")))?;
 
-        let revision_history = {
-            let mut stmt = conn.prepare(
-                "SELECT revision, instruction, created_at_ms, superseded_at_ms
-                 FROM run_revisions
-                 WHERE run_id = ?1
-                 ORDER BY revision ASC",
-            )?;
-            let mut rows = stmt.query(params![run_id])?;
-            let mut history = Vec::new();
-            while let Some(r) = rows.next()? {
-                history.push(RunRevision {
-                    revision: i64_to_u64("revision", r.get(0)?)?,
-                    instruction: r.get(1)?,
-                    created_at_ms: r.get(2)?,
-                    superseded_at_ms: r.get(3)?,
-                });
-            }
-            history
-        };
-
-        let questions = {
-            let mut stmt = conn.prepare(
-                "SELECT question_id, binding_id, run_id, revision, status, prompt,
-                        answer, superseded_by_revision, created_at_ms, resolved_at_ms
-                 FROM questions
-                 WHERE run_id = ?1 AND binding_id = ?2
-                 ORDER BY rowid ASC",
-            )?;
-            let mut rows = stmt.query(params![run_id, binding_id])?;
-            let mut items = Vec::new();
-            while let Some(r) = rows.next()? {
-                let q_status_raw: String = r.get(4)?;
-                let q_status = QuestionStatus::from_str(&q_status_raw).ok_or_else(|| {
-                    CoreError::CorruptState(format!("invalid question status `{q_status_raw}`"))
-                })?;
-                let superseded_raw: Option<i64> = r.get(7)?;
-                let superseded_by_revision = match superseded_raw {
-                    Some(v) => Some(i64_to_u64("superseded_by_revision", v)?),
-                    None => None,
-                };
-                items.push(Question {
-                    question_id: r.get(0)?,
-                    binding_id: r.get(1)?,
-                    run_id: r.get(2)?,
-                    revision: i64_to_u64("revision", r.get(3)?)?,
-                    status: q_status,
-                    prompt: r.get(5)?,
-                    answer: r.get(6)?,
-                    superseded_by_revision,
-                    created_at_ms: r.get(8)?,
-                    resolved_at_ms: r.get(9)?,
-                });
-            }
-            items
+        let active_question = match active_question_id.as_deref() {
+            Some(qid) => Some(Self::load_question_conn(conn, binding_id, &r_id, qid)?),
+            None => None,
         };
 
         Ok(Run {
+            untrusted_data: true,
             run_id: r_id,
             binding_id: b_id,
             revision: i64_to_u64("revision", rev_raw)?,
@@ -2378,38 +2551,673 @@ impl Core {
             step_delay_ms,
             next_step_at_ms,
             active_question_id,
+            active_question,
             started_at_ms,
             updated_at_ms,
             completed_at_ms,
             cancelled_at_ms,
             cancel_reason,
-            revision_history,
-            questions,
         })
     }
 
-    fn list_runs_tx(tx: &Transaction<'_>, binding_id: &str) -> Result<Vec<Run>, CoreError> {
-        let run_ids: Vec<String> = {
-            let mut stmt = tx.prepare(
-                "SELECT run_id
-                 FROM runs
-                 WHERE binding_id = ?1
-                 ORDER BY rowid ASC",
-            )?;
-            let mut rows = stmt.query(params![binding_id])?;
-            let mut ids = Vec::new();
-            while let Some(row) = rows.next()? {
-                ids.push(row.get(0)?);
+    fn load_run_current_revision_conn(
+        conn: &Connection,
+        binding_id: &str,
+        run_id: &str,
+    ) -> Result<u64, CoreError> {
+        let rev_raw: Option<i64> = conn
+            .query_row(
+                "SELECT revision FROM runs WHERE run_id = ?1 AND binding_id = ?2",
+                params![run_id, binding_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match rev_raw {
+            Some(rev) => i64_to_u64("revision", rev),
+            None => Err(CoreError::RunNotFound {
+                binding_id: binding_id.to_string(),
+                run_id: run_id.to_string(),
+            }),
+        }
+    }
+
+    fn list_runs_tx(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RunListPage, CoreError> {
+        Self::list_runs_conn(tx, binding_id, cursor, limit)
+    }
+
+    fn list_runs_conn(
+        conn: &Connection,
+        binding_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RunListPage, CoreError> {
+        let (after_rowid, hwm_rowid) = match cursor {
+            Some(raw_cursor) => {
+                let parsed =
+                    parse_and_validate_cursor(raw_cursor, CursorKind::Runs, binding_id, None)?;
+                let anchor_count: i64 = conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM runs
+                     WHERE binding_id = ?1 AND rowid IN (?2, ?3)",
+                    params![
+                        binding_id,
+                        u64_to_i64("cursor", parsed.after)?,
+                        u64_to_i64("cursor", parsed.high_water_mark)?
+                    ],
+                    |row| row.get(0),
+                )?;
+                if anchor_count != 2 {
+                    return Err(CoreError::Validation {
+                        field: "cursor",
+                        reason: "cursor references unknown or out-of-range run position for this binding".to_string(),
+                    });
+                }
+                (parsed.after, parsed.high_water_mark)
             }
-            ids
+            None => {
+                let max_rowid: Option<i64> = conn.query_row(
+                    "SELECT MAX(rowid) FROM runs WHERE binding_id = ?1",
+                    params![binding_id],
+                    |row| row.get(0),
+                )?;
+                let Some(max_raw) = max_rowid else {
+                    return Ok(RunListPage {
+                        binding_id: binding_id.to_string(),
+                        runs: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                        high_water_mark_rowid: 0,
+                    });
+                };
+                (0, i64_to_u64("high_water_mark_rowid", max_raw)?)
+            }
         };
 
-        let mut runs = Vec::with_capacity(run_ids.len());
-        for run_id in run_ids {
-            runs.push(Self::load_run_tx(tx, binding_id, &run_id)?);
+        let fetch_limit = u64_to_i64("limit", (limit + 1) as u64)?;
+        let candidate_rows: Vec<(u64, String)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, run_id
+                 FROM runs
+                 WHERE binding_id = ?1 AND rowid > ?2 AND rowid <= ?3
+                 ORDER BY rowid ASC
+                 LIMIT ?4",
+            )?;
+            let mut rows = stmt.query(params![
+                binding_id,
+                u64_to_i64("after_rowid", after_rowid)?,
+                u64_to_i64("hwm_rowid", hwm_rowid)?,
+                fetch_limit
+            ])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push((i64_to_u64("rowid", row.get(0)?)?, row.get(1)?));
+            }
+            items
+        };
+
+        let db_has_more = candidate_rows.len() > limit;
+        let mut included_runs = Vec::with_capacity(candidate_rows.len().min(limit));
+        let mut last_included_rowid = after_rowid;
+        let mut stopped_by_budget = false;
+
+        for (rowid, run_id) in candidate_rows.into_iter().take(limit) {
+            let run = Self::load_run_conn(conn, binding_id, &run_id)?;
+            included_runs.push(run);
+
+            let probe_cursor = Some(encode_runs_cursor(binding_id, rowid, hwm_rowid));
+            let probe_output = CommandOutput::RunList(RunListPage {
+                binding_id: binding_id.to_string(),
+                runs: included_runs.clone(),
+                next_cursor: probe_cursor,
+                has_more: true,
+                high_water_mark_rowid: hwm_rowid,
+            });
+            let size_bytes = serialized_output_budget_bytes(&probe_output)?;
+            if size_bytes > MAX_PAGE_RESPONSE_BYTES {
+                if included_runs.len() == 1 {
+                    return Err(CoreError::ResponseTooLarge {
+                        size_bytes,
+                        max_bytes: MAX_PAGE_RESPONSE_BYTES,
+                    });
+                }
+                included_runs.pop();
+                stopped_by_budget = true;
+                break;
+            }
+            last_included_rowid = rowid;
         }
-        Ok(runs)
+
+        let has_more = stopped_by_budget || db_has_more;
+        let next_cursor = if has_more {
+            Some(encode_runs_cursor(
+                binding_id,
+                last_included_rowid,
+                hwm_rowid,
+            ))
+        } else {
+            None
+        };
+
+        Ok(RunListPage {
+            binding_id: binding_id.to_string(),
+            runs: included_runs,
+            next_cursor,
+            has_more,
+            high_water_mark_rowid: hwm_rowid,
+        })
     }
+
+    fn list_run_revisions_tx(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RevisionHistoryPage, CoreError> {
+        Self::list_run_revisions_conn(tx, binding_id, run_id, cursor, limit)
+    }
+
+    fn list_run_revisions_conn(
+        conn: &Connection,
+        binding_id: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<RevisionHistoryPage, CoreError> {
+        let current_revision = Self::load_run_current_revision_conn(conn, binding_id, run_id)?;
+        let (after_revision, hwm_revision) = match cursor {
+            Some(raw_cursor) => {
+                let parsed = parse_and_validate_cursor(
+                    raw_cursor,
+                    CursorKind::Revisions,
+                    binding_id,
+                    Some(run_id),
+                )?;
+                if parsed.high_water_mark > current_revision {
+                    return Err(CoreError::Validation {
+                        field: "cursor",
+                        reason: format!(
+                            "cursor high_water_mark ({}) exceeds run current_revision ({current_revision})",
+                            parsed.high_water_mark
+                        ),
+                    });
+                }
+                let anchor_count: i64 = conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM run_revisions
+                     WHERE run_id = ?1 AND revision IN (?2, ?3)",
+                    params![
+                        run_id,
+                        u64_to_i64("cursor", parsed.after)?,
+                        u64_to_i64("cursor", parsed.high_water_mark)?
+                    ],
+                    |row| row.get(0),
+                )?;
+                if anchor_count != 2 {
+                    return Err(CoreError::Validation {
+                        field: "cursor",
+                        reason: "cursor references unknown revision position for this run"
+                            .to_string(),
+                    });
+                }
+                (parsed.after, parsed.high_water_mark)
+            }
+            None => (0, current_revision),
+        };
+
+        let fetch_limit = u64_to_i64("limit", (limit + 1) as u64)?;
+        let candidate_revisions: Vec<RunRevision> = {
+            let mut stmt = conn.prepare(
+                "SELECT revision, instruction, created_at_ms, superseded_at_ms
+                 FROM run_revisions
+                 WHERE run_id = ?1 AND revision > ?2 AND revision <= ?3
+                 ORDER BY revision ASC
+                 LIMIT ?4",
+            )?;
+            let mut rows = stmt.query(params![
+                run_id,
+                u64_to_i64("after_revision", after_revision)?,
+                u64_to_i64("hwm_revision", hwm_revision)?,
+                fetch_limit
+            ])?;
+            let mut items = Vec::new();
+            while let Some(row) = rows.next()? {
+                items.push(RunRevision {
+                    untrusted_data: true,
+                    revision: i64_to_u64("revision", row.get(0)?)?,
+                    instruction: row.get(1)?,
+                    created_at_ms: row.get(2)?,
+                    superseded_at_ms: row.get(3)?,
+                });
+            }
+            items
+        };
+
+        let db_has_more = candidate_revisions.len() > limit;
+        let mut included_revisions = Vec::with_capacity(candidate_revisions.len().min(limit));
+        let mut last_included_revision = after_revision;
+        let mut stopped_by_budget = false;
+
+        for rev in candidate_revisions.into_iter().take(limit) {
+            let rev_num = rev.revision;
+            included_revisions.push(rev);
+
+            let probe_cursor = Some(encode_revisions_cursor(
+                binding_id,
+                run_id,
+                rev_num,
+                hwm_revision,
+            ));
+            let probe_output = CommandOutput::RevisionHistory(RevisionHistoryPage {
+                binding_id: binding_id.to_string(),
+                run_id: run_id.to_string(),
+                current_revision,
+                high_water_mark_revision: hwm_revision,
+                revisions: included_revisions.clone(),
+                next_cursor: probe_cursor,
+                has_more: true,
+            });
+            let size_bytes = serialized_output_budget_bytes(&probe_output)?;
+            if size_bytes > MAX_PAGE_RESPONSE_BYTES {
+                if included_revisions.len() == 1 {
+                    return Err(CoreError::ResponseTooLarge {
+                        size_bytes,
+                        max_bytes: MAX_PAGE_RESPONSE_BYTES,
+                    });
+                }
+                included_revisions.pop();
+                stopped_by_budget = true;
+                break;
+            }
+            last_included_revision = rev_num;
+        }
+
+        let has_more = stopped_by_budget || db_has_more;
+        let next_cursor = if has_more {
+            Some(encode_revisions_cursor(
+                binding_id,
+                run_id,
+                last_included_revision,
+                hwm_revision,
+            ))
+        } else {
+            None
+        };
+
+        Ok(RevisionHistoryPage {
+            binding_id: binding_id.to_string(),
+            run_id: run_id.to_string(),
+            current_revision,
+            high_water_mark_revision: hwm_revision,
+            revisions: included_revisions,
+            next_cursor,
+            has_more,
+        })
+    }
+
+    fn list_run_questions_tx(
+        tx: &Transaction<'_>,
+        binding_id: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<QuestionHistoryPage, CoreError> {
+        Self::list_run_questions_conn(tx, binding_id, run_id, cursor, limit)
+    }
+
+    fn list_run_questions_conn(
+        conn: &Connection,
+        binding_id: &str,
+        run_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<QuestionHistoryPage, CoreError> {
+        let current_revision = Self::load_run_current_revision_conn(conn, binding_id, run_id)?;
+        let (after_rowid, hwm_rowid) = match cursor {
+            Some(raw_cursor) => {
+                let parsed = parse_and_validate_cursor(
+                    raw_cursor,
+                    CursorKind::Questions,
+                    binding_id,
+                    Some(run_id),
+                )?;
+                let anchor_count: i64 = conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM questions
+                     WHERE binding_id = ?1 AND run_id = ?2 AND rowid IN (?3, ?4)",
+                    params![
+                        binding_id,
+                        run_id,
+                        u64_to_i64("cursor", parsed.after)?,
+                        u64_to_i64("cursor", parsed.high_water_mark)?
+                    ],
+                    |row| row.get(0),
+                )?;
+                if anchor_count != 2 {
+                    return Err(CoreError::Validation {
+                        field: "cursor",
+                        reason: "cursor references unknown or out-of-range question position for this run".to_string(),
+                    });
+                }
+                (parsed.after, parsed.high_water_mark)
+            }
+            None => {
+                let max_rowid: Option<i64> = conn.query_row(
+                    "SELECT MAX(rowid)
+                     FROM questions
+                     WHERE binding_id = ?1 AND run_id = ?2",
+                    params![binding_id, run_id],
+                    |row| row.get(0),
+                )?;
+                let Some(max_raw) = max_rowid else {
+                    return Ok(QuestionHistoryPage {
+                        binding_id: binding_id.to_string(),
+                        run_id: run_id.to_string(),
+                        current_revision,
+                        high_water_mark_rowid: 0,
+                        questions: Vec::new(),
+                        next_cursor: None,
+                        has_more: false,
+                    });
+                };
+                (0, i64_to_u64("high_water_mark_rowid", max_raw)?)
+            }
+        };
+
+        let fetch_limit = u64_to_i64("limit", (limit + 1) as u64)?;
+        let candidate_questions: Vec<(u64, Question)> = {
+            let mut stmt = conn.prepare(
+                "SELECT rowid, question_id, binding_id, run_id, revision, status, prompt,
+                        answer, superseded_by_revision, created_at_ms, resolved_at_ms
+                 FROM questions
+                 WHERE binding_id = ?1 AND run_id = ?2 AND rowid > ?3 AND rowid <= ?4
+                 ORDER BY rowid ASC
+                 LIMIT ?5",
+            )?;
+            let mut rows = stmt.query(params![
+                binding_id,
+                run_id,
+                u64_to_i64("after_rowid", after_rowid)?,
+                u64_to_i64("hwm_rowid", hwm_rowid)?,
+                fetch_limit
+            ])?;
+            let mut items = Vec::new();
+            while let Some(r) = rows.next()? {
+                let rowid = i64_to_u64("rowid", r.get(0)?)?;
+                let q_status_raw: String = r.get(5)?;
+                let q_status = QuestionStatus::from_str(&q_status_raw).ok_or_else(|| {
+                    CoreError::CorruptState(format!("invalid question status `{q_status_raw}`"))
+                })?;
+                let superseded_raw: Option<i64> = r.get(8)?;
+                let superseded_by_revision = match superseded_raw {
+                    Some(v) => Some(i64_to_u64("superseded_by_revision", v)?),
+                    None => None,
+                };
+                items.push((
+                    rowid,
+                    Question {
+                        untrusted_data: true,
+                        question_id: r.get(1)?,
+                        binding_id: r.get(2)?,
+                        run_id: r.get(3)?,
+                        revision: i64_to_u64("revision", r.get(4)?)?,
+                        status: q_status,
+                        prompt: r.get(6)?,
+                        answer: r.get(7)?,
+                        superseded_by_revision,
+                        created_at_ms: r.get(9)?,
+                        resolved_at_ms: r.get(10)?,
+                    },
+                ));
+            }
+            items
+        };
+
+        let db_has_more = candidate_questions.len() > limit;
+        let mut included_questions = Vec::with_capacity(candidate_questions.len().min(limit));
+        let mut last_included_rowid = after_rowid;
+        let mut stopped_by_budget = false;
+
+        for (rowid, question) in candidate_questions.into_iter().take(limit) {
+            included_questions.push(question);
+
+            let probe_cursor = Some(encode_questions_cursor(
+                binding_id, run_id, rowid, hwm_rowid,
+            ));
+            let probe_output = CommandOutput::QuestionHistory(QuestionHistoryPage {
+                binding_id: binding_id.to_string(),
+                run_id: run_id.to_string(),
+                current_revision,
+                high_water_mark_rowid: hwm_rowid,
+                questions: included_questions.clone(),
+                next_cursor: probe_cursor,
+                has_more: true,
+            });
+            let size_bytes = serialized_output_budget_bytes(&probe_output)?;
+            if size_bytes > MAX_PAGE_RESPONSE_BYTES {
+                if included_questions.len() == 1 {
+                    return Err(CoreError::ResponseTooLarge {
+                        size_bytes,
+                        max_bytes: MAX_PAGE_RESPONSE_BYTES,
+                    });
+                }
+                included_questions.pop();
+                stopped_by_budget = true;
+                break;
+            }
+            last_included_rowid = rowid;
+        }
+
+        let has_more = stopped_by_budget || db_has_more;
+        let next_cursor = if has_more {
+            Some(encode_questions_cursor(
+                binding_id,
+                run_id,
+                last_included_rowid,
+                hwm_rowid,
+            ))
+        } else {
+            None
+        };
+
+        Ok(QuestionHistoryPage {
+            binding_id: binding_id.to_string(),
+            run_id: run_id.to_string(),
+            current_revision,
+            high_water_mark_rowid: hwm_rowid,
+            questions: included_questions,
+            next_cursor,
+            has_more,
+        })
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", content = "data", rename_all = "snake_case")]
+enum StoredDedupOutput {
+    Run(Box<LegacyStoredRun>),
+    AckResult(AckResult),
+}
+
+#[derive(Default)]
+struct IgnoredFieldPresence(bool);
+
+impl<'de> serde::Deserialize<'de> for IgnoredFieldPresence {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(Self(true))
+    }
+}
+
+#[derive(Default)]
+struct LegacyQuestionsField {
+    present: bool,
+    pending_question: Option<Question>,
+    last_question: Option<Question>,
+}
+
+impl<'de> serde::Deserialize<'de> for LegacyQuestionsField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct QuestionsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for QuestionsVisitor {
+            type Value = LegacyQuestionsField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an optional array of questions")
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LegacyQuestionsField {
+                    present: true,
+                    pending_question: None,
+                    last_question: None,
+                })
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(LegacyQuestionsField {
+                    present: true,
+                    pending_question: None,
+                    last_question: None,
+                })
+            }
+
+            fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                deserializer.deserialize_any(self)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut pending_question = None;
+                let mut last_question = None;
+                while let Some(q) = seq.next_element::<Question>()? {
+                    if q.status == QuestionStatus::Pending {
+                        pending_question = Some(q.clone());
+                    }
+                    last_question = Some(q);
+                }
+                Ok(LegacyQuestionsField {
+                    present: true,
+                    pending_question,
+                    last_question,
+                })
+            }
+        }
+
+        deserializer.deserialize_option(QuestionsVisitor)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyStoredRun {
+    #[serde(default)]
+    untrusted_data: Option<bool>,
+    run_id: String,
+    binding_id: String,
+    revision: u64,
+    status: RunStatus,
+    instruction: String,
+    step_seq: u64,
+    step_delay_ms: i64,
+    next_step_at_ms: Option<i64>,
+    active_question_id: Option<String>,
+    #[serde(default)]
+    active_question: Option<Question>,
+    started_at_ms: i64,
+    updated_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    cancelled_at_ms: Option<i64>,
+    cancel_reason: Option<String>,
+    #[serde(default)]
+    revision_history: IgnoredFieldPresence,
+    #[serde(default)]
+    questions: LegacyQuestionsField,
+}
+
+fn parse_dedup_command_output(response_json: &str) -> Result<(CommandOutput, bool), CoreError> {
+    let parsed: StoredDedupOutput = serde_json::from_str(response_json)?;
+    match parsed {
+        StoredDedupOutput::AckResult(ack) => Ok((CommandOutput::AckResult(ack), false)),
+        StoredDedupOutput::Run(legacy) => {
+            let legacy = *legacy;
+            let needs_rewrite = legacy.revision_history.0
+                || legacy.questions.present
+                || legacy.untrusted_data != Some(true);
+            let LegacyQuestionsField {
+                pending_question,
+                last_question,
+                ..
+            } = legacy.questions;
+            let active_question = legacy.active_question.or_else(|| {
+                let target_id = legacy.active_question_id.as_deref()?;
+                pending_question
+                    .filter(|q| q.question_id == target_id)
+                    .or_else(|| last_question.filter(|q| q.question_id == target_id))
+            });
+            let compact_run = Run {
+                untrusted_data: true,
+                run_id: legacy.run_id,
+                binding_id: legacy.binding_id,
+                revision: legacy.revision,
+                status: legacy.status,
+                instruction: legacy.instruction,
+                step_seq: legacy.step_seq,
+                step_delay_ms: legacy.step_delay_ms,
+                next_step_at_ms: legacy.next_step_at_ms,
+                active_question_id: legacy.active_question_id,
+                active_question,
+                started_at_ms: legacy.started_at_ms,
+                updated_at_ms: legacy.updated_at_ms,
+                completed_at_ms: legacy.completed_at_ms,
+                cancelled_at_ms: legacy.cancelled_at_ms,
+                cancel_reason: legacy.cancel_reason,
+            };
+            Ok((CommandOutput::Run(Box::new(compact_run)), needs_rewrite))
+        }
+    }
+}
+
+fn serialized_output_budget_bytes(output: &CommandOutput) -> Result<usize, CoreError> {
+    estimate_wire_response_bytes(output)
+}
+
+fn enforce_compact_response_budget(output: &CommandOutput) -> Result<String, CoreError> {
+    let json = serde_json::to_string(output)?;
+    let second_level_string = serde_json::to_string(&json)?;
+    let size_bytes = json
+        .len()
+        .saturating_add(second_level_string.len())
+        .saturating_add(RESPONSE_WRAPPER_OVERHEAD_BYTES);
+    if size_bytes > MAX_COMPACT_RESPONSE_BYTES {
+        return Err(CoreError::ResponseTooLarge {
+            size_bytes,
+            max_bytes: MAX_COMPACT_RESPONSE_BYTES,
+        });
+    }
+    Ok(json)
 }
 
 fn generate_id(prefix: &str) -> String {

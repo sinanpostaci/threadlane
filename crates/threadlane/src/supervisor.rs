@@ -4,13 +4,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::Bytes;
+use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
-use threadlane_core::{Command, Core, CoreError};
+use threadlane_core::{
+    estimate_wire_response_bytes, Core, CoreError, MAX_COMPACT_RESPONSE_BYTES,
+    MAX_STATUS_RECENT_RUNS,
+};
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex, MutexGuard, Notify};
 use tokio::task::JoinHandle;
@@ -511,8 +515,32 @@ fn verify_bearer_auth(
     Ok(())
 }
 
-fn parse_json_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, (StatusCode, Json<ApiError>)> {
-    serde_json::from_slice(body).map_err(|err| {
+fn parse_json_body<T: DeserializeOwned>(
+    body: Result<Bytes, BytesRejection>,
+) -> Result<T, (StatusCode, Json<ApiError>)> {
+    let bytes = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(ApiError::with_details(
+                    ErrorCode::PayloadTooLarge,
+                    format!(
+                        "request body exceeds maximum allowed size of {MAX_HTTP_BODY_BYTES} bytes"
+                    ),
+                    serde_json::json!({ "max_bytes": MAX_HTTP_BODY_BYTES }),
+                )),
+            )
+        } else {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("failed to read request body: {rejection}"),
+                )),
+            )
+        }
+    })?;
+    serde_json::from_slice(&bytes).map_err(|err| {
         (
             StatusCode::BAD_REQUEST,
             Json(ApiError::new(
@@ -556,10 +584,10 @@ async fn handle_fallback(State(state): State<Arc<SharedState>>, headers: HeaderM
 async fn handle_create_binding(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<(StatusCode, Json<threadlane_core::Binding>), (StatusCode, Json<ApiError>)> {
     verify_bearer_auth(&headers, &state.token)?;
-    let req: CreateBindingRequest = parse_json_body(&body)?;
+    let req: CreateBindingRequest = parse_json_body(body)?;
 
     let mut access = state.acquire_for_request().await?;
     let binding = access
@@ -602,10 +630,10 @@ async fn handle_scoped_command(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
     AxumPath(binding_id): AxumPath<String>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<ScopedResponse>, (StatusCode, Json<ApiError>)> {
     verify_bearer_auth(&headers, &state.token)?;
-    let req: ScopedRequest = parse_json_body(&body)?;
+    let req: ScopedRequest = parse_json_body(body)?;
     let may_schedule = req.may_affect_scheduling();
 
     let now = current_time_ms();
@@ -631,12 +659,30 @@ async fn handle_scoped_command(
                     .core_mut()
                     .get_wakeup(&binding_id)
                     .map_err(|err| map_core_error(&state, "status get_wakeup failed", err))?;
-                let runs_output = access
+                let (total_runs, active_runs, recent_runs) = access
                     .core_mut()
-                    .execute(&binding_id, Command::ListRuns)
-                    .map_err(|err| map_core_error(&state, "status list_runs failed", err))?;
-                let runs = runs_output.into_run_list().unwrap_or_default();
-                ScopedResponse::Status(StatusResponse::build(binding, wakeup, &runs))
+                    .get_status_run_summaries(&binding_id, MAX_STATUS_RECENT_RUNS)
+                    .map_err(|err| map_core_error(&state, "status summary query failed", err))?;
+                let status_resp = ScopedResponse::Status(StatusResponse::from_summary_counts(
+                    binding,
+                    wakeup,
+                    total_runs,
+                    active_runs,
+                    recent_runs,
+                ));
+                let serialized_len = estimate_wire_response_bytes(&status_resp)
+                    .map_err(|err| map_core_error(&state, "status serialization failed", err))?;
+                if serialized_len > MAX_COMPACT_RESPONSE_BYTES {
+                    return Err(map_core_error(
+                        &state,
+                        "status budget check failed",
+                        CoreError::ResponseTooLarge {
+                            size_bytes: serialized_len,
+                            max_bytes: MAX_COMPACT_RESPONSE_BYTES,
+                        },
+                    ));
+                }
+                status_resp
             }
             Some(cmd) => {
                 let output = access.core_mut().execute(&binding_id, cmd).map_err(|err| {
@@ -658,10 +704,10 @@ async fn handle_retry_wakeup(
     State(state): State<Arc<SharedState>>,
     headers: HeaderMap,
     AxumPath(binding_id): AxumPath<String>,
-    body: Bytes,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<threadlane_core::WakeupNotice>, (StatusCode, Json<ApiError>)> {
     verify_bearer_auth(&headers, &state.token)?;
-    let req: RetryWakeupRequest = parse_json_body(&body)?;
+    let req: RetryWakeupRequest = parse_json_body(body)?;
     let now = current_time_ms();
 
     let notice = {

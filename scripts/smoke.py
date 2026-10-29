@@ -188,7 +188,11 @@ def main() -> int:
                     json.dumps({"op": "get_run", "run_id": run_id}),
                 ],
             )["data"]
-            prompt_text = run_detail["questions"][0]["prompt"]
+            assert "revision_history" not in run_detail, "Compact Run must not embed revision_history"
+            assert "questions" not in run_detail, "Compact Run must not embed questions"
+            active_q = run_detail["active_question"]
+            assert active_q and active_q["question_id"] == question_id, f"Unexpected active_question: {active_q}"
+            prompt_text = active_q["prompt"]
             print(
                 f"[smoke] Run waiting for input on question {question_id} (untrusted prompt: {prompt_text!r})",
                 flush=True,
@@ -302,8 +306,56 @@ def main() -> int:
                 ],
             )["data"]
             assert ack_2["wakeup_status"] == "idle", f"Expected idle wakeup, got {ack_2}"
+
+            # 8. Verify M2A bounded history pages (`list_runs`, `list_run_revisions`, `list_run_questions`).
+            run_list_page = run_cli_json(
+                bin_path,
+                [
+                    "call",
+                    "--state-dir",
+                    str(state_dir),
+                    "--binding",
+                    binding_id,
+                    "--request",
+                    json.dumps({"op": "list_runs", "limit": 10}),
+                ],
+            )["data"]
+            assert len(run_list_page["runs"]) == 1 and run_list_page["runs"][0]["run_id"] == run_id
+            assert run_list_page["has_more"] is False and run_list_page["next_cursor"] is None
+
+            rev_page = run_cli_json(
+                bin_path,
+                [
+                    "call",
+                    "--state-dir",
+                    str(state_dir),
+                    "--binding",
+                    binding_id,
+                    "--request",
+                    json.dumps({"op": "list_run_revisions", "run_id": run_id, "limit": 10}),
+                ],
+            )["data"]
+            assert len(rev_page["revisions"]) == 1 and rev_page["revisions"][0]["revision"] == 1
+            assert rev_page["has_more"] is False and rev_page["next_cursor"] is None
+
+            q_page = run_cli_json(
+                bin_path,
+                [
+                    "call",
+                    "--state-dir",
+                    str(state_dir),
+                    "--binding",
+                    binding_id,
+                    "--request",
+                    json.dumps({"op": "list_run_questions", "run_id": run_id, "limit": 10}),
+                ],
+            )["data"]
+            assert len(q_page["questions"]) == 1 and q_page["questions"][0]["question_id"] == question_id
+            assert q_page["questions"][0]["status"] == "answered"
+            assert q_page["has_more"] is False and q_page["next_cursor"] is None
+
             print(
-                f"[smoke] Run {run_id} completed and all events acknowledged (acked_seq={ack_2['acked_seq']}, wakeup=idle).",
+                f"[smoke] Run {run_id} completed, history pages verified, and all events acknowledged (acked_seq={ack_2['acked_seq']}, wakeup=idle).",
                 flush=True,
             )
 

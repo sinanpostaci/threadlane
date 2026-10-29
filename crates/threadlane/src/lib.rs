@@ -22,7 +22,7 @@ pub mod protocol;
 /// Single-owner SQLite and demo tick supervisor over authenticated loopback HTTP.
 pub mod supervisor;
 
-pub use client::{ScopedClient, SupervisorClient};
+pub use client::{ScopedClient, SupervisorClient, MAX_CLIENT_RESPONSE_BYTES};
 pub use codex::{build_codex_queue_args, CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
 pub use descriptor::{
     prepare_state_dir, RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME,
@@ -34,4 +34,6 @@ pub use protocol::{
     BindingListResponse, CreateBindingRequest, RetryWakeupRequest, RunSummary, ScopedRequest,
     ScopedResponse, StatusResponse, MAX_STATUS_RECENT_RUNS,
 };
-pub use supervisor::{Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS};
+pub use supervisor::{
+    Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,
+};

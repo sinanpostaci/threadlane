@@ -3,7 +3,15 @@ use uuid::Uuid;
 use crate::error::CoreError;
 
 /// Current SQLite schema version owned by `threadlane-core`.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// Version 2 introduces keyset pagination indexes (`idx_runs_binding_order`,
+/// `idx_questions_binding_run_order`) and in-place compaction of legacy v1
+/// full-run `command_dedup` responses. Databases at version 1 are migrated
+/// automatically and transactionally on open.
+pub const SCHEMA_VERSION: u32 = 2;
+
+/// Legacy Milestone 1 SQLite schema version supported for in-place upgrade on open.
+pub(crate) const LEGACY_SCHEMA_VERSION_V1: u32 = 1;
 
 /// Maximum byte length for software-generated or caller-supplied identifiers.
 pub const MAX_ID_LEN: usize = 64;
@@ -34,6 +42,34 @@ pub const DEFAULT_EVENT_BATCH_SIZE: usize = 50;
 
 /// Maximum serialized JSON payload byte length for a single durable event.
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16_384;
+
+/// Default number of items returned in a bounded run, revision, or question page.
+pub const DEFAULT_PAGE_LIMIT: usize = 20;
+
+/// Maximum number of items permitted in a single bounded run, revision, or question page request.
+pub const MAX_PAGE_LIMIT: usize = 50;
+
+/// Maximum byte length for an opaque keyset pagination cursor token.
+pub const MAX_CURSOR_LEN: usize = 256;
+
+/// Maximum serialized JSON byte budget (64 KiB, including outer protocol/MCP wrapper overhead)
+/// for compact single-resource snapshots (`GetRun`, `StartDemo`, `Answer`, `Steer`, `Cancel`,
+/// `AcknowledgeEvents`, and `Status`).
+pub const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Maximum serialized JSON byte budget (256 KiB, including outer protocol/MCP wrapper overhead)
+/// for bounded history and list pages (`ListRuns`, `ListRunRevisions`, `ListRunQuestions`).
+pub const MAX_PAGE_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Reserved byte budget for outer HTTP/MCP response envelope fields around a serialized
+/// [`crate::CommandOutput`] payload.
+pub const RESPONSE_WRAPPER_OVERHEAD_BYTES: usize = 1_024;
+
+/// Maximum number of recent run summaries included in a compact binding status snapshot.
+pub const MAX_STATUS_RECENT_RUNS: usize = 10;
+
+/// Maximum character count included in `RunSummary::instruction_preview`.
+pub const MAX_SUMMARY_TEXT_PREVIEW_CHARS: usize = 120;
 
 /// Default delay (in milliseconds) between deterministic demo run steps.
 pub const DEFAULT_DEMO_STEP_DELAY_MS: i64 = 1_000;
@@ -217,4 +253,224 @@ pub(crate) fn validate_batch_limit(limit: usize) -> Result<usize, CoreError> {
         });
     }
     Ok(limit)
+}
+
+pub(crate) fn validate_page_limit(limit: usize) -> Result<usize, CoreError> {
+    if limit == 0 || limit > MAX_PAGE_LIMIT {
+        return Err(CoreError::Validation {
+            field: "limit",
+            reason: format!("limit must be between 1 and {MAX_PAGE_LIMIT}, got {limit}"),
+        });
+    }
+    Ok(limit)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CursorKind {
+    Runs,
+    Revisions,
+    Questions,
+}
+
+impl CursorKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Runs => "runs",
+            Self::Revisions => "revisions",
+            Self::Questions => "questions",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ParsedCursor {
+    pub(crate) after: u64,
+    pub(crate) high_water_mark: u64,
+}
+
+pub(crate) fn encode_runs_cursor(binding_id: &str, after_rowid: u64, hwm_rowid: u64) -> String {
+    format!("tlc1:runs:{binding_id}:{after_rowid}:{hwm_rowid}")
+}
+
+pub(crate) fn encode_revisions_cursor(
+    binding_id: &str,
+    run_id: &str,
+    after_revision: u64,
+    hwm_revision: u64,
+) -> String {
+    format!("tlc1:revisions:{binding_id}:{run_id}:{after_revision}:{hwm_revision}")
+}
+
+pub(crate) fn encode_questions_cursor(
+    binding_id: &str,
+    run_id: &str,
+    after_rowid: u64,
+    hwm_rowid: u64,
+) -> String {
+    format!("tlc1:questions:{binding_id}:{run_id}:{after_rowid}:{hwm_rowid}")
+}
+
+fn parse_cursor_position(label: &str, raw: &str) -> Result<u64, CoreError> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) || raw.starts_with('0') {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!("cursor {label} must be a canonical positive integer"),
+        });
+    }
+    let value = raw.parse::<u64>().map_err(|_| CoreError::Validation {
+        field: "cursor",
+        reason: format!("cursor {label} overflows 64-bit integer range"),
+    })?;
+    if value == 0 || value > i64::MAX as u64 {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!("cursor {label} exceeds valid signed 64-bit integer key range"),
+        });
+    }
+    Ok(value)
+}
+
+pub(crate) fn parse_and_validate_cursor(
+    raw: &str,
+    expected_kind: CursorKind,
+    expected_binding_id: &str,
+    expected_run_id: Option<&str>,
+) -> Result<ParsedCursor, CoreError> {
+    if raw.is_empty() {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor must not be empty".to_string(),
+        });
+    }
+    if raw.len() > MAX_CURSOR_LEN {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!("cursor exceeds maximum length of {MAX_CURSOR_LEN} bytes"),
+        });
+    }
+    if raw.trim() != raw || raw.chars().any(char::is_control) {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "cursor must not contain control characters or surrounding whitespace"
+                .to_string(),
+        });
+    }
+
+    let parts: Vec<&str> = raw.split(':').collect();
+    if parts.first().copied() != Some("tlc1") {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: "unrecognized cursor version or format".to_string(),
+        });
+    }
+
+    let actual_kind = match parts.get(1).copied() {
+        Some("runs") => CursorKind::Runs,
+        Some("revisions") => CursorKind::Revisions,
+        Some("questions") => CursorKind::Questions,
+        _ => {
+            return Err(CoreError::Validation {
+                field: "cursor",
+                reason: "unrecognized cursor resource kind".to_string(),
+            });
+        }
+    };
+
+    if actual_kind != expected_kind {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!(
+                "cursor kind '{}' cannot be used for '{}' pagination",
+                actual_kind.as_str(),
+                expected_kind.as_str()
+            ),
+        });
+    }
+
+    let (after_raw, hwm_raw) = match (expected_kind, expected_run_id) {
+        (CursorKind::Runs, None) => {
+            if parts.len() != 5 {
+                return Err(CoreError::Validation {
+                    field: "cursor",
+                    reason: "malformed runs cursor structure".to_string(),
+                });
+            }
+            if parts[2] != expected_binding_id {
+                return Err(CoreError::Validation {
+                    field: "cursor",
+                    reason: "cursor binding_id does not match request scope".to_string(),
+                });
+            }
+            (parts[3], parts[4])
+        }
+        (CursorKind::Revisions | CursorKind::Questions, Some(expected_run)) => {
+            if parts.len() != 6 {
+                return Err(CoreError::Validation {
+                    field: "cursor",
+                    reason: format!("malformed {} cursor structure", expected_kind.as_str()),
+                });
+            }
+            if parts[2] != expected_binding_id {
+                return Err(CoreError::Validation {
+                    field: "cursor",
+                    reason: "cursor binding_id does not match request scope".to_string(),
+                });
+            }
+            if parts[3] != expected_run {
+                return Err(CoreError::Validation {
+                    field: "cursor",
+                    reason: "cursor run_id does not match requested run_id".to_string(),
+                });
+            }
+            (parts[4], parts[5])
+        }
+        _ => {
+            return Err(CoreError::Validation {
+                field: "cursor",
+                reason: "cursor scope mismatch".to_string(),
+            });
+        }
+    };
+
+    let after = parse_cursor_position("position", after_raw)?;
+    let high_water_mark = parse_cursor_position("high_water_mark", hwm_raw)?;
+    if after >= high_water_mark {
+        return Err(CoreError::Validation {
+            field: "cursor",
+            reason: format!(
+                "cursor position ({after}) must be strictly less than high_water_mark ({high_water_mark})"
+            ),
+        });
+    }
+
+    Ok(ParsedCursor {
+        after,
+        high_water_mark,
+    })
+}
+
+pub(crate) fn truncate_preview(text: &str) -> (String, bool) {
+    let mut chars = text.chars();
+    let preview: String = chars
+        .by_ref()
+        .take(MAX_SUMMARY_TEXT_PREVIEW_CHARS)
+        .collect();
+    if chars.next().is_some() {
+        (format!("{preview}..."), true)
+    } else {
+        (preview, false)
+    }
+}
+
+/// Computes a conservative serialized wire byte estimate for `value` that accounts for both
+/// `structuredContent` (first-level JSON) and `content[0].text` (second-level JSON string literal
+/// of the first-level JSON) produced by `rmcp::model::CallToolResult::structured`, plus
+/// [`RESPONSE_WRAPPER_OVERHEAD_BYTES`].
+pub fn estimate_wire_response_bytes<T: serde::Serialize>(value: &T) -> Result<usize, CoreError> {
+    let first_level_json = serde_json::to_string(value)?;
+    let second_level_json_string = serde_json::to_string(&first_level_json)?;
+    Ok(first_level_json
+        .len()
+        .saturating_add(second_level_json_string.len())
+        .saturating_add(RESPONSE_WRAPPER_OVERHEAD_BYTES))
 }

@@ -1,9 +1,12 @@
 use tempfile::TempDir;
 use threadlane_core::{
-    AckErrorReason, Command, Core, CoreError, EventKind, QuestionStatus, RunStatus, WakeupOutcome,
-    WakeupRetryRecord, WakeupStatus, FIXED_WAKEUP_MESSAGE, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
-    MAX_COMMAND_KEY_LEN, MAX_DEMO_STEP_DELAY_MS, MAX_EVENT_BATCH_SIZE, MAX_EVENT_PAYLOAD_BYTES,
-    MAX_INSTRUCTION_LEN, MAX_LABEL_LEN, MAX_WAKEUP_ERROR_LEN,
+    estimate_wire_response_bytes, AckErrorReason, Command, CommandOutput, Core, CoreError,
+    EventKind, QuestionStatus, RunStatus, WakeupOutcome, WakeupRetryRecord, WakeupStatus,
+    DEFAULT_PAGE_LIMIT, FIXED_WAKEUP_MESSAGE, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
+    MAX_COMMAND_KEY_LEN, MAX_COMPACT_RESPONSE_BYTES, MAX_CURSOR_LEN, MAX_DEMO_STEP_DELAY_MS,
+    MAX_EVENT_BATCH_SIZE, MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN, MAX_LABEL_LEN,
+    MAX_PAGE_LIMIT, MAX_PAGE_RESPONSE_BYTES, MAX_STATUS_RECENT_RUNS,
+    MAX_SUMMARY_TEXT_PREVIEW_CHARS, MAX_WAKEUP_ERROR_LEN, SCHEMA_VERSION,
 };
 
 const UUID_A: &str = "11111111-2222-4333-8444-555555555555";
@@ -39,14 +42,25 @@ fn full_demo_loop_with_events_and_wakeups() {
         .into_run()
         .expect("run output");
 
+    assert!(started.untrusted_data);
     assert_eq!(started.status, RunStatus::Running);
     assert_eq!(started.revision, 1);
     assert_eq!(started.step_seq, 1);
     assert_eq!(started.next_step_at_ms, Some(1_500));
     assert_eq!(started.active_question_id, None);
-    assert_eq!(started.revision_history.len(), 1);
+    assert_eq!(started.active_question, None);
+    let started_revs = core
+        .list_run_revisions(
+            &binding.binding_id,
+            &started.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list started revisions");
+    assert_eq!(started_revs.revisions.len(), 1);
+    assert!(started_revs.revisions[0].untrusted_data);
     assert_eq!(
-        started.revision_history[0].instruction,
+        started_revs.revisions[0].instruction,
         "Implement bounded conversation loop"
     );
 
@@ -72,14 +86,33 @@ fn full_demo_loop_with_events_and_wakeups() {
     assert_eq!(waiting.revision, 1);
     assert_eq!(waiting.step_seq, 3);
     assert_eq!(waiting.next_step_at_ms, None);
-    assert_eq!(waiting.questions.len(), 1);
     let question_id = waiting
         .active_question_id
         .clone()
         .expect("active question id");
-    assert_eq!(waiting.questions[0].question_id, question_id);
-    assert_eq!(waiting.questions[0].status, QuestionStatus::Pending);
-    assert_eq!(waiting.questions[0].revision, 1);
+    let active_q = waiting
+        .active_question
+        .as_ref()
+        .expect("active question embedded in waiting run");
+    assert!(active_q.untrusted_data);
+    assert_eq!(active_q.question_id, question_id);
+    assert_eq!(active_q.status, QuestionStatus::Pending);
+    assert_eq!(active_q.revision, 1);
+    let waiting_questions = core
+        .list_run_questions(
+            &binding.binding_id,
+            &started.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list waiting questions");
+    assert_eq!(waiting_questions.questions.len(), 1);
+    assert_eq!(waiting_questions.questions[0].question_id, question_id);
+    assert_eq!(
+        waiting_questions.questions[0].status,
+        QuestionStatus::Pending
+    );
+    assert_eq!(waiting_questions.questions[0].revision, 1);
 
     // QuestionAsked is important -> creates Pending wake-up notice.
     let wakeup = core.get_wakeup(&binding.binding_id).expect("get wakeup");
@@ -192,10 +225,22 @@ fn full_demo_loop_with_events_and_wakeups() {
 
     assert_eq!(completing.status, RunStatus::Completing);
     assert_eq!(completing.active_question_id, None);
+    assert_eq!(completing.active_question, None);
     assert_eq!(completing.next_step_at_ms, Some(2_500));
-    assert_eq!(completing.questions[0].status, QuestionStatus::Answered);
+    let completing_questions = core
+        .list_run_questions(
+            &binding.binding_id,
+            &started.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list completing questions");
     assert_eq!(
-        completing.questions[0].answer.as_deref(),
+        completing_questions.questions[0].status,
+        QuestionStatus::Answered
+    );
+    assert_eq!(
+        completing_questions.questions[0].answer.as_deref(),
         Some("Approved for execution")
     );
 
@@ -334,12 +379,20 @@ fn duplicate_retry_and_reused_key_conflict_persist_across_reopen() {
     assert_eq!(original_run, retry_after_reopen);
 
     // Verify only 1 run and 1 event were ever created.
-    let runs = core
-        .execute(&binding_id, Command::ListRuns)
+    let runs_page = core
+        .execute(
+            &binding_id,
+            Command::ListRuns {
+                cursor: None,
+                limit: DEFAULT_PAGE_LIMIT,
+            },
+        )
         .expect("list runs")
         .into_run_list()
         .expect("run list");
-    assert_eq!(runs.len(), 1);
+    assert_eq!(runs_page.runs.len(), 1);
+    assert!(!runs_page.has_more);
+    assert_eq!(runs_page.next_cursor, None);
 
     let batch = core
         .execute(
@@ -716,15 +769,24 @@ fn steer_increments_revision_supersedes_question_and_rejects_stale_revisions_and
     assert_eq!(steered_v2.status, RunStatus::Running);
     assert_eq!(steered_v2.instruction, "Plan v2");
     assert_eq!(steered_v2.active_question_id, None);
+    assert_eq!(steered_v2.active_question, None);
     assert_eq!(steered_v2.next_step_at_ms, Some(1_500));
-    assert_eq!(steered_v2.revision_history.len(), 2);
-    assert_eq!(steered_v2.revision_history[0].revision, 1);
-    assert_eq!(steered_v2.revision_history[0].superseded_at_ms, Some(1_300));
-    assert_eq!(steered_v2.revision_history[1].revision, 2);
-    assert_eq!(steered_v2.revision_history[1].instruction, "Plan v2");
-    assert_eq!(steered_v2.questions.len(), 1);
-    assert_eq!(steered_v2.questions[0].status, QuestionStatus::Superseded);
-    assert_eq!(steered_v2.questions[0].superseded_by_revision, Some(2));
+
+    let v2_revs = core
+        .list_run_revisions(&binding.binding_id, &run.run_id, None, DEFAULT_PAGE_LIMIT)
+        .expect("list v2 revisions");
+    assert_eq!(v2_revs.revisions.len(), 2);
+    assert_eq!(v2_revs.revisions[0].revision, 1);
+    assert_eq!(v2_revs.revisions[0].superseded_at_ms, Some(1_300));
+    assert_eq!(v2_revs.revisions[1].revision, 2);
+    assert_eq!(v2_revs.revisions[1].instruction, "Plan v2");
+
+    let v2_qs = core
+        .list_run_questions(&binding.binding_id, &run.run_id, None, DEFAULT_PAGE_LIMIT)
+        .expect("list v2 questions");
+    assert_eq!(v2_qs.questions.len(), 1);
+    assert_eq!(v2_qs.questions[0].status, QuestionStatus::Superseded);
+    assert_eq!(v2_qs.questions[0].superseded_by_revision, Some(2));
 
     // Answering superseded q1 with stale revision 1 fails with StaleRevision.
     let ans_stale_rev = core
@@ -780,7 +842,18 @@ fn steer_increments_revision_supersedes_question_and_rejects_stale_revisions_and
         .expect("get waiting v2");
     let q2_id = waiting_v2.active_question_id.clone().expect("q2");
     assert_ne!(q1_id, q2_id);
-    assert_eq!(waiting_v2.questions.len(), 2);
+    assert_eq!(
+        waiting_v2
+            .active_question
+            .as_ref()
+            .expect("active q2")
+            .question_id,
+        q2_id
+    );
+    let waiting_v2_qs = core
+        .list_run_questions(&binding.binding_id, &run.run_id, None, DEFAULT_PAGE_LIMIT)
+        .expect("list waiting v2 questions");
+    assert_eq!(waiting_v2_qs.questions.len(), 2);
 
     // Answering q2 with expected_revision = 2 transitions to Completing.
     let completing_v2 = core
@@ -1565,7 +1638,15 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
         .into_run()
         .expect("run a");
     assert_eq!(started_a.instruction, repro_instruction);
-    assert_eq!(started_a.revision_history[0].instruction, repro_instruction);
+    let started_a_revs = core
+        .list_run_revisions(
+            &binding_a.binding_id,
+            &started_a.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list started_a revs");
+    assert_eq!(started_a_revs.revisions[0].instruction, repro_instruction);
 
     let started_b = core
         .execute(
@@ -1594,11 +1675,19 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
         .expect("get waiting a v1");
     assert_eq!(waiting_a_v1.status, RunStatus::WaitingInput);
     assert_eq!(waiting_a_v1.instruction, repro_instruction);
+    let waiting_a_v1_revs = core
+        .list_run_revisions(
+            &binding_a.binding_id,
+            &started_a.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list waiting_a_v1 revs");
     assert_eq!(
-        waiting_a_v1.revision_history[0].instruction,
+        waiting_a_v1_revs.revisions[0].instruction,
         repro_instruction
     );
-    let q1 = &waiting_a_v1.questions[0];
+    let q1 = waiting_a_v1.active_question.as_ref().expect("active q1");
     assert!(q1.prompt.contains(&started_a.run_id));
     assert!(q1.prompt.contains("revision 1"));
     assert!(q1.prompt.contains("confirm the current instruction"));
@@ -1625,12 +1714,17 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
         .expect("steered run a");
     assert_eq!(steered_a.revision, 2);
     assert_eq!(steered_a.instruction, steered_instruction);
-    assert_eq!(steered_a.revision_history.len(), 2);
-    assert_eq!(steered_a.revision_history[0].instruction, repro_instruction);
-    assert_eq!(
-        steered_a.revision_history[1].instruction,
-        steered_instruction
-    );
+    let steered_a_revs = core
+        .list_run_revisions(
+            &binding_a.binding_id,
+            &started_a.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list steered_a revs");
+    assert_eq!(steered_a_revs.revisions.len(), 2);
+    assert_eq!(steered_a_revs.revisions[0].instruction, repro_instruction);
+    assert_eq!(steered_a_revs.revisions[1].instruction, steered_instruction);
 
     let tick_2 = core.tick(1_300).expect("tick 2 after steer must succeed");
     assert_eq!(tick_2.advanced_runs, vec![started_a.run_id.clone()]);
@@ -1641,8 +1735,9 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
         .expect("waiting a v2");
     assert_eq!(waiting_a_v2.status, RunStatus::WaitingInput);
     let q2_id = waiting_a_v2.active_question_id.clone().expect("q2 id");
-    assert!(waiting_a_v2.questions[1].prompt.contains("revision 2"));
-    assert!(!waiting_a_v2.questions[1].prompt.contains('\u{1}'));
+    let q2_active = waiting_a_v2.active_question.as_ref().expect("active q2");
+    assert!(q2_active.prompt.contains("revision 2"));
+    assert!(!q2_active.prompt.contains('\u{1}'));
 
     // 4. Answer with a 4,096-byte escaped quote payload and tick to completion.
     let max_quote_answer = "\"".repeat(MAX_ANSWER_LEN);
@@ -1668,16 +1763,29 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
         .expect("completed a");
     assert_eq!(completed_a.status, RunStatus::Completed);
     assert_eq!(completed_a.instruction, steered_instruction);
+    let completed_a_revs = core
+        .list_run_revisions(
+            &binding_a.binding_id,
+            &started_a.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list completed_a revs");
+    assert_eq!(completed_a_revs.revisions[0].instruction, repro_instruction);
     assert_eq!(
-        completed_a.revision_history[0].instruction,
-        repro_instruction
-    );
-    assert_eq!(
-        completed_a.revision_history[1].instruction,
+        completed_a_revs.revisions[1].instruction,
         steered_instruction
     );
+    let completed_a_qs = core
+        .list_run_questions(
+            &binding_a.binding_id,
+            &started_a.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("list completed_a questions");
     assert_eq!(
-        completed_a.questions[1].answer.as_deref(),
+        completed_a_qs.questions[1].answer.as_deref(),
         Some(max_quote_answer.as_str())
     );
 
@@ -1802,11 +1910,17 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
 
     // Verify no partial write occurred on StartDemo failure.
     let runs_after_reject = core_reject
-        .execute(&b_reject.binding_id, Command::ListRuns)
+        .execute(
+            &b_reject.binding_id,
+            Command::ListRuns {
+                cursor: None,
+                limit: DEFAULT_PAGE_LIMIT,
+            },
+        )
         .expect("list runs")
         .into_run_list()
         .expect("runs");
-    assert!(runs_after_reject.is_empty());
+    assert!(runs_after_reject.runs.is_empty());
     let events_after_reject = core_reject
         .execute(
             &b_reject.binding_id,
@@ -1863,9 +1977,21 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
     assert_eq!(after_failed_steer.revision, 1);
     assert_eq!(after_failed_steer.status, RunStatus::WaitingInput);
     assert_eq!(after_failed_steer.instruction, "Valid instruction");
-    assert_eq!(after_failed_steer.revision_history.len(), 1);
+    let revs_after_failed_steer = core_reject
+        .list_run_revisions(
+            &b_reject.binding_id,
+            &valid_run.run_id,
+            None,
+            DEFAULT_PAGE_LIMIT,
+        )
+        .expect("revs after failed steer");
+    assert_eq!(revs_after_failed_steer.revisions.len(), 1);
     assert_eq!(
-        after_failed_steer.questions[0].status,
+        after_failed_steer
+            .active_question
+            .as_ref()
+            .expect("active q")
+            .status,
         QuestionStatus::Pending
     );
 
@@ -1893,11 +2019,12 @@ fn escaped_instruction_start_steer_completion_and_oversized_rejection() {
         after_failed_answer.active_question_id.as_deref(),
         Some(valid_q_id.as_str())
     );
-    assert_eq!(
-        after_failed_answer.questions[0].status,
-        QuestionStatus::Pending
-    );
-    assert_eq!(after_failed_answer.questions[0].answer, None);
+    let q_after_failed_answer = after_failed_answer
+        .active_question
+        .as_ref()
+        .expect("active q after failed answer");
+    assert_eq!(q_after_failed_answer.status, QuestionStatus::Pending);
+    assert_eq!(q_after_failed_answer.answer, None);
 }
 
 #[test]
@@ -1999,13 +2126,19 @@ fn restart_with_already_persisted_raw_control_instructions_advances_cleanly() {
     let r1 = core.get_run(&binding_a_id, &run_1_id).expect("get r1");
     assert_eq!(r1.status, RunStatus::WaitingInput);
     assert_eq!(r1.instruction, repro_instruction);
-    assert_eq!(r1.revision_history[0].instruction, repro_instruction);
+    let r1_revs = core
+        .list_run_revisions(&binding_a_id, &run_1_id, None, DEFAULT_PAGE_LIMIT)
+        .expect("list r1 revs");
+    assert_eq!(r1_revs.revisions[0].instruction, repro_instruction);
     let q1_id = r1.active_question_id.expect("q1");
 
     let r2 = core.get_run(&binding_a_id, &run_2_id).expect("get r2");
     assert_eq!(r2.status, RunStatus::WaitingInput);
     assert_eq!(r2.instruction, all_control_instruction);
-    assert_eq!(r2.revision_history[0].instruction, all_control_instruction);
+    let r2_revs = core
+        .list_run_revisions(&binding_a_id, &run_2_id, None, DEFAULT_PAGE_LIMIT)
+        .expect("list r2 revs");
+    assert_eq!(r2_revs.revisions[0].instruction, all_control_instruction);
     let q2_id = r2.active_question_id.expect("q2");
 
     let rb = core.get_run(&binding_b_id, &run_b_id).expect("get rb");
@@ -2518,4 +2651,1019 @@ fn manual_retry_wakeup_lifecycle_audit_isolation_and_ack_reconciliation() {
     assert_eq!(pending_b3.coalesced_count, 1);
     assert_eq!(pending_b3.claimed_at_ms, None);
     assert_eq!(pending_b3.resolved_at_ms, None);
+}
+
+#[test]
+fn m2a_hundreds_of_revisions_and_questions_max_escaped_byte_budget_paging() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane_m2a_scale.db");
+    let mut core = Core::open(&db_path).expect("open");
+
+    let binding = core
+        .create_binding(UUID_A, "M2A Scale Paging")
+        .expect("binding");
+
+    // Helper to build a 4,096-byte control-escaped instruction that fits within the 16 KiB event
+    // payload budget (~16,344 first-level JSON bytes, ~47 KiB two-copy wire estimate).
+    let make_max_instruction = |rev: u64| -> String {
+        let suffix = format!("rev-{rev:04}-");
+        let control_prefix = "\u{1}".repeat(2_410);
+        let pad_len = MAX_INSTRUCTION_LEN - control_prefix.len() - suffix.len();
+        format!("{control_prefix}{suffix}{}", "x".repeat(pad_len))
+    };
+
+    let inst_1 = make_max_instruction(1);
+    assert_eq!(inst_1.len(), MAX_INSTRUCTION_LEN);
+
+    let mut now_ms = 10_000_i64;
+    let started_out = core
+        .execute(
+            &binding.binding_id,
+            Command::StartDemo {
+                command_key: "scale-start".to_string(),
+                instruction: inst_1.clone(),
+                step_delay_ms: Some(10),
+                now_ms,
+            },
+        )
+        .expect("start scale run");
+    assert!(
+        estimate_wire_response_bytes(&started_out).expect("wire bytes")
+            <= MAX_COMPACT_RESPONSE_BYTES
+    );
+    let run = started_out.into_run().expect("run");
+
+    // Advance revision 1 to WaitingInput so it creates question 1.
+    now_ms += 10;
+    core.tick(now_ms).expect("tick rev 1");
+
+    let total_revisions = 210_u64;
+    for rev in 2..=total_revisions {
+        let inst = make_max_instruction(rev);
+        assert_eq!(inst.len(), MAX_INSTRUCTION_LEN);
+
+        now_ms += 10;
+        let steer_out = core
+            .execute(
+                &binding.binding_id,
+                Command::Steer {
+                    command_key: format!("scale-steer-{rev}"),
+                    run_id: run.run_id.clone(),
+                    expected_revision: rev - 1,
+                    instruction: inst.clone(),
+                    now_ms,
+                },
+            )
+            .expect("steer scale run");
+        let steer_wire_bytes = estimate_wire_response_bytes(&steer_out).expect("steer wire bytes");
+        assert!(
+            steer_wire_bytes <= MAX_COMPACT_RESPONSE_BYTES,
+            "compact steer snapshot at rev {rev} was {steer_wire_bytes} bytes > {MAX_COMPACT_RESPONSE_BYTES}"
+        );
+
+        now_ms += 10;
+        core.tick(now_ms).expect("tick after steer");
+    }
+
+    // Answer the final pending question at revision 210 with a 4,096-byte quote-heavy answer.
+    let waiting_final = core
+        .get_run(&binding.binding_id, &run.run_id)
+        .expect("get waiting final");
+    assert_eq!(waiting_final.revision, total_revisions);
+    assert_eq!(waiting_final.status, RunStatus::WaitingInput);
+    let final_q = waiting_final
+        .active_question
+        .as_ref()
+        .expect("final active question");
+    assert_eq!(final_q.revision, total_revisions);
+    assert_eq!(final_q.status, QuestionStatus::Pending);
+
+    let get_wire_bytes =
+        estimate_wire_response_bytes(&CommandOutput::Run(Box::new(waiting_final.clone())))
+            .expect("get_run wire bytes");
+    assert!(
+        get_wire_bytes <= MAX_COMPACT_RESPONSE_BYTES,
+        "GetRun wire bytes {get_wire_bytes} exceeded {MAX_COMPACT_RESPONSE_BYTES}"
+    );
+
+    let max_answer = "\"a".repeat(MAX_ANSWER_LEN / 2);
+    assert_eq!(max_answer.len(), MAX_ANSWER_LEN);
+    now_ms += 10;
+    let answer_out = core
+        .execute(
+            &binding.binding_id,
+            Command::Answer {
+                command_key: "scale-final-answer".to_string(),
+                run_id: run.run_id.clone(),
+                question_id: final_q.question_id.clone(),
+                expected_revision: total_revisions,
+                answer: max_answer.clone(),
+                now_ms,
+            },
+        )
+        .expect("answer final question");
+    assert!(
+        estimate_wire_response_bytes(&answer_out).expect("answer wire bytes")
+            <= MAX_COMPACT_RESPONSE_BYTES
+    );
+
+    // Page through all 210 revisions requesting `limit = MAX_PAGE_LIMIT (50)`.
+    // Because each escaped revision takes ~47 KiB in the two-copy wire estimate, the byte budget
+    // (`MAX_PAGE_RESPONSE_BYTES = 256 KiB`) must split pages early (around 5 items per page)
+    // without skipping the first candidate that would exceed the budget.
+    let mut collected_revisions = Vec::new();
+    let mut rev_cursor: Option<String> = None;
+    let mut saw_budget_split = false;
+    loop {
+        let page = core
+            .list_run_revisions(
+                &binding.binding_id,
+                &run.run_id,
+                rev_cursor.as_deref(),
+                MAX_PAGE_LIMIT,
+            )
+            .expect("list_run_revisions page");
+        let page_wire_bytes =
+            estimate_wire_response_bytes(&CommandOutput::RevisionHistory(page.clone()))
+                .expect("revision page wire bytes");
+        assert!(
+            page_wire_bytes <= MAX_PAGE_RESPONSE_BYTES,
+            "revision page wire bytes {page_wire_bytes} exceeded {MAX_PAGE_RESPONSE_BYTES}"
+        );
+        assert!(!page.revisions.is_empty());
+        if page.has_more && page.revisions.len() < MAX_PAGE_LIMIT {
+            saw_budget_split = true;
+        }
+        collected_revisions.extend(page.revisions);
+        if page.has_more {
+            rev_cursor = Some(page.next_cursor.expect("next_cursor when has_more"));
+        } else {
+            assert!(page.next_cursor.is_none());
+            break;
+        }
+    }
+
+    assert!(
+        saw_budget_split,
+        "expected byte budget to split 50-row request into smaller pages"
+    );
+    assert_eq!(collected_revisions.len() as u64, total_revisions);
+    for (idx, rev_entry) in collected_revisions.iter().enumerate() {
+        let expected_rev = (idx as u64) + 1;
+        assert_eq!(rev_entry.revision, expected_rev);
+        assert_eq!(rev_entry.instruction, make_max_instruction(expected_rev));
+        assert!(rev_entry.untrusted_data);
+        if expected_rev < total_revisions {
+            assert!(rev_entry.superseded_at_ms.is_some());
+        } else {
+            assert_eq!(rev_entry.superseded_at_ms, None);
+        }
+    }
+
+    // Page through all 210 questions and verify exact ascending creation order and no missing/duplicate rows.
+    let mut collected_questions = Vec::new();
+    let mut q_cursor: Option<String> = None;
+    loop {
+        let page = core
+            .list_run_questions(
+                &binding.binding_id,
+                &run.run_id,
+                q_cursor.as_deref(),
+                MAX_PAGE_LIMIT,
+            )
+            .expect("list_run_questions page");
+        let page_wire_bytes =
+            estimate_wire_response_bytes(&CommandOutput::QuestionHistory(page.clone()))
+                .expect("question page wire bytes");
+        assert!(
+            page_wire_bytes <= MAX_PAGE_RESPONSE_BYTES,
+            "question page wire bytes {page_wire_bytes} exceeded {MAX_PAGE_RESPONSE_BYTES}"
+        );
+        assert!(!page.questions.is_empty());
+        collected_questions.extend(page.questions);
+        if page.has_more {
+            q_cursor = Some(page.next_cursor.expect("next_cursor when has_more"));
+        } else {
+            assert!(page.next_cursor.is_none());
+            break;
+        }
+    }
+
+    assert_eq!(collected_questions.len() as u64, total_revisions);
+    for (idx, q_entry) in collected_questions.iter().enumerate() {
+        let expected_rev = (idx as u64) + 1;
+        assert_eq!(q_entry.revision, expected_rev);
+        assert!(q_entry.untrusted_data);
+        if expected_rev == total_revisions {
+            assert_eq!(q_entry.status, QuestionStatus::Answered);
+            assert_eq!(q_entry.answer.as_deref(), Some(max_answer.as_str()));
+        } else {
+            assert_eq!(q_entry.status, QuestionStatus::Superseded);
+            assert_eq!(q_entry.superseded_by_revision, Some(expected_rev + 1));
+        }
+    }
+}
+
+#[test]
+fn m2a_cursor_validation_scope_kind_misuse_and_overflow_rejection() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane_m2a_cursors.db");
+    let mut core = Core::open(&db_path).expect("open");
+
+    let binding_a = core.create_binding(UUID_A, "Binding A").expect("b_a");
+    let binding_b = core.create_binding(UUID_B, "Binding B").expect("b_b");
+
+    // Create 2 runs in binding A and 2 runs in binding B, each with 2 revisions and 2 questions.
+    let mut create_steered_run = |binding_id: &str, prefix: &str, base_ms: i64| -> String {
+        let r = core
+            .execute(
+                binding_id,
+                Command::StartDemo {
+                    command_key: format!("{prefix}-start"),
+                    instruction: format!("{prefix} v1"),
+                    step_delay_ms: Some(10),
+                    now_ms: base_ms,
+                },
+            )
+            .expect("start")
+            .into_run()
+            .expect("run");
+        core.tick(base_ms + 10).expect("tick 1");
+        core.execute(
+            binding_id,
+            Command::Steer {
+                command_key: format!("{prefix}-steer"),
+                run_id: r.run_id.clone(),
+                expected_revision: 1,
+                instruction: format!("{prefix} v2"),
+                now_ms: base_ms + 20,
+            },
+        )
+        .expect("steer");
+        core.tick(base_ms + 30).expect("tick 2");
+        r.run_id
+    };
+
+    let run_a1 = create_steered_run(&binding_a.binding_id, "a1", 1_000);
+    let run_a2 = create_steered_run(&binding_a.binding_id, "a2", 2_000);
+    let run_b1 = create_steered_run(&binding_b.binding_id, "b1", 3_000);
+    let _run_b2 = create_steered_run(&binding_b.binding_id, "b2", 4_000);
+
+    // Obtain valid cursors from binding A (limit = 1).
+    let runs_page_a = core
+        .list_runs(&binding_a.binding_id, None, 1)
+        .expect("runs page a");
+    let runs_cursor_a = runs_page_a.next_cursor.expect("runs cursor a");
+
+    let revs_page_a1 = core
+        .list_run_revisions(&binding_a.binding_id, &run_a1, None, 1)
+        .expect("revs page a1");
+    let revs_cursor_a1 = revs_page_a1.next_cursor.expect("revs cursor a1");
+
+    let qs_page_a1 = core
+        .list_run_questions(&binding_a.binding_id, &run_a1, None, 1)
+        .expect("qs page a1");
+    let qs_cursor_a1 = qs_page_a1.next_cursor.expect("qs cursor a1");
+
+    // 1. Cross-binding cursor misuse must fail with Validation.
+    assert!(matches!(
+        core.list_runs(&binding_b.binding_id, Some(&runs_cursor_a), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_revisions(&binding_b.binding_id, &run_b1, Some(&revs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_questions(&binding_b.binding_id, &run_b1, Some(&qs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+
+    // 2. Same-binding different-run cursor misuse must fail with Validation.
+    assert!(matches!(
+        core.list_run_revisions(&binding_a.binding_id, &run_a2, Some(&revs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_questions(&binding_a.binding_id, &run_a2, Some(&qs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+
+    // 3. Cross-kind cursor misuse must fail with Validation.
+    assert!(matches!(
+        core.list_runs(&binding_a.binding_id, Some(&revs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_runs(&binding_a.binding_id, Some(&qs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_revisions(&binding_a.binding_id, &run_a1, Some(&runs_cursor_a), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_revisions(&binding_a.binding_id, &run_a1, Some(&qs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_questions(&binding_a.binding_id, &run_a1, Some(&runs_cursor_a), 10),
+        Err(CoreError::Validation { .. })
+    ));
+    assert!(matches!(
+        core.list_run_questions(&binding_a.binding_id, &run_a1, Some(&revs_cursor_a1), 10),
+        Err(CoreError::Validation { .. })
+    ));
+
+    // 4. Forged, malformed, leading-zero, out-of-order, non-existent anchor, and overflowing cursors.
+    let bid = &binding_a.binding_id;
+    let bad_runs_cursors = vec![
+        "".to_string(),
+        "   ".to_string(),
+        "x".repeat(MAX_CURSOR_LEN + 1),
+        format!("tlc2:runs:{bid}:1:2"),
+        format!("tlc1:runs:{bid}:0:2"),
+        format!("tlc1:runs:{bid}:1:0"),
+        format!("tlc1:runs:{bid}:01:2"),
+        format!("tlc1:runs:{bid}:1:02"),
+        format!("tlc1:runs:{bid}:2:2"),
+        format!("tlc1:runs:{bid}:2:1"),
+        format!("tlc1:runs:{bid}:999:1000"),
+        format!("tlc1:runs:{bid}:1:999"),
+        format!("tlc1:runs:{bid}:1:{}", u64::MAX),
+        format!("tlc1:runs:{bid}:1:{}", (i64::MAX as u64) + 1),
+        format!("tlc1:runs:{bid}:1:2:extra"),
+    ];
+    for bad in &bad_runs_cursors {
+        assert!(
+            matches!(
+                core.list_runs(bid, Some(bad), 10),
+                Err(CoreError::Validation { .. })
+            ),
+            "expected invalid runs cursor to fail: {bad}"
+        );
+    }
+
+    let bad_revs_cursors = vec![
+        format!("tlc1:revisions:{bid}:{run_a1}:0:2"),
+        format!("tlc1:revisions:{bid}:{run_a1}:1:0"),
+        format!("tlc1:revisions:{bid}:{run_a1}:01:2"),
+        format!("tlc1:revisions:{bid}:{run_a1}:2:2"),
+        format!("tlc1:revisions:{bid}:{run_a1}:2:1"),
+        format!("tlc1:revisions:{bid}:{run_a1}:1:99"),
+        format!("tlc1:revisions:{bid}:{run_a1}:1:{}", u64::MAX),
+        format!("tlc1:revisions:{bid}:{run_a1}:1:{}", (i64::MAX as u64) + 1),
+    ];
+    for bad in &bad_revs_cursors {
+        assert!(
+            matches!(
+                core.list_run_revisions(bid, &run_a1, Some(bad), 10),
+                Err(CoreError::Validation { .. })
+            ),
+            "expected invalid revisions cursor to fail: {bad}"
+        );
+    }
+
+    let bad_qs_cursors = vec![
+        format!("tlc1:questions:{bid}:{run_a1}:0:2"),
+        format!("tlc1:questions:{bid}:{run_a1}:1:0"),
+        format!("tlc1:questions:{bid}:{run_a1}:01:2"),
+        format!("tlc1:questions:{bid}:{run_a1}:2:2"),
+        format!("tlc1:questions:{bid}:{run_a1}:2:1"),
+        format!("tlc1:questions:{bid}:{run_a1}:1:999"),
+        format!("tlc1:questions:{bid}:{run_a1}:1:{}", u64::MAX),
+        format!("tlc1:questions:{bid}:{run_a1}:1:{}", (i64::MAX as u64) + 1),
+    ];
+    for bad in &bad_qs_cursors {
+        assert!(
+            matches!(
+                core.list_run_questions(bid, &run_a1, Some(bad), 10),
+                Err(CoreError::Validation { .. })
+            ),
+            "expected invalid questions cursor to fail: {bad}"
+        );
+    }
+
+    // 5. Invalid page limits (0, MAX_PAGE_LIMIT + 1, usize::MAX) must fail with Validation.
+    for bad_limit in [0_usize, MAX_PAGE_LIMIT + 1, usize::MAX] {
+        assert!(matches!(
+            core.list_runs(bid, None, bad_limit),
+            Err(CoreError::Validation { .. })
+        ));
+        assert!(matches!(
+            core.list_run_revisions(bid, &run_a1, None, bad_limit),
+            Err(CoreError::Validation { .. })
+        ));
+        assert!(matches!(
+            core.list_run_questions(bid, &run_a1, None, bad_limit),
+            Err(CoreError::Validation { .. })
+        ));
+    }
+}
+
+#[test]
+fn m2a_stable_high_water_mark_window_under_concurrent_appends_and_live_view_semantics() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane_m2a_hwm.db");
+    let mut core = Core::open(&db_path).expect("open");
+
+    let binding = core.create_binding(UUID_A, "HWM Binding").expect("binding");
+    let bid = &binding.binding_id;
+
+    // Create 4 initial runs r1..r4.
+    let mut run_ids = Vec::new();
+    for i in 1..=4 {
+        let r = core
+            .execute(
+                bid,
+                Command::StartDemo {
+                    command_key: format!("hwm-run-{i}"),
+                    instruction: format!("Run {i} rev 1"),
+                    step_delay_ms: Some(10),
+                    now_ms: 1_000 + i * 10,
+                },
+            )
+            .expect("start")
+            .into_run()
+            .expect("run");
+        run_ids.push(r.run_id);
+    }
+    core.tick(1_100).expect("tick all 4 to waiting");
+
+    // Advance run_ids[0] through 4 revisions and 4 questions so we can page its history too.
+    let target_run = run_ids[0].clone();
+    for rev in 2..=4 {
+        core.execute(
+            bid,
+            Command::Steer {
+                command_key: format!("hwm-steer-{rev}"),
+                run_id: target_run.clone(),
+                expected_revision: rev - 1,
+                instruction: format!("Run 1 rev {rev}"),
+                now_ms: 1_100 + (rev as i64) * 20,
+            },
+        )
+        .expect("steer target");
+        core.tick(1_110 + (rev as i64) * 20).expect("tick target");
+    }
+
+    // Fetch Page 1 (limit = 2) of runs, revisions, and questions (ascending creation/revision order).
+    let runs_p1 = core.list_runs(bid, None, 2).expect("runs p1");
+    assert_eq!(runs_p1.runs.len(), 2);
+    assert_eq!(runs_p1.runs[0].run_id, run_ids[0]);
+    assert_eq!(runs_p1.runs[1].run_id, run_ids[1]);
+    assert!(runs_p1.has_more);
+    let runs_cursor = runs_p1.next_cursor.expect("runs cursor");
+
+    let revs_p1 = core
+        .list_run_revisions(bid, &target_run, None, 2)
+        .expect("revs p1");
+    assert_eq!(revs_p1.revisions.len(), 2);
+    assert_eq!(revs_p1.revisions[0].revision, 1);
+    assert_eq!(revs_p1.revisions[1].revision, 2);
+    assert!(revs_p1.has_more);
+    let revs_cursor = revs_p1.next_cursor.expect("revs cursor");
+
+    let qs_p1 = core
+        .list_run_questions(bid, &target_run, None, 2)
+        .expect("qs p1");
+    assert_eq!(qs_p1.questions.len(), 2);
+    assert_eq!(qs_p1.questions[0].revision, 1);
+    assert_eq!(qs_p1.questions[1].revision, 2);
+    assert!(qs_p1.has_more);
+    let qs_cursor = qs_p1.next_cursor.expect("qs cursor");
+
+    // Now append new runs (r5, r6), steer target_run to rev 5 & 6 (which supersedes rev 4's question
+    // and creates questions for rev 5 & 6), and cancel run_ids[2] (r3) which will appear on Page 2!
+    for i in 5..=6 {
+        let r = core
+            .execute(
+                bid,
+                Command::StartDemo {
+                    command_key: format!("hwm-run-{i}"),
+                    instruction: format!("Run {i} rev 1"),
+                    step_delay_ms: Some(10),
+                    now_ms: 2_000 + i * 10,
+                },
+            )
+            .expect("start new run")
+            .into_run()
+            .expect("new run");
+        run_ids.push(r.run_id);
+    }
+    for rev in 5..=6 {
+        core.execute(
+            bid,
+            Command::Steer {
+                command_key: format!("hwm-steer-{rev}"),
+                run_id: target_run.clone(),
+                expected_revision: rev - 1,
+                instruction: format!("Run 1 rev {rev}"),
+                now_ms: 2_100 + (rev as i64) * 20,
+            },
+        )
+        .expect("steer target new");
+        core.tick(2_110 + (rev as i64) * 20)
+            .expect("tick target new");
+    }
+    core.execute(
+        bid,
+        Command::Cancel {
+            command_key: "hwm-cancel-r3".to_string(),
+            run_id: run_ids[2].clone(),
+            reason: Some("cancelled between pages".to_string()),
+            now_ms: 2_300,
+        },
+    )
+    .expect("cancel r3");
+
+    // Fetch Page 2 using the cursors from Page 1:
+    // - Membership must be strictly pinned to the initial high-water-mark window (r3, r4; rev 3, 4; q 3, 4)
+    //   with NO duplicates and NO missing rows.
+    // - Mutable status fields reflect live state (e.g. r3 is Cancelled, rev 4 is superseded, q 4 is Superseded).
+    let runs_p2 = core
+        .list_runs(bid, Some(&runs_cursor), 10)
+        .expect("runs p2");
+    assert_eq!(runs_p2.runs.len(), 2);
+    assert_eq!(runs_p2.runs[0].run_id, run_ids[2]);
+    assert_eq!(runs_p2.runs[0].status, RunStatus::Cancelled);
+    assert_eq!(runs_p2.runs[1].run_id, run_ids[3]);
+    assert_eq!(runs_p2.runs[1].status, RunStatus::WaitingInput);
+    assert!(!runs_p2.has_more);
+    assert!(runs_p2.next_cursor.is_none());
+
+    let revs_p2 = core
+        .list_run_revisions(bid, &target_run, Some(&revs_cursor), 10)
+        .expect("revs p2");
+    assert_eq!(revs_p2.revisions.len(), 2);
+    assert_eq!(revs_p2.revisions[0].revision, 3);
+    assert_eq!(revs_p2.revisions[1].revision, 4);
+    assert!(revs_p2.revisions[1].superseded_at_ms.is_some());
+    assert!(!revs_p2.has_more);
+    assert!(revs_p2.next_cursor.is_none());
+
+    let qs_p2 = core
+        .list_run_questions(bid, &target_run, Some(&qs_cursor), 10)
+        .expect("qs p2");
+    assert_eq!(qs_p2.questions.len(), 2);
+    assert_eq!(qs_p2.questions[0].revision, 3);
+    assert_eq!(qs_p2.questions[1].revision, 4);
+    assert_eq!(qs_p2.questions[1].status, QuestionStatus::Superseded);
+    assert_eq!(qs_p2.questions[1].superseded_by_revision, Some(5));
+    assert!(!qs_p2.has_more);
+    assert!(qs_p2.next_cursor.is_none());
+
+    // Starting a fresh Page 1 (cursor: None) now includes the newly appended items (6 runs, 6 revisions, 6 questions).
+    let fresh_runs = core.list_runs(bid, None, 10).expect("fresh runs");
+    assert_eq!(fresh_runs.runs.len(), 6);
+    assert_eq!(fresh_runs.runs[5].run_id, run_ids[5]);
+
+    let fresh_revs = core
+        .list_run_revisions(bid, &target_run, None, 10)
+        .expect("fresh revs");
+    assert_eq!(fresh_revs.revisions.len(), 6);
+    assert_eq!(fresh_revs.revisions[5].revision, 6);
+
+    let fresh_qs = core
+        .list_run_questions(bid, &target_run, None, 10)
+        .expect("fresh qs");
+    assert_eq!(fresh_qs.questions.len(), 6);
+    assert_eq!(fresh_qs.questions[5].revision, 6);
+}
+
+#[test]
+fn m2a_multi_run_bounded_status_counts_and_paged_list_runs() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane_m2a_status.db");
+    let mut core = Core::open(&db_path).expect("open");
+
+    let binding = core
+        .create_binding(UUID_A, "Multi-Run Status")
+        .expect("binding");
+    let bid = &binding.binding_id;
+
+    let total_runs = 65_usize;
+    let long_instruction = "L".repeat(300);
+    let mut created_ids = Vec::with_capacity(total_runs);
+
+    for idx in 0..total_runs {
+        let r = core
+            .execute(
+                bid,
+                Command::StartDemo {
+                    command_key: format!("status-run-{idx}"),
+                    instruction: format!("Run-{idx:02}-{long_instruction}"),
+                    step_delay_ms: Some(10),
+                    now_ms: 1_000 + (idx as i64),
+                },
+            )
+            .expect("start")
+            .into_run()
+            .expect("run");
+        created_ids.push(r.run_id);
+    }
+
+    // Cancel 15 runs so 50 remain active (`Running`).
+    for (idx, run_id) in created_ids.iter().take(15).enumerate() {
+        core.execute(
+            bid,
+            Command::Cancel {
+                command_key: format!("status-cancel-{idx}"),
+                run_id: run_id.clone(),
+                reason: Some("done".to_string()),
+                now_ms: 2_000 + (idx as i64),
+            },
+        )
+        .expect("cancel");
+    }
+
+    let (count_total, count_active, recent) = core
+        .get_status_run_summaries(bid, MAX_STATUS_RECENT_RUNS)
+        .expect("get_status_run_summaries");
+    assert_eq!(count_total, 65);
+    assert_eq!(count_active, 50);
+    assert_eq!(recent.len(), MAX_STATUS_RECENT_RUNS);
+    // Status recent_runs are newest first: indices 64 down to 55.
+    for (offset, summary) in recent.iter().enumerate() {
+        let expected_idx = total_runs - 1 - offset;
+        assert_eq!(summary.run_id, created_ids[expected_idx]);
+        assert!(summary.instruction_truncated);
+        assert!(summary.instruction_preview.ends_with("..."));
+        assert_eq!(
+            summary.instruction_preview.chars().count(),
+            MAX_SUMMARY_TEXT_PREVIEW_CHARS + 3
+        );
+        assert!(summary.untrusted_data);
+    }
+
+    // Page through all 65 runs via `list_runs` with `limit = 25` (25 + 25 + 15 = 65, ascending creation order).
+    let mut paged_ids = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut page_lengths = Vec::new();
+    loop {
+        let page = core
+            .list_runs(bid, cursor.as_deref(), 25)
+            .expect("list_runs page");
+        page_lengths.push(page.runs.len());
+        paged_ids.extend(page.runs.into_iter().map(|r| r.run_id));
+        if page.has_more {
+            cursor = Some(page.next_cursor.expect("next_cursor"));
+        } else {
+            assert!(page.next_cursor.is_none());
+            break;
+        }
+    }
+    assert_eq!(page_lengths, vec![25, 25, 15]);
+    assert_eq!(paged_ids, created_ids);
+}
+
+#[test]
+fn m2a_compact_idempotency_original_snapshot_replay_and_legacy_v1_migration() {
+    const LEGACY_V1_VERSION: u32 = 1;
+
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("threadlane_m2a_dedup.db");
+
+    // Part 1: Verify that retrying `start_demo`, `steer`, `answer`, and `cancel` returns the
+    // ORIGINAL mutation snapshot (not today's mutated state) both in-memory and across reopen.
+    let (binding_id, run_1_id, q1_id) = {
+        let mut core = Core::open(&db_path).expect("open");
+        let b = core.create_binding(UUID_A, "Dedup Replay").expect("b");
+
+        let started = core
+            .execute(
+                &b.binding_id,
+                Command::StartDemo {
+                    command_key: "key-start-1".to_string(),
+                    instruction: "Original v1 instruction".to_string(),
+                    step_delay_ms: Some(10),
+                    now_ms: 1_000,
+                },
+            )
+            .expect("start")
+            .into_run()
+            .expect("run");
+        assert_eq!(started.revision, 1);
+        assert_eq!(started.status, RunStatus::Running);
+
+        core.tick(1_010).expect("tick 1");
+        let waiting_v1 = core
+            .get_run(&b.binding_id, &started.run_id)
+            .expect("waiting v1");
+        let q1_id = waiting_v1.active_question_id.clone().expect("q1");
+
+        let steered = core
+            .execute(
+                &b.binding_id,
+                Command::Steer {
+                    command_key: "key-steer-2".to_string(),
+                    run_id: started.run_id.clone(),
+                    expected_revision: 1,
+                    instruction: "Steered v2 instruction".to_string(),
+                    now_ms: 1_020,
+                },
+            )
+            .expect("steer")
+            .into_run()
+            .expect("steered");
+        assert_eq!(steered.revision, 2);
+        assert_eq!(steered.status, RunStatus::Running);
+
+        core.tick(1_030).expect("tick 2");
+        let waiting_v2 = core
+            .get_run(&b.binding_id, &started.run_id)
+            .expect("waiting v2");
+        let q2_id = waiting_v2.active_question_id.clone().expect("q2");
+
+        let answered = core
+            .execute(
+                &b.binding_id,
+                Command::Answer {
+                    command_key: "key-answer-2".to_string(),
+                    run_id: started.run_id.clone(),
+                    question_id: q2_id.clone(),
+                    expected_revision: 2,
+                    answer: "Approved v2".to_string(),
+                    now_ms: 1_040,
+                },
+            )
+            .expect("answer")
+            .into_run()
+            .expect("answered");
+        assert_eq!(answered.revision, 2);
+        assert_eq!(answered.status, RunStatus::Completing);
+
+        core.tick(1_050).expect("tick 3 to completed");
+        let done = core.get_run(&b.binding_id, &started.run_id).expect("done");
+        assert_eq!(done.status, RunStatus::Completed);
+
+        // Retry `key-start-1`, `key-steer-2`, and `key-answer-2` now that the run is Completed:
+        // each retry must return its ORIGINAL mutation snapshot!
+        let replay_start = core
+            .execute(
+                &b.binding_id,
+                Command::StartDemo {
+                    command_key: "key-start-1".to_string(),
+                    instruction: "Original v1 instruction".to_string(),
+                    step_delay_ms: Some(10),
+                    now_ms: 9_999,
+                },
+            )
+            .expect("replay start")
+            .into_run()
+            .expect("replay start run");
+        assert_eq!(replay_start.run_id, started.run_id);
+        assert_eq!(replay_start.revision, 1);
+        assert_eq!(replay_start.status, RunStatus::Running);
+        assert_eq!(replay_start.instruction, "Original v1 instruction");
+
+        let replay_steer = core
+            .execute(
+                &b.binding_id,
+                Command::Steer {
+                    command_key: "key-steer-2".to_string(),
+                    run_id: started.run_id.clone(),
+                    expected_revision: 1,
+                    instruction: "Steered v2 instruction".to_string(),
+                    now_ms: 9_999,
+                },
+            )
+            .expect("replay steer")
+            .into_run()
+            .expect("replay steer run");
+        assert_eq!(replay_steer.revision, 2);
+        assert_eq!(replay_steer.status, RunStatus::Running);
+        assert_eq!(replay_steer.instruction, "Steered v2 instruction");
+
+        let replay_answer = core
+            .execute(
+                &b.binding_id,
+                Command::Answer {
+                    command_key: "key-answer-2".to_string(),
+                    run_id: started.run_id.clone(),
+                    question_id: q2_id,
+                    expected_revision: 2,
+                    answer: "Approved v2".to_string(),
+                    now_ms: 9_999,
+                },
+            )
+            .expect("replay answer")
+            .into_run()
+            .expect("replay answer run");
+        assert_eq!(replay_answer.revision, 2);
+        assert_eq!(replay_answer.status, RunStatus::Completing);
+
+        (b.binding_id, started.run_id, q1_id)
+    };
+
+    // Part 2: Simulate a legacy v1 SQLite database (`schema_meta.version = 1`) where multiple
+    // `command_dedup` rows (`key-start-1` and `key-steer-2`) contain legacy v1 `CommandOutput::Run`
+    // JSON with 150 `revision_history` and 150 `questions` entries (> 130 KiB each), while the live
+    // `runs` row has already moved on to Completed.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite");
+        conn.execute(
+            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+            rusqlite::params![LEGACY_V1_VERSION],
+        )
+        .expect("downgrade schema_meta to v1");
+
+        let mut legacy_revisions = Vec::new();
+        let mut legacy_questions = Vec::new();
+        for rev in 1..=150_u64 {
+            legacy_revisions.push(serde_json::json!({
+                "revision": rev,
+                "instruction": format!("Legacy revision {rev} {}", "R".repeat(400)),
+                "created_at_ms": 1_000 + (rev as i64),
+                "superseded_at_ms": if rev < 150 { Some(1_001 + (rev as i64)) } else { None },
+            }));
+            let qid = if rev == 1 {
+                q1_id.clone()
+            } else {
+                format!("legacy-q-{rev}")
+            };
+            legacy_questions.push(serde_json::json!({
+                "question_id": qid,
+                "binding_id": binding_id,
+                "run_id": run_1_id,
+                "revision": rev,
+                "status": if rev == 1 { "pending" } else { "superseded" },
+                "prompt": format!("Legacy question {rev} {}", "Q".repeat(400)),
+                "answer": serde_json::Value::Null,
+                "superseded_by_revision": if rev == 1 { None } else { Some(rev + 1) },
+                "created_at_ms": 1_000 + (rev as i64),
+                "resolved_at_ms": serde_json::Value::Null,
+            }));
+        }
+
+        let legacy_v1_start_output = serde_json::json!({
+            "kind": "run",
+            "data": {
+                "run_id": run_1_id,
+                "binding_id": binding_id,
+                "revision": 1,
+                "status": "waiting_input",
+                "instruction": "Original v1 instruction",
+                "step_seq": 3,
+                "step_delay_ms": 10,
+                "next_step_at_ms": serde_json::Value::Null,
+                "active_question_id": q1_id,
+                "started_at_ms": 1_000,
+                "updated_at_ms": 1_010,
+                "completed_at_ms": serde_json::Value::Null,
+                "cancelled_at_ms": serde_json::Value::Null,
+                "cancel_reason": serde_json::Value::Null,
+                "revision_history": legacy_revisions,
+                "questions": legacy_questions,
+            }
+        });
+        let legacy_start_json =
+            serde_json::to_string(&legacy_v1_start_output).expect("serialize legacy v1 start");
+        assert!(legacy_start_json.len() > MAX_COMPACT_RESPONSE_BYTES);
+
+        let legacy_v1_steer_output = serde_json::json!({
+            "kind": "run",
+            "data": {
+                "run_id": run_1_id,
+                "binding_id": binding_id,
+                "revision": 2,
+                "status": "running",
+                "instruction": "Steered v2 instruction",
+                "step_seq": 4,
+                "step_delay_ms": 10,
+                "next_step_at_ms": 1_030,
+                "active_question_id": serde_json::Value::Null,
+                "started_at_ms": 1_000,
+                "updated_at_ms": 1_020,
+                "completed_at_ms": serde_json::Value::Null,
+                "cancelled_at_ms": serde_json::Value::Null,
+                "cancel_reason": serde_json::Value::Null,
+                "revision_history": legacy_revisions,
+                "questions": legacy_questions,
+            }
+        });
+        let legacy_steer_json =
+            serde_json::to_string(&legacy_v1_steer_output).expect("serialize legacy v1 steer");
+        assert!(legacy_steer_json.len() > MAX_COMPACT_RESPONSE_BYTES);
+
+        conn.execute(
+            "UPDATE command_dedup SET response_json = ?1 WHERE binding_id = ?2 AND command_key = 'key-start-1'",
+            rusqlite::params![legacy_start_json, binding_id],
+        )
+        .expect("inject legacy v1 start dedup json");
+        conn.execute(
+            "UPDATE command_dedup SET response_json = ?1 WHERE binding_id = ?2 AND command_key = 'key-steer-2'",
+            rusqlite::params![legacy_steer_json, binding_id],
+        )
+        .expect("inject legacy v1 steer dedup json");
+    }
+
+    // Reopen with `Core::open`: v1 -> v2 migration must compact all legacy `command_dedup` rows
+    // in-place and bump `schema_meta.version` to `SCHEMA_VERSION` (2).
+    let mut reopened = Core::open(&db_path).expect("reopen and migrate v1 -> v2");
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("inspect migrated db");
+        let version: i64 = conn
+            .query_row("SELECT version FROM schema_meta WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("read schema version");
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
+
+        for key in ["key-start-1", "key-steer-2"] {
+            let migrated_json: String = conn
+                .query_row(
+                    "SELECT response_json FROM command_dedup WHERE binding_id = ?1 AND command_key = ?2",
+                    rusqlite::params![binding_id, key],
+                    |r| r.get(0),
+                )
+                .expect("read migrated response_json");
+            assert!(!migrated_json.contains("revision_history"));
+            assert!(!migrated_json.contains("\"questions\""));
+            assert!(migrated_json.len() < 4_096);
+        }
+    }
+
+    // Replay `key-start-1` and `key-steer-2` after migration: must return their compacted original
+    // snapshots (including reconstructed `active_question` on `key-start-1`) within
+    // `MAX_COMPACT_RESPONSE_BYTES`, while payload mismatch still fails with `IdempotencyConflict`.
+    let migrated_replay_out = reopened
+        .execute(
+            &binding_id,
+            Command::StartDemo {
+                command_key: "key-start-1".to_string(),
+                instruction: "Original v1 instruction".to_string(),
+                step_delay_ms: Some(10),
+                now_ms: 20_000,
+            },
+        )
+        .expect("replay migrated key-start-1");
+    assert!(
+        estimate_wire_response_bytes(&migrated_replay_out).expect("wire bytes")
+            <= MAX_COMPACT_RESPONSE_BYTES
+    );
+    let migrated_run = migrated_replay_out.into_run().expect("migrated run");
+    assert_eq!(migrated_run.run_id, run_1_id);
+    assert_eq!(migrated_run.revision, 1);
+    assert_eq!(migrated_run.status, RunStatus::WaitingInput);
+    assert!(migrated_run.untrusted_data);
+    let migrated_active_q = migrated_run
+        .active_question
+        .expect("reconstructed active_question from legacy v1 questions array");
+    assert_eq!(migrated_active_q.question_id, q1_id);
+    assert_eq!(migrated_active_q.revision, 1);
+    assert!(migrated_active_q.untrusted_data);
+
+    let migrated_steer_out = reopened
+        .execute(
+            &binding_id,
+            Command::Steer {
+                command_key: "key-steer-2".to_string(),
+                run_id: run_1_id.clone(),
+                expected_revision: 1,
+                instruction: "Steered v2 instruction".to_string(),
+                now_ms: 20_000,
+            },
+        )
+        .expect("replay migrated key-steer-2")
+        .into_run()
+        .expect("migrated steer run");
+    assert_eq!(migrated_steer_out.revision, 2);
+    assert_eq!(migrated_steer_out.status, RunStatus::Running);
+    assert_eq!(migrated_steer_out.active_question, None);
+
+    let conflict_err = reopened
+        .execute(
+            &binding_id,
+            Command::StartDemo {
+                command_key: "key-start-1".to_string(),
+                instruction: "Different instruction".to_string(),
+                step_delay_ms: Some(10),
+                now_ms: 20_001,
+            },
+        )
+        .expect_err("payload mismatch must still fail after v1->v2 migration");
+    assert!(matches!(
+        conflict_err,
+        CoreError::IdempotencyConflict { .. }
+    ));
+
+    drop(reopened);
+
+    // Part 3: Verify v2 reopen does NOT rescan `command_dedup` rows on every `Core::open`.
+    // Inject a marker into an uncalled `command_dedup` row while `schema_meta.version == 2`:
+    // reopening a v2 database must not rewrite or scan `command_dedup`.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("open raw sqlite v2");
+        conn.execute(
+            "INSERT INTO command_dedup (binding_id, command_key, operation, payload_hash, response_json, created_at_ms)
+             VALUES (?1, 'uncalled-v2-marker', 'start_demo', 'deadbeef', '{\"unscanned_v2_marker\":true}', 30000)",
+            rusqlite::params![binding_id],
+        )
+        .expect("insert uncalled v2 marker row");
+    }
+    let reopened_v2 = Core::open(&db_path).expect("v2 reopen must not rescan command_dedup");
+    let _ = reopened_v2
+        .get_run(&binding_id, &run_1_id)
+        .expect("get_run on v2 reopen");
 }

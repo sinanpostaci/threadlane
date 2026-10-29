@@ -1,14 +1,10 @@
 use serde::{Deserialize, Serialize};
 use threadlane_core::{
-    AckResult, Binding, Command, CommandOutput, EventBatch, Run, RunStatus, WakeupNotice,
-    DEFAULT_EVENT_BATCH_SIZE,
+    AckResult, Binding, Command, CommandOutput, EventBatch, QuestionHistoryPage,
+    RevisionHistoryPage, Run, RunListPage, WakeupNotice, DEFAULT_EVENT_BATCH_SIZE,
+    DEFAULT_PAGE_LIMIT,
 };
-
-/// Maximum number of recent runs included in a compact [`StatusResponse`].
-pub const MAX_STATUS_RECENT_RUNS: usize = 10;
-
-/// Maximum character count included in `RunSummary::instruction_preview`.
-pub const MAX_SUMMARY_TEXT_PREVIEW_CHARS: usize = 120;
+pub use threadlane_core::{RunSummary, MAX_STATUS_RECENT_RUNS, MAX_SUMMARY_TEXT_PREVIEW_CHARS};
 
 /// Trusted CLI request to bind a validated native Codex thread UUID and display label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,59 +37,6 @@ pub struct RetryWakeupRequest {
     pub allow_unknown: bool,
 }
 
-/// Compact summary of a single run for [`StatusResponse`].
-///
-/// Omits historical `revision_history` and `questions` lists to keep `status` compact;
-/// callers use `get_run` to inspect full run detail.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunSummary {
-    /// Explicit marker indicating that `instruction_preview` is untrusted data.
-    pub untrusted_data: bool,
-    /// Software-generated run identifier (`run_<uuid>`).
-    pub run_id: String,
-    /// Owning binding ID.
-    pub binding_id: String,
-    /// Current 1-based task revision.
-    pub revision: u64,
-    /// Current lifecycle status.
-    pub status: RunStatus,
-    /// Truncated preview of the active instruction.
-    pub instruction_preview: String,
-    /// Currently pending question ID when `status == RunStatus::WaitingInput`.
-    pub active_question_id: Option<String>,
-    /// Timestamp (ms) when the run was started.
-    pub started_at_ms: i64,
-    /// Timestamp (ms) when the run was last updated.
-    pub updated_at_ms: i64,
-}
-
-impl RunSummary {
-    /// Builds a compact [`RunSummary`] from a full [`Run`].
-    pub fn from_run(run: &Run) -> Self {
-        Self {
-            untrusted_data: true,
-            run_id: run.run_id.clone(),
-            binding_id: run.binding_id.clone(),
-            revision: run.revision,
-            status: run.status,
-            instruction_preview: truncate_preview(&run.instruction, MAX_SUMMARY_TEXT_PREVIEW_CHARS),
-            active_question_id: run.active_question_id.clone(),
-            started_at_ms: run.started_at_ms,
-            updated_at_ms: run.updated_at_ms,
-        }
-    }
-}
-
-fn truncate_preview(input: &str, max_chars: usize) -> String {
-    let mut chars = input.chars();
-    let preview: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{preview}...")
-    } else {
-        preview
-    }
-}
-
 /// Compact binding-scoped status snapshot returned by `status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -112,17 +55,14 @@ pub struct StatusResponse {
 }
 
 impl StatusResponse {
-    /// Constructs a compact [`StatusResponse`] from binding metadata, wake-up state, and runs.
-    pub fn build(binding: Binding, wakeup: WakeupNotice, runs: &[Run]) -> Self {
-        let total_runs = runs.len();
-        let active_runs = runs.iter().filter(|r| !r.status.is_terminal()).count();
-        let recent_runs = runs
-            .iter()
-            .rev()
-            .take(MAX_STATUS_RECENT_RUNS)
-            .map(RunSummary::from_run)
-            .collect();
-
+    /// Constructs a compact [`StatusResponse`] from binding metadata, wake-up state, and SQL summary counts.
+    pub fn from_summary_counts(
+        binding: Binding,
+        wakeup: WakeupNotice,
+        total_runs: usize,
+        active_runs: usize,
+        recent_runs: Vec<RunSummary>,
+    ) -> Self {
         Self {
             untrusted_data: true,
             binding,
@@ -143,13 +83,42 @@ impl StatusResponse {
 pub enum ScopedRequest {
     /// Return a compact status snapshot for the binding.
     Status,
-    /// Fetch full run detail (including revision history and questions) for `run_id`.
+    /// Fetch a constant-size current run snapshot (including `active_question` when waiting for input) for `run_id`.
     GetRun {
         /// Target run identifier.
         run_id: String,
     },
-    /// List all runs belonging to the binding.
-    ListRuns,
+    /// List a bounded page of runs belonging to the binding in creation order.
+    ListRuns {
+        /// Optional opaque keyset cursor returned by a previous `ListRuns` page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// List a bounded page of revision history records for `run_id`.
+    ListRunRevisions {
+        /// Target run identifier.
+        run_id: String,
+        /// Optional opaque keyset cursor returned by a previous `ListRunRevisions` page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// List a bounded page of question history records for `run_id`.
+    ListRunQuestions {
+        /// Target run identifier.
+        run_id: String,
+        /// Optional opaque keyset cursor returned by a previous `ListRunQuestions` page.
+        #[serde(default)]
+        cursor: Option<String>,
+        /// Optional page size limit (`1..=MAX_PAGE_LIMIT`, defaults to `DEFAULT_PAGE_LIMIT`).
+        #[serde(default)]
+        limit: Option<usize>,
+    },
     /// Start a deterministic demo run (`Start -> Running`).
     StartDemo {
         /// Caller-supplied idempotency key scoped to the binding.
@@ -216,12 +185,33 @@ pub enum ScopedRequest {
 impl ScopedRequest {
     /// Converts this [`ScopedRequest`] into a [`threadlane_core::Command`] using supervisor-injected `now_ms`.
     ///
-    /// Returns `None` for [`ScopedRequest::Status`], which aggregates binding, wake-up, and run summaries.
+    /// Returns `None` for [`ScopedRequest::Status`], which aggregates binding, wake-up, and bounded run summaries.
     pub fn into_core_command(self, now_ms: i64) -> Option<Command> {
         match self {
             Self::Status => None,
             Self::GetRun { run_id } => Some(Command::GetRun { run_id }),
-            Self::ListRuns => Some(Command::ListRuns),
+            Self::ListRuns { cursor, limit } => Some(Command::ListRuns {
+                cursor,
+                limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            }),
+            Self::ListRunRevisions {
+                run_id,
+                cursor,
+                limit,
+            } => Some(Command::ListRunRevisions {
+                run_id,
+                cursor,
+                limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            }),
+            Self::ListRunQuestions {
+                run_id,
+                cursor,
+                limit,
+            } => Some(Command::ListRunQuestions {
+                run_id,
+                cursor,
+                limit: limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            }),
             Self::StartDemo {
                 command_key,
                 instruction,
@@ -303,10 +293,14 @@ impl ScopedRequest {
 pub enum ScopedResponse {
     /// Compact binding status (`Status`).
     Status(StatusResponse),
-    /// Full run snapshot (`GetRun`, `StartDemo`, `Answer`, `Steer`, `Cancel`).
+    /// Constant-size current run snapshot (`GetRun`, `StartDemo`, `Answer`, `Steer`, `Cancel`).
     Run(Run),
-    /// Full run list (`ListRuns`).
-    RunList(Vec<Run>),
+    /// Bounded keyset-paginated run list page (`ListRuns`).
+    RunList(RunListPage),
+    /// Bounded keyset-paginated run revision history page (`ListRunRevisions`).
+    RevisionHistory(RevisionHistoryPage),
+    /// Bounded keyset-paginated run question history page (`ListRunQuestions`).
+    QuestionHistory(QuestionHistoryPage),
     /// Ordered event delivery batch (`PullEvents`).
     EventBatch(EventBatch),
     /// Event batch acknowledgement result (`AckEvents`).
@@ -316,8 +310,10 @@ pub enum ScopedResponse {
 impl From<CommandOutput> for ScopedResponse {
     fn from(output: CommandOutput) -> Self {
         match output {
-            CommandOutput::Run(run) => Self::Run(run),
-            CommandOutput::RunList(runs) => Self::RunList(runs),
+            CommandOutput::Run(run) => Self::Run(*run),
+            CommandOutput::RunList(page) => Self::RunList(page),
+            CommandOutput::RevisionHistory(page) => Self::RevisionHistory(page),
+            CommandOutput::QuestionHistory(page) => Self::QuestionHistory(page),
             CommandOutput::EventBatch(batch) => Self::EventBatch(batch),
             CommandOutput::AckResult(ack) => Self::AckResult(ack),
         }
@@ -341,10 +337,26 @@ impl ScopedResponse {
         }
     }
 
-    /// Extracts the inner `Vec<Run>` if this is `ScopedResponse::RunList`.
-    pub fn into_run_list(self) -> Option<Vec<Run>> {
+    /// Extracts the inner [`RunListPage`] if this is `ScopedResponse::RunList`.
+    pub fn into_run_list(self) -> Option<RunListPage> {
         match self {
-            Self::RunList(runs) => Some(runs),
+            Self::RunList(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`RevisionHistoryPage`] if this is `ScopedResponse::RevisionHistory`.
+    pub fn into_revision_history(self) -> Option<RevisionHistoryPage> {
+        match self {
+            Self::RevisionHistory(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`QuestionHistoryPage`] if this is `ScopedResponse::QuestionHistory`.
+    pub fn into_question_history(self) -> Option<QuestionHistoryPage> {
+        match self {
+            Self::QuestionHistory(page) => Some(page),
             _ => None,
         }
     }

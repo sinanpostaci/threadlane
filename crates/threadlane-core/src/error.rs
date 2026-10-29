@@ -182,6 +182,15 @@ pub enum CoreError {
         max_bytes: usize,
     },
 
+    /// Serialized response snapshot or page exceeded its configured byte budget.
+    #[error("serialized response size {size_bytes} bytes exceeds budget of {max_bytes} bytes")]
+    ResponseTooLarge {
+        /// Actual serialized JSON byte size including reserved wrapper overhead.
+        size_bytes: usize,
+        /// Maximum allowed serialized JSON byte budget.
+        max_bytes: usize,
+    },
+
     /// Underlying SQLite error.
     #[error("database error: {0}")]
     Storage(#[from] rusqlite::Error),

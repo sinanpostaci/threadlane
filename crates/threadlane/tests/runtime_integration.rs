@@ -7,10 +7,15 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use threadlane::{
     prepare_state_dir, CodexWakeupConfig, Error, ErrorCode, RuntimeDescriptor, ScopedClient,
-    ScopedRequest, SecretToken, Supervisor, SupervisorClient, SupervisorConfig, DATABASE_FILENAME,
-    DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION, LOCK_FILENAME, LOOPBACK_HOST,
+    ScopedRequest, SecretToken, Supervisor, SupervisorClient, SupervisorConfig,
+    ThreadlaneMcpServer, DATABASE_FILENAME, DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION, LOCK_FILENAME,
+    LOOPBACK_HOST, MAX_HTTP_BODY_BYTES,
 };
-use threadlane_core::{Core, QuestionStatus, RunStatus, WakeupStatus, FIXED_WAKEUP_MESSAGE};
+use threadlane_core::{
+    estimate_wire_response_bytes, CommandOutput, Core, QuestionStatus, RunStatus, WakeupStatus,
+    FIXED_WAKEUP_MESSAGE, MAX_COMPACT_RESPONSE_BYTES, MAX_INSTRUCTION_LEN, MAX_PAGE_LIMIT,
+    MAX_PAGE_RESPONSE_BYTES,
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 
@@ -439,8 +444,16 @@ async fn test_two_binding_isolation_compact_status_and_idempotency_across_restar
         .expect("steer rev 1 -> 2");
     assert_eq!(steered_run.revision, 2);
     assert_eq!(steered_run.status, RunStatus::Running);
-    assert_eq!(steered_run.questions[0].status, QuestionStatus::Superseded);
-    assert_eq!(steered_run.questions[0].superseded_by_revision, Some(2));
+    assert!(steered_run.active_question.is_none());
+    let qs_after_steer = scoped_a
+        .list_run_questions(started_run.run_id.clone(), None, None)
+        .await
+        .expect("list questions after steer");
+    assert_eq!(
+        qs_after_steer.questions[0].status,
+        QuestionStatus::Superseded
+    );
+    assert_eq!(qs_after_steer.questions[0].superseded_by_revision, Some(2));
 
     // Wait for revision 2 to reach WaitingInput and pose a new question.
     let waiting_rev2 =
@@ -524,8 +537,17 @@ async fn test_two_binding_isolation_compact_status_and_idempotency_across_restar
     let completed_run =
         wait_for_run_status(&scoped_a, &started_run.run_id, RunStatus::Completed).await;
     assert_eq!(completed_run.revision, 2);
-    assert_eq!(completed_run.revision_history.len(), 2);
-    assert_eq!(completed_run.questions.len(), 2);
+    assert!(completed_run.active_question.is_none());
+    let completed_revs = scoped_a
+        .list_run_revisions(started_run.run_id.clone(), None, None)
+        .await
+        .expect("list completed revisions");
+    assert_eq!(completed_revs.revisions.len(), 2);
+    let completed_qs = scoped_a
+        .list_run_questions(started_run.run_id.clone(), None, None)
+        .await
+        .expect("list completed questions");
+    assert_eq!(completed_qs.questions.len(), 2);
 
     handle_restarted.shutdown().await;
 }
@@ -594,7 +616,7 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
     )
     .await;
 
-    // 2. tools/list: verify exact 8 scoped tools, annotations, and no binding_id/thread_uuid/now_ms params.
+    // 2. tools/list: verify exact 11 scoped tools, annotations, and no binding_id/thread_uuid/now_ms params.
     send_json_rpc(
         &mut stdin,
         &json!({
@@ -616,6 +638,9 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
     let expected_names: BTreeSet<&str> = [
         "status",
         "get_run",
+        "list_runs",
+        "list_run_revisions",
+        "list_run_questions",
         "start_demo",
         "pull_events",
         "ack_events",
@@ -879,7 +904,70 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
     let steered_data = &steer_resp["result"]["structuredContent"]["data"];
     assert_eq!(steered_data["revision"], json!(2));
     assert_eq!(steered_data["status"], json!("running"));
-    assert_eq!(steered_data["questions"][0]["status"], json!("superseded"));
+    assert_eq!(steered_data["active_question"], json!(null));
+
+    // Verify superseded question and revision history via MCP `list_run_questions` and `list_run_revisions`.
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 81,
+            "method": "tools/call",
+            "params": {
+                "name": "list_run_questions",
+                "arguments": { "run_id": run_id }
+            }
+        }),
+    )
+    .await;
+    let list_qs_resp = read_json_rpc_response(&mut reader, 81).await;
+    assert_eq!(list_qs_resp["result"]["isError"], json!(false));
+    assert_eq!(
+        list_qs_resp["result"]["structuredContent"]["data"]["questions"][0]["status"],
+        json!("superseded")
+    );
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 82,
+            "method": "tools/call",
+            "params": {
+                "name": "list_run_revisions",
+                "arguments": { "run_id": run_id }
+            }
+        }),
+    )
+    .await;
+    let list_revs_resp = read_json_rpc_response(&mut reader, 82).await;
+    assert_eq!(list_revs_resp["result"]["isError"], json!(false));
+    assert_eq!(
+        list_revs_resp["result"]["structuredContent"]["data"]["revisions"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 83,
+            "method": "tools/call",
+            "params": {
+                "name": "list_runs",
+                "arguments": { "limit": 10 }
+            }
+        }),
+    )
+    .await;
+    let list_runs_resp = read_json_rpc_response(&mut reader, 83).await;
+    assert_eq!(list_runs_resp["result"]["isError"], json!(false));
+    assert_eq!(
+        list_runs_resp["result"]["structuredContent"]["data"]["runs"][0]["run_id"],
+        json!(run_id)
+    );
 
     // Wait for revision 2 to pose a fresh question via MCP `get_run`.
     let mut active_question_id_rev2 = None;
@@ -1732,7 +1820,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
         let missing_list = read_json_rpc_response(&mut missing_reader, 2).await;
         assert_eq!(
             missing_list["result"]["tools"].as_array().map(Vec::len),
-            Some(8)
+            Some(11)
         );
         assert!(
             !missing_state_dir.exists(),
@@ -1825,7 +1913,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 8, "MCP tool count must remain 8");
+    assert_eq!(tools.len(), 11, "MCP tool count must remain 11");
 
     // 5. Calling `status` while supervisor is offline returns a structured transport_error tool result.
     send_json_rpc(
@@ -2620,7 +2708,11 @@ async fn test_oversized_derived_event_instruction_does_not_fault_supervisor_or_o
         "supervisor must not fault on tick with control-heavy 4096-byte instruction"
     );
     assert_eq!(waiting_a.instruction, exact_instruction);
-    assert_eq!(waiting_a.revision_history[0].instruction, exact_instruction);
+    let revs_a = scoped_a
+        .list_run_revisions(started.run_id.clone(), None, None)
+        .await
+        .expect("list revisions on A");
+    assert_eq!(revs_a.revisions[0].instruction, exact_instruction);
 
     // Sibling binding B must remain completely functional.
     let run_b = scoped_b
@@ -2669,6 +2761,379 @@ async fn test_oversized_derived_event_instruction_does_not_fault_supervisor_or_o
     );
 
     handle_restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_m2a_rmcp_call_tool_result_wire_budgets_stdio_mcp_paging_and_http_body_cap() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("m2a_mcp_budget_state");
+    let bin = env!("CARGO_BIN_EXE_threadlane");
+
+    let handle = Supervisor::start(fast_supervisor_config(&state_dir))
+        .await
+        .expect("start supervisor");
+    let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+
+    let binding_a = client
+        .create_binding(THREAD_UUID_A, "M2A Budget Binding A")
+        .await
+        .expect("bind A");
+    let binding_b = client
+        .create_binding(THREAD_UUID_B, "M2A Sibling Binding B")
+        .await
+        .expect("bind B");
+
+    let scoped_a = client
+        .clone()
+        .scoped(&binding_a.binding_id)
+        .expect("scoped A");
+    let scoped_b = client
+        .clone()
+        .scoped(&binding_b.binding_id)
+        .expect("scoped B");
+
+    let make_max_instruction = |rev: u64| -> String {
+        let suffix = format!("mcp-rev-{rev:03}-");
+        let control_prefix = "\u{1}".repeat(2_410);
+        let pad_len = MAX_INSTRUCTION_LEN - control_prefix.len() - suffix.len();
+        format!("{control_prefix}{suffix}{}", "z".repeat(pad_len))
+    };
+
+    // Start a run on A with 15 control-escaped maximum-length revisions (~47 KiB two-copy wire
+    // bytes per revision -> ~700 KiB across 15 revisions, crossing multiple 256 KiB page boundaries).
+    let total_revisions = 15_u64;
+    let inst_1 = make_max_instruction(1);
+    let started_a = scoped_a
+        .start_demo("m2a-start-1".to_string(), inst_1.clone(), Some(10))
+        .await
+        .expect("start_demo rev 1");
+
+    // Verify actual rmcp CallToolResult for compact Run response fits within MAX_COMPACT_RESPONSE_BYTES
+    // and is conservatively bounded by `estimate_wire_response_bytes`.
+    let compact_mcp_res = ThreadlaneMcpServer::build_structured_tool_result(
+        &binding_a.binding_id,
+        "start_demo",
+        &started_a,
+    );
+    let compact_mcp_json =
+        serde_json::to_string(&compact_mcp_res).expect("serialize CallToolResult");
+    let compact_estimate =
+        estimate_wire_response_bytes(&CommandOutput::Run(Box::new(started_a.clone())))
+            .expect("estimate");
+    assert!(
+        compact_mcp_json.len() <= MAX_COMPACT_RESPONSE_BYTES,
+        "serialized CallToolResult for compact Run was {} > {}",
+        compact_mcp_json.len(),
+        MAX_COMPACT_RESPONSE_BYTES
+    );
+    assert!(
+        compact_mcp_json.len() <= compact_estimate,
+        "actual CallToolResult {} exceeded conservative estimate {}",
+        compact_mcp_json.len(),
+        compact_estimate
+    );
+
+    let _ = wait_for_run_status(&scoped_a, &started_a.run_id, RunStatus::WaitingInput).await;
+
+    for rev in 2..=total_revisions {
+        let inst = make_max_instruction(rev);
+        let steered = scoped_a
+            .steer(
+                format!("m2a-steer-{rev}"),
+                started_a.run_id.clone(),
+                rev - 1,
+                inst,
+            )
+            .await
+            .expect("steer to next rev");
+        let steered_mcp_res = ThreadlaneMcpServer::build_structured_tool_result(
+            &binding_a.binding_id,
+            "steer",
+            &steered,
+        );
+        let steered_mcp_json =
+            serde_json::to_string(&steered_mcp_res).expect("serialize steered CallToolResult");
+        assert!(steered_mcp_json.len() <= MAX_COMPACT_RESPONSE_BYTES);
+
+        for _ in 0..80 {
+            let r = scoped_a
+                .get_run(started_a.run_id.clone())
+                .await
+                .expect("get_run");
+            if r.revision == rev && r.status == RunStatus::WaitingInput {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    }
+
+    // Create a run on B as well for cross-binding cursor misuse tests.
+    let run_b = scoped_b
+        .start_demo("m2a-b-start".to_string(), "Run on B".to_string(), Some(10))
+        .await
+        .expect("start B");
+    let _ = wait_for_run_status(&scoped_b, &run_b.run_id, RunStatus::WaitingInput).await;
+
+    // Spawn real stdio MCP server for binding_a and page through `list_run_revisions` with `limit: 50`.
+    let mut mcp_child = spawn_mcp_child(&state_dir, &binding_a.binding_id);
+    let mut stdin = mcp_child.stdin.take().expect("mcp stdin");
+    let stdout = mcp_child.stdout.take().expect("mcp stdout");
+    let mut reader = BufReader::new(stdout);
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "m2a-budget-mcp-client", "version": "0.1.0" }
+            }
+        }),
+    )
+    .await;
+    let _ = read_json_rpc_response(&mut reader, 1).await;
+    send_json_rpc(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+
+    let mut mcp_collected_revs = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut page_count = 0_usize;
+    let mut req_id = 10_u64;
+
+    loop {
+        req_id += 1;
+        send_json_rpc(
+            &mut stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_run_revisions",
+                    "arguments": {
+                        "run_id": started_a.run_id,
+                        "cursor": cursor,
+                        "limit": MAX_PAGE_LIMIT
+                    }
+                }
+            }),
+        )
+        .await;
+        let resp = read_json_rpc_response(&mut reader, req_id).await;
+        assert_eq!(resp["result"]["isError"], json!(false));
+
+        // Measure the serialized `result` (the actual `rmcp::model::CallToolResult` JSON object,
+        // which contains BOTH `content[0].text` and `structuredContent`).
+        let call_tool_result_bytes = serde_json::to_string(&resp["result"])
+            .expect("serialize actual MCP CallToolResult")
+            .len();
+        assert!(
+            call_tool_result_bytes <= MAX_PAGE_RESPONSE_BYTES,
+            "actual MCP CallToolResult was {call_tool_result_bytes} bytes > {MAX_PAGE_RESPONSE_BYTES}"
+        );
+
+        let page_data = &resp["result"]["structuredContent"]["data"];
+        let page_revs = page_data["revisions"].as_array().expect("revisions array");
+        assert!(!page_revs.is_empty());
+        page_count += 1;
+        for item in page_revs {
+            mcp_collected_revs.push((
+                item["revision"].as_u64().expect("rev u64"),
+                item["instruction"].as_str().expect("inst str").to_string(),
+            ));
+        }
+
+        if page_data["has_more"] == json!(true) {
+            assert!(
+                page_revs.len() < MAX_PAGE_LIMIT,
+                "byte budget must split 50-row request into smaller pages"
+            );
+            cursor = Some(
+                page_data["next_cursor"]
+                    .as_str()
+                    .expect("next_cursor")
+                    .to_string(),
+            );
+        } else {
+            assert!(page_data["next_cursor"].is_null());
+            break;
+        }
+    }
+
+    assert!(
+        page_count >= 3,
+        "15 max-escaped revisions must span at least 3 256KiB-bounded MCP pages, got {page_count}"
+    );
+    assert_eq!(mcp_collected_revs.len() as u64, total_revisions);
+    for (idx, (rev, inst)) in mcp_collected_revs.iter().enumerate() {
+        let expected_rev = (idx as u64) + 1;
+        assert_eq!(
+            *rev, expected_rev,
+            "no revision may be skipped or duplicated when byte budget ends a page"
+        );
+        assert_eq!(*inst, make_max_instruction(expected_rev));
+    }
+
+    // Directly serialize a full byte-budget-split `rmcp::model::CallToolResult` from
+    // `ThreadlaneMcpServer::build_structured_tool_result` and verify it is bounded by both
+    // `estimate_wire_response_bytes` and `MAX_PAGE_RESPONSE_BYTES`.
+    let max_page_revs = scoped_a
+        .list_run_revisions(started_a.run_id.clone(), None, Some(MAX_PAGE_LIMIT))
+        .await
+        .expect("max page revs");
+    assert!(max_page_revs.has_more);
+    assert!(max_page_revs.revisions.len() < MAX_PAGE_LIMIT);
+    let page_call_tool_result = ThreadlaneMcpServer::build_structured_tool_result(
+        &binding_a.binding_id,
+        "list_run_revisions",
+        &max_page_revs,
+    );
+    let page_call_tool_json =
+        serde_json::to_string(&page_call_tool_result).expect("serialize page CallToolResult");
+    let page_estimate =
+        estimate_wire_response_bytes(&CommandOutput::RevisionHistory(max_page_revs.clone()))
+            .expect("estimate page wire bytes");
+    assert!(page_call_tool_json.len() <= MAX_PAGE_RESPONSE_BYTES);
+    assert!(
+        page_call_tool_json.len() <= page_estimate,
+        "actual page CallToolResult {} exceeded estimate {}",
+        page_call_tool_json.len(),
+        page_estimate
+    );
+
+    // Verify cross-kind cursor misuse over stdio MCP returns `validation_failed` with `isError: true`.
+    let page_1_revs = scoped_a
+        .list_run_revisions(started_a.run_id.clone(), None, Some(1))
+        .await
+        .expect("page 1 revs");
+    let rev_cursor_1 = page_1_revs.next_cursor.expect("rev cursor 1");
+
+    send_json_rpc(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 90,
+            "method": "tools/call",
+            "params": {
+                "name": "list_run_questions",
+                "arguments": {
+                    "run_id": started_a.run_id,
+                    "cursor": rev_cursor_1,
+                    "limit": 5
+                }
+            }
+        }),
+    )
+    .await;
+    let misuse_resp = read_json_rpc_response(&mut reader, 90).await;
+    assert_eq!(misuse_resp["result"]["isError"], json!(true));
+    assert_eq!(
+        misuse_resp["result"]["structuredContent"]["error"]["code"],
+        json!("validation_failed")
+    );
+
+    drop(stdin);
+    cleanup_child(&mut mcp_child).await;
+
+    // Verify CLI `threadlane call` works for `list_runs`, `list_run_revisions`, and `list_run_questions`.
+    let cli_list_runs = run_cli_cmd(
+        bin,
+        &[
+            "call",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--binding",
+            &binding_a.binding_id,
+            "--request",
+            r#"{"op":"list_runs","limit":5}"#,
+        ],
+    )
+    .await;
+    assert_eq!(cli_list_runs["kind"], json!("run_list"));
+    assert_eq!(
+        cli_list_runs["data"]["runs"][0]["run_id"],
+        json!(started_a.run_id)
+    );
+
+    let cli_list_qs = run_cli_cmd(
+        bin,
+        &[
+            "call",
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--binding",
+            &binding_a.binding_id,
+            "--request",
+            &serde_json::to_string(&ScopedRequest::ListRunQuestions {
+                run_id: started_a.run_id.clone(),
+                cursor: None,
+                limit: Some(5),
+            })
+            .unwrap(),
+        ],
+    )
+    .await;
+    assert_eq!(cli_list_qs["kind"], json!("question_history"));
+    assert_eq!(
+        cli_list_qs["data"]["questions"].as_array().map(Vec::len),
+        Some(5)
+    );
+    assert_eq!(cli_list_qs["data"]["has_more"], json!(true));
+
+    // Verify HTTP request body size cap (> MAX_HTTP_BODY_BYTES = 64 KiB):
+    // 1) Unauthenticated oversized request -> 401 Unauthorized.
+    // 2) Authenticated oversized request -> 413 Payload Too Large with ErrorCode::PayloadTooLarge.
+    let base_url = handle.descriptor().base_url().expect("base_url");
+    let raw_http = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("raw client");
+    let oversized_body = serde_json::to_string(&json!({
+        "op": "start_demo",
+        "command_key": "huge-body",
+        "instruction": "X".repeat(MAX_HTTP_BODY_BYTES + 1024),
+    }))
+    .unwrap();
+    assert!(oversized_body.len() > MAX_HTTP_BODY_BYTES);
+
+    let unauth_huge = raw_http
+        .post(format!(
+            "{base_url}/v1/bindings/{}/command",
+            binding_a.binding_id
+        ))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(oversized_body.clone())
+        .send()
+        .await
+        .expect("send unauth huge");
+    assert_eq!(unauth_huge.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let auth_huge = raw_http
+        .post(format!(
+            "{base_url}/v1/bindings/{}/command",
+            binding_a.binding_id
+        ))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {}", handle.descriptor().token.as_str()),
+        )
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(oversized_body)
+        .send()
+        .await
+        .expect("send auth huge");
+    assert_eq!(auth_huge.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    let huge_err_json: Value = auth_huge.json().await.expect("parse 413 error json");
+    assert_eq!(huge_err_json["code"], json!("payload_too_large"));
+
+    handle.shutdown().await;
 }
 
 async fn wait_for_run_status(

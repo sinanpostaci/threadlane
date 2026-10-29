@@ -5,7 +5,10 @@ use std::time::Duration;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use threadlane_core::{AckResult, Binding, CoreError, EventBatch, Run, WakeupNotice, MAX_ID_LEN};
+use threadlane_core::{
+    AckResult, Binding, CoreError, EventBatch, QuestionHistoryPage, RevisionHistoryPage, Run,
+    RunListPage, WakeupNotice, MAX_ID_LEN,
+};
 
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
 use crate::error::{ApiError, Error};
@@ -293,11 +296,62 @@ impl ScopedClient {
         self.client.status(&self.binding_id).await
     }
 
-    /// Fetches full details for `run_id` within the fixed binding.
+    /// Fetches a constant-size current snapshot for `run_id` within the fixed binding.
     pub async fn get_run(&self, run_id: String) -> Result<Run, Error> {
         let resp = self.execute(&ScopedRequest::GetRun { run_id }).await?;
         resp.into_run()
             .ok_or_else(|| Error::Transport("unexpected response kind for get_run".to_string()))
+    }
+
+    /// Fetches a bounded keyset-paginated page of runs within the fixed binding.
+    pub async fn list_runs(
+        &self,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<RunListPage, Error> {
+        let resp = self
+            .execute(&ScopedRequest::ListRuns { cursor, limit })
+            .await?;
+        resp.into_run_list()
+            .ok_or_else(|| Error::Transport("unexpected response kind for list_runs".to_string()))
+    }
+
+    /// Fetches a bounded keyset-paginated page of revision history for `run_id` within the fixed binding.
+    pub async fn list_run_revisions(
+        &self,
+        run_id: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<RevisionHistoryPage, Error> {
+        let resp = self
+            .execute(&ScopedRequest::ListRunRevisions {
+                run_id,
+                cursor,
+                limit,
+            })
+            .await?;
+        resp.into_revision_history().ok_or_else(|| {
+            Error::Transport("unexpected response kind for list_run_revisions".to_string())
+        })
+    }
+
+    /// Fetches a bounded keyset-paginated page of question history for `run_id` within the fixed binding.
+    pub async fn list_run_questions(
+        &self,
+        run_id: String,
+        cursor: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<QuestionHistoryPage, Error> {
+        let resp = self
+            .execute(&ScopedRequest::ListRunQuestions {
+                run_id,
+                cursor,
+                limit,
+            })
+            .await?;
+        resp.into_question_history().ok_or_else(|| {
+            Error::Transport("unexpected response kind for list_run_questions".to_string())
+        })
     }
 
     /// Starts a deterministic demo run within the fixed binding.

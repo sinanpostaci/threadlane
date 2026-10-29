@@ -94,9 +94,20 @@ impl QuestionStatus {
     }
 }
 
+const fn default_untrusted_data() -> bool {
+    true
+}
+
 /// Persisted question associated with a specific `(binding_id, run_id, revision)`.
+///
+/// When returned via `ListRunQuestions`, mutable lifecycle fields (`status`, `answer`,
+/// `superseded_by_revision`, `resolved_at_ms`) reflect the live persisted state at the time the
+/// page is read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
+    /// Explicit marker indicating that question prompts and answers are untrusted data.
+    #[serde(default = "default_untrusted_data")]
+    pub untrusted_data: bool,
     /// Software-generated question identifier (`qst_<uuid>`).
     pub question_id: String,
     /// Owning binding ID.
@@ -120,8 +131,14 @@ pub struct Question {
 }
 
 /// Historical record of a task instruction at a specific revision.
+///
+/// When returned via `ListRunRevisions`, `superseded_at_ms` reflects the live persisted state at
+/// the time the page is read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRevision {
+    /// Explicit marker indicating that revision instruction text is untrusted data.
+    #[serde(default = "default_untrusted_data")]
+    pub untrusted_data: bool,
     /// 1-based revision number.
     pub revision: u64,
     /// Task instruction active during this revision.
@@ -132,9 +149,17 @@ pub struct RunRevision {
     pub superseded_at_ms: Option<i64>,
 }
 
-/// Full persisted snapshot of a deterministic demo run.
+/// Constant-size current snapshot of a deterministic demo run.
+///
+/// Returned by `GetRun`, `StartDemo`, `Answer`, `Steer`, `Cancel`, and `ListRuns`. Historical
+/// revision and question vectors are never embedded in `Run`; callers inspect history through
+/// bounded keyset pagination (`ListRunRevisions` and `ListRunQuestions`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
+    /// Explicit marker indicating that task instructions, question prompts, answers, and cancel
+    /// reasons inside run snapshots are untrusted data.
+    #[serde(default = "default_untrusted_data")]
+    pub untrusted_data: bool,
     /// Software-generated run identifier (`run_<uuid>`).
     pub run_id: String,
     /// Owning binding ID.
@@ -153,6 +178,9 @@ pub struct Run {
     pub next_step_at_ms: Option<i64>,
     /// Currently pending question ID when `status == RunStatus::WaitingInput`.
     pub active_question_id: Option<String>,
+    /// Bounded detail of the currently active question when `active_question_id` is `Some`.
+    #[serde(default)]
+    pub active_question: Option<Question>,
     /// Timestamp (ms) when the run was started.
     pub started_at_ms: i64,
     /// Timestamp (ms) when the run was last updated.
@@ -163,10 +191,100 @@ pub struct Run {
     pub cancelled_at_ms: Option<i64>,
     /// Optional cancellation reason when `status == RunStatus::Cancelled`.
     pub cancel_reason: Option<String>,
-    /// Ordered revision history (`1..=revision`).
-    pub revision_history: Vec<RunRevision>,
-    /// Ordered history of questions emitted across revisions of this run.
+}
+
+/// Compact summary of a recent run included in a bounded binding status snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunSummary {
+    /// Explicit marker indicating that `instruction_preview` is untrusted data.
+    #[serde(default = "default_untrusted_data")]
+    pub untrusted_data: bool,
+    /// Software-generated run identifier (`run_<uuid>`).
+    pub run_id: String,
+    /// Owning binding ID.
+    pub binding_id: String,
+    /// Current 1-based task revision.
+    pub revision: u64,
+    /// Current lifecycle status.
+    pub status: RunStatus,
+    /// Bounded character preview of the current instruction (up to [`crate::limits::MAX_SUMMARY_TEXT_PREVIEW_CHARS`] chars).
+    pub instruction_preview: String,
+    /// `true` if the full instruction exceeded [`crate::limits::MAX_SUMMARY_TEXT_PREVIEW_CHARS`] characters.
+    pub instruction_truncated: bool,
+    /// Currently pending question ID when `status == RunStatus::WaitingInput`.
+    pub active_question_id: Option<String>,
+    /// Timestamp (ms) when the run was started.
+    pub started_at_ms: i64,
+    /// Timestamp (ms) when the run was last updated.
+    pub updated_at_ms: i64,
+}
+
+/// Bounded keyset-paginated page of [`Run`] snapshots for a binding (`Command::ListRuns`).
+///
+/// Pagination is anchored to `high_water_mark_rowid` in creation order so runs created after page
+/// 1 is fetched never cause duplicate or missing rows on subsequent pages. Each returned [`Run`]
+/// reflects its **live current status and revision** at the time the page is read rather than a
+/// frozen historical snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunListPage {
+    /// Binding ID that owns these runs.
+    pub binding_id: String,
+    /// Ordered compact run snapshots for this page.
+    pub runs: Vec<Run>,
+    /// Opaque keyset cursor to pass on the next `ListRuns` call when `has_more == true`.
+    pub next_cursor: Option<String>,
+    /// `true` if additional runs remain within the high-water-mark window after this page.
+    pub has_more: bool,
+    /// Creation-order high-water mark (`rowid`) anchoring this pagination window (`0` when the binding has no runs).
+    pub high_water_mark_rowid: u64,
+}
+
+/// Bounded keyset-paginated page of [`RunRevision`] records (`Command::ListRunRevisions`).
+///
+/// Pagination is anchored to `high_water_mark_revision` (the run's revision when page 1 was opened)
+/// so concurrent `Steer` operations appending newer revisions never cause duplicate or skipped
+/// revisions across pages. `RunRevision::superseded_at_ms` reflects the **live database state** at
+/// page-read time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevisionHistoryPage {
+    /// Binding ID that owns the run.
+    pub binding_id: String,
+    /// Target run ID.
+    pub run_id: String,
+    /// Live current revision of the run at the time this page was read.
+    pub current_revision: u64,
+    /// High-water-mark revision anchoring this pagination window.
+    pub high_water_mark_revision: u64,
+    /// Ordered revision records (`revision` ascending) within this page.
+    pub revisions: Vec<RunRevision>,
+    /// Opaque keyset cursor to pass on the next `ListRunRevisions` call when `has_more == true`.
+    pub next_cursor: Option<String>,
+    /// `true` if additional revisions remain within `high_water_mark_revision` after this page.
+    pub has_more: bool,
+}
+
+/// Bounded keyset-paginated page of [`Question`] records (`Command::ListRunQuestions`).
+///
+/// Pagination is anchored to `high_water_mark_rowid` in creation order so questions emitted after
+/// page 1 is fetched never cause duplicate or skipped rows across pages. Mutable question fields
+/// (`status`, `answer`, `superseded_by_revision`, `resolved_at_ms`) reflect the **live database
+/// state** at page-read time rather than a frozen historical snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionHistoryPage {
+    /// Binding ID that owns the run.
+    pub binding_id: String,
+    /// Target run ID.
+    pub run_id: String,
+    /// Live current revision of the run at the time this page was read.
+    pub current_revision: u64,
+    /// Creation-order high-water mark (`rowid`) anchoring this pagination window (`0` when the run has no questions).
+    pub high_water_mark_rowid: u64,
+    /// Ordered question records (creation order ascending) within this page.
     pub questions: Vec<Question>,
+    /// Opaque keyset cursor to pass on the next `ListRunQuestions` call when `has_more == true`.
+    pub next_cursor: Option<String>,
+    /// `true` if additional questions remain within `high_water_mark_rowid` after this page.
+    pub has_more: bool,
 }
 
 /// Classification of a durable binding event.
@@ -342,13 +460,36 @@ pub enum Command {
         /// Injected current timestamp in milliseconds.
         now_ms: i64,
     },
-    /// Fetch a run and its full revision/question history scoped to the binding.
+    /// Fetch a constant-size current run snapshot (including `active_question` when waiting for input) scoped to the binding.
     GetRun {
         /// Run ID to inspect.
         run_id: String,
     },
-    /// List all runs belonging to the binding in creation order.
-    ListRuns,
+    /// List a bounded page of runs belonging to the binding in creation order using keyset pagination.
+    ListRuns {
+        /// Optional opaque keyset cursor returned by a previous `ListRuns` page.
+        cursor: Option<String>,
+        /// Maximum number of runs to return (`1..=MAX_PAGE_LIMIT`).
+        limit: usize,
+    },
+    /// List a bounded page of revision history records for a run scoped to the binding.
+    ListRunRevisions {
+        /// Target run ID.
+        run_id: String,
+        /// Optional opaque keyset cursor returned by a previous `ListRunRevisions` page.
+        cursor: Option<String>,
+        /// Maximum number of revisions to return (`1..=MAX_PAGE_LIMIT`).
+        limit: usize,
+    },
+    /// List a bounded page of question history records for a run scoped to the binding.
+    ListRunQuestions {
+        /// Target run ID.
+        run_id: String,
+        /// Optional opaque keyset cursor returned by a previous `ListRunQuestions` page.
+        cursor: Option<String>,
+        /// Maximum number of questions to return (`1..=MAX_PAGE_LIMIT`).
+        limit: usize,
+    },
     /// Pull a bounded batch of ordered events for the binding and record a delivery batch ID.
     PullEvents {
         /// Optional sequence cursor to read after. Defaults to the binding's `acked_seq`.
@@ -414,10 +555,14 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum CommandOutput {
-    /// Single run snapshot (returned by `StartDemo`, `GetRun`, `Answer`, `Steer`, `Cancel`).
-    Run(Run),
-    /// List of runs on the binding (returned by `ListRuns`).
-    RunList(Vec<Run>),
+    /// Single compact run snapshot (returned by `StartDemo`, `GetRun`, `Answer`, `Steer`, `Cancel`).
+    Run(Box<Run>),
+    /// Bounded keyset-paginated page of runs on the binding (returned by `ListRuns`).
+    RunList(RunListPage),
+    /// Bounded keyset-paginated page of run revisions (returned by `ListRunRevisions`).
+    RevisionHistory(RevisionHistoryPage),
+    /// Bounded keyset-paginated page of run questions (returned by `ListRunQuestions`).
+    QuestionHistory(QuestionHistoryPage),
     /// Delivered event batch (returned by `PullEvents`).
     EventBatch(EventBatch),
     /// Event batch acknowledgement result (returned by `AcknowledgeEvents`).
@@ -428,7 +573,7 @@ impl CommandOutput {
     /// Extracts the inner [`Run`] if this output is `CommandOutput::Run`.
     pub fn into_run(self) -> Option<Run> {
         match self {
-            Self::Run(run) => Some(run),
+            Self::Run(run) => Some(*run),
             _ => None,
         }
     }
@@ -436,15 +581,55 @@ impl CommandOutput {
     /// Borrows the inner [`Run`] if this output is `CommandOutput::Run`.
     pub fn as_run(&self) -> Option<&Run> {
         match self {
-            Self::Run(run) => Some(run),
+            Self::Run(run) => Some(run.as_ref()),
             _ => None,
         }
     }
 
-    /// Extracts the inner `Vec<Run>` if this output is `CommandOutput::RunList`.
-    pub fn into_run_list(self) -> Option<Vec<Run>> {
+    /// Extracts the inner [`RunListPage`] if this output is `CommandOutput::RunList`.
+    pub fn into_run_list(self) -> Option<RunListPage> {
         match self {
-            Self::RunList(runs) => Some(runs),
+            Self::RunList(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Borrows the inner [`RunListPage`] if this output is `CommandOutput::RunList`.
+    pub fn as_run_list(&self) -> Option<&RunListPage> {
+        match self {
+            Self::RunList(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`RevisionHistoryPage`] if this output is `CommandOutput::RevisionHistory`.
+    pub fn into_revision_history(self) -> Option<RevisionHistoryPage> {
+        match self {
+            Self::RevisionHistory(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Borrows the inner [`RevisionHistoryPage`] if this output is `CommandOutput::RevisionHistory`.
+    pub fn as_revision_history(&self) -> Option<&RevisionHistoryPage> {
+        match self {
+            Self::RevisionHistory(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Extracts the inner [`QuestionHistoryPage`] if this output is `CommandOutput::QuestionHistory`.
+    pub fn into_question_history(self) -> Option<QuestionHistoryPage> {
+        match self {
+            Self::QuestionHistory(page) => Some(page),
+            _ => None,
+        }
+    }
+
+    /// Borrows the inner [`QuestionHistoryPage`] if this output is `CommandOutput::QuestionHistory`.
+    pub fn as_question_history(&self) -> Option<&QuestionHistoryPage> {
+        match self {
+            Self::QuestionHistory(page) => Some(page),
             _ => None,
         }
     }

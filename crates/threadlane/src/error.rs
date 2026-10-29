@@ -280,6 +280,17 @@ impl ApiError {
                     json!({ "size_bytes": size_bytes, "max_bytes": max_bytes }),
                 ),
             ),
+            CoreError::ResponseTooLarge {
+                size_bytes,
+                max_bytes,
+            } => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Self::with_details(
+                    ErrorCode::PayloadTooLarge,
+                    message,
+                    json!({ "size_bytes": size_bytes, "max_bytes": max_bytes }),
+                ),
+            ),
             CoreError::Storage(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Self::new(ErrorCode::StorageError, message),
