@@ -1,0 +1,18 @@
+[package]
+name = "threadlane-connectors"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Safe CLI metadata probing and OS keychain credential boundary for Threadlane Milestone 4"
+
+[dependencies]
+keyring = { version = "=4.2.0", features = ["v1"] }
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+threadlane-registry = { path = "../threadlane-registry" }
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.10"
