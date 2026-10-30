@@ -1481,6 +1481,20 @@ exit 0
         })
         .await;
         assert_eq!(running.run_id, started.run_id);
+        // Running only proves the runtime recorded the task after spawning; the
+        // fake child may not have written its heartbeat count yet.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count = read_invocation_count(&fixture.agy_count_file);
+            if count == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for exactly one invocation; last count: {count}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
         // Gracefully shut down host 1 while the worker is in-flight.
