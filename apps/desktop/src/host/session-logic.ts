@@ -1,6 +1,8 @@
 import type { ApprovalSummary } from '../approval/types.ts';
+import type { RegistrySnapshot } from '../registry/types.ts';
 import type { BrandKey } from '../types.ts';
 import type {
+  HostCodexToolChoice,
   HostPanelContext,
   HostSessionSummary,
   TaskExecutionStatus,
@@ -21,6 +23,166 @@ export interface StartLocalSessionOptions {
   nativeBridgeAvailable: boolean;
   busy: boolean;
   summary?: HostSessionSummary | null;
+}
+
+/** Quiet operator-facing explanation for the explicit startup opt-in. */
+export const HOST_NOTIFICATION_UNVERIFIED_NOTE =
+  'Queues a fixed wake-up for this approved chat. It may resume the chat and consume tokens; live routing is not verified.';
+
+/** In-memory only notification choice for one approval/context. */
+export interface HostNotificationUiState {
+  optIn: boolean;
+  toolId: string;
+}
+
+export interface HostNotificationAvailabilityOptions {
+  nativeBridgeAvailable: boolean;
+  previewFixtureMode: boolean;
+  contextMatches: boolean;
+  running: boolean;
+  busy: boolean;
+  toolCount: number;
+}
+
+export function emptyHostNotificationState(): HostNotificationUiState {
+  return { optIn: false, toolId: '' };
+}
+
+/** Codex CLI choices come from the trusted registry; all other adapters are excluded. */
+export function codexToolChoicesFromRegistry(
+  registry: RegistrySnapshot | null | undefined
+): HostCodexToolChoice[] {
+  if (!registry) {
+    return [];
+  }
+  const choices: HostCodexToolChoice[] = [];
+  const seen = new Set<string>();
+  for (const tool of registry.tools) {
+    if (tool.adapter !== 'codex_cli') {
+      continue;
+    }
+    const id = tool.id.trim();
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const label = tool.label.trim();
+    choices.push({ id, label: label || id, enabled: tool.enabled });
+  }
+  return choices;
+}
+
+/** Only enabled, de-duplicated Codex CLI tools are selectable. */
+export function enabledHostCodexTools(
+  context: HostPanelContext | null | undefined
+): HostCodexToolChoice[] {
+  const tools: HostCodexToolChoice[] = [];
+  const seen = new Set<string>();
+  for (const tool of context?.codexTools ?? []) {
+    const id = tool.id.trim();
+    if (!id || !tool.enabled || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    const label = tool.label.trim();
+    tools.push({ id, label: label || id, enabled: true });
+  }
+  return tools;
+}
+
+function defaultHostNotificationToolId(tools: readonly HostCodexToolChoice[]): string {
+  return tools.length === 1 ? tools[0]!.id : '';
+}
+
+/**
+ * Reconciles the explicit checkbox with the current context. A context change
+ * always clears the opt-in. A removed or disabled selected tool also clears it.
+ * A single available tool may be preselected, but it is never auto-enabled.
+ */
+export function resolveHostNotificationState(
+  current: HostNotificationUiState,
+  context: HostPanelContext | null | undefined,
+  contextChanged: boolean
+): HostNotificationUiState {
+  const tools = enabledHostCodexTools(context);
+  if (contextChanged) {
+    return { optIn: false, toolId: defaultHostNotificationToolId(tools) };
+  }
+  const selected = tools.some((tool) => tool.id === current.toolId)
+    ? current.toolId
+    : defaultHostNotificationToolId(tools);
+  if (!current.optIn) {
+    return { optIn: false, toolId: selected };
+  }
+  const eligible = tools.find((tool) => tool.id === selected);
+  if (!eligible) {
+    return emptyHostNotificationState();
+  }
+  return { optIn: true, toolId: eligible.id };
+}
+
+export function canConfigureHostNotifications(
+  options: HostNotificationAvailabilityOptions
+): boolean {
+  return (
+    options.nativeBridgeAvailable &&
+    !options.previewFixtureMode &&
+    options.contextMatches &&
+    !options.running &&
+    !options.busy &&
+    options.toolCount > 0
+  );
+}
+
+/** Returns only an eligible tool ID, or null for off. Never returns a path. */
+export function notificationToolIdForStart(
+  state: HostNotificationUiState,
+  context: HostPanelContext | null | undefined,
+  running: boolean
+): string | null {
+  if (running || !state.optIn) {
+    return null;
+  }
+  const selected = enabledHostCodexTools(context).find(
+    (tool) => tool.id === state.toolId
+  );
+  return selected?.id ?? null;
+}
+
+function safeNotificationDigestLabel(raw: string | null | undefined): string {
+  const digest = raw?.trim() ?? '';
+  if (!/^[0-9a-f]{12,64}$/i.test(digest)) {
+    return 'sender digest unavailable';
+  }
+  return `sender ${digest.slice(0, 12)}…`;
+}
+
+/**
+ * Displays the actual startup policy from the host summary. A missing field
+ * means an older summary, which was always notification-off. This never
+ * claims that a wake-up was delivered.
+ */
+export function hostNotificationPolicyText(
+  summary: HostSessionSummary | null | undefined
+): string {
+  if (!summary) {
+    return 'Notifications: no startup policy reported.';
+  }
+  const notifications = summary.notifications ?? {
+    enabled: false,
+    executable_digest: null,
+    timeout_ms: null,
+  };
+  if (!notifications.enabled) {
+    return 'Notifications: off at startup.';
+  }
+  const timeout =
+    notifications.timeout_ms !== null && Number.isSafeInteger(notifications.timeout_ms)
+      ? ` · timeout ${notifications.timeout_ms} ms`
+      : '';
+  return `Notifications: on at startup · ${safeNotificationDigestLabel(
+    notifications.executable_digest
+  )}${timeout} · delivery not verified.`;
 }
 
 export interface HostWorkerTelemetry {
@@ -54,9 +216,9 @@ function nonEmptyText(value: string | null | undefined): string | null {
 
 /**
  * Epoch key for approved-host reads. It deliberately includes the frozen
- * approval identity, the exact control binding/thread context, and the
- * connection state so an old approval or conversation cannot authorize a
- * newer panel state.
+ * approval identity, the exact control binding/thread context, the connection
+ * state, and the registry revision/tool choices so stale responses and stale
+ * notification opt-ins cannot survive a context change.
  */
 export function buildHostRequestKey(
   approval: ApprovalSummary,
@@ -68,6 +230,8 @@ export function buildHostRequestKey(
     context.bindingId ?? '',
     context.threadUuid ?? '',
     context.connected,
+    context.registryRevision ?? null,
+    (context.codexTools ?? []).map((tool) => [tool.id, tool.label, tool.enabled]),
   ]);
 }
 
@@ -463,6 +627,12 @@ export function classifyHostError(err: unknown): HostErrorState {
       return {
         kind: 'invalid_input',
         message: 'The approved session request was not valid.',
+      };
+    case 'notification_policy_change_requires_restart':
+      return {
+        kind: 'other',
+        message:
+          'The running host was started with a different notification policy. Stop and restart it to change the policy; the live host was not changed.',
       };
     default:
       return {

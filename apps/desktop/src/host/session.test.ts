@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import type { ApprovalSummary } from '../approval/types.ts';
 import { AppIpcError } from '../registry/ipc.ts';
+import type { RegistrySnapshot } from '../registry/types.ts';
 import {
   desktop_approved_session,
   desktop_approved_task,
@@ -10,11 +11,16 @@ import {
 } from './ipc.ts';
 import {
   buildHostRequestKey,
+  canConfigureHostNotifications,
   canStartLocalSession,
   classifyHostError,
+  codexToolChoicesFromRegistry,
+  emptyHostNotificationState,
+  enabledHostCodexTools,
   formatHostStatusLabel,
   formatTaskStatusLabel,
   formatTaskTelemetry,
+  hostNotificationPolicyText,
   hostSummaryMatchesContext,
   hostTaskMatchesContext,
   isCurrentHostRequest,
@@ -22,6 +28,8 @@ import {
   MAX_VISIBLE_APPROVED_TASKS,
   nextVisibleApprovedTaskCount,
   normalizeApprovedTaskIds,
+  notificationToolIdForStart,
+  resolveHostNotificationState,
   taskReviewNote,
   workerTelemetry,
 } from './session-logic.ts';
@@ -58,6 +66,8 @@ const CONTEXT: HostPanelContext = {
   bindingId: 'bind-alpha',
   threadUuid: '550e8400-e29b-41d4-a716-446655440000',
   connected: true,
+  registryRevision: 7,
+  codexTools: [{ id: 'tool-codex', label: 'Native Codex', enabled: true }],
 };
 
 const READY_GATES: HostExecutionGates = {
@@ -89,6 +99,11 @@ function makeSummary(
     native_route_task_ids: ['task-native'],
     gates: { ...READY_GATES },
     last_error: null,
+    notifications: {
+      enabled: false,
+      executable_digest: null,
+      timeout_ms: null,
+    },
     ...overrides,
   };
 }
@@ -444,5 +459,255 @@ describe('approved task completion semantics', () => {
     );
     assert.equal(nextVisibleApprovedTaskCount(40, 45), 45);
     assert.equal(nextVisibleApprovedTaskCount(45, 45), 45);
+  });
+});
+
+const TWO_CODEX_TOOLS: HostPanelContext = {
+  ...CONTEXT,
+  registryRevision: 8,
+  codexTools: [
+    { id: 'tool-codex-a', label: 'Codex A', enabled: true },
+    { id: 'tool-codex-b', label: 'Codex B', enabled: true },
+    { id: 'tool-codex-disabled', label: 'Disabled Codex', enabled: false },
+  ],
+};
+
+describe('approved session notification opt-in', () => {
+  it('defaults unchecked, auto-selects only a single tool, and resets on context changes', () => {
+    assert.deepEqual(emptyHostNotificationState(), { optIn: false, toolId: '' });
+    assert.deepEqual(
+      resolveHostNotificationState(emptyHostNotificationState(), CONTEXT, true),
+      { optIn: false, toolId: 'tool-codex' }
+    );
+    assert.deepEqual(
+      resolveHostNotificationState(emptyHostNotificationState(), TWO_CODEX_TOOLS, true),
+      { optIn: false, toolId: '' }
+    );
+    assert.deepEqual(
+      resolveHostNotificationState(
+        { optIn: true, toolId: 'tool-codex-b' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      { optIn: true, toolId: 'tool-codex-b' }
+    );
+    assert.deepEqual(
+      resolveHostNotificationState(
+        { optIn: true, toolId: 'tool-codex-b' },
+        TWO_CODEX_TOOLS,
+        true
+      ),
+      { optIn: false, toolId: '' }
+    );
+    assert.deepEqual(
+      resolveHostNotificationState(
+        { optIn: true, toolId: 'tool-codex-disabled' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      { optIn: false, toolId: '' }
+    );
+    assert.deepEqual(
+      resolveHostNotificationState(
+        { optIn: true, toolId: 'tool-codex-a' },
+        { ...CONTEXT, codexTools: undefined },
+        false
+      ),
+      { optIn: false, toolId: '' }
+    );
+  });
+
+  it('disables opt-in without the native bridge, live context, tools, or while running', () => {
+    const allowed = {
+      nativeBridgeAvailable: true,
+      previewFixtureMode: false,
+      contextMatches: true,
+      running: false,
+      busy: false,
+      toolCount: 1,
+    };
+    assert.equal(canConfigureHostNotifications(allowed), true);
+    assert.equal(
+      canConfigureHostNotifications({ ...allowed, nativeBridgeAvailable: false }),
+      false
+    );
+    assert.equal(
+      canConfigureHostNotifications({ ...allowed, previewFixtureMode: true }),
+      false
+    );
+    assert.equal(
+      canConfigureHostNotifications({ ...allowed, contextMatches: false }),
+      false
+    );
+    assert.equal(
+      canConfigureHostNotifications({ ...allowed, running: true }),
+      false
+    );
+    assert.equal(canConfigureHostNotifications({ ...allowed, busy: true }), false);
+    assert.equal(canConfigureHostNotifications({ ...allowed, toolCount: 0 }), false);
+  });
+
+  it('passes only an eligible tool ID to start, never while running or unchecked', () => {
+    assert.equal(
+      notificationToolIdForStart(
+        { optIn: true, toolId: 'tool-codex-b' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      'tool-codex-b'
+    );
+    assert.equal(
+      notificationToolIdForStart(
+        { optIn: true, toolId: 'tool-codex-b' },
+        TWO_CODEX_TOOLS,
+        true
+      ),
+      null
+    );
+    assert.equal(
+      notificationToolIdForStart(
+        { optIn: false, toolId: 'tool-codex-b' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      null
+    );
+    assert.equal(
+      notificationToolIdForStart(
+        { optIn: true, toolId: 'tool-codex-disabled' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      null
+    );
+    assert.equal(
+      notificationToolIdForStart(
+        { optIn: true, toolId: 'tool-agy' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      null
+    );
+    assert.equal(
+      notificationToolIdForStart(
+        { optIn: true, toolId: '/usr/bin/codex' },
+        TWO_CODEX_TOOLS,
+        false
+      ),
+      null
+    );
+  });
+
+  it('keeps registry and approval context invalidation separate per tool/revision', () => {
+    const baseKey = buildHostRequestKey(APPROVAL, CONTEXT);
+    assert.notEqual(
+      baseKey,
+      buildHostRequestKey(APPROVAL, { ...CONTEXT, registryRevision: 8 })
+    );
+    assert.notEqual(
+      baseKey,
+      buildHostRequestKey(APPROVAL, {
+        ...CONTEXT,
+        codexTools: [{ id: 'tool-codex', label: 'Renamed Codex', enabled: true }],
+      })
+    );
+    assert.notEqual(
+      baseKey,
+      buildHostRequestKey(APPROVAL, {
+        ...CONTEXT,
+        codexTools: [{ id: 'tool-other', label: 'Native Codex', enabled: true }],
+      })
+    );
+    const staleTicket = { epoch: 4, key: baseKey };
+    assert.equal(
+      isCurrentHostRequest(
+        staleTicket,
+        4,
+        buildHostRequestKey(APPROVAL, { ...CONTEXT, registryRevision: 9 })
+      ),
+      false
+    );
+  });
+
+  it('filters registry choices to codex_cli and enabled-only UI options', () => {
+    const registry: RegistrySnapshot = {
+      schema_version: 1,
+      revision: 12,
+      tools: [
+        {
+          id: 'tool-codex',
+          label: 'Native Codex',
+          adapter: 'codex_cli',
+          executable_path: '/private/bin/codex',
+          enabled: true,
+        },
+        {
+          id: 'tool-codex-disabled',
+          label: 'Disabled Codex',
+          adapter: 'codex_cli',
+          executable_path: null,
+          enabled: false,
+        },
+        {
+          id: 'tool-agy',
+          label: 'Antigravity',
+          adapter: 'antigravity',
+          executable_path: '/private/bin/agy',
+          enabled: true,
+        },
+      ],
+      models: [],
+      profiles: [],
+      default_profile_id: null,
+    };
+    assert.deepEqual(codexToolChoicesFromRegistry(registry), [
+      { id: 'tool-codex', label: 'Native Codex', enabled: true },
+      { id: 'tool-codex-disabled', label: 'Disabled Codex', enabled: false },
+    ]);
+    assert.deepEqual(enabledHostCodexTools(CONTEXT), [
+      { id: 'tool-codex', label: 'Native Codex', enabled: true },
+    ]);
+    assert.deepEqual(enabledHostCodexTools(TWO_CODEX_TOOLS), [
+      { id: 'tool-codex-a', label: 'Codex A', enabled: true },
+      { id: 'tool-codex-b', label: 'Codex B', enabled: true },
+    ]);
+  });
+
+  it('shows actual startup policy with a digest only and claims no delivery', () => {
+    const digest = 'a'.repeat(64);
+    const enabled = makeSummary({
+      notifications: {
+        enabled: true,
+        executable_digest: digest,
+        timeout_ms: 10_000,
+      },
+    });
+    const text = hostNotificationPolicyText(enabled);
+    assert.ok(text.includes('on at startup'));
+    assert.ok(text.includes(digest.slice(0, 12)));
+    assert.ok(!text.includes(digest));
+    assert.ok(!text.includes('/'));
+    assert.ok(text.includes('delivery not verified'));
+
+    assert.ok(hostNotificationPolicyText(makeSummary()).includes('off at startup'));
+    assert.ok(
+      hostNotificationPolicyText(makeSummary({ notifications: undefined })).includes(
+        'off at startup'
+      )
+    );
+    assert.ok(
+      hostNotificationPolicyText(null).includes('no startup policy reported')
+    );
+
+    const unsafeDigest = makeSummary({
+      notifications: {
+        enabled: true,
+        executable_digest: '/private/bin/codex',
+        timeout_ms: 10_000,
+      },
+    });
+    const unsafeText = hostNotificationPolicyText(unsafeDigest);
+    assert.ok(!unsafeText.includes('/private/bin/codex'));
+    assert.ok(unsafeText.includes('sender digest unavailable'));
   });
 });

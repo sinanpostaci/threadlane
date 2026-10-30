@@ -1117,8 +1117,20 @@ async fn desktop_start_approved_session(
     bridge: State<'_, DesktopBridge>,
     control: State<'_, DesktopControlState>,
     approval_id: String,
+    notify_codex_tool_id: Option<String>,
 ) -> Result<HostSessionSummary, AppError> {
-    host_control::start_approved_session(&bridge, &control, approval_id).await
+    match notify_codex_tool_id {
+        Some(notify_codex_tool_id) => {
+            host_control::start_approved_session_with_notifications(
+                &bridge,
+                &control,
+                approval_id,
+                Some(notify_codex_tool_id),
+            )
+            .await
+        }
+        None => host_control::start_approved_session(&bridge, &control, approval_id).await,
+    }
 }
 
 #[tauri::command]

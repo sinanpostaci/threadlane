@@ -11,9 +11,12 @@ import {
 import {
   approvalContextMatches,
   buildHostRequestKey,
+  canConfigureHostNotifications,
   canStartLocalSession,
   classifyHostError,
   compactDisplayText,
+  emptyHostNotificationState,
+  enabledHostCodexTools,
   formatAdapterLabel,
   formatHostStatusLabel,
   formatHostStatusTone,
@@ -22,7 +25,9 @@ import {
   formatTaskStatusLabel,
   formatTaskStatusTone,
   formatTaskTelemetry,
+  HOST_NOTIFICATION_UNVERIFIED_NOTE,
   HOST_STATUS_POLL_MS,
+  hostNotificationPolicyText,
   hostSummaryMatchesContext,
   hostTaskMatchesContext,
   isCurrentHostRequest,
@@ -31,10 +36,12 @@ import {
   MAX_VISIBLE_APPROVED_TASKS,
   nextVisibleApprovedTaskCount,
   normalizeApprovedTaskIds,
+  notificationToolIdForStart,
+  resolveHostNotificationState,
   resolveHostTaskBrand,
   taskReviewNote,
 } from './session-logic.ts';
-import type { HostErrorKind } from './session-logic.ts';
+import type { HostErrorKind, HostNotificationUiState } from './session-logic.ts';
 import type {
   HostPanelContext,
   HostSessionSummary,
@@ -92,7 +99,13 @@ function approvalStateKey(approval: ApprovalSummary): string {
 }
 
 function panelContextKey(context: HostPanelContext): string {
-  return JSON.stringify([context.bindingId, context.threadUuid, context.connected]);
+  return JSON.stringify([
+    context.bindingId,
+    context.threadUuid,
+    context.connected,
+    context.registryRevision ?? null,
+    (context.codexTools ?? []).map((tool) => [tool.id, tool.label, tool.enabled]),
+  ]);
 }
 
 function kvRow(label: string, value: string): HTMLElement {
@@ -162,6 +175,12 @@ export class ApprovedSessionPanel {
   private readonly startButton: HTMLButtonElement;
   private readonly startButtonLabel: HTMLElement;
   private readonly actions: HTMLElement;
+  private readonly notificationSection: HTMLElement;
+  private readonly notificationCheckbox: HTMLInputElement;
+  private readonly notificationToolSelect: HTMLSelectElement;
+  private readonly notificationNote: HTMLElement;
+  private readonly notificationPolicy: HTMLElement;
+  private readonly notificationPolicyBadge: HTMLElement;
   private readonly techSection: HTMLDetailsElement;
   private readonly techBody: HTMLElement;
   private readonly tasksSection: HTMLElement;
@@ -184,6 +203,9 @@ export class ApprovedSessionPanel {
   private summary: HostSessionSummary | null = null;
   private errorMessage: string | null = null;
   private lastErrorKind: HostErrorKind | null = null;
+  private notificationState: HostNotificationUiState = emptyHostNotificationState();
+  private notificationToolsKey = '';
+  private notificationEditable = false;
   private statusLoading = false;
   private statusReason: StatusReadReason = 'open';
   private startInFlight = false;
@@ -278,6 +300,99 @@ export class ApprovedSessionPanel {
       startButton
     );
 
+    const notificationPolicyBadge = h(
+      'span',
+      { className: 'aq-host-session-status-badge', 'data-status': 'default' },
+      'Not reported'
+    );
+    const notificationCheckbox = h('input', {
+      type: 'checkbox',
+      className: 'aq-host-session-notification-check',
+      'aria-label': 'Notify this Codex chat about approved session events',
+    });
+    notificationCheckbox.checked = false;
+    notificationCheckbox.disabled = true;
+    notificationCheckbox.addEventListener('change', () => {
+      if (this.disposed || !this.notificationEditable) {
+        notificationCheckbox.checked = this.notificationState.optIn;
+        return;
+      }
+      this.notificationState = resolveHostNotificationState(
+        {
+          optIn: notificationCheckbox.checked,
+          toolId: this.notificationState.toolId,
+        },
+        this.context,
+        false
+      );
+      if (!this.notificationState.optIn) {
+        notificationCheckbox.checked = false;
+      }
+      this.syncUi();
+    });
+
+    const notificationToolSelect = h('select', {
+      className: 'aq-select-input aq-host-session-notification-select',
+      'aria-label': 'Codex CLI tool for the fixed wake-up',
+      disabled: true,
+    });
+    notificationToolSelect.addEventListener('change', () => {
+      if (this.disposed || !this.notificationEditable) {
+        notificationToolSelect.value = this.notificationState.toolId;
+        return;
+      }
+      const selected = enabledHostCodexTools(this.context).find(
+        (tool) => tool.id === notificationToolSelect.value
+      );
+      this.notificationState = selected
+        ? { optIn: this.notificationState.optIn, toolId: selected.id }
+        : emptyHostNotificationState();
+      this.syncUi();
+    });
+
+    const notificationNote = h('p', {
+      className: 'aq-host-session-notification-note',
+    });
+    const notificationPolicy = h('p', {
+      className: 'aq-host-session-notification-policy',
+      'aria-live': 'polite',
+    });
+    const notificationSection = h(
+      'section',
+      {
+        className: 'aq-host-session-notification',
+        'aria-label': 'Codex chat notification startup policy',
+      },
+      h(
+        'div',
+        { className: 'aq-host-session-notification-head' },
+        h(
+          'span',
+          { className: 'aq-host-session-notification-title' },
+          'Codex chat notification'
+        ),
+        notificationPolicyBadge
+      ),
+      h(
+        'label',
+        { className: 'aq-host-session-notification-option' },
+        notificationCheckbox,
+        h('span', undefined, 'Notify this Codex chat')
+      ),
+      h(
+        'label',
+        { className: 'aq-host-session-notification-select-field' },
+        h(
+          'span',
+          { className: 'aq-host-session-notification-select-label' },
+          'Codex CLI tool'
+        ),
+        notificationToolSelect
+      ),
+      notificationNote,
+      notificationPolicy
+    );
+
     const techBody = h('div', { className: 'aq-host-session-tech-body' });
     const techSection = h(
       'details',
@@ -314,6 +429,7 @@ export class ApprovedSessionPanel {
       notice,
       statusRow,
       actions,
+      notificationSection,
       techSection,
       tasksSection
     );
@@ -327,6 +443,12 @@ export class ApprovedSessionPanel {
     this.startButton = startButton;
     this.startButtonLabel = startButtonLabel;
     this.actions = actions;
+    this.notificationSection = notificationSection;
+    this.notificationCheckbox = notificationCheckbox;
+    this.notificationToolSelect = notificationToolSelect;
+    this.notificationNote = notificationNote;
+    this.notificationPolicy = notificationPolicy;
+    this.notificationPolicyBadge = notificationPolicyBadge;
     this.techSection = techSection;
     this.techBody = techBody;
     this.tasksSection = tasksSection;
@@ -400,6 +522,9 @@ export class ApprovedSessionPanel {
     this.statusLoading = false;
     this.startInFlight = false;
     this.startRequestKey = null;
+    this.notificationState = emptyHostNotificationState();
+    this.notificationToolsKey = '';
+    this.notificationEditable = false;
     this.root.removeEventListener('toggle', this.handleToggle);
     if (typeof document !== 'undefined') {
       document.removeEventListener('visibilitychange', this.handleVisibilityChange);
@@ -416,6 +541,8 @@ export class ApprovedSessionPanel {
     this.summary = null;
     this.errorMessage = null;
     this.lastErrorKind = null;
+    this.notificationState = emptyHostNotificationState();
+    this.notificationToolsKey = '';
     this.visibleTaskCount = MAX_VISIBLE_APPROVED_TASKS;
     this.clearTaskData();
   }
@@ -436,6 +563,8 @@ export class ApprovedSessionPanel {
     this.summary = null;
     this.errorMessage = null;
     this.lastErrorKind = null;
+    this.notificationState = emptyHostNotificationState();
+    this.notificationToolsKey = '';
     this.visibleTaskCount = MAX_VISIBLE_APPROVED_TASKS;
     this.clearTaskData();
     this.syncUi();
@@ -592,6 +721,21 @@ export class ApprovedSessionPanel {
       return;
     }
 
+    const notifyCodexToolId = notificationToolIdForStart(
+      this.notificationState,
+      context,
+      this.currentReadySession() !== null ||
+        this.summary?.phase === 'ready' ||
+        this.summary?.phase === 'bootstrapping'
+    );
+    if (this.notificationState.optIn && notifyCodexToolId === null) {
+      this.errorMessage =
+        'Choose an enabled Codex CLI tool before starting with notifications.';
+      this.lastErrorKind = 'other';
+      this.syncUi();
+      return;
+    }
+
     // Set the guard synchronously so a second click cannot issue another command.
     this.startInFlight = true;
     const ticket = ++this.startTicket;
@@ -605,6 +749,7 @@ export class ApprovedSessionPanel {
     try {
       const summary = await desktop_start_approved_session({
         approvalId: approval.approval_id,
+        notifyCodexToolId,
       });
       if (!this.isStartTicketCurrent(ticket, epoch, key) || !this.root.open) {
         return;
@@ -1140,6 +1285,109 @@ export class ApprovedSessionPanel {
     }
   }
 
+  private syncNotificationSection(
+    activeSummary: HostSessionSummary | null,
+    nativeBridgeAvailable: boolean,
+    contextMatches: boolean
+  ): void {
+    const context = this.context;
+    const previewFixtureMode = isDevPreviewFixtureMode();
+    const running =
+      activeSummary?.phase === 'ready' || activeSummary?.phase === 'bootstrapping';
+    const tools = enabledHostCodexTools(context);
+    this.notificationState = resolveHostNotificationState(
+      this.notificationState,
+      context,
+      false
+    );
+
+    const busy =
+      (this.statusLoading && this.statusReason !== 'poll') || this.startInFlight;
+    this.notificationEditable =
+      this.approval !== null &&
+      canConfigureHostNotifications({
+        nativeBridgeAvailable,
+        previewFixtureMode,
+        contextMatches,
+        running,
+        busy,
+        toolCount: tools.length,
+      });
+
+    const toolsKey = JSON.stringify(tools.map((tool) => [tool.id, tool.label]));
+    if (this.notificationToolsKey !== toolsKey) {
+      const options: HTMLElement[] = [];
+      if (tools.length !== 1) {
+        options.push(
+          h(
+            'option',
+            { value: '' },
+            tools.length === 0
+              ? 'No enabled codex_cli tool'
+              : 'Select Codex CLI tool…'
+          )
+        );
+      }
+      for (const tool of tools) {
+        options.push(h('option', { value: tool.id }, tool.label));
+      }
+      this.notificationToolSelect.replaceChildren(...options);
+      this.notificationToolsKey = toolsKey;
+    }
+
+    const hasSelectedTool = tools.some(
+      (tool) => tool.id === this.notificationState.toolId
+    );
+    this.notificationToolSelect.value = this.notificationState.toolId;
+    this.notificationCheckbox.checked = this.notificationState.optIn;
+    this.notificationCheckbox.disabled =
+      !this.notificationEditable || !hasSelectedTool;
+    this.notificationToolSelect.disabled = !this.notificationEditable;
+
+    let note = HOST_NOTIFICATION_UNVERIFIED_NOTE;
+    if (!nativeBridgeAvailable) {
+      note =
+        'Notifications require the native Tauri desktop bridge and an explicit operator opt-in.';
+    } else if (previewFixtureMode) {
+      note =
+        'Read-only DEV preview. Notification opt-in requires the native desktop application.';
+    } else if (!this.approval || !context || !contextMatches) {
+      note =
+        'Notification opt-in requires the exact approved live conversation binding and native thread.';
+    } else if (tools.length === 0) {
+      note =
+        'No enabled codex_cli tool is available in the current registry. Enable one in Tools before opting in.';
+    } else if (running) {
+      note =
+        'Locked while the host session is running. Notification policy is fixed at startup; stop and restart the host to change it.';
+    } else if (tools.length > 1 && !this.notificationState.toolId) {
+      note = `${HOST_NOTIFICATION_UNVERIFIED_NOTE} Choose one Codex CLI tool explicitly.`;
+    } else if (this.notificationState.optIn) {
+      note = `${HOST_NOTIFICATION_UNVERIFIED_NOTE} Native code resolves the selected tool; no executable path is sent from this page.`;
+    }
+    setText(this.notificationNote, note);
+
+    const notifications = activeSummary?.notifications;
+    let badgeText = 'Not reported';
+    let badgeTone: 'default' | 'active' | 'warn' = 'default';
+    if (activeSummary) {
+      if (notifications?.enabled) {
+        badgeText = 'On at startup';
+        badgeTone = 'active';
+      } else {
+        badgeText = 'Off at startup';
+      }
+    }
+    setText(this.notificationPolicyBadge, badgeText);
+    this.notificationPolicyBadge.setAttribute('data-status', badgeTone);
+    setText(
+      this.notificationPolicy,
+      hostNotificationPolicyText(activeSummary)
+    );
+
+    this.notificationSection.hidden = this.approval === null;
+  }
+
   private syncTechSection(): void {
     const approval = this.approval;
     const context = this.context;
@@ -1352,6 +1600,7 @@ export class ApprovedSessionPanel {
     setText(this.startButtonLabel, 'Start local session');
     this.actions.hidden = this.refreshButton.hidden && this.startButton.hidden;
 
+    this.syncNotificationSection(activeSummary, nativeBridgeAvailable, contextMatches);
     this.syncTechSection();
     this.syncTaskRows();
   }

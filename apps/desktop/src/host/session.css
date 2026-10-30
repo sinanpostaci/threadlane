@@ -380,7 +380,93 @@
   margin-top: 2px;
 }
 
+.aq-host-session-notification {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  border-top: 1px solid var(--aq-line);
+  padding-top: 6px;
+}
+
+.aq-host-session-notification-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.aq-host-session-notification-title {
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.aq-host-session-notification-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  color: var(--aq-text);
+  font-size: 10.5px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.aq-host-session-notification-option:has(input:disabled) {
+  cursor: default;
+  color: var(--aq-muted);
+}
+
+.aq-host-session-notification-check {
+  flex: none;
+  margin: 1px 0 0;
+  accent-color: var(--aq-accent);
+}
+
+.aq-host-session-notification-select-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.aq-host-session-notification-select-label {
+  color: var(--aq-muted);
+  font-size: 9.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+
+.aq-host-session-notification-select {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.aq-host-session-notification-note,
+.aq-host-session-notification-policy {
+  margin: 0;
+  min-width: 0;
+  color: var(--aq-muted);
+  font-size: 10.5px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.aq-host-session-notification-policy {
+  color: var(--aq-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  user-select: text;
+}
+
 @media (max-width: 390px) {
+  .aq-host-session-notification {
+    gap: 4px;
+  }
+
   .aq-host-session-body {
     padding: 7px;
   }
