@@ -72,7 +72,8 @@ pub use git::{
     SANITIZED_GIT_ENV_OVERRIDES, WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
 };
 pub use permissions::{
-    build_antigravity_task_files_settings_json, is_unsafe_permission_pattern_char,
+    build_antigravity_task_files_settings_json,
+    build_antigravity_task_files_settings_json_for_scopes, is_unsafe_permission_pattern_char,
     validate_permission_pattern_path, validate_permission_pattern_str, WorkerFilePermissions,
     AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
 };

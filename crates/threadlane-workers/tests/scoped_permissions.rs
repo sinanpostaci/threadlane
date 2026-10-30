@@ -10,9 +10,10 @@ use std::process::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 use threadlane_workers::{
-    build_antigravity_task_files_settings_json, execute_worker_task, run_worker, ExecutionBudgets,
-    FieldEvidence, WorkAcceptanceState, WorkerError, WorkerFilePermissions, WorkerProvider,
-    WorkerRunStatus, WorkerSpec, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    build_antigravity_task_files_settings_json, execute_worker_task, run_worker, DiffViolationKind,
+    ExecutionBudgets, FieldEvidence, WorkAcceptanceState, WorkerError, WorkerFilePermissions,
+    WorkerProvider, WorkerRunStatus, WorkerSpec, WorktreeManager, AGY_READ_PERMISSION_TOOL,
+    AGY_WRITE_PERMISSION_TOOLS,
 };
 use tokio::sync::watch;
 
@@ -89,7 +90,7 @@ impl ScopedTestEnv {
 
     fn default_allowed_paths(&self) -> BTreeSet<String> {
         BTreeSet::from([
-            "crates/threadlane-workers".to_string(),
+            "crates/threadlane-workers/".to_string(),
             "docs/WORKERS.md".to_string(),
         ])
     }
@@ -352,13 +353,20 @@ fn static_validation_and_build_argv_for_workdir_distinguish_inherit_and_task_fil
 
     let w = workdir.to_str().expect("utf8 workdir");
     let mut expected_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
-    for rel in ["crates/threadlane-workers", "docs/WORKERS.md"] {
-        for tool in AGY_WRITE_PERMISSION_TOOLS {
-            expected_allow.push(format!("{tool}({w}/{rel})"));
-            expected_allow.push(format!("{tool}({w}/{rel}/**)"));
-        }
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_allow.push(format!("{tool}({w}/crates/threadlane-workers)"));
+        expected_allow.push(format!("{tool}({w}/crates/threadlane-workers/**)"));
+    }
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_allow.push(format!("{tool}({w}/docs/WORKERS.md)"));
     }
     assert_eq!(allow_list, expected_allow);
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        assert!(
+            !allow_list.contains(&format!("{tool}({w}/docs/WORKERS.md/**)")),
+            "exact file `docs/WORKERS.md` must never be granted descendant `/**` permissions for {tool}"
+        );
+    }
 
     // Ensure source repository path is NOT in the permissions allowlist.
     let repo_str = env.repo_dir.to_str().expect("utf8 repo");
@@ -676,12 +684,18 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
         allow[0].as_str(),
         Some(format!("read_file({w}/**)").as_str())
     );
-    assert!(allow
-        .iter()
-        .any(|v| v.as_str() == Some(format!("edit_file({w}/{allowed_subpath})").as_str())));
-    assert!(allow
-        .iter()
-        .any(|v| v.as_str() == Some(format!("edit_file({w}/{allowed_subpath}/**)").as_str())));
+    assert_eq!(allow.len(), 1 + AGY_WRITE_PERMISSION_TOOLS.len());
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        assert!(allow
+            .iter()
+            .any(|v| v.as_str() == Some(format!("{tool}({w}/{allowed_subpath})").as_str())));
+        assert!(
+            !allow
+                .iter()
+                .any(|v| v.as_str() == Some(format!("{tool}({w}/{allowed_subpath}/**)").as_str())),
+            "exact file path with Unicode and spaces must not grant descendant `/**` for {tool}"
+        );
+    }
 
     let report = run_worker(&spec, &unicode_space_workdir)
         .await
@@ -813,10 +827,10 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
         .join("canonical_workdir_segment_beta_0123456789abcdef");
     fs::create_dir_all(&deep_workdir).expect("create deep_workdir");
 
-    // 2a. 32 legitimate long ASCII entries (<=128) + canonical workdir exceeding 65,536 bytes.
+    // 2a. 32 legitimate long ASCII directory entries (<=128) + canonical workdir exceeding 65,536 bytes.
     let a_seg = "a".repeat(80);
     let long_ascii_paths: BTreeSet<String> = (0..32)
-        .map(|i| format!("crates/threadlane-workers/{a_seg}/{a_seg}/{a_seg}/mod_{i:02}.rs"))
+        .map(|i| format!("crates/threadlane-workers/{a_seg}/{a_seg}/{a_seg}/mod_{i:02}/"))
         .collect();
     assert_eq!(long_ascii_paths.len(), 32);
 
@@ -858,11 +872,11 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
         "spy_bin must not spawn when serialized settings exceed 65,536 bytes"
     );
 
-    // 2b. 12 legitimate entries (<=128) whose unescaped rule strings are under 65,536 bytes,
+    // 2b. 12 legitimate directory entries (<=128) whose unescaped rule strings are under 65,536 bytes,
     // but exceed 65,536 serialized JSON bytes after serde_json escapes `"` to `\"`.
     let q_seg = "q\"".repeat(45);
     let escaped_overflow_paths: BTreeSet<String> = (0..12)
-        .map(|i| format!("crates/threadlane-workers/{q_seg}/{q_seg}/{q_seg}/mod_{i:02}.rs"))
+        .map(|i| format!("crates/threadlane-workers/{q_seg}/{q_seg}/{q_seg}/mod_{i:02}/"))
         .collect();
     assert_eq!(escaped_overflow_paths.len(), 12);
 
@@ -911,9 +925,10 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
     let small_allow = parsed_small["permissions"]["allow"]
         .as_array()
         .expect("allow array");
+    // `crates/threadlane-workers/` (directory -> 2 * 5 rules) + `docs/WORKERS.md` (exact file -> 1 * 5 rules) + 1 read_file rule.
     assert_eq!(
         small_allow.len(),
-        1 + small_task_spec.allowed_write_paths.len() * AGY_WRITE_PERMISSION_TOOLS.len() * 2,
+        1 + AGY_WRITE_PERMISSION_TOOLS.len() * 3,
         "all grants must be preserved without silent truncation"
     );
 
@@ -927,4 +942,578 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
         .await
         .expect("run_worker for small TaskFiles spec");
     assert_eq!(small_run.status, WorkerRunStatus::Succeeded);
+}
+
+fn parse_allow_rules(settings_json: &str) -> Vec<String> {
+    let val: Value = serde_json::from_str(settings_json).expect("parse --settings inline JSON");
+    val["permissions"]["allow"]
+        .as_array()
+        .expect("permissions.allow array")
+        .iter()
+        .map(|v| v.as_str().expect("string rule").to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn exact_file_and_absent_file_scopes_never_grant_descendant_wildcards_while_explicit_and_pinned_base_dirs_do(
+) {
+    let env = ScopedTestEnv::new();
+    let noop_bin = env.write_fake_executable("noop-scope-check-agy", "exit 0");
+    let workdir = env.root_dir.join("exact-vs-dir-workdir");
+    fs::create_dir_all(workdir.join("crates/threadlane-workers/src"))
+        .expect("create workdir crates/threadlane-workers/src");
+    fs::write(
+        workdir.join("crates/threadlane-workers/src/lib.rs"),
+        "pub fn baseline() -> u32 { 1 }\n",
+    )
+    .expect("write existing file in workdir");
+    let w = workdir.to_str().expect("utf8 workdir");
+
+    // 1. Existing exact file (`crates/threadlane-workers/src/lib.rs`):
+    // Must grant ONLY `<tool>(<w>/crates/threadlane-workers/src/lib.rs)` and NEVER `/**` for any write tool.
+    let existing_file_paths = BTreeSet::from(["crates/threadlane-workers/src/lib.rs".to_string()]);
+    let mut existing_file_spec = env.antigravity_spec(
+        noop_bin.clone(),
+        "Existing exact file scope",
+        WorkerFilePermissions::TaskFiles,
+    );
+    existing_file_spec.allowed_write_paths = existing_file_paths.clone();
+
+    let existing_file_argv = existing_file_spec
+        .build_argv_for_workdir(&workdir)
+        .expect("build_argv_for_workdir for existing exact file");
+    assert_eq!(existing_file_argv[10], "--settings");
+    let direct_existing_json =
+        build_antigravity_task_files_settings_json(&workdir, &existing_file_paths)
+            .expect("direct builder for existing exact file");
+    assert_eq!(existing_file_argv[11], direct_existing_json);
+
+    let existing_allow = parse_allow_rules(&existing_file_argv[11]);
+    let mut expected_existing_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_existing_allow.push(format!("{tool}({w}/crates/threadlane-workers/src/lib.rs)"));
+    }
+    assert_eq!(existing_allow, expected_existing_allow);
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        assert!(
+            !existing_allow.iter().any(|rule| rule
+                .starts_with(&format!("{tool}({w}/crates/threadlane-workers/src/lib.rs/"))),
+            "existing exact file must never receive `{tool}(.../lib.rs/**)` or any child grant"
+        );
+    }
+
+    // 2. Absent exact file (`new.txt`):
+    // Must grant ONLY `<tool>(<w>/new.txt)` and NEVER `<tool>(<w>/new.txt/**)` or any child grant for any write tool.
+    let absent_file_paths = BTreeSet::from(["new.txt".to_string()]);
+    let mut absent_file_spec = env.antigravity_spec(
+        noop_bin.clone(),
+        "Absent exact file scope",
+        WorkerFilePermissions::TaskFiles,
+    );
+    absent_file_spec.allowed_write_paths = absent_file_paths.clone();
+
+    let absent_file_argv = absent_file_spec
+        .build_argv_for_workdir(&workdir)
+        .expect("build_argv_for_workdir for absent exact file");
+    assert_eq!(absent_file_argv[10], "--settings");
+    let direct_absent_json =
+        build_antigravity_task_files_settings_json(&workdir, &absent_file_paths)
+            .expect("direct builder for absent exact file");
+    assert_eq!(absent_file_argv[11], direct_absent_json);
+
+    let absent_allow = parse_allow_rules(&absent_file_argv[11]);
+    let mut expected_absent_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_absent_allow.push(format!("{tool}({w}/new.txt)"));
+    }
+    assert_eq!(absent_allow, expected_absent_allow);
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        assert!(
+            !absent_allow
+                .iter()
+                .any(|rule| rule.starts_with(&format!("{tool}({w}/new.txt/"))),
+            "absent exact file `new.txt` must never receive `{tool}(.../new.txt/**)` or any child grant"
+        );
+    }
+
+    // 3. Explicit trailing-slash directory (`crates/threadlane-workers/` and absent `new_dir/`):
+    // Must grant both `<tool>(<w>/<dir>)` and `<tool>(<w>/<dir>/**)` for all write tools.
+    let explicit_dir_paths = BTreeSet::from([
+        "crates/threadlane-workers/".to_string(),
+        "new_dir/".to_string(),
+    ]);
+    let mut explicit_dir_spec = env.antigravity_spec(
+        noop_bin.clone(),
+        "Explicit directory scopes",
+        WorkerFilePermissions::TaskFiles,
+    );
+    explicit_dir_spec.allowed_write_paths = explicit_dir_paths.clone();
+
+    let explicit_dir_argv = explicit_dir_spec
+        .build_argv_for_workdir(&workdir)
+        .expect("build_argv_for_workdir for explicit directories");
+    let direct_explicit_dir_json =
+        build_antigravity_task_files_settings_json(&workdir, &explicit_dir_paths)
+            .expect("direct builder for explicit directories");
+    assert_eq!(explicit_dir_argv[11], direct_explicit_dir_json);
+
+    let explicit_dir_allow = parse_allow_rules(&explicit_dir_argv[11]);
+    let mut expected_explicit_dir_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
+    for rel_dir in ["crates/threadlane-workers", "new_dir"] {
+        for tool in AGY_WRITE_PERMISSION_TOOLS {
+            expected_explicit_dir_allow.push(format!("{tool}({w}/{rel_dir})"));
+            expected_explicit_dir_allow.push(format!("{tool}({w}/{rel_dir}/**)"));
+        }
+    }
+    assert_eq!(explicit_dir_allow, expected_explicit_dir_allow);
+
+    // Explicit trailing-slash directory targeting an existing regular file must fail closed.
+    let file_as_dir_paths = BTreeSet::from(["crates/threadlane-workers/src/lib.rs/".to_string()]);
+    let mut file_as_dir_spec = env.antigravity_spec(
+        noop_bin.clone(),
+        "Reject trailing slash on regular file",
+        WorkerFilePermissions::TaskFiles,
+    );
+    file_as_dir_spec.allowed_write_paths = file_as_dir_paths.clone();
+    assert!(matches!(
+        file_as_dir_spec.build_argv_for_workdir(&workdir),
+        Err(WorkerError::SecurityViolation(_))
+    ));
+    assert!(matches!(
+        build_antigravity_task_files_settings_json(&workdir, &file_as_dir_paths),
+        Err(WorkerError::InvalidSpec(_))
+    ));
+
+    // 4. Legacy bare directory in `WorkerSpec` (`crates/threadlane-workers` exists as a directory
+    // tree in `base_commit`) vs direct builder lacking Git context:
+    let legacy_bare_dir_paths = BTreeSet::from(["crates/threadlane-workers".to_string()]);
+    let mut legacy_bare_dir_spec = env.antigravity_spec(
+        noop_bin.clone(),
+        "Legacy bare base directory in WorkerSpec",
+        WorkerFilePermissions::TaskFiles,
+    );
+    legacy_bare_dir_spec.allowed_write_paths = legacy_bare_dir_paths.clone();
+
+    let legacy_spec_argv = legacy_bare_dir_spec
+        .build_argv_for_workdir(&workdir)
+        .expect("WorkerSpec::build_argv_for_workdir resolves legacy bare base directory via pinned base_commit");
+    let legacy_spec_allow = parse_allow_rules(&legacy_spec_argv[11]);
+    let mut expected_legacy_spec_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_legacy_spec_allow.push(format!("{tool}({w}/crates/threadlane-workers)"));
+        expected_legacy_spec_allow.push(format!("{tool}({w}/crates/threadlane-workers/**)"));
+    }
+    assert_eq!(legacy_spec_allow, expected_legacy_spec_allow);
+
+    // Direct public builder lacks Git context (`base_commit`) and therefore uses syntactic
+    // trailing-slash resolution (bare entry -> exact only).
+    let direct_bare_json =
+        build_antigravity_task_files_settings_json(&workdir, &legacy_bare_dir_paths)
+            .expect("direct builder on bare entry");
+    let direct_bare_allow = parse_allow_rules(&direct_bare_json);
+    let mut expected_direct_bare_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_direct_bare_allow.push(format!("{tool}({w}/crates/threadlane-workers)"));
+    }
+    assert_eq!(direct_bare_allow, expected_direct_bare_allow);
+
+    // 5. `WorkerFilePermissions::Inherit` argv remains completely unchanged across all allowlists.
+    let expected_inherit_argv = vec![
+        "--model",
+        "gemini-4-argon-high",
+        "--effort",
+        "high",
+        "--mode",
+        "accept-edits",
+        "--output-format",
+        "stream-json",
+        "--print-timeout",
+        "0",
+        "--print",
+        "Inherit unchanged check",
+    ];
+    for paths in [
+        existing_file_paths,
+        absent_file_paths,
+        explicit_dir_paths,
+        legacy_bare_dir_paths,
+    ] {
+        let mut inherit_spec = env.antigravity_spec(
+            noop_bin.clone(),
+            "Inherit unchanged check",
+            WorkerFilePermissions::Inherit,
+        );
+        inherit_spec.allowed_write_paths = paths;
+        assert_eq!(
+            inherit_spec.build_argv().expect("Inherit build_argv"),
+            expected_inherit_argv
+        );
+        assert_eq!(
+            inherit_spec
+                .build_argv_for_workdir(&workdir)
+                .expect("Inherit build_argv_for_workdir"),
+            expected_inherit_argv
+        );
+    }
+}
+
+#[tokio::test]
+async fn mutable_file_to_directory_replacement_does_not_widen_task_files_settings_and_diff_gate_rejects_children(
+) {
+    let env = ScopedTestEnv::new();
+    let noop_bin = env.write_fake_executable("noop-mutable-check-agy", "exit 0");
+    let workdir = env.root_dir.join("mutable-file-to-dir-workdir");
+    fs::create_dir_all(&workdir).expect("create workdir");
+
+    // In the mutable task workdir, replace `crates/threadlane-workers/src/lib.rs` (a regular file
+    // at `base_commit`) AND `new.txt` (absent at `base_commit`) with directories containing children.
+    fs::create_dir_all(workdir.join("crates/threadlane-workers/src/lib.rs"))
+        .expect("create directory at lib.rs path in mutable workdir");
+    fs::write(
+        workdir.join("crates/threadlane-workers/src/lib.rs/nested.rs"),
+        "pub fn nested() {}\n",
+    )
+    .expect("write nested file under lib.rs directory in mutable workdir");
+    fs::create_dir_all(workdir.join("new.txt"))
+        .expect("create directory at new.txt path in mutable workdir");
+    fs::write(workdir.join("new.txt/nested.txt"), "nested\n")
+        .expect("write nested file under new.txt directory in mutable workdir");
+
+    // Also mutate `env.repo_dir` working tree AND advance `HEAD` after `env.base_commit` so both
+    // paths become directories on `HEAD`, while `spec.base_commit` stays pinned to `env.base_commit`.
+    fs::remove_file(env.repo_dir.join("crates/threadlane-workers/src/lib.rs"))
+        .expect("remove lib.rs in repo_dir");
+    fs::create_dir_all(env.repo_dir.join("crates/threadlane-workers/src/lib.rs"))
+        .expect("replace lib.rs with dir in repo_dir");
+    fs::write(
+        env.repo_dir
+            .join("crates/threadlane-workers/src/lib.rs/nested.rs"),
+        "pub fn repo_nested() {}\n",
+    )
+    .expect("write nested.rs in repo_dir");
+    fs::create_dir_all(env.repo_dir.join("new.txt")).expect("create new.txt dir in repo_dir");
+    fs::write(env.repo_dir.join("new.txt/nested.txt"), "repo nested\n")
+        .expect("write new.txt/nested.txt in repo_dir");
+    git_cmd(&env.repo_dir, &["add", "."]);
+    git_cmd(
+        &env.repo_dir,
+        &[
+            "commit",
+            "-m",
+            "Mutate HEAD after pinned base_commit to directories",
+        ],
+    );
+
+    let exact_paths = BTreeSet::from([
+        "crates/threadlane-workers/src/lib.rs".to_string(),
+        "new.txt".to_string(),
+    ]);
+    let mut pinned_spec = env.antigravity_spec(
+        noop_bin,
+        "Pinned base_commit exact file scopes",
+        WorkerFilePermissions::TaskFiles,
+    );
+    pinned_spec.allowed_write_paths = exact_paths.clone();
+    assert_eq!(pinned_spec.base_commit, env.base_commit);
+
+    let argv = pinned_spec
+        .build_argv_for_workdir(&workdir)
+        .expect("build_argv_for_workdir must resolve against immutable pinned base_commit");
+    let direct_json = build_antigravity_task_files_settings_json(&workdir, &exact_paths)
+        .expect("direct builder must use syntactic scope, not mutable workdir is_dir()");
+    assert_eq!(argv[11], direct_json);
+
+    let w = workdir.to_str().expect("utf8 workdir");
+    let allow = parse_allow_rules(&argv[11]);
+    let mut expected_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
+    for rel in ["crates/threadlane-workers/src/lib.rs", "new.txt"] {
+        for tool in AGY_WRITE_PERMISSION_TOOLS {
+            expected_allow.push(format!("{tool}({w}/{rel})"));
+        }
+    }
+    assert_eq!(allow, expected_allow);
+    for rel in ["crates/threadlane-workers/src/lib.rs", "new.txt"] {
+        for tool in AGY_WRITE_PERMISSION_TOOLS {
+            assert!(
+                !allow
+                    .iter()
+                    .any(|rule| rule.starts_with(&format!("{tool}({w}/{rel}/"))),
+                "mutable file->dir replacement must never widen `{rel}` to `{tool}({w}/{rel}/**)`"
+            );
+        }
+    }
+
+    // Verify end-to-end via `execute_worker_task`:
+    // 1) Creating exact `new.txt` as a regular file passes with exact-only `--settings` (no `new.txt/**`).
+    let exact_new_file_bin = env.write_fake_executable(
+        "exact-new-file-agy",
+        r#"
+printf 'created exact new file\n' > new.txt
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"ok"}\n'
+"#,
+    );
+    let mut exact_new_spec = env.antigravity_spec(
+        exact_new_file_bin,
+        "Create exact new.txt",
+        WorkerFilePermissions::TaskFiles,
+    );
+    exact_new_spec.allowed_write_paths = BTreeSet::from(["new.txt".to_string()]);
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    let exact_new_report = execute_worker_task(
+        &exact_new_spec,
+        "run-exact-new",
+        "task-exact-new-ok",
+        None,
+        &mut cancel_rx,
+    )
+    .await
+    .expect("execute_worker_task creating exact new.txt");
+    assert_eq!(
+        exact_new_report.worker_report.status,
+        WorkerRunStatus::Succeeded
+    );
+    assert!(exact_new_report.diff_gate.passed);
+    assert_eq!(
+        exact_new_report.overall_acceptance_state,
+        WorkAcceptanceState::DiffGatePassedPendingReview
+    );
+    let task_checkout_str = exact_new_report
+        .manifest
+        .checkout_path
+        .to_str()
+        .expect("utf8 task checkout");
+    let task_allow = parse_allow_rules(&exact_new_report.worker_report.constructed_argv[11]);
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        assert!(task_allow.contains(&format!("{tool}({task_checkout_str}/new.txt)")));
+        assert!(
+            !task_allow
+                .iter()
+                .any(|rule| rule.starts_with(&format!("{tool}({task_checkout_str}/new.txt/"))),
+            "constructed_argv `--settings` for `new.txt` must not grant `{tool}(.../new.txt/**)`"
+        );
+    }
+
+    // 2) Replacing an exact file scope (`new.txt`) with a directory `new.txt/child.txt` is
+    // rejected by the post-run Git diff gate as `OutsideAllowedPaths`.
+    let dir_escalation_bin = env.write_fake_executable(
+        "dir-escalation-agy",
+        r#"
+mkdir -p new.txt
+printf 'unauthorized child under exact file scope\n' > new.txt/child.txt
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"ok"}\n'
+"#,
+    );
+    let mut escalation_spec = env.antigravity_spec(
+        dir_escalation_bin,
+        "Attempt new.txt/child.txt under exact new.txt scope",
+        WorkerFilePermissions::TaskFiles,
+    );
+    escalation_spec.allowed_write_paths = BTreeSet::from(["new.txt".to_string()]);
+    let escalation_report = execute_worker_task(
+        &escalation_spec,
+        "run-exact-new",
+        "task-exact-new-escalate",
+        None,
+        &mut cancel_rx,
+    )
+    .await
+    .expect("execute_worker_task for new.txt/child.txt escalation");
+    assert!(!escalation_report.diff_gate.passed);
+    assert_eq!(
+        escalation_report.overall_acceptance_state,
+        WorkAcceptanceState::RejectedByDiffGate
+    );
+    assert!(escalation_report.diff_gate.violations.iter().any(|v| {
+        v.kind == DiffViolationKind::OutsideAllowedPaths && v.path == "new.txt/child.txt"
+    }));
+}
+
+#[tokio::test]
+async fn moving_legacy_symbolic_ref_from_exact_file_to_directory_does_not_widen_manifest_pinned_launch_settings(
+) {
+    let env = ScopedTestEnv::new();
+    let ok_bin = env.write_fake_executable(
+        "symbolic-ref-pin-agy",
+        r#"
+printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
+printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effort":"high","result":"ok"}\n'
+"#,
+    );
+
+    // At commit A (`env.base_commit`), `crates/threadlane-workers/src/lib.rs` is a regular file
+    // and `new.txt` is absent. The legacy symbolic ref `main` points to commit A.
+    let commit_a = env.base_commit.clone();
+    let exact_paths = BTreeSet::from([
+        "crates/threadlane-workers/src/lib.rs".to_string(),
+        "new.txt".to_string(),
+    ]);
+
+    let mut symbolic_spec = env.antigravity_spec(
+        ok_bin,
+        "Symbolic ref pinned to task manifest base_commit",
+        WorkerFilePermissions::TaskFiles,
+    );
+    symbolic_spec.base_commit = "main".to_string();
+    symbolic_spec.allowed_write_paths = exact_paths.clone();
+
+    // 1. `execute_worker_task` with symbolic `base_commit = "main"` resolves `manifest.base_commit`
+    // to exact 40-hex `commit_a` without mutating caller `symbolic_spec.base_commit`.
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    let exec_report = execute_worker_task(
+        &symbolic_spec,
+        "run-symref",
+        "task-symref-exec",
+        None,
+        &mut cancel_rx,
+    )
+    .await
+    .expect("execute_worker_task with symbolic base_commit `main`");
+    assert_eq!(
+        symbolic_spec.base_commit, "main",
+        "caller spec must not be mutated by execute_worker_task"
+    );
+    assert_eq!(exec_report.manifest.base_commit, commit_a);
+    assert_eq!(
+        exec_report.worker_report.requested_model.base_model,
+        "gemini-4-argon-high"
+    );
+    assert_eq!(
+        exec_report.worker_report.requested_model.effort.as_deref(),
+        Some("high")
+    );
+
+    // 2. Create task manifest A while `main` points to `commit_a`, then deterministically advance
+    // `main` to `commit_b` where both `crates/threadlane-workers/src/lib.rs` and `new.txt` are
+    // directories in the Git commit tree.
+    let manager = WorktreeManager::new(
+        &symbolic_spec.repository_path,
+        &symbolic_spec.work_area_root,
+        &symbolic_spec.base_commit,
+    )
+    .expect("create WorktreeManager for `main` at commit A");
+    assert_eq!(manager.resolved_base_commit(), commit_a);
+    let manifest_a = manager
+        .create_task_worktree("run-symref", "task-manifest-a", &exact_paths)
+        .expect("create task worktree for manifest A");
+    assert_eq!(manifest_a.base_commit, commit_a);
+
+    fs::remove_file(env.repo_dir.join("crates/threadlane-workers/src/lib.rs"))
+        .expect("remove lib.rs regular file");
+    fs::create_dir_all(env.repo_dir.join("crates/threadlane-workers/src/lib.rs"))
+        .expect("replace lib.rs with directory on main");
+    fs::write(
+        env.repo_dir
+            .join("crates/threadlane-workers/src/lib.rs/child.rs"),
+        "pub fn child() {}\n",
+    )
+    .expect("write lib.rs/child.rs");
+    fs::create_dir_all(env.repo_dir.join("new.txt")).expect("create new.txt directory on main");
+    fs::write(env.repo_dir.join("new.txt/child.txt"), "child\n").expect("write new.txt/child.txt");
+    git_cmd(&env.repo_dir, &["add", "."]);
+    git_cmd(
+        &env.repo_dir,
+        &[
+            "commit",
+            "-m",
+            "Advance main to commit B where exact file paths are directories",
+        ],
+    );
+    let commit_b = git_stdout(&env.repo_dir, &["rev-parse", "--verify", "main^{commit}"])
+        .trim()
+        .to_string();
+    assert_ne!(commit_b, commit_a);
+
+    // Confirm that unpinned `symbolic_spec` (`base_commit = "main"`) now resolves `main` to
+    // `commit_b`, where `lib.rs` is a directory but the `manifest_a` checkout still has a regular
+    // file there; the combined exact paths must fail closed, never widen.
+    let checkout_str = manifest_a.checkout_path.to_str().expect("utf8 checkout");
+    let unpinned_b_error = symbolic_spec
+        .build_argv_for_workdir(&manifest_a.checkout_path)
+        .expect_err(
+            "unpinned symbolic_spec at commit B must fail closed against commit A checkout",
+        );
+    assert!(
+        matches!(
+            unpinned_b_error,
+            WorkerError::InvalidSpec(ref msg) if msg.contains("non-directory")
+        ),
+        "expected non-directory InvalidSpec, got {unpinned_b_error:?}"
+    );
+    assert!(matches!(
+        execute_worker_task(
+            &symbolic_spec,
+            "run-symref",
+            "task-manifest-a",
+            Some(&manifest_a.worktree_id),
+            &mut cancel_rx,
+        )
+        .await,
+        Err(WorkerError::InvalidSpec(ref msg)) if msg.contains("base_commit")
+    ));
+
+    // Separate absent-only control: `new.txt` is absent in commit A (no conflicting file
+    // metadata) though it becomes a directory in commit B, so an unpinned spec limited to
+    // `new.txt` may legitimately widen to descendant grants.
+    let mut absent_only_spec = symbolic_spec.clone();
+    absent_only_spec.allowed_write_paths = BTreeSet::from(["new.txt".to_string()]);
+    let absent_only_argv = absent_only_spec
+        .build_argv_for_workdir(&manifest_a.checkout_path)
+        .expect("absent-only `new.txt` may broaden against commit A checkout");
+    let absent_only_allow = parse_allow_rules(&absent_only_argv[11]);
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        assert!(
+            absent_only_allow.contains(&format!("{tool}({checkout_str}/new.txt/**)")),
+            "absent-only `new.txt` must widen to `{tool}({checkout_str}/new.txt/**)`"
+        );
+    }
+
+    // Ephemeral launch spec pinned to `manifest_a.base_commit` (the exact step performed by
+    // `execute_worker_task_with_observer` before invoking `run_worker_with_observer`) must keep
+    // `crates/threadlane-workers/src/lib.rs` and `new.txt` strictly exact (no `/**` grants),
+    // even though `main` now resolves to `commit_b` where both paths are directories.
+    let mut launch_spec = symbolic_spec.clone();
+    launch_spec.base_commit = manifest_a.base_commit.clone();
+    assert_eq!(symbolic_spec.base_commit, "main");
+    assert_eq!(launch_spec.base_commit, commit_a);
+
+    let launch_argv = launch_spec
+        .build_argv_for_workdir(&manifest_a.checkout_path)
+        .expect("build_argv_for_workdir for launch_spec pinned to manifest_a.base_commit");
+    assert_eq!(launch_argv[10], "--settings");
+
+    let allow = parse_allow_rules(&launch_argv[11]);
+    let mut expected_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({checkout_str}/**)")];
+    for rel in ["crates/threadlane-workers/src/lib.rs", "new.txt"] {
+        for tool in AGY_WRITE_PERMISSION_TOOLS {
+            expected_allow.push(format!("{tool}({checkout_str}/{rel})"));
+        }
+    }
+    assert_eq!(allow, expected_allow);
+    for rel in ["crates/threadlane-workers/src/lib.rs", "new.txt"] {
+        for tool in AGY_WRITE_PERMISSION_TOOLS {
+            assert!(
+                !allow
+                    .iter()
+                    .any(|rule| rule.starts_with(&format!("{tool}({checkout_str}/{rel}/"))),
+                "moving symbolic ref `main` from commit A to directory commit B must never widen manifest-pinned `{rel}` to `{tool}({checkout_str}/{rel}/**)`"
+            );
+        }
+    }
+
+    let manifest_a_exec = execute_worker_task(
+        &launch_spec,
+        "run-symref",
+        "task-manifest-a",
+        Some(&manifest_a.worktree_id),
+        &mut cancel_rx,
+    )
+    .await
+    .expect("execute_worker_task on manifest_a with pinned launch_spec");
+    assert_eq!(
+        manifest_a_exec.worker_report.status,
+        WorkerRunStatus::Succeeded
+    );
+    assert_eq!(manifest_a_exec.worker_report.constructed_argv, launch_argv);
 }

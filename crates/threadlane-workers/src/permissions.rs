@@ -8,7 +8,7 @@ use crate::error::WorkerError;
 use crate::fs_safety::{validate_absolute_no_symlink_components, validate_existing_canonical_dir};
 use crate::spec::{
     is_control_config_path, validate_repo_relative_path, validate_simple_identifier,
-    ResolvedModelTarget, WorkerProvider,
+    ResolvedModelTarget, WorkerProvider, WriteScopeKind,
 };
 
 /// Documented Antigravity CLI read permission action identifier.
@@ -304,19 +304,86 @@ pub fn validate_permission_pattern_path(path: &Path, label: &str) -> Result<Stri
 
 /// Builds the session-only Antigravity `--settings <inline-json>` payload for
 /// [`WorkerFilePermissions::TaskFiles`] from an existing canonical task working directory and
-/// validated `allowed_write_paths`.
+/// validated `allowed_write_paths` using explicit trailing-slash directory syntax.
 ///
-/// Grants:
-/// - `read_file(<canonical_workdir>/**)`
-/// - Exact (`<tool>(<canonical_workdir>/<entry>)`) and descendant
-///   (`<tool>(<canonical_workdir>/<entry>/**)`) rules for `edit_file`, `write_file`,
-///   `write_to_file`, `replace_file_content`, and `multi_replace_file_content` for each entry in
-///   `allowed_write_paths`.
+/// Because this direct builder does not receive a Git repository path or pinned `base_commit`,
+/// it resolves write scopes syntactically from `allowed_write_paths`:
+/// - Explicit directory entries ending with a trailing `/` (for example `"foo/"` or
+///   `"crates/threadlane-workers/"`) resolve to [`WriteScopeKind::DirectorySubtree`] and grant
+///   both exact (`<tool>(<canonical_workdir>/<dir>)`) and descendant
+///   (`<tool>(<canonical_workdir>/<dir>/**)`) rules for `edit_file`, `write_file`,
+///   `write_to_file`, `replace_file_content`, and `multi_replace_file_content`.
+/// - Bare entries without a trailing `/` (for example `"foo"`, `"src/lib.rs"`, or `"new.txt"`)
+///   resolve to [`WriteScopeKind::ExactFile`] and grant **only** the exact
+///   `<tool>(<canonical_workdir>/<file>)` rule — never `<tool>(<canonical_workdir>/<file>/**)` —
+///   regardless of whether the path currently exists or is a directory on disk.
 ///
-/// Never includes shell, network, or MCP tool grants, and never modifies global provider settings.
+/// When launching via [`crate::spec::WorkerSpec::build_argv_for_workdir`], `allowed_write_paths`
+/// are first resolved against the immutable pinned `base_commit` tree via
+/// [`crate::git::resolve_allowed_write_scopes_at_base`] and passed to
+/// [`build_antigravity_task_files_settings_json_for_scopes`], preserving legacy bare
+/// base-directory `WorkerSpec` entries while keeping exact files (existing or absent at
+/// `base_commit`) strictly exact.
+///
+/// Always grants `read_file(<canonical_workdir>/**)`. Never includes shell, network, or MCP tool
+/// grants, and never modifies global provider settings.
 pub fn build_antigravity_task_files_settings_json(
     working_directory: &Path,
     allowed_write_paths: &BTreeSet<String>,
+) -> Result<String, WorkerError> {
+    let canonical_workdir =
+        validate_existing_canonical_dir(working_directory, "working_directory")?;
+    if canonical_workdir.parent().is_none() {
+        return Err(WorkerError::InvalidSpec(
+            "refusing to grant `task_files` permissions on filesystem root directory `/`"
+                .to_string(),
+        ));
+    }
+
+    let _ = validate_permission_pattern_path(&canonical_workdir, "working_directory")?;
+
+    WorkerFilePermissions::TaskFiles
+        .validate_for_provider_and_paths(WorkerProvider::Antigravity, allowed_write_paths)?;
+
+    let mut resolved_write_scopes = BTreeMap::new();
+    for entry in allowed_write_paths {
+        let (clean_entry, kind) = match entry.strip_suffix('/') {
+            Some(stripped) => (stripped.to_string(), WriteScopeKind::DirectorySubtree),
+            None => (entry.clone(), WriteScopeKind::ExactFile),
+        };
+        resolved_write_scopes
+            .entry(clean_entry)
+            .and_modify(|existing| {
+                if kind == WriteScopeKind::DirectorySubtree {
+                    *existing = WriteScopeKind::DirectorySubtree;
+                }
+            })
+            .or_insert(kind);
+    }
+
+    build_antigravity_task_files_settings_json_for_scopes(
+        &canonical_workdir,
+        &resolved_write_scopes,
+    )
+}
+
+/// Builds the session-only Antigravity `--settings <inline-json>` payload for
+/// [`WorkerFilePermissions::TaskFiles`] from an existing canonical task working directory and
+/// resolved repository-relative [`WriteScopeKind`] entries.
+///
+/// Grants:
+/// - `read_file(<canonical_workdir>/**)`
+/// - Exact `<tool>(<canonical_workdir>/<entry>)` rules for `edit_file`, `write_file`,
+///   `write_to_file`, `replace_file_content`, and `multi_replace_file_content` for every entry.
+/// - Descendant `<tool>(<canonical_workdir>/<entry>/**)` rules **only** when the entry's scope
+///   is [`WriteScopeKind::DirectorySubtree`]. [`WriteScopeKind::ExactFile`] entries never receive
+///   descendant `/**` grants, even if the target path is replaced by a directory in the mutable
+///   working tree.
+///
+/// Never includes shell, network, or MCP tool grants, and never modifies global provider settings.
+pub fn build_antigravity_task_files_settings_json_for_scopes(
+    working_directory: &Path,
+    resolved_write_scopes: &BTreeMap<String, WriteScopeKind>,
 ) -> Result<String, WorkerError> {
     let canonical_workdir =
         validate_existing_canonical_dir(working_directory, "working_directory")?;
@@ -335,25 +402,54 @@ pub fn build_antigravity_task_files_settings_json(
         ));
     }
 
-    WorkerFilePermissions::TaskFiles
-        .validate_for_provider_and_paths(WorkerProvider::Antigravity, allowed_write_paths)?;
+    if resolved_write_scopes.is_empty() {
+        return Err(WorkerError::InvalidSpec(
+            "allowed_write_paths must contain at least one repository-relative path".to_string(),
+        ));
+    }
+    if resolved_write_scopes.len() > MAX_TASK_FILES_WRITE_PATHS {
+        return Err(WorkerError::InvalidSpec(format!(
+            "allowed_write_paths contains {} entries, which exceeds the maximum of {MAX_TASK_FILES_WRITE_PATHS} entries permitted when `file_permissions` is `task_files`",
+            resolved_write_scopes.len()
+        )));
+    }
 
     let mut allow =
-        Vec::with_capacity(1 + allowed_write_paths.len() * AGY_WRITE_PERMISSION_TOOLS.len() * 2);
+        Vec::with_capacity(1 + resolved_write_scopes.len() * AGY_WRITE_PERMISSION_TOOLS.len() * 2);
     allow.push(format!("{AGY_READ_PERMISSION_TOOL}({clean_workdir}/**)"));
 
-    for entry in allowed_write_paths {
-        let clean_entry = entry.strip_suffix('/').unwrap_or(entry.as_str());
+    for (raw_entry, &scope_kind) in resolved_write_scopes {
+        validate_repo_relative_path(raw_entry, "allowed_write_paths entry")?;
+        let clean_entry = raw_entry.strip_suffix('/').unwrap_or(raw_entry.as_str());
+        if is_control_config_path(clean_entry) {
+            return Err(WorkerError::InvalidSpec(format!(
+                "allowed_write_paths entry `{raw_entry}` targets protected repository or agent control configuration"
+            )));
+        }
+        validate_permission_pattern_str(clean_entry, "allowed_write_paths entry")?;
+
         let joined_target = canonical_workdir.join(clean_entry);
         let _ = validate_absolute_no_symlink_components(
             &joined_target,
             "task_files allowed_write_paths target",
         )?;
+        if scope_kind == WriteScopeKind::DirectorySubtree {
+            if let Ok(meta) = fs::symlink_metadata(&joined_target) {
+                if !meta.file_type().is_dir() {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "allowed_write_paths directory entry `{clean_entry}/` targets existing non-directory `{}`",
+                        joined_target.display()
+                    )));
+                }
+            }
+        }
 
         let target_str = format!("{clean_workdir}/{clean_entry}");
         for tool in AGY_WRITE_PERMISSION_TOOLS {
             allow.push(format!("{tool}({target_str})"));
-            allow.push(format!("{tool}({target_str}/**)"));
+            if scope_kind == WriteScopeKind::DirectorySubtree {
+                allow.push(format!("{tool}({target_str}/**)"));
+            }
         }
     }
 
