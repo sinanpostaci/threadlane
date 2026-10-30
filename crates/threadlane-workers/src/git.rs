@@ -1706,8 +1706,15 @@ pub async fn execute_worker_task_with_observer(
     };
 
     let guard = manager.begin_job(&manifest.worktree_id)?;
-    let worker_report =
-        run_worker_with_observer(spec, &manifest.checkout_path, cancel_rx, progress_tx).await?;
+    let mut launch_spec = spec.clone();
+    launch_spec.base_commit = manifest.base_commit.clone();
+    let worker_report = run_worker_with_observer(
+        &launch_spec,
+        &manifest.checkout_path,
+        cancel_rx,
+        progress_tx,
+    )
+    .await?;
     let diff_gate = evaluate_diff_gate(manager.work_area_root(), &manifest.worktree_id)?;
     let updated_manifest = guard.finish()?;
 

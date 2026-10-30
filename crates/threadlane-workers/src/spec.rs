@@ -10,7 +10,7 @@ use crate::fs_safety::{
     validate_existing_canonical_dir,
 };
 use crate::permissions::{
-    build_antigravity_task_files_settings_json, validate_permission_pattern_path,
+    build_antigravity_task_files_settings_json_for_scopes, validate_permission_pattern_path,
 };
 pub use crate::permissions::{
     build_opencode_config_content, build_opencode_config_content_json, evaluate_opencode_rules,
@@ -528,8 +528,11 @@ impl WorkerSpec {
     /// provider is [`WorkerProvider::OpenCodeV2`]). When `file_permissions` is
     /// [`WorkerFilePermissions::TaskFiles`], validates that the canonical `working_directory` and
     /// `allowed_write_paths` contain no unsafe glob/rule metacharacters or symlinks and, for
-    /// [`WorkerProvider::Antigravity`], injects `--settings <inline-json>` scoped to
-    /// `working_directory`.
+    /// [`WorkerProvider::Antigravity`], resolves `allowed_write_paths` against the immutable
+    /// pinned `base_commit` tree via [`crate::git::resolve_allowed_write_scopes_at_base`] and
+    /// injects `--settings <inline-json>` scoped to `working_directory` (granting descendant `/**`
+    /// rules only for [`WriteScopeKind::DirectorySubtree`] scopes and exact-only rules for
+    /// [`WriteScopeKind::ExactFile`] scopes).
     pub fn build_argv_for_workdir(
         &self,
         working_directory: &Path,
@@ -540,9 +543,15 @@ impl WorkerSpec {
         let settings_json = match (self.provider, self.file_permissions) {
             (WorkerProvider::Antigravity, WorkerFilePermissions::Inherit) => None,
             (WorkerProvider::Antigravity, WorkerFilePermissions::TaskFiles) => {
-                Some(build_antigravity_task_files_settings_json(
-                    &canonical_workdir,
+                let resolved_write_scopes = crate::git::resolve_allowed_write_scopes_at_base(
+                    &report.canonical_repository_path,
+                    &self.base_commit,
                     &self.allowed_write_paths,
+                    crate::git::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+                )?;
+                Some(build_antigravity_task_files_settings_json_for_scopes(
+                    &canonical_workdir,
+                    &resolved_write_scopes,
                 )?)
             }
             (WorkerProvider::OpenCodeV2, _) => {
