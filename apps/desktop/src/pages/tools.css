@@ -658,10 +658,27 @@
 }
 
 input.aq-tools-catalog-search {
-  flex: 1 1 150px;
+  display: block;
+  flex: none;
+  box-sizing: border-box;
   width: 100%;
-  max-width: 100%;
   min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 5px 9px;
+  border: 1px solid var(--aq-line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--aq-field) 52%, transparent);
+  color: var(--aq-text);
+  font: inherit;
+  font-size: 0.8rem;
+  line-height: 1.35;
+}
+
+input.aq-tools-catalog-search:focus-visible {
+  border-color: color-mix(in srgb, var(--aq-accent) 60%, var(--aq-line));
+  outline: 2px solid var(--aq-accent);
+  outline-offset: 1px;
 }
 
 .aq-tools-catalog-list {
