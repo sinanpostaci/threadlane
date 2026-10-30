@@ -1596,4 +1596,199 @@ exit 0
 
         host.shutdown().await.expect("shutdown host");
     }
+
+    #[tokio::test]
+    async fn atomic_writer_temp_artifacts_validated_narrowly_without_false_anchor_or_bypass() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-atomic-tmp",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Atomic temp race validation"),
+        );
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get approval record");
+
+        ensure_private_dir(&fixture.sessions_dir).expect("create private sessions_dir");
+        let session_dir = ensure_private_dir(&fixture.sessions_dir.join(&approval_id))
+            .expect("create private session_dir");
+
+        let valid_manifest_tmp = ".host-manifest.json.tmp.550e8400e29b41d4a716446655440000";
+        let valid_receipts_tmp = ".task-receipts.json.tmp.550e8400e29b41d4a716446655440000";
+        let manifest_tmp_path = session_dir.join(valid_manifest_tmp);
+        let receipts_tmp_path = session_dir.join(valid_receipts_tmp);
+
+        let write_private_file = |path: &Path, bytes: &[u8]| {
+            fs::write(path, bytes).expect("write test file");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 test file");
+        };
+
+        // 1. Temp-only directory with no real anchor (no host.lock or host-manifest.json) must be rejected.
+        let fake_ready_manifest = HostSessionManifest::from_approval_record(
+            &record,
+            Some("sb_fake_uncommitted".to_string()),
+            HostPhase::Ready,
+            Some(12345),
+            None,
+            1_700_000_002_000,
+            1_700_000_002_000,
+        );
+        let serialized_manifest =
+            serde_json::to_vec_pretty(&fake_ready_manifest).expect("serialize fake manifest");
+        write_private_file(&manifest_tmp_path, &serialized_manifest);
+
+        let temp_only_verify_err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect_err("temp-only session dir without anchor must fail verify");
+        assert_eq!(temp_only_verify_err.code(), "security_violation");
+
+        let temp_only_prepare_err = prepare_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect_err("temp-only session dir without anchor must fail prepare");
+        assert_eq!(temp_only_prepare_err.code(), "security_violation");
+
+        // 2. Alongside a real anchor (host.lock), private 0600 recognized temp artifacts within budget succeed,
+        //    are preserved untouched, and are never parsed as committed state or readiness admission.
+        let lock_path = session_dir.join(HOST_LOCK_FILENAME);
+        write_private_file(&lock_path, b"");
+        write_private_file(&receipts_tmp_path, &vec![b'r'; MAX_TASK_RECEIPTS_BYTES]);
+
+        verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect("verify_existing_session_dir succeeds with real anchor and valid temp files");
+        prepare_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect("prepare_session_dir succeeds with real anchor and valid temp files");
+
+        assert!(
+            read_host_manifest_optional(&session_dir, &record)
+                .expect("read_host_manifest_optional ignores temp file")
+                .is_none(),
+            "transient .host-manifest.json.tmp.<uuid> must never be parsed as committed manifest"
+        );
+        assert!(
+            manifest_tmp_path.exists() && receipts_tmp_path.exists(),
+            "recognized temp remnants must not be deleted by directory inspection"
+        );
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+        let not_ready_err = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect_err("temp manifest without committed Ready manifest must reject client calls");
+        assert_eq!(not_ready_err.code(), "host_not_ready");
+
+        fs::remove_file(&manifest_tmp_path).expect("remove manifest temp");
+        fs::remove_file(&receipts_tmp_path).expect("remove receipts temp");
+
+        // 3. Invalid UUID suffixes and invalid prefixes/names remain rejected alongside a real anchor.
+        for invalid_name in [
+            ".host-manifest.json.tmp.not-a-valid-uuid",
+            ".host-manifest.json.tmp.550e8400-e29b-41d4-a716-446655440000",
+            ".host-manifest.json.tmp.550E8400E29B41D4A716446655440000",
+            ".host-manifest.json.tmp.6ba7b8109dad11d180b400c04fd430c8",
+            ".host-manifest.json.tmp.00000000000000000000000000000000",
+            ".host-manifest.json.tmp.550e8400e29b41d40716446655440000",
+            ".host-manifest.json.tmp.550e8400e29b41d4a71644665544000",
+            ".host-manifest.json.tmp.550e8400e29b41d4a716446655440000a",
+            ".host.lock.tmp.550e8400e29b41d4a716446655440000",
+            ".task-receipts.lock.tmp.550e8400e29b41d4a716446655440000",
+            ".record.json.tmp.550e8400e29b41d4a716446655440000",
+            "host-manifest.json.tmp.550e8400e29b41d4a716446655440000",
+            ".foreign-hidden",
+        ] {
+            let bad_path = session_dir.join(invalid_name);
+            write_private_file(&bad_path, b"{}");
+            let err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+                .expect_err("invalid temp/foreign name must be rejected");
+            assert_eq!(err.code(), "security_violation", "failed on {invalid_name}");
+            assert!(
+                bad_path.exists(),
+                "foreign file `{invalid_name}` must not be deleted"
+            );
+            fs::remove_file(&bad_path).expect("clean bad_path");
+        }
+
+        // 4. Directory with recognized temp name must be rejected.
+        fs::create_dir(&manifest_tmp_path).expect("create dir with temp name");
+        fs::set_permissions(&manifest_tmp_path, fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 dir with temp name");
+        let dir_err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect_err("directory named like temp file must be rejected");
+        assert_eq!(dir_err.code(), "security_violation");
+        fs::remove_dir(&manifest_tmp_path).expect("remove temp-named dir");
+
+        // 5. Symlink with recognized temp name must be rejected.
+        let outside_target = fixture.root.join("outside-temp-target.json");
+        write_private_file(&outside_target, b"{}");
+        symlink(&outside_target, &manifest_tmp_path).expect("create symlink with temp name");
+        let sym_err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect_err("symlink named like temp file must be rejected");
+        assert_eq!(sym_err.code(), "security_violation");
+        fs::remove_file(&manifest_tmp_path).expect("remove temp-named symlink");
+
+        // 6. Permissive permissions on recognized temp file must be rejected.
+        for bad_mode in [0o644, 0o640, 0o604, 0o700] {
+            fs::write(&manifest_tmp_path, b"{}").expect("write permissive temp file");
+            fs::set_permissions(&manifest_tmp_path, fs::Permissions::from_mode(bad_mode))
+                .expect("chmod permissive temp file");
+            let perm_err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+                .expect_err("permissive temp file must be rejected");
+            assert_eq!(perm_err.code(), "security_violation");
+            fs::remove_file(&manifest_tmp_path).expect("remove permissive temp file");
+        }
+
+        // 7. Oversize recognized temp files exceeding their respective byte budgets must be rejected.
+        write_private_file(&manifest_tmp_path, &vec![b'a'; MAX_HOST_MANIFEST_BYTES + 1]);
+        let oversize_err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect_err("oversize manifest temp file must be rejected");
+        assert_eq!(oversize_err.code(), "security_violation");
+        fs::remove_file(&manifest_tmp_path).expect("remove oversize manifest temp");
+
+        write_private_file(&receipts_tmp_path, &vec![b'b'; MAX_TASK_RECEIPTS_BYTES + 1]);
+        let oversize_err = verify_existing_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect_err("oversize receipts temp file must be rejected");
+        assert_eq!(oversize_err.code(), "security_violation");
+        fs::remove_file(&receipts_tmp_path).expect("remove oversize receipts temp");
+
+        // 8. Legitimate disappeared-temp observation between read_dir and metadata inspection:
+        //    (a) Disappeared temp alongside existing host.lock succeeds without false failure.
+        storage::inspect_session_dir_snapshot(
+            &session_dir,
+            [HOST_LOCK_FILENAME, valid_manifest_tmp],
+        )
+        .expect("disappeared temp file alongside host.lock must not fail");
+
+        //    (b) Snapshot that observed only the temp file before it was atomically renamed to a valid
+        //        0600 host-manifest.json validates the committed target and succeeds.
+        fs::remove_file(&lock_path).expect("remove host.lock for rename-to-manifest test");
+        let committed_manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+        write_private_file(&committed_manifest_path, &serialized_manifest);
+        storage::inspect_session_dir_snapshot(&session_dir, [valid_manifest_tmp])
+            .expect("disappeared temp file renamed to valid host-manifest.json must succeed");
+
+        //    (c) If the committed target after rename has permissive permissions, security violation is not swallowed.
+        fs::set_permissions(&committed_manifest_path, fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644 committed manifest");
+        let rename_perm_err =
+            storage::inspect_session_dir_snapshot(&session_dir, [valid_manifest_tmp])
+                .expect_err("permissive committed target after temp rename must fail");
+        assert_eq!(rename_perm_err.code(), "security_violation");
+        fs::remove_file(&committed_manifest_path).expect("remove committed manifest");
+
+        //    (d) If the temp file disappeared in an unanchored directory with neither host.lock nor host-manifest.json,
+        //        it still fails closed with security_violation.
+        let unanchored_err =
+            storage::inspect_session_dir_snapshot(&session_dir, [valid_manifest_tmp])
+                .expect_err("disappeared temp file without any committed anchor must fail");
+        assert_eq!(unanchored_err.code(), "security_violation");
+    }
 }
