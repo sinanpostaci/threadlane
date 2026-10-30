@@ -3,7 +3,9 @@
 
 The script always resolves paths from this checkout, installs the locked
 frontend dependencies, builds the Vite bundle, and then compiles the standalone
-Tauri Cargo workspace with ``CARGO_TARGET_DIR=<repo>/target/desktop``. It never
+Tauri Cargo workspace with ``CARGO_TARGET_DIR=<repo>/target/desktop``. The
+``tauri/custom-protocol`` dependency feature is always requested so the binary
+embeds the built assets instead of loading the development server. It never
 runs a Tauri bundler, signs artifacts, or installs anything on the host.
 """
 
@@ -152,7 +154,16 @@ def resolve_config(repo_root: Path, release: bool, timeout_seconds: float) -> Bu
 
 
 def _desktop_build_args(config: BuildConfig) -> list[str]:
-    argv = ["build", "--manifest-path", str(config.manifest_path), "--locked"]
+    argv = [
+        "build",
+        "--manifest-path",
+        str(config.manifest_path),
+        "--locked",
+        # Without this dependency feature Tauri treats the build as a dev build
+        # and connects to tauri.conf.json's devUrl instead of using dist assets.
+        "--features",
+        "tauri/custom-protocol",
+    ]
     if config.release:
         argv.append("--release")
     return argv

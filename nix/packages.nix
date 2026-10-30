@@ -79,7 +79,12 @@ let
     cargoRoot = "apps/desktop/src-tauri";
     buildAndTestSubdir = "apps/desktop/src-tauri";
     cargoLock.lockFile = source + "/apps/desktop/src-tauri/Cargo.lock";
-    cargoBuildFlags = [ "--locked" ];
+    # Tauri treats builds without this dependency feature as development builds
+    # and tries to load tauri.conf.json's devUrl instead of the embedded assets.
+    cargoBuildFlags = [
+      "--locked"
+      "--features" "tauri/custom-protocol"
+    ];
     doCheck = false;
     passthru.frontend = desktopFrontend;
 

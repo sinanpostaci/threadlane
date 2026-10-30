@@ -182,6 +182,11 @@ class DesktopBuildTests(unittest.TestCase):
                 ):
                     yield
 
+    def _assert_production_asset_mode(self, argv: list[str]) -> None:
+        self.assertEqual(argv.count("--features"), 1)
+        features_index = argv.index("--features")
+        self.assertEqual(argv[features_index + 1], "tauri/custom-protocol")
+
     def test_dry_run_has_no_side_effects_and_resolves_repo_paths(self) -> None:
         rc, stdout, stderr = _run_main(["--dry-run", "--release"], self.root)
 
@@ -215,6 +220,7 @@ class DesktopBuildTests(unittest.TestCase):
         self.assertEqual(commands[1]["argv"], ["npm", "run", "build"])
         self.assertEqual(commands[2]["argv"][0], "cargo")
         self.assertIn("--release", commands[2]["argv"])
+        self._assert_production_asset_mode(commands[2]["argv"])
         self.assertEqual(commands[2]["env"], {"CARGO_TARGET_DIR": str(self.root / "target" / "desktop")})
 
     def test_release_build_runs_argv_only_steps_and_creates_expected_artifact(self) -> None:
@@ -246,6 +252,48 @@ class DesktopBuildTests(unittest.TestCase):
             cargo_record["env"]["CARGO_TARGET_DIR"],
             str(self.root / "target" / "desktop"),
         )
+
+    def test_standalone_debug_and_release_builds_request_production_asset_mode(self) -> None:
+        for release in (False, True):
+            profile = "release" if release else "debug"
+            with self.subTest(profile=profile):
+                self.log.unlink(missing_ok=True)
+                argv = ["--release"] if release else []
+                with self._tools():
+                    rc, stdout, stderr = _run_main([*argv, "--timeout-seconds", "30"], self.root)
+
+                self.assertEqual((rc, stderr), (0, ""), msg=stdout)
+                summary = json.loads(stdout)
+                self.assertEqual(summary["profile"], profile)
+                artifact = _artifact(self.root, profile)
+                self.assertEqual(Path(summary["artifact"]), artifact)
+                self.assertTrue(artifact.is_file())
+
+                records = _read_records(self.log)
+                self.assertEqual([record["tool"] for record in records], ["npm", "npm", "cargo"])
+                npm_records = records[:2]
+                cargo_record = records[2]
+                self.assertEqual(
+                    [record["argv"] for record in npm_records],
+                    [["ci"], ["run", "build"]],
+                )
+
+                expected_argv = [
+                    "build",
+                    "--manifest-path",
+                    str(self.root / "apps" / "desktop" / "src-tauri" / "Cargo.toml"),
+                    "--locked",
+                    "--features",
+                    "tauri/custom-protocol",
+                ]
+                if release:
+                    expected_argv.append("--release")
+                self.assertEqual(cargo_record["argv"], expected_argv)
+                self._assert_production_asset_mode(cargo_record["argv"])
+                self.assertEqual(
+                    cargo_record["env"]["CARGO_TARGET_DIR"],
+                    str(self.root / "target" / "desktop"),
+                )
 
     def test_default_profile_is_debug(self) -> None:
         with self._tools():
