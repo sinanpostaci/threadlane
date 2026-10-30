@@ -1947,9 +1947,6 @@ async fn approved_mcp_pull_and_ack_events_enrollment_isolation_cursors_and_256ki
         .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
         .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
 
-    enroll_server(&fixture, &mcp_a, &fixture.binding_a, THREAD_UUID_A).await;
-    enroll_server(&fixture, &mcp_b, &fixture.binding_b, THREAD_UUID_B).await;
-
     // Enroll and then expire `mcp_expired`.
     enroll_server(&fixture, &mcp_expired, &fixture.binding_a, THREAD_UUID_A).await;
     fixture
@@ -1979,6 +1976,11 @@ async fn approved_mcp_pull_and_ack_events_enrollment_isolation_cursors_and_256ki
         )
         .expect_err("shared connection enrollment must fail");
     assert_eq!(quarantine_err.code(), "shared_connection_rejected");
+
+    // Enrolling another connection for a binding expires its previous epoch.
+    // Finish negative fixtures before enrolling the live A/B connections.
+    enroll_server(&fixture, &mcp_a, &fixture.binding_a, THREAD_UUID_A).await;
+    enroll_server(&fixture, &mcp_b, &fixture.binding_b, THREAD_UUID_B).await;
 
     // Create approvals for `(binding_a, THREAD_UUID_A)`, `(binding_a, THREAD_UUID_A_ALT)`, and `(binding_b, THREAD_UUID_B)`.
     let (rev_a, digest_a) = create_published_plan(
