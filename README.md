@@ -51,6 +51,12 @@ not require switching to the panel for each task. See
 
 ### Optional Approved-Session Controls
 
+- **Trusted local review and integration**: `threadlane-operator` provides
+  explicit task commit, review inspection/acceptance, and owned integration
+  commands. It preserves the existing digest/receipt and same-run checks; no
+  main merge, push or dependent-task dispatch follows automatically. See the
+  [operator workflow](docs/OPERATOR-WORKFLOW.md).
+
 - **Codex-first initial startup**: An operator may opt in with
   `threadlane-native-mcp --auto-start-approved-hosts` and the configured stores.
   An explicit approved root-task dispatch can then launch its first fresh host

@@ -90,6 +90,11 @@ without changing requested-versus-observed evidence or automatic-acceptance boun
 A [qualified native single-chat pilot](NATIVE-PILOT-2026-10-30.md) also records the
 simulated loop, deferred busy-turn delivery and remaining identity/onboarding gates.
 
+The [trusted operator CLI](OPERATOR-WORKFLOW.md) exposes the existing task
+commit, review acceptance and same-run integration operations to an explicit
+local caller. It adds no automatic acceptance, primary merge/push, dependency
+input assembly, native enrollment or MCP authority.
+
 ## Default workflow example
 
 Profiles remain configurable. The current desired usage profile is Luna Max for
