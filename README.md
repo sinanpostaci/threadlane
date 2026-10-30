@@ -2,7 +2,7 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
-> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. Production multi-chat onboarding, profile-to-runtime activation, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [current checkpoint and its validation limits](docs/M4-CHECKPOINT.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
+> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. Immutable operator approvals, detached local hosts, and frozen-task MCP dispatch have local fixture coverage. Production multi-chat onboarding, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [current checkpoint and its validation limits](docs/M4-CHECKPOINT.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
 
 ---
 
@@ -39,8 +39,8 @@ Threadlane is a local execution middleware and control plane designed to work al
 
 ### Remaining Milestones
 - **Milestone 2 remaining integration**: Interactive provider question/Steer delivery, busy-turn and multi-chat acceptance, reconciliation of preserved uncertain artifacts, and reviewed Git integration/cleanup. The durable fixture checkpoint is not the full native workflow.
-- **Milestone 3A preview is available**: [Tauri desktop panel](docs/DESKTOP.md) (`Activity`, `Chats`, `Tools`, `Profiles`, `Settings`), read-only runtime observation, a separate local demo, and configurable theme/accent/transparency. Editable profiles and worker orchestration controls remain later work.
-- **Milestone 4**: Global tool/model/effort registry, role/difficulty profiles, and shadow-mode Jev classification.
+- **Desktop configuration and observation**: [Tauri desktop panel](docs/DESKTOP.md) (`Activity`, `Chats`, `Plans`, `Tools`, `Profiles`, `Settings`), editable global models/efforts and role/difficulty profiles, a separate local demo, read-only history, and configurable theme/accent/transparency.
+- **Milestone 4 execution checkpoint**: Durable draft/publication MCP operations, immutable operator approvals, separate per-approval host processes, and caller-scoped frozen-task dispatch are implemented with local fixture coverage. Jev/OpenAI Decisions adapters provide explicit synthetic tests; live credentials and automatic workflow classification are separate gates. The [configuration guide](docs/CONFIGURATION.md) distinguishes approval, host startup, dispatch, and review.
 - **Milestone 5**: Cross-platform release hardening, macOS/Windows native ACLs and secret storage, optional background service/tray packaging, and measured cost/notification budgets.
 
 ---

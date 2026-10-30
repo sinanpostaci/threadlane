@@ -55,7 +55,12 @@ let
     inherit version;
     src = source;
     cargoLock.lockFile = source + "/Cargo.lock";
-    cargoBuildFlags = [ "--locked" "--package" "threadlane" "--package" "threadlane-native" ];
+    cargoBuildFlags = [
+      "--locked"
+      "--package" "threadlane"
+      "--package" "threadlane-native"
+      "--package" "threadlane-host"
+    ];
     nativeBuildInputs = [ pkgs.pkg-config ];
     doCheck = false;
 
@@ -94,6 +99,7 @@ let
 
     postFixup = ''
       wrapProgram "$out/bin/threadlane-desktop" \
+        --prefix PATH : "${lib.makeBinPath [ threadlane ]}" \
         --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath desktopLibs}" \
         --prefix GIO_EXTRA_MODULES : "${pkgs.glib-networking}/lib/gio/modules" \
         --prefix XDG_DATA_DIRS : "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gtk3}/share"

@@ -63,11 +63,16 @@ CLI discovery, and persisted appearance preferences. The standalone Linux build
 and native Wayland rendering passed on the first host with the documented
 process-local NVIDIA compatibility flag. See [desktop usage](DESKTOP.md).
 
-Provider evidence/interactive continuation and the
-[multi-chat routing gate](NATIVE-ROUTING.md) remain separate integration work.
-Busy-turn delivery, reconciliation of uncertain artifacts, reviewed Git
-integration/cleanup, editable profiles/Jev, and release hardening are not implied
-by the desktop preview. See [validation](VALIDATION.md).
+Milestone 4 now adds editable global tools/profiles, durable plan publication,
+immutable operator approvals, separate local hosts, frozen root-task dispatch,
+and per-approval observation. See the [M4 checkpoint](M4-CHECKPOINT.md) for its
+fixture gates and qualified limits.
+
+Provider interactive continuation and the [multi-chat routing gate](NATIVE-ROUTING.md)
+remain separate integration work. Live host-to-Codex notifications, busy-turn
+delivery, verified DAG inputs, product API entitlement, and cross-platform release
+hardening are not implied by the local configuration/execution checkpoint. See
+[validation](VALIDATION.md).
 
 ## Default workflow example
 

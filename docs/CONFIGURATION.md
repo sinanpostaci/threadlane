@@ -59,12 +59,33 @@ transitions. Published payloads are immutable. Compilation resolves exact model,
 effort, executable, dependencies, and write scope against the pinned registry
 revision. It does not start workers or create execution authority.
 
-Current execution still requires trusted supervisor startup profiles described in
-[DISPATCH.md](DISPATCH.md). Connecting saved workflow preferences to an operator-
-approved project session and native conversation is a separate integration gate.
-Native multi-chat pairing and busy-turn delivery remain unverified until the live
-host acceptance test passes. A stored receipt alone is not proof that an external
-orchestrator ran.
+The paired native MCP server exposes binding-scoped catalog, draft, publication,
+and approved-task operations. Each call verifies its original operator enrollment;
+model-provided chat IDs cannot establish identity. Configure the same global
+registry, plans, and authority stores used by the desktop, together with a private
+sessions root. Store paths are trusted launch arguments, never MCP parameters.
+
+A desktop operator can preview a published plan and approve a verified repository,
+exact Git base commit, selected tasks, write paths, concurrency, and budgets.
+Directory scopes end with `/`; bare scopes name exact files. Approval alone starts
+neither a process nor a model. The separate **Start local session** action launches
+or attaches to a dedicated `threadlane-host` process. It leaves the original
+conversation observer attached to its control runtime. Closing the desktop does
+not stop that separately owned host.
+
+Once the host is authenticated and ready, the enrolled Codex follower can call
+`start_approved_task` with only the approval and task IDs. The backend loads the
+frozen instruction, model, effort, executable, scope, and idempotency key; the
+caller cannot replace them. Independent root AGY/OpenCode tasks are supported.
+Dependent tasks stay blocked until verified predecessor inputs are implemented;
+Codex roles remain native/manual routes.
+
+The legacy trusted startup-profile route remains documented in
+[DISPATCH.md](DISPATCH.md). Native two-chat isolation and busy-turn delivery still
+require live acceptance. A stored receipt alone does not prove that an external
+orchestrator ran. The separate approval hosts currently expose activity through
+MCP reads and the Plans session panel; automatic native follower notifications
+still require the live pairing/notification integration gate.
 
 CLI workers support bounded cancellation and safe replacement after a proven stop.
 In-flight provider steering is not implied. Uncertain outcomes block replacement
@@ -74,8 +95,12 @@ instead of starting duplicate work.
 
 The native application selects its registry under its app configuration directory
 and its plans under its app data directory. A trusted CLI launch may set
-`--registry-dir`; JavaScript cannot choose arbitrary storage roots. Credentials
-remain in the OS keychain, outside those JSON stores.
+`--registry-dir`; JavaScript cannot choose arbitrary storage roots. Plans,
+approvals, and host sessions live in separate subdirectories of application data.
+The Nix desktop wrapper supplies its matching `threadlane-host` companion on its
+own process PATH. Development launches may use the trusted `--host-executable`
+argument; it is not exposed to JavaScript. Credentials remain in the OS keychain,
+outside those JSON stores.
 
 The runtime's `state.db`, supervisor descriptor, logs, and task worktrees remain
 separate from configuration preferences and source control.
@@ -85,9 +110,10 @@ separate from configuration preferences and source control.
 An approval freezes the exact published revision, registry version, model/effort
 choices, repository, base commit, task instructions, write scopes, and budgets.
 It is an operator action, not an interpretation of worker text. The immutable
-approval foundation is implemented; desktop approval, host startup, and native
-workflow wiring are being integrated separately. Consult the current
-[checkpoint](M4-CHECKPOINT.md) before treating those paths as accepted end to end.
+approval and host boundaries are implemented and covered by local fixture tests.
+A successful worker is only **Ready for review**, with `accepted: false`; it never
+automatically merges, pushes, cleans worktrees, or marks a plan applied. Consult
+the current [checkpoint](M4-CHECKPOINT.md) for live acceptance limits.
 
 AGY and OpenCode are the current headless worker providers. Codex roles use native
 conversation routes. Dependent tasks require verified predecessor inputs; worker
