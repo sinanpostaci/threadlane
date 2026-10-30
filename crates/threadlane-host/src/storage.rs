@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -21,6 +22,14 @@ use crate::types::{
 const APPROVAL_ID_PREFIX: &str = "apr_";
 const APPROVAL_ID_HEX_LEN: usize = 32;
 const MAX_IDENTIFIER_LEN: usize = 128;
+const HOST_MANIFEST_TMP_PREFIX: &str = ".host-manifest.json.tmp.";
+const TASK_RECEIPTS_TMP_PREFIX: &str = ".task-receipts.json.tmp.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecognizedAtomicTemp {
+    committed_name: &'static str,
+    max_bytes: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -517,30 +526,179 @@ pub fn verify_existing_session_dir(
     }
 }
 
+fn is_valid_lowercase_uuid_v4_simple(suffix: &str) -> bool {
+    if suffix.len() != 32
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return false;
+    }
+    let Ok(parsed) = Uuid::parse_str(suffix) else {
+        return false;
+    };
+    parsed.get_version_num() == 4 && (parsed.as_bytes()[8] & 0xc0) == 0x80
+}
+
+fn recognized_atomic_temp(name: &str) -> Option<RecognizedAtomicTemp> {
+    if let Some(suffix) = name.strip_prefix(HOST_MANIFEST_TMP_PREFIX) {
+        if is_valid_lowercase_uuid_v4_simple(suffix) {
+            return Some(RecognizedAtomicTemp {
+                committed_name: HOST_MANIFEST_FILENAME,
+                max_bytes: MAX_HOST_MANIFEST_BYTES,
+            });
+        }
+    } else if let Some(suffix) = name.strip_prefix(TASK_RECEIPTS_TMP_PREFIX) {
+        if is_valid_lowercase_uuid_v4_simple(suffix) {
+            return Some(RecognizedAtomicTemp {
+                committed_name: TASK_RECEIPTS_FILENAME,
+                max_bytes: MAX_TASK_RECEIPTS_BYTES,
+            });
+        }
+    }
+    None
+}
+
 fn inspect_session_dir_entries(session_dir: &Path) -> Result<(), HostError> {
     let entries = fs::read_dir(session_dir).map_err(|err| HostError::Io {
         operation: "read_dir(session_dir)".to_string(),
         reason: err.to_string(),
     })?;
 
-    let mut seen_names = Vec::new();
+    let mut entry_names = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| HostError::Io {
             operation: "read_dir_entry(session_dir)".to_string(),
             reason: err.to_string(),
         })?;
-        let entry_path = entry.path();
-        let file_name = entry.file_name();
+        entry_names.push(entry.file_name());
+    }
+
+    inspect_session_dir_snapshot(session_dir, &entry_names)
+}
+
+/// Validates a snapshot of directory entry names observed inside `<sessions_root>/<approval_id>`.
+///
+/// Recognizes only the committed session artifacts and active/remnant atomic writer temporary
+/// files for `host-manifest.json` and `task-receipts.json` (`.<target>.tmp.<32-char lowercase UUIDv4>`),
+/// enforcing private `0600` regular file metadata and byte budgets while requiring at least one
+/// committed ownership anchor (`host.lock` or `host-manifest.json`) whenever the directory is
+/// non-empty.
+pub(crate) fn inspect_session_dir_snapshot<I, S>(
+    session_dir: &Path,
+    entry_names: I,
+) -> Result<(), HostError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut saw_any_entry = false;
+    let mut has_ownership_anchor = false;
+
+    for raw_name in entry_names {
+        saw_any_entry = true;
+        let file_name = raw_name.as_ref();
+        let entry_path = session_dir.join(file_name);
         let Some(name) = file_name.to_str() else {
             return Err(HostError::SecurityViolation {
                 path: entry_path.display().to_string(),
                 reason: "non-UTF-8 entry in session directory is not permitted".to_string(),
             });
         };
-        let meta = fs::symlink_metadata(&entry_path).map_err(|err| HostError::Io {
-            operation: "symlink_metadata(session_entry)".to_string(),
-            reason: err.to_string(),
-        })?;
+
+        if let Some(temp_spec) = recognized_atomic_temp(name) {
+            match fs::symlink_metadata(&entry_path) {
+                Ok(meta) => {
+                    if meta.file_type().is_symlink() {
+                        return Err(HostError::SecurityViolation {
+                            path: entry_path.display().to_string(),
+                            reason: "symlink inside session directory is not permitted".to_string(),
+                        });
+                    }
+                    validate_private_regular_metadata(&entry_path, &meta)?;
+                    if meta.len() > temp_spec.max_bytes as u64 {
+                        return Err(HostError::SecurityViolation {
+                            path: entry_path.display().to_string(),
+                            reason: format!(
+                                "transient atomic file `{name}` size ({} bytes) exceeds maximum {} bytes",
+                                meta.len(),
+                                temp_spec.max_bytes
+                            ),
+                        });
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    let committed_path = session_dir.join(temp_spec.committed_name);
+                    match fs::symlink_metadata(&committed_path) {
+                        Ok(committed_meta) => {
+                            if committed_meta.file_type().is_symlink() {
+                                return Err(HostError::SecurityViolation {
+                                    path: committed_path.display().to_string(),
+                                    reason: "symlink inside session directory is not permitted"
+                                        .to_string(),
+                                });
+                            }
+                            validate_private_regular_metadata(&committed_path, &committed_meta)?;
+                            if committed_meta.len() > temp_spec.max_bytes as u64 {
+                                return Err(HostError::SecurityViolation {
+                                    path: committed_path.display().to_string(),
+                                    reason: format!(
+                                        "committed atomic target `{}` size ({} bytes) exceeds maximum {} bytes",
+                                        temp_spec.committed_name,
+                                        committed_meta.len(),
+                                        temp_spec.max_bytes
+                                    ),
+                                });
+                            }
+                            if temp_spec.committed_name == HOST_MANIFEST_FILENAME {
+                                has_ownership_anchor = true;
+                            }
+                        }
+                        Err(committed_err)
+                            if committed_err.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(committed_err) => {
+                            return Err(HostError::Io {
+                                operation: "symlink_metadata(session_entry)".to_string(),
+                                reason: committed_err.to_string(),
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(HostError::Io {
+                        operation: "symlink_metadata(session_entry)".to_string(),
+                        reason: err.to_string(),
+                    });
+                }
+            }
+            continue;
+        }
+
+        let meta = match fs::symlink_metadata(&entry_path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                if !matches!(
+                    name,
+                    HOST_LOCK_FILENAME
+                        | HOST_MANIFEST_FILENAME
+                        | TASK_RECEIPTS_FILENAME
+                        | TASK_RECEIPTS_LOCK_FILENAME
+                        | RUNTIME_STATE_SUBDIR
+                        | WORK_AREA_SUBDIR
+                ) {
+                    return Err(HostError::SecurityViolation {
+                        path: entry_path.display().to_string(),
+                        reason: format!(
+                            "foreign or unexpected entry `{name}` in session directory"
+                        ),
+                    });
+                }
+                return Err(HostError::Io {
+                    operation: "symlink_metadata(session_entry)".to_string(),
+                    reason: err.to_string(),
+                });
+            }
+        };
         if meta.file_type().is_symlink() {
             return Err(HostError::SecurityViolation {
                 path: entry_path.display().to_string(),
@@ -549,12 +707,12 @@ fn inspect_session_dir_entries(session_dir: &Path) -> Result<(), HostError> {
         }
 
         match name {
-            HOST_LOCK_FILENAME
-            | HOST_MANIFEST_FILENAME
-            | TASK_RECEIPTS_FILENAME
-            | TASK_RECEIPTS_LOCK_FILENAME => {
+            HOST_LOCK_FILENAME | HOST_MANIFEST_FILENAME => {
                 validate_private_regular_metadata(&entry_path, &meta)?;
-                seen_names.push(name.to_string());
+                has_ownership_anchor = true;
+            }
+            TASK_RECEIPTS_FILENAME | TASK_RECEIPTS_LOCK_FILENAME => {
+                validate_private_regular_metadata(&entry_path, &meta)?;
             }
             RUNTIME_STATE_SUBDIR | WORK_AREA_SUBDIR => {
                 if !meta.file_type().is_dir() {
@@ -576,7 +734,6 @@ fn inspect_session_dir_entries(session_dir: &Path) -> Result<(), HostError> {
                         });
                     }
                 }
-                seen_names.push(name.to_string());
             }
             _ => {
                 return Err(HostError::SecurityViolation {
@@ -587,11 +744,7 @@ fn inspect_session_dir_entries(session_dir: &Path) -> Result<(), HostError> {
         }
     }
 
-    if !seen_names.is_empty()
-        && !seen_names
-            .iter()
-            .any(|n| n == HOST_LOCK_FILENAME || n == HOST_MANIFEST_FILENAME)
-    {
+    if saw_any_entry && !has_ownership_anchor {
         return Err(HostError::SecurityViolation {
             path: session_dir.display().to_string(),
             reason:
