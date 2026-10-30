@@ -2068,7 +2068,7 @@ export class ToolsPage {
       return haystack.includes(q);
     };
 
-    const renderPickerBody = (): void => {
+    const renderPickerBody = (renderRows = true): void => {
       const currentSelection = this.selection(key, importableModels);
       const query = this.catalogSearch.get(key) ?? '';
       const filtered = catalogModels.filter((model) => matchesSearch(model, query));
@@ -2103,18 +2103,20 @@ export class ToolsPage {
       }
       stateEl.replaceChildren(...stateNodes);
 
-      if (catalogModels.length === 0) {
+      if (renderRows && catalogModels.length === 0) {
         listEl.replaceChildren(
           h('p', { className: 'aq-note' }, 'The catalog reported no models.')
         );
-      } else if (filtered.length === 0) {
+      } else if (renderRows && filtered.length === 0) {
         listEl.replaceChildren(
           h('p', { className: 'aq-note' }, `No models match "${query.trim()}".`)
         );
-      } else {
+      } else if (renderRows) {
         listEl.replaceChildren(
           ...filtered.map((model, index) =>
-            this.catalogRow(tool, key, model, currentSelection, index, renderPickerBody)
+            this.catalogRow(tool, key, model, currentSelection, index, () =>
+              renderPickerBody(false)
+            )
           )
         );
       }

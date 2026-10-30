@@ -128,6 +128,7 @@
 
 .aq-tools-form-grid {
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  align-items: start;
 }
 
 .aq-tools-field {
@@ -142,10 +143,27 @@
   color: var(--aq-muted);
 }
 
-.aq-tools-field .aq-text-input,
+.aq-tools-field input.aq-text-input,
 .aq-tools-field select {
+  flex: none;
+  box-sizing: border-box;
   width: 100%;
   min-width: 0;
+  height: 36px;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--aq-line);
+  border-radius: 6px;
+  background: var(--aq-field);
+  color: var(--aq-text);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.aq-tools-field :is(input.aq-text-input, select):focus-visible {
+  border-color: var(--aq-accent);
+  outline: 2px solid var(--aq-accent);
+  outline-offset: 1px;
 }
 
 .aq-tools-check-field {
