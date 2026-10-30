@@ -160,6 +160,22 @@
   line-height: 1.4;
 }
 
+.aq-tools-field select {
+  /* Keep native theme metrics out of the compact select's text box. */
+  -webkit-appearance: none;
+  appearance: none;
+  height: max(36px, 2.5em);
+  padding-block: 0;
+  padding-inline-end: 32px;
+  line-height: normal;
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--aq-muted) 50%),
+    linear-gradient(135deg, var(--aq-muted) 50%, transparent 50%);
+  background-position: calc(100% - 15px) center, calc(100% - 10px) center;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+
 .aq-tools-field :is(input.aq-text-input, select):focus-visible {
   border-color: var(--aq-accent);
   outline: 2px solid var(--aq-accent);
