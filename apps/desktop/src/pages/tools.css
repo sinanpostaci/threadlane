@@ -698,6 +698,10 @@ input.aq-tools-catalog-search:focus-visible {
 }
 
 .aq-tools-catalog-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
   margin: 0;
   padding: 9px 10px;
   min-width: 0;
