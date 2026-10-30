@@ -180,6 +180,7 @@ pub fn build_supervisor_config_with_workers(
                 executable,
                 notify_bindings: allowlist,
                 timeout: Duration::from_millis(codex_timeout_ms),
+                approved_session: None,
             };
             cfg.validate()?;
             Some(cfg)

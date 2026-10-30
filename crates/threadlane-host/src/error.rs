@@ -400,19 +400,30 @@ impl From<threadlane::Error> for HostError {
                     }
                 }
                 Self::Runtime {
-                    code: format!("{:?}", api_err.code).to_ascii_lowercase(),
+                    code: runtime_error_code_str(api_err.code),
                     message: api_err.message,
                 }
             }
+            threadlane::Error::InvalidConfig(reason) => Self::Validation {
+                field: "config".to_string(),
+                reason,
+            },
             other => {
                 let api = other.to_api_error();
                 Self::Runtime {
-                    code: format!("{:?}", api.code).to_ascii_lowercase(),
+                    code: runtime_error_code_str(api.code),
                     message: api.message,
                 }
             }
         }
     }
+}
+
+fn runtime_error_code_str(code: RuntimeErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{code:?}").to_ascii_lowercase())
 }
 
 fn map_core_err(err: CoreError) -> HostError {

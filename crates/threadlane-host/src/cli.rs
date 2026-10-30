@@ -2,9 +2,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
+use threadlane::DEFAULT_CODEX_TIMEOUT_MS;
 
 use crate::error::HostError;
 use crate::host::{ApprovedHost, ApprovedHostConfig};
+use crate::types::ApprovedHostNotificationConfig;
 
 /// Command-line interface for the `threadlane-host` per-approval local execution host.
 #[derive(Debug, Clone, Parser)]
@@ -50,6 +52,44 @@ pub struct ServeArgs {
     /// Deterministic persisted approval identifier (`apr_<32hex>`) to host.
     #[arg(long = "approval-id")]
     pub approval_id: String,
+
+    /// Optional absolute path to the Codex executable for approved-session wake-up queueing (OFF by default).
+    #[arg(long = "notify-codex")]
+    pub notify_codex: Option<PathBuf>,
+
+    /// Optional bounded timeout in milliseconds for each Codex queue invocation (valid only with `--notify-codex`).
+    #[arg(long = "notify-timeout-ms")]
+    pub notify_timeout_ms: Option<u64>,
+}
+
+impl ServeArgs {
+    /// Validates CLI arguments (including optional notification flags) and constructs an [`ApprovedHostConfig`].
+    pub fn into_host_config(self) -> Result<ApprovedHostConfig, HostError> {
+        let mut config = ApprovedHostConfig::new(
+            self.registry_dir,
+            self.plans_dir,
+            self.authority_dir,
+            self.sessions_dir,
+            self.approval_id,
+        );
+
+        match (self.notify_codex, self.notify_timeout_ms) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                return Err(HostError::validation(
+                    "notify_timeout_ms",
+                    "`--notify-timeout-ms` cannot be used without `--notify-codex <ABS_EXEC>`",
+                ));
+            }
+            (Some(executable), timeout_opt) => {
+                let timeout_ms = timeout_opt.unwrap_or(DEFAULT_CODEX_TIMEOUT_MS);
+                let notify_cfg = ApprovedHostNotificationConfig::new(executable, timeout_ms)?;
+                config = config.with_notifications(notify_cfg);
+            }
+        }
+
+        Ok(config)
+    }
 }
 
 /// Executes a parsed [`HostCli`] command on the current Tokio runtime.
@@ -63,13 +103,7 @@ pub async fn run_cli(cli: HostCli) -> Result<(), HostError> {
 /// token-free [`crate::HostSessionSummary`] JSON line (ignoring broken pipes if stdio is closed),
 /// and keeps the host alive until explicit `SIGINT`/`SIGTERM` or a fatal supervisor error.
 pub async fn run_serve(args: ServeArgs) -> Result<(), HostError> {
-    let config = ApprovedHostConfig::new(
-        args.registry_dir,
-        args.plans_dir,
-        args.authority_dir,
-        args.sessions_dir,
-        args.approval_id,
-    );
+    let config = args.into_host_config()?;
 
     let handle = ApprovedHost::start(config).await?;
     let summary = handle.summary();

@@ -6,20 +6,21 @@ use threadlane::{
     WorkerSnapshot,
 };
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
-use threadlane_core::Binding;
+use threadlane_core::{AckResult, Binding, EventBatch};
 use threadlane_plans::PlanStore;
 use threadlane_registry::{RegistryStore, ToolAdapter};
 
 use crate::error::HostError;
 use crate::storage::{
-    derive_cancel_command_key, is_host_lock_held, now_epoch_ms, read_host_manifest_optional,
-    read_task_ledger_entry, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
-    validate_canonical_thread_uuid, validate_identifier, validate_sessions_root,
-    verify_existing_private_dir, verify_existing_session_dir,
+    derive_ack_command_key, derive_cancel_command_key, is_host_lock_held, now_epoch_ms,
+    read_host_manifest_optional, read_task_ledger_entry, record_task_dispatch_intent,
+    record_task_receipt, validate_approval_id, validate_canonical_thread_uuid, validate_identifier,
+    validate_sessions_root, verify_existing_private_dir, verify_existing_session_dir,
 };
 use crate::types::{
     HostPhase, HostSessionSummary, TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt,
-    TaskStateSnapshot, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
+    RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 
 struct VerifiedSession {
@@ -610,6 +611,90 @@ impl ApprovedHostClient {
             .list_activity(after_seq, cursor, limit, Some(receipt.run_id), kind)
             .await?;
         Ok(page)
+    }
+
+    /// Pulls a bounded batch of events from the approved session's full runtime event stream
+    /// and advances `delivered_seq` on the session binding.
+    ///
+    /// - Enforces default/max `limit = 20` ([`APPROVED_EVENT_BATCH_MAX_EVENTS`]); rejects `limit == Some(0)`
+    ///   or `limit > Some(20)` with [`HostError::Validation`] before any runtime mutation.
+    /// - Enforces the `49_152`-byte ([`APPROVED_EVENT_BATCH_MAX_BYTES`]) serialized batch budget via
+    ///   [`ScopedClient::pull_events_bounded`].
+    /// - Verifies active ready session state and original caller `control_binding_id` + `native_thread_uuid`
+    ///   on every call.
+    pub async fn pull_events(
+        &self,
+        approval_id: &str,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<EventBatch, HostError> {
+        let resolved_limit = limit.unwrap_or(APPROVED_EVENT_BATCH_MAX_EVENTS);
+        if resolved_limit == 0 || resolved_limit > APPROVED_EVENT_BATCH_MAX_EVENTS {
+            return Err(HostError::validation(
+                "limit",
+                format!(
+                    "limit must be between 1 and {APPROVED_EVENT_BATCH_MAX_EVENTS} (got {resolved_limit})"
+                ),
+            ));
+        }
+
+        let session = self.verify_active_ready_session(approval_id).await?;
+        let batch = session
+            .scoped_client
+            .pull_events_bounded(
+                after_seq,
+                Some(resolved_limit),
+                APPROVED_EVENT_BATCH_MAX_BYTES,
+            )
+            .await?;
+
+        if batch.binding_id != session.live_binding.binding_id {
+            return Err(HostError::ScopeMismatch {
+                field: "session_binding_id".to_string(),
+                expected: session.live_binding.binding_id.clone(),
+                actual: batch.binding_id,
+                reason: "event batch returned mismatched session_binding_id".to_string(),
+            });
+        }
+
+        Ok(batch)
+    }
+
+    /// Acknowledges a previously delivered event batch (`batch_id`) on the approved session's
+    /// runtime binding, advancing `acked_seq` and releasing or re-arming wake-up coverage.
+    ///
+    /// - Derives a deterministic idempotency command key internally from the approval's
+    ///   `subject_digest`, `session_binding_id`, and `batch_id` (no arbitrary caller keys).
+    /// - Verifies active ready session state and original caller `control_binding_id` + `native_thread_uuid`
+    ///   on every call.
+    pub async fn ack_events(
+        &self,
+        approval_id: &str,
+        batch_id: String,
+    ) -> Result<AckResult, HostError> {
+        validate_identifier("batch_id", &batch_id)?;
+        let session = self.verify_active_ready_session(approval_id).await?;
+        let command_key = derive_ack_command_key(
+            &session.record.subject_digest,
+            &session.live_binding.binding_id,
+            &batch_id,
+        );
+
+        let ack = session
+            .scoped_client
+            .ack_events(command_key, batch_id)
+            .await?;
+
+        if ack.binding_id != session.live_binding.binding_id {
+            return Err(HostError::ScopeMismatch {
+                field: "session_binding_id".to_string(),
+                expected: session.live_binding.binding_id.clone(),
+                actual: ack.binding_id,
+                reason: "ack result returned mismatched session_binding_id".to_string(),
+            });
+        }
+
+        Ok(ack)
     }
 
     fn resolve_authorized_approval(&self, approval_id: &str) -> Result<ApprovalRecord, HostError> {

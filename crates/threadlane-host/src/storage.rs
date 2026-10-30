@@ -220,6 +220,31 @@ pub fn derive_cancel_command_key(
     format!("cancel_{hex}")
 }
 
+/// Derives a deterministic, bounded command key for acknowledging a delivered event batch.
+///
+/// Keyed by domain separator (`threadlane-host-ack-v1`), the approval's `subject_digest`,
+/// the runtime `session_binding_id`, and `batch_id`.
+pub fn derive_ack_command_key(
+    subject_digest: &str,
+    session_binding_id: &str,
+    batch_id: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"threadlane-host-ack-v1\0");
+    hasher.update(subject_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(session_binding_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(batch_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(32);
+    for byte in &digest[..16] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("ack_{hex}")
+}
+
 /// Ensures no existing component of `path` is a symlink and rejects parent-directory traversal.
 pub fn ensure_no_symlink_components(path: &Path) -> Result<PathBuf, HostError> {
     let abs = if path.is_absolute() {
@@ -1043,6 +1068,7 @@ fn validate_host_manifest_structure(manifest: &HostSessionManifest) -> Result<()
             "manifest gates do not match phase invariants",
         ));
     }
+    manifest.notifications.validate()?;
     Ok(())
 }
 
@@ -1136,6 +1162,11 @@ fn verify_manifest_against_approval(
             "manifest execution gates do not match required phase invariants".to_string(),
         ));
     }
+    manifest.notifications.validate().map_err(|err| {
+        corrupt(format!(
+            "manifest notifications summary is inconsistent: {err}"
+        ))
+    })?;
     Ok(())
 }
 

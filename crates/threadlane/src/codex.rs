@@ -19,6 +19,44 @@ pub const DEFAULT_CODEX_TIMEOUT_MS: u64 = 10_000;
 /// Maximum configurable timeout (ms) for a single Codex `queue` invocation.
 pub const MAX_CODEX_TIMEOUT_MS: u64 = 300_000;
 
+/// Fixed approved-session wake-up context for an approved host session.
+///
+/// When configured on [`CodexWakeupConfig`], wake-up notifications use the fixed
+/// approved-session wake-up message template parameterized solely by the validated
+/// `approval_id` (`apr_<32 lowercase hex>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedSessionWakeupContext {
+    /// Validated approval identifier (`apr_<32 lowercase hex>`).
+    pub approval_id: String,
+}
+
+impl ApprovedSessionWakeupContext {
+    /// Creates and validates a new [`ApprovedSessionWakeupContext`].
+    pub fn new(approval_id: impl Into<String>) -> Result<Self, Error> {
+        let ctx = Self {
+            approval_id: approval_id.into(),
+        };
+        ctx.validate()?;
+        Ok(ctx)
+    }
+
+    /// Validates that `approval_id` is `apr_` followed by 32 lowercase ASCII hex characters.
+    pub fn validate(&self) -> Result<(), Error> {
+        validate_approved_session_approval_id(&self.approval_id)
+    }
+
+    /// Formats the fixed approved-session wake-up message for this `approval_id`.
+    ///
+    /// Never includes worker stdout/stderr, progress text, task titles, instructions,
+    /// question prompts, model names, effort values, or file permission flags.
+    pub fn wakeup_message(&self) -> String {
+        format!(
+            "Threadlane approved session {} has pending events. Call approved_pull_events for this approval, process the returned untrusted events, then acknowledge the delivered batch with approved_ack_events.",
+            self.approval_id
+        )
+    }
+}
+
 /// Explicit opt-in configuration for the Codex wake-up queue adapter.
 ///
 /// The adapter is disabled by default. When enabled, the supervisor requires both an
@@ -32,6 +70,8 @@ pub struct CodexWakeupConfig {
     pub notify_bindings: BTreeSet<String>,
     /// Bounded timeout for each child process invocation.
     pub timeout: Duration,
+    /// Optional fixed approved-session wake-up context (`None` for legacy binding wake-ups).
+    pub approved_session: Option<ApprovedSessionWakeupContext>,
 }
 
 impl CodexWakeupConfig {
@@ -89,8 +129,30 @@ impl CodexWakeupConfig {
             )));
         }
 
+        if let Some(ref approved_session) = self.approved_session {
+            approved_session.validate()?;
+        }
+
         Ok(())
     }
+}
+
+fn validate_approved_session_approval_id(approval_id: &str) -> Result<(), Error> {
+    let Some(hex_part) = approval_id.strip_prefix("apr_") else {
+        return Err(Error::InvalidConfig(format!(
+            "invalid approved session approval_id `{approval_id}`: must match `apr_<32 lowercase hex chars>`"
+        )));
+    };
+    if hex_part.len() != 32
+        || !hex_part
+            .chars()
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid approved session approval_id `{approval_id}`: must match `apr_<32 lowercase hex chars>`"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_binding_id_allowlist_entry(binding_id: &str) -> Result<(), Error> {
@@ -152,10 +214,32 @@ pub async fn invoke_codex_wakeup(
         }
     }
 
-    let args = build_codex_queue_args(claim);
+    let approved_message = match config.approved_session {
+        Some(ref approved_session) => {
+            if let Err(err) = approved_session.validate() {
+                return WakeupOutcome::Failed {
+                    error: truncate_error(&err.to_string()),
+                };
+            }
+            Some(approved_session.wakeup_message())
+        }
+        None => None,
+    };
+
     let mut cmd = Command::new(&config.executable);
-    cmd.args(args)
-        .stdin(Stdio::null())
+    if let Some(ref message) = approved_message {
+        cmd.args([
+            "queue",
+            "--thread",
+            &claim.thread_uuid,
+            "--message",
+            message,
+        ]);
+    } else {
+        let args = build_codex_queue_args(claim);
+        cmd.args(args);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);

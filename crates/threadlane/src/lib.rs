@@ -25,7 +25,10 @@ pub mod supervisor;
 pub mod workers;
 
 pub use client::{ScopedClient, SupervisorClient, MAX_CLIENT_RESPONSE_BYTES};
-pub use codex::{build_codex_queue_args, CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
+pub use codex::{
+    build_codex_queue_args, ApprovedSessionWakeupContext, CodexWakeupConfig,
+    DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,
+};
 pub use descriptor::{
     prepare_state_dir, RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME,
     DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION, LOCK_FILENAME, LOOPBACK_HOST,
