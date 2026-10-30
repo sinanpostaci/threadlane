@@ -582,6 +582,73 @@
   line-height: 1.5;
 }
 
+/* Calm setup surface shown before profiles have any selectable models. */
+.aq-profiles-setup {
+  display: grid;
+  gap: 9px;
+  min-width: 0;
+  padding: 14px 15px;
+  border: 1px solid var(--aq-line);
+  border-left: 3px solid var(--aq-accent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--aq-field) 38%, transparent);
+}
+
+.aq-profiles-setup[data-tone="warn"] {
+  border-left-color: var(--aq-warn);
+}
+
+.aq-profiles-setup[data-tone="error"] {
+  border-left-color: var(--aq-danger);
+}
+
+.aq-profiles-setup :is(h2, h3, h4) {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.35;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.aq-profiles-setup :is(p, li) {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 12.5px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.aq-profiles-setup :is(ul, ol) {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.aq-profiles-setup strong {
+  color: var(--aq-text);
+  font-weight: 600;
+}
+
+.aq-profiles-setup-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.aq-profiles-setup-actions .aq-btn {
+  min-height: 30px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+}
+
+.aq-profiles-setup-actions .aq-btn-primary {
+  font-weight: 600;
+}
+
 @media (max-width: 640px) {
   .aq-profiles-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -593,6 +660,15 @@
 }
 
 @media (max-width: 480px) {
+  .aq-profiles-setup {
+    padding: 11px 12px;
+  }
+
+  .aq-profiles-setup-actions .aq-btn {
+    flex: 1 1 110px;
+    min-width: 0;
+  }
+
   .aq-profiles-row {
     grid-template-columns: minmax(0, 1fr);
   }
