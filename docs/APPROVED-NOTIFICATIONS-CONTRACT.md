@@ -1,7 +1,8 @@
 # Approved-host notification contract (implementation branch)
 
-This next slice is not implemented or live-tested merely by this contract.
-Main checkpoint f86b4f6 remains the separately validated Linux pilot. Reuse the
+This contract defines the extension described in [approved-session
+notifications](APPROVED-NOTIFICATIONS.md); the contract itself is not validation
+evidence. Baseline checkpoint f86b4f6 is the separately validated Linux pilot. Reuse the
 existing queue transport and durable Core notice lifecycle. No real Codex chats,
 credentials, paid API calls, global configuration or OS services are touched.
 

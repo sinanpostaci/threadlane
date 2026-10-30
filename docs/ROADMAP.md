@@ -68,6 +68,11 @@ immutable operator approvals, separate local hosts, frozen root-task dispatch,
 and per-approval observation. See the [M4 checkpoint](M4-CHECKPOINT.md) for its
 fixture gates and qualified limits.
 
+The [approved-session notification extension](APPROVED-NOTIFICATIONS.md) adds
+default-off startup policy, fixed approval wake-ups and transactional byte-bounded
+event pull/ACK through the original paired native enrollment. Fake-process local
+coverage does not establish delivery to real native chats.
+
 Provider interactive continuation and the [multi-chat routing gate](NATIVE-ROUTING.md)
 remain separate integration work. Live host-to-Codex notifications, busy-turn
 delivery, verified DAG inputs, product API entitlement, and cross-platform release

@@ -537,6 +537,7 @@ exit 0
             executable: fake_codex,
             notify_bindings: BTreeSet::from([binding.binding_id.clone()]),
             timeout: Duration::from_millis(2_000),
+            approved_session: None,
         }),
         workers: Some(workers_cfg),
     })

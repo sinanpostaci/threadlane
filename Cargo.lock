@@ -2502,6 +2502,7 @@ dependencies = [
  "fs2",
  "libc",
  "rmcp",
+ "rusqlite",
  "schemars",
  "serde",
  "serde_json",

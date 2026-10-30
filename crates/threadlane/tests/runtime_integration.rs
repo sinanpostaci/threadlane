@@ -1122,6 +1122,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
         executable: PathBuf::from("relative/codex"),
         notify_bindings: BTreeSet::from(["bnd_123".to_string()]),
         timeout: Duration::from_millis(500),
+        approved_session: None,
     };
     assert!(matches!(rel_cfg.validate(), Err(Error::InvalidConfig(_))));
 
@@ -1158,6 +1159,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
             executable: fake_codex.clone(),
             notify_bindings: BTreeSet::from([binding_allowed.binding_id.clone()]),
             timeout: Duration::from_millis(2_000),
+            approved_session: None,
         }),
         workers: None,
     };
@@ -1322,6 +1324,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
             executable: slow_codex,
             notify_bindings: BTreeSet::from([binding_timeout.binding_id.clone()]),
             timeout: Duration::from_millis(80),
+            approved_session: None,
         }),
         workers: None,
     })
@@ -1382,6 +1385,7 @@ async fn test_codex_wakeup_exact_args_allowlist_timeout_and_no_repeat_dispatch()
             executable: non_exec_codex,
             notify_bindings: BTreeSet::from([binding_fail.binding_id.clone()]),
             timeout: Duration::from_millis(500),
+            approved_session: None,
         }),
         workers: None,
     })
@@ -1609,6 +1613,7 @@ async fn test_persistence_failure_stops_mutations_and_does_not_retry_wakeup() {
             executable: fake_codex,
             notify_bindings: BTreeSet::from([binding.binding_id.clone()]),
             timeout: Duration::from_millis(500),
+            approved_session: None,
         }),
         workers: None,
     })
@@ -2213,6 +2218,7 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
             executable: fake_codex.clone(),
             notify_bindings: BTreeSet::from([binding.binding_id.clone()]),
             timeout: Duration::from_millis(1_000),
+            approved_session: None,
         }),
         workers: None,
     })
@@ -2460,6 +2466,7 @@ async fn test_trusted_cli_retry_wakeup_failed_unknown_auth_and_mcp_rejection() {
             executable: toggle_codex,
             notify_bindings: BTreeSet::from([unknown_binding.binding_id.clone()]),
             timeout: Duration::from_millis(80),
+            approved_session: None,
         }),
         workers: None,
     })

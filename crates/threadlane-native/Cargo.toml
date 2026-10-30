@@ -32,3 +32,6 @@ threadlane-workers = { path = "../threadlane-workers" }
 threadlane-workflow = { path = "../threadlane-workflow" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1.8", features = ["v4", "serde"] }
+
+[dev-dependencies]
+rusqlite.workspace = true

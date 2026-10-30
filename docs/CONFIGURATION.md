@@ -83,9 +83,13 @@ Codex roles remain native/manual routes.
 The legacy trusted startup-profile route remains documented in
 [DISPATCH.md](DISPATCH.md). Native two-chat isolation and busy-turn delivery still
 require live acceptance. A stored receipt alone does not prove that an external
-orchestrator ran. The separate approval hosts currently expose activity through
-MCP reads and the Plans session panel; automatic native follower notifications
-still require the live pairing/notification integration gate.
+orchestrator ran. Separate approval hosts expose read-only activity through MCP
+and the Plans session panel. An explicit startup-only opt-in can also queue a
+fixed approval wake-up to the original Codex chat; it is off by default. The new
+`approved_pull_events` / `approved_ack_events` tools deliver and acknowledge that
+host's ordered stream without changing the control binding's cursors. See
+[approved-session notifications](APPROVED-NOTIFICATIONS.md) for configuration,
+recovery and the live pairing/notification acceptance gates.
 
 CLI workers support bounded cancellation and safe replacement after a proven stop.
 In-flight provider steering is not implied. Uncertain outcomes block replacement
