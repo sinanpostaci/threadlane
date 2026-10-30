@@ -1134,6 +1134,47 @@ async fn desktop_start_approved_session(
 }
 
 #[tauri::command]
+async fn desktop_stop_approved_session(
+    bridge: State<'_, DesktopBridge>,
+    control: State<'_, DesktopControlState>,
+    approval_id: String,
+    expected_instance_id: String,
+) -> Result<HostSessionSummary, AppError> {
+    host_control::stop_approved_session(&bridge, &control, approval_id, expected_instance_id).await
+}
+
+#[tauri::command]
+async fn desktop_restart_approved_session(
+    bridge: State<'_, DesktopBridge>,
+    control: State<'_, DesktopControlState>,
+    approval_id: String,
+    expected_prior_instance_id: String,
+    notify_codex_tool_id: Option<String>,
+) -> Result<HostSessionSummary, AppError> {
+    match notify_codex_tool_id {
+        Some(notify_codex_tool_id) => {
+            host_control::restart_approved_session_with_notifications(
+                &bridge,
+                &control,
+                approval_id,
+                expected_prior_instance_id,
+                Some(notify_codex_tool_id),
+            )
+            .await
+        }
+        None => {
+            host_control::restart_approved_session(
+                &bridge,
+                &control,
+                approval_id,
+                expected_prior_instance_id,
+            )
+            .await
+        }
+    }
+}
+
+#[tauri::command]
 async fn desktop_approved_session(
     bridge: State<'_, DesktopBridge>,
     control: State<'_, DesktopControlState>,
@@ -1306,6 +1347,8 @@ fn main() -> ExitCode {
             desktop_approve_plan,
             desktop_plan_approvals,
             desktop_start_approved_session,
+            desktop_stop_approved_session,
+            desktop_restart_approved_session,
             desktop_approved_session,
             desktop_approved_task,
             desktop_approved_activity,

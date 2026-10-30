@@ -1,7 +1,7 @@
 import type { ToolAdapter } from '../registry/types.ts';
 
 /** Lifecycle phase serialized by `threadlane_host::HostPhase`. */
-export type HostPhase = 'bootstrapping' | 'ready' | 'failed' | 'stopped';
+export type HostPhase = 'bootstrapping' | 'ready' | 'stopping' | 'failed' | 'stopped';
 
 /**
  * Execution gates from `threadlane_host::HostExecutionGates`.
@@ -42,6 +42,12 @@ export interface HostSessionSummary {
   plan_revision: number;
   /** Host-owned runtime session binding, distinct from `binding_id`. */
   session_binding_id: string | null;
+  /**
+   * Software-generated host instance identity (`hst_` + 32 lowercase hex).
+   * `undefined`/`null` identifies a legacy summary whose lifecycle controls
+   * remain unavailable.
+   */
+  instance_id?: string | null;
   phase: HostPhase;
   worker_profile_count: number;
   native_route_count: number;
@@ -230,6 +236,25 @@ export interface DesktopApprovedSessionArgs {
  */
 export interface DesktopStartApprovedSessionArgs {
   approvalId: string;
+  notifyCodexToolId?: string | null;
+}
+
+/** Arguments for the explicit `desktop_stop_approved_session` command. */
+export interface DesktopStopApprovedSessionArgs {
+  approvalId: string;
+  expectedInstanceId: string;
+}
+
+/**
+ * Arguments for the explicit `desktop_restart_approved_session` command.
+ *
+ * Only a trusted registry tool identifier may cross the bridge. Omitted or
+ * null means the new instance starts with notifications off; a prior opt-in is
+ * never restored automatically.
+ */
+export interface DesktopRestartApprovedSessionArgs {
+  approvalId: string;
+  expectedPriorInstanceId: string;
   notifyCodexToolId?: string | null;
 }
 

@@ -221,6 +221,8 @@ pub enum HostPhase {
     Bootstrapping,
     /// Final supervisor is running with frozen `WorkersConfig` and authenticated readiness was verified.
     Ready,
+    /// Host has accepted an idle stop request or initiated graceful shutdown and is draining before writing `Stopped`.
+    Stopping,
     /// Host startup or runtime faulted; preserved for diagnostics without claiming readiness.
     Failed,
     /// Host completed a clean graceful shutdown.
@@ -233,6 +235,7 @@ impl HostPhase {
         match self {
             Self::Bootstrapping => "bootstrapping",
             Self::Ready => "ready",
+            Self::Stopping => "stopping",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
         }
@@ -305,6 +308,9 @@ pub struct HostSessionManifest {
     pub plan_revision: u64,
     /// Single software-generated runtime session binding ID in `runtime-state`, once created or recovered.
     pub session_binding_id: Option<String>,
+    /// Public per-start host instance identifier (`hst_<32hex>`), or `None` for legacy manifests.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Current lifecycle phase of the host session.
     pub phase: HostPhase,
     /// Process ID of the owning `threadlane-host` instance while bootstrapping or ready.
@@ -377,6 +383,7 @@ impl HostSessionManifest {
             plan_id: record.plan_id.clone(),
             plan_revision: record.plan_revision,
             session_binding_id,
+            instance_id: None,
             phase,
             pid,
             worker_profile_count,
@@ -398,6 +405,12 @@ impl HostSessionManifest {
         self
     }
 
+    /// Sets the public per-start `instance_id` (`hst_<32hex>`) on this manifest.
+    pub fn with_instance_id(mut self, instance_id: Option<String>) -> Self {
+        self.instance_id = instance_id;
+        self
+    }
+
     /// Projects this manifest into a safe [`HostSessionSummary`] omitting any local path material or PIDs.
     pub fn to_summary(&self) -> HostSessionSummary {
         HostSessionSummary {
@@ -408,6 +421,7 @@ impl HostSessionManifest {
             plan_id: self.plan_id.clone(),
             plan_revision: self.plan_revision,
             session_binding_id: self.session_binding_id.clone(),
+            instance_id: self.instance_id.clone(),
             phase: self.phase,
             worker_profile_count: self.worker_profile_count,
             native_route_count: self.native_route_count,
@@ -439,6 +453,9 @@ pub struct HostSessionSummary {
     pub plan_revision: u64,
     /// Single software-generated runtime session binding ID inside the host's runtime supervisor.
     pub session_binding_id: Option<String>,
+    /// Public per-start host instance identifier (`hst_<32hex>`), or `None` for legacy manifests.
+    #[serde(default)]
+    pub instance_id: Option<String>,
     /// Current host session phase.
     pub phase: HostPhase,
     /// Number of headless worker profiles (`antigravity` or `opencode_v2`).

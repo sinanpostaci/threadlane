@@ -21,8 +21,54 @@ export interface HostRequestTicket {
 
 export interface StartLocalSessionOptions {
   nativeBridgeAvailable: boolean;
+  previewFixtureMode?: boolean;
   busy: boolean;
+  uncertain?: boolean;
   summary?: HostSessionSummary | null;
+}
+
+/** One explicit lifecycle action; all three share the panel's single guard. */
+export type HostLifecycleAction = 'start' | 'stop' | 'restart';
+
+export interface HostLifecycleEligibilityOptions {
+  nativeBridgeAvailable: boolean;
+  previewFixtureMode?: boolean;
+  busy: boolean;
+  uncertain?: boolean;
+  summary?: HostSessionSummary | null;
+}
+
+/** Exact `hst_` instance identity accepted from the host summary. */
+export function isValidHostInstanceId(raw: string | null | undefined): boolean {
+  return typeof raw === 'string' && /^hst_[0-9a-f]{32}$/.test(raw);
+}
+
+/** Stable identity key for one host instance, used to clear per-instance UI state. */
+export function hostInstanceId(
+  summary: HostSessionSummary | null | undefined
+): string | null {
+  const raw = summary?.instance_id?.trim() ?? '';
+  return raw ? raw : null;
+}
+
+export function hostInstanceChanged(
+  previous: HostSessionSummary | null | undefined,
+  next: HostSessionSummary | null | undefined
+): boolean {
+  return hostInstanceId(previous) !== hostInstanceId(next);
+}
+
+export function formatHostLifecycleActionLabel(action: HostLifecycleAction): string {
+  switch (action) {
+    case 'start':
+      return 'Starting';
+    case 'stop':
+      return 'Stopping';
+    case 'restart':
+      return 'Restarting';
+    default:
+      return 'Working';
+  }
 }
 
 /** Quiet operator-facing explanation for the explicit startup opt-in. */
@@ -202,11 +248,21 @@ export type HostErrorKind =
   | 'not_ready'
   | 'bridge_disconnected'
   | 'invalid_input'
+  | 'not_idle'
+  | 'instance_mismatch'
+  | 'uncertain'
+  | 'restart_not_allowed'
+  | 'control_unavailable'
   | 'other';
 
 export interface HostErrorState {
   kind: HostErrorKind;
   message: string | null;
+}
+
+/** Errors after which start, stop and restart stay disabled until refresh. */
+export function isUncertainHostErrorKind(kind: HostErrorKind | null): boolean {
+  return kind === 'uncertain' || kind === 'instance_mismatch';
 }
 
 function nonEmptyText(value: string | null | undefined): string | null {
@@ -232,6 +288,24 @@ export function buildHostRequestKey(
     context.connected,
     context.registryRevision ?? null,
     (context.codexTools ?? []).map((tool) => [tool.id, tool.label, tool.enabled]),
+  ]);
+}
+
+/**
+ * Lifecycle-action ticket key. Action and expected instance are part of the
+ * key so a late stop/restart response cannot mutate a newly selected chat or a
+ * new host instance.
+ */
+export function buildHostLifecycleRequestKey(
+  approval: ApprovalSummary,
+  context: HostPanelContext,
+  action: HostLifecycleAction,
+  expectedInstanceId: string | null | undefined
+): string {
+  return JSON.stringify([
+    buildHostRequestKey(approval, context),
+    action,
+    expectedInstanceId ?? '',
   ]);
 }
 
@@ -331,6 +405,8 @@ export function formatHostStatusLabel(
   switch (summary.phase) {
     case 'bootstrapping':
       return 'Bootstrapping';
+    case 'stopping':
+      return 'Stopping';
     case 'failed':
       return 'Failed';
     case 'stopped':
@@ -348,6 +424,9 @@ export function formatHostStatusTone(
   if (isHostSummaryReady(summary)) {
     return 'active';
   }
+  if (summary?.phase === 'stopping') {
+    return 'active';
+  }
   if (summary?.phase === 'failed' || summary?.phase === 'ready') {
     return 'warn';
   }
@@ -356,15 +435,21 @@ export function formatHostStatusTone(
 
 /**
  * Starting is available only from an actual native bridge, a connected exact
- * approval context, and no in-flight action. A matching ready/bootstrapping
- * session must not be started again from this panel.
+ * approval context, and no in-flight action. A matching ready/bootstrapping/
+ * stopping/failed/stopped session must not be started again from this panel; a
+ * stopped session requires the explicit Restart action.
  */
 export function canStartLocalSession(
   approval: ApprovalSummary,
   context: HostPanelContext,
   options: StartLocalSessionOptions
 ): boolean {
-  if (!options.nativeBridgeAvailable || options.busy) {
+  if (
+    !options.nativeBridgeAvailable ||
+    options.previewFixtureMode === true ||
+    options.uncertain === true ||
+    options.busy
+  ) {
     return false;
   }
   if (!approval.approval_id.trim() || !approval.subject_digest.trim()) {
@@ -374,11 +459,90 @@ export function canStartLocalSession(
     return false;
   }
   if (options.summary && hostSummaryMatchesContext(options.summary, approval, context)) {
-    if (options.summary.phase === 'ready' || options.summary.phase === 'bootstrapping') {
+    if (
+      options.summary.phase === 'ready' ||
+      options.summary.phase === 'bootstrapping' ||
+      options.summary.phase === 'stopping' ||
+      options.summary.phase === 'failed' ||
+      options.summary.phase === 'stopped'
+    ) {
       return false;
     }
   }
   return true;
+}
+
+function lifecycleControlsEligible(
+  approval: ApprovalSummary,
+  context: HostPanelContext,
+  options: HostLifecycleEligibilityOptions
+): boolean {
+  return (
+    options.nativeBridgeAvailable &&
+    options.previewFixtureMode !== true &&
+    options.uncertain !== true &&
+    !options.busy &&
+    approvalContextMatches(approval, context) &&
+    Boolean(approval.approval_id.trim()) &&
+    Boolean(approval.subject_digest.trim()) &&
+    options.summary != null &&
+    hostSummaryMatchesContext(options.summary, approval, context)
+  );
+}
+
+/** Stop is explicit and only offered for an authenticated Ready instance. */
+export function canStopLocalSession(
+  approval: ApprovalSummary,
+  context: HostPanelContext,
+  options: HostLifecycleEligibilityOptions
+): boolean {
+  if (!lifecycleControlsEligible(approval, context, options)) {
+    return false;
+  }
+  const summary = options.summary ?? null;
+  return isHostSummaryReady(summary) && isValidHostInstanceId(hostInstanceId(summary));
+}
+
+/**
+ * Restart is only offered from a clean Stopped manifest with a valid prior
+ * instance. Ready, Failed, Stopping and unknown phases never qualify.
+ */
+export function canRestartLocalSession(
+  approval: ApprovalSummary,
+  context: HostPanelContext,
+  options: HostLifecycleEligibilityOptions
+): boolean {
+  if (!lifecycleControlsEligible(approval, context, options)) {
+    return false;
+  }
+  const summary = options.summary ?? null;
+  return (
+    summary?.phase === 'stopped' &&
+    isValidHostInstanceId(hostInstanceId(summary))
+  );
+}
+
+/** Bounded operator hint for the one available lifecycle action. */
+export function hostLifecycleHint(
+  summary: HostSessionSummary | null | undefined,
+  uncertain: boolean
+): string {
+  if (uncertain) {
+    return 'The last lifecycle outcome is uncertain. Refresh status before starting, stopping, or restarting.';
+  }
+  if (!summary) {
+    return '';
+  }
+  switch (summary.phase) {
+    case 'ready':
+      return 'Stop idle session is explicit. The server may refuse it while any task or wake-up is active; cancel existing approved tasks first.';
+    case 'stopping':
+      return 'Stopping is in progress. Start, stop and restart are disabled until the host reports Stopped or Failed.';
+    case 'stopped':
+      return 'Restart creates a new host instance. Existing task receipts are not replayed and notification opt-in stays off unless selected again.';
+    default:
+      return '';
+  }
 }
 
 export function normalizeApprovedTaskIds(taskIds: readonly string[]): string[] {
@@ -627,6 +791,42 @@ export function classifyHostError(err: unknown): HostErrorState {
       return {
         kind: 'invalid_input',
         message: 'The approved session request was not valid.',
+      };
+    case 'host_not_idle':
+      return {
+        kind: 'not_idle',
+        message:
+          'The host reports active or pending work and refused the idle stop. Use the existing approved task cancellation controls, then retry.',
+      };
+    case 'host_instance_mismatch':
+      return {
+        kind: 'instance_mismatch',
+        message:
+          'The host instance changed or no longer matches this approval. Refresh status before retrying.',
+      };
+    case 'host_stop_outcome_uncertain':
+      return {
+        kind: 'uncertain',
+        message:
+          'Shutdown could not be confirmed. The session is not reported stopped; refresh status before another action.',
+      };
+    case 'host_restart_not_allowed':
+      return {
+        kind: 'restart_not_allowed',
+        message:
+          'Only a cleanly stopped session with the same instance can be restarted explicitly.',
+      };
+    case 'host_control_unavailable':
+      return {
+        kind: 'control_unavailable',
+        message:
+          'This host session does not expose authenticated lifecycle controls.',
+      };
+    case 'lock_busy':
+      return {
+        kind: 'other',
+        message:
+          'The host session is locked by an active host process. Refresh status before retrying.',
       };
     case 'notification_policy_change_requires_restart':
       return {

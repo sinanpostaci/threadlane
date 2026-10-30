@@ -36,8 +36,8 @@ pub use limits::{
 pub use types::{
     AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
     EventPayload, Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run,
-    RunListPage, RunRevision, RunStatus, RunSummary, TickReport, WakeupClaim, WakeupNotice,
-    WakeupOutcome, WakeupRetryRecord, WakeupStatus,
+    RunListPage, RunRevision, RunStatus, RunSummary, RuntimeIdleInspection, TickReport,
+    WakeupClaim, WakeupNotice, WakeupOutcome, WakeupRetryRecord, WakeupStatus,
 };
 pub use worker::{
     sanitize_worker_text, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord,

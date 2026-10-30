@@ -2,6 +2,12 @@
 
 Threadlane is a local execution middleware and control plane designed to work alongside a native Codex conversation. The user remains in their native Codex chat while Threadlane owns validated task state, durable event streams, revision checks, and process supervision.
 
+Everyday planning, questions, Steer, and work follow-up belong in Codex. The
+desktop is an optional observer and configuration surface. Initial pairing and
+trusted scope approval remain explicit setup boundaries; ordinary work should
+not require switching to the panel for each task. See
+[session lifecycle and its current limits](docs/SESSION-LIFECYCLE.md).
+
 > **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. Immutable operator approvals, detached local hosts, frozen-task MCP dispatch and default-off approved-session notifications have local fixture coverage. Production multi-chat onboarding, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [M4 baseline and its validation limits](docs/M4-CHECKPOINT.md), [approved-session notification extension](docs/APPROVED-NOTIFICATIONS.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
 
 ---
@@ -42,6 +48,21 @@ Threadlane is a local execution middleware and control plane designed to work al
 - **Desktop configuration and observation**: [Tauri desktop panel](docs/DESKTOP.md) (`Activity`, `Chats`, `Plans`, `Tools`, `Profiles`, `Settings`), editable global models/efforts and role/difficulty profiles, a separate local demo, read-only history, and configurable theme/accent/transparency.
 - **Milestone 4 execution checkpoint**: Durable draft/publication MCP operations, immutable operator approvals, separate per-approval host processes, and caller-scoped frozen-task dispatch are implemented with local fixture coverage. Jev/OpenAI Decisions adapters provide explicit synthetic tests; live credentials and automatic workflow classification are separate gates. The [configuration guide](docs/CONFIGURATION.md) distinguishes approval, host startup, dispatch, and review.
 - **Milestone 5**: Cross-platform release hardening, macOS/Windows native ACLs and secret storage, optional background service/tray packaging, and measured cost/notification budgets.
+
+### Optional Approved-Session Controls
+
+- **Explicit idle stop and stopped-session restart**: Operator controls use
+  authenticated owner scope and per-start instance identity. Active jobs prevent
+  idle stop; restart preserves receipts without replay and resets notification
+  opt-in. Closing the window leaves the approval host running.
+- **Native metadata context**: Read-only chat lists reject stale tool/filter/
+  registry replies, preserve input focus, and retain at most 100 distinct threads.
+  A missing executable path uses PATH discovery. Loading metadata never enrolls
+  a chat or grants approval.
+- **Validation limits**: Local tests include a real host CLI-process lifecycle.
+  Native multi-chat delivery and real provider compatibility remain separate
+  gates. No new lifecycle MCP tools are exposed. See
+  [session lifecycle](docs/SESSION-LIFECYCLE.md).
 
 ---
 

@@ -11,8 +11,9 @@ use threadlane_desktop_bridge::{ActivityPage, DesktopBridge};
 use threadlane_host::{
     is_host_lock_held, read_host_manifest_optional, validate_approval_id, validate_identifier,
     validate_sessions_root, verify_existing_session_dir, ApprovedHostClient,
-    ApprovedHostNotificationConfig, HostError, HostNotificationSummary, HostPhase,
-    HostSessionSummary, TaskStateSnapshot, TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
+    ApprovedHostNotificationConfig, HostControlRuntimeState, HostControlStatusResponse, HostError,
+    HostNotificationSummary, HostPhase, HostSessionSummary, TaskStateSnapshot,
+    TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
 };
 use threadlane_registry::{RegistrySnapshot, ToolAdapter};
 use tokio::process::{Child, Command};
@@ -51,6 +52,39 @@ const NOTIFY_TIMEOUT_MS_FLAG: &str = "--notify-timeout-ms";
 
 /// Maximum permitted length for an operator-selected notification tool ID.
 const MAX_NOTIFY_TOOL_ID_LEN: usize = 128;
+
+/// Exact CLI flag selecting the explicit restart-from-stopped path.
+const RESTART_FROM_INSTANCE_ID_FLAG: &str = "--restart-from-instance-id";
+
+/// Exact prefix for one host-session instance identifier (`hst_` + 32 lowercase hex).
+const HOST_INSTANCE_ID_PREFIX: &str = "hst_";
+
+/// Exact host-session instance identifier length (`hst_` + 32 hex characters).
+const HOST_INSTANCE_ID_LEN: usize = 36;
+
+/// Returns whether `raw` is exactly `hst_` followed by 32 lowercase hexadecimal characters.
+///
+/// JavaScript may supply only this identifier for lifecycle actions; it never
+/// becomes a process ID, filesystem path, token, or owner field.
+pub fn is_valid_host_instance_id(raw: &str) -> bool {
+    raw.len() == HOST_INSTANCE_ID_LEN
+        && raw.starts_with(HOST_INSTANCE_ID_PREFIX)
+        && raw[HOST_INSTANCE_ID_PREFIX.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Validates an exact host-session instance identifier and returns a bounded static error.
+pub fn validate_host_instance_id(raw: &str) -> Result<(), AppError> {
+    if is_valid_host_instance_id(raw) {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "validation",
+            "Host instance identifier must match hst_<32 lowercase hex characters>.",
+        ))
+    }
+}
 
 /// Bounded default notification timeout, matching the runtime Codex wake-up default (10s).
 /// The desktop cannot add a runtime-crate dependency here, so this value is kept stable.
@@ -93,7 +127,7 @@ struct ChildReaperEntry {
     last_exit_status: Option<ExitStatus>,
 }
 
-/// Process-local coordinator for per-approval async start serialization and non-blocking
+/// Process-local coordinator for per-approval async lifecycle serialization and non-blocking
 /// child-process exit reaping.
 ///
 /// Never holds a [`threadlane::SupervisorHandle`] or `host.lock`; dropping [`HostControlHub`]
@@ -157,8 +191,8 @@ impl HostControlHub {
         }
     }
 
-    /// Returns the per-approval async mutex used to serialize `desktop_start_approved_session`
-    /// calls within this desktop process.
+    /// Returns the per-approval async mutex used to serialize start, idle-stop,
+    /// and explicit-restart commands within this desktop process.
     pub fn approval_start_mutex(&self, approval_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut guard = self.start_locks.lock().unwrap_or_else(|e| e.into_inner());
         Arc::clone(
@@ -341,6 +375,22 @@ impl AppError {
                 "unpublished_or_superseded_plan",
                 "Approved source plan revision is no longer active published and cannot be executed.",
             ),
+            HostError::HostNotIdle { .. } => (
+                "host_not_idle",
+                "The host reports active or pending work and refused the idle stop. Use the existing approved task cancellation controls, then retry.",
+            ),
+            HostError::InstanceMismatch { .. } => (
+                "host_instance_mismatch",
+                "The approved host instance changed or does not match the expected instance. Refresh status before retrying.",
+            ),
+            HostError::StopOutcomeUncertain { .. } => (
+                "host_stop_outcome_uncertain",
+                "Host shutdown could not be confirmed. The session is not reported stopped; refresh status before another action.",
+            ),
+            HostError::RestartNotAllowed { .. } => (
+                "host_restart_not_allowed",
+                "Only a cleanly stopped session with the expected prior instance can be restarted explicitly.",
+            ),
             HostError::LockBusy { .. } => (
                 "lock_busy",
                 "Approved execution host session is already locked by an active host process.",
@@ -378,6 +428,10 @@ impl AppError {
                 "Host session runtime state failed integrity verification.",
             ),
             HostError::Authority { code, .. } => map_authority_code_static(&code),
+            HostError::Runtime { code, .. } if code == "host_control_not_configured" => (
+                "host_control_unavailable",
+                "This host session does not expose authenticated lifecycle controls.",
+            ),
             HostError::Runtime { .. } => (
                 "runtime_error",
                 "Host session runtime supervisor operation failed.",
@@ -523,6 +577,32 @@ pub fn build_host_serve_args_with_notifications(
     approval_id: &str,
     notifications: Option<&ApprovedHostNotificationConfig>,
 ) -> Result<Vec<OsString>, AppError> {
+    build_host_serve_args_with_control(
+        registry_dir,
+        plans_dir,
+        authority_dir,
+        sessions_dir,
+        approval_id,
+        notifications,
+        None,
+    )
+}
+
+/// Constructs the exact `threadlane-host serve` argument list for an ordinary
+/// start or an explicit restart from a validated prior instance.
+///
+/// A restart appends exactly `--restart-from-instance-id <hst_...>` after the
+/// frozen approval identity. Only a validated host instance ID can be added;
+/// no task IDs, PIDs, paths, or arbitrary argv are accepted.
+pub fn build_host_serve_args_with_control(
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+    approval_id: &str,
+    notifications: Option<&ApprovedHostNotificationConfig>,
+    restart_from_instance_id: Option<&str>,
+) -> Result<Vec<OsString>, AppError> {
     if approval_id.trim() != approval_id {
         return Err(AppError::new(
             "validation",
@@ -530,6 +610,10 @@ pub fn build_host_serve_args_with_notifications(
         ));
     }
     validate_approval_id(approval_id).map_err(AppError::from_host_error)?;
+
+    if let Some(instance_id) = restart_from_instance_id {
+        validate_host_instance_id(instance_id)?;
+    }
 
     for dir in [registry_dir, plans_dir, authority_dir, sessions_dir] {
         validate_clean_absolute_dir_arg(dir)?;
@@ -548,6 +632,11 @@ pub fn build_host_serve_args_with_notifications(
         OsString::from("--approval-id"),
         OsString::from(approval_id),
     ];
+
+    if let Some(instance_id) = restart_from_instance_id {
+        args.push(OsString::from(RESTART_FROM_INSTANCE_ID_FLAG));
+        args.push(OsString::from(instance_id));
+    }
 
     if let Some(config) = notifications {
         let canonical_executable = canonicalize_notification_executable(&config.executable)?;
@@ -929,6 +1018,26 @@ fn map_authority_or_host_code_static(code: &str) -> (&'static str, &'static str)
             "host_not_ready",
             "Approved execution host session is not running or has not reached authenticated ready state.",
         ),
+        "host_not_idle" => (
+            "host_not_idle",
+            "The host reports active or pending work and refused the idle stop.",
+        ),
+        "host_instance_mismatch" => (
+            "host_instance_mismatch",
+            "The approved host instance did not match the expected instance.",
+        ),
+        "host_stop_outcome_uncertain" => (
+            "host_stop_outcome_uncertain",
+            "Host shutdown could not be confirmed.",
+        ),
+        "host_restart_not_allowed" => (
+            "host_restart_not_allowed",
+            "Only a cleanly stopped session with the expected prior instance can be restarted explicitly.",
+        ),
+        "host_control_unavailable" => (
+            "host_control_unavailable",
+            "This host session does not expose authenticated lifecycle controls.",
+        ),
         "corrupt_manifest" => (
             "corrupt_manifest",
             "Persisted host session manifest failed integrity verification.",
@@ -1078,13 +1187,85 @@ async fn recheck_caller_bridge_snapshot(
     verify_snapshot_recheck(captured_ctx, &rechecked_snapshot)
 }
 
-async fn verify_authenticated_ready_summary(
+async fn read_host_control_status(
     client: &ApprovedHostClient,
     approval_id: &str,
-) -> Result<HostSessionSummary, AppError> {
-    let summary = client
+) -> Result<Option<HostControlStatusResponse>, AppError> {
+    match client.host_control_status(approval_id).await {
+        Ok(status) => Ok(status),
+        Err(HostError::HostNotReady { .. }) => Ok(None),
+        Err(HostError::Runtime { code, .. }) if code == "host_control_not_configured" => Ok(None),
+        Err(err) => Err(AppError::from_host_error(err)),
+    }
+}
+
+/// Projects authenticated runtime control information onto a manifest summary.
+///
+/// Only a matching owner scope and matching persisted instance may influence the
+/// projection. A runtime `Stopping` state always gates readiness false and is
+/// never converted into `Ready` or `Stopped`.
+fn apply_control_status_projection(
+    summary: &mut HostSessionSummary,
+    status: Option<&HostControlStatusResponse>,
+) -> Result<bool, AppError> {
+    let Some(status) = status else {
+        return Ok(summary.phase == HostPhase::Stopping);
+    };
+
+    // A legacy manifest without an instance ID keeps read-only status but never
+    // gains new lifecycle authority from an unpaired control response.
+    if summary.instance_id.is_none() {
+        return Ok(summary.phase == HostPhase::Stopping);
+    }
+
+    if status.approval_id != summary.approval_id
+        || status.subject_digest != summary.subject_digest
+        || status.control_binding_id != summary.binding_id
+        || status.thread_uuid != summary.thread_uuid
+        || summary.session_binding_id.as_deref() != Some(status.session_binding_id.as_str())
+    {
+        return Err(AppError::new(
+            "scope_mismatch",
+            "Authenticated host control status did not match this approval and conversation scope.",
+        ));
+    }
+
+    if summary.instance_id.as_deref() != Some(status.instance_id.as_str()) {
+        return Err(AppError::from_host_error(HostError::InstanceMismatch {
+            approval_id: summary.approval_id.clone(),
+            expected_instance_id: summary.instance_id.clone().unwrap_or_default(),
+            actual_instance_id: Some(status.instance_id.clone()),
+        }));
+    }
+
+    if matches!(&status.state, HostControlRuntimeState::Stopping) {
+        summary.phase = HostPhase::Stopping;
+        summary.gates.supervisor_authenticated_ready = false;
+    }
+
+    Ok(summary.phase == HostPhase::Stopping)
+}
+
+enum VerifiedHostState {
+    Ready(HostSessionSummary),
+    Stopping(HostSessionSummary),
+}
+
+async fn verify_authenticated_host_state(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+) -> Result<VerifiedHostState, AppError> {
+    let mut summary = client
         .session_summary(approval_id)
         .map_err(AppError::from_host_error)?;
+    let status = if summary.instance_id.is_some() {
+        read_host_control_status(client, approval_id).await?
+    } else {
+        None
+    };
+    if apply_control_status_projection(&mut summary, status.as_ref())? {
+        return Ok(VerifiedHostState::Stopping(summary));
+    }
 
     if summary.phase != HostPhase::Ready || !summary.gates.supervisor_authenticated_ready {
         return Err(AppError::new(
@@ -1105,7 +1286,29 @@ async fn verify_authenticated_ready_summary(
         ));
     }
 
-    Ok(sanitize_session_summary(summary))
+    let status_after = if summary.instance_id.is_some() {
+        read_host_control_status(client, approval_id).await?
+    } else {
+        None
+    };
+    if apply_control_status_projection(&mut summary, status_after.as_ref())? {
+        return Ok(VerifiedHostState::Stopping(summary));
+    }
+
+    Ok(VerifiedHostState::Ready(summary))
+}
+
+async fn verify_authenticated_ready_summary(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+) -> Result<HostSessionSummary, AppError> {
+    match verify_authenticated_host_state(client, approval_id).await? {
+        VerifiedHostState::Ready(summary) => Ok(sanitize_session_summary(summary)),
+        VerifiedHostState::Stopping(_) => Err(AppError::new(
+            "host_not_ready",
+            "Approved execution host session is stopping and is not ready.",
+        )),
+    }
 }
 
 async fn poll_until_authenticated_ready(
@@ -1140,17 +1343,19 @@ async fn poll_until_authenticated_ready(
             let lock_held = is_host_lock_held(&verified_dir).map_err(AppError::from_host_error)?;
 
             if let Some(ref manifest) = manifest_opt {
-                if manifest.phase == HostPhase::Failed && !lock_held {
-                    return Err(AppError::new(
-                        "host_startup_failed",
-                        "Approved execution host session failed during startup.",
-                    ));
-                }
-                if manifest.phase == HostPhase::Stopped && !lock_held {
-                    return Err(AppError::new(
-                        "host_not_ready",
-                        "Approved execution host session stopped before reaching ready state.",
-                    ));
+                if !spawned_by_this_call {
+                    if manifest.phase == HostPhase::Failed && !lock_held {
+                        return Err(AppError::new(
+                            "host_startup_failed",
+                            "Approved execution host session failed during startup.",
+                        ));
+                    }
+                    if manifest.phase == HostPhase::Stopped && !lock_held {
+                        return Err(AppError::new(
+                            "host_not_ready",
+                            "Approved execution host session stopped before reaching ready state.",
+                        ));
+                    }
                 }
             }
 
@@ -1201,13 +1406,12 @@ pub(crate) async fn start_approved_session(
 ///   and `record.thread_uuid` (initial check + recheck before action).
 /// - Resolves only an enabled `codex_cli` registry tool; raw paths/threads/argv are never accepted.
 /// - Verifies source plan publication and side-effect-free materialization via `AuthorityStore::materialize`.
-/// - Serializes per-approval starts via an async mutex and OS-level `host.lock`.
+/// - Serializes per-approval lifecycle actions via an async mutex and OS-level `host.lock`.
 /// - Attaches without spawning if an active authenticated host is already `Ready` (proven via
 ///   `ApprovedHostClient::list_activity(limit = 1)`) and its actual startup notification policy
 ///   matches the requested policy; a mismatch never restarts or mutates the live host.
-/// - Otherwise rechecks attachment and selected-tool identity, then spawns `threadlane-host serve`
-///   in its own Unix process group with stdio null and `kill_on_drop(false)`, and polls bounded
-///   readiness (`<= 15s`).
+/// - Rejects an existing `Stopped` session; only the explicit restart command may start a new
+///   instance from durable stopped evidence.
 pub(crate) async fn start_approved_session_with_notifications(
     bridge: &DesktopBridge,
     control: &DesktopControlState,
@@ -1232,6 +1436,108 @@ pub(crate) async fn start_approved_session_with_notifications(
     recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
     control.host_control.reap_all_finished();
 
+    launch_authenticated_host(
+        bridge,
+        control,
+        &record,
+        &captured_ctx,
+        notification_selection.as_ref(),
+        &requested_notifications,
+        HostLaunchMode::Start,
+    )
+    .await
+}
+
+/// Operator-only desktop command implementation for `desktop_restart_approved_session`.
+///
+/// Existing notification-off callers keep this exact signature.
+pub(crate) async fn restart_approved_session(
+    bridge: &DesktopBridge,
+    control: &DesktopControlState,
+    approval_id: String,
+    expected_prior_instance_id: String,
+) -> Result<HostSessionSummary, AppError> {
+    restart_approved_session_with_notifications(
+        bridge,
+        control,
+        approval_id,
+        expected_prior_instance_id,
+        None,
+    )
+    .await
+}
+
+/// Explicit restart from a cleanly stopped session and matching prior instance.
+///
+/// A restart never stops a running host, never replays prior tasks, and never
+/// restores a previous notification opt-in. Existing task receipts are allowed
+/// only on this explicit path; the host revalidates them under `host.lock`.
+pub(crate) async fn restart_approved_session_with_notifications(
+    bridge: &DesktopBridge,
+    control: &DesktopControlState,
+    approval_id: String,
+    expected_prior_instance_id: String,
+    notify_codex_tool_id: Option<String>,
+) -> Result<HostSessionSummary, AppError> {
+    ensure_host_platform_supported()?;
+    validate_host_instance_id(&expected_prior_instance_id)?;
+    control.host_control.reap_all_finished();
+
+    let (record, captured_ctx) =
+        verify_caller_and_load_approval(bridge, control, &approval_id, true).await?;
+
+    let notification_selection =
+        resolve_notification_launch_selection(control, notify_codex_tool_id.as_deref())?;
+    let requested_notifications = requested_notification_summary(notification_selection.as_ref());
+
+    let start_mutex = control
+        .host_control
+        .approval_start_mutex(&record.approval_id);
+    let _start_guard = start_mutex.lock().await;
+
+    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+    control.host_control.reap_all_finished();
+
+    launch_authenticated_host(
+        bridge,
+        control,
+        &record,
+        &captured_ctx,
+        notification_selection.as_ref(),
+        &requested_notifications,
+        HostLaunchMode::Restart {
+            expected_prior_instance_id: &expected_prior_instance_id,
+        },
+    )
+    .await
+}
+
+/// Operator-only desktop command implementation for `desktop_stop_approved_session`.
+///
+/// Stop only requests an idle authenticated shutdown; it never sends a signal,
+/// uses a PID, inspects a child handle, or treats EOF as stop proof. A matching
+/// durable `Stopped` manifest with a released `host.lock` is the only success.
+pub(crate) async fn stop_approved_session(
+    bridge: &DesktopBridge,
+    control: &DesktopControlState,
+    approval_id: String,
+    expected_instance_id: String,
+) -> Result<HostSessionSummary, AppError> {
+    ensure_host_platform_supported()?;
+    validate_host_instance_id(&expected_instance_id)?;
+    control.host_control.reap_all_finished();
+
+    let (record, captured_ctx) =
+        verify_caller_and_load_approval(bridge, control, &approval_id, false).await?;
+
+    let start_mutex = control
+        .host_control
+        .approval_start_mutex(&record.approval_id);
+    let _start_guard = start_mutex.lock().await;
+
+    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+    control.host_control.reap_all_finished();
+
     let client = ApprovedHostClient::new(
         Arc::clone(&control.authority),
         &control.sessions_dir,
@@ -1240,88 +1546,290 @@ pub(crate) async fn start_approved_session_with_notifications(
     )
     .map_err(AppError::from_host_error)?;
 
-    match verify_existing_session_dir(&control.sessions_dir, &record.approval_id) {
-        Ok(session_dir) => {
-            let manifest_opt = read_host_manifest_optional(&session_dir, &record)
-                .map_err(AppError::from_host_error)?;
-            let lock_held = is_host_lock_held(&session_dir).map_err(AppError::from_host_error)?;
-            let has_receipts = session_dir.join(TASK_RECEIPTS_FILENAME).exists();
+    let mut summary = client
+        .session_summary(&record.approval_id)
+        .map_err(AppError::from_host_error)?;
 
-            if lock_held {
-                if manifest_opt.as_ref().is_some_and(|m| {
-                    m.phase == HostPhase::Ready && m.gates.supervisor_authenticated_ready
-                }) {
-                    if let Ok(ready_summary) =
-                        verify_authenticated_ready_summary(&client, &record.approval_id).await
-                    {
+    match summary.instance_id.as_deref() {
+        Some(actual) if actual != expected_instance_id => {
+            return Err(AppError::from_host_error(HostError::InstanceMismatch {
+                approval_id: record.approval_id.clone(),
+                expected_instance_id: expected_instance_id.clone(),
+                actual_instance_id: Some(actual.to_string()),
+            }));
+        }
+        Some(_) => {}
+        None => {
+            return Err(AppError::new(
+                "host_control_unavailable",
+                "This legacy host session has no instance identity; lifecycle controls are unavailable.",
+            ));
+        }
+    }
+
+    let session_dir = verify_existing_session_dir(&control.sessions_dir, &record.approval_id)
+        .map_err(AppError::from_host_error)?;
+    let lock_held = is_host_lock_held(&session_dir).map_err(AppError::from_host_error)?;
+
+    if summary.phase == HostPhase::Stopped && !lock_held {
+        recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+        return Ok(sanitize_session_summary(summary));
+    }
+
+    let status = read_host_control_status(&client, &record.approval_id).await?;
+    if status.is_none() {
+        if matches!(summary.phase, HostPhase::Stopping | HostPhase::Stopped) {
+            return Err(AppError::from_host_error(HostError::StopOutcomeUncertain {
+                approval_id: record.approval_id.clone(),
+                detail: "shutdown is in progress without an observable control status".to_string(),
+            }));
+        }
+        return Err(AppError::new(
+            "host_control_unavailable",
+            "This host session does not expose authenticated lifecycle controls.",
+        ));
+    }
+    apply_control_status_projection(&mut summary, status.as_ref())?;
+
+    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+
+    let stopped = client
+        .stop_idle_session(&record.approval_id, &expected_instance_id)
+        .await
+        .map_err(AppError::from_host_error)?;
+    control.host_control.reap_all_finished();
+
+    let released = verify_existing_session_dir(&control.sessions_dir, &record.approval_id)
+        .and_then(|dir| is_host_lock_held(&dir))
+        .map(|held| !held)
+        .unwrap_or(false);
+
+    if stopped.phase != HostPhase::Stopped
+        || stopped.instance_id.as_deref() != Some(expected_instance_id.as_str())
+        || !released
+    {
+        return Err(AppError::from_host_error(HostError::StopOutcomeUncertain {
+            approval_id: record.approval_id.clone(),
+            detail: "durable stopped state or lock release was not observed".to_string(),
+        }));
+    }
+
+    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+    Ok(sanitize_session_summary(stopped))
+}
+
+#[derive(Clone, Copy)]
+enum HostLaunchMode<'a> {
+    Start,
+    Restart { expected_prior_instance_id: &'a str },
+}
+
+fn restart_not_allowed_error(
+    record: &ApprovalRecord,
+    phase: Option<HostPhase>,
+    detail: &'static str,
+) -> AppError {
+    AppError::from_host_error(HostError::RestartNotAllowed {
+        approval_id: record.approval_id.clone(),
+        phase,
+        detail: detail.to_string(),
+    })
+}
+
+/// Validates explicit restart eligibility against persisted stopped evidence.
+///
+/// Lock check comes first so a running or concurrently restarting host is never
+/// mutated. Only `Stopped`, a matching prior instance, and a released lock pass.
+fn validate_restart_target(
+    record: &ApprovalRecord,
+    summary: &HostSessionSummary,
+    expected_prior_instance_id: &str,
+    lock_held: bool,
+) -> Result<(), AppError> {
+    if lock_held {
+        return Err(restart_not_allowed_error(
+            record,
+            Some(summary.phase),
+            "host lock is held",
+        ));
+    }
+    if summary.phase != HostPhase::Stopped {
+        return Err(restart_not_allowed_error(
+            record,
+            Some(summary.phase),
+            "host session is not cleanly stopped",
+        ));
+    }
+    match summary.instance_id.as_deref() {
+        Some(actual) if actual == expected_prior_instance_id => Ok(()),
+        Some(actual) => Err(AppError::from_host_error(HostError::InstanceMismatch {
+            approval_id: record.approval_id.clone(),
+            expected_instance_id: expected_prior_instance_id.to_string(),
+            actual_instance_id: Some(actual.to_string()),
+        })),
+        None => Err(restart_not_allowed_error(
+            record,
+            Some(summary.phase),
+            "stopped manifest has no instance identity",
+        )),
+    }
+}
+
+fn existing_start_phase_error(phase: HostPhase) -> Option<AppError> {
+    match phase {
+        HostPhase::Ready | HostPhase::Bootstrapping => Some(AppError::new(
+            "host_not_ready",
+            "Existing host session manifest is not backed by an active authenticated host process.",
+        )),
+        HostPhase::Stopping => Some(AppError::new(
+            "host_not_ready",
+            "Approved host session is stopping; wait for Stopped and use explicit Restart.",
+        )),
+        HostPhase::Failed => Some(AppError::new(
+            "host_startup_failed",
+            "Approved execution host session previously failed startup.",
+        )),
+        HostPhase::Stopped => Some(AppError::new(
+            "host_not_ready",
+            "Approved host session is stopped; use explicit Restart to create a new instance.",
+        )),
+    }
+}
+
+async fn launch_authenticated_host(
+    bridge: &DesktopBridge,
+    control: &DesktopControlState,
+    record: &ApprovalRecord,
+    captured_ctx: &VerifiedBindingContext,
+    notification_selection: Option<&NotificationLaunchSelection>,
+    requested_notifications: &HostNotificationSummary,
+    mode: HostLaunchMode<'_>,
+) -> Result<HostSessionSummary, AppError> {
+    let client = ApprovedHostClient::new(
+        Arc::clone(&control.authority),
+        &control.sessions_dir,
+        &record.binding_id,
+        &record.thread_uuid,
+    )
+    .map_err(AppError::from_host_error)?;
+
+    match mode {
+        HostLaunchMode::Start => {
+            match verify_existing_session_dir(&control.sessions_dir, &record.approval_id) {
+                Ok(session_dir) => {
+                    let manifest_opt = read_host_manifest_optional(&session_dir, record)
+                        .map_err(AppError::from_host_error)?;
+                    let lock_held =
+                        is_host_lock_held(&session_dir).map_err(AppError::from_host_error)?;
+                    let has_receipts = session_dir.join(TASK_RECEIPTS_FILENAME).exists();
+
+                    if lock_held {
+                        if manifest_opt.as_ref().is_some_and(|m| {
+                            m.phase == HostPhase::Ready && m.gates.supervisor_authenticated_ready
+                        }) {
+                            if let Ok(ready_summary) =
+                                verify_authenticated_ready_summary(&client, &record.approval_id)
+                                    .await
+                            {
+                                verify_notification_policy_on_attach(
+                                    &ready_summary.notifications,
+                                    requested_notifications,
+                                )?;
+                                recheck_caller_bridge_snapshot(bridge, captured_ctx).await?;
+                                return Ok(ready_summary);
+                            }
+                        }
+                        let ready_summary =
+                            poll_until_authenticated_ready(control, &client, record, false).await?;
                         verify_notification_policy_on_attach(
                             &ready_summary.notifications,
-                            &requested_notifications,
+                            requested_notifications,
                         )?;
-                        recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+                        recheck_caller_bridge_snapshot(bridge, captured_ctx).await?;
                         return Ok(ready_summary);
                     }
-                }
-                let ready_summary =
-                    poll_until_authenticated_ready(control, &client, &record, false).await?;
-                verify_notification_policy_on_attach(
-                    &ready_summary.notifications,
-                    &requested_notifications,
-                )?;
-                recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
-                return Ok(ready_summary);
-            }
 
-            if has_receipts {
-                return Err(AppError::new(
-                    "host_not_ready",
-                    "Approved execution host session has recorded task receipts and is offline; automatic restart of prior work is disabled.",
-                ));
-            }
+                    if let Some(err) = manifest_opt
+                        .as_ref()
+                        .and_then(|manifest| existing_start_phase_error(manifest.phase))
+                    {
+                        return Err(err);
+                    }
 
-            if let Some(manifest) = manifest_opt {
-                match manifest.phase {
-                    HostPhase::Ready | HostPhase::Bootstrapping => {
+                    if has_receipts {
                         return Err(AppError::new(
-                            "host_not_ready",
-                            "Existing host session manifest is not backed by an active authenticated host process.",
-                        ));
+                        "host_not_ready",
+                        "Approved execution host session has recorded task receipts and is offline; automatic restart of prior work is disabled.",
+                    ));
                     }
-                    HostPhase::Failed => {
-                        return Err(AppError::new(
-                            "host_startup_failed",
-                            "Approved execution host session previously failed startup.",
-                        ));
-                    }
-                    HostPhase::Stopped => {}
                 }
+                Err(HostError::HostNotReady { phase: None, .. }) => {}
+                Err(other_err) => return Err(AppError::from_host_error(other_err)),
             }
         }
-        Err(HostError::HostNotReady { phase: None, .. }) => {}
-        Err(other_err) => return Err(AppError::from_host_error(other_err)),
+        HostLaunchMode::Restart {
+            expected_prior_instance_id,
+        } => {
+            let session_dir = verify_existing_session_dir(
+                &control.sessions_dir,
+                &record.approval_id,
+            )
+            .map_err(|_| {
+                restart_not_allowed_error(record, None, "no durable stopped host session exists")
+            })?;
+            let manifest = read_host_manifest_optional(&session_dir, record)
+                .map_err(AppError::from_host_error)?
+                .ok_or_else(|| {
+                    restart_not_allowed_error(
+                        record,
+                        None,
+                        "stopped host session manifest is missing",
+                    )
+                })?;
+            let lock_held = is_host_lock_held(&session_dir).map_err(AppError::from_host_error)?;
+            validate_restart_target(
+                record,
+                &manifest.to_summary(),
+                expected_prior_instance_id,
+                lock_held,
+            )?;
+        }
     }
 
     let canonical_exe = resolve_host_executable(control.host_executable.as_deref())?;
-    let serve_args = match notification_selection.as_ref() {
-        Some(selection) => build_host_serve_args_with_notifications(
+    let serve_args = match mode {
+        HostLaunchMode::Start => match notification_selection {
+            Some(selection) => build_host_serve_args_with_notifications(
+                control.registry.config_dir(),
+                control.plans.dir(),
+                control.authority.dir(),
+                &control.sessions_dir,
+                &record.approval_id,
+                Some(&selection.config),
+            )?,
+            None => build_host_serve_args(
+                control.registry.config_dir(),
+                control.plans.dir(),
+                control.authority.dir(),
+                &control.sessions_dir,
+                &record.approval_id,
+            )?,
+        },
+        HostLaunchMode::Restart {
+            expected_prior_instance_id,
+        } => build_host_serve_args_with_control(
             control.registry.config_dir(),
             control.plans.dir(),
             control.authority.dir(),
             &control.sessions_dir,
             &record.approval_id,
-            Some(&selection.config),
-        )?,
-        None => build_host_serve_args(
-            control.registry.config_dir(),
-            control.plans.dir(),
-            control.authority.dir(),
-            &control.sessions_dir,
-            &record.approval_id,
+            notification_selection.map(|selection| &selection.config),
+            Some(expected_prior_instance_id),
         )?,
     };
 
-    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
-    recheck_notification_tool_identity(control, notification_selection.as_ref())?;
+    recheck_caller_bridge_snapshot(bridge, captured_ctx).await?;
+    recheck_notification_tool_identity(control, notification_selection)?;
 
     control.host_control.spawn_detached_host_process(
         &record.approval_id,
@@ -1329,18 +1837,36 @@ pub(crate) async fn start_approved_session_with_notifications(
         &serve_args,
     )?;
 
-    let ready_summary = poll_until_authenticated_ready(control, &client, &record, true).await?;
-    verify_notification_policy_on_attach(&ready_summary.notifications, &requested_notifications)?;
-    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+    let ready_summary = poll_until_authenticated_ready(control, &client, record, true).await?;
+    verify_notification_policy_on_attach(&ready_summary.notifications, requested_notifications)?;
+    recheck_caller_bridge_snapshot(bridge, captured_ctx).await?;
+
+    if let HostLaunchMode::Restart {
+        expected_prior_instance_id,
+    } = mode
+    {
+        if !matches!(
+            ready_summary.instance_id.as_deref(),
+            Some(actual) if actual != expected_prior_instance_id
+        ) {
+            return Err(AppError::from_host_error(HostError::InstanceMismatch {
+                approval_id: record.approval_id.clone(),
+                expected_instance_id: expected_prior_instance_id.to_string(),
+                actual_instance_id: ready_summary.instance_id.clone(),
+            }));
+        }
+    }
+
     Ok(ready_summary)
 }
 
 /// Operator-only read-only desktop command implementation for `desktop_approved_session`.
 ///
 /// Verifies caller runtime attachment and binding context, reads the session summary via
-/// [`ApprovedHostClient`], and requires authenticated supervisor readiness via
+/// [`ApprovedHostClient`], projects authenticated runtime `Stopping` with readiness
+/// gates false, and requires authenticated supervisor readiness via
 /// `ApprovedHostClient::list_activity(limit = 1)` before returning `HostPhase::Ready`.
-/// Stopped or offline manifests never report `Ready`.
+/// Stopped, stopping, or offline manifests never report `Ready`.
 pub(crate) async fn approved_session(
     bridge: &DesktopBridge,
     control: &DesktopControlState,
@@ -1363,12 +1889,36 @@ pub(crate) async fn approved_session(
     let mut summary = client
         .session_summary(&record.approval_id)
         .map_err(AppError::from_host_error)?;
+    let status = if summary.instance_id.is_some()
+        && matches!(
+            summary.phase,
+            HostPhase::Ready | HostPhase::Bootstrapping | HostPhase::Stopping
+        ) {
+        read_host_control_status(&client, &record.approval_id).await?
+    } else {
+        None
+    };
+    let stopping = apply_control_status_projection(&mut summary, status.as_ref())?;
+
+    if stopping || summary.phase == HostPhase::Stopping {
+        summary.gates.supervisor_authenticated_ready = false;
+        recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+        return Ok(sanitize_session_summary(summary));
+    }
 
     match summary.phase {
         HostPhase::Ready => {
-            let verified = verify_authenticated_ready_summary(&client, &record.approval_id).await?;
-            recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
-            Ok(verified)
+            match verify_authenticated_host_state(&client, &record.approval_id).await? {
+                VerifiedHostState::Ready(verified) => {
+                    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+                    Ok(sanitize_session_summary(verified))
+                }
+                VerifiedHostState::Stopping(mut stopping_summary) => {
+                    stopping_summary.gates.supervisor_authenticated_ready = false;
+                    recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+                    Ok(sanitize_session_summary(stopping_summary))
+                }
+            }
         }
         HostPhase::Bootstrapping => {
             summary.gates.supervisor_authenticated_ready = false;
@@ -1385,7 +1935,7 @@ pub(crate) async fn approved_session(
             recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
             Ok(sanitize_session_summary(summary))
         }
-        HostPhase::Stopped | HostPhase::Failed => {
+        HostPhase::Stopping | HostPhase::Stopped | HostPhase::Failed => {
             summary.gates.supervisor_authenticated_ready = false;
             recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
             Ok(sanitize_session_summary(summary))
@@ -2079,6 +2629,296 @@ mod tests {
     }
 
     #[test]
+    fn host_instance_identifier_validation_is_exact_and_path_free() {
+        for valid in [
+            "hst_0123456789abcdef0123456789abcdef",
+            "hst_ffffffffffffffffffffffffffffffff",
+        ] {
+            assert!(is_valid_host_instance_id(valid));
+            assert!(validate_host_instance_id(valid).is_ok());
+        }
+
+        for invalid in [
+            "",
+            "hst_",
+            "hst_0123456789abcdef0123456789abcde",
+            "hst_0123456789abcdef0123456789abcdef0",
+            "hst_0123456789ABCDEF0123456789abcdef",
+            "HST_0123456789abcdef0123456789abcdef",
+            "pid_0123456789abcdef0123456789abcdef",
+            " hst_0123456789abcdef0123456789abcdef",
+            "hst_0123456789abcdef0123456789abcdef ",
+            "/tmp/hst_0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(!is_valid_host_instance_id(invalid));
+            let err = validate_host_instance_id(invalid).expect_err("invalid instance id");
+            assert_eq!(err.code, "validation");
+            // The generic format prefix is deliberately present in the static hint.
+            if invalid.len() > HOST_INSTANCE_ID_PREFIX.len() {
+                assert!(!err.message.contains(invalid));
+            }
+        }
+    }
+
+    #[test]
+    fn restart_argv_appends_only_the_validated_prior_instance_and_parses() {
+        let valid_approval = "apr_0123456789abcdef0123456789abcdef";
+        let prior_instance = "hst_0123456789abcdef0123456789abcdef";
+        let reg = Path::new("/tmp/tl-reg");
+        let plans = Path::new("/tmp/tl-plans");
+        let auth = Path::new("/tmp/tl-auth");
+        let sess = Path::new("/tmp/tl-sess");
+
+        let args = build_host_serve_args_with_control(
+            reg,
+            plans,
+            auth,
+            sess,
+            valid_approval,
+            None,
+            Some(prior_instance),
+        )
+        .expect("valid restart args");
+
+        let expected: Vec<OsString> = vec![
+            OsString::from("serve"),
+            OsString::from("--registry-dir"),
+            OsString::from("/tmp/tl-reg"),
+            OsString::from("--plans-dir"),
+            OsString::from("/tmp/tl-plans"),
+            OsString::from("--authority-dir"),
+            OsString::from("/tmp/tl-auth"),
+            OsString::from("--sessions-dir"),
+            OsString::from("/tmp/tl-sess"),
+            OsString::from("--approval-id"),
+            OsString::from(valid_approval),
+            OsString::from("--restart-from-instance-id"),
+            OsString::from(prior_instance),
+        ];
+        assert_eq!(args, expected);
+        assert!(!args
+            .iter()
+            .any(|arg| arg.as_os_str() == OsStr::new(NOTIFY_CODEX_FLAG)));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.as_os_str() == OsStr::new("task-root-agy")));
+
+        let full_cli_iter = std::iter::once(OsString::from(HOST_BINARY_NAME)).chain(args.clone());
+        let parsed = HostCli::try_parse_from(full_cli_iter).expect("HostCli restart argv");
+        match parsed.command {
+            HostCommand::Serve(serve) => {
+                assert_eq!(serve.approval_id, valid_approval);
+                assert_eq!(
+                    serve.restart_from_instance_id.as_deref(),
+                    Some(prior_instance)
+                );
+                assert!(serve.notify_codex.is_none());
+                assert!(serve.notify_timeout_ms.is_none());
+            }
+        }
+
+        for bad_instance in [
+            "",
+            "hst_short",
+            "hst_0123456789ABCDEF0123456789abcdef",
+            "pid_0123456789abcdef0123456789abcdef",
+            "hst_0123456789abcdef0123456789abcdef /tmp/escape",
+        ] {
+            let err = build_host_serve_args_with_control(
+                reg,
+                plans,
+                auth,
+                sess,
+                valid_approval,
+                None,
+                Some(bad_instance),
+            )
+            .expect_err("invalid restart instance must fail");
+            assert_eq!(err.code, "validation");
+            if !bad_instance.is_empty() {
+                assert!(!err.message.contains(bad_instance));
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_control_status_projects_phase_and_never_reports_ready() {
+        let mut summary: HostSessionSummary = serde_json::from_value(serde_json::json!({
+            "approval_id": "apr_0123456789abcdef0123456789abcdef",
+            "subject_digest": "a".repeat(64),
+            "binding_id": "bnd_control_alpha",
+            "thread_uuid": THREAD_UUID_A,
+            "plan_id": "plan-control",
+            "plan_revision": 1,
+            "session_binding_id": "bnd_session_alpha",
+            "instance_id": "hst_0123456789abcdef0123456789abcdef",
+            "phase": "ready",
+            "worker_profile_count": 1,
+            "native_route_count": 0,
+            "root_worker_task_ids": ["task-root-agy"],
+            "dependent_task_ids": [],
+            "native_route_task_ids": [],
+            "gates": {
+                "supervisor_authenticated_ready": true,
+                "workers_auto_started_on_boot": false,
+                "root_tasks_only": true,
+                "dependent_tasks_blocked": true,
+                "native_routes_manual_only": true,
+                "worker_completed_means_ready_for_review": true,
+                "auto_accept_or_merge_enabled": false
+            },
+            "notifications": {
+                "enabled": false,
+                "executable_digest": null,
+                "timeout_ms": null
+            },
+            "last_error": null
+        }))
+        .expect("summary fixture");
+
+        let status: HostControlStatusResponse = serde_json::from_value(serde_json::json!({
+            "approval_id": "apr_0123456789abcdef0123456789abcdef",
+            "subject_digest": "a".repeat(64),
+            "control_binding_id": "bnd_control_alpha",
+            "thread_uuid": THREAD_UUID_A,
+            "session_binding_id": "bnd_session_alpha",
+            "instance_id": "hst_0123456789abcdef0123456789abcdef",
+            "state": "stopping",
+            "idle": true,
+            "busy": {
+                "non_terminal_runs": 0,
+                "non_terminal_workers": 0,
+                "live_worker_tasks": 0,
+                "in_flight_wakeups": 0,
+                "pending_enabled_wakeups": 0
+            }
+        }))
+        .expect("stopping status fixture");
+
+        assert!(apply_control_status_projection(&mut summary, Some(&status))
+            .expect("project stopping status"));
+        assert_eq!(summary.phase, HostPhase::Stopping);
+        assert!(!summary.gates.supervisor_authenticated_ready);
+        assert_ne!(format_host_phase_for_test(summary.phase), "ready");
+
+        let mut mismatched = summary.clone();
+        let mut other_status = status.clone();
+        other_status.instance_id = "hst_ffffffffffffffffffffffffffffffff".to_string();
+        let err = apply_control_status_projection(&mut mismatched, Some(&other_status))
+            .expect_err("instance mismatch must fail");
+        assert_eq!(err.code, "host_instance_mismatch");
+        assert!(!err.message.contains("hst_"));
+    }
+
+    #[test]
+    fn restart_preconditions_require_lock_free_stopped_same_instance() {
+        let fixture = setup_desktop_host_fixture("restart-preconditions");
+        let record = seed_published_plan_and_approval(
+            &fixture,
+            "plan-restart-preconditions",
+            "bnd_control_alpha",
+            THREAD_UUID_A,
+        );
+        let instance = "hst_0123456789abcdef0123456789abcdef";
+
+        let mut summary: HostSessionSummary = serde_json::from_value(serde_json::json!({
+            "approval_id": record.approval_id.clone(),
+            "subject_digest": record.subject_digest.clone(),
+            "binding_id": record.binding_id.clone(),
+            "thread_uuid": record.thread_uuid.clone(),
+            "plan_id": record.plan_id.clone(),
+            "plan_revision": record.plan_revision,
+            "session_binding_id": "bnd_session_alpha",
+            "instance_id": instance,
+            "phase": "stopped",
+            "worker_profile_count": 1,
+            "native_route_count": 0,
+            "root_worker_task_ids": ["task-root-agy"],
+            "dependent_task_ids": [],
+            "native_route_task_ids": [],
+            "gates": {
+                "supervisor_authenticated_ready": false,
+                "workers_auto_started_on_boot": false,
+                "root_tasks_only": true,
+                "dependent_tasks_blocked": true,
+                "native_routes_manual_only": true,
+                "worker_completed_means_ready_for_review": true,
+                "auto_accept_or_merge_enabled": false
+            },
+            "notifications": {
+                "enabled": true,
+                "executable_digest": "b".repeat(64),
+                "timeout_ms": 10_000
+            },
+            "last_error": null
+        }))
+        .expect("stopped summary fixture");
+
+        validate_restart_target(&record, &summary, instance, false)
+            .expect("clean stopped same instance with receipts policy is restartable");
+
+        let lock_err = validate_restart_target(&record, &summary, instance, true)
+            .expect_err("held lock must reject restart");
+        assert_eq!(lock_err.code, "host_restart_not_allowed");
+        assert!(!lock_err.message.contains(instance));
+
+        let ready_err = validate_restart_target(
+            &record,
+            &HostSessionSummary {
+                phase: HostPhase::Ready,
+                ..summary.clone()
+            },
+            instance,
+            false,
+        )
+        .expect_err("ready phase must reject restart");
+        assert_eq!(ready_err.code, "host_restart_not_allowed");
+
+        let mismatch_err = validate_restart_target(
+            &record,
+            &summary,
+            "hst_ffffffffffffffffffffffffffffffff",
+            false,
+        )
+        .expect_err("different expected instance must reject restart");
+        assert_eq!(mismatch_err.code, "host_instance_mismatch");
+        assert!(!mismatch_err.message.contains(instance));
+
+        summary.instance_id = None;
+        let legacy_err = validate_restart_target(&record, &summary, instance, false)
+            .expect_err("legacy missing instance must reject restart");
+        assert_eq!(legacy_err.code, "host_restart_not_allowed");
+    }
+
+    fn format_host_phase_for_test(phase: HostPhase) -> &'static str {
+        phase.as_str()
+    }
+
+    #[test]
+    fn start_phase_rejection_blocks_stopped_stopping_and_failed_sessions() {
+        assert_eq!(
+            existing_start_phase_error(HostPhase::Stopped)
+                .expect("stopped start rejection")
+                .code,
+            "host_not_ready"
+        );
+        assert_eq!(
+            existing_start_phase_error(HostPhase::Stopping)
+                .expect("stopping start rejection")
+                .code,
+            "host_not_ready"
+        );
+        assert_eq!(
+            existing_start_phase_error(HostPhase::Failed)
+                .expect("failed start rejection")
+                .code,
+            "host_startup_failed"
+        );
+        assert!(existing_start_phase_error(HostPhase::Ready).is_some());
+        assert!(existing_start_phase_error(HostPhase::Bootstrapping).is_some());
+    }
+
+    #[test]
     fn notification_tool_resolution_rejects_non_codex_disabled_and_appends_exact_args_only_on_opt_in(
     ) {
         let tmp = ScopedHostTestDir::new("notify-resolve");
@@ -2494,6 +3334,37 @@ mod tests {
                 "runtime_error",
             ),
             (
+                HostError::HostNotIdle {
+                    approval_id: "apr_0123456789abcdef0123456789abcdef".to_string(),
+                    detail: "hidden work at /home/secret-operator with token tl_private"
+                        .to_string(),
+                },
+                "host_not_idle",
+            ),
+            (
+                HostError::InstanceMismatch {
+                    approval_id: "apr_0123456789abcdef0123456789abcdef".to_string(),
+                    expected_instance_id: "hst_0123456789abcdef0123456789abcdef".to_string(),
+                    actual_instance_id: Some("hst_ffffffffffffffffffffffffffffffff".to_string()),
+                },
+                "host_instance_mismatch",
+            ),
+            (
+                HostError::StopOutcomeUncertain {
+                    approval_id: "apr_0123456789abcdef0123456789abcdef".to_string(),
+                    detail: "leftover child at /private/session with Bearer tl_raw".to_string(),
+                },
+                "host_stop_outcome_uncertain",
+            ),
+            (
+                HostError::RestartNotAllowed {
+                    approval_id: "apr_0123456789abcdef0123456789abcdef".to_string(),
+                    phase: Some(HostPhase::Stopping),
+                    detail: "lock path /home/secret-operator/session".to_string(),
+                },
+                "host_restart_not_allowed",
+            ),
+            (
                 HostError::Io {
                     operation: "open(/home/secret/file)".to_string(),
                     reason: "permission denied on /home/secret/file".to_string(),
@@ -2601,6 +3472,24 @@ mod tests {
                 .await
                 .unwrap_err()
                 .code,
+                stop_approved_session(
+                    &unconfigured_bridge,
+                    &fixture.control,
+                    target_record.approval_id.clone(),
+                    "hst_0123456789abcdef0123456789abcdef".to_string(),
+                )
+                .await
+                .unwrap_err()
+                .code,
+                restart_approved_session(
+                    &unconfigured_bridge,
+                    &fixture.control,
+                    target_record.approval_id.clone(),
+                    "hst_0123456789abcdef0123456789abcdef".to_string(),
+                )
+                .await
+                .unwrap_err()
+                .code,
             ] {
                 assert_eq!(code, "runtime_not_attached");
             }
@@ -2677,6 +3566,30 @@ mod tests {
                     &connected_bridge,
                     &fixture.control,
                     wrong_binding_record.approval_id.clone()
+                )
+                .await
+                .unwrap_err()
+                .code,
+                "binding_not_found"
+            );
+            assert_eq!(
+                stop_approved_session(
+                    &connected_bridge,
+                    &fixture.control,
+                    wrong_binding_record.approval_id.clone(),
+                    "hst_0123456789abcdef0123456789abcdef".to_string(),
+                )
+                .await
+                .unwrap_err()
+                .code,
+                "binding_not_found"
+            );
+            assert_eq!(
+                restart_approved_session(
+                    &connected_bridge,
+                    &fixture.control,
+                    wrong_binding_record.approval_id.clone(),
+                    "hst_0123456789abcdef0123456789abcdef".to_string(),
                 )
                 .await
                 .unwrap_err()
@@ -2945,6 +3858,25 @@ mod tests {
             .expect("valid approved_activity");
             assert_eq!(activity_page.binding_id, host_session_binding_id);
 
+            let restart_err = restart_approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+                running_host.instance_id().to_string(),
+            )
+            .await
+            .expect_err("restart must never stop or replace a running host");
+            assert_eq!(restart_err.code, "host_restart_not_allowed");
+            assert!(
+                is_host_lock_held(running_host.session_dir()).expect("host lock still held"),
+                "restart must not release the running host lock"
+            );
+            assert_eq!(
+                read_count_file(&fixture.agy_count_file),
+                0,
+                "restart rejection must not start or replay any worker"
+            );
+
             // Plan status remains Published (never mutated to Received or Applied).
             let plan_rev = fixture
                 .control
@@ -3113,10 +4045,112 @@ mod tests {
             assert_eq!(stopped_summary.phase, HostPhase::Stopped);
             assert!(!stopped_summary.gates.supervisor_authenticated_ready);
 
+            let stopped_start_err = start_approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+            )
+            .await
+            .expect_err("ordinary start must reject a stopped session");
+            assert_eq!(stopped_start_err.code, "host_not_ready");
+            assert!(
+                stopped_start_err.message.contains("Restart"),
+                "start rejection must direct the operator to explicit Restart"
+            );
+
             control_host
                 .shutdown()
                 .await
                 .expect("shutdown control_host");
+        });
+    }
+
+    #[test]
+    fn stop_with_reopened_hub_uses_durable_stopped_proof_without_child_handle() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = setup_desktop_host_fixture("stop-reopened-hub");
+
+            let bootstrap_record = seed_published_plan_and_approval(
+                &fixture,
+                "plan-ctrl-stop-reopen",
+                "bnd_ctrl_stop_reopen",
+                THREAD_UUID_A,
+            );
+            let control_host = ApprovedHost::start(
+                ApprovedHostConfig::new(
+                    fixture.control.registry.config_dir(),
+                    fixture.control.plans.dir(),
+                    fixture.control.authority.dir(),
+                    &fixture.control_sessions_dir,
+                    &bootstrap_record.approval_id,
+                )
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect("start control host");
+            let control_binding_id = control_host.session_binding_id().to_string();
+            let connected_bridge =
+                DesktopBridge::new(Some(control_host.runtime_state_dir().to_path_buf()), None)
+                    .expect("create connected bridge");
+
+            let record = seed_published_plan_and_approval(
+                &fixture,
+                "plan-stop-reopen",
+                &control_binding_id,
+                THREAD_UUID_A,
+            );
+            let instance = "hst_0123456789abcdef0123456789abcdef";
+            let session_dir =
+                prepare_session_dir(&fixture.control.sessions_dir, &record.approval_id)
+                    .expect("prepare stopped session dir");
+            threadlane_host::ensure_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))
+                .expect("create runtime-state");
+            threadlane_host::ensure_private_dir(&session_dir.join(WORK_AREA_SUBDIR))
+                .expect("create work-area");
+            let mut manifest = HostSessionManifest::from_approval_record(
+                &record,
+                Some("bnd_session_stopped".to_string()),
+                HostPhase::Stopped,
+                None,
+                None,
+                1_700_000_000_000,
+                1_700_000_010_000,
+            );
+            manifest.instance_id = Some(instance.to_string());
+            write_host_manifest(&session_dir, &manifest).expect("write stopped manifest");
+
+            let reopened_hub = HostControlHub::new();
+            assert_eq!(
+                reopened_hub.poll_child_reaper(&record.approval_id),
+                ReapedChildState::NotTracked
+            );
+            fixture.control.host_control = Arc::new(reopened_hub);
+
+            let stopped = stop_approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+                instance.to_string(),
+            )
+            .await
+            .expect("duplicate stop proof must succeed after Hub reopen");
+            assert_eq!(stopped.phase, HostPhase::Stopped);
+            assert_eq!(stopped.instance_id.as_deref(), Some(instance));
+            assert!(!stopped.gates.supervisor_authenticated_ready);
+            assert!(!is_host_lock_held(&session_dir).expect("inspect host lock"));
+            assert_eq!(
+                fixture
+                    .control
+                    .host_control
+                    .poll_child_reaper(&record.approval_id),
+                ReapedChildState::NotTracked,
+                "stop must not depend on a process child handle"
+            );
+
+            control_host
+                .shutdown()
+                .await
+                .expect("shutdown control host");
         });
     }
 
@@ -3399,6 +4433,167 @@ exit 0
                 .shutdown()
                 .await
                 .expect("shutdown control_host");
+        });
+    }
+
+    #[test]
+    fn explicit_restart_rotates_instance_without_replaying_tasks_or_notifications() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = setup_desktop_host_fixture("restart-explicit");
+
+            let bootstrap_record = seed_published_plan_and_approval(
+                &fixture,
+                "plan-ctrl-restart",
+                "bnd_ctrl_restart",
+                THREAD_UUID_A,
+            );
+            let control_host = ApprovedHost::start(
+                ApprovedHostConfig::new(
+                    fixture.control.registry.config_dir(),
+                    fixture.control.plans.dir(),
+                    fixture.control.authority.dir(),
+                    &fixture.control_sessions_dir,
+                    &bootstrap_record.approval_id,
+                )
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect("start control host");
+            let control_binding_id = control_host.session_binding_id().to_string();
+            let connected_bridge =
+                DesktopBridge::new(Some(control_host.runtime_state_dir().to_path_buf()), None)
+                    .expect("create connected bridge");
+
+            let record = seed_published_plan_and_approval(
+                &fixture,
+                "plan-restart-explicit",
+                &control_binding_id,
+                THREAD_UUID_A,
+            );
+            let initial_host = ApprovedHost::start(
+                ApprovedHostConfig::new(
+                    fixture.control.registry.config_dir(),
+                    fixture.control.plans.dir(),
+                    fixture.control.authority.dir(),
+                    &fixture.control.sessions_dir,
+                    &record.approval_id,
+                )
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect("start initial host");
+            let prior_instance = initial_host.instance_id().to_string();
+            initial_host
+                .shutdown()
+                .await
+                .expect("cleanly stop initial host");
+
+            let stopped = approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+            )
+            .await
+            .expect("observe stopped host");
+            assert_eq!(stopped.phase, HostPhase::Stopped);
+            assert_eq!(
+                stopped.instance_id.as_deref(),
+                Some(prior_instance.as_str())
+            );
+
+            let argv_file = fixture.tmp.path.join("restart-argv.txt");
+            let hold_restart_file = fixture.tmp.path.join("hold-restart-host");
+            fs::write(&hold_restart_file, "1").expect("write hold file");
+            let fake_host_exe = fixture.tmp.path.join("bin/restart-host-wrapper");
+            let restart_script = format!(
+                r#"#!/bin/sh
+set -eu
+: > "{argv}.tmp"
+for arg in "$@"; do
+    printf "%s\n" "$arg" >> "{argv}.tmp"
+done
+mv "{argv}.tmp" "{argv}"
+i=0
+while [ "$i" -lt 250 ] && [ -f "{hold}" ]; do
+    sleep 0.02
+    i=$((i + 1))
+done
+exit 0
+"#,
+                argv = argv_file.display(),
+                hold = hold_restart_file.display(),
+            );
+            write_executable_script(&fake_host_exe, &restart_script);
+            fixture.control.host_executable = Some(fake_host_exe);
+
+            let argv_file_bg = argv_file.clone();
+            let bg_host_task = tauri::async_runtime::spawn(async move {
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while !argv_file_bg.exists() && Instant::now() < deadline {
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
+                let raw_lines = fs::read_to_string(&argv_file_bg).expect("read restart argv");
+                let mut cli_args = vec![HOST_BINARY_NAME.to_string()];
+                cli_args.extend(raw_lines.lines().map(str::to_string));
+                let parsed = HostCli::try_parse_from(&cli_args).expect("parse restart argv");
+                let HostCommand::Serve(serve_args) = parsed.command;
+                let expected_prior_instance = serve_args
+                    .restart_from_instance_id
+                    .expect("explicit restart flag is required");
+                assert_ne!(expected_prior_instance, "");
+                ApprovedHost::restart_stopped(
+                    ApprovedHostConfig::new(
+                        serve_args.registry_dir,
+                        serve_args.plans_dir,
+                        serve_args.authority_dir,
+                        serve_args.sessions_dir,
+                        serve_args.approval_id,
+                    )
+                    .with_tick_interval(Duration::from_millis(20)),
+                    &expected_prior_instance,
+                )
+                .await
+                .expect("restart stopped host from captured CLI args")
+            });
+
+            let restarted = restart_approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+                prior_instance.clone(),
+            )
+            .await
+            .expect("explicit restart must succeed from stopped evidence");
+            assert_eq!(restarted.phase, HostPhase::Ready);
+            assert!(restarted.gates.supervisor_authenticated_ready);
+            assert_ne!(
+                restarted.instance_id.as_deref(),
+                Some(prior_instance.as_str())
+            );
+            assert!(!restarted.notifications.enabled);
+            assert_eq!(
+                read_count_file(&fixture.agy_count_file),
+                0,
+                "restart must not replay or start any approved task"
+            );
+
+            let captured = fs::read_to_string(&argv_file).expect("read captured restart argv");
+            assert!(captured
+                .lines()
+                .any(|line| line == RESTART_FROM_INSTANCE_ID_FLAG));
+            assert!(!captured.lines().any(|line| line == NOTIFY_CODEX_FLAG));
+
+            let restarted_host = bg_host_task.await.expect("join restart host task");
+            let _ = fs::remove_file(&hold_restart_file);
+            restarted_host
+                .shutdown()
+                .await
+                .expect("shutdown restarted host");
+
+            control_host
+                .shutdown()
+                .await
+                .expect("shutdown control host");
         });
     }
 

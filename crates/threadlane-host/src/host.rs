@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use threadlane::{
-    ApprovedSessionWakeupContext, CodexWakeupConfig, ScopedClient, Supervisor, SupervisorClient,
-    SupervisorConfig, SupervisorHandle,
+    ApprovedSessionWakeupContext, CodexWakeupConfig, HostControlConfig, HostControlInfoRequest,
+    HostControlRuntimeState, ScopedClient, Supervisor, SupervisorClient, SupervisorConfig,
+    SupervisorHandle,
 };
 use threadlane_authority::{ApprovalRecord, AuthorityStore, MaterializedPlan};
 use threadlane_core::Binding;
@@ -14,12 +15,14 @@ use threadlane_registry::RegistryStore;
 
 use crate::error::HostError;
 use crate::storage::{
-    ensure_private_dir, now_epoch_ms, prepare_session_dir, read_host_manifest_optional,
-    validate_approval_id, validate_sessions_root, write_host_manifest, HostSessionLock,
+    ensure_private_dir, generate_host_instance_id, now_epoch_ms, prepare_session_dir,
+    read_host_manifest_optional, validate_approval_id, validate_host_instance_id,
+    validate_sessions_root, verify_existing_task_receipts, write_host_manifest, HostSessionLock,
 };
 use crate::types::{
     ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
-    HostSessionManifest, HostSessionSummary, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    HostSessionManifest, HostSessionSummary, HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR,
+    WORK_AREA_SUBDIR,
 };
 
 /// Default supervisor tick interval (`50ms`) used by [`ApprovedHostConfig`].
@@ -186,6 +189,7 @@ impl ApprovedHost {
             .map(|m| m.created_at_ms)
             .unwrap_or_else(now_epoch_ms);
         let pid = std::process::id();
+        let instance_id = generate_host_instance_id();
 
         let boot_manifest = HostSessionManifest::from_approval_record(
             &record,
@@ -196,6 +200,7 @@ impl ApprovedHost {
             created_at_ms,
             now_epoch_ms(),
         )
+        .with_instance_id(Some(instance_id.clone()))
         .with_notifications(notify_summary.clone());
         write_host_manifest(&session_dir, &boot_manifest)?;
 
@@ -207,6 +212,7 @@ impl ApprovedHost {
             &session_dir,
             created_at_ms,
             pid,
+            &instance_id,
             tick_interval,
             validated_notifications.as_ref(),
             &notify_summary,
@@ -231,6 +237,7 @@ impl ApprovedHost {
                 approval: record,
                 materialized,
                 session_binding,
+                instance_id,
                 manifest: ready_manifest,
             }),
             Err(err) => {
@@ -244,6 +251,222 @@ impl ApprovedHost {
                     created_at_ms,
                     now_epoch_ms(),
                 )
+                .with_instance_id(Some(instance_id))
+                .with_notifications(notify_summary);
+                let _ = write_host_manifest(&session_dir, &failed_manifest);
+                drop(host_lock);
+                Err(err)
+            }
+        }
+    }
+
+    /// Explicitly restarts a cleanly [`HostPhase::Stopped`] host session after verifying
+    /// `expected_prior_instance_id`, current authority/publication/registry state, and any existing
+    /// task receipts under `host.lock` before writing `Bootstrapping`.
+    pub async fn restart_stopped(
+        config: ApprovedHostConfig,
+        expected_prior_instance_id: &str,
+    ) -> Result<ApprovedHostHandle, HostError> {
+        validate_approval_id(&config.approval_id)?;
+        validate_host_instance_id("expected_prior_instance_id", expected_prior_instance_id)?;
+        let registry = Arc::new(RegistryStore::open(&config.registry_dir)?);
+        let plans = Arc::new(PlanStore::open(&config.plans_dir)?);
+        let authority = Arc::new(AuthorityStore::open(
+            &config.authority_dir,
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+        )?);
+        validate_sessions_root(
+            &config.sessions_dir,
+            &[
+                ("registry_dir", registry.config_dir()),
+                ("plans_dir", plans.dir()),
+                ("authority_dir", authority.dir()),
+            ],
+        )?;
+        Self::restart_stopped_with_authority_and_notifications(
+            authority,
+            &config.sessions_dir,
+            &config.approval_id,
+            expected_prior_instance_id,
+            config.tick_interval,
+            config.notifications,
+        )
+        .await
+    }
+
+    /// Explicitly restarts a cleanly [`HostPhase::Stopped`] host session using an already opened
+    /// [`AuthorityStore`] and optional explicit [`ApprovedHostNotificationConfig`] (defaulting to
+    /// disabled; never restoring prior notification policy from the stopped manifest).
+    pub async fn restart_stopped_with_authority_and_notifications(
+        authority: Arc<AuthorityStore>,
+        sessions_dir: impl AsRef<Path>,
+        approval_id: impl AsRef<str>,
+        expected_prior_instance_id: impl AsRef<str>,
+        tick_interval: Duration,
+        notifications: Option<ApprovedHostNotificationConfig>,
+    ) -> Result<ApprovedHostHandle, HostError> {
+        let approval_id = approval_id.as_ref();
+        let expected_prior_instance_id = expected_prior_instance_id.as_ref();
+        validate_approval_id(approval_id)?;
+        validate_host_instance_id("expected_prior_instance_id", expected_prior_instance_id)?;
+
+        let validated_notifications = match notifications {
+            Some(cfg) => Some(ApprovedHostNotificationConfig::new(
+                cfg.executable,
+                cfg.timeout_ms,
+            )?),
+            None => None,
+        };
+        let notify_summary = validated_notifications
+            .as_ref()
+            .map(ApprovedHostNotificationConfig::summary)
+            .unwrap_or_default();
+
+        let record = authority.get_for_operator(approval_id)?;
+
+        let canonical_sessions_root = validate_sessions_root(
+            sessions_dir.as_ref(),
+            &[
+                ("authority_dir", authority.dir()),
+                ("repository_path", record.repository_path.as_path()),
+            ],
+        )?;
+
+        let candidate_session_dir = canonical_sessions_root.join(&record.approval_id);
+        if std::fs::symlink_metadata(&candidate_session_dir).is_err() {
+            return Err(HostError::RestartNotAllowed {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                detail: "host session directory does not exist".to_string(),
+            });
+        }
+
+        let session_dir = prepare_session_dir(&canonical_sessions_root, &record.approval_id)?;
+        let host_lock = HostSessionLock::acquire(&session_dir, &record.approval_id)?;
+
+        // Under `host.lock`, validate clean `Stopped` phase, `expected_prior_instance_id`,
+        // existing `task-receipts.json` identity, and current approval/publication/registry
+        // BEFORE writing `Bootstrapping` so any precheck failure leaves `Stopped` untouched.
+        let existing_manifest =
+            read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+                HostError::RestartNotAllowed {
+                    approval_id: record.approval_id.clone(),
+                    phase: None,
+                    detail: "host-manifest.json does not exist".to_string(),
+                }
+            })?;
+
+        if existing_manifest.phase != HostPhase::Stopped {
+            return Err(HostError::RestartNotAllowed {
+                approval_id: record.approval_id.clone(),
+                phase: Some(existing_manifest.phase),
+                detail: format!(
+                    "host session is in phase `{}` (expected `stopped`)",
+                    existing_manifest.phase
+                ),
+            });
+        }
+
+        if existing_manifest.instance_id.as_deref() != Some(expected_prior_instance_id) {
+            return Err(HostError::InstanceMismatch {
+                approval_id: record.approval_id.clone(),
+                expected_instance_id: expected_prior_instance_id.to_string(),
+                actual_instance_id: existing_manifest.instance_id.clone(),
+            });
+        }
+
+        let prior_session_binding_id =
+            existing_manifest
+                .session_binding_id
+                .clone()
+                .ok_or_else(|| HostError::CorruptManifest {
+                    path: session_dir
+                        .join(HOST_MANIFEST_FILENAME)
+                        .display()
+                        .to_string(),
+                    reason: "Stopped manifest is missing session_binding_id".to_string(),
+                })?;
+
+        let _ = verify_existing_task_receipts(&session_dir, &record, &prior_session_binding_id)?;
+
+        let work_area_dir = ensure_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+        let precheck_binding = Binding {
+            binding_id: prior_session_binding_id.clone(),
+            thread_uuid: record.thread_uuid.clone(),
+            label: "restart-precheck".to_string(),
+            delivered_seq: 0,
+            acked_seq: 0,
+        };
+        authority.materialize(&record.approval_id, &precheck_binding, &work_area_dir)?;
+
+        let created_at_ms = existing_manifest.created_at_ms;
+        let pid = std::process::id();
+        let mut instance_id = generate_host_instance_id();
+        while instance_id == expected_prior_instance_id {
+            instance_id = generate_host_instance_id();
+        }
+
+        let boot_manifest = HostSessionManifest::from_approval_record(
+            &record,
+            Some(prior_session_binding_id.clone()),
+            HostPhase::Bootstrapping,
+            Some(pid),
+            None,
+            created_at_ms,
+            now_epoch_ms(),
+        )
+        .with_instance_id(Some(instance_id.clone()))
+        .with_notifications(notify_summary.clone());
+        write_host_manifest(&session_dir, &boot_manifest)?;
+
+        let mut known_session_binding_id = Some(prior_session_binding_id);
+
+        let startup_result = Self::bootstrap_and_launch(
+            &authority,
+            &record,
+            &session_dir,
+            created_at_ms,
+            pid,
+            &instance_id,
+            tick_interval,
+            validated_notifications.as_ref(),
+            &notify_summary,
+            &mut known_session_binding_id,
+        )
+        .await;
+
+        match startup_result {
+            Ok((
+                supervisor_handle,
+                runtime_state_dir,
+                work_area_dir,
+                materialized,
+                session_binding,
+                ready_manifest,
+            )) => Ok(ApprovedHostHandle {
+                host_lock,
+                supervisor_handle,
+                session_dir,
+                runtime_state_dir,
+                work_area_dir,
+                approval: record,
+                materialized,
+                session_binding,
+                instance_id,
+                manifest: ready_manifest,
+            }),
+            Err(err) => {
+                let failed_manifest = HostSessionManifest::from_approval_record(
+                    &record,
+                    known_session_binding_id,
+                    HostPhase::Failed,
+                    None,
+                    Some(sanitize_error_diagnostic(&err)),
+                    created_at_ms,
+                    now_epoch_ms(),
+                )
+                .with_instance_id(Some(instance_id))
                 .with_notifications(notify_summary);
                 let _ = write_host_manifest(&session_dir, &failed_manifest);
                 drop(host_lock);
@@ -260,6 +483,7 @@ impl ApprovedHost {
         session_dir: &Path,
         created_at_ms: i64,
         pid: u32,
+        instance_id: &str,
         tick_interval: Duration,
         notifications: Option<&ApprovedHostNotificationConfig>,
         notify_summary: &HostNotificationSummary,
@@ -380,6 +604,7 @@ impl ApprovedHost {
             created_at_ms,
             now_epoch_ms(),
         )
+        .with_instance_id(Some(instance_id.to_string()))
         .with_notifications(notify_summary.clone());
         write_host_manifest(session_dir, &mid_manifest)?;
 
@@ -416,7 +641,15 @@ impl ApprovedHost {
             codex: final_codex,
             workers: materialized.workers.clone(),
         };
-        let final_handle = Supervisor::start(final_config).await?;
+        let host_control = HostControlConfig {
+            approval_id: record.approval_id.clone(),
+            subject_digest: record.subject_digest.clone(),
+            control_binding_id: record.binding_id.clone(),
+            thread_uuid: record.thread_uuid.clone(),
+            session_binding_id: session_binding.binding_id.clone(),
+            instance_id: instance_id.to_string(),
+        };
+        let final_handle = Supervisor::start_with_host_control(final_config, host_control).await?;
 
         // Verify actual authenticated supervisor readiness before writing READY manifest.
         let readiness_check = async {
@@ -471,6 +704,31 @@ impl ApprovedHost {
                 });
             }
 
+            let hc_info = sup_client
+                .host_control_info(&HostControlInfoRequest {
+                    approval_id: record.approval_id.clone(),
+                    subject_digest: record.subject_digest.clone(),
+                    control_binding_id: record.binding_id.clone(),
+                    thread_uuid: record.thread_uuid.clone(),
+                    session_binding_id: session_binding.binding_id.clone(),
+                    expected_instance_id: instance_id.to_string(),
+                })
+                .await?;
+            if hc_info.approval_id != record.approval_id
+                || hc_info.subject_digest != record.subject_digest
+                || hc_info.control_binding_id != record.binding_id
+                || hc_info.thread_uuid != record.thread_uuid
+                || hc_info.session_binding_id != session_binding.binding_id
+                || hc_info.instance_id != instance_id
+                || hc_info.state != HostControlRuntimeState::Ready
+            {
+                return Err(HostError::CorruptSessionState {
+                    reason:
+                        "authenticated supervisor host_control_info did not match Ready owner scope"
+                            .to_string(),
+                });
+            }
+
             let ready_manifest = HostSessionManifest::from_approval_record(
                 record,
                 Some(session_binding.binding_id.clone()),
@@ -480,6 +738,7 @@ impl ApprovedHost {
                 created_at_ms,
                 now_epoch_ms(),
             )
+            .with_instance_id(Some(instance_id.to_string()))
             .with_notifications(notify_summary.clone());
             write_host_manifest(session_dir, &ready_manifest)?;
             Ok(ready_manifest)
@@ -517,6 +776,7 @@ pub struct ApprovedHostHandle {
     approval: ApprovalRecord,
     materialized: MaterializedPlan,
     session_binding: Binding,
+    instance_id: String,
     manifest: HostSessionManifest,
     host_lock: HostSessionLock,
 }
@@ -529,6 +789,7 @@ impl std::fmt::Debug for ApprovedHostHandle {
             .field("control_binding_id", &self.approval.binding_id)
             .field("thread_uuid", &self.approval.thread_uuid)
             .field("session_binding_id", &self.session_binding.binding_id)
+            .field("instance_id", &self.instance_id)
             .field("phase", &self.manifest.phase)
             .finish()
     }
@@ -543,6 +804,11 @@ impl ApprovedHostHandle {
     /// Returns the durable [`HostSessionManifest`] committed when this host became ready.
     pub fn manifest(&self) -> &HostSessionManifest {
         &self.manifest
+    }
+
+    /// Returns the public per-start host `instance_id` (`hst_<32hex>`).
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
     }
 
     /// Returns the frozen [`ApprovalRecord`] governing this host session.
@@ -595,15 +861,35 @@ impl ApprovedHostHandle {
         &self.work_area_dir
     }
 
+    /// Waits until an authenticated, owner-scoped idle stop request is latched on this host's supervisor.
+    pub async fn wait_for_stop_request(&self) {
+        self.supervisor_handle.wait_for_stop_request().await;
+    }
+
     /// Waits until the underlying supervisor records a fatal background error and returns it.
     pub async fn wait_for_fatal(&self) -> threadlane::ApiError {
         self.supervisor_handle.wait_for_fatal().await
     }
 
-    /// Gracefully shuts down the session supervisor, updates `host-manifest.json` to
-    /// [`HostPhase::Stopped`] (or [`HostPhase::Failed`] if the supervisor faulted), and releases
-    /// `host.lock`.
+    /// Gracefully shuts down the session supervisor, recording [`HostPhase::Stopping`] first,
+    /// then updating `host-manifest.json` to [`HostPhase::Stopped`] (or [`HostPhase::Failed`] if
+    /// the supervisor faulted), and finally releasing `host.lock`.
     pub async fn shutdown(mut self) -> Result<(), HostError> {
+        self.manifest.phase = HostPhase::Stopping;
+        self.manifest.gates = HostExecutionGates::for_ready_state(false);
+        self.manifest.updated_at_ms = now_epoch_ms();
+        if let Err(stopping_write_err) = write_host_manifest(&self.session_dir, &self.manifest) {
+            let _ = self.supervisor_handle.shutdown_and_take_fatal().await;
+            self.manifest.phase = HostPhase::Failed;
+            self.manifest.pid = None;
+            self.manifest.gates = HostExecutionGates::for_ready_state(false);
+            self.manifest.last_error = Some(sanitize_error_diagnostic(&stopping_write_err));
+            self.manifest.updated_at_ms = now_epoch_ms();
+            let _ = write_host_manifest(&self.session_dir, &self.manifest);
+            drop(self.host_lock);
+            return Err(stopping_write_err);
+        }
+
         let fatal = self.supervisor_handle.shutdown_and_take_fatal().await;
         match fatal {
             Some(err) => {

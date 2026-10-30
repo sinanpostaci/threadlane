@@ -10,6 +10,11 @@
   box-sizing: border-box;
 }
 
+/* Author display styles must not override semantic hidden state. */
+.aq-app [hidden] {
+  display: none !important;
+}
+
 html,
 body,
 #app {

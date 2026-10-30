@@ -202,6 +202,19 @@ impl BridgeError {
             ErrorCode::InvalidRunState => {
                 Self::InvalidState("Action is not valid for the current task state.")
             }
+            ErrorCode::HostControlNotConfigured => {
+                Self::InvalidState("Host session controls are unavailable for this runtime.")
+            }
+            ErrorCode::HostNotIdle => {
+                Self::InvalidState("Host session still has active work or notifications.")
+            }
+            ErrorCode::HostInstanceMismatch => {
+                Self::InvalidState("Host instance changed; refresh before choosing an action.")
+            }
+            ErrorCode::HostScopeMismatch => {
+                Self::SecurityBlocked("Host control scope does not match the active attachment.")
+            }
+            ErrorCode::HostStopping => Self::InvalidState("Host session is stopping."),
             ErrorCode::PayloadTooLarge
             | ErrorCode::EventPayloadTooLarge
             | ErrorCode::SerializationError => {
@@ -218,6 +231,40 @@ impl BridgeError {
             | ErrorCode::InvalidWakeupState => {
                 Self::Protocol("Runtime supervisor reported an internal protocol error.")
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_codes_keep_private_remote_details_out_of_observer_errors() {
+        for (code, expected_state) in [
+            (
+                ErrorCode::HostControlNotConfigured,
+                ConnectionState::Disconnected,
+            ),
+            (ErrorCode::HostNotIdle, ConnectionState::Disconnected),
+            (
+                ErrorCode::HostInstanceMismatch,
+                ConnectionState::Disconnected,
+            ),
+            (ErrorCode::HostScopeMismatch, ConnectionState::Blocked),
+            (ErrorCode::HostStopping, ConnectionState::Disconnected),
+        ] {
+            let remote = threadlane::Error::Remote(threadlane::ApiError::new(
+                code,
+                "private-token-41 /private/session/operator-note",
+            ));
+            let (state, message) = BridgeError::classify_snapshot_error(&remote);
+            assert_eq!(state, expected_state);
+            assert!(!message.contains("private-token-41"));
+            assert!(!message.contains("/private/session"));
+            assert!(!BridgeError::from_threadlane_error(&remote)
+                .to_string()
+                .contains("operator-note"));
         }
     }
 }

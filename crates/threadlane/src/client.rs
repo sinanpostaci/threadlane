@@ -13,8 +13,8 @@ use threadlane_core::{
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
 use crate::error::{ApiError, Error};
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, RetryWakeupRequest, ScopedRequest, ScopedResponse,
-    StatusResponse,
+    BindingListResponse, CreateBindingRequest, HostControlInfoRequest, HostControlStatusResponse,
+    RetryWakeupRequest, ScopedRequest, ScopedResponse, StatusResponse, StopIdleHostRequest,
 };
 
 /// Maximum response body size accepted by [`SupervisorClient`] (2 MiB).
@@ -167,6 +167,24 @@ impl SupervisorClient {
         };
         let path = format!("/v1/bindings/{clean_id}/retry-wakeup");
         self.send_json(Method::POST, &path, Some(&req)).await
+    }
+
+    /// Queries owner-scoped host control status and idle counters from a host-control-enabled supervisor.
+    pub async fn host_control_info(
+        &self,
+        request: &HostControlInfoRequest,
+    ) -> Result<HostControlStatusResponse, Error> {
+        self.send_json(Method::POST, "/v1/host-control/info", Some(request))
+            .await
+    }
+
+    /// Requests an atomic owner-scoped idle stop on a host-control-enabled supervisor.
+    pub async fn stop_idle_host(
+        &self,
+        request: &StopIdleHostRequest,
+    ) -> Result<HostControlStatusResponse, Error> {
+        self.send_json(Method::POST, "/v1/host-control/stop", Some(request))
+            .await
     }
 
     fn resolve_descriptor(&self) -> Result<RuntimeDescriptor, Error> {

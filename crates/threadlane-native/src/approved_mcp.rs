@@ -529,6 +529,22 @@ pub fn map_host_error_to_mcp(err: &HostError) -> (&'static str, &'static str) {
             "host_not_ready",
             "Approved host session is not running or has not reached authenticated ready state.",
         ),
+        HostError::HostNotIdle { .. } => (
+            "host_not_idle",
+            "Approved host session still has active work or notifications and cannot stop yet.",
+        ),
+        HostError::InstanceMismatch { .. } => (
+            "host_instance_mismatch",
+            "Approved host instance changed. Refresh the session before choosing an action.",
+        ),
+        HostError::StopOutcomeUncertain { .. } => (
+            "host_stop_outcome_uncertain",
+            "Approved host stop could not be confirmed. Inspect its current state before retrying.",
+        ),
+        HostError::RestartNotAllowed { .. } => (
+            "host_restart_not_allowed",
+            "Approved host can restart only after a confirmed clean stop of the selected instance.",
+        ),
         HostError::StaleRevision { .. } => (
             "stale_revision",
             "Expected worker run revision does not match the current revision.",
@@ -588,6 +604,14 @@ pub fn map_host_error_to_mcp(err: &HostError) -> (&'static str, &'static str) {
             ),
         },
         HostError::Runtime { code, .. } => match code.as_str() {
+            "host_stopping" => (
+                "host_stopping",
+                "Approved host session is stopping and cannot accept new mutations.",
+            ),
+            "host_control_not_configured" => (
+                "host_control_unavailable",
+                "Approved host session does not expose authenticated lifecycle controls.",
+            ),
             "stalerevision" | "stale_revision" => (
                 "stale_revision",
                 "Expected worker run revision does not match the current revision.",
@@ -1464,4 +1488,68 @@ pub(crate) async fn execute_approved_ack_events(
     };
 
     format_approved_result(&trusted_binding_id, TOOL, view)
+}
+
+#[cfg(test)]
+mod lifecycle_error_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_errors_expose_static_codes_without_private_host_details() {
+        let private = "private-token-41 /private/session/operator-note";
+        let cases = [
+            (
+                HostError::HostNotIdle {
+                    approval_id: private.to_string(),
+                    detail: private.to_string(),
+                },
+                "host_not_idle",
+            ),
+            (
+                HostError::InstanceMismatch {
+                    approval_id: private.to_string(),
+                    expected_instance_id: private.to_string(),
+                    actual_instance_id: Some(private.to_string()),
+                },
+                "host_instance_mismatch",
+            ),
+            (
+                HostError::StopOutcomeUncertain {
+                    approval_id: private.to_string(),
+                    detail: private.to_string(),
+                },
+                "host_stop_outcome_uncertain",
+            ),
+            (
+                HostError::RestartNotAllowed {
+                    approval_id: private.to_string(),
+                    phase: Some(HostPhase::Failed),
+                    detail: private.to_string(),
+                },
+                "host_restart_not_allowed",
+            ),
+            (
+                HostError::Runtime {
+                    code: "host_stopping".to_string(),
+                    message: private.to_string(),
+                },
+                "host_stopping",
+            ),
+            (
+                HostError::Runtime {
+                    code: "host_control_not_configured".to_string(),
+                    message: private.to_string(),
+                },
+                "host_control_unavailable",
+            ),
+        ];
+        for (error, expected_code) in cases {
+            let (code, message) = map_host_error_to_mcp(&error);
+            assert_eq!(code, expected_code);
+            assert!(message.len() <= 256);
+            assert!(!message.contains("private-token-41"));
+            assert!(!message.contains("/private/session"));
+            assert!(!message.contains("operator-note"));
+        }
+    }
 }

@@ -386,6 +386,125 @@ impl ScopedRequest {
                 | Self::CancelWorker { .. }
         )
     }
+
+    /// Returns `true` if executing this request mutates persistent binding, run, worker, or cursor state.
+    pub const fn is_mutating(&self) -> bool {
+        matches!(
+            self,
+            Self::StartDemo { .. }
+                | Self::PullEvents { .. }
+                | Self::PullEventsBounded { .. }
+                | Self::AckEvents { .. }
+                | Self::Answer { .. }
+                | Self::Steer { .. }
+                | Self::Cancel { .. }
+                | Self::StartWorker { .. }
+                | Self::CancelWorker { .. }
+        )
+    }
+}
+
+/// Frozen owner-scoped configuration installed on a final `ApprovedHost` runtime supervisor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlConfig {
+    /// Approved session authority identifier (`apr_<32hex>`).
+    pub approval_id: String,
+    /// Immutable SHA-256 hex digest of the approved subject.
+    pub subject_digest: String,
+    /// Originating control binding identifier (`bnd_<uuid>`).
+    pub control_binding_id: String,
+    /// Originating native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Dedicated approved host session binding identifier (`bnd_<uuid>`).
+    pub session_binding_id: String,
+    /// Public per-start host instance identifier (`hst_<32hex>`).
+    pub instance_id: String,
+}
+
+/// Owner-scoped verification and compare-and-swap request payload for host control endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlOwnerScope {
+    /// Approved session authority identifier (`apr_<32hex>`).
+    pub approval_id: String,
+    /// Immutable SHA-256 hex digest of the approved subject.
+    pub subject_digest: String,
+    /// Originating control binding identifier (`bnd_<uuid>`).
+    pub control_binding_id: String,
+    /// Originating native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Dedicated approved host session binding identifier (`bnd_<uuid>`).
+    pub session_binding_id: String,
+    /// Expected live host instance identifier (`hst_<32hex>`).
+    pub expected_instance_id: String,
+}
+
+/// Request payload for `POST /v1/host-control/info`.
+pub type HostControlInfoRequest = HostControlOwnerScope;
+
+/// Request payload for `POST /v1/host-control/stop`.
+pub type StopIdleHostRequest = HostControlOwnerScope;
+
+/// Runtime host control lifecycle state reported by a host-control-enabled supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostControlRuntimeState {
+    /// Supervisor is ready and accepting requests.
+    Ready,
+    /// Supervisor has latched an idle-stop request and is draining.
+    Stopping,
+}
+
+/// Aggregate busy counts across all bindings and live worker tasks on the supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlBusyCounts {
+    /// Count of non-terminal runs across all bindings.
+    pub non_terminal_runs: usize,
+    /// Count of non-terminal workers across all bindings.
+    pub non_terminal_workers: usize,
+    /// Count of live spawned worker tasks tracked by the supervisor.
+    pub live_worker_tasks: usize,
+    /// Count of wake-up notices currently in `WakeupStatus::InFlight`.
+    pub in_flight_wakeups: usize,
+    /// Count of wake-up notices in `WakeupStatus::Pending` when the Codex wake-up sender is enabled (`0` when disabled).
+    pub pending_enabled_wakeups: usize,
+}
+
+impl HostControlBusyCounts {
+    /// Returns `true` if all five busy counters are zero.
+    pub const fn is_idle(&self) -> bool {
+        self.non_terminal_runs == 0
+            && self.non_terminal_workers == 0
+            && self.live_worker_tasks == 0
+            && self.in_flight_wakeups == 0
+            && self.pending_enabled_wakeups == 0
+    }
+}
+
+/// Authenticated status and idle-stop response returned by `/v1/host-control/info` and `/v1/host-control/stop`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostControlStatusResponse {
+    /// Approved session authority identifier (`apr_<32hex>`).
+    pub approval_id: String,
+    /// Immutable SHA-256 hex digest of the approved subject.
+    pub subject_digest: String,
+    /// Originating control binding identifier (`bnd_<uuid>`).
+    pub control_binding_id: String,
+    /// Originating native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Dedicated approved host session binding identifier (`bnd_<uuid>`).
+    pub session_binding_id: String,
+    /// Live host instance identifier (`hst_<32hex>`).
+    pub instance_id: String,
+    /// Current runtime host control state (`Ready` or `Stopping`).
+    pub state: HostControlRuntimeState,
+    /// Whether all busy counters in `busy` are zero.
+    pub idle: bool,
+    /// Detailed breakdown of runtime busy counters.
+    pub busy: HostControlBusyCounts,
 }
 
 trait IntoWorkerSnapshot {

@@ -1,5 +1,10 @@
 # Desktop Control Panel (Milestone 3A)
 
+This document describes the original Milestone 3A preview. For the current
+editable tools/profiles and approved local workflow, read
+[configuration](CONFIGURATION.md), the [M4 checkpoint](M4-CHECKPOINT.md), and
+[optional session controls](SESSION-LIFECYCLE.md).
+
 Milestone 3A introduces the first usable Threadlane desktop control panel (`apps/desktop` and `crates/threadlane-desktop-bridge`) together with an isolated local preview launcher (`scripts/desktop_preview.py`).
 
 ## Scope and Current Limits

@@ -7,24 +7,35 @@ import type { RegistrySnapshot } from '../registry/types.ts';
 import {
   desktop_approved_session,
   desktop_approved_task,
+  desktop_restart_approved_session,
   desktop_start_approved_session,
+  desktop_stop_approved_session,
 } from './ipc.ts';
 import {
+  buildHostLifecycleRequestKey,
   buildHostRequestKey,
   canConfigureHostNotifications,
+  canRestartLocalSession,
   canStartLocalSession,
+  canStopLocalSession,
   classifyHostError,
   codexToolChoicesFromRegistry,
   emptyHostNotificationState,
   enabledHostCodexTools,
+  formatHostLifecycleActionLabel,
   formatHostStatusLabel,
   formatTaskStatusLabel,
   formatTaskTelemetry,
+  hostInstanceChanged,
+  hostInstanceId,
+  hostLifecycleHint,
   hostNotificationPolicyText,
   hostSummaryMatchesContext,
   hostTaskMatchesContext,
   isCurrentHostRequest,
   isHostSummaryReady,
+  isUncertainHostErrorKind,
+  isValidHostInstanceId,
   MAX_VISIBLE_APPROVED_TASKS,
   nextVisibleApprovedTaskCount,
   normalizeApprovedTaskIds,
@@ -91,6 +102,7 @@ function makeSummary(
     plan_id: APPROVAL.plan_id,
     plan_revision: APPROVAL.plan_revision,
     session_binding_id: 'host-session-1',
+    instance_id: 'hst_0123456789abcdef0123456789abcdef',
     phase: 'ready',
     worker_profile_count: 1,
     native_route_count: 1,
@@ -329,7 +341,31 @@ describe('approved local-session start authority', () => {
         busy: false,
         summary: makeSummary({ phase: 'stopped' }),
       }),
-      true
+      false
+    );
+    assert.equal(
+      canStartLocalSession(APPROVAL, CONTEXT, {
+        nativeBridgeAvailable: true,
+        busy: false,
+        summary: makeSummary({ phase: 'stopping' }),
+      }),
+      false
+    );
+    assert.equal(
+      canStartLocalSession(APPROVAL, CONTEXT, {
+        nativeBridgeAvailable: true,
+        busy: false,
+        previewFixtureMode: true,
+      }),
+      false
+    );
+    assert.equal(
+      canStartLocalSession(APPROVAL, CONTEXT, {
+        nativeBridgeAvailable: true,
+        busy: false,
+        uncertain: true,
+      }),
+      false
     );
 
     await assert.rejects(
@@ -351,6 +387,333 @@ describe('approved local-session start authority', () => {
       (err: unknown) =>
         err instanceof AppIpcError && err.code === 'bridge_disconnected'
     );
+  });
+
+  it('denies ordinary start for failed, not-ready, stopped, and stopping summaries', () => {
+    const options = {
+      nativeBridgeAvailable: true,
+      previewFixtureMode: false,
+      busy: false,
+      uncertain: false,
+    };
+    const failedNotReady = makeSummary({
+      phase: 'failed',
+      gates: { ...READY_GATES, supervisor_authenticated_ready: false },
+    });
+
+    assert.equal(canStartLocalSession(APPROVAL, CONTEXT, options), true);
+
+    for (const summary of [
+      failedNotReady,
+      makeSummary({ phase: 'failed' }),
+      makeSummary({
+        phase: 'ready',
+        gates: { ...READY_GATES, supervisor_authenticated_ready: false },
+      }),
+      makeSummary({
+        phase: 'stopped',
+        gates: { ...READY_GATES, supervisor_authenticated_ready: false },
+      }),
+      makeSummary({
+        phase: 'stopping',
+        gates: { ...READY_GATES, supervisor_authenticated_ready: false },
+      }),
+    ]) {
+      assert.equal(
+        canStartLocalSession(APPROVAL, CONTEXT, { ...options, summary }),
+        false
+      );
+    }
+
+    assert.equal(
+      canRestartLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        summary: failedNotReady,
+      }),
+      false
+    );
+  });
+});
+
+describe('host lifecycle identity and eligibility', () => {
+  it('accepts only exact hst identities and rejects wrappers without the native bridge', async () => {
+    const instance = 'hst_0123456789abcdef0123456789abcdef';
+    assert.equal(isValidHostInstanceId(instance), true);
+    for (const invalid of [
+      '',
+      'hst_',
+      'hst_0123456789abcdef0123456789abcde',
+      'hst_0123456789abcdef0123456789abcdef0',
+      'hst_0123456789ABCDEF0123456789abcdef',
+      'pid_0123456789abcdef0123456789abcdef',
+      ' hst_0123456789abcdef0123456789abcdef',
+      'hst_0123456789abcdef0123456789abcdef ',
+      '/tmp/hst_0123456789abcdef0123456789abcdef',
+    ]) {
+      assert.equal(isValidHostInstanceId(invalid), false);
+    }
+    assert.equal(hostInstanceId(makeSummary()), instance);
+    assert.equal(hostInstanceId(makeSummary({ instance_id: null })), null);
+
+    await assert.rejects(
+      () =>
+        desktop_stop_approved_session({
+          approvalId: APPROVAL.approval_id,
+          expectedInstanceId: 'hst_short',
+        }),
+      (err: unknown) =>
+        err instanceof AppIpcError && err.code === 'invalid_input'
+    );
+    await assert.rejects(
+      () =>
+        desktop_restart_approved_session({
+          approvalId: APPROVAL.approval_id,
+          expectedPriorInstanceId: '/tmp/not-an-instance',
+        }),
+      (err: unknown) =>
+        err instanceof AppIpcError && err.code === 'invalid_input'
+    );
+    await assert.rejects(
+      () =>
+        desktop_stop_approved_session({
+          approvalId: APPROVAL.approval_id,
+          expectedInstanceId: instance,
+        }),
+      (err: unknown) =>
+        err instanceof AppIpcError && err.code === 'bridge_disconnected'
+    );
+    await assert.rejects(
+      () =>
+        desktop_restart_approved_session({
+          approvalId: APPROVAL.approval_id,
+          expectedPriorInstanceId: instance,
+          notifyCodexToolId: 'tool-codex',
+        }),
+      (err: unknown) =>
+        err instanceof AppIpcError && err.code === 'bridge_disconnected'
+    );
+  });
+
+  it('offers stop only from authenticated Ready, restart only from Stopped, and start never from Stopped', () => {
+    const options = {
+      nativeBridgeAvailable: true,
+      previewFixtureMode: false,
+      busy: false,
+      uncertain: false,
+    };
+    const ready = makeSummary();
+    const stopped = makeSummary({
+      phase: 'stopped',
+      gates: { ...READY_GATES, supervisor_authenticated_ready: false },
+    });
+    const stopping = makeSummary({
+      phase: 'stopping',
+      gates: { ...READY_GATES, supervisor_authenticated_ready: false },
+    });
+
+    assert.equal(canStartLocalSession(APPROVAL, CONTEXT, options), true);
+
+    assert.equal(canStopLocalSession(APPROVAL, CONTEXT, { ...options, summary: ready }), true);
+    assert.equal(
+      canRestartLocalSession(APPROVAL, CONTEXT, { ...options, summary: ready }),
+      false
+    );
+    assert.equal(
+      canStartLocalSession(APPROVAL, CONTEXT, { ...options, summary: ready }),
+      false
+    );
+
+    assert.equal(
+      canRestartLocalSession(APPROVAL, CONTEXT, { ...options, summary: stopped }),
+      true
+    );
+    assert.equal(
+      canStopLocalSession(APPROVAL, CONTEXT, { ...options, summary: stopped }),
+      false
+    );
+    assert.equal(
+      canStartLocalSession(APPROVAL, CONTEXT, { ...options, summary: stopped }),
+      false
+    );
+
+    for (const summary of [stopping, makeSummary({ instance_id: null })]) {
+      assert.equal(
+        canStartLocalSession(APPROVAL, CONTEXT, { ...options, summary }),
+        false
+      );
+      assert.equal(
+        canStopLocalSession(APPROVAL, CONTEXT, { ...options, summary }),
+        false
+      );
+      assert.equal(
+        canRestartLocalSession(APPROVAL, CONTEXT, { ...options, summary }),
+        false
+      );
+    }
+
+    assert.equal(
+      canStopLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        nativeBridgeAvailable: false,
+        summary: ready,
+      }),
+      false
+    );
+    assert.equal(
+      canStopLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        busy: true,
+        summary: ready,
+      }),
+      false
+    );
+    assert.equal(
+      canRestartLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        busy: true,
+        summary: stopped,
+      }),
+      false
+    );
+    assert.equal(
+      canStopLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        previewFixtureMode: true,
+        summary: ready,
+      }),
+      false
+    );
+    assert.equal(
+      canRestartLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        previewFixtureMode: true,
+        summary: stopped,
+      }),
+      false
+    );
+    assert.equal(
+      canStopLocalSession(APPROVAL, CONTEXT, {
+        ...options,
+        uncertain: true,
+        summary: ready,
+      }),
+      false
+    );
+    assert.equal(
+      canStopLocalSession(
+        APPROVAL,
+        { ...CONTEXT, connected: false },
+        { ...options, summary: ready }
+      ),
+      false
+    );
+    assert.equal(
+      canRestartLocalSession(
+        APPROVAL,
+        { ...CONTEXT, bindingId: 'bind-beta' },
+        { ...options, summary: stopped }
+      ),
+      false
+    );
+
+    assert.equal(formatHostStatusLabel(stopping), 'Stopping');
+    assert.notEqual(formatHostStatusLabel(stopping), 'Ready');
+    assert.equal(formatHostLifecycleActionLabel('start'), 'Starting');
+    assert.equal(formatHostLifecycleActionLabel('stop'), 'Stopping');
+    assert.equal(formatHostLifecycleActionLabel('restart'), 'Restarting');
+  });
+
+  it('drops stale lifecycle tickets across action, instance, and context changes', () => {
+    const instance = 'hst_0123456789abcdef0123456789abcdef';
+    const otherInstance = 'hst_ffffffffffffffffffffffffffffffff';
+    const key = buildHostLifecycleRequestKey(APPROVAL, CONTEXT, 'stop', instance);
+    const ticket = { epoch: 3, key };
+    assert.equal(isCurrentHostRequest(ticket, 3, key), true);
+    assert.equal(isCurrentHostRequest(ticket, 4, key), false);
+    assert.notEqual(
+      key,
+      buildHostLifecycleRequestKey(APPROVAL, CONTEXT, 'restart', instance)
+    );
+    assert.notEqual(
+      key,
+      buildHostLifecycleRequestKey(APPROVAL, CONTEXT, 'stop', otherInstance)
+    );
+    assert.notEqual(
+      key,
+      buildHostLifecycleRequestKey(
+        APPROVAL,
+        { ...CONTEXT, bindingId: 'bind-beta' },
+        'stop',
+        instance
+      )
+    );
+    assert.equal(
+      isCurrentHostRequest(
+        ticket,
+        3,
+        buildHostLifecycleRequestKey(APPROVAL, CONTEXT, 'stop', otherInstance)
+      ),
+      false
+    );
+
+    assert.equal(
+      hostInstanceChanged(makeSummary(), makeSummary({ instance_id: otherInstance })),
+      true
+    );
+    assert.equal(
+      hostInstanceChanged(makeSummary(), makeSummary({ instance_id: instance })),
+      false
+    );
+
+    assert.deepEqual(
+      resolveHostNotificationState(
+        { optIn: true, toolId: 'tool-codex' },
+        CONTEXT,
+        true
+      ),
+      { optIn: false, toolId: 'tool-codex' }
+    );
+  });
+
+  it('maps busy and uncertain errors without claiming stopped or ready', () => {
+    const notIdle = classifyHostError({ code: 'host_not_idle', message: 'raw' });
+    assert.equal(notIdle.kind, 'not_idle');
+    assert.ok(notIdle.message?.includes('cancellation controls'));
+
+    const uncertain = classifyHostError({
+      code: 'host_stop_outcome_uncertain',
+      message: 'raw',
+    });
+    assert.equal(uncertain.kind, 'uncertain');
+    assert.ok(uncertain.message?.includes('not reported stopped'));
+    assert.equal(isUncertainHostErrorKind(uncertain.kind), true);
+
+    const mismatch = classifyHostError({
+      code: 'host_instance_mismatch',
+      message: 'raw',
+    });
+    assert.equal(mismatch.kind, 'instance_mismatch');
+    assert.equal(isUncertainHostErrorKind(mismatch.kind), true);
+
+    const restart = classifyHostError({
+      code: 'host_restart_not_allowed',
+      message: 'raw',
+    });
+    assert.equal(restart.kind, 'restart_not_allowed');
+    assert.equal(isUncertainHostErrorKind(restart.kind), false);
+
+    const unavailable = classifyHostError({
+      code: 'host_control_unavailable',
+      message: 'raw',
+    });
+    assert.equal(unavailable.kind, 'control_unavailable');
+
+    assert.ok(hostLifecycleHint(makeSummary(), false).includes('cancel existing'));
+    assert.ok(hostLifecycleHint(makeSummary({ phase: 'stopped' }), false).includes('not replayed'));
+    assert.ok(
+      hostLifecycleHint(makeSummary({ phase: 'stopping' }), false).includes('disabled')
+    );
+    assert.ok(hostLifecycleHint(null, true).includes('uncertain'));
   });
 });
 

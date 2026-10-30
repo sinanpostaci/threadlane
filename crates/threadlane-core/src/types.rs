@@ -1009,3 +1009,17 @@ pub struct WakeupRetryRecord {
     /// Timestamp (ms) when the manual retry was recorded.
     pub retried_at_ms: i64,
 }
+
+/// Runtime-wide aggregate counts of active or pending execution state across all bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeIdleInspection {
+    /// Count of runs across all bindings in non-terminal statuses (`Queued`, `Claimed`, `Running`, `WaitingInput`, `Completing`, `CancelRequested`).
+    pub non_terminal_runs: usize,
+    /// Count of workers across all bindings in non-terminal statuses (`Queued`, `Claimed`, `Running`, `CancelRequested`).
+    pub non_terminal_workers: usize,
+    /// Count of wake-up notices across all bindings currently in `WakeupStatus::InFlight`.
+    pub in_flight_wakeups: usize,
+    /// Count of wake-up notices across all bindings currently in `WakeupStatus::Pending`.
+    pub pending_wakeups: usize,
+}

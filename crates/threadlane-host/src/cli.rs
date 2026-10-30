@@ -60,11 +60,19 @@ pub struct ServeArgs {
     /// Optional bounded timeout in milliseconds for each Codex queue invocation (valid only with `--notify-codex`).
     #[arg(long = "notify-timeout-ms")]
     pub notify_timeout_ms: Option<u64>,
+
+    /// Optional expected prior stopped host instance identifier (`hst_<32hex>`) to restart cleanly via `ApprovedHost::restart_stopped`.
+    #[arg(long = "restart-from-instance-id")]
+    pub restart_from_instance_id: Option<String>,
 }
 
 impl ServeArgs {
     /// Validates CLI arguments (including optional notification flags) and constructs an [`ApprovedHostConfig`].
     pub fn into_host_config(self) -> Result<ApprovedHostConfig, HostError> {
+        if let Some(ref prior_id) = self.restart_from_instance_id {
+            crate::storage::validate_host_instance_id("restart_from_instance_id", prior_id)?;
+        }
+
         let mut config = ApprovedHostConfig::new(
             self.registry_dir,
             self.plans_dir,
@@ -99,13 +107,20 @@ pub async fn run_cli(cli: HostCli) -> Result<(), HostError> {
     }
 }
 
-/// Runs the `serve` command: starts the [`ApprovedHost`] for `args.approval_id`, emits a safe
-/// token-free [`crate::HostSessionSummary`] JSON line (ignoring broken pipes if stdio is closed),
-/// and keeps the host alive until explicit `SIGINT`/`SIGTERM` or a fatal supervisor error.
+/// Runs the `serve` command: starts (or restarts from a stopped instance) the [`ApprovedHost`] for
+/// `args.approval_id`, emits a safe token-free [`crate::HostSessionSummary`] JSON line (ignoring
+/// broken pipes if stdio is closed), and keeps the host alive until explicit `SIGINT`/`SIGTERM`,
+/// an authenticated idle-stop request, or a fatal supervisor error.
 pub async fn run_serve(args: ServeArgs) -> Result<(), HostError> {
+    let restart_from_instance_id = args.restart_from_instance_id.clone();
     let config = args.into_host_config()?;
 
-    let handle = ApprovedHost::start(config).await?;
+    let handle = match restart_from_instance_id.as_deref() {
+        Some(expected_prior_instance_id) => {
+            ApprovedHost::restart_stopped(config, expected_prior_instance_id).await?
+        }
+        None => ApprovedHost::start(config).await?,
+    };
     let summary = handle.summary();
     if let Ok(line) = serde_json::to_string(&summary) {
         let mut stdout = std::io::stdout().lock();
@@ -115,6 +130,9 @@ pub async fn run_serve(args: ServeArgs) -> Result<(), HostError> {
 
     tokio::select! {
         _ = wait_for_shutdown_signal() => {
+            handle.shutdown().await
+        }
+        _ = handle.wait_for_stop_request() => {
             handle.shutdown().await
         }
         fatal = handle.wait_for_fatal() => {

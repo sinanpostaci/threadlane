@@ -66,6 +66,16 @@ pub enum ErrorCode {
     TransportError,
     /// Unexpected internal runtime error.
     InternalError,
+    /// Host session control is not configured on this supervisor instance.
+    HostControlNotConfigured,
+    /// Host session is not idle (active runs, workers, tasks, or wake-ups remain).
+    HostNotIdle,
+    /// Expected host instance ID did not match the live supervisor's instance ID.
+    HostInstanceMismatch,
+    /// Owner scope fields did not match the live supervisor's frozen host control scope.
+    HostScopeMismatch,
+    /// Host session has latched a stop request and is no longer accepting mutations or claims.
+    HostStopping,
 }
 
 /// Structured wire error returned by the supervisor HTTP API and MCP tool error responses.

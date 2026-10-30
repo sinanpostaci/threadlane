@@ -1,5 +1,10 @@
 # M4 local workflow checkpoint
 
+This document records the original M4 baseline. Later checkpoints add
+[approved notifications](APPROVED-NOTIFICATIONS.md) and
+[optional session lifecycle controls](SESSION-LIFECYCLE.md), with their own
+validation evidence and unchanged live-acceptance boundaries.
+
 This is a Linux pilot with local fixture coverage. Native Codex remains the user's
 conversational interface. Threadlane does not listen to conversation transcripts,
 interpret worker prose as operator approval, or silently choose another model.

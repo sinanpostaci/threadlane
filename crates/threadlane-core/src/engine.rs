@@ -19,8 +19,8 @@ use crate::limits::{
 use crate::types::{
     AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
     EventPayload, Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run,
-    RunListPage, RunRevision, RunStatus, RunSummary, TickReport, WakeupClaim, WakeupNotice,
-    WakeupOutcome, WakeupRetryRecord, WakeupStatus,
+    RunListPage, RunRevision, RunStatus, RunSummary, RuntimeIdleInspection, TickReport,
+    WakeupClaim, WakeupNotice, WakeupOutcome, WakeupRetryRecord, WakeupStatus,
 };
 use crate::worker::WorkerSnapshot;
 
@@ -1165,6 +1165,28 @@ impl Core {
         }
 
         Ok((total_runs, active_runs, recent_runs))
+    }
+
+    /// Computes consistent runtime-wide aggregate counts of active runs, workers, and wake-ups
+    /// across all bindings in a single read query.
+    pub fn inspect_runtime_idle(&self) -> Result<RuntimeIdleInspection, CoreError> {
+        let (runs_raw, workers_raw, in_flight_raw, pending_raw): (i64, i64, i64, i64) =
+            self.conn.query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM runs WHERE status NOT IN ('completed', 'failed', 'cancelled', 'timed_out', 'unknown')),
+                    (SELECT COUNT(*) FROM workers WHERE status NOT IN ('completed', 'failed', 'cancelled', 'timed_out', 'unknown')),
+                    (SELECT COUNT(*) FROM wakeups WHERE status = 'in_flight'),
+                    (SELECT COUNT(*) FROM wakeups WHERE status = 'pending')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+
+        Ok(RuntimeIdleInspection {
+            non_terminal_runs: i64_to_u64("non_terminal_runs", runs_raw)? as usize,
+            non_terminal_workers: i64_to_u64("non_terminal_workers", workers_raw)? as usize,
+            in_flight_wakeups: i64_to_u64("in_flight_wakeups", in_flight_raw)? as usize,
+            pending_wakeups: i64_to_u64("pending_wakeups", pending_raw)? as usize,
+        })
     }
 
     fn init_schema_and_recover(tx: &Transaction<'_>) -> Result<(), CoreError> {
@@ -3656,4 +3678,361 @@ pub(crate) fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, CoreErr
     u64::try_from(value).map_err(|_| {
         CoreError::CorruptState(format!("negative integer {value} stored in `{field}`"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::worker::{
+        WorkerAcceptanceState, WorkerCompletionRecord, WorkerOutcomeSummary, WorkerStatus,
+        WorkerWorktreeUpdate,
+    };
+
+    const THREAD_A: &str = "11111111-1111-4111-8111-111111111111";
+    const THREAD_B: &str = "22222222-2222-4222-8222-222222222222";
+    const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const BASE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    fn open_temp_core() -> (tempfile::TempDir, Core) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("threadlane.db");
+        let core = Core::open(&db).expect("open core");
+        (dir, core)
+    }
+
+    fn default_outcome(cancelled: bool) -> WorkerOutcomeSummary {
+        WorkerOutcomeSummary {
+            exit_code: Some(if cancelled { 130 } else { 0 }),
+            signal: None,
+            duration_ms: Some(15),
+            timed_out: false,
+            cancelled,
+            cancel_requested_before_completion: cancelled,
+            missing_model_evidence: false,
+            missing_effort_evidence: false,
+            provider_error: false,
+            incomplete_cleanup: false,
+            rejected_by_diff_gate: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            acceptance_state: if cancelled {
+                WorkerAcceptanceState::ExecutionFailed
+            } else {
+                WorkerAcceptanceState::ReadyForReview
+            },
+            changed_paths_count: 0,
+            changed_paths_preview: Vec::new(),
+            violation_count: 0,
+            violation_summaries: Vec::new(),
+            final_summary: Some("ok".to_string()),
+            failure_reason: None,
+            report_artifact_id: None,
+        }
+    }
+
+    #[test]
+    fn inspect_runtime_idle_counts_all_bindings_runs_workers_and_wakeups() {
+        let (_dir, mut core) = open_temp_core();
+        assert_eq!(
+            core.inspect_runtime_idle().expect("empty idle"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 0,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        let b1 = core.create_binding(THREAD_A, "control").expect("b1");
+        let b2 = core.create_binding(THREAD_B, "session").expect("b2");
+
+        // Start a demo run on b1 -> Running
+        let demo_run = core
+            .execute(
+                &b1.binding_id,
+                Command::StartDemo {
+                    command_key: "demo-1".to_string(),
+                    instruction: "demo task".to_string(),
+                    step_delay_ms: Some(100),
+                    now_ms: 1_000,
+                },
+            )
+            .expect("start demo")
+            .into_run()
+            .expect("demo run");
+        assert_eq!(demo_run.status, RunStatus::Running);
+        assert_eq!(
+            core.inspect_runtime_idle().expect("running demo"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Advance demo run to WaitingInput -> emits important question_opened -> wakeup Pending on b1
+        core.tick(1_200).expect("tick waiting_input");
+        assert_eq!(
+            core.inspect_runtime_idle()
+                .expect("waiting_input + pending"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 1,
+            }
+        );
+
+        // Claim wakeup on b1 -> InFlight
+        let claim_w1 = core
+            .claim_wakeup_for_binding(&b1.binding_id, 1_210)
+            .expect("claim wakeup")
+            .expect("wakeup claim");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("in_flight wakeup"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 1,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Record wakeup Submitted -> in_flight_wakeups drops to 0
+        core.record_wakeup_result(&claim_w1.claim_id, WakeupOutcome::Submitted, 1_220)
+            .expect("record submitted");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("submitted wakeup"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Acknowledge the delivered question events on b1 -> Submitted wakeup returns to Idle.
+        let question_batch = core
+            .execute(
+                &b1.binding_id,
+                Command::PullEvents {
+                    after_seq: None,
+                    limit: 50,
+                    now_ms: 1_230,
+                },
+            )
+            .expect("pull b1 question")
+            .into_event_batch()
+            .expect("batch b1 question");
+        core.execute(
+            &b1.binding_id,
+            Command::AcknowledgeEvents {
+                command_key: "ack-b1-question".to_string(),
+                batch_id: question_batch.batch_id,
+                now_ms: 1_240,
+            },
+        )
+        .expect("ack b1 question");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("after b1 question ack"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Complete the demo run -> terminal Completed, emits important run_completed -> wakeup Pending again.
+        let waiting_run = core
+            .get_run(&b1.binding_id, &demo_run.run_id)
+            .expect("get waiting demo run");
+        let question = waiting_run
+            .active_question
+            .as_ref()
+            .expect("active demo question");
+        core.execute(
+            &b1.binding_id,
+            Command::Answer {
+                command_key: "answer-demo-1".to_string(),
+                run_id: waiting_run.run_id.clone(),
+                question_id: question.question_id.clone(),
+                expected_revision: waiting_run.revision,
+                answer: "confirmed".to_string(),
+                now_ms: 1_250,
+            },
+        )
+        .expect("answer demo");
+        core.tick(1_360).expect("tick demo completion");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("completed demo"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 0,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 1,
+            }
+        );
+
+        // Pull and ack events on b1 -> wakeup returns to Idle
+        let batch = core
+            .execute(
+                &b1.binding_id,
+                Command::PullEvents {
+                    after_seq: None,
+                    limit: 50,
+                    now_ms: 1_370,
+                },
+            )
+            .expect("pull")
+            .into_event_batch()
+            .expect("batch");
+        core.execute(
+            &b1.binding_id,
+            Command::AcknowledgeEvents {
+                command_key: "ack-b1".to_string(),
+                batch_id: batch.batch_id,
+                now_ms: 1_380,
+            },
+        )
+        .expect("ack");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("after ack"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 0,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Start a worker on b2 -> Queued (both runs and workers tables have 1 non-terminal row)
+        let w1 = core
+            .execute(
+                &b2.binding_id,
+                Command::StartWorker {
+                    command_key: "start-w1".to_string(),
+                    profile_id: "verify".to_string(),
+                    profile_digest: DIGEST_A.to_string(),
+                    provider: "codex_cli".to_string(),
+                    requested_model: "gpt-5.4".to_string(),
+                    requested_effort: "high".to_string(),
+                    base_commit: BASE_COMMIT.to_string(),
+                    instruction: "verify package".to_string(),
+                    now_ms: 2_000,
+                },
+            )
+            .expect("start worker")
+            .into_worker()
+            .expect("worker");
+        assert_eq!(w1.status, WorkerStatus::Queued);
+        assert_eq!(
+            core.inspect_runtime_idle().expect("queued worker"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 1,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Claim worker -> Claimed
+        let claim = core
+            .claim_worker(
+                &b2.binding_id,
+                &w1.run_id,
+                w1.revision,
+                &w1.profile_digest,
+                2_010,
+            )
+            .expect("claim worker");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("claimed worker"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 1,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Record worker running -> Running
+        core.record_worker_running(
+            &claim,
+            WorkerWorktreeUpdate {
+                run_worktree_id: "rwt_1".to_string(),
+                run_worktree_path: "/tmp/rwt_1".to_string(),
+                run_branch_name: "tl/run/1".to_string(),
+                task_worktree_id: "twt_1".to_string(),
+                task_worktree_path: "/tmp/twt_1".to_string(),
+                task_branch_name: "tl/task/1".to_string(),
+                base_commit: BASE_COMMIT.to_string(),
+            },
+            2_020,
+        )
+        .expect("record running");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("running worker"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 1,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Request cancel while running -> CancelRequested (still non-terminal!)
+        core.execute(
+            &b2.binding_id,
+            Command::CancelWorker {
+                command_key: "cancel-w1".to_string(),
+                run_id: w1.run_id.clone(),
+                expected_revision: claim.revision,
+                reason: Some("operator cancel".to_string()),
+                now_ms: 2_030,
+            },
+        )
+        .expect("cancel worker");
+        assert_eq!(
+            core.inspect_runtime_idle()
+                .expect("cancel_requested worker"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 1,
+                non_terminal_workers: 1,
+                in_flight_wakeups: 0,
+                pending_wakeups: 0,
+            }
+        );
+
+        // Record terminal Cancelled outcome -> non-terminal runs/workers drop to 0, wakeup Pending on b2
+        core.record_worker_outcome(
+            &claim,
+            WorkerCompletionRecord {
+                status: WorkerStatus::Cancelled,
+                observed_model: None,
+                observed_effort: None,
+                head_commit: None,
+                dropped_live_events: 0,
+                outcome: default_outcome(true),
+            },
+            2_040,
+        )
+        .expect("record outcome");
+        assert_eq!(
+            core.inspect_runtime_idle().expect("after worker cancelled"),
+            RuntimeIdleInspection {
+                non_terminal_runs: 0,
+                non_terminal_workers: 0,
+                in_flight_wakeups: 0,
+                pending_wakeups: 1,
+            }
+        );
+
+        // serde deny_unknown_fields check
+        let err = serde_json::from_str::<RuntimeIdleInspection>(
+            r#"{"non_terminal_runs":0,"non_terminal_workers":0,"in_flight_wakeups":0,"pending_wakeups":0,"extra":1}"#,
+        );
+        assert!(err.is_err());
+    }
 }

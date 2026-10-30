@@ -6,18 +6,24 @@ import type { BrandKey } from '../types.ts';
 import {
   desktop_approved_session,
   desktop_approved_task,
+  desktop_restart_approved_session,
   desktop_start_approved_session,
+  desktop_stop_approved_session,
 } from './ipc.ts';
 import {
   approvalContextMatches,
+  buildHostLifecycleRequestKey,
   buildHostRequestKey,
   canConfigureHostNotifications,
+  canRestartLocalSession,
   canStartLocalSession,
+  canStopLocalSession,
   classifyHostError,
   compactDisplayText,
   emptyHostNotificationState,
   enabledHostCodexTools,
   formatAdapterLabel,
+  formatHostLifecycleActionLabel,
   formatHostStatusLabel,
   formatHostStatusTone,
   formatTaskInstruction,
@@ -25,6 +31,9 @@ import {
   formatTaskStatusLabel,
   formatTaskStatusTone,
   formatTaskTelemetry,
+  hostInstanceChanged,
+  hostInstanceId,
+  hostLifecycleHint,
   HOST_NOTIFICATION_UNVERIFIED_NOTE,
   HOST_STATUS_POLL_MS,
   hostNotificationPolicyText,
@@ -33,6 +42,8 @@ import {
   isCurrentHostRequest,
   isHostSummaryReady,
   isTerminalTaskStatus,
+  isUncertainHostErrorKind,
+  isValidHostInstanceId,
   MAX_VISIBLE_APPROVED_TASKS,
   nextVisibleApprovedTaskCount,
   normalizeApprovedTaskIds,
@@ -41,7 +52,7 @@ import {
   resolveHostTaskBrand,
   taskReviewNote,
 } from './session-logic.ts';
-import type { HostErrorKind, HostNotificationUiState } from './session-logic.ts';
+import type { HostErrorKind, HostLifecycleAction, HostNotificationUiState } from './session-logic.ts';
 import type {
   HostPanelContext,
   HostSessionSummary,
@@ -83,6 +94,7 @@ interface TaskReadRequest {
   epoch: number;
   key: string;
   sessionBindingId: string | null;
+  instanceId: string | null;
   approvalId: string;
 }
 
@@ -174,6 +186,11 @@ export class ApprovedSessionPanel {
   private readonly refreshButton: HTMLButtonElement;
   private readonly startButton: HTMLButtonElement;
   private readonly startButtonLabel: HTMLElement;
+  private readonly stopButton: HTMLButtonElement;
+  private readonly stopButtonLabel: HTMLElement;
+  private readonly restartButton: HTMLButtonElement;
+  private readonly restartButtonLabel: HTMLElement;
+  private readonly lifecycleHint: HTMLElement;
   private readonly actions: HTMLElement;
   private readonly notificationSection: HTMLElement;
   private readonly notificationCheckbox: HTMLInputElement;
@@ -205,14 +222,16 @@ export class ApprovedSessionPanel {
   private lastErrorKind: HostErrorKind | null = null;
   private notificationState: HostNotificationUiState = emptyHostNotificationState();
   private notificationToolsKey = '';
+  private notificationInstanceKey = '';
   private notificationEditable = false;
   private statusLoading = false;
   private statusReason: StatusReadReason = 'open';
-  private startInFlight = false;
-  private startRequestKey: string | null = null;
+  private lifecycleInFlight = false;
+  private lifecycleAction: HostLifecycleAction | null = null;
+  private lifecycleRequestKey: string | null = null;
   private contextEpoch = 0;
   private statusTicket = 0;
-  private startTicket = 0;
+  private lifecycleTicket = 0;
   private visibleTaskCount = MAX_VISIBLE_APPROVED_TASKS;
   private pollTimer: number | null = null;
   private disposed = false;
@@ -293,11 +312,51 @@ export class ApprovedSessionPanel {
       void this.handleStart();
     });
 
+    const stopButtonLabel = h('span', undefined, 'Stop idle session');
+    const stopButton = h(
+      'button',
+      { type: 'button', className: 'aq-btn' },
+      createUiIcon('ban'),
+      stopButtonLabel
+    );
+    stopButton.hidden = true;
+    stopButton.setAttribute(
+      'aria-label',
+      'Stop the approved local host only when the server confirms it is idle'
+    );
+    stopButton.addEventListener('click', () => {
+      void this.handleLifecycleAction('stop');
+    });
+
+    const restartButtonLabel = h('span', undefined, 'Restart stopped session');
+    const restartButton = h(
+      'button',
+      { type: 'button', className: 'aq-btn' },
+      createUiIcon('refresh-cw'),
+      restartButtonLabel
+    );
+    restartButton.hidden = true;
+    restartButton.setAttribute(
+      'aria-label',
+      'Explicitly restart the approved local host from its stopped instance'
+    );
+    restartButton.addEventListener('click', () => {
+      void this.handleLifecycleAction('restart');
+    });
+
+    const lifecycleHint = h('p', {
+      className: 'aq-host-session-lifecycle-hint',
+      'aria-live': 'polite',
+    });
+
     const actions = h(
       'div',
       { className: 'aq-host-session-actions' },
       refreshButton,
-      startButton
+      startButton,
+      stopButton,
+      restartButton,
+      lifecycleHint
     );
 
     const notificationPolicyBadge = h(
@@ -442,6 +501,11 @@ export class ApprovedSessionPanel {
     this.refreshButton = refreshButton;
     this.startButton = startButton;
     this.startButtonLabel = startButtonLabel;
+    this.stopButton = stopButton;
+    this.stopButtonLabel = stopButtonLabel;
+    this.restartButton = restartButton;
+    this.restartButtonLabel = restartButtonLabel;
+    this.lifecycleHint = lifecycleHint;
     this.actions = actions;
     this.notificationSection = notificationSection;
     this.notificationCheckbox = notificationCheckbox;
@@ -505,7 +569,7 @@ export class ApprovedSessionPanel {
     this.disposed = true;
     this.contextEpoch += 1;
     this.statusTicket += 1;
-    this.startTicket += 1;
+    this.lifecycleTicket += 1;
     this.stopPolling();
     this.taskQueue = [];
     this.taskPending.clear();
@@ -520,10 +584,12 @@ export class ApprovedSessionPanel {
     this.approval = null;
     this.context = null;
     this.statusLoading = false;
-    this.startInFlight = false;
-    this.startRequestKey = null;
+    this.lifecycleInFlight = false;
+    this.lifecycleAction = null;
+    this.lifecycleRequestKey = null;
     this.notificationState = emptyHostNotificationState();
     this.notificationToolsKey = '';
+    this.notificationInstanceKey = '';
     this.notificationEditable = false;
     this.root.removeEventListener('toggle', this.handleToggle);
     if (typeof document !== 'undefined') {
@@ -543,6 +609,7 @@ export class ApprovedSessionPanel {
     this.lastErrorKind = null;
     this.notificationState = emptyHostNotificationState();
     this.notificationToolsKey = '';
+    this.notificationInstanceKey = '';
     this.visibleTaskCount = MAX_VISIBLE_APPROVED_TASKS;
     this.clearTaskData();
   }
@@ -565,6 +632,7 @@ export class ApprovedSessionPanel {
     this.lastErrorKind = null;
     this.notificationState = emptyHostNotificationState();
     this.notificationToolsKey = '';
+    this.notificationInstanceKey = '';
     this.visibleTaskCount = MAX_VISIBLE_APPROVED_TASKS;
     this.clearTaskData();
     this.syncUi();
@@ -614,25 +682,49 @@ export class ApprovedSessionPanel {
     );
   }
 
-  private isStartTicketCurrent(ticket: number, epoch: number, key: string): boolean {
+  private currentContextSummary(): HostSessionSummary | null {
+    if (!this.summary || !this.approval || !this.context) {
+      return null;
+    }
+    return hostSummaryMatchesContext(this.summary, this.approval, this.context)
+      ? this.summary
+      : null;
+  }
+
+  private currentLifecycleKey(): string {
+    if (!this.approval || !this.context || !this.lifecycleAction) {
+      return '';
+    }
+    const expectedInstance =
+      this.lifecycleAction === 'start'
+        ? null
+        : hostInstanceId(this.currentContextSummary());
+    return buildHostLifecycleRequestKey(
+      this.approval,
+      this.context,
+      this.lifecycleAction,
+      expectedInstance
+    );
+  }
+
+  private isLifecycleTicketCurrent(ticket: number, epoch: number, key: string): boolean {
     return (
-      this.startTicket === ticket &&
-      isCurrentHostRequest({ epoch, key }, this.contextEpoch, this.currentRequestKey())
+      this.lifecycleTicket === ticket &&
+      this.contextEpoch === epoch &&
+      this.currentLifecycleKey() === key
     );
   }
 
   private currentReadySession(): HostSessionSummary | null {
-    if (!this.summary || !this.approval || !this.context || !hasTauriRuntime()) {
+    const summary = this.currentContextSummary();
+    if (!summary || !hasTauriRuntime()) {
       return null;
     }
-    if (!hostSummaryMatchesContext(this.summary, this.approval, this.context)) {
-      return null;
-    }
-    return isHostSummaryReady(this.summary) ? this.summary : null;
+    return isHostSummaryReady(summary) ? summary : null;
   }
 
   private async refreshStatus(reason: StatusReadReason): Promise<void> {
-    if (this.disposed || !this.root.open || this.statusLoading || this.startInFlight) {
+    if (this.disposed || !this.root.open || this.statusLoading || this.lifecycleInFlight) {
       return;
     }
     const approval = this.approval;
@@ -668,11 +760,16 @@ export class ApprovedSessionPanel {
         return;
       }
 
-      const previousSessionBindingId = this.summary?.session_binding_id ?? null;
+      const previousSummary = this.summary;
+      const previousSessionBindingId = previousSummary?.session_binding_id ?? null;
+      const instanceChanged = hostInstanceChanged(previousSummary, summary);
       this.summary = summary;
       this.errorMessage = null;
       this.lastErrorKind = null;
-      if (previousSessionBindingId !== summary.session_binding_id) {
+      if (instanceChanged) {
+        this.clearTaskData();
+        this.resetNotificationForInstance();
+      } else if (previousSessionBindingId !== summary.session_binding_id) {
         this.clearTaskSnapshots();
       }
 
@@ -701,7 +798,18 @@ export class ApprovedSessionPanel {
   }
 
   private async handleStart(): Promise<void> {
-    if (this.disposed || !this.root.open || this.startInFlight) {
+    await this.handleLifecycleAction('start');
+  }
+
+  /**
+   * One guarded path for start, idle stop, and explicit restart.
+   *
+   * The guard is set synchronously before any IPC call. Context epoch, action,
+   * and expected instance are part of the ticket so late responses never
+   * mutate a newly selected chat or a different host instance.
+   */
+  private async handleLifecycleAction(action: HostLifecycleAction): Promise<void> {
+    if (this.disposed || !this.root.open || this.lifecycleInFlight) {
       return;
     }
     const approval = this.approval;
@@ -709,52 +817,120 @@ export class ApprovedSessionPanel {
     if (!approval || !context) {
       return;
     }
+
     const nativeBridgeAvailable = hasTauriRuntime();
-    if (
-      !canStartLocalSession(approval, context, {
-        nativeBridgeAvailable,
-        busy: this.statusLoading || this.lastErrorKind === 'bridge_disconnected',
-        summary: this.summary,
-      })
-    ) {
+    const previewFixtureMode = isDevPreviewFixtureMode();
+    const summary = this.currentContextSummary();
+    const busy = this.statusLoading || this.lastErrorKind === 'bridge_disconnected';
+    const uncertain = isUncertainHostErrorKind(this.lastErrorKind);
+    const options = {
+      nativeBridgeAvailable,
+      previewFixtureMode,
+      busy,
+      uncertain,
+      summary,
+    };
+
+    let eligible = false;
+    switch (action) {
+      case 'start':
+        eligible = canStartLocalSession(approval, context, options);
+        break;
+      case 'stop':
+        eligible = canStopLocalSession(approval, context, options);
+        break;
+      case 'restart':
+        eligible = canRestartLocalSession(approval, context, options);
+        break;
+    }
+    if (!eligible) {
       this.syncUi();
       return;
     }
 
-    const notifyCodexToolId = notificationToolIdForStart(
-      this.notificationState,
-      context,
-      this.currentReadySession() !== null ||
-        this.summary?.phase === 'ready' ||
-        this.summary?.phase === 'bootstrapping'
-    );
-    if (this.notificationState.optIn && notifyCodexToolId === null) {
+    const expectedInstance = action === 'start' ? null : hostInstanceId(summary);
+    if (action !== 'start' && !expectedInstance) {
       this.errorMessage =
-        'Choose an enabled Codex CLI tool before starting with notifications.';
-      this.lastErrorKind = 'other';
+        'The host instance identity is unavailable; lifecycle controls remain disabled.';
+      this.lastErrorKind = 'control_unavailable';
       this.syncUi();
       return;
     }
 
-    // Set the guard synchronously so a second click cannot issue another command.
-    this.startInFlight = true;
-    const ticket = ++this.startTicket;
+    let notifyCodexToolId: string | null = null;
+    if (action !== 'stop') {
+      const running =
+        summary !== null &&
+        (isHostSummaryReady(summary) ||
+          summary.phase === 'bootstrapping' ||
+          summary.phase === 'stopping');
+      notifyCodexToolId = notificationToolIdForStart(
+        this.notificationState,
+        context,
+        running
+      );
+      if (this.notificationState.optIn && notifyCodexToolId === null) {
+        this.errorMessage =
+          action === 'restart'
+            ? 'Choose an enabled Codex CLI tool before restarting with notifications.'
+            : 'Choose an enabled Codex CLI tool before starting with notifications.';
+        this.lastErrorKind = 'other';
+        this.syncUi();
+        return;
+      }
+    }
+
+    // Set the shared guard synchronously so a second click cannot issue another command.
+    // Invalidate any status read already in flight so it cannot change the
+    // expected instance while this lifecycle action is pending.
+    this.statusTicket += 1;
+    this.statusLoading = false;
+    const ticket = ++this.lifecycleTicket;
     const epoch = this.contextEpoch;
-    const key = this.currentRequestKey();
-    this.startRequestKey = key;
+    const key = buildHostLifecycleRequestKey(
+      approval,
+      context,
+      action,
+      expectedInstance
+    );
+    this.lifecycleInFlight = true;
+    this.lifecycleAction = action;
+    this.lifecycleRequestKey = key;
     this.errorMessage = null;
     this.lastErrorKind = null;
     this.syncUi();
 
     try {
-      const summary = await desktop_start_approved_session({
-        approvalId: approval.approval_id,
-        notifyCodexToolId,
-      });
-      if (!this.isStartTicketCurrent(ticket, epoch, key) || !this.root.open) {
+      let result: HostSessionSummary | null = null;
+      switch (action) {
+        case 'start':
+          result = await desktop_start_approved_session({
+            approvalId: approval.approval_id,
+            notifyCodexToolId,
+          });
+          break;
+        case 'stop':
+          result = await desktop_stop_approved_session({
+            approvalId: approval.approval_id,
+            expectedInstanceId: expectedInstance!,
+          });
+          break;
+        case 'restart':
+          result = await desktop_restart_approved_session({
+            approvalId: approval.approval_id,
+            expectedPriorInstanceId: expectedInstance!,
+            notifyCodexToolId,
+          });
+          break;
+      }
+      if (result === null) {
         return;
       }
-      if (!hostSummaryMatchesContext(summary, approval, context)) {
+
+      if (!this.isLifecycleTicketCurrent(ticket, epoch, key) || !this.root.open) {
+        return;
+      }
+      if (!hostSummaryMatchesContext(result, approval, context)) {
         this.summary = null;
         this.errorMessage = 'Session result did not match this approval context.';
         this.lastErrorKind = 'other';
@@ -762,36 +938,58 @@ export class ApprovedSessionPanel {
         return;
       }
 
-      const previousSessionBindingId = this.summary?.session_binding_id ?? null;
-      this.summary = summary;
+      const previousSummary = this.summary;
+      const previousSessionBindingId = previousSummary?.session_binding_id ?? null;
+      const instanceChanged = hostInstanceChanged(previousSummary, result);
+      this.summary = result;
       this.errorMessage = null;
       this.lastErrorKind = null;
-      if (previousSessionBindingId !== summary.session_binding_id) {
+      if (instanceChanged) {
+        this.clearTaskData();
+        this.resetNotificationForInstance();
+      } else if (previousSessionBindingId !== result.session_binding_id) {
         this.clearTaskSnapshots();
       }
-      if (isHostSummaryReady(summary)) {
+
+      // A chosen opt-in belongs to the action that just ran. A later explicit
+      // start/restart begins unchecked unless the operator opts in again.
+      this.notificationState = {
+        optIn: false,
+        toolId: this.notificationState.toolId,
+      };
+
+      if (isHostSummaryReady(result)) {
         this.queueVisibleTaskReads('missing');
       } else {
         this.clearTaskSnapshots();
       }
     } catch (err) {
-      if (!this.isStartTicketCurrent(ticket, epoch, key)) {
+      if (!this.isLifecycleTicketCurrent(ticket, epoch, key)) {
         return;
       }
       const state = classifyHostError(err);
       this.summary = null;
       this.errorMessage =
-        state.message ?? 'The approved local session could not be started.';
+        state.message ??
+        (action === 'stop'
+          ? 'The approved local session could not be stopped.'
+          : action === 'restart'
+            ? 'The approved local session could not be restarted.'
+            : 'The approved local session could not be started.');
       this.lastErrorKind = state.kind;
       this.clearTaskSnapshots();
     } finally {
-      if (this.startTicket === ticket) {
-        this.startInFlight = false;
-        this.startRequestKey = null;
+      if (this.lifecycleTicket === ticket) {
+        this.lifecycleInFlight = false;
+        this.lifecycleAction = null;
+        this.lifecycleRequestKey = null;
       }
       if (!this.disposed) {
         if (this.root.open) {
           this.ensurePolling();
+        }
+        if (this.root.open && !this.lifecycleInFlight && this.contextEpoch !== epoch) {
+          void this.refreshStatus('context');
         }
         this.syncUi();
       }
@@ -831,7 +1029,7 @@ export class ApprovedSessionPanel {
     if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
       return;
     }
-    if (!this.canReadStatus() || this.statusLoading || this.startInFlight) {
+    if (!this.canReadStatus() || this.statusLoading || this.lifecycleInFlight) {
       return;
     }
     void this.refreshStatus('poll');
@@ -845,6 +1043,7 @@ export class ApprovedSessionPanel {
     return JSON.stringify([
       this.contextEpoch,
       this.currentRequestKey(),
+      hostInstanceId(session),
       session.session_binding_id,
       taskId,
     ]);
@@ -858,7 +1057,11 @@ export class ApprovedSessionPanel {
       return false;
     }
     const session = this.currentReadySession();
-    return session !== null && session.session_binding_id === request.sessionBindingId;
+    return (
+      session !== null &&
+      session.session_binding_id === request.sessionBindingId &&
+      hostInstanceId(session) === request.instanceId
+    );
   }
 
   private queueVisibleTaskReads(mode: TaskReadMode): void {
@@ -932,6 +1135,7 @@ export class ApprovedSessionPanel {
         epoch,
         key,
         sessionBindingId: session.session_binding_id,
+        instanceId: hostInstanceId(session),
         approvalId: approval.approval_id,
       };
       this.taskInFlight.set(readKey, request);
@@ -1117,6 +1321,9 @@ export class ApprovedSessionPanel {
       if (hostSummary?.phase === 'bootstrapping') {
         statusText = 'Host starting';
         statusTone = 'active';
+      } else if (hostSummary?.phase === 'stopping') {
+        statusText = 'Host stopping';
+        statusTone = 'active';
       } else if (hostSummary?.phase === 'failed') {
         statusText = 'Host failed';
         statusTone = 'warn';
@@ -1285,6 +1492,11 @@ export class ApprovedSessionPanel {
     }
   }
 
+  private resetNotificationForInstance(): void {
+    this.notificationState = emptyHostNotificationState();
+    this.notificationInstanceKey = hostInstanceId(this.summary) ?? '';
+  }
+
   private syncNotificationSection(
     activeSummary: HostSessionSummary | null,
     nativeBridgeAvailable: boolean,
@@ -1292,8 +1504,15 @@ export class ApprovedSessionPanel {
   ): void {
     const context = this.context;
     const previewFixtureMode = isDevPreviewFixtureMode();
+    const activeInstanceKey = hostInstanceId(activeSummary) ?? '';
+    if (activeInstanceKey !== this.notificationInstanceKey) {
+      this.notificationInstanceKey = activeInstanceKey;
+      this.notificationState = emptyHostNotificationState();
+    }
     const running =
-      activeSummary?.phase === 'ready' || activeSummary?.phase === 'bootstrapping';
+      activeSummary?.phase === 'ready' ||
+      activeSummary?.phase === 'bootstrapping' ||
+      activeSummary?.phase === 'stopping';
     const tools = enabledHostCodexTools(context);
     this.notificationState = resolveHostNotificationState(
       this.notificationState,
@@ -1302,7 +1521,7 @@ export class ApprovedSessionPanel {
     );
 
     const busy =
-      (this.statusLoading && this.statusReason !== 'poll') || this.startInFlight;
+      (this.statusLoading && this.statusReason !== 'poll') || this.lifecycleInFlight;
     this.notificationEditable =
       this.approval !== null &&
       canConfigureHostNotifications({
@@ -1360,6 +1579,8 @@ export class ApprovedSessionPanel {
     } else if (running) {
       note =
         'Locked while the host session is running. Notification policy is fixed at startup; stop and restart the host to change it.';
+    } else if (activeSummary?.phase === 'stopped') {
+      note = `${HOST_NOTIFICATION_UNVERIFIED_NOTE} The next explicit Restart starts a new instance; existing task receipts are not replayed and this choice stays off unless selected again.`;
     } else if (tools.length > 1 && !this.notificationState.toolId) {
       note = `${HOST_NOTIFICATION_UNVERIFIED_NOTE} Choose one Codex CLI tool explicitly.`;
     } else if (this.notificationState.optIn) {
@@ -1405,7 +1626,13 @@ export class ApprovedSessionPanel {
     this.techSection.hidden = false;
 
     const gates = summary.gates;
+    const instanceLabel = isValidHostInstanceId(summary.instance_id)
+      ? summary.instance_id!
+      : summary.instance_id
+        ? 'Invalid instance (controls unavailable)'
+        : 'Legacy (controls unavailable)';
     const rows: HTMLElement[] = [
+      kvRow('Instance', instanceLabel),
       kvRow('Control binding', summary.binding_id),
       kvRow('Host session binding', summary.session_binding_id ?? 'Not created'),
       kvRow('Plan revision', `${summary.plan_id} · r${summary.plan_revision}`),
@@ -1473,13 +1700,21 @@ export class ApprovedSessionPanel {
         ? this.summary
         : null;
     const ready = this.currentReadySession();
-    const startMatchesContext =
-      this.startInFlight && this.startRequestKey === this.currentRequestKey();
+    const previewFixtureMode = isDevPreviewFixtureMode();
+    const uncertain = isUncertainHostErrorKind(this.lastErrorKind);
+    const lifecycleMatchesContext =
+      this.lifecycleInFlight &&
+      this.lifecycleAction !== null &&
+      this.lifecycleRequestKey === this.currentLifecycleKey();
+    const lifecycleLabel =
+      this.lifecycleAction !== null
+        ? formatHostLifecycleActionLabel(this.lifecycleAction)
+        : 'Working';
 
     let summaryBadgeText = 'Not checked';
     let summaryBadgeTone: 'default' | 'active' | 'warn' = 'default';
-    if (startMatchesContext) {
-      summaryBadgeText = 'Starting…';
+    if (lifecycleMatchesContext) {
+      summaryBadgeText = `${lifecycleLabel}…`;
       summaryBadgeTone = 'active';
     } else if (this.statusLoading && this.statusReason !== 'poll') {
       summaryBadgeText = 'Reading…';
@@ -1491,9 +1726,19 @@ export class ApprovedSessionPanel {
       summaryBadgeText =
         this.lastErrorKind === 'not_ready'
           ? 'Host not ready'
-          : this.lastErrorKind === 'bridge_disconnected'
-            ? 'Bridge disconnected'
-            : 'Status unavailable';
+          : this.lastErrorKind === 'uncertain'
+            ? 'Stop uncertain'
+            : this.lastErrorKind === 'instance_mismatch'
+              ? 'Session changed'
+              : this.lastErrorKind === 'restart_not_allowed'
+                ? 'Restart blocked'
+                : this.lastErrorKind === 'control_unavailable'
+                  ? 'Controls unavailable'
+                  : this.lastErrorKind === 'not_idle'
+                    ? 'Host busy'
+                    : this.lastErrorKind === 'bridge_disconnected'
+                      ? 'Bridge disconnected'
+                      : 'Status unavailable';
       summaryBadgeTone = 'warn';
     } else if (!nativeBridgeAvailable || !contextMatches) {
       summaryBadgeText = 'Not checked';
@@ -1523,8 +1768,8 @@ export class ApprovedSessionPanel {
     let statusText =
       nativeBridgeAvailable && contextMatches ? 'Not started' : 'Not checked';
     let statusTone: 'default' | 'active' | 'warn' = 'default';
-    if (startMatchesContext) {
-      statusText = 'Starting…';
+    if (lifecycleMatchesContext) {
+      statusText = `${lifecycleLabel}…`;
       statusTone = 'active';
     } else if (this.statusLoading && this.statusReason !== 'poll') {
       statusText = 'Reading…';
@@ -1538,6 +1783,16 @@ export class ApprovedSessionPanel {
     } else if (this.errorMessage) {
       if (this.lastErrorKind === 'not_ready') {
         statusText = 'Host not ready';
+      } else if (this.lastErrorKind === 'uncertain') {
+        statusText = 'Stop uncertain';
+      } else if (this.lastErrorKind === 'instance_mismatch') {
+        statusText = 'Session changed';
+      } else if (this.lastErrorKind === 'restart_not_allowed') {
+        statusText = 'Restart blocked';
+      } else if (this.lastErrorKind === 'control_unavailable') {
+        statusText = 'Controls unavailable';
+      } else if (this.lastErrorKind === 'not_idle') {
+        statusText = 'Host busy';
       } else if (this.lastErrorKind === 'bridge_disconnected') {
         statusText = 'Bridge disconnected';
       } else {
@@ -1549,8 +1804,16 @@ export class ApprovedSessionPanel {
     this.statusBadge.setAttribute('data-status', statusTone);
 
     let meta = '';
-    if (startMatchesContext) {
-      meta = 'Starting the approved host process. No models or tasks are started.';
+    if (lifecycleMatchesContext) {
+      if (this.lifecycleAction === 'stop') {
+        meta =
+          'Requesting an authenticated idle stop. Success requires durable Stopped state and a released host lock.';
+      } else if (this.lifecycleAction === 'restart') {
+        meta =
+          'Restarting the stopped instance. Existing task receipts are not replayed and notifications stay off unless selected.';
+      } else {
+        meta = 'Starting the approved host process. No models or tasks are started.';
+      }
     } else if (this.statusLoading && this.statusReason !== 'poll') {
       meta = 'Reading approved host status…';
     } else if (this.errorMessage) {
@@ -1567,6 +1830,11 @@ export class ApprovedSessionPanel {
       meta = `${activeSummary.plan_id} r${activeSummary.plan_revision} · ${
         activeSummary.worker_profile_count
       } ${workerLabel} · ${activeSummary.native_route_count} ${nativeLabel}`;
+      if (activeSummary.phase === 'stopping') {
+        meta += ' · Stopping; lifecycle actions are disabled';
+      } else if (activeSummary.phase === 'stopped') {
+        meta += ' · Stopped; explicit Restart required';
+      }
       if (activeSummary.last_error?.trim() && !isHostSummaryReady(activeSummary)) {
         meta += ' · Reported diagnostic in Session details';
       }
@@ -1580,25 +1848,56 @@ export class ApprovedSessionPanel {
       nativeBridgeAvailable &&
       contextMatches
     );
-    this.refreshButton.disabled = this.statusLoading || this.startInFlight;
+    this.refreshButton.disabled = this.statusLoading || this.lifecycleInFlight;
 
+    const lifecycleOptions = {
+      nativeBridgeAvailable,
+      previewFixtureMode,
+      busy:
+        this.statusLoading ||
+        this.lifecycleInFlight ||
+        this.lastErrorKind === 'bridge_disconnected',
+      uncertain,
+      summary: activeSummary,
+    };
     const canStart =
       approval !== null &&
       context !== null &&
-      canStartLocalSession(approval, context, {
-        nativeBridgeAvailable,
-        busy:
-          this.statusLoading ||
-          this.startInFlight ||
-          this.lastErrorKind === 'bridge_disconnected',
-        summary: activeSummary,
-      });
-    const showStart =
-      this.root.open && canStart && nativeBridgeAvailable && contextMatches;
+      canStartLocalSession(approval, context, lifecycleOptions);
+    const canStop =
+      approval !== null &&
+      context !== null &&
+      canStopLocalSession(approval, context, lifecycleOptions);
+    const canRestart =
+      approval !== null &&
+      context !== null &&
+      canRestartLocalSession(approval, context, lifecycleOptions);
+    const showStart = this.root.open && canStart;
+    const showStop = this.root.open && canStop;
+    const showRestart = this.root.open && canRestart;
+
     this.startButton.hidden = !showStart;
-    this.startButton.disabled = this.statusLoading || this.startInFlight;
+    this.startButton.disabled = this.statusLoading || this.lifecycleInFlight;
     setText(this.startButtonLabel, 'Start local session');
-    this.actions.hidden = this.refreshButton.hidden && this.startButton.hidden;
+
+    this.stopButton.hidden = !showStop;
+    this.stopButton.disabled = this.statusLoading || this.lifecycleInFlight;
+    setText(this.stopButtonLabel, 'Stop idle session');
+
+    this.restartButton.hidden = !showRestart;
+    this.restartButton.disabled = this.statusLoading || this.lifecycleInFlight;
+    setText(this.restartButtonLabel, 'Restart stopped session');
+
+    const hint = hostLifecycleHint(activeSummary, uncertain);
+    setText(this.lifecycleHint, hint);
+    this.lifecycleHint.hidden = hint.length === 0;
+
+    this.actions.hidden =
+      this.refreshButton.hidden &&
+      this.startButton.hidden &&
+      this.stopButton.hidden &&
+      this.restartButton.hidden &&
+      this.lifecycleHint.hidden;
 
     this.syncNotificationSection(activeSummary, nativeBridgeAvailable, contextMatches);
     this.syncTechSection();

@@ -941,6 +941,10 @@ class ThreadlaneDesktopApp {
   }
 
   private renderMain(): void {
+    // Only the visible Chats panel may keep an in-flight metadata query alive.
+    this.nativeLinkingPanel.setActive(
+      this.state.page === 'chats' && this.state.detailTarget === null
+    );
     const nodes: Node[] = [];
 
     if (this.state.actionError) {

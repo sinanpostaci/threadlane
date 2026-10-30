@@ -13,8 +13,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::de::DeserializeOwned;
 use threadlane_core::{
-    estimate_wire_response_bytes, Command, Core, CoreError, WorkerClaim, WorkerStatus,
-    MAX_COMPACT_RESPONSE_BYTES, MAX_STATUS_RECENT_RUNS,
+    estimate_wire_response_bytes, Command, Core, CoreError, WakeupStatus, WorkerClaim,
+    WorkerStatus, MAX_COMPACT_RESPONSE_BYTES, MAX_STATUS_RECENT_RUNS,
 };
 use threadlane_workers::NormalizedWorkerEvent;
 use tokio::net::TcpListener;
@@ -29,8 +29,10 @@ use crate::descriptor::{
 };
 use crate::error::{ApiError, Error, ErrorCode};
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, RetryWakeupRequest, ScopedRequest, ScopedResponse,
-    StatusResponse,
+    BindingListResponse, CreateBindingRequest, HostControlBusyCounts, HostControlConfig,
+    HostControlInfoRequest, HostControlOwnerScope, HostControlRuntimeState,
+    HostControlStatusResponse, RetryWakeupRequest, ScopedRequest, ScopedResponse, StatusResponse,
+    StopIdleHostRequest,
 };
 use crate::workers::{
     build_completion_record, build_pre_spawn_cancelled_completion, execute_claimed_worker,
@@ -139,6 +141,9 @@ struct SharedState {
     state_dir: PathBuf,
     active: Mutex<Option<ActiveCore>>,
     retired: AtomicBool,
+    stopping: AtomicBool,
+    stop_tx: watch::Sender<bool>,
+    host_control: Option<HostControlConfig>,
     fatal_error: std::sync::Mutex<Option<ApiError>>,
     fatal_tx: watch::Sender<Option<ApiError>>,
     token: SecretToken,
@@ -294,7 +299,9 @@ impl SharedState {
         if self.fatal_error().is_some() {
             return None;
         }
-        if !allow_when_retiring && self.retired.load(Ordering::SeqCst) {
+        if !allow_when_retiring
+            && (self.retired.load(Ordering::SeqCst) || self.stopping.load(Ordering::SeqCst))
+        {
             return None;
         }
 
@@ -306,11 +313,21 @@ impl SharedState {
             let _ = guard.take();
             return None;
         }
+        if !allow_when_retiring && self.stopping.load(Ordering::SeqCst) {
+            return None;
+        }
         if guard.is_none() {
             return None;
         }
 
         Some(CoreAccessGuard { state: self, guard })
+    }
+
+    fn ensure_not_stopping(&self) -> Result<(), (StatusCode, Json<ApiError>)> {
+        if self.stopping.load(Ordering::SeqCst) {
+            return Err(stopping_response());
+        }
+        Ok(())
     }
 }
 
@@ -320,6 +337,16 @@ fn retired_response() -> (StatusCode, Json<ApiError>) {
         Json(ApiError::new(
             ErrorCode::InternalError,
             "supervisor is shutting down and no longer accepting requests",
+        )),
+    )
+}
+
+fn stopping_response() -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiError::new(
+            ErrorCode::HostStopping,
+            "host session is stopping and no longer accepting mutations",
         )),
     )
 }
@@ -385,6 +412,28 @@ impl SupervisorHandle {
             if rx.changed().await.is_err() {
                 if let Some(err) = self.fatal_error() {
                     return err;
+                }
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Waits until an authenticated, owner-scoped idle stop request is latched on this supervisor.
+    ///
+    /// If host control is not configured on this supervisor, this future remains pending indefinitely.
+    pub async fn wait_for_stop_request(&self) {
+        if self.shared.host_control.is_none() {
+            std::future::pending::<()>().await;
+            return;
+        }
+        let mut rx = self.shared.stop_tx.subscribe();
+        loop {
+            if *rx.borrow_and_update() || self.shared.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                if self.shared.stopping.load(Ordering::SeqCst) {
+                    return;
                 }
                 std::future::pending::<()>().await;
             }
@@ -484,7 +533,25 @@ pub struct Supervisor;
 impl Supervisor {
     /// Starts the supervisor on `127.0.0.1:0`, acquiring the exclusive state directory lock,
     /// opening/recovering SQLite state, and atomically writing `supervisor.json`.
+    ///
+    /// Host session control is disabled by default on supervisors started via [`Supervisor::start`].
     pub async fn start(config: SupervisorConfig) -> Result<SupervisorHandle, Error> {
+        Self::start_inner(config, None).await
+    }
+
+    /// Starts the supervisor on `127.0.0.1:0` with owner-scoped [`HostControlConfig`] installed.
+    pub async fn start_with_host_control(
+        config: SupervisorConfig,
+        control: HostControlConfig,
+    ) -> Result<SupervisorHandle, Error> {
+        validate_host_control_config(&control)?;
+        Self::start_inner(config, Some(control)).await
+    }
+
+    async fn start_inner(
+        config: SupervisorConfig,
+        host_control: Option<HostControlConfig>,
+    ) -> Result<SupervisorHandle, Error> {
         config.validate()?;
         let validated_workers = match &config.workers {
             Some(w) => Some(w.validate()?),
@@ -522,11 +589,15 @@ impl Supervisor {
         };
 
         let (fatal_tx, _fatal_rx) = watch::channel(None);
+        let (stop_tx, _stop_rx) = watch::channel(false);
 
         let shared = Arc::new(SharedState {
             state_dir: config.state_dir.clone(),
             active: Mutex::new(Some(active_core)),
             retired: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            stop_tx,
+            host_control,
             fatal_error: std::sync::Mutex::new(None),
             fatal_tx,
             token,
@@ -577,6 +648,53 @@ impl Supervisor {
     }
 }
 
+fn validate_host_control_config(control: &HostControlConfig) -> Result<(), Error> {
+    validate_host_control_id("approval_id", &control.approval_id)?;
+    if control.subject_digest.len() != 64
+        || !control
+            .subject_digest
+            .chars()
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
+    {
+        return Err(Error::InvalidConfig(
+            "host control `subject_digest` must be 64 lowercase hex characters".to_string(),
+        ));
+    }
+    validate_host_control_id("control_binding_id", &control.control_binding_id)?;
+    validate_host_control_id("session_binding_id", &control.session_binding_id)?;
+    validate_host_control_id("thread_uuid", &control.thread_uuid)?;
+    let Some(hex_part) = control.instance_id.strip_prefix("hst_") else {
+        return Err(Error::InvalidConfig(format!(
+            "invalid host control instance_id `{}`: must match `hst_<32 lowercase hex chars>`",
+            control.instance_id
+        )));
+    };
+    if hex_part.len() != 32
+        || !hex_part
+            .chars()
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f'))
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid host control instance_id `{}`: must match `hst_<32 lowercase hex chars>`",
+            control.instance_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_host_control_id(field: &'static str, value: &str) -> Result<(), Error> {
+    if value.is_empty()
+        || value.len() > threadlane_core::MAX_ID_LEN
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "invalid host control `{field}` identifier `{value}`"
+        )));
+    }
+    Ok(())
+}
+
 fn build_router(state: Arc<SharedState>) -> Router {
     Router::new()
         .route(
@@ -592,6 +710,8 @@ fn build_router(state: Arc<SharedState>) -> Router {
             "/v1/bindings/{binding_id}/retry-wakeup",
             post(handle_retry_wakeup),
         )
+        .route("/v1/host-control/info", post(handle_host_control_info))
+        .route("/v1/host-control/stop", post(handle_stop_idle_host))
         .fallback(handle_fallback)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
@@ -715,6 +835,7 @@ async fn handle_create_binding(
     let req: CreateBindingRequest = parse_json_body(body)?;
 
     let mut access = state.acquire_for_request().await?;
+    state.ensure_not_stopping()?;
     let binding = access
         .core_mut()
         .create_binding(&req.thread_uuid, &req.label)
@@ -766,7 +887,12 @@ async fn handle_scoped_command(
 
     let response = {
         let mut access = state.acquire_for_request().await?;
-        if !matches!(req, ScopedRequest::ListActivity { .. }) {
+        if req.is_mutating() {
+            state.ensure_not_stopping()?;
+        }
+        if !state.stopping.load(Ordering::SeqCst)
+            && !matches!(req, ScopedRequest::ListActivity { .. })
+        {
             let report = access
                 .core_mut()
                 .tick(now)
@@ -913,6 +1039,7 @@ async fn handle_retry_wakeup(
 
     let notice = {
         let mut access = state.acquire_for_request().await?;
+        state.ensure_not_stopping()?;
         access
             .core_mut()
             .retry_wakeup(&binding_id, &req.expected_claim_id, req.allow_unknown, now)
@@ -921,6 +1048,217 @@ async fn handle_retry_wakeup(
 
     state.wake_notify.notify_one();
     Ok(Json(notice))
+}
+
+fn verify_host_control_scope<'a>(
+    state: &'a SharedState,
+    req: &HostControlOwnerScope,
+) -> Result<&'a HostControlConfig, (StatusCode, Json<ApiError>)> {
+    let Some(control) = state.host_control.as_ref() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError::new(
+                ErrorCode::HostControlNotConfigured,
+                "host session control is not configured on this supervisor",
+            )),
+        ));
+    };
+
+    let scope_checks = [
+        ("approval_id", &control.approval_id, &req.approval_id),
+        (
+            "subject_digest",
+            &control.subject_digest,
+            &req.subject_digest,
+        ),
+        (
+            "control_binding_id",
+            &control.control_binding_id,
+            &req.control_binding_id,
+        ),
+        ("thread_uuid", &control.thread_uuid, &req.thread_uuid),
+        (
+            "session_binding_id",
+            &control.session_binding_id,
+            &req.session_binding_id,
+        ),
+    ];
+
+    for (field, expected, actual) in scope_checks {
+        if expected != actual {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError::with_details(
+                    ErrorCode::HostScopeMismatch,
+                    format!(
+                        "host control scope mismatch on `{field}`: expected `{expected}`, got `{actual}`"
+                    ),
+                    serde_json::json!({
+                        "field": field,
+                        "expected": expected,
+                        "actual": actual,
+                    }),
+                )),
+            ));
+        }
+    }
+
+    if req.expected_instance_id != control.instance_id {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::with_details(
+                ErrorCode::HostInstanceMismatch,
+                format!(
+                    "host instance mismatch for approval `{}`: expected `{}`, actual `{}`",
+                    control.approval_id, req.expected_instance_id, control.instance_id
+                ),
+                serde_json::json!({
+                    "approval_id": control.approval_id,
+                    "expected_instance_id": req.expected_instance_id,
+                    "actual_instance_id": control.instance_id,
+                }),
+            )),
+        ));
+    }
+
+    Ok(control)
+}
+
+fn inspect_host_busy_counts(
+    state: &SharedState,
+    access: &mut CoreAccessGuard<'_>,
+) -> Result<HostControlBusyCounts, (StatusCode, Json<ApiError>)> {
+    let inspection = access
+        .core_mut()
+        .inspect_runtime_idle()
+        .map_err(|err| map_core_error(state, "inspect_runtime_idle failed", err))?;
+    let mut pending_enabled_wakeups = 0usize;
+    if let Some(codex_cfg) = &state.codex {
+        for binding_id in &codex_cfg.notify_bindings {
+            match access.core_mut().get_wakeup(binding_id) {
+                Ok(wakeup) => {
+                    if wakeup.status == WakeupStatus::Pending {
+                        pending_enabled_wakeups += 1;
+                    }
+                }
+                Err(CoreError::BindingNotFound { .. }) => {
+                    // Deliberate no-op when an allowlisted binding does not exist yet,
+                    // matching the background notifier loop.
+                }
+                Err(err) => {
+                    return Err(map_core_error(
+                        state,
+                        &format!("get_wakeup failed for notify binding `{binding_id}`"),
+                        err,
+                    ));
+                }
+            }
+        }
+    }
+    let live_worker_tasks = state
+        .active_workers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .len();
+    Ok(HostControlBusyCounts {
+        non_terminal_runs: inspection.non_terminal_runs,
+        non_terminal_workers: inspection.non_terminal_workers,
+        live_worker_tasks,
+        in_flight_wakeups: inspection.in_flight_wakeups,
+        pending_enabled_wakeups,
+    })
+}
+
+fn build_host_control_status_response(
+    control: &HostControlConfig,
+    runtime_state: HostControlRuntimeState,
+    busy: HostControlBusyCounts,
+) -> HostControlStatusResponse {
+    HostControlStatusResponse {
+        approval_id: control.approval_id.clone(),
+        subject_digest: control.subject_digest.clone(),
+        control_binding_id: control.control_binding_id.clone(),
+        thread_uuid: control.thread_uuid.clone(),
+        session_binding_id: control.session_binding_id.clone(),
+        instance_id: control.instance_id.clone(),
+        state: runtime_state,
+        idle: busy.is_idle(),
+        busy,
+    }
+}
+
+async fn handle_host_control_info(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<HostControlStatusResponse>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: HostControlInfoRequest = parse_json_body(body)?;
+
+    let mut access = state.acquire_for_request().await?;
+    let control = verify_host_control_scope(&state, &req)?;
+    let busy = inspect_host_busy_counts(&state, &mut access)?;
+    let runtime_state = if state.stopping.load(Ordering::SeqCst) {
+        HostControlRuntimeState::Stopping
+    } else {
+        HostControlRuntimeState::Ready
+    };
+
+    Ok(Json(build_host_control_status_response(
+        control,
+        runtime_state,
+        busy,
+    )))
+}
+
+async fn handle_stop_idle_host(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<HostControlStatusResponse>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: StopIdleHostRequest = parse_json_body(body)?;
+
+    let mut access = state.acquire_for_request().await?;
+    let control = verify_host_control_scope(&state, &req)?;
+    let busy = inspect_host_busy_counts(&state, &mut access)?;
+
+    if state.stopping.load(Ordering::SeqCst) {
+        return Ok(Json(build_host_control_status_response(
+            control,
+            HostControlRuntimeState::Stopping,
+            busy,
+        )));
+    }
+
+    if !busy.is_idle() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(ApiError::with_details(
+                ErrorCode::HostNotIdle,
+                format!(
+                    "host session for approval `{}` is not idle (non_terminal_runs={}, non_terminal_workers={}, live_worker_tasks={}, in_flight_wakeups={}, pending_enabled_wakeups={})",
+                    control.approval_id,
+                    busy.non_terminal_runs,
+                    busy.non_terminal_workers,
+                    busy.live_worker_tasks,
+                    busy.in_flight_wakeups,
+                    busy.pending_enabled_wakeups,
+                ),
+                serde_json::to_value(busy).unwrap_or_default(),
+            )),
+        ));
+    }
+
+    state.stopping.store(true, Ordering::SeqCst);
+    let _ = state.stop_tx.send_replace(true);
+    state.wake_notify.notify_waiters();
+
+    Ok(Json(build_host_control_status_response(
+        control,
+        HostControlRuntimeState::Stopping,
+        busy,
+    )))
 }
 
 async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::Receiver<bool>) {
@@ -936,204 +1274,216 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
             break;
         }
 
-        {
-            let Some(mut access) = state.acquire_for_worker(false).await else {
-                break;
-            };
-            if let Err(err) = access.core_mut().tick(current_time_ms()) {
-                let _ =
-                    state.record_core_fatal_error("background demo tick persistence failed", &err);
-                break;
+        if !state.stopping.load(Ordering::SeqCst) {
+            if let Some(mut access) = state.acquire_for_worker(false).await {
+                if let Err(err) = access.core_mut().tick(current_time_ms()) {
+                    let _ = state
+                        .record_core_fatal_error("background demo tick persistence failed", &err);
+                    break;
+                }
             }
         }
 
-        if let Some(workers_cfg) = &state.workers {
-            let mut fatal_occurred = false;
-            while worker_tasks.len() < workers_cfg.max_parallel {
-                if *shutdown_rx.borrow()
-                    || state.retired.load(Ordering::SeqCst)
-                    || state.fatal_error().is_some()
-                {
-                    break;
-                }
-
-                let available_slots = workers_cfg.max_parallel.saturating_sub(worker_tasks.len());
-                if available_slots == 0 {
-                    break;
-                }
-
-                let claimed_batch = {
-                    let Some(mut access) = state.acquire_for_worker(false).await else {
-                        break;
-                    };
-                    let queued = match access.core_mut().list_queued_workers(available_slots) {
-                        Ok(list) => list,
-                        Err(err) => {
-                            let _ =
-                                state.record_core_fatal_error("list_queued_workers failed", &err);
-                            fatal_occurred = true;
-                            break;
-                        }
-                    };
-                    if queued.is_empty() {
+        if !state.stopping.load(Ordering::SeqCst) {
+            if let Some(workers_cfg) = &state.workers {
+                let mut fatal_occurred = false;
+                while worker_tasks.len() < workers_cfg.max_parallel {
+                    if *shutdown_rx.borrow()
+                        || state.retired.load(Ordering::SeqCst)
+                        || state.stopping.load(Ordering::SeqCst)
+                        || state.fatal_error().is_some()
+                    {
                         break;
                     }
 
-                    let mut newly_claimed = Vec::new();
-                    for snap in queued {
-                        if worker_tasks.len() + newly_claimed.len() >= workers_cfg.max_parallel {
+                    let available_slots =
+                        workers_cfg.max_parallel.saturating_sub(worker_tasks.len());
+                    if available_slots == 0 {
+                        break;
+                    }
+
+                    let claimed_batch = {
+                        let Some(mut access) = state.acquire_for_worker(false).await else {
+                            break;
+                        };
+                        let queued = match access.core_mut().list_queued_workers(available_slots) {
+                            Ok(list) => list,
+                            Err(err) => {
+                                let _ = state
+                                    .record_core_fatal_error("list_queued_workers failed", &err);
+                                fatal_occurred = true;
+                                break;
+                            }
+                        };
+                        if queued.is_empty() {
                             break;
                         }
-                        let Some(profile) = workers_cfg.profiles.get(&snap.profile_id) else {
-                            continue;
-                        };
-                        if profile.profile_digest != snap.profile_digest
-                            || !profile.allowed_binding_ids.contains(&snap.binding_id)
-                        {
-                            continue;
-                        }
 
-                        match access.core_mut().claim_worker(
-                            &snap.binding_id,
-                            &snap.run_id,
-                            snap.revision,
-                            &profile.profile_digest,
-                            current_time_ms(),
-                        ) {
-                            Ok(claim) => {
-                                let (cancel_tx, cancel_rx) = watch::channel(false);
-                                let user_cancel_requested = Arc::new(AtomicBool::new(false));
-                                state.register_active_worker(
-                                    claim.clone(),
-                                    cancel_tx.clone(),
-                                    Arc::clone(&user_cancel_requested),
-                                );
-                                newly_claimed.push((
-                                    profile.clone(),
-                                    claim,
-                                    cancel_tx,
-                                    cancel_rx,
-                                    user_cancel_requested,
-                                ));
+                        let mut newly_claimed = Vec::new();
+                        for snap in queued {
+                            if worker_tasks.len() + newly_claimed.len() >= workers_cfg.max_parallel
+                            {
+                                break;
                             }
-                            Err(
-                                CoreError::StaleRevision { .. }
-                                | CoreError::InvalidRunState { .. }
-                                | CoreError::RunNotFound { .. }
-                                | CoreError::BindingNotFound { .. },
-                            ) => {
+                            let Some(profile) = workers_cfg.profiles.get(&snap.profile_id) else {
+                                continue;
+                            };
+                            if profile.profile_digest != snap.profile_digest
+                                || !profile.allowed_binding_ids.contains(&snap.binding_id)
+                            {
                                 continue;
                             }
-                            Err(err) => {
-                                let _ = state.record_core_fatal_error("claim_worker failed", &err);
-                                fatal_occurred = true;
-                                break;
+
+                            match access.core_mut().claim_worker(
+                                &snap.binding_id,
+                                &snap.run_id,
+                                snap.revision,
+                                &profile.profile_digest,
+                                current_time_ms(),
+                            ) {
+                                Ok(claim) => {
+                                    let (cancel_tx, cancel_rx) = watch::channel(false);
+                                    let user_cancel_requested = Arc::new(AtomicBool::new(false));
+                                    state.register_active_worker(
+                                        claim.clone(),
+                                        cancel_tx.clone(),
+                                        Arc::clone(&user_cancel_requested),
+                                    );
+                                    newly_claimed.push((
+                                        profile.clone(),
+                                        claim,
+                                        cancel_tx,
+                                        cancel_rx,
+                                        user_cancel_requested,
+                                    ));
+                                }
+                                Err(
+                                    CoreError::StaleRevision { .. }
+                                    | CoreError::InvalidRunState { .. }
+                                    | CoreError::RunNotFound { .. }
+                                    | CoreError::BindingNotFound { .. },
+                                ) => {
+                                    continue;
+                                }
+                                Err(err) => {
+                                    let _ =
+                                        state.record_core_fatal_error("claim_worker failed", &err);
+                                    fatal_occurred = true;
+                                    break;
+                                }
                             }
                         }
-                    }
-                    newly_claimed
-                };
-
-                if fatal_occurred || claimed_batch.is_empty() {
-                    break;
-                }
-
-                for (profile, claim, cancel_tx, cancel_rx, user_cancel_requested) in claimed_batch {
-                    let task_state = Arc::clone(&state);
-                    let task_shutdown_rx = shutdown_rx.clone();
-                    worker_tasks.spawn(async move {
-                        run_single_claimed_worker(
-                            task_state,
-                            profile,
-                            claim,
-                            cancel_tx,
-                            cancel_rx,
-                            user_cancel_requested,
-                            task_shutdown_rx,
-                        )
-                        .await
-                    });
-                }
-            }
-
-            if fatal_occurred {
-                break;
-            }
-        }
-
-        if let Some(codex_cfg) = &state.codex {
-            let mut fatal_occurred = false;
-            loop {
-                if *shutdown_rx.borrow()
-                    || state.retired.load(Ordering::SeqCst)
-                    || state.fatal_error().is_some()
-                {
-                    break;
-                }
-
-                let next_claim = {
-                    let Some(mut access) = state.acquire_for_worker(false).await else {
-                        break;
+                        newly_claimed
                     };
-                    let now = current_time_ms();
-                    let mut claimed = None;
-                    for binding_id in &codex_cfg.notify_bindings {
-                        match access.core_mut().claim_wakeup_for_binding(binding_id, now) {
-                            Ok(Some(claim)) => {
-                                claimed = Some(claim);
-                                break;
-                            }
-                            Ok(None) | Err(CoreError::BindingNotFound { .. }) => {
-                                // Deliberate no-op when binding has no pending wake-up or does not exist yet.
-                            }
-                            Err(err) => {
-                                let _ = state.record_core_fatal_error(
-                                    &format!("failed to claim wake-up for binding `{binding_id}`"),
-                                    &err,
-                                );
-                                fatal_occurred = true;
-                                break;
-                            }
-                        }
+
+                    if fatal_occurred || claimed_batch.is_empty() {
+                        break;
                     }
-                    claimed
-                };
+
+                    for (profile, claim, cancel_tx, cancel_rx, user_cancel_requested) in
+                        claimed_batch
+                    {
+                        let task_state = Arc::clone(&state);
+                        let task_shutdown_rx = shutdown_rx.clone();
+                        worker_tasks.spawn(async move {
+                            run_single_claimed_worker(
+                                task_state,
+                                profile,
+                                claim,
+                                cancel_tx,
+                                cancel_rx,
+                                user_cancel_requested,
+                                task_shutdown_rx,
+                            )
+                            .await
+                        });
+                    }
+                }
 
                 if fatal_occurred {
                     break;
                 }
+            }
+        }
 
-                let Some(claim) = next_claim else {
-                    break;
-                };
+        if !state.stopping.load(Ordering::SeqCst) {
+            if let Some(codex_cfg) = &state.codex {
+                let mut fatal_occurred = false;
+                loop {
+                    if *shutdown_rx.borrow()
+                        || state.retired.load(Ordering::SeqCst)
+                        || state.stopping.load(Ordering::SeqCst)
+                        || state.fatal_error().is_some()
+                    {
+                        break;
+                    }
 
-                let outcome = invoke_codex_wakeup(codex_cfg, &claim, &mut shutdown_rx).await;
+                    let next_claim = {
+                        let Some(mut access) = state.acquire_for_worker(false).await else {
+                            break;
+                        };
+                        let now = current_time_ms();
+                        let mut claimed = None;
+                        for binding_id in &codex_cfg.notify_bindings {
+                            match access.core_mut().claim_wakeup_for_binding(binding_id, now) {
+                                Ok(Some(claim)) => {
+                                    claimed = Some(claim);
+                                    break;
+                                }
+                                Ok(None) | Err(CoreError::BindingNotFound { .. }) => {
+                                    // Deliberate no-op when binding has no pending wake-up or does not exist yet.
+                                }
+                                Err(err) => {
+                                    let _ = state.record_core_fatal_error(
+                                        &format!(
+                                            "failed to claim wake-up for binding `{binding_id}`"
+                                        ),
+                                        &err,
+                                    );
+                                    fatal_occurred = true;
+                                    break;
+                                }
+                            }
+                        }
+                        claimed
+                    };
 
-                // Persist the wake-up outcome (even if shutdown started while the child process was running).
-                // If persisting the result fails, record a fatal supervisor error and stop without
-                // retrying the uncertain external side effect.
-                let Some(mut access) = state.acquire_for_worker(true).await else {
-                    break;
-                };
-                if let Err(err) = access.core_mut().record_wakeup_result(
-                    &claim.claim_id,
-                    outcome,
-                    current_time_ms(),
-                ) {
-                    let _ = state.record_core_fatal_error(
-                        &format!(
-                            "failed to persist wake-up outcome for claim `{}` (external effect not retried)",
-                            claim.claim_id
-                        ),
-                        &err,
-                    );
-                    fatal_occurred = true;
+                    if fatal_occurred {
+                        break;
+                    }
+
+                    let Some(claim) = next_claim else {
+                        break;
+                    };
+
+                    let outcome = invoke_codex_wakeup(codex_cfg, &claim, &mut shutdown_rx).await;
+
+                    // Persist the wake-up outcome (even if shutdown started while the child process was running).
+                    // If persisting the result fails, record a fatal supervisor error and stop without
+                    // retrying the uncertain external side effect.
+                    let Some(mut access) = state.acquire_for_worker(true).await else {
+                        break;
+                    };
+                    if let Err(err) = access.core_mut().record_wakeup_result(
+                        &claim.claim_id,
+                        outcome,
+                        current_time_ms(),
+                    ) {
+                        let _ = state.record_core_fatal_error(
+                            &format!(
+                                "failed to persist wake-up outcome for claim `{}` (external effect not retried)",
+                                claim.claim_id
+                            ),
+                            &err,
+                        );
+                        fatal_occurred = true;
+                        break;
+                    }
+                }
+
+                if fatal_occurred {
                     break;
                 }
-            }
-
-            if fatal_occurred {
-                break;
             }
         }
 
@@ -1414,4 +1764,945 @@ pub fn current_time_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::client::SupervisorClient;
+
+    const APPROVAL_ID: &str = "apr_11111111111111111111111111111111";
+    const SUBJECT_DIGEST: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const THREAD_UUID: &str = "33333333-3333-4333-8333-333333333333";
+    const OTHER_THREAD_UUID: &str = "44444444-4444-4444-8444-444444444444";
+    const INSTANCE_ID: &str = "hst_55555555555555555555555555555555";
+    const STALE_INSTANCE_ID: &str = "hst_66666666666666666666666666666666";
+
+    fn sample_host_control(session_binding_id: &str) -> HostControlConfig {
+        HostControlConfig {
+            approval_id: APPROVAL_ID.to_string(),
+            subject_digest: SUBJECT_DIGEST.to_string(),
+            control_binding_id: "bnd_control_001".to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            session_binding_id: session_binding_id.to_string(),
+            instance_id: INSTANCE_ID.to_string(),
+        }
+    }
+
+    fn owner_scope_from_config(cfg: &HostControlConfig) -> HostControlOwnerScope {
+        HostControlOwnerScope {
+            approval_id: cfg.approval_id.clone(),
+            subject_digest: cfg.subject_digest.clone(),
+            control_binding_id: cfg.control_binding_id.clone(),
+            thread_uuid: cfg.thread_uuid.clone(),
+            session_binding_id: cfg.session_binding_id.clone(),
+            expected_instance_id: cfg.instance_id.clone(),
+        }
+    }
+
+    // Cancellation alone is not an important event. Seed a real QuestionAsked through the Core
+    // timing path (start -> tick to WaitingInput -> cancel), leaving a Pending wakeup and no
+    // non-terminal run rows, without touching SQLite or persisted status directly.
+    fn seed_pending_important_wakeup(core: &mut Core, binding_id: &str, command_prefix: &str) {
+        let now = current_time_ms();
+        let seeded_run = core
+            .execute(
+                binding_id,
+                Command::StartDemo {
+                    command_key: format!("{command_prefix}-start"),
+                    instruction: "seed important question event before cancellation".to_string(),
+                    step_delay_ms: Some(1),
+                    now_ms: now,
+                },
+            )
+            .expect("start seeded demo")
+            .into_run()
+            .expect("seeded demo run snapshot");
+
+        core.tick(now + 2)
+            .expect("tick seeded demo to WaitingInput");
+
+        let waiting_run = core
+            .execute(
+                binding_id,
+                Command::GetRun {
+                    run_id: seeded_run.run_id.clone(),
+                },
+            )
+            .expect("get seeded demo after tick")
+            .into_run()
+            .expect("seeded waiting run snapshot");
+        assert_eq!(waiting_run.status, threadlane_core::RunStatus::WaitingInput);
+        assert!(
+            waiting_run.active_question.is_some(),
+            "seeded tick must emit an important QuestionAsked event"
+        );
+
+        let cancelled_run = core
+            .execute(
+                binding_id,
+                Command::Cancel {
+                    command_key: format!("{command_prefix}-cancel"),
+                    run_id: seeded_run.run_id,
+                    reason: Some("seed pending wakeup via QuestionAsked".to_string()),
+                    now_ms: now + 3,
+                },
+            )
+            .expect("cancel seeded demo")
+            .into_run()
+            .expect("cancelled seeded run snapshot");
+        assert_eq!(cancelled_run.status, threadlane_core::RunStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn host_control_disabled_by_default_on_legacy_start() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let handle = Supervisor::start(SupervisorConfig::new(&state_dir))
+            .await
+            .expect("start supervisor");
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+
+        let scope = owner_scope_from_config(&sample_host_control("bnd_session_001"));
+        let info_err = client
+            .host_control_info(&scope)
+            .await
+            .expect_err("info should be disabled");
+        match info_err {
+            Error::Remote(api_err) => assert_eq!(api_err.code, ErrorCode::HostControlNotConfigured),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let stop_err = client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("stop should be disabled");
+        match stop_err {
+            Error::Remote(api_err) => assert_eq!(api_err.code, ErrorCode::HostControlNotConfigured),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        // wait_for_stop_request remains pending when host control is disabled
+        let wait_res =
+            tokio::time::timeout(Duration::from_millis(40), handle.wait_for_stop_request()).await;
+        assert!(wait_res.is_err());
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn host_control_validates_auth_unknown_fields_owner_scope_and_instance_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let control = sample_host_control("bnd_session_001");
+        let handle =
+            Supervisor::start_with_host_control(SupervisorConfig::new(&state_dir), control.clone())
+                .await
+                .expect("start with host control");
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+
+        // Unauthenticated raw HTTP request fails with Unauthorized
+        let base_url = handle.descriptor().base_url().expect("base_url");
+        let raw_http = reqwest::Client::builder().no_proxy().build().expect("http");
+        let unauth_resp = raw_http
+            .post(format!("{base_url}/v1/host-control/info"))
+            .json(&owner_scope_from_config(&control))
+            .send()
+            .await
+            .expect("send unauth");
+        assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Unknown field in JSON body is rejected with InvalidRequest
+        let unknown_field_resp = raw_http
+            .post(format!("{base_url}/v1/host-control/stop"))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {}", handle.descriptor().token.as_str()),
+            )
+            .body(
+                serde_json::to_string(&serde_json::json!({
+                    "approval_id": APPROVAL_ID,
+                    "subject_digest": SUBJECT_DIGEST,
+                    "control_binding_id": "bnd_control_001",
+                    "thread_uuid": THREAD_UUID,
+                    "session_binding_id": "bnd_session_001",
+                    "expected_instance_id": INSTANCE_ID,
+                    "force": true
+                }))
+                .expect("json"),
+            )
+            .send()
+            .await
+            .expect("send unknown field");
+        assert_eq!(
+            unknown_field_resp.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+        let api_err: ApiError = unknown_field_resp.json().await.expect("api_err");
+        assert_eq!(api_err.code, ErrorCode::InvalidRequest);
+
+        // Owner scope mismatches fail with HostScopeMismatch
+        let mut wrong_approval = owner_scope_from_config(&control);
+        wrong_approval.approval_id = "apr_99999999999999999999999999999999".to_string();
+        match client
+            .stop_idle_host(&wrong_approval)
+            .await
+            .expect_err("wrong approval")
+        {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostScopeMismatch),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let mut wrong_thread = owner_scope_from_config(&control);
+        wrong_thread.thread_uuid = OTHER_THREAD_UUID.to_string();
+        match client
+            .host_control_info(&wrong_thread)
+            .await
+            .expect_err("wrong thread")
+        {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostScopeMismatch),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Instance mismatch fails with HostInstanceMismatch
+        let mut stale_scope = owner_scope_from_config(&control);
+        stale_scope.expected_instance_id = STALE_INSTANCE_ID.to_string();
+        match client
+            .stop_idle_host(&stale_scope)
+            .await
+            .expect_err("stale instance")
+        {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostInstanceMismatch),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_idle_host_rejects_active_demo_or_pending_enabled_wakeup_and_latches_when_idle() {
+        use threadlane_core::WakeupOutcome;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin_dir");
+        let fake_codex = bin_dir.join("fake-codex");
+        std::fs::write(&fake_codex, "#!/bin/sh\nexit 1\n").expect("write fake codex");
+        std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+
+        // Long tick interval so we can deterministically inspect Pending and InFlight wakeup states
+        // without background notifier timer races.
+        let mut sup_cfg = SupervisorConfig::new(&state_dir);
+        sup_cfg.tick_interval = Duration::from_secs(30);
+
+        // Bootstrap bindings
+        let boot = Supervisor::start(SupervisorConfig::new(&state_dir))
+            .await
+            .expect("boot");
+        let boot_client = SupervisorClient::from_state_dir(&state_dir).expect("boot client");
+        let session_binding = boot_client
+            .create_binding(THREAD_UUID, "session")
+            .await
+            .expect("create session binding");
+        let aux_binding = boot_client
+            .create_binding(OTHER_THREAD_UUID, "aux")
+            .await
+            .expect("create aux binding");
+        boot.shutdown().await;
+
+        let mut notify_bindings = BTreeSet::new();
+        notify_bindings.insert(session_binding.binding_id.clone());
+        // Include a nonexistent binding ID in notify_bindings to verify BindingNotFound is ignored
+        // identically to the background notifier loop.
+        notify_bindings.insert("bnd_nonexistent_notify_target".to_string());
+        sup_cfg.codex = Some(CodexWakeupConfig {
+            executable: fake_codex,
+            notify_bindings,
+            timeout: Duration::from_secs(5),
+            approved_session: None,
+        });
+
+        let control = sample_host_control(&session_binding.binding_id);
+        let scope = owner_scope_from_config(&control);
+        let mut handle = Supervisor::start_with_host_control(sup_cfg, control.clone())
+            .await
+            .expect("start final");
+        // Freeze this fixture's background worker/notifier effects so Pending/InFlight core
+        // states are deterministic; live provider/sender behavior is covered by other tests.
+        let worker_task = handle.worker_task.take().expect("background worker task");
+        worker_task.abort();
+        let _ = worker_task.await;
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+
+        // Initially idle
+        let info0 = client.host_control_info(&scope).await.expect("info0");
+        assert_eq!(info0.state, HostControlRuntimeState::Ready);
+        assert!(info0.idle);
+
+        // 1. Start a demo run on aux_binding (not in notify_bindings) -> runtime-wide idle check
+        //    must still count non_terminal_runs == 1 globally.
+        let aux_scoped = client
+            .clone()
+            .scoped(aux_binding.binding_id.clone())
+            .expect("aux scoped");
+        let demo_run = aux_scoped
+            .start_demo(
+                "demo-aux-1".to_string(),
+                "test demo".to_string(),
+                Some(60_000),
+            )
+            .await
+            .expect("start demo");
+
+        let busy_err = client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("should reject active demo run on aux binding");
+        match busy_err {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("busy details");
+                assert_eq!(details["non_terminal_runs"], 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 2. Cancel the demo run on aux_binding -> non_terminal_runs becomes 0. Cancellation alone
+        //    is not important, so seed a real QuestionAsked below; because aux_binding is NOT in
+        //    notify_bindings, pending_enabled_wakeups must be 0 and the host must be idle!
+        aux_scoped
+            .cancel(
+                "cancel-aux-1".to_string(),
+                demo_run.run_id,
+                Some("cleanup".to_string()),
+            )
+            .await
+            .expect("cancel demo");
+
+        // Cancellation alone leaves the wakeup Idle, so seed a real important QuestionAsked on
+        // aux_binding through Core timing before inspecting Pending.
+        {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire for aux pending seed");
+            seed_pending_important_wakeup(
+                access.core_mut(),
+                &aux_binding.binding_id,
+                "seed-aux-pending",
+            );
+        }
+
+        let aux_status = client
+            .status(&aux_binding.binding_id)
+            .await
+            .expect("aux status");
+        assert_eq!(aux_status.wakeup.status, WakeupStatus::Pending);
+
+        let info_idle = client.host_control_info(&scope).await.expect("info_idle");
+        assert!(info_idle.idle);
+        assert_eq!(info_idle.busy.pending_enabled_wakeups, 0);
+        assert_eq!(info_idle.busy.in_flight_wakeups, 0);
+
+        // 3. Deterministically create a Pending wakeup on the allowlisted session_binding under
+        //    SharedState::active without waking the background notifier loop, and verify that
+        //    pending_enabled_wakeups == 1 blocks stop_idle_host.
+        {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            seed_pending_important_wakeup(
+                access.core_mut(),
+                &session_binding.binding_id,
+                "sess-seed",
+            );
+            let busy_under_lock =
+                inspect_host_busy_counts(&handle.shared, &mut access).expect("inspect busy");
+            assert_eq!(busy_under_lock.non_terminal_runs, 0);
+            assert_eq!(busy_under_lock.pending_enabled_wakeups, 1);
+            assert!(!busy_under_lock.is_idle());
+        }
+
+        let info_pending = client
+            .host_control_info(&scope)
+            .await
+            .expect("info_pending");
+        assert!(!info_pending.idle);
+        assert_eq!(info_pending.busy.pending_enabled_wakeups, 1);
+
+        let pending_err = client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("allowlisted Pending wakeup must reject stop_idle_host");
+        match pending_err {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("busy details");
+                assert_eq!(details["pending_enabled_wakeups"], 1);
+                assert_eq!(details["in_flight_wakeups"], 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 4. Claim both session_binding and aux_binding wakeups into InFlight under the active
+        //    lock, proving in_flight_wakeups is counted globally across all bindings while
+        //    pending_enabled_wakeups drops to 0.
+        let (session_claim, aux_claim) = {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            let now = current_time_ms();
+            let s_claim = access
+                .core_mut()
+                .claim_wakeup_for_binding(&session_binding.binding_id, now)
+                .expect("claim session wakeup")
+                .expect("session wakeup was Pending");
+            let a_claim = access
+                .core_mut()
+                .claim_wakeup_for_binding(&aux_binding.binding_id, now)
+                .expect("claim aux wakeup")
+                .expect("aux wakeup was Pending");
+            (s_claim, a_claim)
+        };
+
+        let inflight_err = client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("InFlight wakeups must reject stop_idle_host");
+        match inflight_err {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("busy details");
+                assert_eq!(details["pending_enabled_wakeups"], 0);
+                assert_eq!(details["in_flight_wakeups"], 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Resolve both InFlight wakeup claims to Submitted. The later aux cancellation adds no
+        // important event, so only terminal rows remain when stop_idle_host is attempted below.
+        {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            let now = current_time_ms();
+            access
+                .core_mut()
+                .record_wakeup_result(&session_claim.claim_id, WakeupOutcome::Submitted, now)
+                .expect("resolve session claim");
+            access
+                .core_mut()
+                .record_wakeup_result(&aux_claim.claim_id, WakeupOutcome::Submitted, now)
+                .expect("resolve aux claim");
+        }
+        let aux_demo_2 = aux_scoped
+            .start_demo(
+                "demo-aux-2".to_string(),
+                "second aux demo".to_string(),
+                Some(60_000),
+            )
+            .await
+            .expect("start aux demo 2");
+        aux_scoped
+            .cancel(
+                "cancel-aux-2".to_string(),
+                aux_demo_2.run_id,
+                Some("cleanup 2".to_string()),
+            )
+            .await
+            .expect("cancel aux demo 2");
+
+        // 5. Now stop_idle_host succeeds and latches Stopping!
+        let stop_resp = client.stop_idle_host(&scope).await.expect("stop_idle_host");
+        assert_eq!(stop_resp.state, HostControlRuntimeState::Stopping);
+        assert!(stop_resp.idle);
+
+        // wait_for_stop_request(&self) resolves immediately
+        tokio::time::timeout(Duration::from_millis(200), handle.wait_for_stop_request())
+            .await
+            .expect("wait_for_stop_request should resolve");
+
+        // Duplicate stop_idle_host for the same instance is idempotent
+        let dup_stop = client
+            .stop_idle_host(&scope)
+            .await
+            .expect("duplicate stop_idle_host");
+        assert_eq!(dup_stop.state, HostControlRuntimeState::Stopping);
+
+        // Read-only queries still succeed while Stopping before owner calls shutdown
+        let bindings = client
+            .list_bindings()
+            .await
+            .expect("list_bindings while stopping");
+        assert_eq!(bindings.len(), 2);
+        let status = client
+            .status(&session_binding.binding_id)
+            .await
+            .expect("status while stopping");
+        assert_eq!(status.binding.binding_id, session_binding.binding_id);
+
+        // All mutating endpoints are rejected with HostStopping before shutdown
+        let create_err = client
+            .create_binding(THREAD_UUID, "blocked")
+            .await
+            .expect_err("create_binding blocked");
+        match create_err {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostStopping),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let start_demo_err = aux_scoped
+            .start_demo("demo-blocked".to_string(), "blocked".to_string(), None)
+            .await
+            .expect_err("start_demo blocked");
+        match start_demo_err {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostStopping),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let pull_err = aux_scoped
+            .pull_events(None, Some(10))
+            .await
+            .expect_err("pull_events blocked");
+        match pull_err {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostStopping),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let fatal = handle.shutdown_and_take_fatal().await;
+        assert!(fatal.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_idle_host_with_disabled_sender_ignores_pending_wakeup_and_blocks_nonterminal_workers_and_live_tasks(
+    ) {
+        use threadlane_core::{
+            WorkerAcceptanceState, WorkerCompletionRecord, WorkerOutcomeSummary,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+
+        // Start supervisor with Codex sender disabled (codex: None) and workers dispatcher disabled.
+        let mut sup_cfg = SupervisorConfig::new(&state_dir);
+        sup_cfg.tick_interval = Duration::from_secs(30);
+
+        let boot = Supervisor::start(SupervisorConfig::new(&state_dir))
+            .await
+            .expect("boot");
+        let boot_client = SupervisorClient::from_state_dir(&state_dir).expect("boot client");
+        let session_binding = boot_client
+            .create_binding(THREAD_UUID, "session")
+            .await
+            .expect("create session binding");
+        boot.shutdown().await;
+
+        let control = sample_host_control(&session_binding.binding_id);
+        let scope = owner_scope_from_config(&control);
+        let handle = Supervisor::start_with_host_control(sup_cfg, control.clone())
+            .await
+            .expect("start with host control");
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+        let scoped = client
+            .clone()
+            .scoped(session_binding.binding_id.clone())
+            .expect("scoped");
+
+        // 1. With sender disabled (codex: None), a Pending wakeup on session_binding itself
+        //    produces pending_enabled_wakeups == 0 and does not block idle stop.
+        let demo = scoped
+            .start_demo(
+                "demo-disabled-sender".to_string(),
+                "demo".to_string(),
+                Some(60_000),
+            )
+            .await
+            .expect("start demo");
+        scoped
+            .cancel(
+                "cancel-disabled-sender".to_string(),
+                demo.run_id,
+                Some("cancel".to_string()),
+            )
+            .await
+            .expect("cancel demo");
+
+        // Cancellation alone leaves the wakeup Idle, so seed a real important QuestionAsked on
+        // session_binding through Core timing before asserting the disabled sender ignores Pending.
+        {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire for disabled-sender pending seed");
+            seed_pending_important_wakeup(
+                access.core_mut(),
+                &session_binding.binding_id,
+                "seed-disabled-sender",
+            );
+        }
+
+        let st_pending = client
+            .status(&session_binding.binding_id)
+            .await
+            .expect("status");
+        assert_eq!(st_pending.wakeup.status, WakeupStatus::Pending);
+
+        let info_disabled = client
+            .host_control_info(&scope)
+            .await
+            .expect("info with disabled sender");
+        assert!(info_disabled.idle);
+        assert_eq!(info_disabled.busy.pending_enabled_wakeups, 0);
+
+        // Pull and acknowledge the batch (EventBatch.batch_id is String) to return wakeup to Idle.
+        let batch = scoped
+            .pull_events(None, Some(10))
+            .await
+            .expect("pull_events");
+        let batch_id: String = batch.batch_id;
+        scoped
+            .ack_events("ack-disabled-sender".to_string(), batch_id)
+            .await
+            .expect("ack_events");
+
+        // 2. Non-terminal worker rows in Queued, Claimed, and CancelRequested states must each
+        //    prevent stop_idle_host even when no background worker task is running.
+        let profile_digest = "a".repeat(64);
+        let base_commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+
+        let queued_worker = {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            access
+                .core_mut()
+                .execute(
+                    &session_binding.binding_id,
+                    Command::StartWorker {
+                        command_key: "wk-nonterminal-1".to_string(),
+                        profile_id: "prof_test".to_string(),
+                        profile_digest: profile_digest.clone(),
+                        provider: "antigravity".to_string(),
+                        requested_model: "gemini-4-argon-high".to_string(),
+                        requested_effort: "high".to_string(),
+                        base_commit,
+                        instruction: "verify non-terminal worker states block idle stop"
+                            .to_string(),
+                        now_ms: current_time_ms(),
+                    },
+                )
+                .expect("start_worker in core")
+                .into_worker()
+                .expect("worker snapshot")
+        };
+        assert_eq!(queued_worker.status, WorkerStatus::Queued);
+
+        match client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("Queued worker must block stop_idle_host")
+        {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("details");
+                assert_eq!(details["non_terminal_runs"], 1);
+                assert_eq!(details["non_terminal_workers"], 1);
+                assert_eq!(details["live_worker_tasks"], 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Transition Queued -> Claimed via 5-argument Core::claim_worker
+        let claim = {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            access
+                .core_mut()
+                .claim_worker(
+                    &session_binding.binding_id,
+                    &queued_worker.run_id,
+                    queued_worker.revision,
+                    &profile_digest,
+                    current_time_ms(),
+                )
+                .expect("claim_worker")
+        };
+
+        match client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("Claimed worker must block stop_idle_host")
+        {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("details");
+                assert_eq!(details["non_terminal_runs"], 1);
+                assert_eq!(details["non_terminal_workers"], 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Transition Claimed -> CancelRequested using current revision
+        let cancel_requested = {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            access
+                .core_mut()
+                .execute(
+                    &session_binding.binding_id,
+                    Command::CancelWorker {
+                        command_key: "cancel-wk-nonterminal-1".to_string(),
+                        run_id: claim.run_id.clone(),
+                        expected_revision: claim.revision,
+                        reason: Some("request cancel before outcome".to_string()),
+                        now_ms: current_time_ms(),
+                    },
+                )
+                .expect("cancel_worker")
+                .into_worker()
+                .expect("worker snapshot")
+        };
+        assert_eq!(cancel_requested.status, WorkerStatus::CancelRequested);
+
+        match client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("CancelRequested worker must block stop_idle_host")
+        {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("details");
+                assert_eq!(details["non_terminal_runs"], 1);
+                assert_eq!(details["non_terminal_workers"], 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Resolve worker to terminal Cancelled in Core
+        {
+            let mut access = handle
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            let terminal = access
+                .core_mut()
+                .record_worker_outcome(
+                    &claim,
+                    WorkerCompletionRecord {
+                        status: WorkerStatus::Cancelled,
+                        observed_model: None,
+                        observed_effort: None,
+                        head_commit: None,
+                        dropped_live_events: 0,
+                        outcome: WorkerOutcomeSummary {
+                            exit_code: None,
+                            signal: None,
+                            duration_ms: Some(5),
+                            timed_out: false,
+                            cancelled: true,
+                            cancel_requested_before_completion: true,
+                            missing_model_evidence: false,
+                            missing_effort_evidence: false,
+                            provider_error: false,
+                            incomplete_cleanup: false,
+                            rejected_by_diff_gate: false,
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                            acceptance_state: WorkerAcceptanceState::ExecutionFailed,
+                            changed_paths_count: 0,
+                            changed_paths_preview: Vec::new(),
+                            violation_count: 0,
+                            violation_summaries: Vec::new(),
+                            final_summary: None,
+                            failure_reason: Some("cancelled in test".to_string()),
+                            report_artifact_id: None,
+                        },
+                    },
+                    current_time_ms(),
+                )
+                .expect("record_worker_outcome");
+            assert_eq!(terminal.status, WorkerStatus::Cancelled);
+        }
+
+        // 3. Even when all persisted SQLite rows are terminal, a registered entry in
+        //    SharedState::active_workers (live_worker_tasks == 1) must prevent stop_idle_host.
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        handle.shared.register_active_worker(
+            claim.clone(),
+            cancel_tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        match client
+            .stop_idle_host(&scope)
+            .await
+            .expect_err("registered active_workers entry must block stop_idle_host")
+        {
+            Error::Remote(err) => {
+                assert_eq!(err.code, ErrorCode::HostNotIdle);
+                let details = err.details.expect("details");
+                assert_eq!(details["non_terminal_runs"], 0);
+                assert_eq!(details["non_terminal_workers"], 0);
+                assert_eq!(details["live_worker_tasks"], 1);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        handle.shared.unregister_active_worker(&claim.run_id);
+
+        let stopped = client
+            .stop_idle_host(&scope)
+            .await
+            .expect("stop_idle_host succeeds once active_workers entry is removed");
+        assert_eq!(stopped.state, HostControlRuntimeState::Stopping);
+        assert!(stopped.idle);
+
+        let fatal = handle.shutdown_and_take_fatal().await;
+        assert!(fatal.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_start_demo_and_stop_idle_host_admits_exclusively_one_winner() {
+        for round in 0..4u32 {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let state_dir = temp.path().join("state");
+
+            let boot = Supervisor::start(SupervisorConfig::new(&state_dir))
+                .await
+                .expect("boot");
+            let boot_client = SupervisorClient::from_state_dir(&state_dir).expect("boot client");
+            let session_binding = boot_client
+                .create_binding(THREAD_UUID, "session")
+                .await
+                .expect("create session binding");
+            boot.shutdown().await;
+
+            let mut sup_cfg = SupervisorConfig::new(&state_dir);
+            sup_cfg.tick_interval = Duration::from_secs(30);
+            let control = sample_host_control(&session_binding.binding_id);
+            let scope = owner_scope_from_config(&control);
+            let handle = Supervisor::start_with_host_control(sup_cfg, control)
+                .await
+                .expect("start with host control");
+
+            let client_stop = SupervisorClient::from_state_dir(&state_dir).expect("client stop");
+            let scoped_start = SupervisorClient::from_state_dir(&state_dir)
+                .expect("client start")
+                .scoped(session_binding.binding_id.clone())
+                .expect("scoped start");
+
+            // Hold SharedState::active briefly so both HTTP requests arrive and contend on the
+            // active mutex simultaneously, then release it.
+            let gate = handle.shared.active.lock().await;
+            let scope_clone = scope.clone();
+            let start_task = tokio::spawn(async move {
+                scoped_start
+                    .start_demo(
+                        format!("race-demo-{round}"),
+                        "race instruction".to_string(),
+                        Some(60_000),
+                    )
+                    .await
+            });
+            let stop_task =
+                tokio::spawn(async move { client_stop.stop_idle_host(&scope_clone).await });
+
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            drop(gate);
+
+            let start_res = start_task.await.expect("join start_task");
+            let stop_res = stop_task.await.expect("join stop_task");
+
+            match (start_res, stop_res) {
+                (Ok(run), Err(Error::Remote(stop_err))) => {
+                    // StartDemo won the mutex race: stop_idle_host MUST fail with HostNotIdle,
+                    // and the supervisor must remain in Ready state until the run is cancelled.
+                    assert_eq!(stop_err.code, ErrorCode::HostNotIdle);
+                    let info = SupervisorClient::from_state_dir(&state_dir)
+                        .expect("client")
+                        .host_control_info(&scope)
+                        .await
+                        .expect("info after start won");
+                    assert_eq!(info.state, HostControlRuntimeState::Ready);
+                    assert!(!info.idle);
+                    assert_eq!(info.busy.non_terminal_runs, 1);
+
+                    let cleanup_scoped = SupervisorClient::from_state_dir(&state_dir)
+                        .expect("client")
+                        .scoped(session_binding.binding_id.clone())
+                        .expect("scoped");
+                    cleanup_scoped
+                        .cancel(
+                            format!("race-cancel-{round}"),
+                            run.run_id,
+                            Some("cleanup after race".to_string()),
+                        )
+                        .await
+                        .expect("cancel winning demo");
+
+                    let latched = SupervisorClient::from_state_dir(&state_dir)
+                        .expect("client")
+                        .stop_idle_host(&scope)
+                        .await
+                        .expect("stop after cancel");
+                    assert_eq!(latched.state, HostControlRuntimeState::Stopping);
+                }
+                (Err(Error::Remote(start_err)), Ok(stop_status)) => {
+                    // stop_idle_host won the mutex race: StartDemo MUST fail with HostStopping,
+                    // and zero active runs may exist.
+                    assert_eq!(stop_status.state, HostControlRuntimeState::Stopping);
+                    assert!(stop_status.idle);
+                    assert_eq!(start_err.code, ErrorCode::HostStopping);
+                }
+                other => panic!(
+                    "exclusively one of StartDemo or stop_idle_host must win; got: {other:?}"
+                ),
+            }
+
+            // Post-latch verification: read-only status succeeds while new mutations are fenced.
+            let verify_client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+            let status_after = verify_client
+                .status(&session_binding.binding_id)
+                .await
+                .expect("read-only status allowed after Stopping latch");
+            assert_eq!(status_after.active_runs, 0);
+
+            let fenced_err = verify_client
+                .scoped(session_binding.binding_id.clone())
+                .expect("scoped")
+                .start_demo(format!("post-latch-{round}"), "fenced".to_string(), None)
+                .await
+                .expect_err("post-latch start_demo must be fenced");
+            match fenced_err {
+                Error::Remote(err) => assert_eq!(err.code, ErrorCode::HostStopping),
+                other => panic!("unexpected post-latch error: {other:?}"),
+            }
+
+            let fatal = handle.shutdown_and_take_fatal().await;
+            assert!(fatal.is_none());
+        }
+    }
 }

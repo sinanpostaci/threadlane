@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use threadlane::{
-    ActivityPage, ErrorCode as RuntimeErrorCode, EventKind, ScopedClient, SupervisorClient,
-    WorkerSnapshot,
+    ActivityPage, ErrorCode as RuntimeErrorCode, EventKind, HostControlInfoRequest,
+    HostControlRuntimeState, HostControlStatusResponse, ScopedClient, StopIdleHostRequest,
+    SupervisorClient, WorkerSnapshot,
 };
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
 use threadlane_core::{AckResult, Binding, EventBatch};
@@ -14,14 +16,18 @@ use crate::error::HostError;
 use crate::storage::{
     derive_ack_command_key, derive_cancel_command_key, is_host_lock_held, now_epoch_ms,
     read_host_manifest_optional, read_task_ledger_entry, record_task_dispatch_intent,
-    record_task_receipt, validate_approval_id, validate_canonical_thread_uuid, validate_identifier,
-    validate_sessions_root, verify_existing_private_dir, verify_existing_session_dir,
+    record_task_receipt, validate_approval_id, validate_canonical_thread_uuid,
+    validate_host_instance_id, validate_identifier, validate_sessions_root,
+    verify_existing_private_dir, verify_existing_session_dir,
 };
 use crate::types::{
     HostPhase, HostSessionSummary, TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt,
     TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
     RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
+
+const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+const STOP_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 struct VerifiedSession {
     record: ApprovalRecord,
@@ -151,6 +157,293 @@ impl ApprovedHostClient {
             summary.gates.supervisor_authenticated_ready = false;
         }
         Ok(summary)
+    }
+
+    /// Queries live authenticated host control status (`Ready` or `Stopping` + idle/busy counts)
+    /// for `approval_id` after verifying the approval record, caller authority
+    /// (`control_binding_id` and `native_thread_uuid`), and manifest integrity.
+    ///
+    /// Returns `Ok(None)` when live control is unavailable by design: legacy manifests without an
+    /// `instance_id` (read-only compatibility; lifecycle actions stay unsupported), lock-free
+    /// `Stopped`/`Failed` sessions with no live control, or a running supervisor without host
+    /// control configured. `Ready`/`Stopping` without a held `host.lock`, `Bootstrapping`, and other
+    /// non-live phases remain `HostNotReady`; this method never fabricates readiness or stop proof.
+    pub async fn host_control_status(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<HostControlStatusResponse>, HostError> {
+        let record = self.resolve_authorized_approval(approval_id)?;
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+            HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                reason: "host-manifest.json does not exist".to_string(),
+            }
+        })?;
+
+        let Some(ref instance_id) = manifest.instance_id else {
+            return Ok(None);
+        };
+
+        let lock_held = is_host_lock_held(&session_dir)?;
+        if !lock_held && matches!(manifest.phase, HostPhase::Stopped | HostPhase::Failed) {
+            return Ok(None);
+        }
+
+        if !lock_held || !matches!(manifest.phase, HostPhase::Ready | HostPhase::Stopping) {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(manifest.phase),
+                reason: manifest
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| format!("host session is in phase `{}`", manifest.phase)),
+            });
+        }
+
+        let session_binding_id =
+            manifest
+                .session_binding_id
+                .clone()
+                .ok_or_else(|| HostError::CorruptManifest {
+                    path: session_dir.display().to_string(),
+                    reason: format!("{} manifest is missing session_binding_id", manifest.phase),
+                })?;
+
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let sup_client =
+            SupervisorClient::from_state_dir(&runtime_state_dir).map_err(|err| match err {
+                threadlane::Error::SecurityViolation(reason) => HostError::SecurityViolation {
+                    path: runtime_state_dir.display().to_string(),
+                    reason,
+                },
+                other => HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: Some(manifest.phase),
+                    reason: format!("supervisor descriptor unavailable: {other}"),
+                },
+            })?;
+
+        let info = match sup_client
+            .host_control_info(&HostControlInfoRequest {
+                approval_id: record.approval_id.clone(),
+                subject_digest: record.subject_digest.clone(),
+                control_binding_id: self.control_binding_id.clone(),
+                thread_uuid: self.native_thread_uuid.clone(),
+                session_binding_id: session_binding_id.clone(),
+                expected_instance_id: instance_id.clone(),
+            })
+            .await
+        {
+            Ok(info) => info,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::HostControlNotConfigured =>
+            {
+                return Ok(None);
+            }
+            Err(threadlane::Error::Transport(msg)) => {
+                return Err(HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: Some(manifest.phase),
+                    reason: format!("supervisor IPC unreachable: {msg}"),
+                });
+            }
+            Err(other) => return Err(other.into()),
+        };
+
+        if info.approval_id != record.approval_id
+            || info.subject_digest != record.subject_digest
+            || info.control_binding_id != self.control_binding_id
+            || info.thread_uuid != self.native_thread_uuid
+            || info.session_binding_id != session_binding_id
+            || &info.instance_id != instance_id
+        {
+            return Err(HostError::CorruptSessionState {
+                reason: "live supervisor host_control_info returned mismatched owner scope"
+                    .to_string(),
+            });
+        }
+
+        Ok(Some(info))
+    }
+
+    /// Requests an authenticated, owner-scoped idle stop for `approval_id` at `expected_instance_id`
+    /// and waits for durable `HostPhase::Stopped` + released `host.lock` proof (`5s` timeout, `25ms` poll).
+    pub async fn stop_idle_session(
+        &self,
+        approval_id: &str,
+        expected_instance_id: &str,
+    ) -> Result<HostSessionSummary, HostError> {
+        let record = self.resolve_authorized_approval(approval_id)?;
+        validate_host_instance_id("expected_instance_id", expected_instance_id)?;
+
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+            HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                reason: "host-manifest.json does not exist".to_string(),
+            }
+        })?;
+
+        if manifest.instance_id.as_deref() != Some(expected_instance_id) {
+            return Err(HostError::InstanceMismatch {
+                approval_id: record.approval_id.clone(),
+                expected_instance_id: expected_instance_id.to_string(),
+                actual_instance_id: manifest.instance_id.clone(),
+            });
+        }
+
+        let lock_held = is_host_lock_held(&session_dir)?;
+        if manifest.phase == HostPhase::Stopped && !lock_held {
+            return Ok(manifest.to_summary());
+        }
+
+        if !lock_held || !matches!(manifest.phase, HostPhase::Ready | HostPhase::Stopping) {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(manifest.phase),
+                reason: manifest.last_error.clone().unwrap_or_else(|| {
+                    format!(
+                        "host session is in phase `{}` (lock_held={lock_held})",
+                        manifest.phase
+                    )
+                }),
+            });
+        }
+
+        let session_binding_id =
+            manifest
+                .session_binding_id
+                .clone()
+                .ok_or_else(|| HostError::CorruptManifest {
+                    path: session_dir.display().to_string(),
+                    reason: format!("{} manifest is missing session_binding_id", manifest.phase),
+                })?;
+
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+
+        match SupervisorClient::from_state_dir(&runtime_state_dir) {
+            Ok(sup_client) => {
+                let stop_req = StopIdleHostRequest {
+                    approval_id: record.approval_id.clone(),
+                    subject_digest: record.subject_digest.clone(),
+                    control_binding_id: self.control_binding_id.clone(),
+                    thread_uuid: self.native_thread_uuid.clone(),
+                    session_binding_id: session_binding_id.clone(),
+                    expected_instance_id: expected_instance_id.to_string(),
+                };
+                match sup_client.stop_idle_host(&stop_req).await {
+                    Ok(resp) => {
+                        if resp.approval_id != record.approval_id
+                            || resp.subject_digest != record.subject_digest
+                            || resp.control_binding_id != self.control_binding_id
+                            || resp.thread_uuid != self.native_thread_uuid
+                            || resp.session_binding_id != session_binding_id
+                            || resp.instance_id != expected_instance_id
+                            || resp.state != HostControlRuntimeState::Stopping
+                        {
+                            return Err(HostError::CorruptSessionState {
+                                reason:
+                                    "stop_idle_host response did not match Stopping owner scope"
+                                        .to_string(),
+                            });
+                        }
+                    }
+                    Err(threadlane::Error::Remote(api_err)) => match api_err.code {
+                        RuntimeErrorCode::HostNotIdle => {
+                            return Err(HostError::HostNotIdle {
+                                approval_id: record.approval_id.clone(),
+                                detail: api_err.message,
+                            });
+                        }
+                        RuntimeErrorCode::HostInstanceMismatch
+                        | RuntimeErrorCode::HostScopeMismatch => {
+                            return Err(HostError::from(threadlane::Error::Remote(api_err)));
+                        }
+                        RuntimeErrorCode::HostControlNotConfigured => {
+                            return Err(HostError::HostNotReady {
+                                approval_id: record.approval_id.clone(),
+                                phase: Some(manifest.phase),
+                                reason: api_err.message,
+                            });
+                        }
+                        RuntimeErrorCode::SecurityViolation => {
+                            return Err(HostError::SecurityViolation {
+                                path: runtime_state_dir.display().to_string(),
+                                reason: api_err.message,
+                            });
+                        }
+                        _ => {
+                            // Fall through to bounded durable confirmation loop if the supervisor
+                            // retired concurrently while draining.
+                        }
+                    },
+                    Err(threadlane::Error::SecurityViolation(reason)) => {
+                        return Err(HostError::SecurityViolation {
+                            path: runtime_state_dir.display().to_string(),
+                            reason,
+                        });
+                    }
+                    Err(threadlane::Error::Transport(_)) => {
+                        // A lost HTTP response or connection closed mid-shutdown may only be
+                        // reconciled by durable `Stopped` + released `host.lock` + matching
+                        // `expected_instance_id` in the bounded confirmation loop below.
+                    }
+                    Err(other) => return Err(other.into()),
+                }
+            }
+            Err(threadlane::Error::SecurityViolation(reason)) => {
+                return Err(HostError::SecurityViolation {
+                    path: runtime_state_dir.display().to_string(),
+                    reason,
+                });
+            }
+            Err(_) => {
+                // Descriptor may have been removed mid-shutdown; reconcile only via durable proof below.
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + STOP_CONFIRM_TIMEOUT;
+        loop {
+            let current_manifest = read_host_manifest_optional(&session_dir, &record)?;
+            let current_lock_held = is_host_lock_held(&session_dir)?;
+
+            if let Some(m) = current_manifest {
+                if m.instance_id.as_deref() != Some(expected_instance_id) {
+                    return Err(HostError::InstanceMismatch {
+                        approval_id: record.approval_id.clone(),
+                        expected_instance_id: expected_instance_id.to_string(),
+                        actual_instance_id: m.instance_id,
+                    });
+                }
+                if m.phase == HostPhase::Stopped && !current_lock_held {
+                    return Ok(m.to_summary());
+                }
+                if m.phase == HostPhase::Failed {
+                    return Err(HostError::HostNotReady {
+                        approval_id: record.approval_id.clone(),
+                        phase: Some(HostPhase::Failed),
+                        reason: m
+                            .last_error
+                            .unwrap_or_else(|| "host shutdown failed".to_string()),
+                    });
+                }
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(HostError::StopOutcomeUncertain {
+                    approval_id: record.approval_id.clone(),
+                    detail: "timed out waiting for durable Stopped manifest and released host.lock"
+                        .to_string(),
+                });
+            }
+
+            tokio::time::sleep(STOP_CONFIRM_POLL_INTERVAL).await;
+        }
     }
 
     /// Dispatches an approved root headless worker task (`antigravity` or `opencode_v2`) using

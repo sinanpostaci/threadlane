@@ -126,6 +126,50 @@ pub enum HostError {
         reason: String,
     },
 
+    /// Host session cannot be stopped because active runs, workers, tasks, or wake-ups remain.
+    #[error("host session for approval `{approval_id}` is not idle: {detail}")]
+    HostNotIdle {
+        /// Target approval identifier.
+        approval_id: String,
+        /// Sanitized busy breakdown or reason.
+        detail: String,
+    },
+
+    /// Expected host instance identifier did not match the manifest or runtime instance identifier.
+    #[error(
+        "host session instance mismatch for approval `{approval_id}`: expected `{expected_instance_id}`, actual `{actual_instance_id:?}`"
+    )]
+    InstanceMismatch {
+        /// Target approval identifier.
+        approval_id: String,
+        /// Expected host instance identifier (`hst_<32hex>`).
+        expected_instance_id: String,
+        /// Observed host instance identifier in the manifest or runtime (`None` for legacy manifests).
+        actual_instance_id: Option<String>,
+    },
+
+    /// Idle-stop request was sent or lost, and durable `Stopped` + released `host.lock` proof was not observed before timeout.
+    #[error("host session stop outcome is uncertain for approval `{approval_id}`: {detail}")]
+    StopOutcomeUncertain {
+        /// Target approval identifier.
+        approval_id: String,
+        /// Explanation of why durable stop completion could not be confirmed.
+        detail: String,
+    },
+
+    /// Explicit stopped-session restart was refused because the session is not in a clean `Stopped` state or failed prechecks.
+    #[error(
+        "host session restart is not allowed for approval `{approval_id}` (phase: {phase:?}): {detail}"
+    )]
+    RestartNotAllowed {
+        /// Target approval identifier.
+        approval_id: String,
+        /// Observed session phase, if a manifest exists.
+        phase: Option<HostPhase>,
+        /// Explanation of why restart was refused.
+        detail: String,
+    },
+
     /// Revision-checked cancellation failed because `expected_revision` did not match the worker run's revision.
     #[error(
         "stale revision for worker run `{run_id}`: expected revision {expected_revision}, actual revision {actual_revision}"
@@ -235,6 +279,10 @@ impl HostError {
             Self::UnpublishedOrSupersededPlan { .. } => "unpublished_or_superseded_plan",
             Self::LockBusy { .. } => "lock_busy",
             Self::HostNotReady { .. } => "host_not_ready",
+            Self::HostNotIdle { .. } => "host_not_idle",
+            Self::InstanceMismatch { .. } => "host_instance_mismatch",
+            Self::StopOutcomeUncertain { .. } => "host_stop_outcome_uncertain",
+            Self::RestartNotAllowed { .. } => "host_restart_not_allowed",
             Self::StaleRevision { .. } => "stale_revision",
             Self::IdempotencyConflict { .. } => "idempotency_conflict",
             Self::InvalidRunState { .. } => "invalid_run_state",
@@ -396,6 +444,54 @@ impl From<threadlane::Error> for HostError {
                             run_id,
                             action,
                             reason: api_err.message,
+                        };
+                    }
+                }
+                if api_err.code == RuntimeErrorCode::HostScopeMismatch {
+                    if let Some(details) = &api_err.details {
+                        let field = details
+                            .get("field")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("scope")
+                            .to_string();
+                        let expected = details
+                            .get("expected")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let actual = details
+                            .get("actual")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        return Self::ScopeMismatch {
+                            field,
+                            expected,
+                            actual,
+                            reason: api_err.message,
+                        };
+                    }
+                }
+                if api_err.code == RuntimeErrorCode::HostInstanceMismatch {
+                    if let Some(details) = &api_err.details {
+                        let approval_id = details
+                            .get("approval_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let expected_instance_id = details
+                            .get("expected_instance_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let actual_instance_id = details
+                            .get("actual_instance_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        return Self::InstanceMismatch {
+                            approval_id,
+                            expected_instance_id,
+                            actual_instance_id,
                         };
                     }
                 }

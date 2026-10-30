@@ -56,11 +56,15 @@ pub use storage::{
     ensure_private_dir, is_host_lock_held, paths_overlap, prepare_session_dir,
     read_and_verify_host_manifest, read_host_manifest_optional, read_task_dispatch_intent,
     read_task_receipt, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
-    validate_canonical_thread_uuid, validate_hex_digest, validate_identifier,
-    validate_sessions_root, verify_existing_private_dir, verify_existing_session_dir,
-    write_host_manifest, HostSessionLock,
+    validate_canonical_thread_uuid, validate_hex_digest, validate_host_instance_id,
+    validate_identifier, validate_sessions_root, verify_existing_private_dir,
+    verify_existing_session_dir, write_host_manifest, HostSessionLock,
 };
-pub use threadlane::{DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS};
+pub use threadlane::{
+    HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
+    HostControlRuntimeState, HostControlStatusResponse, StopIdleHostRequest,
+    DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,
+};
 pub use threadlane_core::{AckResult, EventBatch};
 pub use types::{
     ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
@@ -502,6 +506,7 @@ exit 0
         thread_uuid: &str,
         tasks: Vec<PlanTask>,
     ) -> String {
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
         let draft = fixture
             .plans
             .change_at(
@@ -510,7 +515,7 @@ exit 0
                     plan_id: plan_id.to_string(),
                     binding_id: binding_id.to_string(),
                     profile_id: "profile-main".to_string(),
-                    profile_revision: 5,
+                    profile_revision: reg_snap.revision,
                     summary: format!("Plan {plan_id}"),
                     tasks: tasks.clone(),
                 },
@@ -529,7 +534,6 @@ exit 0
             )
             .expect("publish plan");
 
-        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
         let compiled =
             compile_plan_revision(&published, &reg_snap).expect("compile published plan");
 
@@ -3248,5 +3252,981 @@ exit 0
         assert_eq!(logged.lines().count(), 1);
 
         host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn host_instance_id_lifecycle_legacy_compat_and_control_status_inspection() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-instance-id",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Instance ID and control status inspection"),
+        );
+
+        let generated_a = storage::generate_host_instance_id();
+        let generated_b = storage::generate_host_instance_id();
+        assert_ne!(generated_a, generated_b);
+        validate_host_instance_id("instance_id", &generated_a)
+            .expect("valid generated instance_id");
+
+        for invalid_id in [
+            "",
+            "hst_",
+            "apr_0123456789abcdef0123456789abcdef",
+            "hst_0123456789abcdef0123456789abcde",
+            "hst_0123456789abcdef0123456789abcdef0",
+            "hst_0123456789ABCDEF0123456789abcdef",
+            "hst_0123456789abcdef0123456789abcdeg",
+        ] {
+            assert_eq!(
+                validate_host_instance_id("instance_id", invalid_id)
+                    .expect_err("invalid host instance_id must be rejected")
+                    .code(),
+                "validation",
+                "failed on {invalid_id}"
+            );
+        }
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let instance_id = host.instance_id().to_string();
+        validate_host_instance_id("instance_id", &instance_id).expect("valid host.instance_id()");
+        assert_eq!(
+            host.summary().instance_id.as_deref(),
+            Some(instance_id.as_str())
+        );
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open valid client");
+
+        let wrong_binding_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+        )
+        .expect("open wrong binding client");
+        assert_eq!(
+            wrong_binding_client
+                .host_control_status(&approval_id)
+                .await
+                .expect_err("wrong binding denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        let wrong_thread_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_B,
+        )
+        .expect("open wrong thread client");
+        assert_eq!(
+            wrong_thread_client
+                .host_control_status(&approval_id)
+                .await
+                .expect_err("wrong thread denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        let info = client
+            .host_control_status(&approval_id)
+            .await
+            .expect("host_control_status")
+            .expect("live host with instance_id returns Some(status)");
+        assert_eq!(info.instance_id, instance_id);
+        assert_eq!(info.state, HostControlRuntimeState::Ready);
+        assert!(info.busy.is_idle());
+
+        let session_dir = host.session_dir().to_path_buf();
+        let session_binding_id = host.session_binding_id().to_string();
+        host.shutdown().await.expect("shutdown host");
+
+        let stopped_summary = client
+            .session_summary(&approval_id)
+            .expect("stopped session summary");
+        assert_eq!(stopped_summary.phase, HostPhase::Stopped);
+        assert_eq!(
+            stopped_summary.instance_id.as_deref(),
+            Some(instance_id.as_str())
+        );
+        assert!(
+            client
+                .host_control_status(&approval_id)
+                .await
+                .expect("host_control_status when Stopped")
+                .is_none(),
+            "stopped session must return Ok(None) from host_control_status"
+        );
+
+        // Legacy manifest compatibility: a stopped manifest serialized without `instance_id`
+        // deserializes as `instance_id: None`, returns `Ok(None)` from `host_control_status`,
+        // and rejects lifecycle control (`stop_idle_session`) with `host_instance_mismatch`.
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get record");
+        let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+        let legacy_stopped = HostSessionManifest::from_approval_record(
+            &record,
+            Some(session_binding_id.clone()),
+            HostPhase::Stopped,
+            None,
+            None,
+            1_700_000_000_000,
+            1_700_000_000_500,
+        );
+        let mut legacy_json = serde_json::to_value(&legacy_stopped).expect("to json");
+        legacy_json
+            .as_object_mut()
+            .expect("object")
+            .remove("instance_id");
+        let mut raw_legacy = serde_json::to_vec_pretty(&legacy_json).expect("serialize legacy");
+        raw_legacy.push(b'\n');
+        fs::write(&manifest_path, &raw_legacy).expect("write legacy manifest");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 legacy manifest");
+
+        let read_legacy =
+            read_and_verify_host_manifest(&manifest_path, &record).expect("read legacy manifest");
+        assert_eq!(read_legacy.instance_id, None);
+        assert_eq!(
+            client
+                .session_summary(&approval_id)
+                .expect("legacy summary")
+                .instance_id,
+            None
+        );
+        assert!(client
+            .host_control_status(&approval_id)
+            .await
+            .expect("legacy host_control_status")
+            .is_none());
+        assert_eq!(
+            client
+                .stop_idle_session(&approval_id, &instance_id)
+                .await
+                .expect_err("legacy manifest without instance_id cannot satisfy stop_idle_session")
+                .code(),
+            "host_instance_mismatch"
+        );
+
+        let write_raw_manifest_value = |value: &serde_json::Value| {
+            let mut raw = serde_json::to_vec_pretty(value).expect("serialize raw manifest");
+            raw.push(b'\n');
+            fs::write(&manifest_path, &raw).expect("write raw manifest");
+            fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 raw manifest");
+        };
+
+        // A valid legacy `Ready` manifest serialized without `instance_id` stays readable for
+        // read-only views, but lifecycle control remains unavailable because no per-start
+        // instance identity exists to match against.
+        let legacy_ready = HostSessionManifest::from_approval_record(
+            &record,
+            Some(session_binding_id.clone()),
+            HostPhase::Ready,
+            None,
+            None,
+            1_700_000_000_000,
+            1_700_000_000_500,
+        );
+        let mut legacy_ready_json =
+            serde_json::to_value(&legacy_ready).expect("serialize legacy Ready manifest");
+        legacy_ready_json
+            .as_object_mut()
+            .expect("legacy Ready manifest object")
+            .remove("instance_id");
+        write_raw_manifest_value(&legacy_ready_json);
+
+        let read_legacy_ready = read_and_verify_host_manifest(&manifest_path, &record)
+            .expect("read legacy Ready manifest");
+        assert_eq!(read_legacy_ready.phase, HostPhase::Ready);
+        assert_eq!(read_legacy_ready.instance_id, None);
+
+        let legacy_ready_summary = client
+            .session_summary(&approval_id)
+            .expect("legacy Ready summary remains readable");
+        assert_eq!(legacy_ready_summary.phase, HostPhase::Ready);
+        assert_eq!(legacy_ready_summary.instance_id, None);
+        assert!(client
+            .host_control_status(&approval_id)
+            .await
+            .expect("legacy Ready host_control_status")
+            .is_none());
+        assert_eq!(
+            client
+                .stop_idle_session(&approval_id, &instance_id)
+                .await
+                .expect_err("legacy Ready without instance_id cannot satisfy stop_idle_session")
+                .code(),
+            "host_instance_mismatch"
+        );
+
+        // A present but malformed `instance_id` is rejected after JSON deserialization.
+        let valid_ready_with_instance = HostSessionManifest::from_approval_record(
+            &record,
+            Some(session_binding_id.clone()),
+            HostPhase::Ready,
+            None,
+            None,
+            1_700_000_000_000,
+            1_700_000_000_500,
+        )
+        .with_instance_id(Some(instance_id.clone()));
+        let mut malformed_instance_json = serde_json::to_value(&valid_ready_with_instance)
+            .expect("serialize valid Ready manifest");
+        malformed_instance_json
+            .as_object_mut()
+            .expect("valid Ready manifest object")
+            .insert(
+                "instance_id".to_string(),
+                serde_json::Value::String("hst_INVALID".to_string()),
+            );
+        write_raw_manifest_value(&malformed_instance_json);
+        assert_eq!(
+            read_and_verify_host_manifest(&manifest_path, &record)
+                .expect_err("malformed present instance_id must fail closed")
+                .code(),
+            "corrupt_manifest"
+        );
+
+        // Inconsistent real gate fields are rejected independently of instance identity.
+        let mut inconsistent_gates_json = serde_json::to_value(&valid_ready_with_instance)
+            .expect("serialize valid Ready manifest");
+        inconsistent_gates_json["gates"]["supervisor_authenticated_ready"] =
+            serde_json::Value::Bool(false);
+        write_raw_manifest_value(&inconsistent_gates_json);
+        assert_eq!(
+            read_and_verify_host_manifest(&manifest_path, &record)
+                .expect_err("Ready manifest with inconsistent gates must fail closed")
+                .code(),
+            "corrupt_manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_idle_session_rejects_active_work_and_succeeds_after_cancellation_with_idempotent_duplicate(
+    ) {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-stop-idle",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("SLOW_WAIT_FOR_CANCEL stop idle session test"),
+        );
+
+        let serve_args = ServeArgs {
+            registry_dir: fixture.registry_dir.clone(),
+            plans_dir: fixture.plans_dir.clone(),
+            authority_dir: fixture.authority_dir.clone(),
+            sessions_dir: fixture.sessions_dir.clone(),
+            approval_id: approval_id.clone(),
+            notify_codex: None,
+            notify_timeout_ms: None,
+            restart_from_instance_id: None,
+        };
+        let serve_task = tokio::spawn(async move { run_serve(serve_args).await });
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // Wait until run_serve commits Ready and exposes its instance_id.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let ready_summary = loop {
+            if let Ok(summary) = client.session_summary(&approval_id) {
+                if summary.phase == HostPhase::Ready {
+                    break summary;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for run_serve Ready manifest"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+        let instance_id = ready_summary
+            .instance_id
+            .clone()
+            .expect("ready summary must include instance_id");
+
+        // Wrong caller scope and wrong instance_id fail closed without stopping the host.
+        let wrong_binding_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+        )
+        .expect("open wrong binding client");
+        assert_eq!(
+            wrong_binding_client
+                .stop_idle_session(&approval_id, &instance_id)
+                .await
+                .expect_err("wrong binding stop denied")
+                .code(),
+            "scope_mismatch"
+        );
+        assert_eq!(
+            client
+                .stop_idle_session(&approval_id, "hst_ffffffffffffffffffffffffffffffff")
+                .await
+                .expect_err("stale instance_id stop denied")
+                .code(),
+            "host_instance_mismatch"
+        );
+
+        // Dispatch slow worker task and wait until Running.
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch slow task");
+        let running = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::Running
+        })
+        .await;
+        let worker_revision = running
+            .worker
+            .as_ref()
+            .expect("worker snapshot present")
+            .revision;
+
+        let busy_status = client
+            .host_control_status(&approval_id)
+            .await
+            .expect("host_control_status while busy")
+            .expect("live status");
+        assert_eq!(busy_status.state, HostControlRuntimeState::Ready);
+        assert!(!busy_status.busy.is_idle());
+        assert_eq!(busy_status.busy.non_terminal_workers, 1);
+
+        // Stopping while worker is active must fail with `host_not_idle` and leave host running.
+        let busy_err = client
+            .stop_idle_session(&approval_id, &instance_id)
+            .await
+            .expect_err("stop_idle_session while worker is running must fail");
+        assert_eq!(busy_err.code(), "host_not_idle");
+        assert_eq!(
+            client
+                .session_summary(&approval_id)
+                .expect("summary after rejected stop")
+                .phase,
+            HostPhase::Ready
+        );
+
+        // Cancel the active worker through the existing revision-checked task control and wait for terminal Cancelled.
+        client
+            .cancel_task(
+                &approval_id,
+                "task-root-agy",
+                worker_revision,
+                Some("cancel before idle stop".to_string()),
+            )
+            .await
+            .expect("cancel active worker");
+        wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::Cancelled
+        })
+        .await;
+
+        let idle_status = client
+            .host_control_status(&approval_id)
+            .await
+            .expect("host_control_status after cancellation")
+            .expect("live status");
+        assert!(idle_status.busy.is_idle());
+
+        // Now stop_idle_session succeeds, run_serve exits cleanly, and host.lock is released.
+        let stopped = client
+            .stop_idle_session(&approval_id, &instance_id)
+            .await
+            .expect("stop_idle_session after worker cancellation");
+        assert_eq!(stopped.phase, HostPhase::Stopped);
+        assert_eq!(stopped.instance_id.as_deref(), Some(instance_id.as_str()));
+
+        serve_task
+            .await
+            .expect("join run_serve task")
+            .expect("run_serve exited cleanly");
+        assert!(!is_host_lock_held(&fixture.sessions_dir.join(&approval_id))
+            .expect("host.lock released after stop"));
+
+        // Duplicate stop_idle_session with the same instance_id is idempotent once Stopped + lock free.
+        let duplicate_stopped = client
+            .stop_idle_session(&approval_id, &instance_id)
+            .await
+            .expect("idempotent duplicate stop_idle_session");
+        assert_eq!(duplicate_stopped.phase, HostPhase::Stopped);
+        assert_eq!(
+            duplicate_stopped.instance_id.as_deref(),
+            Some(instance_id.as_str())
+        );
+
+        // Wrong expected_instance_id on Stopped session still fails with host_instance_mismatch.
+        assert_eq!(
+            client
+                .stop_idle_session(&approval_id, "hst_00000000000000000000000000000000")
+                .await
+                .expect_err("wrong instance_id when Stopped must fail")
+                .code(),
+            "host_instance_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_idle_session_reports_uncertain_outcome_when_owner_does_not_commit_stopped() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-stop-uncertain",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Uncertain stop outcome test"),
+        );
+
+        // Start ApprovedHost directly without polling wait_for_stop_request to call shutdown().
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+        let instance_id = host.instance_id().to_string();
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // Because no owner loop calls host.shutdown(), host.lock stays held and the manifest stays Ready.
+        // stop_idle_session must never fabricate Stopped; it must return host_stop_outcome_uncertain.
+        let uncertain_err = client
+            .stop_idle_session(&approval_id, &instance_id)
+            .await
+            .expect_err("uncommitted stop must return host_stop_outcome_uncertain");
+        assert_eq!(uncertain_err.code(), "host_stop_outcome_uncertain");
+
+        // The runtime supervisor latched Stopping before acknowledging the stop request, and new
+        // task dispatches are blocked while Stopping.
+        let stopping_info = client
+            .host_control_status(&approval_id)
+            .await
+            .expect("host_control_status while Stopping")
+            .expect("runtime still reachable");
+        assert_eq!(stopping_info.state, HostControlRuntimeState::Stopping);
+        let dispatch_blocked = client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect_err("dispatch_task must be rejected once runtime latched Stopping");
+        assert_eq!(dispatch_blocked.code(), "runtime_error");
+
+        host.shutdown().await.expect("cleanup host shutdown");
+    }
+
+    #[tokio::test]
+    async fn restart_stopped_enforces_prechecks_preserves_receipts_without_replay_rotates_instance_and_resets_notifications(
+    ) {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-restart-stopped",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Restart stopped session test"),
+        );
+
+        let codex_log = fixture.root.join("restart-stopped-codex.log");
+        let fake_codex = fixture.root.join("bin/fake-codex-restart");
+        write_fake_codex_script(&fake_codex, &codex_log, None);
+        let notify_cfg =
+            ApprovedHostNotificationConfig::new(fake_codex, 2_000).expect("notify config");
+
+        // 1. Restarting before any session exists fails with host_restart_not_allowed and writes nothing.
+        let missing_err = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            ),
+            "hst_0123456789abcdef0123456789abcdef",
+        )
+        .await
+        .expect_err("restart_stopped on missing session must fail");
+        assert_eq!(missing_err.code(), "host_restart_not_allowed");
+
+        // 2. Start initial host with notifications enabled, complete task-root-oc, and acknowledge events.
+        let host1 = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20))
+            .with_notifications(notify_cfg),
+        )
+        .await
+        .expect("start host 1");
+        let first_instance_id = host1.instance_id().to_string();
+        let first_binding_id = host1.session_binding_id().to_string();
+        assert!(host1.summary().notifications.enabled);
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect("dispatch task-root-oc on host 1");
+        let oc_completed = wait_for_task_status(&client, &approval_id, "task-root-oc", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(read_invocation_count(&fixture.oc_count_file), 1);
+
+        let batch = client
+            .pull_events(&approval_id, None, None)
+            .await
+            .expect("pull events");
+        client
+            .ack_events(&approval_id, batch.batch_id)
+            .await
+            .expect("ack events");
+
+        // While host 1 is still running (holding host.lock), restart_stopped fails with lock_busy.
+        let lock_busy_err = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            ),
+            &first_instance_id,
+        )
+        .await
+        .expect_err("restart_stopped while host 1 holds lock must fail with lock_busy");
+        assert_eq!(lock_busy_err.code(), "lock_busy");
+
+        host1.shutdown().await.expect("shutdown host 1");
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get record");
+
+        // 3. Stale/wrong expected_prior_instance_id fails with host_instance_mismatch BEFORE writing Bootstrapping.
+        let mismatch_err = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            ),
+            "hst_ffffffffffffffffffffffffffffffff",
+        )
+        .await
+        .expect_err("wrong prior instance_id must fail");
+        assert_eq!(mismatch_err.code(), "host_instance_mismatch");
+        let preserved_stopped = read_host_manifest_optional(&session_dir, &record)
+            .expect("read manifest after mismatch")
+            .expect("manifest exists");
+        assert_eq!(preserved_stopped.phase, HostPhase::Stopped);
+        assert_eq!(
+            preserved_stopped.instance_id.as_deref(),
+            Some(first_instance_id.as_str())
+        );
+
+        // 4. Non-Stopped phase (e.g. Failed) is rejected by restart_stopped with host_restart_not_allowed.
+        let mut failed_manifest = preserved_stopped.clone();
+        failed_manifest.phase = HostPhase::Failed;
+        failed_manifest.last_error = Some("simulated prior failure".to_string());
+        write_host_manifest(&session_dir, &failed_manifest).expect("write Failed manifest");
+
+        let wrong_phase_err = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            ),
+            &first_instance_id,
+        )
+        .await
+        .expect_err("restart_stopped from Failed phase must fail");
+        assert_eq!(wrong_phase_err.code(), "host_restart_not_allowed");
+        assert_eq!(
+            read_host_manifest_optional(&session_dir, &record)
+                .expect("read manifest")
+                .expect("manifest exists")
+                .phase,
+            HostPhase::Failed
+        );
+
+        // Restore clean Stopped manifest.
+        write_host_manifest(&session_dir, &preserved_stopped).expect("restore Stopped manifest");
+
+        // 5. Disabling tool-oc in the mutable global registry must not rewrite or revoke the
+        //    existing immutable approval. The approval keeps its frozen registry snapshot, so an
+        //    explicit restart from the clean Stopped session with the correct prior instance ID
+        //    succeeds and uses the frozen approved profile without replaying completed work.
+        let orig_reg_rev = fixture.registry.snapshot().expect("reg snap").revision;
+        fixture
+            .registry
+            .apply(
+                orig_reg_rev,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-oc".to_string(),
+                        label: "Disabled OpenCode".to_string(),
+                        adapter: ToolAdapter::OpencodeV2,
+                        executable_path: Some(fixture.fake_oc_exe.clone()),
+                        enabled: false,
+                    },
+                },
+            )
+            .expect("disable tool-oc in registry");
+
+        let record_after_registry_edit = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get record after registry edit");
+        assert_eq!(
+            record_after_registry_edit, record,
+            "global registry edits must not rewrite the existing immutable approval"
+        );
+
+        let restarted_host = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            ),
+            &first_instance_id,
+        )
+        .await
+        .expect("restart_stopped must succeed using the frozen approved registry scope");
+
+        let restarted_instance_id = restarted_host.instance_id().to_string();
+        assert_ne!(restarted_instance_id, first_instance_id);
+        assert!(restarted_instance_id.starts_with("hst_"));
+        assert_eq!(
+            restarted_host.approval().subject_digest,
+            record.subject_digest
+        );
+        assert_eq!(restarted_host.approval().binding_id, record.binding_id);
+        assert_eq!(restarted_host.session_binding_id(), first_binding_id);
+
+        // The public materialized profile API has no `enabled` field; verify the frozen execution
+        // tuple that actually drives the restarted host.
+        let materialized = restarted_host.materialized_plan();
+        assert_eq!(materialized.subject_digest, record.subject_digest);
+        let oc_dispatch = materialized
+            .task_dispatch
+            .iter()
+            .find(|dispatch| dispatch.task_id == "task-root-oc")
+            .expect("frozen task-root-oc dispatch entry");
+        let oc_profile = materialized
+            .workers
+            .as_ref()
+            .expect("frozen worker profiles")
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == oc_dispatch.profile_id)
+            .expect("frozen task-root-oc worker profile");
+        assert_eq!(
+            oc_profile.spec.provider,
+            threadlane_workers::WorkerProvider::OpenCodeV2
+        );
+        assert_eq!(oc_profile.spec.model, "opencode-go/deepseek-v4.1-flash");
+        assert_eq!(oc_profile.spec.effort.as_deref(), Some("max"));
+        assert_eq!(oc_profile.spec.executable, fixture.fake_oc_exe);
+
+        let oc_after_restart = client
+            .get_task(&approval_id, "task-root-oc")
+            .await
+            .expect("get_task task-root-oc after restart");
+        assert_eq!(oc_after_restart.status, TaskExecutionStatus::ReadyForReview);
+        assert!(oc_after_restart.run_id.is_some());
+        assert!(oc_after_restart.worker_id.is_some());
+        assert_eq!(oc_after_restart.run_id, oc_completed.run_id);
+        assert_eq!(oc_after_restart.worker_id, oc_completed.worker_id);
+        assert!(
+            oc_after_restart.worker.is_some(),
+            "restart must preserve the completed run state without replay"
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.oc_count_file),
+            1,
+            "restart_stopped must not replay the completed task-root-oc run"
+        );
+
+        restarted_host
+            .shutdown()
+            .await
+            .expect("shutdown restarted host cleanly");
+        assert!(
+            !is_host_lock_held(&session_dir).expect("host.lock released after restart shutdown"),
+            "clean shutdown must release host.lock before the test continues"
+        );
+        let stopped_after_restart = read_host_manifest_optional(&session_dir, &record)
+            .expect("read manifest after restart shutdown")
+            .expect("manifest exists");
+        assert_eq!(stopped_after_restart.phase, HostPhase::Stopped);
+        assert_eq!(
+            stopped_after_restart.instance_id.as_deref(),
+            Some(restarted_instance_id.as_str())
+        );
+
+        // The earlier approval's frozen registry snapshot remains immutable. A separately created
+        // AGY-only approval below exercises the CLI restart path with its own current registry
+        // revision and independent counter/instance assertions.
+        let approval_id_clean = create_approved_plan(
+            &fixture,
+            "plan-restart-clean",
+            BINDING_A,
+            THREAD_UUID_A,
+            vec![PlanTask {
+                id: "task-root-agy".to_string(),
+                title: "Root AGY implementation".to_string(),
+                instruction: "Clean stopped restart test".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+        );
+        let notify_cfg2 =
+            ApprovedHostNotificationConfig::new(fixture.root.join("bin/fake-codex-restart"), 2_000)
+                .expect("notify cfg 2");
+        let clean_host1 = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id_clean,
+            )
+            .with_tick_interval(Duration::from_millis(20))
+            .with_notifications(notify_cfg2),
+        )
+        .await
+        .expect("start clean_host1");
+        let clean_inst1 = clean_host1.instance_id().to_string();
+        let clean_binding = clean_host1.session_binding_id().to_string();
+        assert!(clean_host1.summary().notifications.enabled);
+
+        client
+            .dispatch_task(&approval_id_clean, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy on clean_host1");
+        let agy_done = wait_for_task_status(&client, &approval_id_clean, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        clean_host1.shutdown().await.expect("shutdown clean_host1");
+
+        // 6. Clean restart via CLI `--restart-from-instance-id` / `ApprovedHost::restart_stopped`
+        //    with existing `task-receipts.json` succeeds, rotates `instance_id`, preserves receipts
+        //    without replaying tasks, and resets notifications to disabled (`enabled: false`).
+        let cli_restart = HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--approval-id",
+            &approval_id_clean,
+            "--restart-from-instance-id",
+            &clean_inst1,
+        ])
+        .expect("parse --restart-from-instance-id");
+        match cli_restart.command {
+            HostCommand::Serve(args) => {
+                assert_eq!(
+                    args.restart_from_instance_id.as_deref(),
+                    Some(clean_inst1.as_str())
+                );
+            }
+        }
+
+        let clean_host2 = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id_clean,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+            &clean_inst1,
+        )
+        .await
+        .expect("restart_stopped on clean Stopped session with existing receipts");
+
+        let clean_inst2 = clean_host2.instance_id().to_string();
+        assert_ne!(clean_inst2, clean_inst1);
+        assert_eq!(clean_host2.session_binding_id(), clean_binding);
+        assert_eq!(
+            clean_host2.summary().notifications,
+            HostNotificationSummary::disabled(),
+            "restart_stopped without explicit notification opt-in must default notifications to disabled"
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            1,
+            "restart_stopped must never replay completed tasks"
+        );
+
+        let snap_after_restart = client
+            .get_task(&approval_id_clean, "task-root-agy")
+            .await
+            .expect("get_task after restart_stopped");
+        assert_eq!(
+            snap_after_restart.status,
+            TaskExecutionStatus::ReadyForReview
+        );
+        assert_eq!(snap_after_restart.run_id, agy_done.run_id);
+        assert_eq!(oc_completed.status, TaskExecutionStatus::ReadyForReview);
+        assert!(first_binding_id.starts_with("bnd_"));
+
+        // Stale prior instance ID is rejected on the restarted host.
+        assert_eq!(
+            client
+                .stop_idle_session(&approval_id_clean, &clean_inst1)
+                .await
+                .expect_err("stale prior instance_id must be rejected after restart")
+                .code(),
+            "host_instance_mismatch"
+        );
+
+        clean_host2.shutdown().await.expect("shutdown clean_host2");
+
+        // 7. Superseding the plan revision blocks restart_stopped and preserves the Stopped manifest.
+        let latest_clean = fixture
+            .plans
+            .latest_revision("plan-restart-clean")
+            .expect("latest plan")
+            .expect("exists");
+        let newer_draft = fixture
+            .plans
+            .change(
+                latest_clean.revision,
+                PlanChange::SaveDraft {
+                    plan_id: "plan-restart-clean".to_string(),
+                    binding_id: BINDING_A.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: 5,
+                    summary: "Superseding draft".to_string(),
+                    tasks: latest_clean.tasks.clone(),
+                },
+            )
+            .expect("save superseding draft");
+        fixture
+            .plans
+            .change(
+                newer_draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan-restart-clean".to_string(),
+                    revision: newer_draft.revision,
+                },
+            )
+            .expect("publish superseding draft");
+
+        let superseded_err = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id_clean,
+            ),
+            &clean_inst2,
+        )
+        .await
+        .expect_err("superseded plan must reject restart_stopped");
+        assert_eq!(superseded_err.code(), "unpublished_or_superseded_plan");
+
+        let clean_record = fixture
+            .authority
+            .get_for_operator(&approval_id_clean)
+            .expect("clean record");
+        let clean_manifest_after = read_host_manifest_optional(
+            &fixture.sessions_dir.join(&approval_id_clean),
+            &clean_record,
+        )
+        .expect("read manifest after superseded rejection")
+        .expect("manifest still exists");
+        assert_eq!(clean_manifest_after.phase, HostPhase::Stopped);
+        assert_eq!(
+            clean_manifest_after.instance_id.as_deref(),
+            Some(clean_inst2.as_str())
+        );
     }
 }

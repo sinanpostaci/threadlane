@@ -111,6 +111,11 @@ path. Existing trusted library start/recovery API remains compatible (not a new
 untrusted/MCP route); desktop ordinary Start must reject Stopped and direct operator
 to explicit Restart. Desktop restart never treats Ready/Failed/unknown as Stopped.
 
+Registry revalidation means integrity of the approval's frozen registry snapshot.
+Later global tool/profile edits affect future approvals and do not rewrite or
+revoke an existing immutable approval. Active source publication and the exact
+repository/base remain required, as in the established materialization contract.
+
 ## C: native desktop and session panel
 
 Tauri commands (operator only, NOT MCP):

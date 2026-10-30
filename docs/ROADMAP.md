@@ -13,6 +13,9 @@ itself new scope, select an unapproved model, or replace the user's conversation
 
 Two paths must work: worker -> Threadlane -> Codex -> user; user -> Codex ->
 Threadlane -> affected worker. Software owns identity/correlation and lifecycle.
+Everyday work stays in Codex; the desktop is an optional observation and settings
+surface. Trusted approval of a new execution scope remains explicit, but ordinary
+task dispatch and follow-up must not require a panel visit for each action.
 
 ## Milestones
 

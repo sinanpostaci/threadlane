@@ -22,6 +22,8 @@ use crate::types::{
 
 const APPROVAL_ID_PREFIX: &str = "apr_";
 const APPROVAL_ID_HEX_LEN: usize = 32;
+const HOST_INSTANCE_ID_PREFIX: &str = "hst_";
+const HOST_INSTANCE_ID_HEX_LEN: usize = 32;
 const MAX_IDENTIFIER_LEN: usize = 128;
 const HOST_MANIFEST_TMP_PREFIX: &str = ".host-manifest.json.tmp.";
 const TASK_RECEIPTS_TMP_PREFIX: &str = ".task-receipts.json.tmp.";
@@ -136,6 +138,34 @@ pub fn validate_approval_id(approval_id: &str) -> Result<(), HostError> {
         return Err(HostError::validation(
             "approval_id",
             "must contain only lowercase hexadecimal characters after `apr_`",
+        ));
+    }
+    Ok(())
+}
+
+/// Generates a fresh public per-start host instance identifier (`hst_<32 lowercase hex>`).
+pub(crate) fn generate_host_instance_id() -> String {
+    format!("{HOST_INSTANCE_ID_PREFIX}{}", Uuid::new_v4().simple())
+}
+
+/// Validates that `value` has the canonical `hst_<32 lowercase hex>` format.
+pub fn validate_host_instance_id(field: &'static str, value: &str) -> Result<(), HostError> {
+    if !value.starts_with(HOST_INSTANCE_ID_PREFIX)
+        || value.len() != HOST_INSTANCE_ID_PREFIX.len() + HOST_INSTANCE_ID_HEX_LEN
+    {
+        return Err(HostError::validation(
+            field,
+            "must match `hst_<32 lowercase hex characters>`",
+        ));
+    }
+    let hex_part = &value[HOST_INSTANCE_ID_PREFIX.len()..];
+    if !hex_part
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(HostError::validation(
+            field,
+            "must contain only lowercase hexadecimal characters after `hst_`",
         ));
     }
     Ok(())
@@ -1055,10 +1085,15 @@ fn validate_host_manifest_structure(manifest: &HostSessionManifest) -> Result<()
     if let Some(ref sb) = manifest.session_binding_id {
         validate_identifier("session_binding_id", sb)?;
     }
-    if manifest.phase == HostPhase::Ready && manifest.session_binding_id.is_none() {
+    if let Some(ref inst) = manifest.instance_id {
+        validate_host_instance_id("instance_id", inst)?;
+    }
+    if matches!(manifest.phase, HostPhase::Ready | HostPhase::Stopping)
+        && manifest.session_binding_id.is_none()
+    {
         return Err(HostError::validation(
             "session_binding_id",
-            "Ready manifest must record session_binding_id",
+            "Ready or Stopping manifest must record session_binding_id",
         ));
     }
     let expected_gates = HostExecutionGates::for_ready_state(manifest.phase == HostPhase::Ready);
@@ -1131,10 +1166,18 @@ fn verify_manifest_against_approval(
             )));
         }
     }
-    if manifest.phase == HostPhase::Ready && manifest.session_binding_id.is_none() {
-        return Err(corrupt(
-            "manifest is in `ready` phase without `session_binding_id`".to_string(),
-        ));
+    if let Some(ref inst) = manifest.instance_id {
+        if validate_host_instance_id("instance_id", inst).is_err() {
+            return Err(corrupt(format!("manifest instance_id `{inst}` is invalid")));
+        }
+    }
+    if matches!(manifest.phase, HostPhase::Ready | HostPhase::Stopping)
+        && manifest.session_binding_id.is_none()
+    {
+        return Err(corrupt(format!(
+            "manifest is in `{}` phase without `session_binding_id`",
+            manifest.phase
+        )));
     }
 
     let expected_reference = HostSessionManifest::from_approval_record(
@@ -1196,6 +1239,36 @@ pub fn read_task_receipt(
 ) -> Result<Option<TaskRunReceipt>, HostError> {
     let (_, receipt) = read_task_ledger_entry(session_dir, record, session_binding_id, task_id)?;
     Ok(receipt)
+}
+
+/// Verifies `<session_dir>/task-receipts.json` (if present) against `record` and `session_binding_id`
+/// under `task-receipts.lock`.
+pub(crate) fn verify_existing_task_receipts(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+) -> Result<Option<TaskReceiptsFile>, HostError> {
+    let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+    let checked = ensure_no_symlink_components(&receipts_path)?;
+    match fs::symlink_metadata(&checked) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(task-receipts.json)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    }
+
+    let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
+    lock_file.lock_exclusive().map_err(|err| HostError::Io {
+        operation: "lock_exclusive(task-receipts.lock)".to_string(),
+        reason: err.to_string(),
+    })?;
+    let res = read_task_receipts_locked(session_dir, record, session_binding_id);
+    let _ = lock_file.unlock();
+    res
 }
 
 pub(crate) fn read_task_ledger_entry(
