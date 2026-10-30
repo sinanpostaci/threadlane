@@ -11,6 +11,7 @@ import type {
 } from '../registry/types.ts';
 import { createButton, h } from '../ui/dom.ts';
 import { planDetectedEffortUpdates } from './effort-setup.ts';
+import { catalogProvider, catalogProviderOptions, matchesCatalogProvider, type CatalogProvider } from './catalog-providers.ts';
 
 type Adapter = ToolDefinition['adapter'];
 type Provider = 'jev' | 'openai';
@@ -555,6 +556,7 @@ export class ToolsPage {
   private apiStates = new Map<string, ApiState>();
   private selections = new Map<string, Set<string>>();
   private catalogSearch = new Map<string, string>();
+  private catalogProviders = new Map<string, CatalogProvider>();
   private openPickers = new Set<string>();
   private expanded = new Set<string>();
   private configuringDiscoveredId: string | null = null;
@@ -707,6 +709,7 @@ export class ToolsPage {
     this.apiStates.clear();
     this.selections.clear();
     this.catalogSearch.clear();
+    this.catalogProviders.clear();
     this.openPickers.clear();
     this.expanded.clear();
     this.configuringDiscoveredId = null;
@@ -919,6 +922,8 @@ export class ToolsPage {
       this.selections.delete(probeKey);
       this.selections.delete(apiKey);
     }
+    this.catalogProviders.delete(probeKey);
+    this.catalogProviders.delete(apiKey);
     this.catalogSearch.delete(probeKey);
     this.catalogSearch.delete(apiKey);
     const probe = this.probes.get(toolId);
@@ -2021,6 +2026,16 @@ export class ToolsPage {
     searchInput.classList.add('aq-tools-catalog-search');
     searchInput.setAttribute('aria-label', `Search models for ${tool.label}`);
 
+    const hasProviderFilter = tool.adapter === 'opencode_v2';
+    const providerSelect = hasProviderFilter
+      ? this.select(
+          `${key}-provider`,
+          catalogProviderOptions(catalogModels),
+          this.catalogProviders.get(key) ?? 'all'
+        )
+      : null;
+    providerSelect?.setAttribute('aria-label', `Model source for ${tool.label}`);
+
     const stateEl = h('div', { className: 'aq-tools-catalog-state', role: 'status' });
     const listEl = h('div', { className: 'aq-tools-catalog aq-tools-catalog-list' });
     const actionsEl = h('div', { className: 'aq-tools-actions aq-tools-form-actions' });
@@ -2071,7 +2086,12 @@ export class ToolsPage {
     const renderPickerBody = (renderRows = true): void => {
       const currentSelection = this.selection(key, importableModels);
       const query = this.catalogSearch.get(key) ?? '';
-      const filtered = catalogModels.filter((model) => matchesSearch(model, query));
+      const provider = hasProviderFilter ? this.catalogProviders.get(key) ?? 'all' : 'all';
+      const filtered = catalogModels.filter((model) =>
+        matchesCatalogProvider(model.model_arg, provider) && matchesSearch(model, query)
+      );
+      const visibleIds = new Set(filtered.map(model => model.id));
+      const hiddenSelected = Array.from(currentSelection).filter(id => !visibleIds.has(id)).length;
       const addedForToolCount = catalogModels.filter((model) =>
         this.snapshot?.models.some(
           (saved) => saved.id.trim() === model.id.trim() && saved.tool_id === tool.id
@@ -2089,6 +2109,10 @@ export class ToolsPage {
         h('span', undefined, `${addedForToolCount} already added for ${tool.label}`),
         h('span', undefined, `Showing ${filtered.length} of ${catalogModels.length}`),
       ];
+      if (hiddenSelected > 0) {
+        stateNodes.push(h('span', { className: 'aq-tools-hint' },
+          `${hiddenSelected} selected outside the current view. Clear selection to remove them.`));
+      }
       if (currentSelection.size > 0) {
         stateNodes.push(
           this.button(
@@ -2109,7 +2133,10 @@ export class ToolsPage {
         );
       } else if (renderRows && filtered.length === 0) {
         listEl.replaceChildren(
-          h('p', { className: 'aq-note' }, `No models match "${query.trim()}".`)
+          h('p', { className: 'aq-note' },
+            provider === 'opencode-go' && query.trim() === ''
+              ? 'OpenCode Go is not listed in this catalog. Check your Go connection in OpenCode, then refresh the catalog.'
+              : `No models match the selected source and search "${query.trim()}".`)
         );
       } else if (renderRows) {
         listEl.replaceChildren(
@@ -2170,6 +2197,11 @@ export class ToolsPage {
       actionsEl.replaceChildren(...actionNodes);
     };
 
+    providerSelect?.addEventListener('change', () => {
+      this.catalogProviders.set(key, catalogProvider(providerSelect.value));
+      renderPickerBody();
+    });
+
     searchInput.addEventListener('input', () => {
       this.catalogSearch.set(key, searchInput.value);
       renderPickerBody();
@@ -2181,6 +2213,10 @@ export class ToolsPage {
       'div',
       { className: 'aq-tools-probe' },
       head,
+      providerSelect
+        ? this.field('Model source', providerSelect,
+            'Go and API use separate routes. Catalog visibility does not confirm subscription access.')
+        : null,
       catalogModels.length > 0 ? searchInput : null,
       stateEl,
       listEl,

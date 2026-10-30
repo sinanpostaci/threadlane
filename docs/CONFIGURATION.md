@@ -24,6 +24,12 @@ matching model IDs, tool IDs and exact model arguments. Custom nonempty effort
 lists, labels, model arguments, default-without-effort choices and assignments are
 preserved. Manual overrides remain available under Advanced.
 
+OpenCode catalogs may list the same model under separate Go and API routes. Use
+**Model source** to choose **OpenCode Go** or **OpenCode API**, with counts from the
+current catalog. Filtering never changes a model's execution route or imports it.
+Selections outside the current view are reported explicitly. A catalog entry does
+not confirm that the active subscription permits that model.
+
 For example, an OpenCode Go model uses provider argument
 `opencode-go/deepseek-v4.1-flash`, with `max` configured as a separate effort. The
 worker combines them as `opencode-go/deepseek-v4.1-flash#max`.
