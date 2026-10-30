@@ -51,6 +51,13 @@ not require switching to the panel for each task. See
 
 ### Optional Approved-Session Controls
 
+- **Codex-first initial startup**: An operator may opt in with
+  `threadlane-native-mcp --auto-start-approved-hosts` and the configured stores.
+  An explicit approved root-task dispatch can then launch its first fresh host
+  and wait for authenticated readiness. It cannot create approval or restart an
+  uncertain session. New-scope approval currently uses desktop confirmation;
+  a trusted headless approval route remains planned. See the
+  [native conversation workflow](docs/CODEX-WORKFLOW.md).
 - **Explicit idle stop and stopped-session restart**: Operator controls use
   authenticated owner scope and per-start instance identity. Active jobs prevent
   idle stop; restart preserves receipts without replay and resets notification
@@ -63,6 +70,11 @@ not require switching to the panel for each task. See
   Native multi-chat delivery and real provider compatibility remain separate
   gates. No new lifecycle MCP tools are exposed. See
   [session lifecycle](docs/SESSION-LIFECYCLE.md).
+
+OpenCode v2 [metadata validation](docs/OPENCODE-METADATA.md) is available as a pure library boundary using
+bounded, already-loaded inputs and per-assistant model/effort fields. It performs
+no session discovery or export and is not yet connected to the runtime worker
+collector. The existing missing-evidence gate remains in force.
 
 ---
 

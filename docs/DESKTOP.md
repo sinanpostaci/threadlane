@@ -93,6 +93,14 @@ nix develop "path:$tiny_flake#desktop"
    artifact at `./target/desktop/debug/threadlane-desktop`. Tauri runs the
    configured frontend build before compiling the native shell.
 
+Standalone builds made directly with Cargo must enable the dependency feature
+`--features tauri/custom-protocol` after the frontend bundle exists. The Nix
+package and `scripts/build-desktop.py` set this automatically for both debug and
+release builds. Without it, Tauri treats the executable as a development client
+and tries `http://127.0.0.1:1420` instead of its embedded assets. A packaged
+standalone window requires no local frontend server; `tauri dev` keeps its normal
+development-server behavior.
+
 ---
 
 ## Running the Desktop Preview Launcher (`scripts/desktop_preview.py`)

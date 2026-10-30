@@ -24,13 +24,17 @@ use threadlane_workflow::{
 use crate::approved_mcp::{
     execute_approved_ack_events, execute_approved_activity, execute_approved_pull_events,
     execute_approved_session, execute_approved_task, execute_cancel_approved_task,
-    execute_list_approvals, execute_start_approved_task, format_approved_scoped_error,
-    open_host_stores_with_known_dirs, ApprovedAckEventsParams, ApprovedActivityParams,
-    ApprovedPullEventsParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
-    ListApprovalsParams, StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
+    execute_list_approvals, format_approved_scoped_error, open_host_stores_with_known_dirs,
+    ApprovedAckEventsParams, ApprovedActivityParams, ApprovedPullEventsParams,
+    ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams, ListApprovalsParams,
+    StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
 };
 use crate::error::{NativeError, NativeErrorCode};
-use crate::fs_safety::constant_time_str_eq;
+use crate::fs_safety::{constant_time_str_eq, ensure_platform_supported};
+use crate::host_launcher::{
+    execute_start_approved_task_with_launcher, validate_host_executable_path, ApprovedHostLauncher,
+    ApprovedHostLauncherPolicy,
+};
 use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
 };
@@ -318,6 +322,7 @@ pub struct PairedMcpServer {
     server_pid: u32,
     workflow_stores: Option<WorkflowStores>,
     host_stores: Option<HostStores>,
+    host_launcher: Option<Arc<ApprovedHostLauncher>>,
     cached_workflow: Arc<Mutex<Option<CachedScopedWorkflow>>>,
     tool_router: ToolRouter<Self>,
 }
@@ -352,6 +357,7 @@ impl PairedMcpServer {
             server_pid,
             workflow_stores: None,
             host_stores: None,
+            host_launcher: None,
             cached_workflow: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         })
@@ -451,6 +457,50 @@ impl PairedMcpServer {
             ));
         };
         Ok(self.with_host_stores(authority, clean_sessions_dir))
+    }
+
+    /// Attaches a validated operator [`ApprovedHostLauncherPolicy`] to this server so
+    /// `start_approved_task(approval_id, task_id)` can auto-start an initial fresh
+    /// `threadlane-host` process when no prior session state exists.
+    ///
+    /// Requires both workflow stores (`registry_dir` and `plans_dir`) and host stores
+    /// (`authority_dir` and `sessions_dir`) to be configured on this server; otherwise fails with
+    /// [`NativeErrorCode::InvalidConfig`].
+    pub fn with_host_launcher_policy(
+        mut self,
+        policy: ApprovedHostLauncherPolicy,
+    ) -> Result<Self, NativeError> {
+        ensure_platform_supported()?;
+        if self.workflow_stores.is_none() || self.host_stores.is_none() {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "approved host launcher policy requires workflow stores (registry_dir, plans_dir) and host stores (authority_dir, sessions_dir) to be configured",
+            ));
+        }
+        let canonical_exec = validate_host_executable_path(policy.executable())?;
+        let startup_timeout = policy.startup_timeout();
+        let validated_policy = ApprovedHostLauncherPolicy::new(canonical_exec)?
+            .with_startup_timeout(startup_timeout)?;
+        self.host_launcher = Some(Arc::new(ApprovedHostLauncher::new(validated_policy)));
+        Ok(self)
+    }
+
+    /// Alias for [`PairedMcpServer::with_host_launcher_policy`].
+    pub fn with_approved_host_launcher(
+        self,
+        policy: ApprovedHostLauncherPolicy,
+    ) -> Result<Self, NativeError> {
+        self.with_host_launcher_policy(policy)
+    }
+
+    /// Returns `true` if an explicit operator [`ApprovedHostLauncherPolicy`] is configured.
+    pub fn has_host_launcher_policy(&self) -> bool {
+        self.host_launcher.is_some()
+    }
+
+    /// Returns a reference to the configured [`ApprovedHostLauncherPolicy`], if any.
+    pub fn host_launcher_policy(&self) -> Option<&ApprovedHostLauncherPolicy> {
+        self.host_launcher.as_ref().map(|l| l.policy())
     }
 
     /// Returns `true` if operator [`RegistryStore`] and [`PlanStore`] handles are configured.
@@ -563,6 +613,9 @@ impl PairedMcpServer {
             | "approve_plan"
             | "start_host"
             | "run_host"
+            | "auto_start_approved_hosts"
+            | "set_host_executable"
+            | "configure_host_launcher"
             | "enable_notifications"
             | "disable_notifications"
             | "configure_notifications"
@@ -1568,12 +1621,30 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("start_approved_task")?;
-        execute_start_approved_task(
+        let expected_binding_id = trusted_binding_id.clone();
+        let expected_thread_uuid = trusted_thread_uuid.clone();
+        execute_start_approved_task_with_launcher(
             stores.authority,
             stores.sessions_dir,
             trusted_binding_id,
             trusted_thread_uuid,
             params,
+            self.host_launcher.clone(),
+            || {
+                let enrollment = self.verify_enrolled_binding_for_tool("start_approved_task")?;
+                if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
+                    || !constant_time_str_eq(&enrollment.thread_id, &expected_thread_uuid)
+                {
+                    return Err(Self::format_pairing_error(
+                        "start_approved_task",
+                        NativeError::new(
+                            NativeErrorCode::RebindRejected,
+                            "enrolled binding or native thread changed during approved host startup",
+                        ),
+                    ));
+                }
+                Ok(())
+            },
         )
         .await
     }

@@ -3,6 +3,51 @@
 Verified on 2026-10-29 on Linux/NixOS. This is a checkpoint report, not a claim
 that every milestone or platform is supported.
 
+## Approved native startup checkpoint (2026-10-30)
+
+The integrated Linux candidate passed `cargo test --locked --workspace
+--all-targets`: **261 tests**, zero failures or ignored cases across 40 test
+binaries. Workspace formatting and Clippy with warnings denied also passed.
+
+Coverage includes default-off startup policy, CLI prerequisites, unchanged MCP
+tools, frozen scope/task checks, enrollment revocation, exact process arguments,
+fresh-only preservation, cross-coordinator launch intents, duplicate dispatch,
+bounded readiness and cancellation without late process creation. The real host
+CLI lifecycle regression verifies authenticated stop/restart and no task replay.
+
+A repeated native check exposed a real work-area initialization race: the first
+worker could create an ownership lock before its marker, while a second task's
+authority validation observed the temporary lock-only directory. Retrying an
+isolated test did not establish a fix. In a disposable synthetic snapshot, the
+primary inserted a 300 ms scheduling pause after the existing work-area lock
+acquisition and reproduced `invalid_work_area` with the original assertions.
+The host now initializes and verifies its repository-bound work area before
+Ready. The same widened-window scenario then passed. Neither diagnostic logging
+nor the scheduling pause is included in product source. Additional regressions
+verify private marker/directories and zero workers before dispatch, and preserve
+a Stopped manifest when its work-area marker refers to a foreign repository.
+
+The Tauri workspace passed **23 tests**, formatting and Clippy. Its production
+Rust and Cargo inputs were compared with the final candidate after three
+test-only import corrections; all 132 compared inputs remained identical.
+Frontend inputs are unchanged from the existing 70-test/typecheck/build gate.
+The built frontend assets were reused rather than running an unchanged suite
+again. The standalone embedded-asset fix separately passed 11 Python tests and
+an exact-commit Nix build; the user confirmed its native window with the
+temporary port 1420 server stopped.
+
+The pure OpenCode v2 metadata validator contributes 13 synthetic tests to the
+root total. It is not connected to the runtime collector and does not establish
+live Go worker acceptance. See [metadata boundaries](OPENCODE-METADATA.md).
+
+This gate establishes local fixture and build compatibility. New-scope approval
+still uses desktop confirmation, and real two-chat/busy-turn delivery, live
+interactive provider continuation, receipt-bound DAG inputs, product API
+entitlement and macOS/Windows acceptance remain separate. See the
+[native conversation workflow](CODEX-WORKFLOW.md). Package-closing review and
+the exact-candidate Nix build remain release gates; test counts alone do not
+establish either outcome.
+
 ## Reproduce locally
 
 From the repository root:

@@ -37,6 +37,8 @@ pub mod error;
 pub mod fs_safety;
 /// Git worktree manager, private ownership manifests, post-run diff gate, and safe cleanup.
 pub mod git;
+/// Pure validation of explicitly supplied owned OpenCode metadata; performs no I/O.
+pub mod opencode_metadata;
 /// Session-only provider file permission policies and Antigravity `--settings` builders.
 pub mod permissions;
 /// Typed worker specification, execution budgets, policy allowlists, and exact argv builders.

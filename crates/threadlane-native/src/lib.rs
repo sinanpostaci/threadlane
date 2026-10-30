@@ -31,6 +31,8 @@ pub mod client;
 pub mod error;
 /// Path validation, private `0700`/`0600` persistence, cross-process locking, and sanitization.
 pub mod fs_safety;
+/// Validated operator launcher policy, CLI flags, and initial fresh-only host auto-start coordinator.
+pub mod host_launcher;
 /// Paired MCP stdio server delegating to [`threadlane::ThreadlaneMcpServer`] after enrollment.
 pub mod mcp_pair;
 /// Private operator connection-epoch pairing store and verification gate types.
@@ -55,6 +57,11 @@ pub use client::{
     NativeMcpToolCallResult, NativeThread, NativeThreadPage,
 };
 pub use error::{NativeError, NativeErrorCode};
+pub use host_launcher::{
+    validate_host_executable_path, ApprovedHostLauncherPolicy, HostLauncherPolicy, NativeMcpCli,
+    APPROVED_HOST_STARTUP_POLL_INTERVAL, APPROVED_HOST_STARTUP_TIMEOUT,
+    DEFAULT_HOST_EXECUTABLE_NAME,
+};
 pub use mcp_pair::{
     open_workflow_stores, CatalogParams, ConnectionIdentityParams, DraftTaskParams, GetPlanParams,
     ListPlansParams, PairedMcpServer, PlanTaskParams, PublishParams, PublishPlanParams,

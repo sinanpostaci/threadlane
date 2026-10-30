@@ -22,7 +22,7 @@ use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalReque
 use threadlane_host::{
     is_host_lock_held, read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
     ApprovedHostClient, HostControlRuntimeState, HostControlStatusResponse, HostError, HostPhase,
-    HostSessionSummary,
+    HostSessionSummary, WORK_AREA_SUBDIR,
 };
 use threadlane_plans::{
     compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStore,
@@ -30,7 +30,9 @@ use threadlane_plans::{
 };
 use threadlane_registry::{RegistryChange, RegistryStore};
 use threadlane_workers::{
-    resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, WorkAreaOwnershipMarker,
+    WorktreeManager, CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
+    WORK_AREA_MARKER_FILENAME,
 };
 
 const THREAD_UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
@@ -495,6 +497,27 @@ fn assert_live_ready(
     assert!(!manifest.gates.workers_auto_started_on_boot);
     assert!(!manifest.notifications.enabled);
     assert!(manifest.last_error.is_none());
+
+    fixture.assert_no_provider_invocation();
+    let work_area_dir = fixture.session_dir().join(WORK_AREA_SUBDIR);
+    let marker_path = work_area_dir.join(WORK_AREA_MARKER_FILENAME);
+    let marker_bytes =
+        fs::read(&marker_path).expect("read Ready process .threadlane-work-area.json");
+    let marker: WorkAreaOwnershipMarker =
+        serde_json::from_slice(&marker_bytes).expect("parse Ready process WorkAreaOwnershipMarker");
+    let manager =
+        WorktreeManager::new(&record.repository_path, &work_area_dir, &record.base_commit)
+            .expect("WorktreeManager::new on Ready process work-area");
+    assert_eq!(marker.marker_version, 1);
+    assert_eq!(marker.work_area_root, manager.work_area_root());
+    assert_eq!(
+        marker.repository_common_git_dir,
+        manager.repository_common_git_dir()
+    );
+    assert_eq!(manager.resolved_base_commit(), record.base_commit);
+    assert!(work_area_dir.join(MANIFESTS_SUBDIR).is_dir());
+    assert!(work_area_dir.join(CHECKOUTS_SUBDIR).join("runs").is_dir());
+    assert!(work_area_dir.join(CHECKOUTS_SUBDIR).join("tasks").is_dir());
 
     child.assert_running();
 }

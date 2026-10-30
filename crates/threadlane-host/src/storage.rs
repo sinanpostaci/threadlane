@@ -14,9 +14,10 @@ use uuid::Uuid;
 
 use crate::error::HostError;
 use crate::types::{
-    HostExecutionGates, HostPhase, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
-    HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME, HOST_MANIFEST_SCHEMA_VERSION,
-    MAX_HOST_MANIFEST_BYTES, MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
+    HostExecutionGates, HostLaunchIntent, HostPhase, HostSessionManifest, TaskDispatchIntent,
+    TaskRunReceipt, HOST_LAUNCH_INTENT_SCHEMA_VERSION, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
+    HOST_MANIFEST_SCHEMA_VERSION, LAUNCH_INTENTS_SUBDIR, MAX_HOST_MANIFEST_BYTES,
+    MAX_LAUNCH_INTENT_BYTES, MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
     TASK_RECEIPTS_LOCK_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
 };
 
@@ -503,6 +504,34 @@ pub fn validate_sessions_root(
                 reason: "non-UTF-8 entry in sessions_dir is not permitted".to_string(),
             });
         };
+        if name_str == LAUNCH_INTENTS_SUBDIR {
+            let meta = fs::symlink_metadata(&entry_path).map_err(|err| HostError::Io {
+                operation: "symlink_metadata(launch_intents_dir)".to_string(),
+                reason: err.to_string(),
+            })?;
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(HostError::SecurityViolation {
+                    path: entry_path.display().to_string(),
+                    reason: ".launch-intents inside sessions_dir must be a private directory"
+                        .to_string(),
+                });
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode() & 0o777;
+                if (mode & 0o077) != 0 {
+                    return Err(HostError::SecurityViolation {
+                        path: entry_path.display().to_string(),
+                        reason: format!(
+                            ".launch-intents directory permissions {mode:04o} are too permissive (expected 0700)"
+                        ),
+                    });
+                }
+            }
+            inspect_launch_intents_dir(&entry_path)?;
+            continue;
+        }
         if validate_approval_id(name_str).is_err() {
             return Err(HostError::SecurityViolation {
                 path: entry_path.display().to_string(),
@@ -582,6 +611,82 @@ pub fn verify_existing_session_dir(
             reason: err.to_string(),
         }),
     }
+}
+
+/// Verifies under a held [`HostSessionLock`] that `session_dir` contains no prior host manifest,
+/// task receipts, runtime state, work area, or transient temp files before a `--start-fresh-only`
+/// launch writes `Bootstrapping`.
+///
+/// An empty session directory containing only the zero-byte `host.lock` file is permitted. All
+/// existing files are preserved untouched on error.
+pub fn ensure_fresh_session_dir_locked(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+) -> Result<(), HostError> {
+    inspect_session_dir_entries(session_dir)?;
+
+    if let Some(existing_manifest) = read_host_manifest_optional(session_dir, record)? {
+        return Err(HostError::RestartNotAllowed {
+            approval_id: record.approval_id.clone(),
+            phase: Some(existing_manifest.phase),
+            detail: format!(
+                "fresh-only host start refused existing host session in phase `{}`",
+                existing_manifest.phase
+            ),
+        });
+    }
+
+    let entries = fs::read_dir(session_dir).map_err(|err| HostError::Io {
+        operation: "read_dir(session_dir)".to_string(),
+        reason: err.to_string(),
+    })?;
+
+    let mut prior_entries = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| HostError::Io {
+            operation: "read_dir_entry(session_dir)".to_string(),
+            reason: err.to_string(),
+        })?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            return Err(HostError::SecurityViolation {
+                path: entry.path().display().to_string(),
+                reason: "non-UTF-8 entry in session directory is not permitted".to_string(),
+            });
+        };
+        if name == HOST_LOCK_FILENAME {
+            let meta = fs::symlink_metadata(entry.path()).map_err(|err| HostError::Io {
+                operation: "symlink_metadata(host.lock)".to_string(),
+                reason: err.to_string(),
+            })?;
+            validate_private_regular_metadata(&entry.path(), &meta)?;
+            if meta.len() != 0 {
+                return Err(HostError::SecurityViolation {
+                    path: entry.path().display().to_string(),
+                    reason: format!(
+                        "host.lock must be an empty 0-byte lock file (found {} bytes)",
+                        meta.len()
+                    ),
+                });
+            }
+            continue;
+        }
+        prior_entries.push(name.to_string());
+    }
+
+    if !prior_entries.is_empty() {
+        prior_entries.sort();
+        return Err(HostError::RestartNotAllowed {
+            approval_id: record.approval_id.clone(),
+            phase: None,
+            detail: format!(
+                "fresh-only host start refused pre-existing session state ({})",
+                prior_entries.join(", ")
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn is_valid_lowercase_uuid_v4_simple(suffix: &str) -> bool {
@@ -1809,4 +1914,384 @@ fn validate_single_receipt(
     }
 
     Ok(())
+}
+
+/// Exclusive cross-process file lock (`<sessions_root>/.launch-intents/<approval_id>.lock`)
+/// serializing durable initial host launch intent reads/writes and pre-manifest process spawns.
+#[derive(Debug)]
+pub struct HostLaunchIntentLock {
+    lock_path: PathBuf,
+    file: File,
+}
+
+impl HostLaunchIntentLock {
+    /// Acquires an exclusive lock on `<sessions_root>/.launch-intents/<approval_id>.lock`.
+    pub fn acquire_blocking(sessions_root: &Path, approval_id: &str) -> Result<Self, HostError> {
+        validate_approval_id(approval_id)?;
+        let intents_dir = ensure_private_dir(&sessions_root.join(LAUNCH_INTENTS_SUBDIR))?;
+        inspect_launch_intents_dir(&intents_dir)?;
+        let lock_path = intents_dir.join(format!("{approval_id}.lock"));
+        let file = open_private_lock_file(&lock_path)?;
+        file.lock_exclusive().map_err(|err| HostError::Io {
+            operation: "lock_exclusive(launch_intent.lock)".to_string(),
+            reason: err.to_string(),
+        })?;
+        Ok(Self { lock_path, file })
+    }
+
+    /// Attempts to non-blockingly acquire an exclusive lock on
+    /// `<sessions_root>/.launch-intents/<approval_id>.lock`.
+    ///
+    /// Returns `Ok(None)` when another process or handle currently holds the exclusive lock.
+    pub fn try_acquire(sessions_root: &Path, approval_id: &str) -> Result<Option<Self>, HostError> {
+        validate_approval_id(approval_id)?;
+        let intents_dir = ensure_private_dir(&sessions_root.join(LAUNCH_INTENTS_SUBDIR))?;
+        inspect_launch_intents_dir(&intents_dir)?;
+        let lock_path = intents_dir.join(format!("{approval_id}.lock"));
+        let file = open_private_lock_file(&lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { lock_path, file })),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Returns the path to the underlying `<approval_id>.lock` file.
+    pub fn path(&self) -> &Path {
+        &self.lock_path
+    }
+}
+
+impl Drop for HostLaunchIntentLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn inspect_launch_intents_dir(intents_dir: &Path) -> Result<(), HostError> {
+    let entries = fs::read_dir(intents_dir).map_err(|err| HostError::Io {
+        operation: "read_dir(launch_intents_dir)".to_string(),
+        reason: err.to_string(),
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|err| HostError::Io {
+            operation: "read_dir_entry(launch_intents_dir)".to_string(),
+            reason: err.to_string(),
+        })?;
+        let entry_path = entry.path();
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            return Err(HostError::SecurityViolation {
+                path: entry_path.display().to_string(),
+                reason: "non-UTF-8 entry in .launch-intents is not permitted".to_string(),
+            });
+        };
+
+        if let Some(rest) = name.strip_prefix('.') {
+            if let Some((target_json, suffix)) = rest.split_once(".tmp.") {
+                if let Some(approval_id) = target_json.strip_suffix(".json") {
+                    if validate_approval_id(approval_id).is_ok()
+                        && is_valid_lowercase_uuid_v4_simple(suffix)
+                    {
+                        match fs::symlink_metadata(&entry_path) {
+                            Ok(meta) => {
+                                validate_private_regular_metadata(&entry_path, &meta)?;
+                                if meta.len() > MAX_LAUNCH_INTENT_BYTES as u64 {
+                                    return Err(HostError::SecurityViolation {
+                                        path: entry_path.display().to_string(),
+                                        reason: format!(
+                                            "transient launch intent temp file `{name}` size ({} bytes) exceeds maximum {} bytes",
+                                            meta.len(),
+                                            MAX_LAUNCH_INTENT_BYTES
+                                        ),
+                                    });
+                                }
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                let committed_path = intents_dir.join(target_json);
+                                if let Ok(committed_meta) = fs::symlink_metadata(&committed_path) {
+                                    validate_private_regular_metadata(
+                                        &committed_path,
+                                        &committed_meta,
+                                    )?;
+                                    if committed_meta.len() > MAX_LAUNCH_INTENT_BYTES as u64 {
+                                        return Err(HostError::SecurityViolation {
+                                            path: committed_path.display().to_string(),
+                                            reason: format!(
+                                                "committed launch intent `{target_json}` size ({} bytes) exceeds maximum {} bytes",
+                                                committed_meta.len(),
+                                                MAX_LAUNCH_INTENT_BYTES
+                                            ),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                return Err(HostError::Io {
+                                    operation: "symlink_metadata(launch_intent_tmp)".to_string(),
+                                    reason: err.to_string(),
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        let meta = fs::symlink_metadata(&entry_path).map_err(|err| HostError::Io {
+            operation: "symlink_metadata(launch_intent_entry)".to_string(),
+            reason: err.to_string(),
+        })?;
+        validate_private_regular_metadata(&entry_path, &meta)?;
+
+        if let Some(approval_id) = name.strip_suffix(".json") {
+            if validate_approval_id(approval_id).is_err() {
+                return Err(HostError::SecurityViolation {
+                    path: entry_path.display().to_string(),
+                    reason: format!(
+                        "foreign or invalid launch intent file `{name}` in .launch-intents"
+                    ),
+                });
+            }
+            if meta.len() > MAX_LAUNCH_INTENT_BYTES as u64 {
+                return Err(HostError::SecurityViolation {
+                    path: entry_path.display().to_string(),
+                    reason: format!(
+                        "launch intent file `{name}` size ({} bytes) exceeds maximum {} bytes",
+                        meta.len(),
+                        MAX_LAUNCH_INTENT_BYTES
+                    ),
+                });
+            }
+        } else if let Some(approval_id) = name.strip_suffix(".lock") {
+            if validate_approval_id(approval_id).is_err() {
+                return Err(HostError::SecurityViolation {
+                    path: entry_path.display().to_string(),
+                    reason: format!(
+                        "foreign or invalid launch intent lock `{name}` in .launch-intents"
+                    ),
+                });
+            }
+            if meta.len() != 0 {
+                return Err(HostError::SecurityViolation {
+                    path: entry_path.display().to_string(),
+                    reason: format!(
+                        "launch intent lock `{name}` must be a 0-byte lock file (found {} bytes)",
+                        meta.len()
+                    ),
+                });
+            }
+        } else {
+            return Err(HostError::SecurityViolation {
+                path: entry_path.display().to_string(),
+                reason: format!("foreign or unexpected entry `{name}` in .launch-intents"),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn verify_host_launch_intent(
+    intent: &HostLaunchIntent,
+    record: &ApprovalRecord,
+    intent_path: &Path,
+) -> Result<(), HostError> {
+    let corrupt = |reason: String| HostError::CorruptSessionState {
+        reason: format!("{} ({})", reason, intent_path.display()),
+    };
+
+    if intent.schema_version != HOST_LAUNCH_INTENT_SCHEMA_VERSION {
+        return Err(corrupt(format!(
+            "unsupported launch intent schema_version {} (expected {})",
+            intent.schema_version, HOST_LAUNCH_INTENT_SCHEMA_VERSION
+        )));
+    }
+    if validate_approval_id(&intent.approval_id).is_err()
+        || intent.approval_id != record.approval_id
+    {
+        return Err(corrupt(format!(
+            "launch intent approval_id `{}` does not match expected `{}`",
+            intent.approval_id, record.approval_id
+        )));
+    }
+    if validate_hex_digest("subject_digest", &intent.subject_digest).is_err()
+        || intent.subject_digest != record.subject_digest
+    {
+        return Err(corrupt(format!(
+            "launch intent subject_digest `{}` does not match frozen `{}`",
+            intent.subject_digest, record.subject_digest
+        )));
+    }
+    if intent.policy_version != record.policy_version {
+        return Err(corrupt(format!(
+            "launch intent policy_version {} does not match frozen {}",
+            intent.policy_version, record.policy_version
+        )));
+    }
+    if validate_identifier("control_binding_id", &intent.control_binding_id).is_err()
+        || intent.control_binding_id != record.binding_id
+    {
+        return Err(corrupt(format!(
+            "launch intent control_binding_id `{}` does not match frozen `{}`",
+            intent.control_binding_id, record.binding_id
+        )));
+    }
+    if validate_canonical_thread_uuid("thread_uuid", &intent.thread_uuid).is_err()
+        || intent.thread_uuid != record.thread_uuid
+    {
+        return Err(corrupt(format!(
+            "launch intent thread_uuid `{}` does not match frozen `{}`",
+            intent.thread_uuid, record.thread_uuid
+        )));
+    }
+    if validate_identifier("plan_id", &intent.plan_id).is_err() || intent.plan_id != record.plan_id
+    {
+        return Err(corrupt(format!(
+            "launch intent plan_id `{}` does not match frozen `{}`",
+            intent.plan_id, record.plan_id
+        )));
+    }
+    if intent.plan_revision == 0 || intent.plan_revision != record.plan_revision {
+        return Err(corrupt(format!(
+            "launch intent plan_revision {} does not match frozen {}",
+            intent.plan_revision, record.plan_revision
+        )));
+    }
+    if intent.executable_path.as_os_str().is_empty() || !intent.executable_path.is_absolute() {
+        return Err(corrupt(
+            "launch intent executable_path must be a non-empty absolute path".to_string(),
+        ));
+    }
+    for comp in intent.executable_path.components() {
+        if matches!(comp, Component::CurDir | Component::ParentDir) {
+            return Err(corrupt(
+                "launch intent executable_path must not contain `.` or `..` components".to_string(),
+            ));
+        }
+    }
+    if intent.spawn_pid == Some(0) {
+        return Err(corrupt("launch intent spawn_pid must not be 0".to_string()));
+    }
+    if intent.created_at_ms <= 0 || intent.updated_at_ms < intent.created_at_ms {
+        return Err(corrupt("launch intent timestamps are invalid".to_string()));
+    }
+    if let Some(ref err_msg) = intent.last_error {
+        if err_msg.is_empty() || err_msg.len() > 512 || err_msg.chars().any(char::is_control) {
+            return Err(corrupt(
+                "launch intent last_error must be non-empty, <= 512 bytes, and free of control characters"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads and verifies `<sessions_root>/.launch-intents/<approval_id>.json` against `record`,
+/// returning `Ok(None)` if no launch intent exists yet.
+///
+/// Corrupt or mismatched files are preserved untouched on disk and fail closed with
+/// [`HostError::CorruptSessionState`].
+pub fn read_host_launch_intent_optional(
+    sessions_root: &Path,
+    record: &ApprovalRecord,
+) -> Result<Option<HostLaunchIntent>, HostError> {
+    validate_approval_id(&record.approval_id)?;
+    let intents_dir_candidate = sessions_root.join(LAUNCH_INTENTS_SUBDIR);
+    let checked_dir = ensure_no_symlink_components(&intents_dir_candidate)?;
+    match fs::symlink_metadata(&checked_dir) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(launch_intents_dir)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    }
+
+    let intents_dir = verify_existing_private_dir(&checked_dir)?;
+    inspect_launch_intents_dir(&intents_dir)?;
+
+    let intent_path = intents_dir.join(format!("{}.json", record.approval_id));
+    let checked_file = ensure_no_symlink_components(&intent_path)?;
+    let meta = match fs::symlink_metadata(&checked_file) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(launch_intent.json)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    };
+    validate_private_regular_metadata(&checked_file, &meta)?;
+    if meta.len() > MAX_LAUNCH_INTENT_BYTES as u64 {
+        return Err(HostError::CorruptSessionState {
+            reason: format!(
+                "launch intent file size ({} bytes) exceeds maximum {} bytes",
+                meta.len(),
+                MAX_LAUNCH_INTENT_BYTES
+            ),
+        });
+    }
+
+    let file = File::open(&checked_file).map_err(|err| HostError::Io {
+        operation: "open(launch_intent.json)".to_string(),
+        reason: err.to_string(),
+    })?;
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    file.take(MAX_LAUNCH_INTENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| HostError::Io {
+            operation: "read(launch_intent.json)".to_string(),
+            reason: err.to_string(),
+        })?;
+    if bytes.len() > MAX_LAUNCH_INTENT_BYTES {
+        return Err(HostError::CorruptSessionState {
+            reason: format!(
+                "launch intent content exceeds maximum {} bytes",
+                MAX_LAUNCH_INTENT_BYTES
+            ),
+        });
+    }
+
+    let intent: HostLaunchIntent =
+        serde_json::from_slice(&bytes).map_err(|err| HostError::CorruptSessionState {
+            reason: format!("invalid launch intent JSON: {err}"),
+        })?;
+    verify_host_launch_intent(&intent, record, &checked_file)?;
+    Ok(Some(intent))
+}
+
+/// Validates and atomically writes `<sessions_root>/.launch-intents/<approval_id>.json` (`0600`,
+/// `<= 16 KiB`).
+pub fn write_host_launch_intent(
+    sessions_root: &Path,
+    record: &ApprovalRecord,
+    intent: &HostLaunchIntent,
+) -> Result<(), HostError> {
+    validate_approval_id(&record.approval_id)?;
+    let intents_dir = ensure_private_dir(&sessions_root.join(LAUNCH_INTENTS_SUBDIR))?;
+    inspect_launch_intents_dir(&intents_dir)?;
+    let intent_path = intents_dir.join(format!("{}.json", record.approval_id));
+    verify_host_launch_intent(intent, record, &intent_path)?;
+
+    let mut bytes =
+        serde_json::to_vec_pretty(intent).map_err(|err| HostError::CorruptSessionState {
+            reason: format!("failed to serialize launch intent: {err}"),
+        })?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_LAUNCH_INTENT_BYTES {
+        return Err(HostError::CorruptSessionState {
+            reason: format!(
+                "serialized launch intent ({} bytes) exceeds maximum {} bytes",
+                bytes.len(),
+                MAX_LAUNCH_INTENT_BYTES
+            ),
+        });
+    }
+    atomic_write_private_file(&intent_path, &bytes, MAX_LAUNCH_INTENT_BYTES)
 }

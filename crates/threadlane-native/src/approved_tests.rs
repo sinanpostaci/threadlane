@@ -1,10 +1,12 @@
 use std::fs::{self, File};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use clap::{CommandFactory, Parser};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -18,13 +20,17 @@ use threadlane_core::{
     EventPayload,
 };
 use threadlane_host::{
-    ensure_private_dir, write_host_manifest, ApprovedHost, ApprovedHostConfig, HostPhase,
+    ensure_private_dir, read_host_launch_intent_optional, write_host_launch_intent,
+    write_host_manifest, ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, HostCli,
+    HostCommand, HostLaunchIntentLock, HostLaunchIntentStatus, HostNotificationSummary, HostPhase,
     HostSessionLock, HostSessionManifest, HostSessionSummary, TaskExecutionStatus,
     TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
-    RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 use threadlane_workers::{
-    resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, WorkAreaOwnershipMarker,
+    WorktreeManager, CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
+    WORK_AREA_MARKER_FILENAME,
 };
 use threadlane_workflow::{
     compile_plan_revision, ensure_mcp_response_budget, Difficulty, ModelChoice, ModelDefinition,
@@ -33,11 +39,12 @@ use threadlane_workflow::{
 };
 
 use crate::{
-    open_host_stores, open_workflow_stores, ApprovalSummaryPage, ApprovedAckEventsParams,
-    ApprovedActivityPage, ApprovedActivityParams, ApprovedEventAck, ApprovedEventBatch,
-    ApprovedPullEventsParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
-    ListApprovalsParams, NativeErrorCode, OperatorEnrollRequest, PairedMcpServer, PairingStore,
-    StartApprovedTaskParams, CONNECTION_IDENTITY_TOOL,
+    is_process_alive, open_host_stores, open_workflow_stores, validate_host_executable_path,
+    ApprovalSummaryPage, ApprovedAckEventsParams, ApprovedActivityPage, ApprovedActivityParams,
+    ApprovedEventAck, ApprovedEventBatch, ApprovedHostLauncherPolicy, ApprovedPullEventsParams,
+    ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams, HostLauncherPolicy,
+    ListApprovalsParams, NativeErrorCode, NativeMcpCli, OperatorEnrollRequest, PairedMcpServer,
+    PairingStore, StartApprovedTaskParams, CONNECTION_IDENTITY_TOOL, DEFAULT_HOST_EXECUTABLE_NAME,
 };
 
 const THREAD_UUID_A: &str = "018f1a2b-3c4d-7e00-8000-0000000000a1";
@@ -2825,4 +2832,1975 @@ async fn approved_mcp_pull_and_ack_events_enrollment_isolation_cursors_and_256ki
 
     host_a.shutdown().await.expect("shutdown host_a");
     host_b.shutdown().await.expect("shutdown host_b");
+}
+
+fn write_spy_host_script(
+    script_path: &Path,
+    count_file: &Path,
+    argv_file: &Path,
+    pid_file: &Path,
+    exit_code: i32,
+    sleep_secs: Option<&str>,
+) {
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent).expect("create spy host parent dir");
+    }
+    let sleep_block = match sleep_secs {
+        Some(secs) => format!("sleep {secs}\n"),
+        None => String::new(),
+    };
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+COUNT_FILE="{count_file}"
+ARGV_FILE="{argv_file}"
+PID_FILE="{pid_file}"
+c=0
+if [ -f "$COUNT_FILE" ]; then
+    c=$(cat "$COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$COUNT_FILE"
+printf "%s" "$$" > "$PID_FILE"
+: > "$ARGV_FILE"
+for arg in "$@"; do
+    printf "%s\n" "$arg" >> "$ARGV_FILE"
+done
+{sleep_block}exit {exit_code}
+"#,
+        count_file = count_file.display(),
+        argv_file = argv_file.display(),
+        pid_file = pid_file.display(),
+        sleep_block = sleep_block,
+        exit_code = exit_code,
+    );
+    let mut f = File::create(script_path).expect("create spy host script");
+    f.write_all(script.as_bytes())
+        .expect("write spy host script");
+    f.sync_all().expect("sync spy host script");
+    fs::set_permissions(script_path, fs::Permissions::from_mode(0o755))
+        .expect("chmod 0755 spy host script");
+}
+
+#[tokio::test]
+async fn codex_first_auto_start_cli_and_policy_prerequisites_and_default_off_invariants() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    // 1. CLI help text documents that `--auto-start-approved-hosts` is disabled/off by default
+    //    and is an explicit operator-only opt-in, alongside `--host-executable`.
+    let mut cmd = NativeMcpCli::command();
+    let help_text = cmd.render_long_help().to_string();
+    assert!(help_text.contains("--auto-start-approved-hosts"));
+    assert!(help_text.contains("--host-executable"));
+    assert!(
+        help_text.contains("disabled by default") || help_text.contains("off by default"),
+        "CLI help must document that auto-start is off by default: {help_text}"
+    );
+    assert!(
+        help_text.contains("operator-only"),
+        "CLI help must document explicit operator-only opt-in: {help_text}"
+    );
+
+    // 2. Default CLI parsing leaves `auto_start_approved_hosts == false` and `host_executable == None`.
+    let cli_default = NativeMcpCli::try_parse_from([
+        "threadlane-native-mcp",
+        "--state-dir",
+        fixture.state_dir.to_str().unwrap(),
+        "--pairing-dir",
+        fixture.pairing_dir.to_str().unwrap(),
+        "--registry-dir",
+        fixture.registry_dir.to_str().unwrap(),
+        "--plans-dir",
+        fixture.plans_dir.to_str().unwrap(),
+        "--authority-dir",
+        fixture.authority_dir.to_str().unwrap(),
+        "--sessions-dir",
+        fixture.sessions_dir.to_str().unwrap(),
+    ])
+    .expect("parse default NativeMcpCli");
+    assert!(!cli_default.auto_start_approved_hosts);
+    assert!(cli_default.host_executable.is_none());
+
+    let default_server = cli_default
+        .clone()
+        .into_server()
+        .expect("default into_server");
+    assert!(!default_server.has_host_launcher_policy());
+    assert!(default_server.host_launcher_policy().is_none());
+
+    // 3. `--auto-start-approved-hosts` requires all four store directory flags in clap AND `into_server`.
+    assert!(
+        NativeMcpCli::try_parse_from([
+            "threadlane-native-mcp",
+            "--state-dir",
+            fixture.state_dir.to_str().unwrap(),
+            "--pairing-dir",
+            fixture.pairing_dir.to_str().unwrap(),
+            "--auto-start-approved-hosts",
+        ])
+        .is_err(),
+        "--auto-start-approved-hosts without 4 store dirs must fail in clap"
+    );
+    assert!(
+        NativeMcpCli::try_parse_from([
+            "threadlane-native-mcp",
+            "--state-dir",
+            fixture.state_dir.to_str().unwrap(),
+            "--pairing-dir",
+            fixture.pairing_dir.to_str().unwrap(),
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--auto-start-approved-hosts",
+        ])
+        .is_err(),
+        "--auto-start-approved-hosts without authority/sessions dirs must fail in clap"
+    );
+
+    // `--host-executable` requires `--auto-start-approved-hosts`.
+    let bin_dir = fixture.root.join("host-bin");
+    fs::create_dir_all(&bin_dir).expect("create host-bin dir");
+    let spy_host_exe = bin_dir.join(DEFAULT_HOST_EXECUTABLE_NAME);
+    let spy_count = fixture.root.join("spy-policy-count.txt");
+    let spy_argv = fixture.root.join("spy-policy-argv.txt");
+    let spy_pid = fixture.root.join("spy-policy-pid.txt");
+    write_spy_host_script(&spy_host_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    assert!(
+        NativeMcpCli::try_parse_from([
+            "threadlane-native-mcp",
+            "--state-dir",
+            fixture.state_dir.to_str().unwrap(),
+            "--pairing-dir",
+            fixture.pairing_dir.to_str().unwrap(),
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--host-executable",
+            spy_host_exe.to_str().unwrap(),
+        ])
+        .is_err(),
+        "--host-executable without --auto-start-approved-hosts must fail in clap"
+    );
+
+    let err_from_cli =
+        ApprovedHostLauncherPolicy::from_operator_cli(false, Some(spy_host_exe.as_path()))
+            .expect_err("host_executable without auto_start_approved_hosts must fail");
+    assert_eq!(err_from_cli.error_code(), NativeErrorCode::InvalidConfig);
+
+    // 4. Executable path validation & sibling resolution:
+    //    - Rejects relative paths, `.` / `..`, missing files, directories, and non-executable files.
+    //    - Canonicalizes symlinks and resolves sibling `threadlane-host` next to canonical native exe.
+    assert_eq!(
+        validate_host_executable_path(Path::new("threadlane-host"))
+            .expect_err("relative bare name must fail")
+            .error_code(),
+        NativeErrorCode::InvalidConfig
+    );
+    assert_eq!(
+        validate_host_executable_path(&bin_dir.join("../host-bin/threadlane-host"))
+            .expect_err("parent traversal must fail")
+            .error_code(),
+        NativeErrorCode::SecurityViolation
+    );
+    assert_eq!(
+        validate_host_executable_path(&bin_dir)
+            .expect_err("directory must fail")
+            .error_code(),
+        NativeErrorCode::InvalidConfig
+    );
+    let non_exec_file = bin_dir.join("non-exec-host");
+    fs::write(&non_exec_file, b"#!/bin/sh\nexit 0\n").expect("write non-exec");
+    fs::set_permissions(&non_exec_file, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    assert_eq!(
+        validate_host_executable_path(&non_exec_file)
+            .expect_err("non-executable file must fail")
+            .error_code(),
+        NativeErrorCode::InvalidConfig
+    );
+
+    let fake_native_exe = bin_dir.join("threadlane-native-mcp");
+    write_spy_host_script(&fake_native_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+    let symlink_dir = fixture.root.join("symlink-bin");
+    fs::create_dir_all(&symlink_dir).expect("create symlink-bin");
+    let symlink_native_exe = symlink_dir.join("threadlane-native-mcp-link");
+    symlink(&fake_native_exe, &symlink_native_exe).expect("symlink native exe");
+
+    let sibling_policy = ApprovedHostLauncherPolicy::from_sibling_of_executable(
+        &symlink_native_exe,
+    )
+    .expect("resolve sibling threadlane-host from canonical target of symlinked native exe");
+    assert_eq!(
+        sibling_policy.executable(),
+        fs::canonicalize(&spy_host_exe).expect("canonical spy host")
+    );
+
+    // 5. Builder prerequisites on `PairedMcpServer`:
+    let bare_mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create bare mcp");
+    assert_eq!(
+        bare_mcp
+            .clone()
+            .with_host_launcher_policy(sibling_policy.clone())
+            .expect_err("launcher policy without stores must fail")
+            .error_code(),
+        NativeErrorCode::InvalidConfig
+    );
+    let wf_only =
+        bare_mcp.with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans));
+    assert_eq!(
+        wf_only
+            .with_host_launcher_policy(sibling_policy.clone())
+            .expect_err("launcher policy without host stores must fail")
+            .error_code(),
+        NativeErrorCode::InvalidConfig
+    );
+
+    // Full CLI with `--auto-start-approved-hosts` and `--host-executable` succeeds and attaches policy.
+    let cli_enabled = NativeMcpCli::try_parse_from([
+        "threadlane-native-mcp",
+        "--state-dir",
+        fixture.state_dir.to_str().unwrap(),
+        "--pairing-dir",
+        fixture.pairing_dir.to_str().unwrap(),
+        "--registry-dir",
+        fixture.registry_dir.to_str().unwrap(),
+        "--plans-dir",
+        fixture.plans_dir.to_str().unwrap(),
+        "--authority-dir",
+        fixture.authority_dir.to_str().unwrap(),
+        "--sessions-dir",
+        fixture.sessions_dir.to_str().unwrap(),
+        "--auto-start-approved-hosts",
+        "--host-executable",
+        spy_host_exe.to_str().unwrap(),
+    ])
+    .expect("parse enabled CLI");
+    let enabled_server = cli_enabled.into_server().expect("enabled into_server");
+    assert!(enabled_server.has_host_launcher_policy());
+    assert_eq!(enabled_server.host_launcher_policy(), Some(&sibling_policy));
+    assert_eq!(enabled_server.list_tools().len(), 29);
+
+    // 6. Legacy/default-off server never spawns when `start_approved_task` is called on an unstarted approval.
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-default-off",
+        &fixture.binding_a,
+        default_plan_tasks("Default-off check"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-default-off",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_100_000,
+    );
+    enroll_server(&fixture, &default_server, &fixture.binding_a, THREAD_UUID_A).await;
+    let off_err = default_server
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("default-off server must not auto-start host");
+    assert_eq!(
+        off_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+    assert!(
+        !fixture.sessions_dir.join(&approval.approval_id).exists(),
+        "default-off server must not create session directory"
+    );
+}
+
+#[tokio::test]
+async fn codex_first_pre_spawn_scope_task_and_read_only_guards_cause_zero_process_effects() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let spy_exe = fixture.root.join("bin/spy-host-zero-effects");
+    let spy_count = fixture.root.join("spy-zero-count.txt");
+    let spy_argv = fixture.root.join("spy-zero-argv.txt");
+    let spy_pid = fixture.root.join("spy-zero-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = HostLauncherPolicy::new(&spy_exe).expect("valid spy host policy");
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach launcher policy");
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let (rev_a, digest_a) = create_published_plan(
+        &fixture,
+        "plan-zero-effects-a",
+        &fixture.binding_a,
+        default_plan_tasks("Zero effects A"),
+    );
+    let approval_a = approve_published_plan(
+        &fixture,
+        "plan-zero-effects-a",
+        rev_a,
+        &digest_a,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec![
+            "task-root-agy".to_string(),
+            "task-dep-agy".to_string(),
+            "task-native-codex".to_string(),
+        ],
+        1_700_000_200_000,
+    );
+
+    let (rev_alt, digest_alt) = create_published_plan(
+        &fixture,
+        "plan-zero-effects-alt-thread",
+        &fixture.binding_a,
+        default_plan_tasks("Zero effects alt thread"),
+    );
+    let approval_alt_thread = approve_published_plan(
+        &fixture,
+        "plan-zero-effects-alt-thread",
+        rev_alt,
+        &digest_alt,
+        &fixture.binding_a,
+        THREAD_UUID_A_ALT,
+        vec!["task-root-agy".to_string()],
+        1_700_000_200_100,
+    );
+
+    let (rev_b, digest_b) = create_published_plan(
+        &fixture,
+        "plan-zero-effects-b",
+        &fixture.binding_b,
+        default_plan_tasks("Zero effects B"),
+    );
+    let approval_b = approve_published_plan(
+        &fixture,
+        "plan-zero-effects-b",
+        rev_b,
+        &digest_b,
+        &fixture.binding_b,
+        THREAD_UUID_B,
+        vec!["task-root-agy".to_string()],
+        1_700_000_200_200,
+    );
+
+    // 1. Read-only, listing, status, publication, event, and cancel tools NEVER launch a host.
+    let list_res = mcp
+        .invoke_tool_json("list_approvals", json!({}), None)
+        .await
+        .expect("list_approvals");
+    assert!(list_res.structured_content.is_some());
+
+    let _ = mcp
+        .invoke_tool_json("status", json!({}), None)
+        .await
+        .expect("status");
+    let _ = mcp
+        .invoke_tool_json("catalog", json!({}), None)
+        .await
+        .expect("catalog");
+    let _ = mcp
+        .invoke_tool_json("list_plans", json!({}), None)
+        .await
+        .expect("list_plans");
+    let _ = mcp
+        .invoke_tool_json(
+            "get_plan",
+            json!({ "plan_id": "plan-zero-effects-a" }),
+            None,
+        )
+        .await
+        .expect("get_plan");
+
+    for (tool_name, args, expected_code) in [
+        (
+            "approved_session",
+            json!({ "approval_id": approval_a.approval_id }),
+            "host_not_ready",
+        ),
+        (
+            "approved_task",
+            json!({ "approval_id": approval_a.approval_id, "task_id": "task-root-agy" }),
+            "host_not_ready",
+        ),
+        (
+            "cancel_approved_task",
+            json!({
+                "approval_id": approval_a.approval_id,
+                "task_id": "task-root-agy",
+                "expected_revision": 1
+            }),
+            "host_not_ready",
+        ),
+        (
+            "approved_activity",
+            json!({ "approval_id": approval_a.approval_id }),
+            "host_not_ready",
+        ),
+        (
+            "approved_pull_events",
+            json!({ "approval_id": approval_a.approval_id }),
+            "host_not_ready",
+        ),
+        (
+            "approved_ack_events",
+            json!({ "approval_id": approval_a.approval_id, "batch_id": "evt_batch_1" }),
+            "host_not_ready",
+        ),
+    ] {
+        let err = mcp
+            .invoke_tool_json(tool_name, args, None)
+            .await
+            .expect_err("non-start tool must not auto-start host");
+        assert_eq!(
+            err.structured_content.unwrap()["error"]["code"],
+            expected_code,
+            "unexpected code for {tool_name}"
+        );
+    }
+    assert_eq!(read_invocation_count(&spy_count), 0);
+
+    // 2. Reject model-supplied `auto_start_approved_hosts` or `host_executable` arguments or tool names.
+    for forbidden_arg in [
+        json!({
+            "approval_id": approval_a.approval_id,
+            "task_id": "task-root-agy",
+            "auto_start_approved_hosts": true
+        }),
+        json!({
+            "approval_id": approval_a.approval_id,
+            "task_id": "task-root-agy",
+            "host_executable": spy_exe.to_str().unwrap()
+        }),
+    ] {
+        let err = mcp
+            .invoke_tool_json("start_approved_task", forbidden_arg, None)
+            .await
+            .expect_err("extra launcher fields must be rejected");
+        assert_eq!(
+            err.structured_content.unwrap()["error"]["code"],
+            "validation_failed"
+        );
+    }
+    for forbidden_tool in [
+        "auto_start_approved_hosts",
+        "set_host_executable",
+        "configure_host_launcher",
+    ] {
+        let err = mcp
+            .invoke_tool_json(forbidden_tool, json!({}), None)
+            .await
+            .expect_err("forbidden launcher tool must fail");
+        assert_eq!(
+            err.structured_content.unwrap()["error"]["code"],
+            "rebind_rejected"
+        );
+    }
+    assert_eq!(read_invocation_count(&spy_count), 0);
+
+    // 3. Unknown approval, cross-binding, cross-thread, unknown task, dependent task, and manual
+    //    `codex_cli` route all fail BEFORE spawning any process or creating any session directory.
+    for (args, expected_code) in [
+        (
+            json!({
+                "approval_id": "apr_ffffffffffffffffffffffffffffffff",
+                "task_id": "task-root-agy"
+            }),
+            "approval_not_found",
+        ),
+        (
+            json!({
+                "approval_id": approval_b.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            "scope_mismatch",
+        ),
+        (
+            json!({
+                "approval_id": approval_alt_thread.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            "scope_mismatch",
+        ),
+        (
+            json!({
+                "approval_id": approval_a.approval_id,
+                "task_id": "task-does-not-exist"
+            }),
+            "unknown_task",
+        ),
+        (
+            json!({
+                "approval_id": approval_a.approval_id,
+                "task_id": "task-dep-agy"
+            }),
+            "dependency_inputs_unverified",
+        ),
+        (
+            json!({
+                "approval_id": approval_a.approval_id,
+                "task_id": "task-native-codex"
+            }),
+            "native_route_required",
+        ),
+    ] {
+        let err = mcp
+            .invoke_tool_json("start_approved_task", args, None)
+            .await
+            .expect_err("invalid pre-spawn request must fail closed");
+        assert_eq!(
+            err.structured_content.unwrap()["error"]["code"],
+            expected_code
+        );
+        assert_eq!(
+            read_invocation_count(&spy_count),
+            0,
+            "pre-spawn rejection ({expected_code}) must cause ZERO process spawns"
+        );
+    }
+    assert!(!fixture.sessions_dir.join(&approval_a.approval_id).exists());
+    assert!(!fixture.sessions_dir.join(&approval_b.approval_id).exists());
+    assert!(!fixture
+        .sessions_dir
+        .join(&approval_alt_thread.approval_id)
+        .exists());
+
+    // 4. Superseding the source plan revision causes `start_approved_task` to fail closed with
+    //    `unpublished_or_superseded_plan` and ZERO process spawns.
+    let newer_draft = fixture
+        .plans
+        .change(
+            rev_a,
+            PlanChange::SaveDraft {
+                plan_id: "plan-zero-effects-a".to_string(),
+                binding_id: fixture.binding_a.clone(),
+                profile_id: "profile-main".to_string(),
+                profile_revision: 5,
+                summary: "Superseding revision".to_string(),
+                tasks: default_plan_tasks("Superseding revision"),
+            },
+        )
+        .expect("save superseding draft");
+    fixture
+        .plans
+        .change(
+            newer_draft.revision,
+            PlanChange::Publish {
+                plan_id: "plan-zero-effects-a".to_string(),
+                revision: newer_draft.revision,
+            },
+        )
+        .expect("publish superseding draft");
+
+    let sup_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval_a.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("superseded plan must fail pre-spawn check");
+    assert_eq!(
+        sup_err.structured_content.unwrap()["error"]["code"],
+        "unpublished_or_superseded_plan"
+    );
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "superseded plan must cause ZERO process spawns"
+    );
+    assert!(!fixture.sessions_dir.join(&approval_a.approval_id).exists());
+}
+
+#[tokio::test]
+async fn codex_first_existing_stopped_failed_corrupt_and_orphaned_states_never_auto_start() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let spy_exe = fixture.root.join("bin/spy-host-prior-state");
+    let spy_count = fixture.root.join("spy-prior-count.txt");
+    let spy_argv = fixture.root.join("spy-prior-argv.txt");
+    let spy_pid = fixture.root.join("spy-prior-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = ApprovedHostLauncherPolicy::new(&spy_exe).expect("valid spy host policy");
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach launcher policy");
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-prior-states",
+        &fixture.binding_a,
+        default_plan_tasks("Prior state refusal test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-prior-states",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_300_000,
+    );
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("get approval record");
+
+    let session_dir = ensure_private_dir(&fixture.sessions_dir.join(&approval.approval_id))
+        .expect("create session dir");
+    let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+
+    // 1. `Stopped`, `Failed`, `Stopping`, and unlocked `Bootstrapping`/`Ready` manifests are
+    //    NEVER auto-started and are preserved byte-for-byte with ZERO process spawns.
+    for phase in [
+        HostPhase::Stopped,
+        HostPhase::Failed,
+        HostPhase::Stopping,
+        HostPhase::Bootstrapping,
+        HostPhase::Ready,
+    ] {
+        let session_binding = matches!(
+            phase,
+            HostPhase::Ready | HostPhase::Stopping | HostPhase::Stopped
+        )
+        .then(|| "bnd_prior_session".to_string());
+        let manifest = HostSessionManifest::from_approval_record(
+            &record,
+            session_binding,
+            phase,
+            None,
+            Some(format!("prior phase {phase}")),
+            1_700_000_300_100,
+            1_700_000_300_200,
+        )
+        .with_instance_id(Some("hst_22222222222222222222222222222222".to_string()))
+        .with_notifications(HostNotificationSummary::disabled());
+        write_host_manifest(&session_dir, &manifest).expect("write prior manifest");
+        let expected_bytes = fs::read(&manifest_path).expect("read manifest bytes");
+
+        let err = mcp
+            .invoke_tool_json(
+                "start_approved_task",
+                json!({
+                    "approval_id": approval.approval_id,
+                    "task_id": "task-root-agy"
+                }),
+                None,
+            )
+            .await
+            .expect_err("prior manifest state must never auto-start");
+        assert_eq!(
+            err.structured_content.unwrap()["error"]["code"],
+            "host_not_ready",
+            "phase {phase} must return host_not_ready"
+        );
+        assert_eq!(
+            read_invocation_count(&spy_count),
+            0,
+            "phase {phase} must cause ZERO process spawns"
+        );
+        assert_eq!(
+            fs::read(&manifest_path).expect("read manifest after refusal"),
+            expected_bytes,
+            "manifest in phase {phase} must be preserved byte-for-byte"
+        );
+    }
+
+    // 2. Corrupt `host-manifest.json` fails with `corrupt_manifest`, preserves the corrupt file,
+    //    and causes ZERO process spawns.
+    let corrupt_bytes = b"{not-valid-json\n";
+    fs::write(&manifest_path, corrupt_bytes).expect("write corrupt manifest");
+    fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+    let corrupt_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("corrupt manifest must fail closed");
+    assert_eq!(
+        corrupt_err.structured_content.unwrap()["error"]["code"],
+        "corrupt_manifest"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+    assert_eq!(
+        fs::read(&manifest_path).expect("read corrupt manifest after refusal"),
+        corrupt_bytes
+    );
+
+    // 3a. Forged `Ready` manifest WITH a held `host.lock` but missing required private
+    //     `runtime-state` / `work-area` directories fails closed with `security_violation`
+    //     and ZERO process spawns.
+    let forged_ready = HostSessionManifest::from_approval_record(
+        &record,
+        Some("bnd_forged_ready".to_string()),
+        HostPhase::Ready,
+        Some(std::process::id()),
+        None,
+        1_700_000_300_300,
+        1_700_000_300_400,
+    )
+    .with_instance_id(Some("hst_33333333333333333333333333333333".to_string()))
+    .with_notifications(HostNotificationSummary::disabled());
+    write_host_manifest(&session_dir, &forged_ready).expect("write forged Ready manifest");
+    let held_lock =
+        HostSessionLock::acquire(&session_dir, &approval.approval_id).expect("acquire host.lock");
+    let missing_dirs_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("forged Ready manifest missing runtime-state/work-area must fail closed");
+    assert_eq!(
+        missing_dirs_err.structured_content.unwrap()["error"]["code"],
+        "security_violation"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+
+    // 3b. Forged `Ready` manifest WITH a held `host.lock` and private `runtime-state` / `work-area`
+    //     directories (but no live authenticated `supervisor.json` endpoint) fails live readiness
+    //     verification via `ApprovedHostClient` with `host_not_ready` and ZERO process spawns.
+    ensure_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR)).expect("create runtime-state");
+    ensure_private_dir(&session_dir.join(WORK_AREA_SUBDIR)).expect("create work-area");
+    let forged_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("forged Ready manifest without live authenticated supervisor must fail");
+    assert_eq!(
+        forged_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+    drop(held_lock);
+
+    // 4. Orphaned `work-area` / `runtime-state` without `host-manifest.json` (while `host.lock`
+    //    exists on disk) is refused with `host_not_ready` and ZERO process spawns.
+    fs::remove_file(&manifest_path).expect("remove forged manifest");
+    fs::remove_dir_all(session_dir.join(RUNTIME_STATE_SUBDIR)).expect("remove runtime-state");
+    let orphan_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("orphaned work-area must not auto-start");
+    assert_eq!(
+        orphan_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+    assert!(session_dir.join(WORK_AREA_SUBDIR).exists());
+}
+
+fn assert_ready_host_work_area_initialized(
+    handle: &ApprovedHostHandle,
+    expect_zero_checkouts: bool,
+) {
+    assert_eq!(handle.summary().phase, HostPhase::Ready);
+    let work_area_dir = handle.work_area_dir();
+    let marker_path = work_area_dir.join(WORK_AREA_MARKER_FILENAME);
+    let manifests_dir = work_area_dir.join(MANIFESTS_SUBDIR);
+    let checkouts_dir = work_area_dir.join(CHECKOUTS_SUBDIR);
+    let runs_dir = checkouts_dir.join("runs");
+    let tasks_dir = checkouts_dir.join("tasks");
+
+    let marker_mode = fs::symlink_metadata(&marker_path)
+        .expect("stat .threadlane-work-area.json on Ready host")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(marker_mode, 0o600);
+
+    for dir in [&manifests_dir, &checkouts_dir, &runs_dir, &tasks_dir] {
+        let mode = fs::symlink_metadata(dir)
+            .unwrap_or_else(|err| panic!("stat {}: {err}", dir.display()))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "expected 0700 on {}", dir.display());
+    }
+
+    if expect_zero_checkouts {
+        assert_eq!(
+            fs::read_dir(&manifests_dir)
+                .expect("read manifests_dir")
+                .count(),
+            0
+        );
+        assert_eq!(fs::read_dir(&runs_dir).expect("read runs_dir").count(), 0);
+        assert_eq!(fs::read_dir(&tasks_dir).expect("read tasks_dir").count(), 0);
+    }
+
+    let marker_bytes = fs::read(&marker_path).expect("read .threadlane-work-area.json");
+    let marker: WorkAreaOwnershipMarker =
+        serde_json::from_slice(&marker_bytes).expect("parse WorkAreaOwnershipMarker");
+    let manager = WorktreeManager::new(
+        &handle.approval().repository_path,
+        work_area_dir,
+        &handle.approval().base_commit,
+    )
+    .expect("WorktreeManager::new must validate initialized Ready work-area");
+    assert_eq!(marker.marker_version, 1);
+    assert_eq!(marker.work_area_root, work_area_dir);
+    assert_eq!(marker.work_area_root, manager.work_area_root());
+    assert_eq!(
+        marker.repository_common_git_dir,
+        manager.repository_common_git_dir(),
+        "Ready work-area ownership marker must be bound to the approved repository's common Git directory"
+    );
+    assert_eq!(
+        manager.resolved_base_commit(),
+        handle.approval().base_commit
+    );
+}
+
+#[tokio::test]
+async fn codex_first_live_subprocess_auto_start_exact_argv_readiness_and_dispatch_e2e() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-live-auto-start",
+        &fixture.binding_a,
+        default_plan_tasks("Auto-started initial host root task"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-live-auto-start",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string(), "task-root-oc".to_string()],
+        1_700_000_400_000,
+    );
+
+    // Prepare a real subprocess script that records its exact argv, PID, and PGID, stays alive
+    // independently of the MCP server, and triggers an in-process watcher that parses the exact
+    // recorded argv via `HostCli::try_parse_from` and runs `ApprovedHost::start_fresh_only`.
+    let host_script = fixture.root.join("bin/threadlane-host");
+    let host_count_file = fixture.root.join("host-spawn-count.txt");
+    let host_argv_file = fixture.root.join("host-spawn-argv.txt");
+    let host_pid_file = fixture.root.join("host-spawn-pid.txt");
+    let keep_alive_file = fixture.root.join("host-keep-alive.flag");
+    fs::write(&keep_alive_file, b"1").expect("write keep-alive flag");
+    write_spy_host_script(
+        &host_script,
+        &host_count_file,
+        &host_argv_file,
+        &host_pid_file,
+        0,
+        Some("2"),
+    );
+
+    let argv_watch = host_argv_file.clone();
+    let count_watch = host_count_file.clone();
+    let (host_handle_tx, host_handle_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if read_invocation_count(&count_watch) >= 1 {
+                if let Ok(raw_argv) = fs::read_to_string(&argv_watch) {
+                    let lines: Vec<String> = raw_argv.lines().map(str::to_string).collect();
+                    if lines.len() == 12 {
+                        let mut full_args = vec!["threadlane-host".to_string()];
+                        full_args.extend(lines);
+                        let parsed = HostCli::try_parse_from(&full_args)
+                            .expect("spawned argv must parse as valid HostCli");
+                        match parsed.command {
+                            HostCommand::Serve(serve_args) => {
+                                assert!(serve_args.start_fresh_only);
+                                assert!(serve_args.restart_from_instance_id.is_none());
+                                assert!(serve_args.notify_codex.is_none());
+                                assert!(serve_args.notify_timeout_ms.is_none());
+                                let cfg = serve_args
+                                    .into_host_config()
+                                    .expect("valid ApprovedHostConfig from spawned argv")
+                                    .with_tick_interval(Duration::from_millis(20));
+                                let handle = ApprovedHost::start_fresh_only(cfg)
+                                    .await
+                                    .expect("start_fresh_only from spawned argv");
+                                let _ = host_handle_tx.send(handle);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let policy = ApprovedHostLauncherPolicy::new(&host_script).expect("validate host script");
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach launcher policy");
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    // 1. First `start_approved_task` spawns the detached host, waits for live authenticated Ready,
+    //    rechecks enrollment, and dispatches `task-root-agy`.
+    let start_res = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("start_approved_task auto-starts fresh host and dispatches root task");
+    let first_snap: TaskStateSnapshot =
+        serde_json::from_value(start_res.structured_content.unwrap()["data"].clone())
+            .expect("decode TaskStateSnapshot");
+    assert_eq!(first_snap.approval_id, approval.approval_id);
+    assert_eq!(first_snap.task_id, "task-root-agy");
+    assert!(first_snap.run_id.is_some());
+    assert!(first_snap.worker_id.is_some());
+    assert!(!first_snap.accepted);
+
+    // 2. Verify exact spawned argv and detached process survival.
+    assert_eq!(
+        read_invocation_count(&host_count_file),
+        1,
+        "exactly one host process must be spawned"
+    );
+    let recorded_args: Vec<String> = fs::read_to_string(&host_argv_file)
+        .expect("read recorded argv")
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        recorded_args,
+        vec![
+            "serve".to_string(),
+            "--registry-dir".to_string(),
+            fixture.registry.config_dir().display().to_string(),
+            "--plans-dir".to_string(),
+            fixture.plans.dir().display().to_string(),
+            "--authority-dir".to_string(),
+            fixture.authority.dir().display().to_string(),
+            "--sessions-dir".to_string(),
+            fs::canonicalize(&fixture.sessions_dir)
+                .unwrap()
+                .display()
+                .to_string(),
+            "--approval-id".to_string(),
+            approval.approval_id.clone(),
+            "--start-fresh-only".to_string(),
+        ]
+    );
+    let child_pid: u32 = fs::read_to_string(&host_pid_file)
+        .expect("read child pid")
+        .trim()
+        .parse()
+        .expect("parse child pid");
+    assert!(
+        is_process_alive(child_pid),
+        "spawned child must run in its own process group"
+    );
+
+    let host_handle = host_handle_rx.await.expect("receive started host handle");
+    assert_ready_host_work_area_initialized(&host_handle, false);
+    assert_eq!(
+        host_handle.summary().notifications,
+        HostNotificationSummary::disabled(),
+        "auto-started host must keep notifications disabled"
+    );
+
+    // 3. Duplicate dispatch of `task-root-agy` and dispatch of `task-root-oc` attach to the live
+    //    authenticated Ready host without spawning a second host process (`spawn_count == 1`).
+    let dup_res = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("duplicate start_approved_task attaches to running host");
+    let dup_snap: TaskStateSnapshot =
+        serde_json::from_value(dup_res.structured_content.unwrap()["data"].clone()).unwrap();
+    assert_eq!(dup_snap.run_id, first_snap.run_id);
+    assert_eq!(dup_snap.worker_id, first_snap.worker_id);
+    assert_eq!(read_invocation_count(&host_count_file), 1);
+
+    let oc_res = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-oc"
+            }),
+            None,
+        )
+        .await
+        .expect("second root task attaches to running host");
+    let oc_snap: TaskStateSnapshot =
+        serde_json::from_value(oc_res.structured_content.unwrap()["data"].clone()).unwrap();
+    assert_eq!(oc_snap.task_id, "task-root-oc");
+    assert_eq!(read_invocation_count(&host_count_file), 1);
+
+    // Poll until both tasks complete at the `ReadyForReview` (`accepted: false`) review gate.
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let t1 = mcp
+            .invoke_tool_json(
+                "approved_task",
+                json!({ "approval_id": approval.approval_id, "task_id": "task-root-agy" }),
+                None,
+            )
+            .await
+            .expect("approved_task agy");
+        let s1: TaskStateSnapshot =
+            serde_json::from_value(t1.structured_content.unwrap()["data"].clone()).unwrap();
+        let t2 = mcp
+            .invoke_tool_json(
+                "approved_task",
+                json!({ "approval_id": approval.approval_id, "task_id": "task-root-oc" }),
+                None,
+            )
+            .await
+            .expect("approved_task oc");
+        let s2: TaskStateSnapshot =
+            serde_json::from_value(t2.structured_content.unwrap()["data"].clone()).unwrap();
+        if s1.status == TaskExecutionStatus::ReadyForReview
+            && s2.status == TaskExecutionStatus::ReadyForReview
+        {
+            assert!(!s1.accepted);
+            assert!(!s2.accepted);
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "timed out waiting for tasks to reach ReadyForReview"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    assert_eq!(read_invocation_count(&fixture.oc_count_file), 1);
+
+    // Dropping `mcp` must NOT kill the running host session (`kill_on_drop(false)`).
+    drop(mcp);
+    assert_eq!(host_handle.summary().phase, HostPhase::Ready);
+
+    host_handle.shutdown().await.expect("shutdown host_handle");
+}
+
+#[tokio::test]
+async fn codex_first_concurrent_starts_enrollment_revocation_and_startup_failure_or_timeout() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    // 1. Concurrent first starts on the same `approval_id` serialize/coalesce to a single host
+    //    launch (`spawn_count == 1`) and attach to the one authenticated owner.
+    let (rev_conc, digest_conc) = create_published_plan(
+        &fixture,
+        "plan-concurrent-start",
+        &fixture.binding_a,
+        default_plan_tasks("Concurrent first start test"),
+    );
+    let approval_conc = approve_published_plan(
+        &fixture,
+        "plan-concurrent-start",
+        rev_conc,
+        &digest_conc,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string(), "task-root-oc".to_string()],
+        1_700_000_500_000,
+    );
+
+    let conc_script = fixture.root.join("bin/conc-host");
+    let conc_count = fixture.root.join("conc-count.txt");
+    let conc_argv = fixture.root.join("conc-argv.txt");
+    let conc_pid = fixture.root.join("conc-pid.txt");
+    write_spy_host_script(
+        &conc_script,
+        &conc_count,
+        &conc_argv,
+        &conc_pid,
+        0,
+        Some("1"),
+    );
+
+    let conc_count_watch = conc_count.clone();
+    let reg_dir = fixture.registry_dir.clone();
+    let plans_dir = fixture.plans_dir.clone();
+    let auth_dir = fixture.authority_dir.clone();
+    let sess_dir = fixture.sessions_dir.clone();
+    let conc_approval_id = approval_conc.approval_id.clone();
+    let (conc_host_tx, conc_host_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if read_invocation_count(&conc_count_watch) >= 1 {
+                let handle = ApprovedHost::start_fresh_only(
+                    ApprovedHostConfig::new(
+                        reg_dir,
+                        plans_dir,
+                        auth_dir,
+                        sess_dir,
+                        conc_approval_id,
+                    )
+                    .with_tick_interval(Duration::from_millis(20)),
+                )
+                .await
+                .expect("start_fresh_only for concurrent test");
+                let _ = conc_host_tx.send(handle);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let conc_policy = ApprovedHostLauncherPolicy::new(&conc_script).expect("conc policy");
+    let mcp_conc = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp_conc")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(conc_policy)
+        .expect("attach conc_policy");
+    enroll_server(&fixture, &mcp_conc, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let (res_agy, res_oc) = tokio::join!(
+        mcp_conc.invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval_conc.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        ),
+        mcp_conc.invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval_conc.approval_id,
+                "task_id": "task-root-oc"
+            }),
+            None,
+        ),
+    );
+    let snap_agy: TaskStateSnapshot = serde_json::from_value(
+        res_agy.expect("concurrent agy").structured_content.unwrap()["data"].clone(),
+    )
+    .unwrap();
+    let snap_oc: TaskStateSnapshot = serde_json::from_value(
+        res_oc.expect("concurrent oc").structured_content.unwrap()["data"].clone(),
+    )
+    .unwrap();
+    assert_eq!(snap_agy.session_binding_id, snap_oc.session_binding_id);
+    assert_eq!(
+        read_invocation_count(&conc_count),
+        1,
+        "concurrent callers must coalesce to a single host spawn"
+    );
+    let conc_host = conc_host_rx.await.expect("receive conc_host");
+    assert_ready_host_work_area_initialized(&conc_host, false);
+    conc_host.shutdown().await.expect("shutdown conc_host");
+
+    // 2. Revoked/expired enrollment during startup await fails closed on the second enrollment
+    //    recheck BEFORE dispatching the task (`agy_count` does not increment).
+    let (rev_exp, digest_exp) = create_published_plan(
+        &fixture,
+        "plan-revoke-during-start",
+        &fixture.binding_a,
+        default_plan_tasks("Revoke during startup test"),
+    );
+    let approval_exp = approve_published_plan(
+        &fixture,
+        "plan-revoke-during-start",
+        rev_exp,
+        &digest_exp,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_500_100,
+    );
+    let agy_count_before_revoke = read_invocation_count(&fixture.agy_count_file);
+    let oc_count_before_revoke = read_invocation_count(&fixture.oc_count_file);
+
+    let exp_script = fixture.root.join("bin/exp-host");
+    let exp_count = fixture.root.join("exp-count.txt");
+    let exp_argv = fixture.root.join("exp-argv.txt");
+    let exp_pid = fixture.root.join("exp-pid.txt");
+    write_spy_host_script(&exp_script, &exp_count, &exp_argv, &exp_pid, 0, Some("1"));
+
+    let exp_policy = ApprovedHostLauncherPolicy::new(&exp_script).expect("exp policy");
+    let mut mcp_exp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp_exp")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(exp_policy)
+        .expect("attach exp_policy");
+    enroll_server(&fixture, &mcp_exp, &fixture.binding_a, THREAD_UUID_A).await;
+    let mcp_exp_call = mcp_exp.clone();
+
+    let exp_count_watch = exp_count.clone();
+    let reg_dir2 = fixture.registry_dir.clone();
+    let plans_dir2 = fixture.plans_dir.clone();
+    let auth_dir2 = fixture.authority_dir.clone();
+    let sess_dir2 = fixture.sessions_dir.clone();
+    let exp_approval_id = approval_exp.approval_id.clone();
+    let (exp_host_tx, exp_host_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < deadline {
+            if read_invocation_count(&exp_count_watch) >= 1 {
+                // Rotate/expire the MCP connection epoch while `start_approved_task` is awaiting
+                // host readiness, then bring the host to `Ready`.
+                mcp_exp
+                    .restart_epoch()
+                    .expect("expire epoch during startup await");
+                let handle = ApprovedHost::start_fresh_only(
+                    ApprovedHostConfig::new(
+                        reg_dir2,
+                        plans_dir2,
+                        auth_dir2,
+                        sess_dir2,
+                        exp_approval_id,
+                    )
+                    .with_tick_interval(Duration::from_millis(20)),
+                )
+                .await
+                .expect("start_fresh_only for revoke test");
+                let _ = exp_host_tx.send(handle);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+
+    let revoked_err = mcp_exp_call
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval_exp.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("expired epoch during startup await must fail before task dispatch");
+    assert_eq!(
+        revoked_err.structured_content.unwrap()["error"]["code"],
+        "expired_epoch"
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        agy_count_before_revoke,
+        "task must NOT be dispatched when the second enrollment recheck fails"
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.oc_count_file),
+        oc_count_before_revoke,
+        "no OpenCode worker may start when the second enrollment recheck fails"
+    );
+    let exp_host = exp_host_rx.await.expect("receive exp_host");
+    assert_ready_host_work_area_initialized(&exp_host, true);
+    exp_host.shutdown().await.expect("shutdown exp_host");
+
+    // 3. Startup failure (child exits immediately without reaching Ready) fails closed with
+    //    `host_not_ready` without blind retry.
+    let (rev_fail, digest_fail) = create_published_plan(
+        &fixture,
+        "plan-fail-startup",
+        &fixture.binding_a,
+        default_plan_tasks("Startup failure test"),
+    );
+    let approval_fail = approve_published_plan(
+        &fixture,
+        "plan-fail-startup",
+        rev_fail,
+        &digest_fail,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_500_200,
+    );
+    let fail_script = fixture.root.join("bin/fail-host");
+    let fail_count = fixture.root.join("fail-count.txt");
+    let fail_argv = fixture.root.join("fail-argv.txt");
+    let fail_pid = fixture.root.join("fail-pid.txt");
+    write_spy_host_script(&fail_script, &fail_count, &fail_argv, &fail_pid, 1, None);
+
+    let fail_policy = ApprovedHostLauncherPolicy::new(&fail_script).expect("fail policy");
+    let mcp_fail = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp_fail")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(fail_policy)
+        .expect("attach fail_policy");
+    enroll_server(&fixture, &mcp_fail, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let fail_err = mcp_fail
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval_fail.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("exited child must fail closed with host_not_ready");
+    assert_eq!(
+        fail_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(
+        read_invocation_count(&fail_count),
+        1,
+        "failed startup must not blindly spawn a second time within the call"
+    );
+
+    // A second call after the child exited without creating session state must also refuse via
+    // the persisted `Unknown` launch intent without spawning a second process.
+    let fail_record = fixture
+        .authority
+        .get_for_operator(&approval_fail.approval_id)
+        .expect("get fail record");
+    let fail_intent = read_host_launch_intent_optional(&fixture.sessions_dir, &fail_record)
+        .expect("read fail launch intent")
+        .expect("fail launch intent persisted");
+    assert_eq!(fail_intent.status, HostLaunchIntentStatus::Unknown);
+
+    let fail_retry_err = mcp_fail
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval_fail.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("subsequent call after failed pre-manifest launch must refuse duplicate spawn");
+    assert_eq!(
+        fail_retry_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(
+        read_invocation_count(&fail_count),
+        1,
+        "persisted Unknown launch intent must prevent a second spawn after child exit"
+    );
+}
+
+#[tokio::test]
+async fn codex_first_delayed_launcher_timeout_durable_intent_and_cross_coordinator_reconciliation()
+{
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-delayed-launcher",
+        &fixture.binding_a,
+        default_plan_tasks("Delayed launcher durable intent test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-delayed-launcher",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_600_000,
+    );
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("get approval record");
+
+    let delayed_script = fixture.root.join("bin/delayed-host");
+    let delayed_count = fixture.root.join("delayed-count.txt");
+    let delayed_argv = fixture.root.join("delayed-argv.txt");
+    let delayed_pid = fixture.root.join("delayed-pid.txt");
+    let hold_file = fixture.root.join("delayed-hold.flag");
+    fs::write(&hold_file, b"hold\n").expect("create hold_file");
+
+    // The fake launcher records its invocation and stays alive while `hold_file` exists (with a
+    // bounded 30s safety ceiling), avoiding fixed-duration sleep races under parallel test load.
+    {
+        if let Some(parent) = delayed_script.parent() {
+            fs::create_dir_all(parent).expect("create delayed_script parent");
+        }
+        let body = format!(
+            "#!/bin/sh\nset -eu\ncount=0\nif [ -f \"{count_path}\" ]; then\n  count=$(cat \"{count_path}\")\nfi\ncount=$((count + 1))\nprintf '%s' \"$count\" > \"{count_path}\"\n: > \"{argv_path}\"\nfor arg in \"$@\"; do\n  printf '%s\\n' \"$arg\" >> \"{argv_path}\"\ndone\nprintf '%s' \"$$\" > \"{pid_path}\"\ni=0\nwhile [ -f \"{hold_path}\" ] && [ \"$i\" -lt 600 ]; do\n  sleep 0.05\n  i=$((i + 1))\ndone\nexit 0\n",
+            count_path = delayed_count.display(),
+            argv_path = delayed_argv.display(),
+            pid_path = delayed_pid.display(),
+            hold_path = hold_file.display(),
+        );
+        fs::write(&delayed_script, body).expect("write delayed host script");
+        fs::set_permissions(&delayed_script, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 delayed host script");
+    }
+
+    let short_policy = ApprovedHostLauncherPolicy::new(&delayed_script)
+        .expect("delayed policy")
+        .with_startup_timeout(Duration::from_millis(350))
+        .expect("short startup timeout");
+    let mcp_1 = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp_1")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(short_policy)
+        .expect("attach short_policy");
+    enroll_server(&fixture, &mcp_1, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let agy_before = read_invocation_count(&fixture.agy_count_file);
+
+    // 1. First `start_approved_task` on `mcp_1` persists the launch intent BEFORE spawning,
+    //    spawns the delayed launcher once (`spawn_count == 1`), times out while
+    //    `<sessions_dir>/<approval_id>` still does not exist, marks the intent `Unknown`,
+    //    leaves the spawned child alive (`kill_on_drop(false)`), and does NOT dispatch the task.
+    let timeout_err_1 = mcp_1
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("delayed launcher must time out on first call");
+    assert_eq!(
+        timeout_err_1.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(
+        read_invocation_count(&delayed_count),
+        1,
+        "first call must spawn exactly one process"
+    );
+    assert!(
+        !fixture.sessions_dir.join(&approval.approval_id).exists(),
+        "delayed launcher has not created the session directory yet"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), agy_before);
+
+    let intent_after_timeout = read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+        .expect("read launch intent after timeout")
+        .expect("durable launch intent must exist outside the fresh host leaf");
+    assert_eq!(intent_after_timeout.approval_id, record.approval_id);
+    assert_eq!(intent_after_timeout.subject_digest, record.subject_digest);
+    assert_eq!(intent_after_timeout.control_binding_id, record.binding_id);
+    assert_eq!(intent_after_timeout.thread_uuid, record.thread_uuid);
+    assert_eq!(intent_after_timeout.status, HostLaunchIntentStatus::Unknown);
+    let spawned_pid = intent_after_timeout
+        .spawn_pid
+        .expect("spawn_pid must be recorded");
+    assert!(
+        is_process_alive(spawned_pid),
+        "timeout must never kill the winning pre-manifest host process"
+    );
+
+    // 2. Second `start_approved_task` on `mcp_1` while `<sessions_dir>/<approval_id>` STILL does
+    //    not exist must NOT spawn a second process (`spawn_count == 1`).
+    let timeout_err_2 = mcp_1
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("second call while still delayed must also time out without spawning");
+    assert_eq!(
+        timeout_err_2.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(
+        read_invocation_count(&delayed_count),
+        1,
+        "second call on same coordinator must not spawn a duplicate process"
+    );
+
+    // 3. Construct a brand-new `PairedMcpServer` coordinator instance (`mcp_2`) against the same
+    //    stores while `<sessions_dir>/<approval_id>` STILL does not exist. Start the delayed host
+    //    100ms into `mcp_2`'s wait window; `mcp_2` must wait for the existing launch intent,
+    //    verify live authenticated Ready, reconcile the intent to `ReconciledReady`, and dispatch
+    //    `task-root-agy` with `spawn_count == 1`!
+    let reconcile_policy = ApprovedHostLauncherPolicy::new(&delayed_script)
+        .expect("reconcile policy")
+        .with_startup_timeout(Duration::from_secs(4))
+        .expect("4s timeout");
+    let mcp_2 = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create new coordinator mcp_2")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(reconcile_policy)
+        .expect("attach reconcile_policy");
+    enroll_server(&fixture, &mcp_2, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let reg_dir = fixture.registry_dir.clone();
+    let plans_dir = fixture.plans_dir.clone();
+    let auth_dir = fixture.authority_dir.clone();
+    let sess_dir = fixture.sessions_dir.clone();
+    let app_id = approval.approval_id.clone();
+    let (host_tx, host_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let handle = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(reg_dir, plans_dir, auth_dir, sess_dir, app_id)
+                .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("delayed host reaches Ready");
+        let _ = host_tx.send(handle);
+    });
+
+    let reconciled_res = mcp_2
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect("new coordinator instance waits, reconciles Ready, and dispatches task");
+    let snap: TaskStateSnapshot =
+        serde_json::from_value(reconciled_res.structured_content.unwrap()["data"].clone())
+            .expect("decode TaskStateSnapshot");
+    assert_eq!(snap.approval_id, approval.approval_id);
+    assert_eq!(snap.task_id, "task-root-agy");
+    assert!(snap.run_id.is_some());
+    assert_eq!(
+        read_invocation_count(&delayed_count),
+        1,
+        "new coordinator instance must reconcile the existing launch without spawning a second process"
+    );
+
+    let intent_reconciled = read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+        .expect("read reconciled launch intent")
+        .expect("launch intent exists");
+    assert_eq!(
+        intent_reconciled.status,
+        HostLaunchIntentStatus::ReconciledReady
+    );
+    assert!(intent_reconciled.last_error.is_none());
+
+    let host_handle = host_rx.await.expect("receive delayed host handle");
+    host_handle.shutdown().await.expect("shutdown delayed host");
+    let _ = fs::remove_file(&hold_file);
+
+    // 4. If `<sessions_dir>/<approval_id>` is removed after a launch intent was reconciled Ready,
+    //    `start_approved_task` must refuse to spawn a new fresh host (`spawn_count` remains `1`).
+    fs::remove_dir_all(fixture.sessions_dir.join(&approval.approval_id))
+        .expect("remove session leaf after shutdown");
+    let post_reconcile_err = mcp_2
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("missing session state after ReconciledReady must refuse fresh launch");
+    assert_eq!(
+        post_reconcile_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert_eq!(read_invocation_count(&delayed_count), 1);
+
+    // 5. Tampering with the persisted launch intent's frozen approval identity fails closed with
+    //    `corrupt_session_state` and zero additional spawns.
+    let intent_path = fixture
+        .sessions_dir
+        .join(threadlane_host::LAUNCH_INTENTS_SUBDIR)
+        .join(format!("{}.json", approval.approval_id));
+    let mut tampered_json: Value =
+        serde_json::from_slice(&fs::read(&intent_path).expect("read intent json"))
+            .expect("parse intent json");
+    tampered_json["subject_digest"] = Value::String("0".repeat(64));
+    fs::write(
+        &intent_path,
+        serde_json::to_vec_pretty(&tampered_json).unwrap(),
+    )
+    .expect("write tampered intent json");
+    fs::set_permissions(&intent_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+    let tampered_err = mcp_2
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("tampered launch intent must fail closed");
+    assert_eq!(
+        tampered_err.structured_content.unwrap()["error"]["code"],
+        "corrupt_session_state"
+    );
+    assert_eq!(read_invocation_count(&delayed_count), 1);
+    let _ = write_host_launch_intent(&fixture.sessions_dir, &record, &intent_reconciled);
+}
+
+#[tokio::test]
+async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_deadline() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-slow-probe",
+        &fixture.binding_a,
+        default_plan_tasks("Slow authenticated probe deadline test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-slow-probe",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_700_000,
+    );
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("get approval record");
+
+    // Bind a local TCP listener that accepts connections and holds them open without sending HTTP
+    // bytes, simulating a slow/unresponsive authenticated supervisor endpoint on a Ready manifest.
+    let hanging_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind hanging listener");
+    let hanging_addr = hanging_listener.local_addr().expect("local_addr");
+    hanging_listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking");
+    let tokio_listener =
+        tokio::net::TcpListener::from_std(hanging_listener).expect("tokio TcpListener");
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let accepted_connections_bg = Arc::clone(&accepted_connections);
+    let accept_task = tokio::spawn(async move {
+        let mut held_sockets = Vec::new();
+        while let Ok((socket, _)) = tokio_listener.accept().await {
+            accepted_connections_bg.fetch_add(1, Ordering::SeqCst);
+            held_sockets.push(socket);
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        }
+    });
+
+    let session_dir = ensure_private_dir(&fixture.sessions_dir.join(&approval.approval_id))
+        .expect("create session dir");
+    let runtime_state_dir =
+        ensure_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR)).expect("create runtime-state");
+    ensure_private_dir(&session_dir.join(WORK_AREA_SUBDIR)).expect("create work-area");
+    let descriptor_path = runtime_state_dir.join("supervisor.json");
+    let descriptor_json = json!({
+        "version": 1,
+        "host": "127.0.0.1",
+        "port": hanging_addr.port(),
+        "pid": std::process::id(),
+        "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    });
+    fs::write(
+        &descriptor_path,
+        serde_json::to_vec_pretty(&descriptor_json).unwrap(),
+    )
+    .expect("write supervisor.json");
+    fs::set_permissions(&descriptor_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 supervisor.json");
+
+    let ready_manifest = HostSessionManifest::from_approval_record(
+        &record,
+        Some("bnd_hanging_session".to_string()),
+        HostPhase::Ready,
+        Some(std::process::id()),
+        None,
+        1_700_000_700_100,
+        1_700_000_700_200,
+    )
+    .with_instance_id(Some("hst_44444444444444444444444444444444".to_string()))
+    .with_notifications(HostNotificationSummary::disabled());
+    write_host_manifest(&session_dir, &ready_manifest).expect("write Ready manifest");
+    let _held_lock =
+        HostSessionLock::acquire(&session_dir, &approval.approval_id).expect("acquire host.lock");
+
+    let spy_exe = fixture.root.join("bin/spy-slow-probe");
+    let spy_count = fixture.root.join("spy-slow-count.txt");
+    let spy_argv = fixture.root.join("spy-slow-argv.txt");
+    let spy_pid = fixture.root.join("spy-slow-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = ApprovedHostLauncherPolicy::new(&spy_exe)
+        .expect("valid policy")
+        .with_startup_timeout(Duration::from_millis(250))
+        .expect("250ms startup timeout");
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach launcher policy");
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let started = Instant::now();
+    let probe_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("hanging authenticated probe must time out at outer startup deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        probe_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert!(
+        accepted_connections.load(Ordering::SeqCst) >= 1,
+        "authenticated readiness probe must have connected to the hanging supervisor listener"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "slow authenticated probe must be bounded by the 250ms startup deadline (elapsed: {elapsed:?})"
+    );
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "AttachReady timeout must not spawn a host process"
+    );
+
+    accept_task.abort();
+}
+
+#[tokio::test]
+async fn codex_first_held_intent_lock_bounds_wait_and_prevents_late_spawn_after_timeout_cancel_or_revocation(
+) {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (rev, digest) = create_published_plan(
+        &fixture,
+        "plan-held-intent-lock",
+        &fixture.binding_a,
+        default_plan_tasks("Held launch-intent lock regression test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-held-intent-lock",
+        rev,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_800_000,
+    );
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("get approval record");
+    let canonical_sessions_root =
+        fs::canonicalize(&fixture.sessions_dir).expect("canonicalize sessions_dir");
+
+    let spy_exe = fixture.root.join("bin/spy-held-lock-host");
+    let spy_count = fixture.root.join("spy-held-lock-count.txt");
+    let spy_argv = fixture.root.join("spy-held-lock-argv.txt");
+    let spy_pid = fixture.root.join("spy-held-lock-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = ApprovedHostLauncherPolicy::new(&spy_exe)
+        .expect("valid policy")
+        .with_startup_timeout(Duration::from_millis(250))
+        .expect("250ms startup timeout");
+    let mut mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach launcher policy");
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let agy_before = read_invocation_count(&fixture.agy_count_file);
+
+    // 1. Hold `.launch-intents/<approval_id>.lock` past `startup_timeout`:
+    //    - Non-blocking `HostLaunchIntentLock::try_acquire` returns `Ok(None)` while held.
+    //    - `start_approved_task` must fail closed with `host_not_ready` within the bounded
+    //      deadline and must NOT spawn `threadlane-host` or write `<approval_id>.json` after
+    //      the lock is released.
+    let held_lock_1 =
+        HostLaunchIntentLock::acquire_blocking(&canonical_sessions_root, &approval.approval_id)
+            .expect("acquire launch intent lock");
+    assert!(
+        HostLaunchIntentLock::try_acquire(&canonical_sessions_root, &approval.approval_id)
+            .expect("try_acquire while held")
+            .is_none(),
+        "try_acquire must return Ok(None) while exclusive lock is held"
+    );
+
+    let started_1 = Instant::now();
+    let timeout_err = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("held launch-intent lock must time out at startup_deadline");
+    let elapsed_1 = started_1.elapsed();
+    assert_eq!(
+        timeout_err.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+    assert!(
+        elapsed_1 < Duration::from_millis(1500),
+        "held launch-intent lock wait must be bounded by 250ms startup_deadline (elapsed: {elapsed_1:?})"
+    );
+    assert_eq!(read_invocation_count(&spy_count), 0);
+
+    // Release the lock and give any background tasks a window to run; zero late effects may occur.
+    drop(held_lock_1);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "releasing launch-intent lock after timeout must never cause a late process spawn"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), agy_before);
+    assert!(
+        read_host_launch_intent_optional(&canonical_sessions_root, &record)
+            .expect("read launch intent after timeout + unlock")
+            .is_none(),
+        "timed-out pre-lock request must not write a late launch intent after unlock"
+    );
+
+    // 2. Cancel/drop the request future while `.launch-intents/<approval_id>.lock` is held, then
+    //    release the lock: zero late process spawns or launch intent writes may occur.
+    let held_lock_2 =
+        HostLaunchIntentLock::acquire_blocking(&canonical_sessions_root, &approval.approval_id)
+            .expect("re-acquire launch intent lock for cancel test");
+    let cancel_res = tokio::time::timeout(
+        Duration::from_millis(60),
+        mcp.invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        cancel_res.is_err(),
+        "caller future must be cancelled/dropped while launch-intent lock is held"
+    );
+    drop(held_lock_2);
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "dropping request future while waiting on launch-intent lock must never cause a late spawn"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), agy_before);
+    assert!(
+        read_host_launch_intent_optional(&canonical_sessions_root, &record)
+            .expect("read launch intent after cancel + unlock")
+            .is_none()
+    );
+
+    // 3. Rotate/revoke enrollment while `.launch-intents/<approval_id>.lock` is held and release
+    //    the lock BEFORE `startup_timeout` expires: the request must fail closed with
+    //    `expired_epoch` and cause zero process spawns and zero launch intent writes.
+    let held_lock_3 =
+        HostLaunchIntentLock::acquire_blocking(&canonical_sessions_root, &approval.approval_id)
+            .expect("re-acquire launch intent lock for revocation test");
+    let mcp_call = mcp.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        mcp.restart_epoch()
+            .expect("rotate connection epoch while waiting on launch-intent lock");
+        drop(held_lock_3);
+    });
+
+    let revoked_err = mcp_call
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await
+        .expect_err("revoked enrollment before lock release must fail closed");
+    assert_eq!(
+        revoked_err.structured_content.unwrap()["error"]["code"],
+        "expired_epoch"
+    );
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "enrollment revocation before lock release must prevent process spawn"
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), agy_before);
+    assert!(
+        read_host_launch_intent_optional(&canonical_sessions_root, &record)
+            .expect("read launch intent after revocation + unlock")
+            .is_none(),
+        "enrollment revocation before lock release must prevent launch intent creation"
+    );
 }

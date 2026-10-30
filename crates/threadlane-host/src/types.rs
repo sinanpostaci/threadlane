@@ -17,6 +17,9 @@ pub const HOST_MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Current on-disk schema version for `task-receipts.json`.
 pub const TASK_RECEIPTS_SCHEMA_VERSION: u32 = 1;
 
+/// Current on-disk schema version for `<sessions_dir>/.launch-intents/<approval_id>.json`.
+pub const HOST_LAUNCH_INTENT_SCHEMA_VERSION: u32 = 1;
+
 /// Filename for the exclusive process-lifetime lock inside a host session directory.
 pub const HOST_LOCK_FILENAME: &str = "host.lock";
 
@@ -35,11 +38,17 @@ pub const RUNTIME_STATE_SUBDIR: &str = "runtime-state";
 /// Subdirectory name for the per-session isolated Git worktrees and manifests.
 pub const WORK_AREA_SUBDIR: &str = "work-area";
 
+/// Subdirectory name for private (`0700`) durable per-approval initial host launch intents inside `sessions_dir`.
+pub const LAUNCH_INTENTS_SUBDIR: &str = ".launch-intents";
+
 /// Maximum permitted byte size when reading or writing `host-manifest.json` (`64 KiB`).
 pub const MAX_HOST_MANIFEST_BYTES: usize = 65_536;
 
 /// Maximum permitted byte size when reading or writing `task-receipts.json` (`64 KiB`).
 pub const MAX_TASK_RECEIPTS_BYTES: usize = 65_536;
+
+/// Maximum permitted byte size when reading or writing `<sessions_dir>/.launch-intents/<approval_id>.json` (`16 KiB`).
+pub const MAX_LAUNCH_INTENT_BYTES: usize = 16_384;
 
 /// Default and maximum event batch count (`20`) for [`crate::ApprovedHostClient::pull_events`].
 pub const APPROVED_EVENT_BATCH_MAX_EVENTS: usize = 20;
@@ -622,4 +631,88 @@ pub struct TaskStateSnapshot {
     pub worker: Option<WorkerSnapshot>,
     /// Always `false`: worker completion means `ReadyForReview` and is never automatically accepted/merged/applied.
     pub accepted: bool,
+}
+
+/// Lifecycle status of a durable per-approval initial host launch intent under
+/// `<sessions_dir>/.launch-intents/<approval_id>.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostLaunchIntentStatus {
+    /// Launch intent was persisted before spawning `threadlane-host`; startup is in progress.
+    Pending,
+    /// Startup timed out or exited before live authenticated `Ready` could be proven; outcome is
+    /// uncertain and duplicate fresh spawns are refused.
+    Unknown,
+    /// The launched host session was verified to have reached live authenticated `Ready` for the
+    /// exact frozen approval identity.
+    ReconciledReady,
+}
+
+impl std::fmt::Display for HostLaunchIntentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => f.write_str("pending"),
+            Self::Unknown => f.write_str("unknown"),
+            Self::ReconciledReady => f.write_str("reconciled_ready"),
+        }
+    }
+}
+
+/// Bounded, private (`0600`) durable per-approval initial host launch intent persisted at
+/// `<sessions_dir>/.launch-intents/<approval_id>.json` before spawning a fresh `threadlane-host`
+/// process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostLaunchIntent {
+    /// Schema version (`1`).
+    pub schema_version: u32,
+    /// Canonical approval ID (`apr_<32 lowercase hex>`).
+    pub approval_id: String,
+    /// Frozen 64-character lowercase hex SHA-256 subject digest.
+    pub subject_digest: String,
+    /// Frozen policy version of the approval record.
+    pub policy_version: u32,
+    /// Frozen control-plane `binding_id`.
+    pub control_binding_id: String,
+    /// Frozen canonical lowercase hyphenated `thread_uuid`.
+    pub thread_uuid: String,
+    /// Frozen workflow `plan_id`.
+    pub plan_id: String,
+    /// Frozen workflow `plan_revision` (`>= 1`).
+    pub plan_revision: u64,
+    /// Canonical absolute `threadlane-host` executable path used for this launch attempt.
+    pub executable_path: PathBuf,
+    /// Current launch intent lifecycle status.
+    pub status: HostLaunchIntentStatus,
+    /// Optional OS process ID of the spawned `threadlane-host` child once `spawn()` returns.
+    pub spawn_pid: Option<u32>,
+    /// Optional sanitized diagnostic when `status` transitions to `unknown`.
+    pub last_error: Option<String>,
+    /// Creation timestamp in milliseconds since Unix epoch.
+    pub created_at_ms: i64,
+    /// Last update timestamp in milliseconds since Unix epoch.
+    pub updated_at_ms: i64,
+}
+
+impl HostLaunchIntent {
+    /// Constructs a new [`HostLaunchIntentStatus::Pending`] launch intent from the frozen
+    /// [`ApprovalRecord`] and canonical host executable path before spawning `threadlane-host`.
+    pub fn new_pending(record: &ApprovalRecord, executable_path: PathBuf, now_ms: i64) -> Self {
+        Self {
+            schema_version: HOST_LAUNCH_INTENT_SCHEMA_VERSION,
+            approval_id: record.approval_id.clone(),
+            subject_digest: record.subject_digest.clone(),
+            policy_version: record.policy_version,
+            control_binding_id: record.binding_id.clone(),
+            thread_uuid: record.thread_uuid.clone(),
+            plan_id: record.plan_id.clone(),
+            plan_revision: record.plan_revision,
+            executable_path,
+            status: HostLaunchIntentStatus::Pending,
+            spawn_pid: None,
+            last_error: None,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        }
+    }
 }

@@ -82,6 +82,12 @@ delivery, verified DAG inputs, product API entitlement, and cross-platform relea
 hardening are not implied by the local configuration/execution checkpoint. See
 [validation](VALIDATION.md).
 
+The optional [Codex-first startup extension](CODEX-WORKFLOW.md) removes the
+desktop Start step for an existing approved root task. Trusted scope approval
+still uses desktop confirmation; a headless operator route remains a usability
+gap. The OpenCode v2 pure metadata validator is preparation for an owned-session
+collector, not proof that live Go worker acceptance is integrated.
+
 ## Default workflow example
 
 Profiles remain configurable. The current desired usage profile is Luna Max for

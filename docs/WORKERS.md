@@ -7,6 +7,11 @@ worktrees with post-run diff gates and ownership-verified cleanup.
 
 ## Scope and Non-Claims
 
+- **OpenCode v2 metadata preparation**: The pure
+  [metadata validator](OPENCODE-METADATA.md) checks bounded, already-loaded
+  session info and sanitized per-assistant records. It does not discover or
+  export sessions and is not connected to the runtime collector. Missing
+  printed-stream evidence continues to prevent verified worker acceptance.
 - **Independent foundation crate**: `crates/threadlane-workers` is intentionally decoupled
   from `threadlane-core` and `threadlane` so it can be tested and reviewed
   independently of the durable supervisor/MCP dispatch described in [DISPATCH.md](DISPATCH.md).

@@ -52,13 +52,15 @@ pub use client::ApprovedHostClient;
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
 pub use storage::{
-    derive_ack_command_key, derive_cancel_command_key, ensure_no_symlink_components,
-    ensure_private_dir, is_host_lock_held, paths_overlap, prepare_session_dir,
-    read_and_verify_host_manifest, read_host_manifest_optional, read_task_dispatch_intent,
-    read_task_receipt, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
+    derive_ack_command_key, derive_cancel_command_key, ensure_fresh_session_dir_locked,
+    ensure_no_symlink_components, ensure_private_dir, is_host_lock_held, paths_overlap,
+    prepare_session_dir, read_and_verify_host_manifest, read_host_launch_intent_optional,
+    read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
+    record_task_dispatch_intent, record_task_receipt, validate_approval_id,
     validate_canonical_thread_uuid, validate_hex_digest, validate_host_instance_id,
     validate_identifier, validate_sessions_root, verify_existing_private_dir,
-    verify_existing_session_dir, write_host_manifest, HostSessionLock,
+    verify_existing_session_dir, write_host_launch_intent, write_host_manifest,
+    HostLaunchIntentLock, HostSessionLock,
 };
 pub use threadlane::{
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
@@ -67,13 +69,14 @@ pub use threadlane::{
 };
 pub use threadlane_core::{AckResult, EventBatch};
 pub use types::{
-    ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
-    HostSessionManifest, HostSessionSummary, TaskDispatchIntent, TaskExecutionStatus,
-    TaskRunReceipt, TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES,
-    APPROVED_EVENT_BATCH_MAX_EVENTS, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
-    HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES, MAX_TASK_RECEIPTS_BYTES,
-    RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_LOCK_FILENAME,
-    TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
+    ApprovedHostNotificationConfig, HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus,
+    HostNotificationSummary, HostPhase, HostSessionManifest, HostSessionSummary,
+    TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot,
+    APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
+    HOST_LAUNCH_INTENT_SCHEMA_VERSION, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
+    HOST_MANIFEST_SCHEMA_VERSION, LAUNCH_INTENTS_SUBDIR, MAX_HOST_MANIFEST_BYTES,
+    MAX_LAUNCH_INTENT_BYTES, MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
+    TASK_RECEIPTS_LOCK_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
 };
 
 #[cfg(test)]
@@ -95,8 +98,9 @@ mod tests {
     };
     use threadlane_registry::{RegistryChange, RegistryStore};
     use threadlane_workers::{
-        resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets,
-        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, WorkAreaOwnershipMarker,
+        WorktreeManager, CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
+        WORK_AREA_MARKER_FILENAME,
     };
 
     use super::*;
@@ -569,6 +573,78 @@ exit 0
         }
     }
 
+    fn assert_ready_work_area_initialized_before_workers(
+        handle: &ApprovedHostHandle,
+        fixture: &HostTestFixture,
+    ) {
+        assert_eq!(handle.summary().phase, HostPhase::Ready);
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            0,
+            "work-area ownership verification must run before any AGY worker starts"
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.oc_count_file),
+            0,
+            "work-area ownership verification must run before any OpenCode worker starts"
+        );
+
+        let work_area_dir = handle.work_area_dir();
+        let marker_path = work_area_dir.join(WORK_AREA_MARKER_FILENAME);
+        let manifests_dir = work_area_dir.join(MANIFESTS_SUBDIR);
+        let checkouts_dir = work_area_dir.join(CHECKOUTS_SUBDIR);
+        let runs_dir = checkouts_dir.join("runs");
+        let tasks_dir = checkouts_dir.join("tasks");
+
+        let marker_mode = fs::symlink_metadata(&marker_path)
+            .expect("stat .threadlane-work-area.json on Ready host")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(marker_mode, 0o600);
+
+        for dir in [&manifests_dir, &checkouts_dir, &runs_dir, &tasks_dir] {
+            let mode = fs::symlink_metadata(dir)
+                .unwrap_or_else(|err| panic!("stat {}: {err}", dir.display()))
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700, "expected 0700 on {}", dir.display());
+        }
+
+        // No run or task worktrees or manifests may be created during host startup.
+        assert_eq!(
+            fs::read_dir(&manifests_dir)
+                .expect("read manifests_dir")
+                .count(),
+            0
+        );
+        assert_eq!(fs::read_dir(&runs_dir).expect("read runs_dir").count(), 0);
+        assert_eq!(fs::read_dir(&tasks_dir).expect("read tasks_dir").count(), 0);
+
+        let marker_bytes = fs::read(&marker_path).expect("read .threadlane-work-area.json");
+        let marker: WorkAreaOwnershipMarker =
+            serde_json::from_slice(&marker_bytes).expect("parse WorkAreaOwnershipMarker");
+        let manager = WorktreeManager::new(
+            &handle.approval().repository_path,
+            work_area_dir,
+            &handle.approval().base_commit,
+        )
+        .expect("WorktreeManager::new must validate initialized Ready work-area");
+        assert_eq!(marker.marker_version, 1);
+        assert_eq!(marker.work_area_root, work_area_dir);
+        assert_eq!(marker.work_area_root, manager.work_area_root());
+        assert_eq!(
+            marker.repository_common_git_dir,
+            manager.repository_common_git_dir(),
+            "Ready work-area ownership marker must be bound to the approved repository's common Git directory"
+        );
+        assert_eq!(
+            manager.resolved_base_commit(),
+            handle.approval().base_commit
+        );
+    }
+
     async fn wait_for_task_status(
         client: &ApprovedHostClient,
         approval_id: &str,
@@ -755,6 +831,7 @@ exit 0
         )
         .await
         .expect("start valid host");
+        assert_ready_work_area_initialized_before_workers(&handle, &fixture);
 
         let sess_mode = fs::symlink_metadata(&session_dir)
             .expect("stat session_dir")
@@ -907,9 +984,9 @@ exit 0
         .await
         .expect("start host");
 
-        // No provider starts automatically on host startup.
-        assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
-        assert_eq!(read_invocation_count(&fixture.oc_count_file), 0);
+        // No provider starts automatically on host startup, and the owned work area is already
+        // completely initialized and bound to the repository's common Git directory.
+        assert_ready_work_area_initialized_before_workers(&host, &fixture);
         assert!(!host.summary().gates.workers_auto_started_on_boot);
 
         let frozen_revision = host.approval().plan_revision;
@@ -3552,6 +3629,7 @@ exit 0
             notify_codex: None,
             notify_timeout_ms: None,
             restart_from_instance_id: None,
+            start_fresh_only: false,
         };
         let serve_task = tokio::spawn(async move { run_serve(serve_args).await });
 
@@ -3924,6 +4002,52 @@ exit 0
         // Restore clean Stopped manifest.
         write_host_manifest(&session_dir, &preserved_stopped).expect("restore Stopped manifest");
 
+        // Tampering with `.threadlane-work-area.json` to bind a foreign `repository_common_git_dir`
+        // is caught during `restart_stopped` precheck BEFORE writing `Bootstrapping`, preserving
+        // the `Stopped` manifest untouched.
+        let marker_path = session_dir
+            .join(WORK_AREA_SUBDIR)
+            .join(WORK_AREA_MARKER_FILENAME);
+        let orig_marker_bytes = fs::read(&marker_path).expect("read original work-area marker");
+        let mut tampered_marker: WorkAreaOwnershipMarker =
+            serde_json::from_slice(&orig_marker_bytes).expect("parse original work-area marker");
+        tampered_marker.repository_common_git_dir = fixture.root.join("foreign-repo/.git");
+        fs::write(
+            &marker_path,
+            serde_json::to_vec_pretty(&tampered_marker).expect("serialize tampered marker"),
+        )
+        .expect("write tampered marker");
+        fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 tampered marker");
+
+        let foreign_marker_err = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            ),
+            &first_instance_id,
+        )
+        .await
+        .expect_err(
+            "foreign work-area repository_common_git_dir must fail restart_stopped precheck",
+        );
+        assert_eq!(foreign_marker_err.code(), "security_violation");
+        assert_eq!(
+            read_host_manifest_optional(&session_dir, &record)
+                .expect("read manifest after foreign marker precheck failure")
+                .expect("manifest exists")
+                .phase,
+            HostPhase::Stopped,
+            "restart_stopped precheck failure must preserve Stopped manifest before writing Bootstrapping"
+        );
+
+        fs::write(&marker_path, &orig_marker_bytes).expect("restore original work-area marker");
+        fs::set_permissions(&marker_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 restored marker");
+
         // 5. Disabling tool-oc in the mutable global registry must not rewrite or revoke the
         //    existing immutable approval. The approval keeps its frozen registry snapshot, so an
         //    explicit restart from the clean Stopped session with the correct prior instance ID
@@ -4227,6 +4351,340 @@ exit 0
         assert_eq!(
             clean_manifest_after.instance_id.as_deref(),
             Some(clean_inst2.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn start_fresh_only_cli_and_gate_refuse_prior_or_corrupt_state_and_preserve_files() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-fresh-only-gate",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Fresh-only gate test"),
+        );
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get approval record");
+
+        // 1. CLI parsing: `--start-fresh-only` defaults to false, parses when passed, and
+        //    conflicts with `--restart-from-instance-id` both in clap and `into_host_config`.
+        let default_cli = HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--approval-id",
+            &approval_id,
+        ])
+        .expect("parse default serve CLI");
+        match default_cli.command {
+            HostCommand::Serve(ref args) => {
+                assert!(!args.start_fresh_only);
+                assert!(args.restart_from_instance_id.is_none());
+            }
+        }
+
+        let fresh_cli = HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--approval-id",
+            &approval_id,
+            "--start-fresh-only",
+        ])
+        .expect("parse --start-fresh-only CLI");
+        match fresh_cli.command {
+            HostCommand::Serve(args) => {
+                assert!(args.start_fresh_only);
+                assert!(args.restart_from_instance_id.is_none());
+                let cfg = args.into_host_config().expect("into_host_config");
+                assert_eq!(cfg.approval_id, approval_id);
+                assert!(cfg.notifications.is_none());
+            }
+        }
+
+        assert!(
+            HostCli::try_parse_from([
+                "threadlane-host",
+                "serve",
+                "--registry-dir",
+                fixture.registry_dir.to_str().unwrap(),
+                "--plans-dir",
+                fixture.plans_dir.to_str().unwrap(),
+                "--authority-dir",
+                fixture.authority_dir.to_str().unwrap(),
+                "--sessions-dir",
+                fixture.sessions_dir.to_str().unwrap(),
+                "--approval-id",
+                &approval_id,
+                "--start-fresh-only",
+                "--restart-from-instance-id",
+                "hst_11111111111111111111111111111111",
+            ])
+            .is_err(),
+            "--start-fresh-only and --restart-from-instance-id must conflict in clap"
+        );
+
+        let programmatic_conflict = ServeArgs {
+            registry_dir: fixture.registry_dir.clone(),
+            plans_dir: fixture.plans_dir.clone(),
+            authority_dir: fixture.authority_dir.clone(),
+            sessions_dir: fixture.sessions_dir.clone(),
+            approval_id: approval_id.clone(),
+            notify_codex: None,
+            notify_timeout_ms: None,
+            restart_from_instance_id: Some("hst_11111111111111111111111111111111".to_string()),
+            start_fresh_only: true,
+        }
+        .into_host_config()
+        .expect_err("programmatic mutual exclusion must also fail closed");
+        assert_eq!(programmatic_conflict.code(), "validation");
+
+        // 2. An empty private session directory containing only a 0-byte `host.lock` (such as from
+        //    a concurrent first launcher probe) is not prior execution and is allowed by
+        //    `start_fresh_only` once the lock is free.
+        let session_dir = prepare_session_dir(&fixture.sessions_dir, &approval_id)
+            .expect("prepare empty session dir");
+        {
+            let probe_lock =
+                HostSessionLock::acquire(&session_dir, &approval_id).expect("acquire probe lock");
+            // While `probe_lock` is held, a concurrent `start_fresh_only` fails with `lock_busy`.
+            let busy_err = ApprovedHost::start_fresh_only(
+                ApprovedHostConfig::new(
+                    &fixture.registry_dir,
+                    &fixture.plans_dir,
+                    &fixture.authority_dir,
+                    &fixture.sessions_dir,
+                    &approval_id,
+                )
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect_err("held host.lock must block concurrent start_fresh_only");
+            assert_eq!(busy_err.code(), "lock_busy");
+            drop(probe_lock);
+        }
+
+        // Now only 0-byte `host.lock` exists in `session_dir`; `start_fresh_only` must succeed.
+        let fresh_host = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start_fresh_only on empty session dir with unlocked 0-byte host.lock");
+        assert_ready_work_area_initialized_before_workers(&fresh_host, &fixture);
+        assert_eq!(
+            fresh_host.summary().notifications,
+            HostNotificationSummary::disabled()
+        );
+        let first_instance_id = fresh_host.instance_id().to_string();
+
+        // While running, a second `start_fresh_only` fails with `lock_busy`.
+        let active_err = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("running host must reject second start_fresh_only with lock_busy");
+        assert_eq!(active_err.code(), "lock_busy");
+
+        fresh_host
+            .shutdown()
+            .await
+            .expect("shutdown fresh_host cleanly");
+
+        // 3. `Stopped` manifest must be refused by `start_fresh_only` under `host.lock`, preserving
+        //    `host-manifest.json` byte-for-byte.
+        let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+        let stopped_bytes_before = fs::read(&manifest_path).expect("read Stopped manifest bytes");
+        let stopped_err = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("Stopped session must be refused by start_fresh_only");
+        assert_eq!(stopped_err.code(), "host_restart_not_allowed");
+        assert_eq!(
+            fs::read(&manifest_path).expect("read Stopped manifest after refusal"),
+            stopped_bytes_before,
+            "Stopped manifest must be preserved byte-for-byte"
+        );
+
+        // Trusted `restart_stopped` still works after `start_fresh_only` refusal!
+        let restarted = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+            &first_instance_id,
+        )
+        .await
+        .expect("trusted restart_stopped still succeeds after fresh-only refusal");
+        restarted.shutdown().await.expect("shutdown restarted host");
+
+        // 4. `Failed` manifest must be refused by `start_fresh_only` and preserved byte-for-byte.
+        let mut failed_manifest = read_host_manifest_optional(&session_dir, &record)
+            .expect("read manifest")
+            .expect("manifest exists");
+        failed_manifest.phase = HostPhase::Failed;
+        failed_manifest.pid = None;
+        failed_manifest.last_error = Some("simulated failure".to_string());
+        failed_manifest.gates = HostExecutionGates::for_ready_state(false);
+        write_host_manifest(&session_dir, &failed_manifest).expect("write Failed manifest");
+        let failed_bytes_before = fs::read(&manifest_path).expect("read Failed manifest bytes");
+
+        let failed_err = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("Failed session must be refused by start_fresh_only");
+        assert_eq!(failed_err.code(), "host_restart_not_allowed");
+        assert_eq!(
+            fs::read(&manifest_path).expect("read Failed manifest after refusal"),
+            failed_bytes_before,
+            "Failed manifest must be preserved byte-for-byte"
+        );
+
+        // 5. Corrupt `host-manifest.json` must be refused with `corrupt_manifest` and preserved.
+        let corrupt_payload = b"{\"corrupt\": true}\n";
+        fs::write(&manifest_path, corrupt_payload).expect("write corrupt manifest");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 corrupt manifest");
+        let corrupt_err = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("corrupt manifest must be refused by start_fresh_only");
+        assert_eq!(corrupt_err.code(), "corrupt_manifest");
+        assert_eq!(
+            fs::read(&manifest_path).expect("read corrupt manifest after refusal"),
+            corrupt_payload,
+            "corrupt manifest must be preserved untouched"
+        );
+
+        // 6. Remove `host-manifest.json` while keeping `runtime-state` / `work-area` /
+        //    `task-receipts.json` alongside `host.lock`: `start_fresh_only` must still refuse
+        //    under `host.lock` and preserve all remaining directories/files.
+        fs::remove_file(&manifest_path).expect("remove manifest leaving runtime-state/work-area");
+        let orphan_err = ApprovedHost::start_fresh_only(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect_err("orphaned runtime-state and work-area must be refused by start_fresh_only");
+        assert_eq!(orphan_err.code(), "host_restart_not_allowed");
+        assert!(
+            !manifest_path.exists(),
+            "refused start_fresh_only must not write Bootstrapping or Failed manifest"
+        );
+        assert!(session_dir.join(RUNTIME_STATE_SUBDIR).exists());
+        assert!(session_dir.join(WORK_AREA_SUBDIR).exists());
+
+        // 7. Durable per-approval launch intent under `<sessions_dir>/.launch-intents/<approval_id>.json`
+        //    is validated by `validate_sessions_root`, verifies frozen approval identity, and fails
+        //    closed on corruption or foreign entries while keeping `<sessions_dir>/<approval_id>` untouched.
+        assert_eq!(
+            read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+                .expect("read missing launch intent"),
+            None
+        );
+        let intent_lock =
+            HostLaunchIntentLock::acquire_blocking(&fixture.sessions_dir, &approval_id)
+                .expect("acquire launch intent lock");
+        assert!(intent_lock.path().exists());
+        assert!(
+            HostLaunchIntentLock::try_acquire(&fixture.sessions_dir, &approval_id)
+                .expect("try_acquire while held")
+                .is_none(),
+            "try_acquire must return Ok(None) while exclusive launch intent lock is held"
+        );
+        let mut intent =
+            HostLaunchIntent::new_pending(&record, fixture.fake_agy_exe.clone(), 1_700_000_900_000);
+        intent.spawn_pid = Some(12345);
+        write_host_launch_intent(&fixture.sessions_dir, &record, &intent)
+            .expect("write launch intent");
+        let loaded_intent = read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+            .expect("read launch intent")
+            .expect("launch intent exists");
+        assert_eq!(loaded_intent, intent);
+        drop(intent_lock);
+        let try_reacquired = HostLaunchIntentLock::try_acquire(&fixture.sessions_dir, &approval_id)
+            .expect("try_acquire after release")
+            .expect("try_acquire must succeed once lock is dropped");
+        drop(try_reacquired);
+
+        validate_sessions_root(
+            &fixture.sessions_dir,
+            &[("authority_dir", &fixture.authority_dir)],
+        )
+        .expect(".launch-intents with valid 0600 intent and 0-byte lock must pass validate_sessions_root");
+
+        // Mismatched subject_digest in launch intent fails closed with `corrupt_session_state`.
+        let mut tampered_intent = intent.clone();
+        tampered_intent.subject_digest = "f".repeat(64);
+        assert_eq!(
+            write_host_launch_intent(&fixture.sessions_dir, &record, &tampered_intent)
+                .expect_err("mismatched subject_digest must fail")
+                .code(),
+            "corrupt_session_state"
         );
     }
 }

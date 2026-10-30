@@ -788,6 +788,6 @@ pub fn sanitize_diagnostic_text(raw: &str) -> String {
     }
 }
 
-fn sanitize_io_error(err: &std::io::Error) -> String {
+pub(crate) fn sanitize_io_error(err: &std::io::Error) -> String {
     sanitize_diagnostic_text(&err.kind().to_string())
 }

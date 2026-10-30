@@ -12,12 +12,14 @@ use threadlane_authority::{ApprovalRecord, AuthorityStore, MaterializedPlan};
 use threadlane_core::Binding;
 use threadlane_plans::PlanStore;
 use threadlane_registry::RegistryStore;
+use threadlane_workers::{WorkerError, WorktreeManager};
 
 use crate::error::HostError;
 use crate::storage::{
-    ensure_private_dir, generate_host_instance_id, now_epoch_ms, prepare_session_dir,
-    read_host_manifest_optional, validate_approval_id, validate_host_instance_id,
-    validate_sessions_root, verify_existing_task_receipts, write_host_manifest, HostSessionLock,
+    ensure_fresh_session_dir_locked, ensure_private_dir, generate_host_instance_id, now_epoch_ms,
+    prepare_session_dir, read_host_manifest_optional, validate_approval_id,
+    validate_host_instance_id, validate_sessions_root, verify_existing_task_receipts,
+    write_host_manifest, HostSessionLock,
 };
 use crate::types::{
     ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
@@ -78,6 +80,12 @@ impl ApprovedHostConfig {
         self.notifications = Some(config);
         self
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartSessionMode {
+    TrustedStartOrRecover,
+    FreshOnly,
 }
 
 /// Entrypoint for starting a separately owned per-approval local execution host.
@@ -146,7 +154,98 @@ impl ApprovedHost {
         tick_interval: Duration,
         notifications: Option<ApprovedHostNotificationConfig>,
     ) -> Result<ApprovedHostHandle, HostError> {
-        let approval_id = approval_id.as_ref();
+        Self::start_session_internal(
+            authority,
+            sessions_dir.as_ref(),
+            approval_id.as_ref(),
+            tick_interval,
+            notifications,
+            StartSessionMode::TrustedStartOrRecover,
+        )
+        .await
+    }
+
+    /// Opens the global stores in `config` and starts a brand-new host session for
+    /// `config.approval_id`, refusing under `host.lock` any pre-existing manifest, task receipts,
+    /// runtime state, or work area.
+    pub async fn start_fresh_only(
+        config: ApprovedHostConfig,
+    ) -> Result<ApprovedHostHandle, HostError> {
+        validate_approval_id(&config.approval_id)?;
+        let registry = Arc::new(RegistryStore::open(&config.registry_dir)?);
+        let plans = Arc::new(PlanStore::open(&config.plans_dir)?);
+        let authority = Arc::new(AuthorityStore::open(
+            &config.authority_dir,
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+        )?);
+        validate_sessions_root(
+            &config.sessions_dir,
+            &[
+                ("registry_dir", registry.config_dir()),
+                ("plans_dir", plans.dir()),
+                ("authority_dir", authority.dir()),
+            ],
+        )?;
+        Self::start_fresh_only_with_authority_and_notifications(
+            authority,
+            &config.sessions_dir,
+            &config.approval_id,
+            config.tick_interval,
+            config.notifications,
+        )
+        .await
+    }
+
+    /// Starts a brand-new host session for `approval_id` using an already opened
+    /// [`AuthorityStore`] with notifications disabled (`None`), refusing under `host.lock` any
+    /// pre-existing manifest, task receipts, runtime state, or work area.
+    pub async fn start_fresh_only_with_authority(
+        authority: Arc<AuthorityStore>,
+        sessions_dir: impl AsRef<Path>,
+        approval_id: impl AsRef<str>,
+        tick_interval: Duration,
+    ) -> Result<ApprovedHostHandle, HostError> {
+        Self::start_fresh_only_with_authority_and_notifications(
+            authority,
+            sessions_dir,
+            approval_id,
+            tick_interval,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a brand-new host session for `approval_id` using an already opened
+    /// [`AuthorityStore`] and optional [`ApprovedHostNotificationConfig`], refusing under
+    /// `host.lock` any pre-existing manifest, task receipts, runtime state, or work area while
+    /// preserving all existing files untouched.
+    pub async fn start_fresh_only_with_authority_and_notifications(
+        authority: Arc<AuthorityStore>,
+        sessions_dir: impl AsRef<Path>,
+        approval_id: impl AsRef<str>,
+        tick_interval: Duration,
+        notifications: Option<ApprovedHostNotificationConfig>,
+    ) -> Result<ApprovedHostHandle, HostError> {
+        Self::start_session_internal(
+            authority,
+            sessions_dir.as_ref(),
+            approval_id.as_ref(),
+            tick_interval,
+            notifications,
+            StartSessionMode::FreshOnly,
+        )
+        .await
+    }
+
+    async fn start_session_internal(
+        authority: Arc<AuthorityStore>,
+        sessions_dir: &Path,
+        approval_id: &str,
+        tick_interval: Duration,
+        notifications: Option<ApprovedHostNotificationConfig>,
+        mode: StartSessionMode,
+    ) -> Result<ApprovedHostHandle, HostError> {
         validate_approval_id(approval_id)?;
 
         let validated_notifications = match notifications {
@@ -166,7 +265,7 @@ impl ApprovedHost {
         let record = authority.get_for_operator(approval_id)?;
 
         let canonical_sessions_root = validate_sessions_root(
-            sessions_dir.as_ref(),
+            sessions_dir,
             &[
                 ("authority_dir", authority.dir()),
                 ("repository_path", record.repository_path.as_path()),
@@ -176,18 +275,45 @@ impl ApprovedHost {
         let session_dir = prepare_session_dir(&canonical_sessions_root, &record.approval_id)?;
         let host_lock = HostSessionLock::acquire(&session_dir, &record.approval_id)?;
 
-        // Read and validate any pre-existing manifest before touching state.
-        // If the manifest on disk is corrupt, preserve it untouched and release host_lock.
-        // Note: notification config is NEVER restored from an old manifest on restart;
-        // notification opt-in is strictly an explicit startup choice on each host start.
-        let existing_manifest = read_host_manifest_optional(&session_dir, &record)?;
-        let prior_session_binding_id = existing_manifest
-            .as_ref()
-            .and_then(|m| m.session_binding_id.clone());
-        let created_at_ms = existing_manifest
-            .as_ref()
-            .map(|m| m.created_at_ms)
-            .unwrap_or_else(now_epoch_ms);
+        let (prior_session_binding_id, created_at_ms) = match mode {
+            StartSessionMode::TrustedStartOrRecover => {
+                // Read and validate any pre-existing manifest before touching state.
+                // If the manifest on disk is corrupt, preserve it untouched and release host_lock.
+                // Note: notification config is NEVER restored from an old manifest on restart;
+                // notification opt-in is strictly an explicit startup choice on each host start.
+                let existing_manifest = read_host_manifest_optional(&session_dir, &record)?;
+                let prior_binding = existing_manifest
+                    .as_ref()
+                    .and_then(|m| m.session_binding_id.clone());
+                let created_ms = existing_manifest
+                    .as_ref()
+                    .map(|m| m.created_at_ms)
+                    .unwrap_or_else(now_epoch_ms);
+                (prior_binding, created_ms)
+            }
+            StartSessionMode::FreshOnly => {
+                // Under `host.lock`, refuse any existing manifest, task-receipts file, runtime
+                // state, or work area (including Stopped, Failed, Ready, Bootstrapping, or
+                // corrupt/orphaned state) before writing Bootstrapping or creating subdirectories.
+                ensure_fresh_session_dir_locked(&session_dir, &record)?;
+
+                let precheck_binding = Binding {
+                    binding_id: "bnd_fresh_start_precheck".to_string(),
+                    thread_uuid: record.thread_uuid.clone(),
+                    label: "fresh-start-precheck".to_string(),
+                    delivered_seq: 0,
+                    acked_seq: 0,
+                };
+                authority.materialize(
+                    &record.approval_id,
+                    &precheck_binding,
+                    &session_dir.join(WORK_AREA_SUBDIR),
+                )?;
+
+                (None, now_epoch_ms())
+            }
+        };
+
         let pid = std::process::id();
         let instance_id = generate_host_instance_id();
 
@@ -399,6 +525,7 @@ impl ApprovedHost {
             acked_seq: 0,
         };
         authority.materialize(&record.approval_id, &precheck_binding, &work_area_dir)?;
+        initialize_and_verify_work_area(&record, &work_area_dir)?;
 
         let created_at_ms = existing_manifest.created_at_ms;
         let pid = std::process::id();
@@ -514,6 +641,12 @@ impl ApprovedHost {
             acked_seq: 0,
         };
         authority.materialize(&record.approval_id, &preview_binding, &work_area_dir)?;
+        // Initialize and verify the host's owned work area (`.threadlane-work-area.json` ownership
+        // marker bound to `repository_path`'s common Git directory plus `manifests/` and
+        // `checkouts/` subdirectories) BEFORE starting any supervisor or advertising `Ready`.
+        // This guarantees concurrent `start_approved_task` dispatches never race an uninitialized
+        // lock-only work area during `AuthorityStore::materialize`.
+        initialize_and_verify_work_area(record, &work_area_dir)?;
 
         // Phase 1: Start temporary bootstrap supervisor with `workers: None`.
         // Because `workers` is `None`, no worker can be claimed or spawned, and any prior
@@ -914,6 +1047,59 @@ impl ApprovedHostHandle {
                 write_res
             }
         }
+    }
+}
+
+fn initialize_and_verify_work_area(
+    record: &ApprovalRecord,
+    work_area_dir: &Path,
+) -> Result<(), HostError> {
+    let manager = WorktreeManager::new(&record.repository_path, work_area_dir, &record.base_commit)
+        .map_err(|err| map_work_area_init_error(work_area_dir, err))?;
+    if manager.resolved_base_commit() != record.base_commit {
+        return Err(HostError::ScopeMismatch {
+            field: "base_commit".to_string(),
+            expected: record.base_commit.clone(),
+            actual: manager.resolved_base_commit().to_string(),
+            reason: "work-area manager resolved base_commit does not match frozen approval"
+                .to_string(),
+        });
+    }
+    if manager.work_area_root() != work_area_dir {
+        return Err(HostError::SecurityViolation {
+            path: work_area_dir.display().to_string(),
+            reason: format!(
+                "canonical work-area root `{}` does not match `{}`",
+                manager.work_area_root().display(),
+                work_area_dir.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn map_work_area_init_error(work_area_dir: &Path, err: WorkerError) -> HostError {
+    match err {
+        WorkerError::SecurityViolation(reason) => HostError::SecurityViolation {
+            path: work_area_dir.display().to_string(),
+            reason,
+        },
+        WorkerError::Io(io_err) => HostError::Io {
+            operation: "initialize_work_area".to_string(),
+            reason: io_err.to_string(),
+        },
+        WorkerError::GitCommandFailed {
+            command,
+            status,
+            stderr,
+        } => HostError::Authority {
+            code: "invalid_repository".to_string(),
+            message: format!("git command `{command}` failed (status: {status:?}): {stderr}"),
+        },
+        other => HostError::Authority {
+            code: "invalid_work_area".to_string(),
+            message: other.to_string(),
+        },
     }
 }
 

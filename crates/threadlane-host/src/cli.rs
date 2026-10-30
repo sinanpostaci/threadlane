@@ -64,11 +64,27 @@ pub struct ServeArgs {
     /// Optional expected prior stopped host instance identifier (`hst_<32hex>`) to restart cleanly via `ApprovedHost::restart_stopped`.
     #[arg(long = "restart-from-instance-id")]
     pub restart_from_instance_id: Option<String>,
+
+    /// Require a brand-new host session with no prior manifest, receipts, runtime state, or
+    /// work area (mutually exclusive with `--restart-from-instance-id`).
+    #[arg(
+        long = "start-fresh-only",
+        default_value_t = false,
+        conflicts_with = "restart_from_instance_id"
+    )]
+    pub start_fresh_only: bool,
 }
 
 impl ServeArgs {
     /// Validates CLI arguments (including optional notification flags) and constructs an [`ApprovedHostConfig`].
     pub fn into_host_config(self) -> Result<ApprovedHostConfig, HostError> {
+        if self.start_fresh_only && self.restart_from_instance_id.is_some() {
+            return Err(HostError::validation(
+                "start_fresh_only",
+                "`--start-fresh-only` cannot be combined with `--restart-from-instance-id`",
+            ));
+        }
+
         if let Some(ref prior_id) = self.restart_from_instance_id {
             crate::storage::validate_host_instance_id("restart_from_instance_id", prior_id)?;
         }
@@ -112,14 +128,22 @@ pub async fn run_cli(cli: HostCli) -> Result<(), HostError> {
 /// broken pipes if stdio is closed), and keeps the host alive until explicit `SIGINT`/`SIGTERM`,
 /// an authenticated idle-stop request, or a fatal supervisor error.
 pub async fn run_serve(args: ServeArgs) -> Result<(), HostError> {
+    let start_fresh_only = args.start_fresh_only;
     let restart_from_instance_id = args.restart_from_instance_id.clone();
     let config = args.into_host_config()?;
 
-    let handle = match restart_from_instance_id.as_deref() {
-        Some(expected_prior_instance_id) => {
+    let handle = match (start_fresh_only, restart_from_instance_id.as_deref()) {
+        (true, Some(_)) => {
+            return Err(HostError::validation(
+                "start_fresh_only",
+                "`--start-fresh-only` cannot be combined with `--restart-from-instance-id`",
+            ));
+        }
+        (true, None) => ApprovedHost::start_fresh_only(config).await?,
+        (false, Some(expected_prior_instance_id)) => {
             ApprovedHost::restart_stopped(config, expected_prior_instance_id).await?
         }
-        None => ApprovedHost::start(config).await?,
+        (false, None) => ApprovedHost::start(config).await?,
     };
     let summary = handle.summary();
     if let Ok(line) = serde_json::to_string(&summary) {
