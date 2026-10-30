@@ -6,17 +6,23 @@ repository. A new native installation starts with an empty registry.
 
 ## Configure a CLI tool
 
-1. Open **Tools**, then **Add tool**.
-2. Choose an adapter and a unique ID. An executable path is optional when the
-   command is available on `PATH`; explicit absolute paths may use normal symlinks.
-3. Save the tool, open **Details**, then choose **Probe saved tool**.
-4. Import selected catalog entries, or add a model manually. Keep the registry ID
-   distinct from the actual provider argument.
+1. Open **Tools** and choose **Add and choose models** for a detected CLI, or
+   configure a custom tool and save it.
+2. Select models in its searchable catalog, then choose **Add selected models**.
+3. Open **Profiles** and assign a model and one of its detected effort options.
 
-A probe checks installed metadata. It does not prove subscription entitlement or
-perform inference. Codex catalogs include effort metadata. OpenCode and Antigravity
-catalogs may not; configure supported efforts explicitly instead of inferring them
-from a model's display name.
+Catalog checks read metadata without running a model. Codex exposes supported
+reasoning levels; OpenCode v2 exposes per-model variants through its standalone
+`model.list` metadata operation. Antigravity exposes concrete effort variants:
+Threadlane uses an effort only when the model ID suffix and catalog label agree.
+The concrete Antigravity model argument is preserved. Catalog options do not prove
+runtime entitlement or execution telemetry.
+
+For saved models imported before effort detection was available, load the catalog
+and choose **Use detected effort options**. This fills missing options only for
+matching model IDs, tool IDs and exact model arguments. Custom nonempty effort
+lists, labels, model arguments, default-without-effort choices and assignments are
+preserved. Manual overrides remain available under Advanced.
 
 For example, an OpenCode Go model uses provider argument
 `opencode-go/deepseek-v4.1-flash`, with `max` configured as a separate effort. The

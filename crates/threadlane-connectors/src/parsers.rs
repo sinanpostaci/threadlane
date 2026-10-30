@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use serde_json::Value;
-use threadlane_registry::ModelDefinition;
+use threadlane_registry::{ModelDefinition, MAX_EFFORTS_PER_MODEL};
 
 use crate::credentials::validate_tool_id;
 use crate::error::ConnectorError;
@@ -104,7 +104,7 @@ pub fn validate_effort_token(effort: &str) -> Result<(), ConnectorError> {
             "Catalog contained an empty or oversized reasoning effort.",
         ));
     }
-    if effort.starts_with('-') || effort.starts_with('.') {
+    if effort.starts_with('-') || effort.starts_with('.') || effort.contains("..") {
         return Err(ConnectorError::ParseError(
             "Catalog reasoning effort must not start with '-' or '.'.",
         ));
@@ -275,6 +275,11 @@ pub fn parse_codex_bundled_models(
                 for level in levels {
                     if let Some(effort) = extract_effort_from_value(level)? {
                         if seen_efforts.insert(effort.clone()) {
+                            if efforts.len() >= MAX_EFFORTS_PER_MODEL {
+                                return Err(ConnectorError::ParseError(
+                                    "Codex model catalog entry exceeded maximum reasoning effort count.",
+                                ));
+                            }
                             efforts.push(effort);
                         }
                     }
@@ -288,6 +293,11 @@ pub fn parse_codex_bundled_models(
         };
         if let Some(ref def_eff) = default_effort {
             if !efforts.is_empty() && seen_efforts.insert(def_eff.clone()) {
+                if efforts.len() >= MAX_EFFORTS_PER_MODEL {
+                    return Err(ConnectorError::ParseError(
+                        "Codex model catalog entry exceeded maximum reasoning effort count.",
+                    ));
+                }
                 efforts.push(def_eff.clone());
             }
         }
@@ -478,10 +488,243 @@ fn is_disallowed_noise_word(token: &str) -> bool {
     )
 }
 
-/// Parses `opencode models --standalone` output into [`ModelDefinition`] items.
+fn validate_opencode_provider_id(provider_id: &str) -> Result<(), ConnectorError> {
+    if provider_id.is_empty()
+        || provider_id.len() > MAX_MODEL_ID_BYTES
+        || provider_id.trim() != provider_id
+    {
+        return Err(ConnectorError::ParseError(
+            "OpenCode model catalog contained an empty or oversized provider identifier.",
+        ));
+    }
+    if provider_id.starts_with('-')
+        || provider_id.starts_with('.')
+        || provider_id.contains("..")
+        || provider_id.contains('/')
+        || provider_id.contains(':')
+        || is_disallowed_noise_word(provider_id)
+    {
+        return Err(ConnectorError::ParseError(
+            "OpenCode model catalog contained a malformed provider identifier.",
+        ));
+    }
+    if !provider_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(ConnectorError::ParseError(
+            "OpenCode model catalog provider identifier contained unsupported characters.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_opencode_bare_model_id(bare_id: &str) -> Result<(), ConnectorError> {
+    validate_model_id(bare_id)?;
+    if is_disallowed_noise_word(bare_id) {
+        return Err(ConnectorError::ParseError(
+            "OpenCode model catalog contained a malformed model identifier.",
+        ));
+    }
+    Ok(())
+}
+
+fn format_opencode_display_label(
+    raw_name: Option<&str>,
+    provider_id: &str,
+    selectable_id: &str,
+) -> String {
+    let Some(raw) = raw_name else {
+        return selectable_id.to_string();
+    };
+    let cleaned_name = sanitize_display_label(raw, "");
+    if cleaned_name.is_empty() || cleaned_name == selectable_id {
+        return selectable_id.to_string();
+    }
+    let suffix = format!("({provider_id})");
+    if cleaned_name.ends_with(&suffix) {
+        return cleaned_name;
+    }
+    sanitize_display_label(&format!("{cleaned_name} ({provider_id})"), selectable_id)
+}
+
+fn parse_opencode_json_catalog(
+    tool_id: &str,
+    trimmed: &str,
+) -> Result<Vec<ModelDefinition>, ConnectorError> {
+    let parsed: Value = serde_json::from_str(trimmed).map_err(|_| {
+        ConnectorError::ParseError("OpenCode model catalog JSON output was malformed.")
+    })?;
+
+    let items = match &parsed {
+        Value::Object(map) => {
+            if let Some(data_val) = map.get("data") {
+                data_val.as_array().ok_or(ConnectorError::ParseError(
+                    "OpenCode model catalog JSON 'data' field must be an array.",
+                ))?
+            } else {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog JSON object did not contain a 'data' array.",
+                ));
+            }
+        }
+        Value::Array(arr) => arr,
+        _ => {
+            return Err(ConnectorError::ParseError(
+                "OpenCode model catalog JSON root must be an object or array.",
+            ));
+        }
+    };
+
+    if items.is_empty() {
+        return Err(ConnectorError::ParseError(
+            "OpenCode model catalog output did not contain any models.",
+        ));
+    }
+
+    let mut models = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+
+    for item in items {
+        let obj = item.as_object().ok_or(ConnectorError::ParseError(
+            "OpenCode model catalog entry must be a JSON object.",
+        ))?;
+
+        let provider_id =
+            obj.get("providerID")
+                .and_then(Value::as_str)
+                .ok_or(ConnectorError::ParseError(
+                    "OpenCode model catalog entry was missing a string 'providerID' field.",
+                ))?;
+        validate_opencode_provider_id(provider_id)?;
+
+        let bare_id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(ConnectorError::ParseError(
+                "OpenCode model catalog entry was missing a string 'id' field.",
+            ))?;
+        validate_opencode_bare_model_id(bare_id)?;
+
+        if let Some(model_id_val) = obj.get("modelID") {
+            let Some(alias_str) = model_id_val.as_str() else {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog entry contained a non-string 'modelID' field.",
+                ));
+            };
+            if alias_str.trim().is_empty() || alias_str.chars().any(char::is_control) {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog entry contained an invalid 'modelID' field.",
+                ));
+            }
+        }
+
+        let selectable_id = format!("{provider_id}/{bare_id}");
+        validate_model_id(&selectable_id)?;
+
+        let enabled = match obj.get("enabled") {
+            Some(Value::Bool(b)) => *b,
+            None => true,
+            Some(_) => {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog entry contained a non-boolean 'enabled' field.",
+                ));
+            }
+        };
+
+        let is_chat = match obj.get("type") {
+            Some(Value::String(kind)) => {
+                let trimmed_kind = kind.trim();
+                if trimmed_kind.is_empty() || trimmed_kind.chars().any(char::is_control) {
+                    return Err(ConnectorError::ParseError(
+                        "OpenCode model catalog entry contained an invalid 'type' field.",
+                    ));
+                }
+                trimmed_kind.eq_ignore_ascii_case("chat")
+            }
+            None => true,
+            Some(_) => {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog entry contained a non-string 'type' field.",
+                ));
+            }
+        };
+
+        let raw_name = match obj.get("name") {
+            Some(Value::String(s)) => Some(s.as_str()),
+            None | Some(Value::Null) => None,
+            Some(_) => {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog entry contained a non-string 'name' field.",
+                ));
+            }
+        };
+
+        let mut efforts = Vec::new();
+        let mut seen_efforts = BTreeSet::new();
+        if let Some(variants_val) = obj.get("variants") {
+            let variants = variants_val.as_array().ok_or(ConnectorError::ParseError(
+                "OpenCode model catalog entry 'variants' field must be an array.",
+            ))?;
+            if variants.len() > MAX_CATALOG_MODELS {
+                return Err(ConnectorError::ParseError(
+                    "OpenCode model catalog entry exceeded maximum variant count.",
+                ));
+            }
+            for variant in variants {
+                let variant_obj = variant.as_object().ok_or(ConnectorError::ParseError(
+                    "OpenCode model variant entry must be a JSON object.",
+                ))?;
+                let variant_id = variant_obj.get("id").and_then(Value::as_str).ok_or(
+                    ConnectorError::ParseError(
+                        "OpenCode model variant entry was missing a string 'id' field.",
+                    ),
+                )?;
+                validate_effort_token(variant_id)?;
+                if seen_efforts.insert(variant_id.to_string()) {
+                    if efforts.len() >= MAX_EFFORTS_PER_MODEL {
+                        return Err(ConnectorError::ParseError(
+                            "OpenCode model catalog entry exceeded maximum reasoning effort count.",
+                        ));
+                    }
+                    efforts.push(variant_id.to_string());
+                }
+            }
+        }
+
+        if !enabled || !is_chat {
+            continue;
+        }
+
+        if seen_ids.insert(selectable_id.clone()) {
+            let label = format_opencode_display_label(raw_name, provider_id, &selectable_id);
+            models.push(ModelDefinition {
+                id: selectable_id.clone(),
+                tool_id: tool_id.to_string(),
+                label,
+                model_arg: selectable_id,
+                efforts,
+                allow_no_effort: true,
+            });
+            if models.len() >= MAX_CATALOG_MODELS {
+                break;
+            }
+        }
+    }
+
+    Ok(models)
+}
+
+/// Parses OpenCode standalone catalog output into [`ModelDefinition`] items.
 ///
-/// Unverified per-model reasoning efforts are never guessed (`efforts` is empty and
-/// `allow_no_effort` is `true` until configured by the user).
+/// For `opencode api --standalone model.list` JSON envelopes (`{ location, data: [Model.Info...] }`),
+/// extracts selectable `providerID/id` for both `id` and `model_arg`, retains a safe
+/// provider-differentiated display label, skips disabled and non-chat models, and reads
+/// per-model effort variants strictly from `variants[].id` in row order without copying raw
+/// `settings`, `headers`, or `body` metadata.
+///
+/// Compatible plain-list output (`provider/model` lines) leaves `efforts` empty with
+/// `allow_no_effort: true`.
 pub fn parse_opencode_models(
     tool_id: &str,
     raw_output: &str,
@@ -496,7 +739,7 @@ pub fn parse_opencode_models(
     }
 
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return parse_unverified_json_catalog(tool_id, trimmed);
+        return parse_opencode_json_catalog(tool_id, trimmed);
     }
 
     let mut models = Vec::new();
@@ -544,10 +787,59 @@ pub fn parse_opencode_models(
     Ok(models)
 }
 
+/// Known Antigravity CLI reasoning effort tokens eligible for mutually evidenced discovery.
+const KNOWN_ANTIGRAVITY_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+fn extract_antigravity_evidenced_efforts(
+    model_id: &str,
+    explicit_label: Option<&str>,
+) -> Vec<String> {
+    let Some(label) = explicit_label else {
+        return Vec::new();
+    };
+    let Some((id_prefix, id_suffix)) = model_id.rsplit_once('-') else {
+        return Vec::new();
+    };
+    if id_prefix.is_empty() || id_suffix.is_empty() {
+        return Vec::new();
+    }
+    let Some(&canonical_effort) = KNOWN_ANTIGRAVITY_EFFORTS
+        .iter()
+        .find(|&&known| known == id_suffix)
+    else {
+        return Vec::new();
+    };
+
+    let trimmed_label = label.trim();
+    let Some(before_close) = trimmed_label.strip_suffix(')') else {
+        return Vec::new();
+    };
+    let Some((label_prefix, paren_inner)) = before_close.rsplit_once('(') else {
+        return Vec::new();
+    };
+    if label_prefix.trim().is_empty() {
+        return Vec::new();
+    }
+    let candidate_label_effort = paren_inner.trim();
+    if candidate_label_effort.is_empty()
+        || candidate_label_effort.contains('(')
+        || candidate_label_effort.contains(')')
+    {
+        return Vec::new();
+    }
+    if !candidate_label_effort.eq_ignore_ascii_case(canonical_effort) {
+        return Vec::new();
+    }
+
+    vec![canonical_effort.to_string()]
+}
+
 /// Parses Antigravity (`agy models`) output into [`ModelDefinition`] items.
 ///
-/// Unverified per-model reasoning efforts are never guessed (`efforts` is empty and
-/// `allow_no_effort` is `true` until configured by the user).
+/// Preserves each concrete model `id` and `model_arg` without family grouping, and reports
+/// a single evidenced effort (`low`, `medium`, `high`, `xhigh`, or `max`) only when the
+/// final ID suffix and the final parenthesized display label mutually agree. Bare model IDs,
+/// unknown suffixes, and conflicting label-vs-ID pairs leave `efforts` empty.
 pub fn parse_antigravity_models(
     tool_id: &str,
     raw_output: &str,
@@ -581,7 +873,7 @@ pub fn parse_antigravity_models(
             .unwrap_or(line)
             .trim();
 
-        let (model_id, label) = match stripped.split_once(char::is_whitespace) {
+        let (model_id, label, efforts) = match stripped.split_once(char::is_whitespace) {
             None => {
                 validate_model_id(stripped)?;
                 if is_disallowed_noise_word(stripped) {
@@ -589,7 +881,7 @@ pub fn parse_antigravity_models(
                         "Antigravity model catalog contained an unrecognized status line.",
                     ));
                 }
-                (stripped.to_string(), stripped.to_string())
+                (stripped.to_string(), stripped.to_string(), Vec::new())
             }
             Some((first, rest)) => {
                 let id = first.trim();
@@ -617,10 +909,16 @@ pub fn parse_antigravity_models(
                 let unparenthesized = raw_label
                     .strip_prefix('(')
                     .and_then(|s| s.strip_suffix(')'))
+                    .filter(|inner| !inner.contains('(') && !inner.contains(')'))
                     .unwrap_or(raw_label)
                     .trim();
                 let lbl = sanitize_display_label(unparenthesized, id);
-                (id.to_string(), lbl)
+                let evidenced_efforts = if raw_label.is_empty() {
+                    Vec::new()
+                } else {
+                    extract_antigravity_evidenced_efforts(id, Some(&lbl))
+                };
+                (id.to_string(), lbl, evidenced_efforts)
             }
         };
 
@@ -630,7 +928,7 @@ pub fn parse_antigravity_models(
                 tool_id: tool_id.to_string(),
                 label,
                 model_arg: model_id,
-                efforts: Vec::new(),
+                efforts,
                 allow_no_effort: true,
             });
             if models.len() >= MAX_CATALOG_MODELS {

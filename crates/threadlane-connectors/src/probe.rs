@@ -96,7 +96,7 @@ impl AdapterKind {
     const fn primary_probe_args(self) -> Option<&'static [&'static str]> {
         match self {
             Self::CodexCli => Some(&["debug", "models", "--bundled"]),
-            Self::OpencodeV2 => Some(&["models", "--standalone"]),
+            Self::OpencodeV2 => Some(&["api", "--standalone", "model.list"]),
             Self::Antigravity => Some(&["models"]),
             Self::Git => Some(&["--version"]),
             Self::Tmux => Some(&["-V"]),
@@ -200,13 +200,13 @@ async fn probe_codex_cli(
 
     let message = match auth_status {
         AUTH_STATUS_AUTHENTICATED => {
-            "Codex CLI executable found and bundled catalog parsed; login status is authenticated (does not prove model entitlement)."
+            "Codex CLI executable found and bundled catalog metadata parsed; login status is authenticated (does not prove runtime model entitlement)."
         }
         AUTH_STATUS_UNAUTHENTICATED => {
-            "Codex CLI executable found and bundled catalog parsed; login status is unauthenticated."
+            "Codex CLI executable found and bundled catalog metadata parsed; login status is unauthenticated."
         }
         _ => {
-            "Codex CLI executable found and bundled catalog parsed; authentication status is unknown."
+            "Codex CLI executable found and bundled catalog metadata parsed; authentication status and runtime model entitlement are unknown."
         }
     };
 
@@ -226,7 +226,8 @@ async fn probe_opencode_v2(
     timeout: Duration,
 ) -> Result<ToolProbe, ConnectorError> {
     let catalog_out =
-        run_bounded_probe_command(executable, &["models", "--standalone"], timeout).await?;
+        run_bounded_probe_command(executable, &["api", "--standalone", "model.list"], timeout)
+            .await?;
     if catalog_out.exit_code != Some(0) {
         return Err(ConnectorError::ProbeFailed(
             "OpenCode standalone model catalog command exited with a non-zero status.",
@@ -240,7 +241,7 @@ async fn probe_opencode_v2(
         version: None,
         auth_status: AUTH_STATUS_UNKNOWN.to_string(),
         models,
-        message: "OpenCode CLI executable found and standalone model catalog parsed; authentication status is unknown and efforts require manual configuration.".to_string(),
+        message: "OpenCode CLI executable found and standalone model catalog metadata parsed; authentication status and runtime model entitlement are unknown.".to_string(),
     })
 }
 
@@ -263,7 +264,7 @@ async fn probe_antigravity(
         version: None,
         auth_status: AUTH_STATUS_UNKNOWN.to_string(),
         models,
-        message: "Antigravity CLI executable found and model catalog parsed; authentication status is unknown and efforts require manual configuration.".to_string(),
+        message: "Antigravity CLI executable found and model catalog metadata parsed; authentication status and runtime model entitlement are unknown.".to_string(),
     })
 }
 

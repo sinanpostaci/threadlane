@@ -10,15 +10,16 @@
 //!   requested (`probe_tool`), never on passive UI page load, and never invoke a shell or
 //!   model inference.
 //!   - `codex_cli`: `debug models --bundled` and `login status`
-//!   - `opencode_v2`: `models --standalone` (plain v2.2 catalog; never v1 `--verbose`/`--provider`)
+//!   - `opencode_v2`: `api --standalone model.list` (standalone v2.2 catalog with per-model variants; never v1 `--verbose`/`--provider`)
 //!   - `antigravity`: `models`
 //!   - `git` / `codegraph`: `--version`; `tmux`: `-V`
 //! - **API adapters never spawn a CLI**: `jev_api` and `openai_decisions_api` return immediately
 //!   without executing any subprocess.
-//! - **Distinct availability vs authentication**: `availability == "found"` proves only that a
-//!   valid executable exists on disk, never login or subscription entitlement. Unverified CLI
-//!   authentication states remain `"unknown"`, and unverified catalog efforts remain empty for
-//!   manual configuration.
+//! - **Distinct availability vs authentication and runtime entitlement**: `availability == "found"`
+//!   proves only that a valid executable exists on disk, and discovered catalog models/efforts
+//!   reflect installed CLI metadata rather than verified account routes or runtime subscription
+//!   entitlement. Unverified CLI authentication states remain `"unknown"`, and models without
+//!   evidenced catalog efforts leave `efforts` empty with `allow_no_effort: true`.
 //! - **Bounded process-group supervision**: Enforces a 10-second timeout, 1 MiB stdout/stderr
 //!   caps, sanitized Git environment variables, and Unix process-group termination/reaping.
 //! - **OS keychain credential boundary**: [`KeyringCredentialStore`] uses `keyring` 4.2.0 (`v1`)
@@ -260,9 +261,288 @@ Available models:
             parse_antigravity_models("antigravity", agy_out).expect("parse agy models");
         assert_eq!(agy_models.len(), 2);
         assert_eq!(agy_models[0].id, "gemini-4-argon-high");
+        assert_eq!(agy_models[0].model_arg, "gemini-4-argon-high");
         assert_eq!(agy_models[0].label, "Gemini 4 Argon (High)");
-        assert!(agy_models[0].efforts.is_empty());
+        assert_eq!(agy_models[0].efforts, vec!["high"]);
         assert!(agy_models[0].allow_no_effort);
+
+        // Bare model row without a parenthesized display label must not infer efforts.
+        assert_eq!(agy_models[1].id, "gemini-4-argon-medium");
+        assert_eq!(agy_models[1].model_arg, "gemini-4-argon-medium");
+        assert_eq!(agy_models[1].label, "gemini-4-argon-medium");
+        assert!(agy_models[1].efforts.is_empty());
+        assert!(agy_models[1].allow_no_effort);
+    }
+
+    #[test]
+    fn opencode_model_list_json_discovers_variants_and_redacts_metadata() {
+        let raw_json = r#"{
+            "location": "/home/alice/.local/share/opencode/secret-location.json",
+            "data": [
+                {
+                    "id": "deepseek-v4.1-flash",
+                    "providerID": "opencode-go",
+                    "modelID": "deepseek/deepseek-chat-v4.1-alias",
+                    "name": "DeepSeek V4.1 Flash",
+                    "enabled": true,
+                    "type": "chat",
+                    "headers": {
+                        "Authorization": "Bearer sk-sentinel-model-header-secret"
+                    },
+                    "variants": [
+                        {
+                            "id": "low",
+                            "settings": {
+                                "reasoningEffort": "low",
+                                "apiKey": "sk-sentinel-variant-low-secret"
+                            }
+                        },
+                        {
+                            "id": "high",
+                            "settings": {
+                                "reasoningEffort": "high",
+                                "headers": {"X-Api-Key": "sk-sentinel-variant-high-secret"}
+                            }
+                        },
+                        {
+                            "id": "max",
+                            "settings": {
+                                "reasoningEffort": "max",
+                                "body": {"secret_token": "sk-sentinel-variant-max-secret"}
+                            }
+                        },
+                        {
+                            "id": "high",
+                            "settings": {"duplicate": true}
+                        }
+                    ]
+                },
+                {
+                    "id": "deepseek-v4.1-flash",
+                    "providerID": "opencode",
+                    "modelID": "deepseek-v4.1-flash",
+                    "name": "DeepSeek V4.1 Flash",
+                    "enabled": true,
+                    "type": "chat",
+                    "variants": [
+                        {"id": "low", "settings": {}},
+                        {"id": "high", "settings": {}}
+                    ]
+                },
+                {
+                    "id": "claude-sonnet-4-5",
+                    "providerID": "anthropic",
+                    "modelID": "claude-3-5-sonnet-20241022",
+                    "name": "Claude Sonnet 4.5",
+                    "enabled": true,
+                    "type": "chat",
+                    "variants": []
+                },
+                {
+                    "id": "disabled-model",
+                    "providerID": "opencode-go",
+                    "modelID": "disabled-model",
+                    "name": "Disabled Model",
+                    "enabled": false,
+                    "type": "chat",
+                    "variants": [{"id": "high", "settings": {}}]
+                },
+                {
+                    "id": "text-embedding-3-large",
+                    "providerID": "openai",
+                    "modelID": "text-embedding-3-large",
+                    "name": "Text Embedding 3 Large",
+                    "enabled": true,
+                    "type": "embedding",
+                    "variants": []
+                },
+                {
+                    "id": "rerank-v3",
+                    "providerID": "cohere",
+                    "modelID": "rerank-english-v3.0",
+                    "name": "Rerank v3",
+                    "enabled": true,
+                    "type": "rerank",
+                    "variants": []
+                }
+            ]
+        }"#;
+
+        let models =
+            parse_opencode_models("opencode", raw_json).expect("parse opencode model.list JSON");
+        assert_eq!(models.len(), 3);
+
+        // 1. opencode-go/deepseek-v4.1-flash: selectable providerID/id (NOT modelID alias or bare id)
+        assert_eq!(models[0].id, "opencode-go/deepseek-v4.1-flash");
+        assert_eq!(models[0].tool_id, "opencode");
+        assert_eq!(models[0].model_arg, "opencode-go/deepseek-v4.1-flash");
+        assert_ne!(models[0].id, "deepseek/deepseek-chat-v4.1-alias");
+        assert_ne!(models[0].model_arg, "deepseek/deepseek-chat-v4.1-alias");
+        assert_ne!(models[0].id, "deepseek-v4.1-flash");
+        assert_eq!(models[0].label, "DeepSeek V4.1 Flash (opencode-go)");
+        assert_eq!(models[0].efforts, vec!["low", "high", "max"]);
+        assert!(models[0].allow_no_effort);
+
+        // 2. opencode/deepseek-v4.1-flash: distinct provider route and differentiated label
+        assert_eq!(models[1].id, "opencode/deepseek-v4.1-flash");
+        assert_eq!(models[1].model_arg, "opencode/deepseek-v4.1-flash");
+        assert_eq!(models[1].label, "DeepSeek V4.1 Flash (opencode)");
+        assert_ne!(models[0].label, models[1].label);
+        assert_eq!(models[1].efforts, vec!["low", "high"]);
+        assert!(models[1].allow_no_effort);
+
+        // 3. anthropic/claude-sonnet-4-5: no variants -> empty efforts, allow_no_effort true
+        assert_eq!(models[2].id, "anthropic/claude-sonnet-4-5");
+        assert_eq!(models[2].model_arg, "anthropic/claude-sonnet-4-5");
+        assert_eq!(models[2].label, "Claude Sonnet 4.5 (anthropic)");
+        assert!(models[2].efforts.is_empty());
+        assert!(models[2].allow_no_effort);
+
+        let serialized = serde_json::to_string(&models).expect("serialize models");
+        let debug_repr = format!("{models:?}");
+        for sentinel in [
+            "secret-location.json",
+            "sk-sentinel-model-header-secret",
+            "sk-sentinel-variant-low-secret",
+            "sk-sentinel-variant-high-secret",
+            "sk-sentinel-variant-max-secret",
+            "reasoningEffort",
+            "deepseek-chat-v4.1-alias",
+        ] {
+            assert!(
+                !serialized.contains(sentinel) && !debug_repr.contains(sentinel),
+                "DTO must never expose raw metadata or sentinel {sentinel}"
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_model_list_preserves_none_variant_and_namespaced_model_ids() {
+        let payload = r#"{"data":[{"providerID":"openrouter","id":"openrouter/free","enabled":true,"type":"chat","variants":[{"id":"none"},{"id":"high"}]}]}"#;
+        let models = parse_opencode_models("opencode", payload).expect("valid catalog metadata");
+        assert_eq!(models[0].id, "openrouter/openrouter/free");
+        assert_eq!(models[0].model_arg, "openrouter/openrouter/free");
+        assert_eq!(models[0].efforts, vec!["none", "high"]);
+    }
+
+    #[test]
+    fn opencode_model_list_rejects_invalid_schema_and_malicious_tokens_safely() {
+        let invalid_payloads = [
+            r#"{"location": "local"}"#,
+            r#"{"location": "local", "data": "not-an-array"}"#,
+            r#"{"location": "local", "data": []}"#,
+            r#"{"data": ["not-an-object"]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "enabled": true, "type": "chat"}]}"#,
+            r#"{"data": [{"providerID": "opencode-go", "enabled": true, "type": "chat"}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode/nested", "enabled": true, "type": "chat"}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "../evil", "enabled": true, "type": "chat"}]}"#,
+            r#"{"data": [{"id": "-bad-flag", "providerID": "opencode-go", "enabled": true, "type": "chat"}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": "yes", "type": "chat"}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": 123}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": "high"}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": ["high"]}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": [{"settings": {"apiKey": "sk-leak-sentinel-999"}}]}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": [{"id": ""}]}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": [{"id": " high "}]}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": [{"id": "-high"}]}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": [{"id": "high#inject"}]}]}"#,
+            r#"{"data": [{"id": "deepseek-v4.1-flash", "providerID": "opencode-go", "enabled": true, "type": "chat", "variants": [{"id": "high;rm -rf /", "settings": {"token": "sk-leak-sentinel-999"}}]}]}"#,
+        ];
+
+        for payload in invalid_payloads {
+            let err = parse_opencode_models("opencode", payload)
+                .expect_err("invalid or malicious OpenCode JSON payload must fail");
+            assert_eq!(err.code(), "parse_error");
+            let wire = serde_json::to_string(&err).expect("serialize error");
+            assert!(!err.to_string().contains("sk-leak-sentinel-999"));
+            assert!(!format!("{err:?}").contains("sk-leak-sentinel-999"));
+            assert!(!wire.contains("sk-leak-sentinel-999"));
+            assert!(!err.to_string().contains("rm -rf"));
+        }
+
+        // Oversized variant count (> 32 distinct efforts) must fail with static ParseError.
+        let many_variants: Vec<serde_json::Value> = (0..33)
+            .map(|i| json!({"id": format!("level-{i}"), "settings": {}}))
+            .collect();
+        let oversized_json = serde_json::to_string(&json!({
+            "location": "local",
+            "data": [{
+                "id": "deepseek-v4.1-flash",
+                "providerID": "opencode-go",
+                "enabled": true,
+                "type": "chat",
+                "variants": many_variants
+            }]
+        }))
+        .expect("serialize oversized variants");
+        let err = parse_opencode_models("opencode", &oversized_json)
+            .expect_err("exceeding MAX_EFFORTS_PER_MODEL must fail");
+        assert_eq!(err.code(), "parse_error");
+    }
+
+    #[test]
+    fn antigravity_parser_discovers_mutually_agreeing_efforts_and_leaves_ambiguous_unknown() {
+        let agy_out = "\
+gemini-4-argon-medium\tGemini 4 Argon (Medium)
+gemini-4-argon-high\tGemini 4 Argon (High)
+gemini-4-argon-low\tGemini 4 Argon (Low)
+gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+claude-opus-5-5-high\tClaude Opus 5.5 (High)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+gpt-6-sol-xhigh\tGPT-6 Sol (XHigh)
+gpt-6-astra-max\tGPT-6 Astra (Max)
+claude-sonnet-4-5\tClaude Sonnet 4.5
+gemini-4-argon-preview\tGemini 4 Argon (Preview)
+gemini-4-argon-conflict-high\tGemini 4 Argon Conflict (Medium)
+gemini-4-argon-idonly-high\tGemini 4 Argon IdOnly
+gemini-4-argon-labelonly\tGemini 4 Argon LabelOnly (High)
+";
+
+        let models =
+            parse_antigravity_models("antigravity", agy_out).expect("parse agy models output");
+        assert_eq!(models.len(), 13);
+
+        let expected: &[(&str, &str, &[&str])] = &[
+            (
+                "gemini-4-argon-medium",
+                "Gemini 4 Argon (Medium)",
+                &["medium"],
+            ),
+            ("gemini-4-argon-high", "Gemini 4 Argon (High)", &["high"]),
+            ("gemini-4-argon-low", "Gemini 4 Argon (Low)", &["low"]),
+            (
+                "gemini-3.8-flash-high",
+                "Gemini 3.8 Flash (High)",
+                &["high"],
+            ),
+            ("claude-opus-5-5-high", "Claude Opus 5.5 (High)", &["high"]),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)", &["medium"]),
+            ("gpt-6-sol-xhigh", "GPT-6 Sol (XHigh)", &["xhigh"]),
+            ("gpt-6-astra-max", "GPT-6 Astra (Max)", &["max"]),
+            ("claude-sonnet-4-5", "Claude Sonnet 4.5", &[]),
+            ("gemini-4-argon-preview", "Gemini 4 Argon (Preview)", &[]),
+            (
+                "gemini-4-argon-conflict-high",
+                "Gemini 4 Argon Conflict (Medium)",
+                &[],
+            ),
+            ("gemini-4-argon-idonly-high", "Gemini 4 Argon IdOnly", &[]),
+            (
+                "gemini-4-argon-labelonly",
+                "Gemini 4 Argon LabelOnly (High)",
+                &[],
+            ),
+        ];
+
+        for (model, (exp_id, exp_label, exp_efforts)) in models.iter().zip(expected.iter()) {
+            assert_eq!(model.id, *exp_id);
+            assert_eq!(model.model_arg, *exp_id);
+            assert_eq!(model.tool_id, "antigravity");
+            assert_eq!(model.label, *exp_label);
+            let expected_vec: Vec<String> = exp_efforts.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(model.efforts, expected_vec, "mismatch for model {exp_id}");
+            assert!(model.allow_no_effort);
+        }
     }
 
     #[tokio::test]
@@ -300,6 +580,11 @@ exit 2
 
     #[tokio::test]
     async fn probe_opencode_v2_uses_exact_standalone_args_and_unknown_auth() {
+        assert_eq!(
+            probe_command_template(&ToolAdapter::OpencodeV2),
+            Some(&["api", "--standalone", "model.list"][..])
+        );
+
         let temp = TempDir::new().expect("tempdir");
         let args_log = temp.path().join("args.txt");
         let script = write_executable_script(
@@ -308,8 +593,10 @@ exit 2
             &format!(
                 r#"#!/bin/sh
 printf '%s' "$*" > "{}"
-if [ "$1" = "models" ] && [ "$2" = "--standalone" ] && [ $# -eq 2 ]; then
-  echo "opencode-go/deepseek-v4.1-flash"
+if [ "$1" = "api" ] && [ "$2" = "--standalone" ] && [ "$3" = "model.list" ] && [ $# -eq 3 ]; then
+  cat <<'EOF'
+{{"location":"/tmp/opencode-secret-path","data":[{{"id":"deepseek-v4.1-flash","providerID":"opencode-go","modelID":"deepseek-chat","name":"DeepSeek V4.1 Flash","enabled":true,"type":"chat","variants":[{{"id":"low","settings":{{"apiKey":"sk-secret-probe-token"}}}},{{"id":"high","settings":{{}}}},{{"id":"max","settings":{{}}}}]}}]}}
+EOF
   exit 0
 fi
 exit 1
@@ -322,12 +609,60 @@ exit 1
         let probe = probe_tool(&tool).await.expect("probe opencode");
 
         let recorded_args = fs::read_to_string(&args_log).expect("read recorded args");
-        assert_eq!(recorded_args, "models --standalone");
+        assert_eq!(recorded_args, "api --standalone model.list");
         assert_eq!(probe.availability, AVAILABILITY_FOUND);
         assert_eq!(probe.auth_status, AUTH_STATUS_UNKNOWN);
         assert_eq!(probe.models.len(), 1);
         assert_eq!(probe.models[0].id, "opencode-go/deepseek-v4.1-flash");
-        assert!(probe.models[0].efforts.is_empty());
+        assert_eq!(probe.models[0].model_arg, "opencode-go/deepseek-v4.1-flash");
+        assert_eq!(probe.models[0].label, "DeepSeek V4.1 Flash (opencode-go)");
+        assert_eq!(probe.models[0].efforts, vec!["low", "high", "max"]);
+        assert!(probe.models[0].allow_no_effort);
+        assert!(!probe.message.contains("manual configuration"));
+        assert!(!probe.message.contains("sk-secret-probe-token"));
+        assert!(!probe.message.contains("opencode-secret-path"));
+    }
+
+    #[tokio::test]
+    async fn probe_antigravity_uses_exact_models_args_and_discovers_efforts() {
+        assert_eq!(
+            probe_command_template(&ToolAdapter::Antigravity),
+            Some(&["models"][..])
+        );
+
+        let temp = TempDir::new().expect("tempdir");
+        let args_log = temp.path().join("agy-args.txt");
+        let script = write_executable_script(
+            temp.path(),
+            "fake-agy",
+            &format!(
+                r#"#!/bin/sh
+printf '%s' "$*" > "{}"
+if [ "$1" = "models" ] && [ $# -eq 1 ]; then
+  printf 'gemini-4-argon-high\tGemini 4 Argon (High)\ngemini-4-argon-medium\tGemini 4 Argon (Medium)\n'
+  exit 0
+fi
+exit 1
+"#,
+                args_log.display()
+            ),
+        );
+
+        let tool = build_tool_definition("agy", "Antigravity", "antigravity", Some(script));
+        let probe = probe_tool(&tool).await.expect("probe antigravity");
+
+        let recorded_args = fs::read_to_string(&args_log).expect("read recorded args");
+        assert_eq!(recorded_args, "models");
+        assert_eq!(probe.availability, AVAILABILITY_FOUND);
+        assert_eq!(probe.auth_status, AUTH_STATUS_UNKNOWN);
+        assert_eq!(probe.models.len(), 2);
+        assert_eq!(probe.models[0].id, "gemini-4-argon-high");
+        assert_eq!(probe.models[0].model_arg, "gemini-4-argon-high");
+        assert_eq!(probe.models[0].efforts, vec!["high"]);
+        assert_eq!(probe.models[1].id, "gemini-4-argon-medium");
+        assert_eq!(probe.models[1].model_arg, "gemini-4-argon-medium");
+        assert_eq!(probe.models[1].efforts, vec!["medium"]);
+        assert!(!probe.message.contains("manual configuration"));
     }
 
     #[tokio::test]
