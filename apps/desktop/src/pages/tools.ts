@@ -146,6 +146,62 @@ function brandFor(adapter: Adapter) {
   return 'generic' as const;
 }
 
+interface DiscoveryCliSetup {
+  adapter: Adapter;
+  label: string;
+  idBase: string;
+}
+
+function discoveryCliSetup(toolId: string, label: string): DiscoveryCliSetup | null {
+  const identity = `${toolId} ${label}`.toLowerCase();
+  if (identity.includes('opencode')) {
+    return {
+      adapter: 'opencode_v2',
+      label: ADAPTER_LABELS.opencode_v2,
+      idBase: 'opencode-v2',
+    };
+  }
+  if (identity.includes('antigravity') || /\bagy\b/.test(identity)) {
+    return {
+      adapter: 'antigravity',
+      label: ADAPTER_LABELS.antigravity,
+      idBase: 'antigravity',
+    };
+  }
+  if (identity.includes('codex')) {
+    return {
+      adapter: 'codex_cli',
+      label: ADAPTER_LABELS.codex_cli,
+      idBase: 'codex-cli',
+    };
+  }
+  return null;
+}
+
+export function isConfigurableDiscoveredCli(toolId: string, label: string): boolean {
+  return discoveryCliSetup(toolId, label) !== null;
+}
+
+function uniqueToolId(baseId: string, tools: readonly ToolDefinition[]): string {
+  const used = new Set(tools.map((tool) => tool.id));
+  if (!used.has(baseId)) return baseId;
+  let suffix = 2;
+  while (used.has(`${baseId}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${baseId}-${suffix}`;
+}
+
+function hasNewToolContent(draft: ToolDraft): boolean {
+  return Boolean(
+    draft.id.trim() ||
+      draft.label.trim() ||
+      draft.executable.trim() ||
+      draft.adapter !== 'codex_cli' ||
+      !draft.enabled
+  );
+}
+
 function parseEfforts(raw: string): string[] {
   const seen = new Set<string>();
   const efforts: string[] = [];
@@ -427,6 +483,68 @@ export class ToolsPage {
     return root;
   }
 
+  configureDiscoveredTool(toolId: string, label: string, executablePath: string): void {
+    if (this.disposed || !this.snapshot) return;
+    const setup = discoveryCliSetup(toolId, label);
+    const path = executablePath.trim();
+    if (!setup || !path) {
+      this.notice = {
+        tone: 'info',
+        title: 'Discovery not configured',
+        text: 'This discovered command does not map to a supported CLI adapter. Add the tool manually below.',
+      };
+      this.refresh();
+      return;
+    }
+
+    const existing = this.snapshot.tools.find(
+      (tool) => tool.adapter === setup.adapter && (tool.executable_path ?? '').trim() === path
+    );
+    if (existing) {
+      this.expanded.add(`tool:${existing.id}`);
+      this.notice = {
+        tone: 'info',
+        title: 'Already registered',
+        text: `${setup.label} with this executable path is already registered. Opened its details; nothing was changed or probed.`,
+      };
+      this.rewrite();
+      this.focusAndScroll(`tool-${existing.id}-details`);
+      return;
+    }
+
+    if (this.newTool.dirty && hasNewToolContent(this.newTool)) {
+      this.expanded.add('create-tool');
+      this.notice = {
+        tone: 'info',
+        title: 'Unsaved draft preserved',
+        text: `The Add tool form already has unsaved changes, so discovery did not prefill ${setup.label}. Review or clear that draft before trying Configure again.`,
+      };
+      this.rewrite();
+      this.focusAndScroll('new-tool-id');
+      return;
+    }
+
+    this.newTool = {
+      id: uniqueToolId(setup.idBase, this.snapshot.tools),
+      label: setup.label,
+      adapter: setup.adapter,
+      executable: path,
+      enabled: true,
+      baseRevision: this.snapshot.revision,
+      dirty: true,
+      conflict: false,
+      overwrite: false,
+    };
+    this.expanded.add('create-tool');
+    this.notice = {
+      tone: 'info',
+      title: 'Add tool prefilled',
+      text: `Prefilled ${setup.label} from local PATH discovery. Nothing was saved or probed. Save the tool, then load models and import the entries you want.`,
+    };
+    this.rewrite();
+    this.focusAndScroll('new-tool-id');
+  }
+
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
@@ -452,6 +570,25 @@ export class ToolsPage {
 
   private refresh(): void {
     if (!this.disposed) this.rewrite();
+  }
+
+  private focusAndScroll(key: string): void {
+    const focusKey = token(key);
+    const attempt = (): boolean => {
+      if (this.disposed || !this.root || !this.root.isConnected) return false;
+      const target = Array.from(
+        this.root.querySelectorAll<HTMLElement>('[data-focus-key]')
+      ).find((element) => element.dataset.focusKey === focusKey);
+      if (!target) return false;
+      target.focus({ preventScroll: true });
+      target.scrollIntoView?.({ block: 'nearest' });
+      return true;
+    };
+
+    queueMicrotask(() => {
+      if (attempt()) return;
+      setTimeout(attempt, 0);
+    });
   }
 
   private toggleExpanded(key: string): void {
@@ -564,7 +701,7 @@ export class ToolsPage {
           h(
             'p',
             { className: 'aq-note' },
-            'Custom executable paths and enabled state live here. API adapters never spawn a CLI.'
+            'Custom executable paths and enabled state live here. API adapters never spawn a CLI. Setup: save a tool, load its models, select and import entries, then assign them in Profiles.'
           )
         ),
         h('span', { className: 'aq-badge' }, `${enabled} enabled`)
@@ -645,7 +782,9 @@ export class ToolsPage {
             ? h(
                 'p',
                 { className: 'aq-note' },
-                'ID and label are required. The executable path is optional and is never executed by the registry.'
+                draft.dirty
+                  ? 'Unsaved Add tool draft. Configure preserves existing input; save this tool before loading models.'
+                  : 'ID and label are required. The executable path is optional and is never executed by the registry.'
               )
             : null
         ),
@@ -773,7 +912,7 @@ export class ToolsPage {
               this.field(
                 'Executable path',
                 executable,
-                'Custom path applies to this tool only. Save before probing a changed path.'
+                'Custom path applies to this tool only. Save before loading models from a changed path.'
               ),
               this.checkField('Enabled for profiles', enabled)
             ),
@@ -811,7 +950,7 @@ export class ToolsPage {
               ),
               provider === null
                 ? this.button(
-                    this.pending.has(`probe:${tool.id}`) ? 'Probing…' : 'Probe saved tool',
+                    this.pending.has(`probe:${tool.id}`) ? 'Loading models…' : 'Load models',
                     () => void this.probe(tool),
                     `tool-${tool.id}-probe`,
                     undefined,
@@ -867,9 +1006,9 @@ export class ToolsPage {
               'p',
               { className: 'aq-tools-hint' },
               changed
-                ? 'Draft changes are not used by probing or API controls until saved.'
+                ? 'Draft changes are not used by loading models or API controls until saved.'
                 : provider === null
-                  ? 'Probe uses the saved tool definition. A found executable is not login or subscription proof.'
+                  ? 'Load models uses the saved tool definition. A found executable is not login or subscription proof.'
                   : 'API adapters never spawn a CLI. Credential and synthetic controls use the saved tool definition.'
             ),
             this.buildStatus(provider, probe),
@@ -913,7 +1052,7 @@ export class ToolsPage {
       result?.message
         ? h('p', { className: 'aq-tools-message' }, safeText(result.message, 'No diagnostic message.'))
         : null,
-      probe?.loading ? h('p', { className: 'aq-tools-inline-status', role: 'status' }, 'Probing saved tool…') : null,
+      probe?.loading ? h('p', { className: 'aq-tools-inline-status', role: 'status' }, 'Loading catalog models…') : null,
       probe?.error ? this.errorBlock(probe.error) : null
     );
   }
@@ -921,16 +1060,26 @@ export class ToolsPage {
   private buildProbe(tool: ToolDefinition, probe: ProbeState | undefined): HTMLElement {
     if (!probe || (!probe.result && !probe.error && !probe.loading)) {
       return h(
-        'p',
-        { className: 'aq-note aq-tools-probe-empty' },
-        'No probe result. Nothing has been executed for this tool in this view.'
+        'div',
+        { className: 'aq-tools-probe aq-tools-probe-empty' },
+        h('h5', undefined, 'Model catalog'),
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          'No catalog loaded. Choose Load models when you want to query the saved tool; nothing is fetched automatically.'
+        ),
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          'Setup: save this tool, load models, select and import desired entries, then assign them in Profiles.'
+        )
       );
     }
     if (!probe.result) {
       return h(
         'div',
         { className: 'aq-tools-probe' },
-        h('h5', undefined, 'Catalog probe'),
+        h('h5', undefined, 'Model catalog'),
         probe.error ? this.errorBlock(probe.error) : null
       );
     }
@@ -945,11 +1094,11 @@ export class ToolsPage {
     return h(
       'div',
       { className: 'aq-tools-probe' },
-      h('h5', undefined, 'Catalog probe'),
+      h('h5', undefined, 'Model catalog'),
       h(
         'p',
         { className: 'aq-tools-hint' },
-        'Catalog metadata only. Import uses upsert_models at the latest registry revision; entitlement and effort support remain unverified.'
+        'Setup: select and import desired entries, then assign them in Profiles. Catalog metadata only; import uses upsert_models at the latest registry revision. Entitlement and effort support remain unverified.'
       ),
       existing > 0
         ? h(

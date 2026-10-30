@@ -558,6 +558,7 @@ function roleState(
 
 export class ProfilesPage {
   private readonly onRegistryChanged: () => void;
+  private readonly onOpenTools: () => void;
   private readonly instanceId: number;
   private root: HTMLElement | null = null;
   private snapshot: RegistrySnapshot | null = null;
@@ -574,8 +575,9 @@ export class ProfilesPage {
   private reloadGeneration = 0;
   private overridesOpen = new Set<string>();
 
-  constructor(onRegistryChanged: () => void) {
+  constructor(onRegistryChanged: () => void, onOpenTools: () => void = () => {}) {
     this.onRegistryChanged = onRegistryChanged;
+    this.onOpenTools = onOpenTools;
     this.instanceId = nextPageId;
     nextPageId += 1;
   }
@@ -587,12 +589,14 @@ export class ProfilesPage {
       return this.root;
     }
 
+    const scrollPositions = this.captureAncestorScroll(this.root);
     this.detectExternalChange(snapshot);
     this.index = buildIndex(snapshot);
     this.root = this.build(snapshot);
     this.renderedRevision = snapshot.revision;
+    this.restoreAncestorScroll(scrollPositions);
     if (focus) {
-      this.queueFocusRestore(this.root, focus);
+      this.queueFocusRestore(this.root, focus, scrollPositions);
     }
     return this.root;
   }
@@ -616,6 +620,11 @@ export class ProfilesPage {
     const analysis = this.draft && this.index
       ? analyzeWithIndex(this.index, this.draft)
       : null;
+    const inlineTargetId =
+      this.draft?.mode === 'edit' ? (this.draft.sourceId ?? this.draft.id) : null;
+    const renderInlineEditor =
+      inlineTargetId !== null &&
+      snapshot.profiles.some((profile) => profile.id === inlineTargetId);
 
     return h(
       'section',
@@ -626,10 +635,16 @@ export class ProfilesPage {
       },
       this.buildHeader(snapshot, headingId),
       ...this.buildBanners(),
-      this.draft && analysis
+      this.buildModelSetupNotice(snapshot),
+      this.draft && analysis && !renderInlineEditor
         ? this.buildEditor(snapshot, this.draft, analysis)
         : null,
-      this.buildList(snapshot)
+      this.buildList(
+        snapshot,
+        renderInlineEditor && this.draft && analysis
+          ? { targetId: inlineTargetId, draft: this.draft, analysis }
+          : null
+      )
     );
   }
 
@@ -702,6 +717,49 @@ export class ProfilesPage {
     );
   }
 
+  private buildModelSetupNotice(snapshot: RegistrySnapshot): HTMLElement | null {
+    const enabledTools = snapshot.tools.filter((tool) => tool.enabled);
+    const enabledToolIds = new Set(enabledTools.map((tool) => tool.id));
+    const enabledModels = snapshot.models.filter((model) => enabledToolIds.has(model.tool_id));
+    if (enabledModels.length > 0) {
+      return null;
+    }
+
+    let title = 'No models available for profiles';
+    let detail = '';
+    if (snapshot.tools.length === 0) {
+      title = 'No tools registered';
+      detail =
+        'Profile model selectors are empty because no tools are registered. Open Tools to configure a discovered CLI, save the tool, and import its model catalog. PATH discovery alone does not register or authenticate a tool.';
+    } else if (enabledTools.length === 0) {
+      title = 'All tools disabled';
+      detail =
+        'Profile model selectors are empty because every registered tool is disabled. Open Tools to enable a tool, then load and import its model catalog.';
+    } else if (snapshot.models.length === 0) {
+      title = 'No models registered';
+      detail =
+        'Profile model selectors are empty because no models are registered for enabled tools. Open Tools, load models for a saved tool, and import the entries you want. Model and effort values are never inferred.';
+    } else {
+      title = 'No enabled-tool models';
+      detail =
+        'Models exist only under disabled tools, so no models are selectable here. Open Tools to enable a tool or import models for an enabled tool.';
+    }
+
+    return banner(
+      'info',
+      title,
+      `${detail} Loading catalog metadata does not verify login, entitlement, or execution readiness.`,
+      [
+        button('Open Tools', () => this.onOpenTools(), {
+          className: 'aq-btn aq-btn-primary',
+          disabled: this.pending !== null,
+          focusKey: 'open-tools',
+          ariaLabel: 'Open Tools to configure tools and models',
+        }),
+      ]
+    );
+  }
+
   private buildBanners(): (HTMLElement | null)[] {
     const banners: (HTMLElement | null)[] = [];
 
@@ -762,7 +820,14 @@ export class ProfilesPage {
     return banners;
   }
 
-  private buildList(snapshot: RegistrySnapshot): HTMLElement {
+  private buildList(
+    snapshot: RegistrySnapshot,
+    inlineEditor: {
+      targetId: string;
+      draft: ProfileDraft;
+      analysis: DraftAnalysis;
+    } | null = null
+  ): HTMLElement {
     const listId = `aq-profiles-list-${this.instanceId}`;
     const children: (HTMLElement | null)[] = [
       h(
@@ -791,8 +856,15 @@ export class ProfilesPage {
         )
       );
     } else {
+      let inlineBuilt = false;
       for (const profile of snapshot.profiles) {
         children.push(this.buildProfileCard(snapshot, profile));
+        if (!inlineBuilt && inlineEditor && profile.id === inlineEditor.targetId) {
+          children.push(
+            this.buildEditor(snapshot, inlineEditor.draft, inlineEditor.analysis)
+          );
+          inlineBuilt = true;
+        }
       }
     }
 
@@ -1232,13 +1304,20 @@ export class ProfilesPage {
   ): HTMLSelectElement {
     const index = this.index;
     const key = `${role}:${slot}`;
+    const hasAssignableModels = index?.groups.some((group) => group.models.length > 0) ?? false;
     const select = h('select', {
       class: 'aq-profiles-select',
       'aria-label': `${ROLE_LABELS[role]} ${slotLabel(slot)} model`,
       'data-model-key': key,
       'data-focus-key': `model-${role}-${slot}`,
     });
-    select.append(h('option', { value: '' }, 'Not assigned'));
+    select.append(
+      h(
+        'option',
+        { value: '' },
+        hasAssignableModels ? 'Not assigned' : 'No enabled-tool models available'
+      )
+    );
 
     if (index) {
       let selected = false;
@@ -1571,9 +1650,15 @@ export class ProfilesPage {
     if (this.pending !== null || !this.draft) {
       return;
     }
+    const editTargetId =
+      this.draft.mode === 'edit' ? (this.draft.sourceId ?? this.draft.id) : null;
+    const focusKey =
+      editTargetId && this.snapshot?.profiles.some((profile) => profile.id === editTargetId)
+        ? `edit-${editTargetId}`
+        : 'new-profile';
     this.draft = null;
     this.resetTransientState();
-    this.rebuild('new-profile');
+    this.rebuild(focusKey);
   }
 
   private async saveDraft(): Promise<void> {
@@ -1613,11 +1698,13 @@ export class ProfilesPage {
   }
 
   private async deleteProfile(profile: WorkflowProfile): Promise<void> {
+    const focusKey =
+      this.draft && this.draft.sourceId !== profile.id ? 'profile-name' : 'new-profile';
     await this.runChange(
       { op: 'delete_profile', profile_id: profile.id },
       { kind: 'delete', targetId: profile.id },
       `Profile "${profile.name}" deleted.`,
-      'new-profile',
+      focusKey,
       () => {
         if (this.draft?.sourceId === profile.id) {
           this.draft = null;
@@ -1637,11 +1724,16 @@ export class ProfilesPage {
   }
 
   private async clearDefault(): Promise<void> {
+    const focusKey = this.draft
+      ? this.draft.mode === 'edit'
+        ? `edit-${this.draft.sourceId ?? this.draft.id}`
+        : 'profile-name'
+      : 'new-profile';
     await this.runChange(
       { op: 'set_default_profile', profile_id: null },
       { kind: 'default' },
       'Default profile cleared.',
-      'new-profile'
+      focusKey
     );
   }
 
@@ -1825,6 +1917,7 @@ export class ProfilesPage {
       return;
     }
     const focus = focusKey ?? this.captureFocus();
+    const scrollPositions = this.captureAncestorScroll(this.root);
     const next = this.build(this.snapshot);
     const previous = this.root;
     this.root = next;
@@ -1832,11 +1925,38 @@ export class ProfilesPage {
     if (previous?.parentNode) {
       previous.parentNode.replaceChild(next, previous);
     }
+    this.restoreAncestorScroll(scrollPositions);
     if (focus) {
       this.queueFocusRestore(
         next,
-        typeof focus === 'string' ? { key: focus, start: null, end: null } : focus
+        typeof focus === 'string' ? { key: focus, start: null, end: null } : focus,
+        scrollPositions
       );
+    }
+  }
+
+  private captureAncestorScroll(
+    node: HTMLElement | null
+  ): Array<{ el: HTMLElement; top: number; left: number }> {
+    const saved: Array<{ el: HTMLElement; top: number; left: number }> = [];
+    let current = node?.parentElement ?? null;
+    while (current) {
+      saved.push({ el: current, top: current.scrollTop, left: current.scrollLeft });
+      current = current.parentElement;
+    }
+    return saved;
+  }
+
+  private restoreAncestorScroll(
+    saved: ReadonlyArray<{ el: HTMLElement; top: number; left: number }>
+  ): void {
+    for (const item of saved) {
+      if (item.el.scrollTop !== item.top) {
+        item.el.scrollTop = item.top;
+      }
+      if (item.el.scrollLeft !== item.left) {
+        item.el.scrollLeft = item.left;
+      }
     }
   }
 
@@ -1858,7 +1978,11 @@ export class ProfilesPage {
     return { key, start: null, end: null };
   }
 
-  private queueFocusRestore(root: HTMLElement, focus: FocusState): void {
+  private queueFocusRestore(
+    root: HTMLElement,
+    focus: FocusState,
+    scrollPositions: ReadonlyArray<{ el: HTMLElement; top: number; left: number }> = []
+  ): void {
     if (this.focusTimer !== null) {
       clearTimeout(this.focusTimer);
       this.focusTimer = null;
@@ -1890,6 +2014,7 @@ export class ProfilesPage {
       ) {
         target.setSelectionRange(focus.start, focus.end);
       }
+      this.restoreAncestorScroll(scrollPositions);
       return true;
     };
 

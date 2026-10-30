@@ -31,6 +31,7 @@ import {
   formatToolAvailability,
   matchesProviderFilter,
   resolveTaskBrand,
+  resolveToolBrand,
   sanitizeAppearancePreferences,
   sanitizeExecutionPreferences,
 } from './format.ts';
@@ -101,7 +102,7 @@ import {
 } from './registry/ipc.ts';
 import { createBrandIconElement, createUiIcon, type UiIconName } from './icons.ts';
 import { createButton, h } from './ui/dom.ts';
-import { ToolsPage } from './pages/tools.ts';
+import { ToolsPage, isConfigurableDiscoveredCli } from './pages/tools.ts';
 import { ProfilesPage } from './pages/profiles.ts';
 import { PlansPage } from './pages/plans.ts';
 import { NativeLinkingPanel } from './pages/native.ts';
@@ -223,9 +224,17 @@ class ThreadlaneDesktopApp {
     this.toolsPage = new ToolsPage(() => {
       void this.refreshRegistry();
     });
-    this.profilesPage = new ProfilesPage(() => {
-      void this.refreshRegistry();
-    });
+    this.profilesPage = new ProfilesPage(
+      () => {
+        void this.refreshRegistry();
+      },
+      () => {
+        this.returnFocusKey = null;
+        this.state = navigateToPage(this.state, 'tools');
+        this.render('nav-tools');
+        this.mainEl.scrollTop = 0;
+      }
+    );
     this.plansPage = new PlansPage(() => {
       void this.refreshPlansPageData(true);
     });
@@ -623,6 +632,9 @@ class ThreadlaneDesktopApp {
       toolsLoading: true,
       toolsError: null,
     };
+    if (this.state.detailTarget === null && this.state.page === 'tools') {
+      this.renderPreserveActiveInput();
+    }
     try {
       const tools = await ipcDesktopToolStatus();
       this.state = {
@@ -825,28 +837,82 @@ class ThreadlaneDesktopApp {
     document.documentElement.style.colorScheme = colorScheme;
   }
 
-  private renderPreserveActiveInput(): void {
-    const active = document.activeElement as HTMLElement | null;
-    if (active && active instanceof HTMLInputElement && active.dataset.focus) {
-      const focusKey = active.dataset.focus;
-      const selStart = active.selectionStart;
-      const selEnd = active.selectionEnd;
-      this.render(focusKey);
-      const restored = this.root.querySelector<HTMLInputElement>(
-        `[data-focus="${focusKey}"]`
-      );
-      if (restored && selStart !== null && selEnd !== null) {
-        try {
-          restored.setSelectionRange(selStart, selEnd);
-        } catch {
-          // Non-text inputs (e.g. number/range) do not support setSelectionRange.
-        }
+  private findFocusTarget(
+    attr: 'focus' | 'focusKey',
+    key: string
+  ): HTMLElement | null {
+    const selector = attr === 'focus' ? '[data-focus]' : '[data-focus-key]';
+    for (const element of this.root.querySelectorAll<HTMLElement>(selector)) {
+      if (element.dataset[attr] === key) {
+        return element;
       }
+    }
+    return null;
+  }
+
+  private renderPreserveActiveInput(): void {
+    const active =
+      typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const hasActiveInApp =
+      active !== null && active !== this.root && this.root.contains(active);
+    if (!hasActiveInApp || !active) {
+      this.render();
       return;
     }
-    const currentFocus =
-      active && this.root.contains(active) ? active.dataset.focus : undefined;
-    this.render(currentFocus);
+
+    const focusAttr: 'focus' | 'focusKey' | null = active.dataset.focus
+      ? 'focus'
+      : active.dataset.focusKey
+        ? 'focusKey'
+        : null;
+    const focusKey = focusAttr ? active.dataset[focusAttr] ?? null : null;
+
+    const isTextControl =
+      active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement;
+    let selStart: number | null = null;
+    let selEnd: number | null = null;
+    let selDirection: 'forward' | 'backward' | 'none' | null = null;
+    if (isTextControl) {
+      try {
+        selStart = active.selectionStart;
+        selEnd = active.selectionEnd;
+        selDirection = active.selectionDirection;
+      } catch {
+        selStart = null;
+        selEnd = null;
+        selDirection = null;
+      }
+    }
+
+    const prevScrollTop = this.mainEl.scrollTop;
+    this.render();
+
+    const restored =
+      (focusAttr && focusKey ? this.findFocusTarget(focusAttr, focusKey) : null) ??
+      (this.root.contains(active) ? active : null);
+
+    if (restored && !(restored as { disabled?: boolean }).disabled) {
+      restored.focus({ preventScroll: true });
+      if (
+        (restored instanceof HTMLInputElement ||
+          restored instanceof HTMLTextAreaElement) &&
+        selStart !== null &&
+        selEnd !== null
+      ) {
+        try {
+          if (selDirection) {
+            restored.setSelectionRange(selStart, selEnd, selDirection);
+          } else {
+            restored.setSelectionRange(selStart, selEnd);
+          }
+        } catch {
+          // Non-text inputs (e.g. number/range/checkbox) do not support setSelectionRange.
+        }
+      }
+    }
+    this.mainEl.scrollTop = prevScrollTop;
   }
 
   private render(focusKey?: string): void {
@@ -859,8 +925,13 @@ class ThreadlaneDesktopApp {
     this.mainEl.scrollTop = prevScrollTop;
 
     if (focusKey) {
-      const target = this.root.querySelector<HTMLElement>(`[data-focus="${focusKey}"]`);
-      target?.focus({ preventScroll: true });
+      const target =
+        this.findFocusTarget('focus', focusKey) ??
+        this.findFocusTarget('focusKey', focusKey);
+      if (target && !(target as { disabled?: boolean }).disabled) {
+        target.focus({ preventScroll: true });
+      }
+      this.mainEl.scrollTop = prevScrollTop;
     }
   }
 
@@ -1863,6 +1934,7 @@ class ThreadlaneDesktopApp {
 
   private buildToolsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    frag.appendChild(this.buildLocalDiscoverySection());
     frag.appendChild(this.buildRegistryHeaderBar());
 
     if (this.state.registryError) {
@@ -1876,39 +1948,182 @@ class ThreadlaneDesktopApp {
     }
 
     frag.appendChild(this.toolsPage.render(this.state.registrySnapshot));
-
-    if (this.state.tools.length > 0) {
-      frag.appendChild(this.buildPassivePathStatusDetails(this.state.tools));
-    }
-
     return frag;
   }
 
-  private buildPassivePathStatusDetails(tools: readonly ToolStatus[]): HTMLElement {
-    const details = h('details', { className: 'aq-technical' });
-    details.appendChild(
+  private buildLocalDiscoverySection(): HTMLElement {
+    const { tools, toolsLoading, toolsError } = this.state;
+    const hasResults = tools.length > 0;
+    const titleId = 'aq-local-discovery-title';
+    const refreshLabel = toolsLoading ? 'Refreshing…' : 'Refresh discovery';
+
+    const section = h(
+      'section',
+      { className: 'aq-discovery', 'aria-labelledby': titleId, 'aria-busy': toolsLoading ? 'true' : undefined },
       h(
-        'summary',
-        { 'data-focus': 'passive-path-summary' },
-        h('span', undefined, 'Passive PATH command lookup (no CLI execution)'),
-        createUiIcon('chevron-down')
+        'div',
+        { className: 'aq-discovery-head' },
+        h(
+          'div',
+          { className: 'aq-discovery-heading' },
+          h('p', { className: 'aq-kicker' }, 'Local discovery'),
+          h('h2', { className: 'aq-discovery-title', id: titleId }, 'Tools on this device')
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'aq-btn aq-discovery-refresh',
+            'data-action': 'refresh-tools',
+            'data-focus': 'discovery-refresh',
+            'aria-label': 'Refresh discovery',
+            title: 'Refresh discovery',
+            disabled: toolsLoading,
+          },
+          createUiIcon('refresh-cw'),
+          h('span', undefined, refreshLabel)
+        )
+      ),
+      h(
+        'p',
+        { className: 'aq-discovery-note' },
+        'Read-only PATH lookup on this device. It does not verify login, credentials, version, model, or effort, and never adds registry tools or models.'
       )
     );
-    const list = h('dl', { className: 'aq-technical-grid' });
-    for (const tool of tools) {
-      list.appendChild(h('dt', undefined, tool.label));
-      list.appendChild(
+
+    if (toolsLoading) {
+      section.appendChild(
         h(
-          'dd',
-          undefined,
-          `${formatToolAvailability(tool.availability)}${
-            tool.executable_path ? ` · ${tool.executable_path}` : ''
-          }`
+          'p',
+          { className: 'aq-discovery-status', role: 'status', 'aria-live': 'polite' },
+          hasResults
+            ? 'Refreshing discovery. Previous results stay visible until the check completes.'
+            : 'Checking local PATH…'
         )
       );
     }
-    details.appendChild(list);
-    return details;
+
+    if (toolsError) {
+      section.appendChild(
+        h(
+          'div',
+          { className: 'aq-discovery-error', role: 'alert' },
+          h('span', undefined, toolsError),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'aq-btn',
+              'data-action': 'refresh-tools',
+              'aria-label': 'Retry local PATH discovery',
+              title: 'Retry local PATH discovery',
+            },
+            createUiIcon('refresh-cw'),
+            h('span', undefined, 'Retry discovery')
+          )
+        )
+      );
+      if (hasResults) {
+        section.appendChild(
+          h(
+            'p',
+            { className: 'aq-discovery-status' },
+            'The latest discovery refresh failed. Results below are from the last successful check.'
+          )
+        );
+      }
+    }
+
+    if (hasResults) {
+      section.appendChild(
+        h(
+          'ul',
+          { className: 'aq-discovery-list', 'aria-label': 'Tools discovered on this device' },
+          ...tools.map((tool) => this.buildDiscoveryRow(tool))
+        )
+      );
+    } else if (!toolsLoading && !toolsError) {
+      section.appendChild(
+        h(
+          'p',
+          { className: 'aq-discovery-empty', role: 'status' },
+          'Local discovery returned no commands. Add tools explicitly in the registry below.'
+        )
+      );
+    }
+
+    section.appendChild(
+      h(
+        'p',
+        { className: 'aq-discovery-note' },
+        'Registry tools, models, and API adapters are configured below. Configure only prefills a draft; save it, load models, import entries, then assign them in Profiles. Discovery does not change the registry.'
+      )
+    );
+    return section;
+  }
+
+  private buildDiscoveryRow(tool: ToolStatus): HTMLElement {
+    const status = formatToolAvailability(tool.availability);
+    const executablePath = tool.executable_path?.trim() ?? '';
+    const canConfigure =
+      tool.availability === 'found' &&
+      executablePath.length > 0 &&
+      isConfigurableDiscoveredCli(tool.id, tool.label);
+    const statusTone =
+      tool.availability === 'found'
+        ? 'found'
+        : tool.availability === 'not_found'
+          ? 'warn'
+          : undefined;
+    const detail = executablePath
+      ? executablePath
+      : tool.availability === 'not_configured'
+        ? 'No executable reported for discovery. Registry and API configuration is below.'
+        : tool.availability === 'found'
+          ? 'Found on PATH; no executable path reported.'
+          : 'No executable found on PATH.';
+
+    return h(
+      'li',
+      { className: 'aq-discovery-row' },
+      createBrandIconElement(resolveToolBrand(tool.id, tool.label)),
+      h(
+        'div',
+        { className: 'aq-discovery-body' },
+        h(
+          'div',
+          { className: 'aq-discovery-name-row' },
+          h('span', { className: 'aq-discovery-name' }, tool.label),
+          h(
+            'span',
+            { className: 'aq-badge aq-discovery-badge', 'data-status': statusTone },
+            status
+          )
+        ),
+        h('code', { className: 'aq-discovery-detail' }, detail),
+        canConfigure
+          ? h(
+              'div',
+              { className: 'aq-discovery-actions' },
+              h(
+                'button',
+                {
+                  type: 'button',
+                  className: 'aq-btn aq-discovery-configure',
+                  'data-action': 'configure-discovered-tool',
+                  'data-discovery-tool-id': tool.id,
+                  'data-discovery-tool-label': tool.label,
+                  'data-discovery-executable': executablePath,
+                  'data-focus': `configure-discovery-${tool.id}`,
+                  'aria-label': `Configure ${tool.label} from local discovery`,
+                  title: `Prefill the Add tool form with ${tool.label}`,
+                },
+                'Configure'
+              )
+            )
+          : null
+      )
+    );
   }
 
   private buildProfilesView(): DocumentFragment {
@@ -2613,6 +2828,15 @@ class ThreadlaneDesktopApp {
       }
       if (action === 'refresh-tools') {
         void this.refreshTools();
+        return;
+      }
+      if (action === 'configure-discovered-tool') {
+        const toolId = button.dataset.discoveryToolId;
+        const toolLabel = button.dataset.discoveryToolLabel;
+        const executablePath = button.dataset.discoveryExecutable;
+        if (toolId && toolLabel && executablePath) {
+          this.toolsPage.configureDiscoveredTool(toolId, toolLabel, executablePath);
+        }
         return;
       }
       if (action === 'start-demo') {
