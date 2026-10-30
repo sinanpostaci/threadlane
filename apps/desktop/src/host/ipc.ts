@@ -42,18 +42,40 @@ function requireNativeBridge(): void {
   }
 }
 
+function normalizeNotifyCodexToolId(raw: string | null | undefined): string | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+  const toolId = raw.trim();
+  if (!toolId) {
+    return null;
+  }
+  if (toolId.length > 128) {
+    throw new AppIpcError(
+      'invalid_input',
+      'Selected Codex CLI notification tool identifier is invalid.'
+    );
+  }
+  return toolId;
+}
+
 /**
  * Explicit operator action only. This command starts a dedicated host process
  * for the frozen approval; it does not start models, tasks, or prompts.
+ *
+ * `notifyCodexToolId` is an explicit per-start startup choice. Omitted or null
+ * means off and never enables a notification policy implicitly.
  */
 export async function desktop_start_approved_session(
   args: DesktopStartApprovedSessionArgs
 ): Promise<HostSessionSummary> {
   const approvalId = requireApprovalId(args.approvalId);
+  const notifyCodexToolId = normalizeNotifyCodexToolId(args.notifyCodexToolId);
   requireNativeBridge();
   try {
     return await invoke<HostSessionSummary>('desktop_start_approved_session', {
       approvalId,
+      notifyCodexToolId,
     });
   } catch (err) {
     throw normalizeAppError(

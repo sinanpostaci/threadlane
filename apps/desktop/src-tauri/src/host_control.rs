@@ -10,9 +10,11 @@ use threadlane_authority::{ApprovalRecord, AuthorityStore};
 use threadlane_desktop_bridge::{ActivityPage, DesktopBridge};
 use threadlane_host::{
     is_host_lock_held, read_host_manifest_optional, validate_approval_id, validate_identifier,
-    validate_sessions_root, verify_existing_session_dir, ApprovedHostClient, HostError, HostPhase,
+    validate_sessions_root, verify_existing_session_dir, ApprovedHostClient,
+    ApprovedHostNotificationConfig, HostError, HostNotificationSummary, HostPhase,
     HostSessionSummary, TaskStateSnapshot, TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
 };
+use threadlane_registry::{RegistrySnapshot, ToolAdapter};
 use tokio::process::{Child, Command};
 
 use crate::{
@@ -40,6 +42,26 @@ pub const MAX_APPROVED_ACTIVITY_LIMIT: usize = 20;
 
 /// Maximum permitted byte length for an optional pagination cursor string.
 const MAX_ACTIVITY_CURSOR_LEN: usize = 256;
+
+/// Exact CLI flag for the optional approved-host notification sender.
+const NOTIFY_CODEX_FLAG: &str = "--notify-codex";
+
+/// Exact CLI flag for the optional approved-host notification timeout.
+const NOTIFY_TIMEOUT_MS_FLAG: &str = "--notify-timeout-ms";
+
+/// Maximum permitted length for an operator-selected notification tool ID.
+const MAX_NOTIFY_TOOL_ID_LEN: usize = 128;
+
+/// Bounded default notification timeout, matching the runtime Codex wake-up default (10s).
+/// The desktop cannot add a runtime-crate dependency here, so this value is kept stable.
+pub const DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS: u64 = 10_000;
+
+/// Validated startup notification launch selection for one host process.
+struct NotificationLaunchSelection {
+    tool_id: String,
+    canonical_executable: PathBuf,
+    config: ApprovedHostNotificationConfig,
+}
 
 /// Non-blocking child exit status observed by [`HostControlHub::poll_child_reaper`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,6 +487,9 @@ pub fn ensure_host_platform_supported() -> Result<(), AppError> {
 /// Constructs the exact argument list for `threadlane-host serve`:
 /// `["serve", "--registry-dir", <global>, "--plans-dir", <global>, "--authority-dir", <global>, "--sessions-dir", <private>, "--approval-id", <validated>]`.
 ///
+/// Existing notification-off callers keep this exact signature. Notification
+/// flags are appended only by [`build_host_serve_args_with_notifications`].
+///
 /// Rejects non-canonical `approval_id` values and relative, empty, or traversal directory paths.
 pub fn build_host_serve_args(
     registry_dir: &Path,
@@ -472,6 +497,31 @@ pub fn build_host_serve_args(
     authority_dir: &Path,
     sessions_dir: &Path,
     approval_id: &str,
+) -> Result<Vec<OsString>, AppError> {
+    build_host_serve_args_with_notifications(
+        registry_dir,
+        plans_dir,
+        authority_dir,
+        sessions_dir,
+        approval_id,
+        None,
+    )
+}
+
+/// Constructs the exact `threadlane-host serve` argument list with optional
+/// startup-only notification flags.
+///
+/// When `notifications` is `None`, no notification arguments are emitted. When
+/// present, exactly `--notify-codex <canonical-executable>` and
+/// `--notify-timeout-ms <bounded-timeout>` are appended. No path, thread, or
+/// argv value from JavaScript is accepted here.
+pub fn build_host_serve_args_with_notifications(
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+    approval_id: &str,
+    notifications: Option<&ApprovedHostNotificationConfig>,
 ) -> Result<Vec<OsString>, AppError> {
     if approval_id.trim() != approval_id {
         return Err(AppError::new(
@@ -485,7 +535,7 @@ pub fn build_host_serve_args(
         validate_clean_absolute_dir_arg(dir)?;
     }
 
-    Ok(vec![
+    let mut args = vec![
         OsString::from("serve"),
         OsString::from("--registry-dir"),
         registry_dir.as_os_str().to_os_string(),
@@ -497,7 +547,196 @@ pub fn build_host_serve_args(
         sessions_dir.as_os_str().to_os_string(),
         OsString::from("--approval-id"),
         OsString::from(approval_id),
-    ])
+    ];
+
+    if let Some(config) = notifications {
+        let canonical_executable = canonicalize_notification_executable(&config.executable)?;
+        args.push(OsString::from(NOTIFY_CODEX_FLAG));
+        args.push(canonical_executable.into_os_string());
+        args.push(OsString::from(NOTIFY_TIMEOUT_MS_FLAG));
+        args.push(OsString::from(config.timeout_ms.to_string()));
+    }
+
+    Ok(args)
+}
+
+fn canonicalize_notification_executable(candidate: &Path) -> Result<PathBuf, AppError> {
+    let canonical = fs::canonicalize(candidate).map_err(|_| {
+        AppError::new(
+            "invalid_executable",
+            "Selected Codex CLI notification executable could not be resolved to a valid local binary.",
+        )
+    })?;
+    validate_canonical_regular_executable(&canonical).map_err(|_| {
+        AppError::new(
+            "invalid_executable",
+            "Selected Codex CLI notification executable is not a regular executable binary.",
+        )
+    })?;
+    Ok(canonical)
+}
+
+fn resolve_codex_cli_notification_tool_from_snapshot(
+    snapshot: &RegistrySnapshot,
+    requested_tool_id: &str,
+    path_var: Option<&OsStr>,
+) -> Result<(String, PathBuf), AppError> {
+    if requested_tool_id.is_empty()
+        || requested_tool_id.trim() != requested_tool_id
+        || requested_tool_id.len() > MAX_NOTIFY_TOOL_ID_LEN
+    {
+        return Err(AppError::new(
+            "validation",
+            "Selected Codex CLI notification tool identifier is invalid.",
+        ));
+    }
+
+    let tool = snapshot
+        .tools
+        .iter()
+        .find(|candidate| candidate.id == requested_tool_id)
+        .ok_or_else(|| {
+            AppError::new(
+                "not_configured",
+                "Selected Codex CLI notification tool is not present in the current registry.",
+            )
+        })?;
+
+    if tool.adapter != ToolAdapter::CodexCli {
+        return Err(AppError::new(
+            "invalid_adapter",
+            "Selected notification tool does not use the codex_cli adapter.",
+        ));
+    }
+    if !tool.enabled {
+        return Err(AppError::new(
+            "tool_disabled",
+            "Selected Codex CLI notification tool is disabled in the registry.",
+        ));
+    }
+
+    let executable = match tool.executable_path.as_ref() {
+        Some(path) if !path.as_os_str().is_empty() => canonicalize_notification_executable(path)?,
+        _ => resolve_codex_cli_on_path(path_var)?,
+    };
+
+    Ok((tool.id.clone(), executable))
+}
+
+fn resolve_codex_cli_on_path(path_var: Option<&OsStr>) -> Result<PathBuf, AppError> {
+    let Some(paths) = path_var else {
+        return Err(codex_path_unavailable_error());
+    };
+    for dir in std::env::split_paths(paths) {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
+            continue;
+        }
+        if dir
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        {
+            continue;
+        }
+        let candidate = dir.join("codex");
+        if let Ok(resolved) = canonicalize_notification_executable(&candidate) {
+            return Ok(resolved);
+        }
+    }
+    Err(codex_path_unavailable_error())
+}
+
+fn codex_path_unavailable_error() -> AppError {
+    AppError::new(
+        "not_configured",
+        "Codex CLI executable path is not configured and was not found on PATH.",
+    )
+}
+
+fn resolve_notification_launch_selection(
+    control: &DesktopControlState,
+    requested_tool_id: Option<&str>,
+) -> Result<Option<NotificationLaunchSelection>, AppError> {
+    let Some(requested_tool_id) = requested_tool_id else {
+        return Ok(None);
+    };
+    let snapshot = control
+        .registry
+        .snapshot()
+        .map_err(AppError::from_registry_error)?;
+    let (tool_id, canonical_executable) = resolve_codex_cli_notification_tool_from_snapshot(
+        &snapshot,
+        requested_tool_id,
+        std::env::var_os("PATH").as_deref(),
+    )?;
+    let config = ApprovedHostNotificationConfig::new(
+        canonical_executable.clone(),
+        DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS,
+    )
+    .map_err(AppError::from_host_error)?;
+    Ok(Some(NotificationLaunchSelection {
+        tool_id,
+        canonical_executable,
+        config,
+    }))
+}
+
+fn requested_notification_summary(
+    selection: Option<&NotificationLaunchSelection>,
+) -> HostNotificationSummary {
+    match selection {
+        Some(selection) => selection.config.summary(),
+        None => HostNotificationSummary {
+            enabled: false,
+            executable_digest: None,
+            timeout_ms: None,
+        },
+    }
+}
+
+fn verify_notification_policy_on_attach(
+    actual: &HostNotificationSummary,
+    requested: &HostNotificationSummary,
+) -> Result<(), AppError> {
+    if actual.enabled == requested.enabled
+        && actual.executable_digest == requested.executable_digest
+        && actual.timeout_ms == requested.timeout_ms
+    {
+        return Ok(());
+    }
+    Err(AppError::new(
+        "notification_policy_change_requires_restart",
+        "The running host was started with a different notification policy. Stop and restart the host to change the policy; the live host was not changed.",
+    ))
+}
+
+fn notification_tool_changed_error() -> AppError {
+    AppError::new(
+        "notification_tool_changed",
+        "The selected Codex CLI notification tool or executable changed in the registry; review the choice and retry.",
+    )
+}
+
+fn recheck_notification_tool_identity(
+    control: &DesktopControlState,
+    selection: Option<&NotificationLaunchSelection>,
+) -> Result<(), AppError> {
+    let Some(selection) = selection else {
+        return Ok(());
+    };
+    let snapshot = control
+        .registry
+        .snapshot()
+        .map_err(|_| notification_tool_changed_error())?;
+    let (tool_id, canonical_executable) = resolve_codex_cli_notification_tool_from_snapshot(
+        &snapshot,
+        &selection.tool_id,
+        std::env::var_os("PATH").as_deref(),
+    )
+    .map_err(|_| notification_tool_changed_error())?;
+    if tool_id != selection.tool_id || canonical_executable != selection.canonical_executable {
+        return Err(notification_tool_changed_error());
+    }
+    Ok(())
 }
 
 fn validate_clean_absolute_dir_arg(dir: &Path) -> Result<(), AppError> {
@@ -947,24 +1186,43 @@ async fn poll_until_authenticated_ready(
 
 /// Operator-only desktop command implementation for `desktop_start_approved_session`.
 ///
-/// - Verifies fresh connected runtime attachment and non-demo binding matching `record.binding_id`
-///   and `record.thread_uuid` (initial check + recheck before action).
-/// - Verifies source plan publication and side-effect-free materialization via `AuthorityStore::materialize`.
-/// - Serializes per-approval starts via an async mutex and OS-level `host.lock`.
-/// - Attaches without spawning if an active authenticated host is already `Ready` (proven via
-///   `ApprovedHostClient::list_activity(limit = 1)`).
-/// - Otherwise spawns `threadlane-host serve` in its own Unix process group with stdio null and
-///   `kill_on_drop(false)` and polls bounded readiness (`<= 15s`).
+/// Existing notification-off callers keep this exact signature.
 pub(crate) async fn start_approved_session(
     bridge: &DesktopBridge,
     control: &DesktopControlState,
     approval_id: String,
+) -> Result<HostSessionSummary, AppError> {
+    start_approved_session_with_notifications(bridge, control, approval_id, None).await
+}
+
+/// Additive start path with an explicit per-start notification tool choice.
+///
+/// - Verifies fresh connected runtime attachment and non-demo binding matching `record.binding_id`
+///   and `record.thread_uuid` (initial check + recheck before action).
+/// - Resolves only an enabled `codex_cli` registry tool; raw paths/threads/argv are never accepted.
+/// - Verifies source plan publication and side-effect-free materialization via `AuthorityStore::materialize`.
+/// - Serializes per-approval starts via an async mutex and OS-level `host.lock`.
+/// - Attaches without spawning if an active authenticated host is already `Ready` (proven via
+///   `ApprovedHostClient::list_activity(limit = 1)`) and its actual startup notification policy
+///   matches the requested policy; a mismatch never restarts or mutates the live host.
+/// - Otherwise rechecks attachment and selected-tool identity, then spawns `threadlane-host serve`
+///   in its own Unix process group with stdio null and `kill_on_drop(false)`, and polls bounded
+///   readiness (`<= 15s`).
+pub(crate) async fn start_approved_session_with_notifications(
+    bridge: &DesktopBridge,
+    control: &DesktopControlState,
+    approval_id: String,
+    notify_codex_tool_id: Option<String>,
 ) -> Result<HostSessionSummary, AppError> {
     ensure_host_platform_supported()?;
     control.host_control.reap_all_finished();
 
     let (record, captured_ctx) =
         verify_caller_and_load_approval(bridge, control, &approval_id, true).await?;
+
+    let notification_selection =
+        resolve_notification_launch_selection(control, notify_codex_tool_id.as_deref())?;
+    let requested_notifications = requested_notification_summary(notification_selection.as_ref());
 
     let start_mutex = control
         .host_control
@@ -996,12 +1254,20 @@ pub(crate) async fn start_approved_session(
                     if let Ok(ready_summary) =
                         verify_authenticated_ready_summary(&client, &record.approval_id).await
                     {
+                        verify_notification_policy_on_attach(
+                            &ready_summary.notifications,
+                            &requested_notifications,
+                        )?;
                         recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
                         return Ok(ready_summary);
                     }
                 }
                 let ready_summary =
                     poll_until_authenticated_ready(control, &client, &record, false).await?;
+                verify_notification_policy_on_attach(
+                    &ready_summary.notifications,
+                    &requested_notifications,
+                )?;
                 recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
                 return Ok(ready_summary);
             }
@@ -1036,15 +1302,26 @@ pub(crate) async fn start_approved_session(
     }
 
     let canonical_exe = resolve_host_executable(control.host_executable.as_deref())?;
-    let serve_args = build_host_serve_args(
-        control.registry.config_dir(),
-        control.plans.dir(),
-        control.authority.dir(),
-        &control.sessions_dir,
-        &record.approval_id,
-    )?;
+    let serve_args = match notification_selection.as_ref() {
+        Some(selection) => build_host_serve_args_with_notifications(
+            control.registry.config_dir(),
+            control.plans.dir(),
+            control.authority.dir(),
+            &control.sessions_dir,
+            &record.approval_id,
+            Some(&selection.config),
+        )?,
+        None => build_host_serve_args(
+            control.registry.config_dir(),
+            control.plans.dir(),
+            control.authority.dir(),
+            &control.sessions_dir,
+            &record.approval_id,
+        )?,
+    };
 
     recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
+    recheck_notification_tool_identity(control, notification_selection.as_ref())?;
 
     control.host_control.spawn_detached_host_process(
         &record.approval_id,
@@ -1053,6 +1330,7 @@ pub(crate) async fn start_approved_session(
     )?;
 
     let ready_summary = poll_until_authenticated_ready(control, &client, &record, true).await?;
+    verify_notification_policy_on_attach(&ready_summary.notifications, &requested_notifications)?;
     recheck_caller_bridge_snapshot(bridge, &captured_ctx).await?;
     Ok(ready_summary)
 }
@@ -1258,8 +1536,8 @@ mod tests {
         compile_plan_revision, Difficulty, PlanChange, PlanStatus, PlanTask, WorkflowRole,
     };
     use threadlane_registry::{
-        ModelChoice, ModelDefinition, RegistryChange, RoleAssignment, ToolAdapter, ToolDefinition,
-        WorkflowProfile,
+        ModelChoice, ModelDefinition, RegistryChange, RegistrySnapshot, RoleAssignment,
+        ToolAdapter, ToolDefinition, WorkflowProfile,
     };
     use threadlane_workers::{
         resolve_exact_commit_sha, run_sanitized_git, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -1798,6 +2076,292 @@ mod tests {
                 .expect_err("non-canonical directory arg must fail");
             assert_eq!(err.code, "security_violation");
         }
+    }
+
+    #[test]
+    fn notification_tool_resolution_rejects_non_codex_disabled_and_appends_exact_args_only_on_opt_in(
+    ) {
+        let tmp = ScopedHostTestDir::new("notify-resolve");
+        let fake_codex = tmp.path.join("bin/fake-codex");
+        write_executable_script(&fake_codex, "#!/bin/sh\nexit 0\n");
+        let canonical_codex = fs::canonicalize(&fake_codex).expect("canonical fake codex");
+
+        let path_bin = tmp.path.join("path-bin");
+        fs::create_dir_all(&path_bin).expect("create path bin");
+        write_executable_script(&path_bin.join("codex"), "#!/bin/sh\nexit 0\n");
+
+        let snapshot = RegistrySnapshot {
+            schema_version: 1,
+            revision: 3,
+            tools: vec![
+                ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Native Codex".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(fake_codex),
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "tool-codex-disabled".to_string(),
+                    label: "Disabled Codex".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(canonical_codex.clone()),
+                    enabled: false,
+                },
+                ToolDefinition {
+                    id: "tool-agy".to_string(),
+                    label: "Antigravity".to_string(),
+                    adapter: ToolAdapter::Antigravity,
+                    executable_path: Some(canonical_codex.clone()),
+                    enabled: true,
+                },
+                ToolDefinition {
+                    id: "tool-codex-path".to_string(),
+                    label: "PATH Codex".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: None,
+                    enabled: true,
+                },
+            ],
+            models: Vec::new(),
+            profiles: Vec::new(),
+            default_profile_id: None,
+        };
+
+        assert_eq!(
+            resolve_codex_cli_notification_tool_from_snapshot(&snapshot, "", None)
+                .unwrap_err()
+                .code,
+            "validation"
+        );
+        assert_eq!(
+            resolve_codex_cli_notification_tool_from_snapshot(&snapshot, "tool-missing", None)
+                .unwrap_err()
+                .code,
+            "not_configured"
+        );
+        assert_eq!(
+            resolve_codex_cli_notification_tool_from_snapshot(&snapshot, "tool-agy", None)
+                .unwrap_err()
+                .code,
+            "invalid_adapter"
+        );
+        assert_eq!(
+            resolve_codex_cli_notification_tool_from_snapshot(
+                &snapshot,
+                "tool-codex-disabled",
+                None
+            )
+            .unwrap_err()
+            .code,
+            "tool_disabled"
+        );
+
+        let (tool_id, executable) =
+            resolve_codex_cli_notification_tool_from_snapshot(&snapshot, "tool-codex", None)
+                .expect("enabled codex_cli tool");
+        assert_eq!(tool_id, "tool-codex");
+        assert_eq!(executable, canonical_codex);
+
+        let (path_tool_id, path_executable) = resolve_codex_cli_notification_tool_from_snapshot(
+            &snapshot,
+            "tool-codex-path",
+            Some(path_bin.as_os_str()),
+        )
+        .expect("PATH resolution");
+        assert_eq!(path_tool_id, "tool-codex-path");
+        assert_eq!(
+            path_executable,
+            fs::canonicalize(path_bin.join("codex")).expect("canonical PATH codex")
+        );
+
+        let config = ApprovedHostNotificationConfig::new(
+            executable.clone(),
+            DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS,
+        )
+        .expect("valid notification config");
+        let summary = config.summary();
+        assert!(summary.enabled);
+        assert_eq!(
+            summary.timeout_ms,
+            Some(DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS)
+        );
+        assert!(summary.executable_digest.is_some());
+        let summary_json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(!summary_json.contains(&executable.display().to_string()));
+
+        let base = build_host_serve_args_with_notifications(
+            Path::new("/tmp/tl-reg"),
+            Path::new("/tmp/tl-plans"),
+            Path::new("/tmp/tl-auth"),
+            Path::new("/tmp/tl-sess"),
+            "apr_0123456789abcdef0123456789abcdef",
+            None,
+        )
+        .expect("notification-off args");
+        assert!(!base
+            .iter()
+            .any(|arg| arg.as_os_str() == OsStr::new(NOTIFY_CODEX_FLAG)));
+        assert!(!base
+            .iter()
+            .any(|arg| arg.as_os_str() == OsStr::new(NOTIFY_TIMEOUT_MS_FLAG)));
+
+        let opted_in = build_host_serve_args_with_notifications(
+            Path::new("/tmp/tl-reg"),
+            Path::new("/tmp/tl-plans"),
+            Path::new("/tmp/tl-auth"),
+            Path::new("/tmp/tl-sess"),
+            "apr_0123456789abcdef0123456789abcdef",
+            Some(&config),
+        )
+        .expect("notification-on args");
+        let codex_flag_index = opted_in
+            .iter()
+            .position(|arg| arg.as_os_str() == OsStr::new(NOTIFY_CODEX_FLAG))
+            .expect("exact --notify-codex flag");
+        assert_eq!(
+            opted_in[codex_flag_index + 1],
+            executable.as_os_str().to_os_string()
+        );
+        let timeout_flag_index = opted_in
+            .iter()
+            .position(|arg| arg.as_os_str() == OsStr::new(NOTIFY_TIMEOUT_MS_FLAG))
+            .expect("exact --notify-timeout-ms flag");
+        assert_eq!(
+            opted_in[timeout_flag_index + 1],
+            OsString::from(DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS.to_string())
+        );
+        let full_cli_iter =
+            std::iter::once(OsString::from(HOST_BINARY_NAME)).chain(opted_in.clone());
+        HostCli::try_parse_from(full_cli_iter)
+            .expect("HostCli must accept exact notification flags");
+    }
+
+    #[test]
+    fn notification_policy_mismatch_requires_restart_and_tool_identity_recheck_rejects_changes() {
+        let tmp = ScopedHostTestDir::new("notify-policy");
+        let fake_codex_a = tmp.path.join("bin/fake-codex-a");
+        let fake_codex_b = tmp.path.join("bin/fake-codex-b");
+        write_executable_script(&fake_codex_a, "#!/bin/sh\nexit 0\n");
+        write_executable_script(&fake_codex_b, "#!/bin/sh\nexit 0\n");
+
+        let config_a = ApprovedHostNotificationConfig::new(
+            fake_codex_a.clone(),
+            DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS,
+        )
+        .expect("config a");
+        let requested = config_a.summary();
+        let disabled = HostNotificationSummary {
+            enabled: false,
+            executable_digest: None,
+            timeout_ms: None,
+        };
+        assert_eq!(
+            verify_notification_policy_on_attach(&disabled, &requested)
+                .unwrap_err()
+                .code,
+            "notification_policy_change_requires_restart"
+        );
+        assert!(verify_notification_policy_on_attach(&requested, &requested).is_ok());
+
+        let changed_timeout = HostNotificationSummary {
+            enabled: true,
+            executable_digest: requested.executable_digest.clone(),
+            timeout_ms: Some(1),
+        };
+        assert_eq!(
+            verify_notification_policy_on_attach(&changed_timeout, &requested)
+                .unwrap_err()
+                .code,
+            "notification_policy_change_requires_restart"
+        );
+
+        let fixture = setup_desktop_host_fixture("notify-tool-identity");
+        let registry_revision = fixture
+            .control
+            .registry
+            .snapshot()
+            .expect("registry snapshot")
+            .revision;
+        fixture
+            .control
+            .registry
+            .apply(
+                registry_revision,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-codex".to_string(),
+                        label: "Native Codex".to_string(),
+                        adapter: ToolAdapter::CodexCli,
+                        executable_path: Some(fake_codex_a.clone()),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("set codex executable a");
+        let selection = resolve_notification_launch_selection(&fixture.control, Some("tool-codex"))
+            .expect("resolve notification selection")
+            .expect("opted-in selection");
+        recheck_notification_tool_identity(&fixture.control, Some(&selection))
+            .expect("unchanged tool identity");
+
+        let registry_revision = fixture
+            .control
+            .registry
+            .snapshot()
+            .expect("registry snapshot")
+            .revision;
+        fixture
+            .control
+            .registry
+            .apply(
+                registry_revision,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-codex".to_string(),
+                        label: "Native Codex".to_string(),
+                        adapter: ToolAdapter::CodexCli,
+                        executable_path: Some(fake_codex_b),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("set codex executable b");
+        assert_eq!(
+            recheck_notification_tool_identity(&fixture.control, Some(&selection))
+                .unwrap_err()
+                .code,
+            "notification_tool_changed"
+        );
+
+        let registry_revision = fixture
+            .control
+            .registry
+            .snapshot()
+            .expect("registry snapshot")
+            .revision;
+        fixture
+            .control
+            .registry
+            .apply(
+                registry_revision,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-codex".to_string(),
+                        label: "Native Codex".to_string(),
+                        adapter: ToolAdapter::CodexCli,
+                        executable_path: Some(fake_codex_a),
+                        enabled: false,
+                    },
+                },
+            )
+            .expect("disable codex tool");
+        assert_eq!(
+            recheck_notification_tool_identity(&fixture.control, Some(&selection))
+                .unwrap_err()
+                .code,
+            "notification_tool_changed"
+        );
     }
 
     #[test]
@@ -2831,6 +3395,155 @@ exit 0
                 .expect("shutdown spawned_host_handle");
             fixture.control.host_control.reap_all_finished();
 
+            control_host
+                .shutdown()
+                .await
+                .expect("shutdown control_host");
+        });
+    }
+
+    #[test]
+    fn live_host_attach_notification_policy_mismatch_never_restarts_and_reports_actual_policy() {
+        tauri::async_runtime::block_on(async {
+            let mut fixture = setup_desktop_host_fixture("notify-attach");
+            let fake_codex = fixture.tmp.path.join("bin/fake-codex-notify");
+            let codex_count_file = fixture.tmp.path.join("codex-notify-count.txt");
+            let codex_script = format!(
+                "#!/bin/sh\nset -eu\nc=0\nif [ -f \"{count}\" ]; then c=$(cat \"{count}\"); fi\nc=$((c + 1))\nprintf \"%s\" \"$c\" > \"{count}\"\nexit 0\n",
+                count = codex_count_file.display()
+            );
+            write_executable_script(&fake_codex, &codex_script);
+
+            let registry_revision = fixture
+                .control
+                .registry
+                .snapshot()
+                .expect("registry snapshot")
+                .revision;
+            fixture
+                .control
+                .registry
+                .apply(
+                    registry_revision,
+                    RegistryChange::UpsertTool {
+                        tool: ToolDefinition {
+                            id: "tool-codex".to_string(),
+                            label: "Native Codex".to_string(),
+                            adapter: ToolAdapter::CodexCli,
+                            executable_path: Some(fake_codex),
+                            enabled: true,
+                        },
+                    },
+                )
+                .expect("set codex notification executable");
+
+            let host_spawn_count_file = fixture.tmp.path.join("notify-host-spawn-count.txt");
+            let fake_host_exe = fixture.tmp.path.join("bin/fake-notify-host");
+            let host_script = format!(
+                "#!/bin/sh\nset -eu\nc=0\nif [ -f \"{count}\" ]; then c=$(cat \"{count}\"); fi\nc=$((c + 1))\nprintf \"%s\" \"$c\" > \"{count}\"\nexit 0\n",
+                count = host_spawn_count_file.display()
+            );
+            write_executable_script(&fake_host_exe, &host_script);
+            fixture.control.host_executable = Some(fake_host_exe);
+
+            let bootstrap_record = seed_published_plan_and_approval(
+                &fixture,
+                "plan-ctrl-notify",
+                "bnd_ctrl_notify",
+                THREAD_UUID_A,
+            );
+            let control_host = ApprovedHost::start(
+                ApprovedHostConfig::new(
+                    fixture.control.registry.config_dir(),
+                    fixture.control.plans.dir(),
+                    fixture.control.authority.dir(),
+                    &fixture.control_sessions_dir,
+                    &bootstrap_record.approval_id,
+                )
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect("start control host");
+            let control_binding_id = control_host.session_binding_id().to_string();
+            let connected_bridge =
+                DesktopBridge::new(Some(control_host.runtime_state_dir().to_path_buf()), None)
+                    .expect("create connected bridge");
+
+            let record = seed_published_plan_and_approval(
+                &fixture,
+                "plan-notify-attach",
+                &control_binding_id,
+                THREAD_UUID_A,
+            );
+            let running_host = ApprovedHost::start(
+                ApprovedHostConfig::new(
+                    fixture.control.registry.config_dir(),
+                    fixture.control.plans.dir(),
+                    fixture.control.authority.dir(),
+                    &fixture.control.sessions_dir,
+                    &record.approval_id,
+                )
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect("start notification-off host");
+            assert!(!running_host.summary().notifications.enabled);
+
+            let mismatch = start_approved_session_with_notifications(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+                Some("tool-codex".to_string()),
+            )
+            .await
+            .expect_err("attach with a different startup policy must fail explicitly");
+            assert_eq!(mismatch.code, "notification_policy_change_requires_restart");
+            assert_eq!(
+                read_count_file(&codex_count_file),
+                0,
+                "the notification sender must not run on attach"
+            );
+            assert_eq!(
+                read_count_file(&host_spawn_count_file),
+                0,
+                "a live host must never be restarted to change notification policy"
+            );
+            assert!(is_host_lock_held(running_host.session_dir()).expect("host lock still held"));
+
+            let observed = approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+            )
+            .await
+            .expect("observed live host");
+            assert!(!observed.notifications.enabled);
+            assert!(observed.gates.supervisor_authenticated_ready);
+            assert_eq!(
+                read_count_file(&fixture.agy_count_file),
+                0,
+                "status polling must not start any model or worker"
+            );
+
+            let attached = start_approved_session_with_notifications(
+                &connected_bridge,
+                &fixture.control,
+                record.approval_id.clone(),
+                None,
+            )
+            .await
+            .expect("notification-off attach remains valid");
+            assert!(!attached.notifications.enabled);
+            assert_eq!(
+                read_count_file(&host_spawn_count_file),
+                0,
+                "matching notification-off attach must not spawn"
+            );
+
+            running_host
+                .shutdown()
+                .await
+                .expect("shutdown running_host");
             control_host
                 .shutdown()
                 .await

@@ -44,6 +44,7 @@ import {
   type PlanTaskExecutionPreview,
 } from '../approval/ipc.ts';
 import type { HostPanelContext } from '../host/types.ts';
+import { codexToolChoicesFromRegistry } from '../host/session-logic.ts';
 import type { ApprovedSessionPanel } from '../host/session.ts';
 
 // Keep the browser-only host panel out of the Node test module graph, where its
@@ -684,6 +685,8 @@ export class PlansPage {
    */
   private resolveHostPanelContext(): HostPanelContext {
     const bindingId = this.selectedBindingId?.trim() ?? '';
+    const codexTools = codexToolChoicesFromRegistry(this.latestRegistry);
+    const registryRevision = this.latestRegistry?.revision;
     const bindingResolution = resolveAuthoritativeBindingForApproval(
       this.latestBindings,
       bindingId,
@@ -694,12 +697,16 @@ export class PlansPage {
         bindingId: bindingId || null,
         threadUuid: null,
         connected: false,
+        codexTools,
+        registryRevision,
       };
     }
     return {
       bindingId: bindingResolution.binding.binding_id,
       threadUuid: bindingResolution.threadUuid,
       connected: true,
+      codexTools,
+      registryRevision,
     };
   }
 

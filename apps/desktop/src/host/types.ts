@@ -19,6 +19,18 @@ export interface HostExecutionGates {
   auto_accept_or_merge_enabled: boolean;
 }
 
+/**
+ * Safe startup notification policy from `threadlane_host::HostNotificationSummary`.
+ *
+ * The executable digest is a one-way identity, never a filesystem path. These
+ * fields describe startup configuration only; they do not prove delivery.
+ */
+export interface HostNotificationSummary {
+  enabled: boolean;
+  executable_digest: string | null;
+  timeout_ms: number | null;
+}
+
 /** Safe, token-free, path-free `threadlane_host::HostSessionSummary` DTO. */
 export interface HostSessionSummary {
   approval_id: string;
@@ -38,6 +50,11 @@ export interface HostSessionSummary {
   native_route_task_ids: string[];
   gates: HostExecutionGates;
   last_error: string | null;
+  /**
+   * Actual startup policy reported by the host. Optional for compatibility
+   * with older summaries; a missing value means notifications were off.
+   */
+  notifications?: HostNotificationSummary;
 }
 
 /** Canonical provider values serialized by `threadlane_workers::WorkerProvider`. */
@@ -178,11 +195,25 @@ export interface TaskStateSnapshot {
   accepted: boolean;
 }
 
-/** Current desktop conversation context supplied by the Plans integration. */
+/** Enabled or disabled Codex CLI choice resolved from the trusted registry. */
+export interface HostCodexToolChoice {
+  id: string;
+  label: string;
+  enabled: boolean;
+}
+
+/**
+ * Current desktop conversation context supplied by the Plans integration.
+ *
+ * `codexTools` and `registryRevision` are optional so older callers remain
+ * compatible. Without them the notification opt-in stays disabled.
+ */
 export interface HostPanelContext {
   bindingId: string | null;
   threadUuid: string | null;
   connected: boolean;
+  codexTools?: readonly HostCodexToolChoice[];
+  registryRevision?: number;
 }
 
 /** Arguments for the frozen `desktop_approved_session` command. */
@@ -190,9 +221,16 @@ export interface DesktopApprovedSessionArgs {
   approvalId: string;
 }
 
-/** Arguments for the frozen `desktop_start_approved_session` command. */
+/**
+ * Arguments for the frozen `desktop_start_approved_session` command.
+ *
+ * Only a trusted registry tool identifier may cross the bridge. Omitted or
+ * null means notification opt-in is off; raw paths, threads, argv, and
+ * timeouts are intentionally not accepted from JavaScript.
+ */
 export interface DesktopStartApprovedSessionArgs {
   approvalId: string;
+  notifyCodexToolId?: string | null;
 }
 
 /** Arguments for the frozen `desktop_approved_task` command. */
