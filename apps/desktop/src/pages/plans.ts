@@ -43,9 +43,18 @@ import {
   type EditableApprovalDraftField,
   type PlanTaskExecutionPreview,
 } from '../approval/ipc.ts';
+import type { HostPanelContext } from '../host/types.ts';
+import type { ApprovedSessionPanel } from '../host/session.ts';
+
+// Keep the browser-only host panel out of the Node test module graph, where its
+// bundled brand SVG imports are not resolvable.
+const ApprovedSessionPanelClass =
+  typeof window === 'undefined'
+    ? null
+    : (await import('../host/session.ts')).ApprovedSessionPanel;
 
 if (typeof window !== 'undefined' && typeof import.meta.glob === 'function') {
-  import.meta.glob('./plans.css', { eager: true });
+  import.meta.glob(['./plans.css', '../host/session.css'], { eager: true });
 }
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -242,6 +251,11 @@ export interface StoredPlanContextSyncOptions {
   pendingNotice?: string;
 }
 
+interface RecordedApprovalSessionPanel {
+  approval: ApprovalSummary;
+  panel: ApprovedSessionPanel;
+}
+
 export class PlansPage {
   private readonly onPlansChanged: () => void;
   private readonly container: HTMLElement;
@@ -260,6 +274,10 @@ export class PlansPage {
   private readonly approvalsByBinding = new Map<string, ApprovalSummary[]>();
   private readonly loadingBindings = new Set<string>();
   private readonly loadedBindings = new Set<string>();
+  private readonly approvedSessionPanels = new Map<
+    string,
+    RecordedApprovalSessionPanel
+  >();
 
   constructor(onPlansChanged: () => void) {
     this.onPlansChanged = onPlansChanged;
@@ -325,6 +343,7 @@ export class PlansPage {
     }
 
     this.syncAllApprovalDrafts();
+    this.syncApprovedSessionPanelContexts();
     this.patchLiveApprovalContextDom();
     if (scroller && scrollTop !== null) {
       scroller.scrollTop = scrollTop;
@@ -353,6 +372,7 @@ export class PlansPage {
     this.latestAttachment = attachment;
 
     this.syncAllApprovalDrafts();
+    this.syncApprovedSessionPanelContexts();
     this.ensureBindingApprovalsLoaded(plans);
     this.patchLiveApprovalContextDom();
 
@@ -386,6 +406,10 @@ export class PlansPage {
   }
 
   public dispose(): void {
+    for (const entry of this.approvedSessionPanels.values()) {
+      entry.panel.dispose();
+    }
+    this.approvedSessionPanels.clear();
     this.container.replaceChildren();
   }
 
@@ -651,6 +675,87 @@ export class PlansPage {
     return list.filter(
       (item) => item.plan_id === planId && item.plan_revision === revision
     );
+  }
+
+  /**
+   * Follows the current selected conversation through the same live binding and
+   * attachment authority used for approval submission. A switch or disconnect
+   * therefore yields a non-matching context rather than an invented thread.
+   */
+  private resolveHostPanelContext(): HostPanelContext {
+    const bindingId = this.selectedBindingId?.trim() ?? '';
+    const bindingResolution = resolveAuthoritativeBindingForApproval(
+      this.latestBindings,
+      bindingId,
+      this.latestAttachment
+    );
+    if (!bindingResolution.ok) {
+      return {
+        bindingId: bindingId || null,
+        threadUuid: null,
+        connected: false,
+      };
+    }
+    return {
+      bindingId: bindingResolution.binding.binding_id,
+      threadUuid: bindingResolution.threadUuid,
+      connected: true,
+    };
+  }
+
+  // Only refresh controllers already created by a visible recorded-approval render.
+  private syncApprovedSessionPanelContexts(): void {
+    const context = this.resolveHostPanelContext();
+    for (const entry of this.approvedSessionPanels.values()) {
+      entry.panel.render(entry.approval, context);
+    }
+  }
+
+  private getOrCreateApprovedSessionPanel(
+    approval: ApprovalSummary
+  ): ApprovedSessionPanel | null {
+    const approvalId = approval.approval_id.trim();
+    const existing = this.approvedSessionPanels.get(approvalId);
+    if (existing) {
+      existing.approval = approval;
+      return existing.panel;
+    }
+    const PanelClass = ApprovedSessionPanelClass;
+    if (!PanelClass) {
+      return null;
+    }
+    const panel = new PanelClass();
+    this.approvedSessionPanels.set(approvalId, { approval, panel });
+    return panel;
+  }
+
+  private buildRecordedApprovalSessionPanel(
+    approval: ApprovalSummary
+  ): HTMLElement | null {
+    const panel = this.getOrCreateApprovedSessionPanel(approval);
+    return panel ? panel.render(approval, this.resolveHostPanelContext()) : null;
+  }
+
+  private pruneApprovedSessionPanels(): void {
+    const activeApprovalIds = new Set<string>();
+    for (const rev of this.latestPlans) {
+      if (!isActivePublishedPlanStatus(rev.status)) {
+        continue;
+      }
+      for (const approval of this.findApprovalsForRevision(
+        rev.plan_id,
+        rev.revision,
+        rev.binding_id
+      )) {
+        activeApprovalIds.add(approval.approval_id.trim());
+      }
+    }
+    for (const [approvalId, entry] of this.approvedSessionPanels) {
+      if (!activeApprovalIds.has(approvalId)) {
+        entry.panel.dispose();
+        this.approvedSessionPanels.delete(approvalId);
+      }
+    }
   }
 
   private findLatestRevision(planId: string): PlanRevision | null {
@@ -926,7 +1031,7 @@ export class PlansPage {
         ...latestDraft,
         submitting: false,
         errorMessage: null,
-        statusNotice: `Approved · Not started (${summary.approval_id}). Frozen operator approval artifact recorded; no worker or host process was started.`,
+        statusNotice: `Approved (${summary.approval_id}). Frozen operator approval artifact recorded; no worker or host process was started.`,
       });
     } catch (err) {
       const latestDraft = this.getOrCreateApprovalDraft(rev);
@@ -952,6 +1057,7 @@ export class PlansPage {
     // A full rebuild always renders the latest cached store context, so any deferred
     // update notice has been satisfied by this view.
     this.pendingStoredUpdatesNotice = null;
+    this.pruneApprovedSessionPanels();
     if (!this.hasEditableFocus()) {
       this.draft = reconcileCleanPlanDraft(this.draft, this.latestPlans);
     }
@@ -1638,7 +1744,7 @@ export class PlansPage {
     const latestApproval = recordedApprovals[0] ?? null;
 
     const statusBadgeText = latestApproval
-      ? 'Approved · Not started'
+      ? 'Approved'
       : draft.preview
         ? draft.previewIsSampleFixture
           ? 'Sample preview · Read-only'
@@ -1807,8 +1913,9 @@ export class PlansPage {
         className: 'aq-plan-approval-recorded-list',
         'aria-label': 'Recorded operator approvals for this plan revision',
       },
-      ...approvals.map((summary) =>
-        h(
+      ...approvals.map((summary) => {
+        const sessionPanel = this.buildRecordedApprovalSessionPanel(summary);
+        return h(
           'div',
           { className: 'aq-plan-approval-recorded-card' },
           h(
@@ -1818,7 +1925,7 @@ export class PlansPage {
             h(
               'span',
               { className: 'aq-badge', 'data-status': 'active' },
-              'Approved · Not started'
+              'Approved'
             )
           ),
           h(
@@ -1868,9 +1975,10 @@ export class PlansPage {
               h('dt', undefined, 'Write scope'),
               h('dd', undefined, summary.approved_write_paths.join(', '))
             )
-          )
-        )
-      )
+          ),
+          sessionPanel
+        );
+      })
     );
   }
 

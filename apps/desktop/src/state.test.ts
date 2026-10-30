@@ -1058,3 +1058,4 @@ describe('M4 durable plan ledger, DAG validation, and execution preference bound
 import './pages/history.test.ts';
 import './approval/approval.test.ts';
 import './approval/live.test.ts';
+import './host/session.test.ts';
