@@ -410,6 +410,25 @@ impl ScopedClient {
             .ok_or_else(|| Error::Transport("unexpected response kind for pull_events".to_string()))
     }
 
+    /// Pulls an ordered event batch within the fixed binding bounded by both event count and `max_batch_bytes`.
+    pub async fn pull_events_bounded(
+        &self,
+        after_seq: Option<u64>,
+        limit: Option<usize>,
+        max_batch_bytes: usize,
+    ) -> Result<EventBatch, Error> {
+        let resp = self
+            .execute(&ScopedRequest::PullEventsBounded {
+                after_seq,
+                limit,
+                max_batch_bytes,
+            })
+            .await?;
+        resp.into_event_batch().ok_or_else(|| {
+            Error::Transport("unexpected response kind for pull_events_bounded".to_string())
+        })
+    }
+
     /// Acknowledges a delivered event batch within the fixed binding.
     pub async fn ack_events(
         &self,

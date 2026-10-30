@@ -8,12 +8,12 @@ use crate::error::{AckErrorReason, CoreError};
 use crate::limits::{
     encode_activity_cursor, encode_questions_cursor, encode_revisions_cursor, encode_runs_cursor,
     estimate_wire_response_bytes, parse_and_validate_activity_cursor, parse_and_validate_cursor,
-    truncate_preview, validate_activity_run_id, validate_batch_limit, validate_bounded_text,
-    validate_command_key, validate_identifier, validate_label, validate_optional_text,
-    validate_page_limit, validate_step_delay_ms, validate_thread_uuid, validate_timestamp_ms,
-    CursorKind, FIXED_WAKEUP_MESSAGE, LEGACY_SCHEMA_VERSION_V1, LEGACY_SCHEMA_VERSION_V2,
-    MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMPACT_RESPONSE_BYTES, MAX_EVENT_PAYLOAD_BYTES,
-    MAX_INSTRUCTION_LEN, MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN,
+    truncate_preview, validate_activity_run_id, validate_batch_byte_budget, validate_batch_limit,
+    validate_bounded_text, validate_command_key, validate_identifier, validate_label,
+    validate_optional_text, validate_page_limit, validate_step_delay_ms, validate_thread_uuid,
+    validate_timestamp_ms, CursorKind, FIXED_WAKEUP_MESSAGE, LEGACY_SCHEMA_VERSION_V1,
+    LEGACY_SCHEMA_VERSION_V2, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMPACT_RESPONSE_BYTES,
+    MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN, MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN,
     RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
 };
 use crate::types::{
@@ -218,6 +218,28 @@ impl Core {
                     &clean_binding_id,
                     after_seq,
                     valid_limit,
+                    None,
+                    valid_now,
+                )?;
+                tx.commit()?;
+                Ok(CommandOutput::EventBatch(batch))
+            }
+            Command::PullEventsBounded {
+                after_seq,
+                limit,
+                max_batch_bytes,
+                now_ms,
+            } => {
+                let valid_limit = validate_batch_limit(limit)?;
+                let valid_budget = validate_batch_byte_budget(max_batch_bytes)?;
+                let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
+                let tx = self.conn.transaction()?;
+                let batch = Self::pull_events_tx(
+                    &tx,
+                    &clean_binding_id,
+                    after_seq,
+                    valid_limit,
+                    Some(valid_budget),
                     valid_now,
                 )?;
                 tx.commit()?;
@@ -1810,8 +1832,13 @@ impl Core {
         binding_id: &str,
         after_seq: Option<u64>,
         limit: usize,
+        max_batch_bytes: Option<usize>,
         now_ms: i64,
     ) -> Result<EventBatch, CoreError> {
+        let valid_budget = match max_batch_bytes {
+            Some(budget) => Some(validate_batch_byte_budget(budget)?),
+            None => None,
+        };
         let binding = Self::load_binding_tx(tx, binding_id)?;
         let start_after = match after_seq {
             None => binding.acked_seq,
@@ -1866,49 +1893,75 @@ impl Core {
             items
         };
 
-        let has_more = events.len() > limit;
-        if has_more {
+        let count_trimmed = events.len() > limit;
+        if count_trimmed {
             events.truncate(limit);
         }
 
-        let (from_seq, to_seq) = match (events.first(), events.last()) {
-            (Some(first), Some(last)) => (first.seq, last.seq),
-            _ => (start_after, start_after),
+        let batch_id = generate_id("bat");
+        let mut byte_trimmed = false;
+
+        let candidate = loop {
+            let (from_seq, to_seq) = match (events.first(), events.last()) {
+                (Some(first), Some(last)) => (first.seq, last.seq),
+                _ => (start_after, start_after),
+            };
+            let new_delivered_seq = binding.delivered_seq.max(to_seq);
+            let probe = EventBatch {
+                batch_id: batch_id.clone(),
+                binding_id: binding_id.to_string(),
+                events,
+                from_seq,
+                to_seq,
+                delivered_seq: new_delivered_seq,
+                acked_seq: binding.acked_seq,
+                has_more: count_trimmed || byte_trimmed,
+            };
+
+            if let Some(budget) = valid_budget {
+                let size_bytes = serde_json::to_vec(&probe)?.len();
+                if size_bytes > budget {
+                    if probe.events.len() <= 1 {
+                        return Err(CoreError::ResponseTooLarge {
+                            size_bytes,
+                            max_bytes: budget,
+                        });
+                    }
+                    events = probe.events;
+                    events.pop();
+                    byte_trimmed = true;
+                    continue;
+                }
+            }
+
+            break probe;
         };
 
-        let new_delivered_seq = binding.delivered_seq.max(to_seq);
-        if new_delivered_seq != binding.delivered_seq {
+        if candidate.delivered_seq != binding.delivered_seq {
             tx.execute(
                 "UPDATE bindings SET delivered_seq = ?1 WHERE binding_id = ?2",
-                params![u64_to_i64("delivered_seq", new_delivered_seq)?, binding_id],
+                params![
+                    u64_to_i64("delivered_seq", candidate.delivered_seq)?,
+                    binding_id
+                ],
             )?;
         }
 
-        let batch_id = generate_id("bat");
         tx.execute(
             "INSERT INTO event_batches (
                 batch_id, binding_id, from_seq, to_seq, event_count, created_at_ms, acked_at_ms
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
             params![
-                batch_id,
+                candidate.batch_id,
                 binding_id,
-                u64_to_i64("from_seq", from_seq)?,
-                u64_to_i64("to_seq", to_seq)?,
-                u64_to_i64("event_count", events.len() as u64)?,
+                u64_to_i64("from_seq", candidate.from_seq)?,
+                u64_to_i64("to_seq", candidate.to_seq)?,
+                u64_to_i64("event_count", candidate.events.len() as u64)?,
                 now_ms
             ],
         )?;
 
-        Ok(EventBatch {
-            batch_id,
-            binding_id: binding_id.to_string(),
-            events,
-            from_seq,
-            to_seq,
-            delivered_seq: new_delivered_seq,
-            acked_seq: binding.acked_seq,
-            has_more,
-        })
+        Ok(candidate)
     }
 
     fn acknowledge_events_tx(

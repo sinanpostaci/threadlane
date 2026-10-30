@@ -161,6 +161,17 @@ pub enum ScopedRequest {
         #[serde(default)]
         limit: Option<usize>,
     },
+    /// Pull an ordered batch of durable events for the binding bounded by both event count and serialized JSON byte budget.
+    PullEventsBounded {
+        /// Optional sequence cursor to read after (defaults to `acked_seq`).
+        #[serde(default)]
+        after_seq: Option<u64>,
+        /// Optional batch size limit (`1..=MAX_EVENT_BATCH_SIZE`, defaults to `DEFAULT_EVENT_BATCH_SIZE`).
+        #[serde(default)]
+        limit: Option<usize>,
+        /// Maximum serialized JSON byte size for the returned [`EventBatch`] (`MIN_EVENT_BATCH_BYTES..=MAX_EVENT_BATCH_BYTES`).
+        max_batch_bytes: usize,
+    },
     /// Acknowledge processing of a previously delivered event batch.
     #[serde(alias = "acknowledge_events")]
     AckEvents {
@@ -290,6 +301,16 @@ impl ScopedRequest {
             Self::PullEvents { after_seq, limit } => Some(Command::PullEvents {
                 after_seq,
                 limit: limit.unwrap_or(DEFAULT_EVENT_BATCH_SIZE),
+                now_ms,
+            }),
+            Self::PullEventsBounded {
+                after_seq,
+                limit,
+                max_batch_bytes,
+            } => Some(Command::PullEventsBounded {
+                after_seq,
+                limit: limit.unwrap_or(DEFAULT_EVENT_BATCH_SIZE),
+                max_batch_bytes,
                 now_ms,
             }),
             Self::AckEvents {

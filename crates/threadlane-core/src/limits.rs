@@ -79,6 +79,12 @@ pub const MAX_EVENT_BATCH_SIZE: usize = 100;
 /// Default number of events returned when pulling a batch.
 pub const DEFAULT_EVENT_BATCH_SIZE: usize = 50;
 
+/// Minimum serialized JSON byte budget permitted for `PullEventsBounded` (1 KiB).
+pub const MIN_EVENT_BATCH_BYTES: usize = 1_024;
+
+/// Maximum serialized JSON byte budget permitted for `PullEventsBounded` (128 KiB).
+pub const MAX_EVENT_BATCH_BYTES: usize = 131_072;
+
 /// Maximum serialized JSON payload byte length for a single durable event.
 pub const MAX_EVENT_PAYLOAD_BYTES: usize = 16_384;
 
@@ -292,6 +298,18 @@ pub(crate) fn validate_batch_limit(limit: usize) -> Result<usize, CoreError> {
         });
     }
     Ok(limit)
+}
+
+pub(crate) fn validate_batch_byte_budget(max_batch_bytes: usize) -> Result<usize, CoreError> {
+    if !(MIN_EVENT_BATCH_BYTES..=MAX_EVENT_BATCH_BYTES).contains(&max_batch_bytes) {
+        return Err(CoreError::Validation {
+            field: "max_batch_bytes",
+            reason: format!(
+                "max_batch_bytes must be between {MIN_EVENT_BATCH_BYTES} and {MAX_EVENT_BATCH_BYTES}, got {max_batch_bytes}"
+            ),
+        });
+    }
+    Ok(max_batch_bytes)
 }
 
 pub(crate) fn validate_page_limit(limit: usize) -> Result<usize, CoreError> {

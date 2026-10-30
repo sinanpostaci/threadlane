@@ -615,6 +615,18 @@ pub enum Command {
         /// Injected current timestamp in milliseconds.
         now_ms: i64,
     },
+    /// Pull an ordered batch of events for the binding bounded by both event count and serialized JSON byte budget.
+    PullEventsBounded {
+        /// Optional sequence cursor to read after. Defaults to the binding's `acked_seq`.
+        /// Must not exceed `delivered_seq` (cannot skip unseen events).
+        after_seq: Option<u64>,
+        /// Maximum number of events to return (`1..=MAX_EVENT_BATCH_SIZE`).
+        limit: usize,
+        /// Maximum serialized JSON byte size for the returned [`EventBatch`] (`MIN_EVENT_BATCH_BYTES..=MAX_EVENT_BATCH_BYTES`).
+        max_batch_bytes: usize,
+        /// Injected current timestamp in milliseconds.
+        now_ms: i64,
+    },
     /// Explicitly acknowledge processing of a previously delivered event batch.
     AcknowledgeEvents {
         /// Caller-supplied idempotency key scoped to the binding.
