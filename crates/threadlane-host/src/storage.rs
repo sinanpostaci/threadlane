@@ -9,13 +9,14 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_authority::ApprovalRecord;
+use threadlane_registry::ToolAdapter;
 use uuid::Uuid;
 
 use crate::error::HostError;
 use crate::types::{
-    HostExecutionGates, HostPhase, HostSessionManifest, TaskRunReceipt, HOST_LOCK_FILENAME,
-    HOST_MANIFEST_FILENAME, HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES,
-    MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
+    HostExecutionGates, HostPhase, HostSessionManifest, TaskDispatchIntent, TaskRunReceipt,
+    HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME, HOST_MANIFEST_SCHEMA_VERSION,
+    MAX_HOST_MANIFEST_BYTES, MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
     TASK_RECEIPTS_LOCK_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
 };
 
@@ -38,6 +39,8 @@ pub(crate) struct TaskReceiptsFile {
     pub approval_id: String,
     pub subject_digest: String,
     pub session_binding_id: String,
+    #[serde(default)]
+    pub pending_intents: Vec<TaskDispatchIntent>,
     pub receipts: Vec<TaskRunReceipt>,
 }
 
@@ -1136,6 +1139,20 @@ fn verify_manifest_against_approval(
     Ok(())
 }
 
+/// Reads the persisted [`TaskDispatchIntent`] for `task_id` from `<session_dir>/task-receipts.json`, if present.
+///
+/// Validates the entire receipts file against `record` and `session_binding_id` under `task-receipts.lock`.
+/// Corrupt or tampered receipt files are preserved untouched and return [`HostError::CorruptReceipts`].
+pub fn read_task_dispatch_intent(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    task_id: &str,
+) -> Result<Option<TaskDispatchIntent>, HostError> {
+    let (intent, _) = read_task_ledger_entry(session_dir, record, session_binding_id, task_id)?;
+    Ok(intent)
+}
+
 /// Reads the sealed [`TaskRunReceipt`] for `task_id` from `<session_dir>/task-receipts.json`, if present.
 ///
 /// Validates the entire receipts file against `record` and `session_binding_id` under `task-receipts.lock`.
@@ -1146,19 +1163,122 @@ pub fn read_task_receipt(
     session_binding_id: &str,
     task_id: &str,
 ) -> Result<Option<TaskRunReceipt>, HostError> {
+    let (_, receipt) = read_task_ledger_entry(session_dir, record, session_binding_id, task_id)?;
+    Ok(receipt)
+}
+
+pub(crate) fn read_task_ledger_entry(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    task_id: &str,
+) -> Result<(Option<TaskDispatchIntent>, Option<TaskRunReceipt>), HostError> {
     let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
     lock_file.lock_exclusive().map_err(|err| HostError::Io {
         operation: "lock_exclusive(task-receipts.lock)".to_string(),
         reason: err.to_string(),
     })?;
-    let res = read_task_receipts_locked(session_dir, record, session_binding_id).map(|opt| {
-        opt.and_then(|ledger| {
-            ledger
-                .receipts
-                .into_iter()
-                .find(|entry| entry.task_id == task_id)
-        })
-    });
+    let res =
+        read_task_receipts_locked(session_dir, record, session_binding_id).map(|opt| match opt {
+            Some(ledger) => {
+                let intent = ledger
+                    .pending_intents
+                    .into_iter()
+                    .find(|entry| entry.task_id == task_id);
+                let receipt = ledger
+                    .receipts
+                    .into_iter()
+                    .find(|entry| entry.task_id == task_id);
+                (intent, receipt)
+            }
+            None => (None, None),
+        });
+    let _ = lock_file.unlock();
+    res
+}
+
+/// Atomically persists a validated [`TaskDispatchIntent`] inside `<session_dir>/task-receipts.json`
+/// before invoking the runtime `start_worker` effect.
+///
+/// If an intent for `intent.task_id` already exists with identical frozen fields, returns it
+/// idempotently; if an existing intent or receipt conflicts, fails closed with
+/// [`HostError::CorruptReceipts`].
+pub fn record_task_dispatch_intent(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    intent: TaskDispatchIntent,
+) -> Result<TaskDispatchIntent, HostError> {
+    let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+    if validate_identifier("session_binding_id", session_binding_id).is_err() {
+        return Err(HostError::CorruptReceipts {
+            path: receipts_path.display().to_string(),
+            reason: format!("invalid session_binding_id `{session_binding_id}`"),
+        });
+    }
+    validate_single_intent(&intent, record, &receipts_path)?;
+
+    let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
+    lock_file.lock_exclusive().map_err(|err| HostError::Io {
+        operation: "lock_exclusive(task-receipts.lock)".to_string(),
+        reason: err.to_string(),
+    })?;
+
+    let res = (|| -> Result<TaskDispatchIntent, HostError> {
+        let mut ledger = match read_task_receipts_locked(session_dir, record, session_binding_id)? {
+            Some(existing) => existing,
+            None => TaskReceiptsFile {
+                schema_version: TASK_RECEIPTS_SCHEMA_VERSION,
+                approval_id: record.approval_id.clone(),
+                subject_digest: record.subject_digest.clone(),
+                session_binding_id: session_binding_id.to_string(),
+                pending_intents: Vec::new(),
+                receipts: Vec::new(),
+            },
+        };
+
+        if let Some(existing_receipt) = ledger.receipts.iter().find(|r| r.task_id == intent.task_id)
+        {
+            if existing_receipt.task_digest != intent.task_digest
+                || existing_receipt.profile_id != intent.profile_id
+                || existing_receipt.command_key != intent.command_key
+            {
+                return Err(HostError::CorruptReceipts {
+                    path: receipts_path.display().to_string(),
+                    reason: format!(
+                        "conflicting task receipt for task `{}` when recording dispatch intent",
+                        intent.task_id
+                    ),
+                });
+            }
+        }
+
+        if let Some(existing) = ledger
+            .pending_intents
+            .iter()
+            .find(|i| i.task_id == intent.task_id)
+        {
+            if existing.task_digest != intent.task_digest
+                || existing.profile_id != intent.profile_id
+                || existing.command_key != intent.command_key
+            {
+                return Err(HostError::CorruptReceipts {
+                    path: receipts_path.display().to_string(),
+                    reason: format!("conflicting dispatch intent for task `{}`", intent.task_id),
+                });
+            }
+            return Ok(existing.clone());
+        }
+
+        ledger.pending_intents.push(intent.clone());
+        ledger
+            .pending_intents
+            .sort_by(|left, right| left.task_id.cmp(&right.task_id));
+
+        write_task_receipts_locked(&receipts_path, &ledger)?;
+        Ok(intent)
+    })();
+
     let _ = lock_file.unlock();
     res
 }
@@ -1167,13 +1287,21 @@ pub fn read_task_receipt(
 ///
 /// If a receipt for `receipt.task_id` already exists with identical mapping fields, returns it
 /// idempotently; if an existing receipt conflicts, fails closed with [`HostError::CorruptReceipts`].
+/// Retains the corresponding validated [`TaskDispatchIntent`] in `pending_intents`.
 pub fn record_task_receipt(
     session_dir: &Path,
     record: &ApprovalRecord,
     session_binding_id: &str,
     receipt: TaskRunReceipt,
 ) -> Result<TaskRunReceipt, HostError> {
-    validate_single_receipt(&receipt, record, &session_dir.join(TASK_RECEIPTS_FILENAME))?;
+    let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+    if validate_identifier("session_binding_id", session_binding_id).is_err() {
+        return Err(HostError::CorruptReceipts {
+            path: receipts_path.display().to_string(),
+            reason: format!("invalid session_binding_id `{session_binding_id}`"),
+        });
+    }
+    validate_single_receipt(&receipt, record, &receipts_path)?;
 
     let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
     lock_file.lock_exclusive().map_err(|err| HostError::Io {
@@ -1182,7 +1310,6 @@ pub fn record_task_receipt(
     })?;
 
     let res = (|| -> Result<TaskRunReceipt, HostError> {
-        let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
         let mut ledger = match read_task_receipts_locked(session_dir, record, session_binding_id)? {
             Some(existing) => existing,
             None => TaskReceiptsFile {
@@ -1190,9 +1317,42 @@ pub fn record_task_receipt(
                 approval_id: record.approval_id.clone(),
                 subject_digest: record.subject_digest.clone(),
                 session_binding_id: session_binding_id.to_string(),
+                pending_intents: Vec::new(),
                 receipts: Vec::new(),
             },
         };
+
+        let mut added_intent = false;
+        if let Some(existing_intent) = ledger
+            .pending_intents
+            .iter()
+            .find(|i| i.task_id == receipt.task_id)
+        {
+            if existing_intent.task_digest != receipt.task_digest
+                || existing_intent.profile_id != receipt.profile_id
+                || existing_intent.command_key != receipt.command_key
+            {
+                return Err(HostError::CorruptReceipts {
+                    path: receipts_path.display().to_string(),
+                    reason: format!(
+                        "conflicting dispatch intent for task `{}` when sealing receipt",
+                        receipt.task_id
+                    ),
+                });
+            }
+        } else {
+            ledger.pending_intents.push(TaskDispatchIntent {
+                task_id: receipt.task_id.clone(),
+                task_digest: receipt.task_digest.clone(),
+                profile_id: receipt.profile_id.clone(),
+                command_key: receipt.command_key.clone(),
+                recorded_at_ms: receipt.recorded_at_ms,
+            });
+            ledger
+                .pending_intents
+                .sort_by(|left, right| left.task_id.cmp(&right.task_id));
+            added_intent = true;
+        }
 
         if let Some(existing) = ledger
             .receipts
@@ -1213,7 +1373,11 @@ pub fn record_task_receipt(
                     ),
                 });
             }
-            return Ok(existing.clone());
+            let existing = existing.clone();
+            if added_intent {
+                write_task_receipts_locked(&receipts_path, &ledger)?;
+            }
+            return Ok(existing);
         }
 
         ledger.receipts.push(receipt.clone());
@@ -1221,29 +1385,36 @@ pub fn record_task_receipt(
             .receipts
             .sort_by(|left, right| left.task_id.cmp(&right.task_id));
 
-        let mut bytes =
-            serde_json::to_vec_pretty(&ledger).map_err(|err| HostError::CorruptReceipts {
-                path: receipts_path.display().to_string(),
-                reason: format!("failed to serialize task-receipts.json: {err}"),
-            })?;
-        bytes.push(b'\n');
-        if bytes.len() > MAX_TASK_RECEIPTS_BYTES {
-            return Err(HostError::CorruptReceipts {
-                path: receipts_path.display().to_string(),
-                reason: format!(
-                    "serialized task-receipts.json ({} bytes) exceeds maximum {} bytes",
-                    bytes.len(),
-                    MAX_TASK_RECEIPTS_BYTES
-                ),
-            });
-        }
-
-        atomic_write_private_file(&receipts_path, &bytes, MAX_TASK_RECEIPTS_BYTES)?;
+        write_task_receipts_locked(&receipts_path, &ledger)?;
         Ok(receipt)
     })();
 
     let _ = lock_file.unlock();
     res
+}
+
+fn write_task_receipts_locked(
+    receipts_path: &Path,
+    ledger: &TaskReceiptsFile,
+) -> Result<(), HostError> {
+    let mut bytes =
+        serde_json::to_vec_pretty(ledger).map_err(|err| HostError::CorruptReceipts {
+            path: receipts_path.display().to_string(),
+            reason: format!("failed to serialize task-receipts.json: {err}"),
+        })?;
+    bytes.push(b'\n');
+    if bytes.len() > MAX_TASK_RECEIPTS_BYTES {
+        return Err(HostError::CorruptReceipts {
+            path: receipts_path.display().to_string(),
+            reason: format!(
+                "serialized task-receipts.json ({} bytes) exceeds maximum {} bytes",
+                bytes.len(),
+                MAX_TASK_RECEIPTS_BYTES
+            ),
+        });
+    }
+
+    atomic_write_private_file(receipts_path, &bytes, MAX_TASK_RECEIPTS_BYTES)
 }
 
 fn read_task_receipts_locked(
@@ -1335,15 +1506,29 @@ fn verify_task_receipts_ledger(
             ledger.subject_digest, record.subject_digest
         )));
     }
-    if ledger.session_binding_id != session_binding_id {
+    if validate_identifier("session_binding_id", &ledger.session_binding_id).is_err()
+        || ledger.session_binding_id != session_binding_id
+    {
         return Err(corrupt(format!(
             "receipts session_binding_id `{}` does not match expected `{}`",
             ledger.session_binding_id, session_binding_id
         )));
     }
 
+    let mut seen_intent_tasks = BTreeSet::new();
+    for intent in &ledger.pending_intents {
+        if !seen_intent_tasks.insert(intent.task_id.clone()) {
+            return Err(corrupt(format!(
+                "duplicate dispatch intent entry for task `{}`",
+                intent.task_id
+            )));
+        }
+        validate_single_intent(intent, record, receipts_path)?;
+    }
+
     let mut seen_tasks = BTreeSet::new();
     let mut seen_runs = BTreeSet::new();
+    let mut seen_workers = BTreeSet::new();
     for receipt in &ledger.receipts {
         if !seen_tasks.insert(receipt.task_id.clone()) {
             return Err(corrupt(format!(
@@ -1357,7 +1542,89 @@ fn verify_task_receipts_ledger(
                 receipt.run_id
             )));
         }
+        if !seen_workers.insert(receipt.worker_id.clone()) {
+            return Err(corrupt(format!(
+                "duplicate worker_id `{}` across receipt entries",
+                receipt.worker_id
+            )));
+        }
         validate_single_receipt(receipt, record, receipts_path)?;
+        if let Some(intent) = ledger
+            .pending_intents
+            .iter()
+            .find(|i| i.task_id == receipt.task_id)
+        {
+            if intent.task_digest != receipt.task_digest
+                || intent.profile_id != receipt.profile_id
+                || intent.command_key != receipt.command_key
+            {
+                return Err(corrupt(format!(
+                    "dispatch intent and receipt for task `{}` do not match",
+                    receipt.task_id
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_single_intent(
+    intent: &TaskDispatchIntent,
+    record: &ApprovalRecord,
+    receipts_path: &Path,
+) -> Result<(), HostError> {
+    let corrupt = |reason: String| HostError::CorruptReceipts {
+        path: receipts_path.display().to_string(),
+        reason,
+    };
+
+    let Some(task) = record.tasks.iter().find(|t| t.task_id == intent.task_id) else {
+        return Err(corrupt(format!(
+            "dispatch intent references unknown task_id `{}`",
+            intent.task_id
+        )));
+    };
+    if !task.depends_on.is_empty() {
+        return Err(corrupt(format!(
+            "dispatch intent references dependent task `{}` which cannot be started",
+            intent.task_id
+        )));
+    }
+    if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        return Err(corrupt(format!(
+            "dispatch intent references manual native route task `{}`",
+            intent.task_id
+        )));
+    }
+    let (Some(expected_profile), Some(expected_command_key)) =
+        (&task.profile_id, &task.command_key)
+    else {
+        return Err(corrupt(format!(
+            "dispatch intent references manual native route task `{}`",
+            intent.task_id
+        )));
+    };
+
+    if validate_hex_digest("task_digest", &intent.task_digest).is_err()
+        || intent.task_digest != task.task_digest
+    {
+        return Err(corrupt(format!(
+            "dispatch intent task_digest `{}` for task `{}` does not match frozen `{}`",
+            intent.task_digest, intent.task_id, task.task_digest
+        )));
+    }
+    if intent.profile_id != *expected_profile {
+        return Err(corrupt(format!(
+            "dispatch intent profile_id `{}` for task `{}` does not match frozen `{expected_profile}`",
+            intent.profile_id, intent.task_id
+        )));
+    }
+    if intent.command_key != *expected_command_key {
+        return Err(corrupt(format!(
+            "dispatch intent command_key `{}` for task `{}` does not match frozen `{expected_command_key}`",
+            intent.command_key, intent.task_id
+        )));
     }
 
     Ok(())
@@ -1385,6 +1652,12 @@ fn validate_single_receipt(
             receipt.task_id
         )));
     }
+    if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        return Err(corrupt(format!(
+            "receipt references manual native route task `{}`",
+            receipt.task_id
+        )));
+    }
     let (Some(expected_profile), Some(expected_command_key)) =
         (&task.profile_id, &task.command_key)
     else {
@@ -1394,10 +1667,12 @@ fn validate_single_receipt(
         )));
     };
 
-    if validate_hex_digest("task_digest", &receipt.task_digest).is_err() {
+    if validate_hex_digest("task_digest", &receipt.task_digest).is_err()
+        || receipt.task_digest != task.task_digest
+    {
         return Err(corrupt(format!(
-            "receipt for task `{}` has invalid task_digest `{}`",
-            receipt.task_id, receipt.task_digest
+            "receipt task_digest `{}` for task `{}` does not match frozen `{}`",
+            receipt.task_digest, receipt.task_id, task.task_digest
         )));
     }
     if receipt.profile_id != *expected_profile {

@@ -54,16 +54,17 @@ pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOS
 pub use storage::{
     derive_cancel_command_key, ensure_no_symlink_components, ensure_private_dir, is_host_lock_held,
     paths_overlap, prepare_session_dir, read_and_verify_host_manifest, read_host_manifest_optional,
-    read_task_receipt, record_task_receipt, validate_approval_id, validate_canonical_thread_uuid,
-    validate_hex_digest, validate_identifier, validate_sessions_root, verify_existing_private_dir,
-    verify_existing_session_dir, write_host_manifest, HostSessionLock,
+    read_task_dispatch_intent, read_task_receipt, record_task_dispatch_intent, record_task_receipt,
+    validate_approval_id, validate_canonical_thread_uuid, validate_hex_digest, validate_identifier,
+    validate_sessions_root, verify_existing_private_dir, verify_existing_session_dir,
+    write_host_manifest, HostSessionLock,
 };
 pub use types::{
-    HostExecutionGates, HostPhase, HostSessionManifest, HostSessionSummary, TaskExecutionStatus,
-    TaskRunReceipt, TaskStateSnapshot, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
-    HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES, MAX_TASK_RECEIPTS_BYTES,
-    RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_LOCK_FILENAME,
-    TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
+    HostExecutionGates, HostPhase, HostSessionManifest, HostSessionSummary, TaskDispatchIntent,
+    TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot, HOST_LOCK_FILENAME,
+    HOST_MANIFEST_FILENAME, HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES,
+    MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
+    TASK_RECEIPTS_LOCK_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
 };
 
 #[cfg(test)]
@@ -1086,18 +1087,51 @@ exit 0
         assert_eq!(second.status, TaskExecutionStatus::ReadyForReview);
         assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
-        // Simulate a lost receipt file after start_worker succeeded: re-calling dispatch_task
-        // recovers the exact same run_id from runtime command deduplication without respawning.
+        // Simulate losing the sealed receipt after the pre-dispatch intent and start_worker
+        // succeeded: with the durable intent retained in task-receipts.json, get_task truthfully
+        // reports Unknown (not NotStarted), cancel_task refuses ambiguous cancellation (distinct
+        // from not_started), and an explicit dispatch_task retry recovers the exact same run_id
+        // from runtime command deduplication without respawning.
         let receipts_path = host.session_dir().join(TASK_RECEIPTS_FILENAME);
-        fs::remove_file(&receipts_path).expect("remove task-receipts.json to simulate loss");
-        assert_eq!(
-            client
-                .get_task(&approval_id, "task-root-agy")
-                .await
-                .expect("get_task without receipt")
-                .status,
-            TaskExecutionStatus::NotStarted
-        );
+        let retained_intent = read_task_dispatch_intent(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            "task-root-agy",
+        )
+        .expect("read dispatch intent")
+        .expect("dispatch intent recorded before start_worker");
+        let intent_only_ledger = serde_json::json!({
+            "schema_version": TASK_RECEIPTS_SCHEMA_VERSION,
+            "approval_id": host.approval_id(),
+            "subject_digest": host.approval().subject_digest,
+            "session_binding_id": host.session_binding_id(),
+            "pending_intents": [retained_intent],
+            "receipts": [],
+        });
+        fs::write(
+            &receipts_path,
+            serde_json::to_vec_pretty(&intent_only_ledger).expect("serialize intent-only ledger"),
+        )
+        .expect("write intent-only task-receipts.json to simulate unsealed receipt");
+        fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 intent-only receipts");
+
+        let lost_receipt_snap = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task with retained intent and missing receipt");
+        assert_eq!(lost_receipt_snap.status, TaskExecutionStatus::Unknown);
+        assert!(lost_receipt_snap.run_id.is_none());
+        assert!(lost_receipt_snap.worker_id.is_none());
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        let ambiguous_cancel_err = client
+            .cancel_task(&approval_id, "task-root-agy", 1, None)
+            .await
+            .expect_err("cancel without sealed receipt must fail as ambiguous/unknown");
+        assert_eq!(ambiguous_cancel_err.code(), "invalid_run_state");
+        assert_ne!(ambiguous_cancel_err.code(), "not_started");
 
         let recovered = client
             .dispatch_task(&approval_id, "task-root-agy")
@@ -1804,5 +1838,563 @@ exit 0
             storage::inspect_session_dir_snapshot(&session_dir, [valid_manifest_tmp])
                 .expect_err("disappeared temp file without any committed anchor must fail");
         assert_eq!(unanchored_err.code(), "security_violation");
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_before_effect_unknown_read_cancel_reopen_and_explicit_retry() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-intent-effect",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Effect before seal with durable intent"),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // Truly never-dispatched root worker tasks start in NotStarted.
+        let initial_agy = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task initial agy");
+        assert_eq!(initial_agy.status, TaskExecutionStatus::NotStarted);
+        assert!(initial_agy.run_id.is_none());
+
+        let initial_oc = client
+            .get_task(&approval_id, "task-root-oc")
+            .await
+            .expect("get_task initial oc");
+        assert_eq!(initial_oc.status, TaskExecutionStatus::NotStarted);
+        assert!(initial_oc.run_id.is_none());
+
+        // 1. Simulate the crash window in dispatch_task where the durable TaskDispatchIntent is
+        //    committed and ScopedClient::start_worker executes the real fake-agy worker, but the
+        //    caller crashes before record_task_receipt seals the run_id mapping.
+        let agy_dispatch = host
+            .materialized_plan()
+            .task_dispatch
+            .iter()
+            .find(|d| d.task_id == "task-root-agy")
+            .expect("materialized dispatch entry for task-root-agy")
+            .clone();
+
+        let committed_intent = record_task_dispatch_intent(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            TaskDispatchIntent {
+                task_id: agy_dispatch.task_id.clone(),
+                task_digest: agy_dispatch.task_digest.clone(),
+                profile_id: agy_dispatch.profile_id.clone(),
+                command_key: agy_dispatch.command_key.clone(),
+                recorded_at_ms: 1_700_000_010_000,
+            },
+        )
+        .expect("commit durable dispatch intent before runtime start_worker");
+        assert_eq!(committed_intent.task_id, "task-root-agy");
+
+        let scoped = threadlane::ScopedClient::from_state_dir(
+            host.runtime_state_dir(),
+            host.session_binding_id(),
+        )
+        .expect("open scoped client");
+        let started_worker = scoped
+            .start_worker(
+                agy_dispatch.command_key.clone(),
+                agy_dispatch.profile_id.clone(),
+                agy_dispatch.instruction.clone(),
+            )
+            .await
+            .expect("start_worker runtime effect before receipt seal");
+
+        // Wait for the live worker run in the runtime supervisor to finish executing fake-agy.
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let w = scoped
+                .get_worker(started_worker.run_id.clone())
+                .await
+                .expect("get_worker on live runtime run");
+            if w.status == threadlane::WorkerStatus::Completed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for runtime worker completion; last snapshot: {w:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        // No sealed receipt exists yet, only the durable pre-effect dispatch intent.
+        assert!(read_task_receipt(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            "task-root-agy"
+        )
+        .expect("read_task_receipt")
+        .is_none());
+        assert_eq!(
+            read_task_dispatch_intent(
+                host.session_dir(),
+                host.approval(),
+                host.session_binding_id(),
+                "task-root-agy"
+            )
+            .expect("read_task_dispatch_intent"),
+            Some(committed_intent.clone())
+        );
+
+        // 2. Read-only get_task reports TaskExecutionStatus::Unknown (never NotStarted),
+        //    never spawns a worker, never mutates task-receipts.json, and never changes cursors.
+        let receipts_path = host.session_dir().join(TASK_RECEIPTS_FILENAME);
+        let receipts_bytes_before =
+            fs::read(&receipts_path).expect("read receipts before get_task");
+        let status_before = scoped
+            .status()
+            .await
+            .expect("scoped status before get_task");
+        let activity_before = client
+            .list_activity(&approval_id, None, None, Some(20), None)
+            .await
+            .expect("list_activity before get_task");
+
+        let unknown_snap = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task on unsealed intent");
+        assert_eq!(unknown_snap.status, TaskExecutionStatus::Unknown);
+        assert!(unknown_snap.run_id.is_none());
+        assert!(unknown_snap.worker_id.is_none());
+        assert!(unknown_snap.worker.is_none());
+        assert!(!unknown_snap.accepted);
+
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        let status_after = scoped.status().await.expect("scoped status after get_task");
+        assert_eq!(
+            status_after.binding.delivered_seq,
+            status_before.binding.delivered_seq
+        );
+        assert_eq!(
+            status_after.binding.acked_seq,
+            status_before.binding.acked_seq
+        );
+        let activity_after = client
+            .list_activity(&approval_id, None, None, Some(20), None)
+            .await
+            .expect("list_activity after get_task");
+        assert_eq!(
+            activity_after.high_water_mark_seq,
+            activity_before.high_water_mark_seq
+        );
+        assert_eq!(activity_after.next_cursor, activity_before.next_cursor);
+        assert_eq!(activity_after.events, activity_before.events);
+        assert_eq!(
+            fs::read(&receipts_path).expect("read receipts after get_task"),
+            receipts_bytes_before
+        );
+
+        // 3. Cancelling a task with a durable dispatch intent but no sealed receipt reports
+        //    unknown/unresolved (invalid_run_state), distinct from not_started, without inventing a run_id.
+        let cancel_ambiguous_err = client
+            .cancel_task(
+                &approval_id,
+                "task-root-agy",
+                1,
+                Some("attempt cancel without sealed receipt".to_string()),
+            )
+            .await
+            .expect_err("cancel with unsealed intent must fail");
+        assert_eq!(cancel_ambiguous_err.code(), "invalid_run_state");
+        assert_ne!(cancel_ambiguous_err.code(), "not_started");
+        let cancel_msg = cancel_ambiguous_err.to_string();
+        assert!(cancel_msg.contains("unresolved"));
+        assert!(cancel_msg.contains("unknown"));
+        assert!(!cancel_msg.contains(&started_worker.run_id));
+
+        let activity_ambiguous_err = client
+            .list_task_activity(&approval_id, "task-root-agy", None, None, None, None)
+            .await
+            .expect_err("list_task_activity with unsealed intent must fail");
+        assert_eq!(activity_ambiguous_err.code(), "invalid_run_state");
+        assert_ne!(activity_ambiguous_err.code(), "not_started");
+
+        // 4. Truly never-dispatched sibling task ("task-root-oc") remains NotStarted / not_started.
+        let unstarted_sibling = client
+            .get_task(&approval_id, "task-root-oc")
+            .await
+            .expect("get_task on unstarted sibling");
+        assert_eq!(unstarted_sibling.status, TaskExecutionStatus::NotStarted);
+        let cancel_unstarted_err = client
+            .cancel_task(&approval_id, "task-root-oc", 1, None)
+            .await
+            .expect_err("cancel truly unstarted sibling");
+        assert_eq!(cancel_unstarted_err.code(), "not_started");
+
+        // 5. Reopening the client and restarting the host retains the durable intent on disk.
+        drop(client);
+        let reopened_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("reopen client");
+        assert_eq!(
+            reopened_client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect("get_task after client reopen")
+                .status,
+            TaskExecutionStatus::Unknown
+        );
+        assert_eq!(
+            reopened_client
+                .get_task(&approval_id, "task-root-oc")
+                .await
+                .expect("get_task unstarted after client reopen")
+                .status,
+            TaskExecutionStatus::NotStarted
+        );
+
+        let session_dir = host.session_dir().to_path_buf();
+        let runtime_state_dir = host.runtime_state_dir().to_path_buf();
+        let session_binding_id = host.session_binding_id().to_string();
+        let approval_record = host.approval().clone();
+        let oc_dispatch = host
+            .materialized_plan()
+            .task_dispatch
+            .iter()
+            .find(|d| d.task_id == "task-root-oc")
+            .expect("materialized dispatch entry for task-root-oc")
+            .clone();
+
+        host.shutdown().await.expect("shutdown host before reopen");
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("restart host");
+        assert_eq!(host.session_binding_id(), session_binding_id);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+        assert_eq!(
+            reopened_client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect("get_task after host restart")
+                .status,
+            TaskExecutionStatus::Unknown
+        );
+
+        // 6. Explicit dispatch_task retry uses the SAME frozen command_key to repair the sealed
+        //    receipt mapping without spawning a new worker (invocation count stays 1).
+        let repaired = reopened_client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("explicit dispatch_task retry repairs lost receipt");
+        assert_eq!(repaired.run_id, Some(started_worker.run_id.clone()));
+        assert_eq!(repaired.worker_id, Some(started_worker.worker_id.clone()));
+        assert_eq!(repaired.status, TaskExecutionStatus::ReadyForReview);
+        assert!(!repaired.accepted);
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        let sealed_receipt = read_task_receipt(
+            &session_dir,
+            &approval_record,
+            &session_binding_id,
+            "task-root-agy",
+        )
+        .expect("read repaired receipt")
+        .expect("sealed receipt now present");
+        assert_eq!(sealed_receipt.run_id, started_worker.run_id);
+        assert_eq!(sealed_receipt.worker_id, started_worker.worker_id);
+
+        // 7. Also verify that ApprovedHostClient::dispatch_task itself commits the durable intent
+        //    BEFORE start_worker returns, and retains the intent when start_worker errors.
+        let scoped_restarted =
+            threadlane::ScopedClient::from_state_dir(&runtime_state_dir, &session_binding_id)
+                .expect("open scoped client after restart");
+        scoped_restarted
+            .start_worker(
+                oc_dispatch.command_key.clone(),
+                oc_dispatch.profile_id.clone(),
+                "conflicting payload to force start_worker error in dispatch_task".to_string(),
+            )
+            .await
+            .expect("seed command_key with conflicting instruction");
+
+        let dispatch_oc_err = reopened_client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect_err("dispatch_task must fail when start_worker returns idempotency_conflict");
+        assert_eq!(dispatch_oc_err.code(), "idempotency_conflict");
+
+        // Because dispatch_task committed the intent BEFORE calling start_worker, the intent is
+        // retained on disk and get_task now reports Unknown (not NotStarted).
+        let oc_intent = read_task_dispatch_intent(
+            &session_dir,
+            &approval_record,
+            &session_binding_id,
+            "task-root-oc",
+        )
+        .expect("read oc dispatch intent")
+        .expect("oc dispatch intent retained after start_worker error");
+        assert_eq!(oc_intent.command_key, oc_dispatch.command_key);
+        assert_eq!(oc_intent.profile_id, oc_dispatch.profile_id);
+        assert_eq!(oc_intent.task_digest, oc_dispatch.task_digest);
+        assert!(read_task_receipt(
+            &session_dir,
+            &approval_record,
+            &session_binding_id,
+            "task-root-oc"
+        )
+        .expect("read oc receipt")
+        .is_none());
+        assert_eq!(
+            reopened_client
+                .get_task(&approval_id, "task-root-oc")
+                .await
+                .expect("get_task on task-root-oc after failed dispatch_task")
+                .status,
+            TaskExecutionStatus::Unknown
+        );
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn legacy_receipts_without_intents_and_malformed_or_foreign_intents_fail_closed() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-intent-validation",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Intent ledger validation"),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        let dispatched = client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+        let completed = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(completed.run_id, dispatched.run_id);
+
+        let receipts_path = host.session_dir().join(TASK_RECEIPTS_FILENAME);
+        let sealed_receipt = read_task_receipt(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            "task-root-agy",
+        )
+        .expect("read sealed receipt")
+        .expect("receipt exists");
+
+        let write_receipts_json = |value: serde_json::Value| -> Vec<u8> {
+            let mut bytes = serde_json::to_vec_pretty(&value).expect("serialize ledger JSON");
+            bytes.push(b'\n');
+            fs::write(&receipts_path, &bytes).expect("write task-receipts.json");
+            fs::set_permissions(&receipts_path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 task-receipts.json");
+            bytes
+        };
+
+        // 1. Older ledger format without `pending_intents` key still deserializes cleanly with
+        //    #[serde(default)] empty intents.
+        write_receipts_json(serde_json::json!({
+            "schema_version": TASK_RECEIPTS_SCHEMA_VERSION,
+            "approval_id": host.approval_id(),
+            "subject_digest": host.approval().subject_digest,
+            "session_binding_id": host.session_binding_id(),
+            "receipts": [sealed_receipt],
+        }));
+
+        assert!(read_task_dispatch_intent(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            "task-root-agy"
+        )
+        .expect("read intent from legacy ledger")
+        .is_none());
+        let legacy_snap = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task with legacy ledger");
+        assert_eq!(legacy_snap.status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(legacy_snap.run_id, dispatched.run_id);
+        assert_eq!(
+            client
+                .get_task(&approval_id, "task-root-oc")
+                .await
+                .expect("get_task unstarted with legacy ledger")
+                .status,
+            TaskExecutionStatus::NotStarted
+        );
+
+        // 2. Malformed, foreign, dependent, native-route, mismatched, or duplicate intents in
+        //    task-receipts.json must fail closed with corrupt_receipts and preserve the file.
+        let valid_intent = serde_json::json!({
+            "task_id": sealed_receipt.task_id,
+            "task_digest": sealed_receipt.task_digest,
+            "profile_id": sealed_receipt.profile_id,
+            "command_key": sealed_receipt.command_key,
+            "recorded_at_ms": 1_700_000_020_000i64,
+        });
+
+        let bad_intent_cases = vec![
+            // Foreign task_id not in approval record
+            serde_json::json!([{
+                "task_id": "task-foreign-injected",
+                "task_digest": sealed_receipt.task_digest,
+                "profile_id": sealed_receipt.profile_id,
+                "command_key": sealed_receipt.command_key,
+                "recorded_at_ms": 1_700_000_020_000i64,
+            }]),
+            // Dependent task_id in pending_intents
+            serde_json::json!([{
+                "task_id": "task-dep-agy",
+                "task_digest": sealed_receipt.task_digest,
+                "profile_id": sealed_receipt.profile_id,
+                "command_key": sealed_receipt.command_key,
+                "recorded_at_ms": 1_700_000_020_000i64,
+            }]),
+            // Manual native route task_id in pending_intents
+            serde_json::json!([{
+                "task_id": "task-native-codex",
+                "task_digest": sealed_receipt.task_digest,
+                "profile_id": sealed_receipt.profile_id,
+                "command_key": sealed_receipt.command_key,
+                "recorded_at_ms": 1_700_000_020_000i64,
+            }]),
+            // Mismatched task_digest (valid hex, wrong digest for task)
+            serde_json::json!([{
+                "task_id": sealed_receipt.task_id,
+                "task_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "profile_id": sealed_receipt.profile_id,
+                "command_key": sealed_receipt.command_key,
+                "recorded_at_ms": 1_700_000_020_000i64,
+            }]),
+            // Mismatched profile_id
+            serde_json::json!([{
+                "task_id": sealed_receipt.task_id,
+                "task_digest": sealed_receipt.task_digest,
+                "profile_id": "prof_tampered_profile",
+                "command_key": sealed_receipt.command_key,
+                "recorded_at_ms": 1_700_000_020_000i64,
+            }]),
+            // Mismatched command_key
+            serde_json::json!([{
+                "task_id": sealed_receipt.task_id,
+                "task_digest": sealed_receipt.task_digest,
+                "profile_id": sealed_receipt.profile_id,
+                "command_key": "cmd_tampered_command_key",
+                "recorded_at_ms": 1_700_000_020_000i64,
+            }]),
+            // Duplicate intent entries for the same task_id
+            serde_json::json!([valid_intent.clone(), valid_intent.clone()]),
+            // Unknown field inside intent entry
+            serde_json::json!([{
+                "task_id": sealed_receipt.task_id,
+                "task_digest": sealed_receipt.task_digest,
+                "profile_id": sealed_receipt.profile_id,
+                "command_key": sealed_receipt.command_key,
+                "recorded_at_ms": 1_700_000_020_000i64,
+                "foreign_field": "rejected",
+            }]),
+        ];
+
+        for bad_intents in bad_intent_cases {
+            let raw_bytes = write_receipts_json(serde_json::json!({
+                "schema_version": TASK_RECEIPTS_SCHEMA_VERSION,
+                "approval_id": host.approval_id(),
+                "subject_digest": host.approval().subject_digest,
+                "session_binding_id": host.session_binding_id(),
+                "pending_intents": bad_intents,
+                "receipts": [],
+            }));
+
+            let get_err = client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect_err("malformed/foreign intent must fail get_task closed");
+            assert_eq!(get_err.code(), "corrupt_receipts");
+
+            let dispatch_err = client
+                .dispatch_task(&approval_id, "task-root-agy")
+                .await
+                .expect_err("malformed/foreign intent must fail dispatch_task closed");
+            assert_eq!(dispatch_err.code(), "corrupt_receipts");
+
+            let cancel_err = client
+                .cancel_task(&approval_id, "task-root-agy", 1, None)
+                .await
+                .expect_err("malformed/foreign intent must fail cancel_task closed");
+            assert_eq!(cancel_err.code(), "corrupt_receipts");
+
+            assert_eq!(
+                fs::read(&receipts_path).expect("read preserved corrupt task-receipts.json"),
+                raw_bytes
+            );
+        }
+
+        host.shutdown().await.expect("shutdown host");
     }
 }
