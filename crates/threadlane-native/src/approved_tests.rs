@@ -170,21 +170,62 @@ fn write_fake_oc_script(script_path: &Path, count_file: &Path, prompt_file: &Pat
     if let Some(parent) = script_path.parent() {
         fs::create_dir_all(parent).expect("create script parent dir");
     }
+    let base_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after epoch")
+        .as_millis() as u64
+        + 60_000;
+    let msg_created_ts = base_ts + 1;
+    let msg_completed_ts = base_ts + 2;
+    let idle_ts = base_ts + 3;
+
     let script = format!(
         r#"#!/bin/sh
 set -eu
 COUNT_FILE="{count_file}"
 PROMPT_FILE="{prompt_file}"
-c=0
-if [ -f "$COUNT_FILE" ]; then
-    c=$(cat "$COUNT_FILE")
-fi
-c=$((c + 1))
-printf "%s" "$c" > "$COUNT_FILE"
 
+if [ "${{1:-}}" = "api" ]; then
+    if [ "$#" -eq 5 ] && [ "${{2:-}}" = "--standalone" ] && [ "${{3:-}}" = "session.create" ] && [ "${{4:-}}" = "--data" ] && [ -n "${{5:-}}" ]; then
+        CWD=$(pwd -P)
+        printf '{{"data":{{"id":"sess-oc-mcp","location":{{"directory":"%s"}},"time":{{"created":{base_ts}}}}}}}\n' "$CWD"
+        exit 0
+    elif [ "$#" -eq 5 ] && [ "${{2:-}}" = "--standalone" ] && [ "${{3:-}}" = "session.get" ] && [ "${{4:-}}" = "--param" ] && [ "${{5:-}}" = "sessionID=sess-oc-mcp" ]; then
+        CWD=$(pwd -P)
+        printf '{{"data":{{"id":"sess-oc-mcp","outcome":"succeeded","location":{{"directory":"%s"}},"time":{{"created":{base_ts},"idle":{idle_ts}}}}}}}\n' "$CWD"
+        exit 0
+    else
+        echo "unexpected api metadata argv" >&2
+        exit 2
+    fi
+fi
+
+if [ "${{1:-}}" = "session" ]; then
+    if [ "$#" -eq 5 ] && [ "${{2:-}}" = "export" ] && [ "${{3:-}}" = "--standalone" ] && [ "${{4:-}}" = "--sanitize" ] && [ "${{5:-}}" = "sess-oc-mcp" ]; then
+        CWD=$(pwd -P)
+        printf '{{"info":{{"id":"sess-oc-mcp","outcome":"succeeded","location":{{"directory":"%s"}},"time":{{"created":{base_ts},"idle":{idle_ts}}}}},"messages":[{{"id":"msg_fake_final","type":"assistant","sessionID":"sess-oc-mcp","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"finish":"stop","time":{{"created":{msg_created_ts},"completed":{msg_completed_ts}}}}}]}}\n' "$CWD"
+        exit 0
+    else
+        echo "unexpected session export metadata argv" >&2
+        exit 2
+    fi
+fi
+
+if [ "${{1:-}}" != "--standalone" ] || [ "${{2:-}}" != "run" ]; then
+    echo "unexpected model run argv" >&2
+    exit 2
+fi
+shift 2
+
+SESSION_ID=""
 PROMPT=""
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --session)
+            shift 1
+            SESSION_ID="${{1:-}}"
+            shift 1
+            ;;
         --)
             shift 1
             PROMPT="${{1:-}}"
@@ -196,18 +237,34 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "$SESSION_ID" != "sess-oc-mcp" ]; then
+    echo "expected allocated --session sess-oc-mcp" >&2
+    exit 2
+fi
+
+c=0
+if [ -f "$COUNT_FILE" ]; then
+    c=$(cat "$COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$COUNT_FILE"
+
 printf "%s" "$PROMPT" > "$PROMPT_FILE"
-printf '{{"type":"init","session_id":"sess-oc-mcp","model":"opencode-go/deepseek-v4.1-flash","effort":"max"}}\n'
+printf '{{"type":"init","session_id":"%s","model":"opencode-go/deepseek-v4.1-flash","effort":"max"}}\n' "$SESSION_ID"
 
 if [ -d "src" ]; then
     printf "// updated by fake-oc\npub fn extra() {{}}\n" > "src/extra.rs"
 fi
 
-printf '{{"type":"result","subtype":"success","session_id":"sess-oc-mcp","model":"opencode-go/deepseek-v4.1-flash","effort":"max"}}\n'
+printf '{{"type":"result","subtype":"success","session_id":"%s","model":"opencode-go/deepseek-v4.1-flash","effort":"max"}}\n' "$SESSION_ID"
 exit 0
 "#,
         count_file = count_file.display(),
         prompt_file = prompt_file.display(),
+        base_ts = base_ts,
+        msg_created_ts = msg_created_ts,
+        msg_completed_ts = msg_completed_ts,
+        idle_ts = idle_ts,
     );
 
     let mut f = File::create(script_path).expect("create fake-oc");

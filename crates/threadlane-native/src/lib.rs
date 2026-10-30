@@ -110,11 +110,21 @@ mod tests {
     use super::*;
 
     fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
         let path = dir.join(name);
-        fs::write(&path, body).expect("write fake codex script");
-        let mut perms = fs::metadata(&path).expect("stat script").permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&path, perms).expect("chmod 0700 script");
+        let staging = dir.join(format!(".{name}.tmp"));
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(&staging)
+            .expect("create staged fake script");
+        file.write_all(body.as_bytes()).expect("write fake script");
+        file.sync_all().expect("sync fake script");
+        drop(file);
+        fs::rename(staging, &path).expect("publish closed fake executable");
         path
     }
 

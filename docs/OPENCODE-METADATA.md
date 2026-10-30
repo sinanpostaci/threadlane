@@ -3,7 +3,8 @@
 `threadlane_workers::opencode_metadata::validate_opencode_metadata` is a pure
 validator. It accepts already-loaded inputs and produces compact evidence or a
 finite error code. It performs no file, process, network, session-discovery or
-export operation. The runtime worker collector does not use it yet.
+export operation. The worker supervisor now uses it through a bounded collector
+for new software-owned OpenCode v2 sessions.
 
 ## Trusted inputs
 
@@ -37,10 +38,36 @@ count and terminal assistant ID, plus the fixed labels
 retain prompts, content, reasoning, titles, tool bodies, error prose or paths.
 Errors contain finite static codes, rather than copied provider data.
 
-This is CLI-reported metadata, not cloud attestation. A future collector must
-establish ownership, bounded acquisition, cancellation and privacy before passing
-inputs here. The current worker's missing-evidence gate remains unchanged;
-parser tests alone do not establish live OpenCode worker compatibility.
+This is CLI-reported metadata, not cloud attestation. Parser tests alone do not
+establish live provider compatibility.
+
+## Owned execution collector
+
+A new OpenCode job with no requested session first creates a fresh session using
+its validated executable, canonical task directory and pinned child environment.
+The returned identifier, directory and creation time must validate before model
+execution. The effective run receives that exact session ID; the caller's
+requested session remains distinct from the allocated and observed identity.
+
+After a clean model-process exit, the collector reads only that owned session's
+info and mandatory sanitized export. It never discovers sessions, queries an ID
+from model prose, exports a caller-selected old session, falls back to raw export,
+or replays inference after failure. Explicit existing-session jobs retain their
+stream-only evidence path.
+
+Each metadata command has a ten-second maximum and shares the original job's
+absolute deadline. Info/create output is capped at 64 KiB and export at 1 MiB.
+Both pipes drain concurrently; stderr is discarded. Cancellation, timeout,
+overflow, read failure or incomplete descendant cleanup prevents acceptance.
+Metadata and export content stay in memory; only allowlisted evidence or finite
+error codes enter the report.
+
+Reports preserve the original NDJSON evidence, including `saw_result_event`.
+Validated per-assistant metadata may supplement missing model, effort or terminal
+completion. Stream mismatches, blocks, errors and malformed output remain
+failures. Runtime observation uses effective evidence without inventing a stream
+result. A passing execution and diff gate yield **Ready for review**; they never
+automatically accept or merge a patch.
 
 ## Validation
 

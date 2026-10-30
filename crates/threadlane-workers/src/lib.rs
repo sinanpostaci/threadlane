@@ -37,6 +37,8 @@ pub mod error;
 pub mod fs_safety;
 /// Git worktree manager, private ownership manifests, post-run diff gate, and safe cleanup.
 pub mod git;
+/// Owned OpenCode session allocation and bounded post-run metadata collection.
+pub(crate) mod opencode_collector;
 /// Pure validation of explicitly supplied owned OpenCode metadata; performs no I/O.
 pub mod opencode_metadata;
 /// Session-only provider file permission policies and Antigravity `--settings` builders.
@@ -72,6 +74,11 @@ pub use git::{
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
     DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION,
     SANITIZED_GIT_ENV_OVERRIDES, WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
+};
+pub use opencode_metadata::{
+    validate_opencode_metadata, OpenCodeMetadataError, OpenCodeMetadataEvidence,
+    OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
+    MAX_OPENCODE_MESSAGES,
 };
 pub use permissions::{
     build_antigravity_task_files_settings_json,

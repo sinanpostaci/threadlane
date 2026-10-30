@@ -85,8 +85,10 @@ hardening are not implied by the local configuration/execution checkpoint. See
 The optional [Codex-first startup extension](CODEX-WORKFLOW.md) removes the
 desktop Start step for an existing approved root task. Trusted scope approval
 still uses desktop confirmation; a headless operator route remains a usability
-gap. The OpenCode v2 pure metadata validator is preparation for an owned-session
-collector, not proof that live Go worker acceptance is integrated.
+gap. The OpenCode v2 worker now integrates an [owned-session metadata collector](OPENCODE-METADATA.md)
+without changing requested-versus-observed evidence or automatic-acceptance boundaries.
+A [qualified native single-chat pilot](NATIVE-PILOT-2026-10-30.md) also records the
+simulated loop, deferred busy-turn delivery and remaining identity/onboarding gates.
 
 ## Default workflow example
 

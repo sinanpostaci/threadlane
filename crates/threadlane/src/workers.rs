@@ -16,9 +16,9 @@ pub use threadlane_workers::WorkerFilePermissions;
 use threadlane_workers::{
     execute_worker_task_with_observer, sanitize_and_redact,
     validate_absolute_no_symlink_components, validate_simple_identifier, ExecutionBudgets,
-    FieldEvidence, NormalizedEventKind, NormalizedWorkerEvent, OutputOverflowKind,
-    ResolvedModelTarget, TaskExecutionReport, WorkAcceptanceState, WorkerError,
-    WorkerExecutionReport, WorkerProvider, WorkerRunStatus, WorkerSpec, WorktreeManager,
+    NormalizedEventKind, NormalizedWorkerEvent, OutputOverflowKind, ResolvedModelTarget,
+    TaskExecutionReport, WorkAcceptanceState, WorkerError, WorkerExecutionReport, WorkerProvider,
+    WorkerRunStatus, WorkerSpec, WorktreeManager,
 };
 use tokio::sync::{mpsc, watch};
 
@@ -949,18 +949,7 @@ pub(crate) fn build_completion_record(
 }
 
 fn has_complete_natural_completion_evidence(report: &WorkerExecutionReport) -> bool {
-    report.exit_code == Some(0)
-        && report.signal.is_none()
-        && report.status != WorkerRunStatus::TimedOut
-        && !report.cleanup_incomplete
-        && report.overflow.is_none()
-        && report.evidence.blocked_events.is_empty()
-        && report.evidence.provider_errors.is_empty()
-        && report.evidence.malformed_lines_count == 0
-        && report.evidence.model_evidence.is_satisfied()
-        && report.evidence.effort_evidence.is_satisfied()
-        && report.evidence.session_evidence.is_satisfied()
-        && report.evidence.saw_result_event
+    report.has_complete_natural_completion_evidence()
 }
 
 fn build_completion_from_report(
@@ -993,7 +982,7 @@ fn build_completion_from_report(
             WorkerStatus::TimedOut,
             WorkerAcceptanceState::ExecutionFailed,
         )
-    } else if worker_report.status == WorkerRunStatus::Succeeded || natural_success_evidence {
+    } else if natural_success_evidence {
         if diff_gate.passed {
             (
                 WorkerStatus::Completed,
@@ -1019,23 +1008,29 @@ fn build_completion_from_report(
         (WorkerStatus::Failed, WorkerAcceptanceState::ExecutionFailed)
     };
 
-    let observed_model = extract_observed_field(&worker_report.evidence.model_evidence);
-    let observed_effort = extract_observed_field(&worker_report.evidence.effort_evidence);
+    let observed_model = worker_report
+        .effective_observed_model()
+        .and_then(sanitize_observed_identifier);
+    let observed_effort = worker_report
+        .effective_observed_effort()
+        .and_then(sanitize_observed_identifier);
 
-    let missing_model_evidence = !worker_report.evidence.model_evidence.is_satisfied()
+    let missing_model_evidence = !worker_report.has_satisfied_model_evidence()
         || matches!(
             worker_report.status,
             WorkerRunStatus::MissingModelEvidence | WorkerRunStatus::ModelMismatch
         );
-    let missing_effort_evidence = !worker_report.evidence.effort_evidence.is_satisfied()
+    let missing_effort_evidence = !worker_report.has_satisfied_effort_evidence()
         || matches!(
             worker_report.status,
             WorkerRunStatus::MissingEffortEvidence | WorkerRunStatus::EffortMismatch
         );
     let provider_error = !worker_report.evidence.provider_errors.is_empty()
-        || worker_report.status == WorkerRunStatus::ProviderError;
+        || worker_report.status == WorkerRunStatus::ProviderError
+        || worker_report.opencode_metadata_error.as_deref() == Some("provider_error");
     let incomplete_cleanup = worker_report.cleanup_incomplete
-        || worker_report.status == WorkerRunStatus::IncompleteCleanup;
+        || worker_report.status == WorkerRunStatus::IncompleteCleanup
+        || worker_report.opencode_metadata_error.as_deref() == Some("cleanup_incomplete");
     let rejected_by_diff_gate = !diff_gate.passed;
 
     let stdout_truncated = matches!(
@@ -1171,13 +1166,7 @@ fn build_completion_from_error(
     }
 }
 
-fn extract_observed_field(evidence: &FieldEvidence) -> Option<String> {
-    let raw = match evidence {
-        FieldEvidence::VerifiedMatch { value } => Some(value.as_str()),
-        FieldEvidence::Mismatch { observed, .. } => Some(observed.as_str()),
-        FieldEvidence::NotRequested { observed } => observed.as_deref(),
-        FieldEvidence::Missing { .. } => None,
-    }?;
+fn sanitize_observed_identifier(raw: &str) -> Option<String> {
     let cleaned = sanitize_and_redact(raw.trim(), MAX_ID_LEN);
     if cleaned.trim().is_empty() || cleaned.chars().any(char::is_whitespace) {
         None
@@ -1253,6 +1242,8 @@ fn build_failure_reason(
         format!("worker output exceeded configured budget ({overflow:?})")
     } else if worker_report.status == WorkerRunStatus::MalformedStream {
         "worker stdout stream contained malformed non-JSON lines".to_string()
+    } else if let Some(meta_err) = worker_report.opencode_metadata_error.as_deref() {
+        format!("OpenCode session metadata verification failed ({meta_err})")
     } else if !diff_gate_passed {
         if let Some(first_violation) = violation_summaries.first() {
             format!("post-run diff gate rejected changes: {first_violation}")
@@ -1367,4 +1358,281 @@ fn write_private_report_artifact(
     file.write_all(&payload).ok()?;
     file.sync_all().ok()?;
     Some(artifact_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use threadlane_core::{Command, Core};
+    use threadlane_workers::{
+        DiffGateReport, FieldEvidence, IsolationLevel, OpenCodeMetadataEvidence,
+        StreamEvidenceSummary, WorktreeKind, WorktreeManifest, MANIFEST_SCHEMA_VERSION,
+    };
+
+    fn sample_opencode_task_report(workdir: &Path) -> TaskExecutionReport {
+        let base_commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let mut allowed_write_paths = BTreeSet::new();
+        allowed_write_paths.insert("src/lib.rs".to_string());
+
+        let manifest = WorktreeManifest {
+            manifest_version: MANIFEST_SCHEMA_VERSION,
+            worktree_id: "wt-task-r_01-w_01-tok".to_string(),
+            kind: WorktreeKind::Task,
+            run_id: "r_01".to_string(),
+            task_id: Some("w_01".to_string()),
+            repository_path: workdir.to_path_buf(),
+            repository_common_git_dir: Some(workdir.join(".git")),
+            work_area_root: workdir.join("work-area"),
+            checkout_path: workdir.join("work-area/checkouts/wt-task-r_01-w_01-tok"),
+            manifest_path: workdir.join("work-area/manifests/wt-task-r_01-w_01-tok.json"),
+            branch_name: "threadlane/task/r_01/w_01/tok".to_string(),
+            base_commit: base_commit.clone(),
+            allowed_write_paths,
+            job_active: false,
+            active_job_pid: None,
+            partial_cleanup_accepted_head: None,
+        };
+
+        let worker_report = WorkerExecutionReport {
+            provider: WorkerProvider::OpenCodeV2,
+            requested_model: ResolvedModelTarget {
+                base_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                effort: Some("max".to_string()),
+                cli_model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+            },
+            requested_session_id: None,
+            allocated_session_id: Some("ses_owned_001".to_string()),
+            constructed_argv: vec![
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "--standalone".to_string(),
+                "--model".to_string(),
+                "opencode-go/deepseek-v4.1-flash".to_string(),
+                "--session".to_string(),
+                "ses_owned_001".to_string(),
+            ],
+            working_directory: manifest.checkout_path.clone(),
+            status: WorkerRunStatus::Succeeded,
+            exit_code: Some(0),
+            signal: None,
+            process_group_id: Some(4242),
+            duration_ms: 45,
+            stdout_bytes_captured: 128,
+            stderr_bytes_captured: 0,
+            overflow: None,
+            descendants_terminated_after_exit: false,
+            cleanup_incomplete: false,
+            redacted_stderr_summary: None,
+            dropped_live_events: 0,
+            evidence: StreamEvidenceSummary {
+                total_lines: 1,
+                valid_json_events: 1,
+                malformed_lines_count: 0,
+                malformed_diagnostics: Vec::new(),
+                saw_init_event: false,
+                saw_result_event: false,
+                model_evidence: FieldEvidence::Missing {
+                    requested: "opencode-go/deepseek-v4.1-flash".to_string(),
+                },
+                effort_evidence: FieldEvidence::Missing {
+                    requested: "max".to_string(),
+                },
+                session_evidence: FieldEvidence::VerifiedMatch {
+                    value: "ses_owned_001".to_string(),
+                },
+                observed_session_id: Some("ses_owned_001".to_string()),
+                provider_errors: Vec::new(),
+                recoverable_step_errors_count: 0,
+                blocked_events: Vec::new(),
+                retained_events: Vec::new(),
+                dropped_events_count: 0,
+            },
+            opencode_metadata: Some(OpenCodeMetadataEvidence {
+                source: "opencode_sanitized_session_export".to_string(),
+                strength: "cli_reported_per_assistant".to_string(),
+                session_id: "ses_owned_001".to_string(),
+                observed_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                observed_effort: Some("max".to_string()),
+                assistant_message_count: 1,
+                terminal_message_id: "msg_ast_001".to_string(),
+            }),
+            opencode_metadata_error: None,
+        };
+
+        let diff_gate = DiffGateReport {
+            worktree_id: manifest.worktree_id.clone(),
+            checkout_path: manifest.checkout_path.clone(),
+            base_commit: base_commit.clone(),
+            head_commit: base_commit,
+            isolation_level: IsolationLevel::PostRunDiffEvidence,
+            preventive_sandbox: false,
+            isolation_note: "post-run diff gate".to_string(),
+            evidence_complete: true,
+            passed: true,
+            acceptance_state: WorkAcceptanceState::DiffGatePassedPendingReview,
+            changed_paths: Vec::new(),
+            violations: Vec::new(),
+        };
+
+        TaskExecutionReport {
+            manifest,
+            worker_report,
+            diff_gate,
+            overall_acceptance_state: WorkAcceptanceState::DiffGatePassedPendingReview,
+        }
+    }
+
+    #[test]
+    fn opencode_metadata_mapping_yields_ready_for_review_and_rejects_negative_stream_conflict() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        crate::descriptor::prepare_state_dir(&state_dir).expect("prepare_state_dir");
+        let db_path = state_dir.join(crate::descriptor::DATABASE_FILENAME);
+        let mut core = Core::open(&db_path).expect("open core");
+
+        let binding = core
+            .create_binding("11111111-1111-4111-8111-111111111111", "opencode-runtime")
+            .expect("create_binding");
+        let profile_digest = "a".repeat(64);
+        let base_commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+
+        // 1. Positive case: missing stream model/effort/result supplemented by validated metadata
+        // maps to Completed + ReadyForReview with accepted: false and missing flags cleared.
+        let queued = core
+            .execute(
+                &binding.binding_id,
+                Command::StartWorker {
+                    command_key: "wk-opencode-pos-1".to_string(),
+                    profile_id: "prof_opencode".to_string(),
+                    profile_digest: profile_digest.clone(),
+                    provider: "opencode_v2".to_string(),
+                    requested_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    requested_effort: "max".to_string(),
+                    base_commit: base_commit.clone(),
+                    instruction: "implement bounded change".to_string(),
+                    now_ms: 1_000,
+                },
+            )
+            .expect("start_worker")
+            .into_worker()
+            .expect("worker snapshot");
+
+        let claim = core
+            .claim_worker(
+                &binding.binding_id,
+                &queued.run_id,
+                queued.revision,
+                &profile_digest,
+                1_001,
+            )
+            .expect("claim_worker");
+
+        let report = sample_opencode_task_report(temp.path());
+        assert!(!report.worker_report.evidence.saw_result_event);
+        assert!(report.worker_report.requested_session_id.is_none());
+
+        let completion = build_completion_record(&state_dir, &claim, Ok(report.clone()), false);
+        assert_eq!(completion.status, WorkerStatus::Completed);
+        assert_eq!(
+            completion.observed_model.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+        assert_eq!(completion.observed_effort.as_deref(), Some("max"));
+        assert_eq!(
+            completion.outcome.acceptance_state,
+            WorkerAcceptanceState::ReadyForReview
+        );
+        assert!(!completion.outcome.missing_model_evidence);
+        assert!(!completion.outcome.missing_effort_evidence);
+        assert!(!completion.outcome.provider_error);
+        assert!(!completion.outcome.incomplete_cleanup);
+        assert!(!completion.outcome.rejected_by_diff_gate);
+        assert!(completion.outcome.failure_reason.is_none());
+
+        let snapshot = core
+            .record_worker_outcome(&claim, completion, 1_002)
+            .expect("record_worker_outcome");
+        assert_eq!(snapshot.status, WorkerStatus::Completed);
+        let serialized_snapshot = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(
+            serialized_snapshot.get("accepted").is_none(),
+            "WorkerSnapshot must not fabricate a top-level accepted field"
+        );
+        assert_eq!(
+            snapshot.observed_model.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+        assert_eq!(snapshot.observed_effort.as_deref(), Some("max"));
+        let outcome = snapshot.outcome.expect("outcome present");
+        assert_eq!(
+            outcome.acceptance_state,
+            WorkerAcceptanceState::ReadyForReview
+        );
+        assert!(!outcome.missing_model_evidence);
+        assert!(!outcome.missing_effort_evidence);
+
+        // 2. Negative case: a stream conflict (e.g. model mismatch or effort mismatch) cannot be
+        // rescued by serialized metadata even if status was set to Succeeded and diff_gate passed.
+        let queued_conflict = core
+            .execute(
+                &binding.binding_id,
+                Command::StartWorker {
+                    command_key: "wk-opencode-neg-1".to_string(),
+                    profile_id: "prof_opencode".to_string(),
+                    profile_digest: profile_digest.clone(),
+                    provider: "opencode_v2".to_string(),
+                    requested_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    requested_effort: "max".to_string(),
+                    base_commit,
+                    instruction: "attempt with conflicting stream".to_string(),
+                    now_ms: 2_000,
+                },
+            )
+            .expect("start_worker conflict")
+            .into_worker()
+            .expect("worker snapshot");
+
+        let claim_conflict = core
+            .claim_worker(
+                &binding.binding_id,
+                &queued_conflict.run_id,
+                queued_conflict.revision,
+                &profile_digest,
+                2_001,
+            )
+            .expect("claim_worker conflict");
+
+        let mut conflict_report = report;
+        conflict_report.worker_report.evidence.model_evidence = FieldEvidence::Mismatch {
+            requested: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+            observed: "opencode-go/rogue-model".to_string(),
+            detail: "stream reported conflicting model".to_string(),
+        };
+
+        let conflict_completion =
+            build_completion_record(&state_dir, &claim_conflict, Ok(conflict_report), false);
+        assert_eq!(conflict_completion.status, WorkerStatus::Failed);
+        assert_eq!(
+            conflict_completion.observed_model.as_deref(),
+            Some("opencode-go/rogue-model")
+        );
+        assert_eq!(
+            conflict_completion.outcome.acceptance_state,
+            WorkerAcceptanceState::ExecutionFailed
+        );
+        assert!(conflict_completion.outcome.missing_model_evidence);
+
+        let conflict_snapshot = core
+            .record_worker_outcome(&claim_conflict, conflict_completion, 2_002)
+            .expect("record_worker_outcome conflict");
+        assert_eq!(conflict_snapshot.status, WorkerStatus::Failed);
+        let serialized_conflict =
+            serde_json::to_value(&conflict_snapshot).expect("serialize conflict snapshot");
+        assert!(serialized_conflict.get("accepted").is_none());
+        assert_eq!(
+            conflict_snapshot.outcome.expect("outcome").acceptance_state,
+            WorkerAcceptanceState::ExecutionFailed
+        );
+    }
 }

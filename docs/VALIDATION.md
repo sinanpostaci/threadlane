@@ -3,6 +3,34 @@
 Verified on 2026-10-29 on Linux/NixOS. This is a checkpoint report, not a claim
 that every milestone or platform is supported.
 
+## Owned OpenCode execution evidence (2026-10-31)
+
+Ten new tests cover the bounded metadata collector (four), owned worker execution
+(five, including parameterized failures), and runtime completion mapping (one).
+The existing 24 worker/Git foundation regressions also passed before the live
+probe. All 21 host tests also passed after adapting their shared fake CLI to
+metadata-only commands without counting them as inference. Fixtures retain the
+documented scalar `outcome` schema and actual CLI argument ordering; the validator was not weakened to accept a failing fixture.
+
+One disposable live task used OpenCode 2.2.2 with
+`opencode-go/deepseek-v4.1-flash#max`. It completed in 15.34 seconds, changed only
+`result.py`, passed the diff gate and remained
+`diff_gate_passed_pending_review`. The generated addition function matched the
+expected syntax tree and passed two arithmetic checks. The source fixture's main
+checkout stayed clean; no patch was accepted or merged.
+
+Per-assistant sanitized metadata confirmed the exact owned session, requested
+model and `max` effort. The report retained `saw_result_event: false` because the
+stream never emitted that evidence. No raw export was persisted. This is
+CLI-reported evidence from one bounded Linux task, not cloud attestation, long
+session qualification or a live approved-host-to-native-chat workflow.
+
+The separate [native single-chat pilot](NATIVE-PILOT-2026-10-30.md) records its
+qualified simulated loop and restored temporary configuration. Automatic native
+identity/onboarding, two-chat isolation, provider continuation and verified DAG
+inputs remain separate acceptance gates.
+
+
 ## Approved native startup checkpoint (2026-10-30)
 
 The integrated Linux candidate passed `cargo test --locked --workspace
