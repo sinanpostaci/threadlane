@@ -24,6 +24,11 @@ threadlane-authority = { path = "../../../crates/threadlane-authority" }
 threadlane-connectors = { path = "../../../crates/threadlane-connectors" }
 threadlane-decisions = { path = "../../../crates/threadlane-decisions" }
 threadlane-desktop-bridge = { path = "../../../crates/threadlane-desktop-bridge" }
+threadlane-host = { path = "../../../crates/threadlane-host" }
 threadlane-native = { path = "../../../crates/threadlane-native" }
 threadlane-plans = { path = "../../../crates/threadlane-plans" }
 threadlane-registry = { path = "../../../crates/threadlane-registry" }
+tokio = { version = "1", features = ["process", "time", "sync"] }
+
+[dev-dependencies]
+threadlane-workers = { path = "../../../crates/threadlane-workers" }

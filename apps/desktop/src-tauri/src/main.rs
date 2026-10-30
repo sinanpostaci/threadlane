@@ -1,12 +1,15 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod host_control;
+
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use host_control::HostControlHub;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State, Window};
 use threadlane_authority::{
@@ -23,6 +26,7 @@ use threadlane_desktop_bridge::{
     ActivityPage, AttachmentMode, ConnectionState, DesktopBridge, DesktopSnapshot, EventKind,
     RunDetail, ToolStatus, WindowAction,
 };
+use threadlane_host::{HostSessionSummary, TaskStateSnapshot};
 use threadlane_native::{NativeClient, NativeConfig, NativeError, NativeThreadPage};
 use threadlane_plans::{
     compile_plan_revision, Difficulty, PlanChange, PlanError, PlanRevision, PlanStatus, PlanStore,
@@ -54,17 +58,21 @@ struct DesktopCli {
     /// Optional path to a dedicated private Threadlane registry configuration directory.
     #[arg(long = "registry-dir")]
     registry_dir: Option<PathBuf>,
+
+    /// Optional path to a trusted local threadlane-host executable binary.
+    #[arg(long = "host-executable")]
+    host_executable: Option<PathBuf>,
 }
 
 /// Safe structured error returned to the desktop frontend over Tauri IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AppError {
-    code: String,
-    message: String,
+pub(crate) struct AppError {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 impl AppError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code: code.to_string(),
             message: sanitize_error_message(&message.into(), "Operation failed.", None),
@@ -124,7 +132,7 @@ impl AppError {
         }
     }
 
-    fn from_authority_error(err: AuthorityError) -> Self {
+    pub(crate) fn from_authority_error(err: AuthorityError) -> Self {
         let (code, message) = match err {
             AuthorityError::Validation { field, .. } => {
                 let msg = match field.as_str() {
@@ -243,7 +251,7 @@ impl AppError {
         }
     }
 
-    fn internal_join_error() -> Self {
+    pub(crate) fn internal_join_error() -> Self {
         Self {
             code: "internal_task_error".to_string(),
             message: "Background desktop worker task failed.".to_string(),
@@ -411,11 +419,11 @@ struct PlanExecutionPreview {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct VerifiedBindingContext {
-    state_dir: String,
-    binding_id: String,
-    thread_uuid: String,
-    selected_binding_id: Option<String>,
+pub(crate) struct VerifiedBindingContext {
+    pub(crate) state_dir: String,
+    pub(crate) binding_id: String,
+    pub(crate) thread_uuid: String,
+    pub(crate) selected_binding_id: Option<String>,
 }
 
 fn build_plan_execution_preview(
@@ -449,9 +457,7 @@ fn build_plan_execution_preview(
         ));
     }
 
-    let registry_snapshot = registry
-        .snapshot()
-        .map_err(AppError::from_registry_error)?;
+    let registry_snapshot = registry.snapshot().map_err(AppError::from_registry_error)?;
 
     if registry_snapshot.revision != plan.profile_revision {
         return Err(AppError::new(
@@ -514,7 +520,7 @@ fn build_plan_execution_preview(
     })
 }
 
-fn verify_snapshot_binding_for_approval(
+pub(crate) fn verify_snapshot_binding_for_approval(
     snapshot: &DesktopSnapshot,
     binding_id: &str,
     thread_uuid: &str,
@@ -615,7 +621,7 @@ fn verify_snapshot_binding_for_approval(
     })
 }
 
-fn verify_snapshot_recheck(
+pub(crate) fn verify_snapshot_recheck(
     captured: &VerifiedBindingContext,
     latest_snapshot: &DesktopSnapshot,
 ) -> Result<(), AppError> {
@@ -644,12 +650,8 @@ fn precheck_approval_against_stores(
     registry: &RegistryStore,
     request: &OperatorApprovalRequest,
 ) -> Result<(), AppError> {
-    let preview = build_plan_execution_preview(
-        plans,
-        registry,
-        &request.plan_id,
-        request.plan_revision,
-    )?;
+    let preview =
+        build_plan_execution_preview(plans, registry, &request.plan_id, request.plan_revision)?;
 
     if preview.binding_id != request.binding_id {
         return Err(AppError::new(
@@ -676,18 +678,23 @@ fn precheck_approval_against_stores(
 }
 
 #[derive(Clone)]
-struct DesktopControlState {
-    registry: Arc<RegistryStore>,
-    plans: Arc<PlanStore>,
-    authority: Arc<AuthorityStore>,
-    vault: Arc<dyn CredentialStore>,
+pub(crate) struct DesktopControlState {
+    pub(crate) registry: Arc<RegistryStore>,
+    pub(crate) plans: Arc<PlanStore>,
+    pub(crate) authority: Arc<AuthorityStore>,
+    pub(crate) vault: Arc<dyn CredentialStore>,
+    pub(crate) sessions_dir: PathBuf,
+    pub(crate) host_executable: Option<PathBuf>,
+    pub(crate) host_control: Arc<HostControlHub>,
 }
 
 impl DesktopControlState {
-    fn open(
+    pub(crate) fn open(
         registry_dir: PathBuf,
         plans_dir: PathBuf,
         authority_dir: PathBuf,
+        sessions_dir: PathBuf,
+        host_executable: Option<PathBuf>,
     ) -> Result<Self, String> {
         let registry = Arc::new(
             RegistryStore::open(&registry_dir)
@@ -701,12 +708,25 @@ impl DesktopControlState {
             AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plans))
                 .map_err(|err| format!("failed to open authority store: {err}"))?,
         );
+        let sessions_dir = threadlane_host::validate_sessions_root(
+            &sessions_dir,
+            &[
+                ("registry_dir", registry.config_dir()),
+                ("plans_dir", plans.dir()),
+                ("authority_dir", authority.dir()),
+            ],
+        )
+        .map_err(|err| format!("failed to initialize sessions directory: {err}"))?;
         let vault: Arc<dyn CredentialStore> = Arc::new(KeyringCredentialStore::new());
+        let host_control = Arc::new(HostControlHub::new());
         Ok(Self {
             registry,
             plans,
             authority,
             vault,
+            sessions_dir,
+            host_executable,
+            host_control,
         })
     }
 }
@@ -1093,6 +1113,46 @@ async fn desktop_plan_approvals(
 }
 
 #[tauri::command]
+async fn desktop_start_approved_session(
+    bridge: State<'_, DesktopBridge>,
+    control: State<'_, DesktopControlState>,
+    approval_id: String,
+) -> Result<HostSessionSummary, AppError> {
+    host_control::start_approved_session(&bridge, &control, approval_id).await
+}
+
+#[tauri::command]
+async fn desktop_approved_session(
+    bridge: State<'_, DesktopBridge>,
+    control: State<'_, DesktopControlState>,
+    approval_id: String,
+) -> Result<HostSessionSummary, AppError> {
+    host_control::approved_session(&bridge, &control, approval_id).await
+}
+
+#[tauri::command]
+async fn desktop_approved_task(
+    bridge: State<'_, DesktopBridge>,
+    control: State<'_, DesktopControlState>,
+    approval_id: String,
+    task_id: String,
+) -> Result<TaskStateSnapshot, AppError> {
+    host_control::approved_task(&bridge, &control, approval_id, task_id).await
+}
+
+#[tauri::command]
+async fn desktop_approved_activity(
+    bridge: State<'_, DesktopBridge>,
+    control: State<'_, DesktopControlState>,
+    approval_id: String,
+    after_seq: Option<u64>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+) -> Result<ActivityPage, AppError> {
+    host_control::approved_activity(&bridge, &control, approval_id, after_seq, cursor, limit).await
+}
+
+#[tauri::command]
 async fn desktop_native_threads(
     control: State<'_, DesktopControlState>,
     tool_id: String,
@@ -1179,6 +1239,7 @@ fn main() -> ExitCode {
     };
 
     let cli_registry_dir = cli.registry_dir;
+    let cli_host_executable = cli.host_executable;
 
     let result = tauri::Builder::default()
         .manage(bridge)
@@ -1197,8 +1258,15 @@ fn main() -> ExitCode {
                 .map_err(|_| "Failed to resolve application data directory.")?;
             let plans_dir = app_data_dir.join("plans");
             let authority_dir = app_data_dir.join("authority");
+            let sessions_dir = app_data_dir.join("sessions");
 
-            let control = DesktopControlState::open(registry_dir, plans_dir, authority_dir)?;
+            let control = DesktopControlState::open(
+                registry_dir,
+                plans_dir,
+                authority_dir,
+                sessions_dir,
+                cli_host_executable,
+            )?;
             app.manage(control);
             Ok(())
         })
@@ -1225,6 +1293,10 @@ fn main() -> ExitCode {
             desktop_plan_execution_preview,
             desktop_approve_plan,
             desktop_plan_approvals,
+            desktop_start_approved_session,
+            desktop_approved_session,
+            desktop_approved_task,
+            desktop_approved_activity,
             desktop_native_threads,
         ])
         .run(tauri::generate_context!());
@@ -1255,8 +1327,7 @@ mod tests {
     impl ScopedTestDir {
         fn new(label: &str) -> Self {
             let seq = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let raw_base =
-                fs::canonicalize(env::temp_dir()).unwrap_or_else(|_| env::temp_dir());
+            let raw_base = fs::canonicalize(env::temp_dir()).unwrap_or_else(|_| env::temp_dir());
             let path = raw_base.join(format!(
                 "threadlane-desktop-m4-{label}-{}-{seq}",
                 std::process::id()
