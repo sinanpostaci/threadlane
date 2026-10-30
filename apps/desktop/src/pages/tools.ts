@@ -40,11 +40,41 @@ interface SafeError {
   message: string;
 }
 
+export interface ToolsDiscoveryItem {
+  id: string;
+  label: string;
+  availability: string;
+  executable_path: string | null;
+}
+
+export interface ToolsRenderContext {
+  tools?: readonly ToolsDiscoveryItem[];
+  loading?: boolean;
+  error?: string | null;
+  onRefreshDiscovery?: () => void;
+  onOpenProfiles?: () => void;
+}
+
+export interface ToolsPageOptions {
+  onOpenProfiles?: () => void;
+  onRefreshDiscovery?: () => void;
+}
+
 interface Notice {
   tone: 'success' | 'error' | 'info';
   title?: string;
   text: string;
   code?: string | null;
+  showOpenProfiles?: boolean;
+}
+
+interface PendingToolSwitch {
+  fromKind: 'create-tool' | 'edit-tool';
+  fromToolId: string | null;
+  fromLabel: string;
+  toLabel: string;
+  returnFocusKey: string;
+  proceed: () => void;
 }
 
 interface DraftMeta {
@@ -391,6 +421,16 @@ interface FocusState {
   key: string;
   start: number | null;
   end: number | null;
+  direction: 'forward' | 'backward' | 'none' | null;
+}
+
+function findByFocusKey(root: HTMLElement, key: string): HTMLElement | null {
+  for (const element of root.querySelectorAll<HTMLElement>('[data-focus-key]')) {
+    if (element.dataset.focusKey === key) {
+      return element;
+    }
+  }
+  return null;
 }
 
 function captureFocus(root: HTMLElement): FocusState | null {
@@ -403,20 +443,40 @@ function captureFocus(root: HTMLElement): FocusState | null {
   if (!key) {
     return null;
   }
-  const input = active as HTMLInputElement;
-  return {
-    key,
-    start: typeof input.selectionStart === 'number' ? input.selectionStart : null,
-    end: typeof input.selectionEnd === 'number' ? input.selectionEnd : null,
-  };
+  let start: number | null = null;
+  let end: number | null = null;
+  let direction: 'forward' | 'backward' | 'none' | null = null;
+  if (active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement) {
+    try {
+      start = typeof active.selectionStart === 'number' ? active.selectionStart : null;
+      end = typeof active.selectionEnd === 'number' ? active.selectionEnd : null;
+      direction = active.selectionDirection;
+    } catch {
+      start = null;
+      end = null;
+      direction = null;
+    }
+  }
+  return { key, start, end, direction };
 }
 
 function restoreFocus(root: HTMLElement, state: FocusState | null, disposed: () => boolean): void {
   if (!state) return;
-  const restore = (): void => {
+  const restore = (allowIfAnotherFocused: boolean): void => {
     if (disposed() || !root.isConnected) return;
-    const target = root.querySelector<HTMLElement>(`[data-focus-key="${state.key}"]`);
-    if (!target) return;
+    if (!allowIfAnotherFocused && typeof document !== 'undefined') {
+      const current = document.activeElement;
+      if (
+        current instanceof HTMLElement &&
+        root.contains(current) &&
+        current.dataset.focusKey &&
+        current.dataset.focusKey !== state.key
+      ) {
+        return;
+      }
+    }
+    const target = findByFocusKey(root, state.key);
+    if (!target || (target as { disabled?: boolean }).disabled) return;
     target.focus({ preventScroll: true });
     if (
       (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) &&
@@ -424,22 +484,67 @@ function restoreFocus(root: HTMLElement, state: FocusState | null, disposed: () 
       state.end !== null
     ) {
       try {
-        target.setSelectionRange(state.start, state.end);
+        if (state.direction) {
+          target.setSelectionRange(state.start, state.end, state.direction);
+        } else {
+          target.setSelectionRange(state.start, state.end);
+        }
       } catch {
         // Non-text controls do not expose a selection range.
       }
     }
   };
-  restore();
-  queueMicrotask(restore);
+  restore(true);
+  queueMicrotask(() => restore(false));
+}
+
+function findRegisteredToolForDiscovery(
+  item: ToolsDiscoveryItem,
+  tools: readonly ToolDefinition[]
+): ToolDefinition | null {
+  const setup = discoveryCliSetup(item.id, item.label);
+  const path = item.executable_path?.trim() ?? '';
+  if (setup) {
+    const exactMatch = tools.find(
+      (tool) =>
+        tool.adapter === setup.adapter &&
+        path.length > 0 &&
+        (tool.executable_path ?? '').trim() === path
+    );
+    if (exactMatch) return exactMatch;
+    const adapterMatch = tools.find((tool) => tool.adapter === setup.adapter);
+    if (adapterMatch) return adapterMatch;
+  }
+  if (path.length > 0) {
+    const pathMatch = tools.find((tool) => (tool.executable_path ?? '').trim() === path);
+    if (pathMatch) return pathMatch;
+  }
+  return tools.find((tool) => tool.id === item.id) ?? null;
+}
+
+function deriveToolIdFromLabel(label: string, adapter: Adapter): string {
+  const slug = label
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32);
+  if (slug) return slug;
+  return adapter.replace(/_/g, '-');
 }
 
 export class ToolsPage {
   private readonly onRegistryChanged: () => void;
+  private onOpenProfiles: (() => void) | null = null;
+  private onRefreshDiscovery: (() => void) | null = null;
   private readonly pageId = `aq-tools-${++pageCounter}`;
   private root: HTMLElement | null = null;
   private snapshot: RegistrySnapshot | null = null;
   private renderedRevision: number | null = null;
+  private renderedDiscoverySig: string | null = null;
+  private discoveredTools: readonly ToolsDiscoveryItem[] = [];
+  private discoveryLoading = false;
+  private discoveryError: string | null = null;
   private disposed = false;
   private notice: Notice | null = null;
   private pending = new Set<string>();
@@ -451,18 +556,55 @@ export class ToolsPage {
   private secrets = new Map<string, SecretState>();
   private apiStates = new Map<string, ApiState>();
   private selections = new Map<string, Set<string>>();
+  private catalogSearch = new Map<string, string>();
+  private openPickers = new Set<string>();
   private expanded = new Set<string>();
+  private configuringDiscoveredId: string | null = null;
+  private pendingSwitch: PendingToolSwitch | null = null;
   private deleteConfirm: { kind: 'tool' | 'model'; id: string } | null = null;
 
-  constructor(onRegistryChanged: () => void) {
+  constructor(
+    onRegistryChanged: () => void,
+    options?: ToolsPageOptions | (() => void)
+  ) {
     this.onRegistryChanged = onRegistryChanged;
+    if (typeof options === 'function') {
+      this.onOpenProfiles = options;
+    } else if (options) {
+      this.onOpenProfiles = options.onOpenProfiles ?? null;
+      this.onRefreshDiscovery = options.onRefreshDiscovery ?? null;
+    }
   }
 
-  render(snapshot: RegistrySnapshot): HTMLElement {
+  render(snapshot: RegistrySnapshot, context?: ToolsRenderContext): HTMLElement {
     if (this.disposed) {
       return h('section', { className: 'aq-tools-page', 'aria-label': 'Tools and models' });
     }
-    const needsRender = this.root === null || this.renderedRevision !== snapshot.revision;
+    if (context) {
+      if (context.tools !== undefined) this.discoveredTools = context.tools;
+      if (context.loading !== undefined) this.discoveryLoading = context.loading;
+      if (context.error !== undefined) this.discoveryError = context.error;
+      if (context.onRefreshDiscovery !== undefined) {
+        this.onRefreshDiscovery = context.onRefreshDiscovery;
+      }
+      if (context.onOpenProfiles !== undefined) {
+        this.onOpenProfiles = context.onOpenProfiles;
+      }
+    }
+    const discoverySig = JSON.stringify({
+      loading: this.discoveryLoading,
+      error: this.discoveryError,
+      tools: this.discoveredTools.map((item) => ({
+        id: item.id,
+        label: item.label,
+        availability: item.availability,
+        executable_path: item.executable_path,
+      })),
+    });
+    const needsRender =
+      this.root === null ||
+      this.renderedRevision !== snapshot.revision ||
+      this.renderedDiscoverySig !== discoverySig;
     this.snapshot = snapshot;
     if (this.newTool.baseRevision < 0) this.newTool.baseRevision = snapshot.revision;
     if (this.newModel.baseRevision < 0) this.newModel.baseRevision = snapshot.revision;
@@ -479,6 +621,7 @@ export class ToolsPage {
         'aria-labelledby': `${this.pageId}-title`,
       });
     this.root = root;
+    this.renderedDiscoverySig = discoverySig;
     if (needsRender) this.rewrite();
     return root;
   }
@@ -490,64 +633,74 @@ export class ToolsPage {
     if (!setup || !path) {
       this.notice = {
         tone: 'info',
-        title: 'Discovery not configured',
-        text: 'This discovered command does not map to a supported CLI adapter. Add the tool manually below.',
+        title: 'Custom tool setup',
+        text: 'This command does not map to a preset CLI adapter. Opened the custom tool form below.',
       };
-      this.refresh();
+      this.openCustomToolForm();
       return;
     }
 
-    const existing = this.snapshot.tools.find(
-      (tool) => tool.adapter === setup.adapter && (tool.executable_path ?? '').trim() === path
+    const existing = findRegisteredToolForDiscovery(
+      { id: toolId, label, availability: 'found', executable_path: path },
+      this.snapshot.tools
     );
     if (existing) {
-      this.expanded.add(`tool:${existing.id}`);
-      this.notice = {
-        tone: 'info',
-        title: 'Already registered',
-        text: `${setup.label} with this executable path is already registered. Opened its details; nothing was changed or probed.`,
-      };
-      this.rewrite();
-      this.focusAndScroll(`tool-${existing.id}-details`);
+      this.requestToolSwitch(existing.label, `edit:${existing.id}`, () => {
+        this.expanded.add(`tool:${existing.id}`);
+        this.notice = {
+          tone: 'info',
+          title: 'Already added',
+          text: `${existing.label} is already in your registry. Opened its settings; nothing was changed or probed.`,
+        };
+        this.rewrite();
+        this.focusAndScroll(`tool-${existing.id}-label`);
+      });
       return;
     }
 
-    if (this.newTool.dirty && hasNewToolContent(this.newTool)) {
+    this.requestToolSwitch(setup.label, `configure:${toolId}`, () => {
+      if (!this.snapshot) return;
+      this.configuringDiscoveredId = toolId;
+      this.newTool = {
+        id: uniqueToolId(setup.idBase, this.snapshot.tools),
+        label: setup.label,
+        adapter: setup.adapter,
+        executable: path,
+        enabled: true,
+        baseRevision: this.snapshot.revision,
+        dirty: true,
+        conflict: false,
+        overwrite: false,
+      };
       this.expanded.add('create-tool');
       this.notice = {
         tone: 'info',
-        title: 'Unsaved draft preserved',
-        text: `The Add tool form already has unsaved changes, so discovery did not prefill ${setup.label}. Review or clear that draft before trying Configure again.`,
+        title: 'Customize before adding',
+        text: `Prefilled ${setup.label} from local PATH discovery. Review or adjust settings below, then click Save and choose models or Cancel.`,
       };
       this.rewrite();
-      this.focusAndScroll('new-tool-id');
+      this.focusAndScroll('new-tool-label');
+    });
+  }
+
+  addAndChooseModels(toolId: string, label: string, executablePath: string): void {
+    if (this.disposed || !this.snapshot) return;
+    const setup = discoveryCliSetup(toolId, label);
+    const path = executablePath.trim();
+    if (!setup || !path) {
+      this.configureDiscoveredTool(toolId, label, executablePath);
       return;
     }
 
-    this.newTool = {
-      id: uniqueToolId(setup.idBase, this.snapshot.tools),
-      label: setup.label,
-      adapter: setup.adapter,
-      executable: path,
-      enabled: true,
-      baseRevision: this.snapshot.revision,
-      dirty: true,
-      conflict: false,
-      overwrite: false,
-    };
-    this.expanded.add('create-tool');
-    this.notice = {
-      tone: 'info',
-      title: 'Add tool prefilled',
-      text: `Prefilled ${setup.label} from local PATH discovery. Nothing was saved or probed. Save the tool, then load models and import the entries you want.`,
-    };
-    this.rewrite();
-    this.focusAndScroll('new-tool-id');
+    this.requestToolSwitch(setup.label, `add-choose:${toolId}`, () => {
+      void this.performAddAndChooseModels(toolId, label, path, setup);
+    });
   }
 
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.clearSecretInputs();
     this.pending.clear();
     this.toolDrafts.clear();
     this.modelDrafts.clear();
@@ -555,13 +708,238 @@ export class ToolsPage {
     this.secrets.clear();
     this.apiStates.clear();
     this.selections.clear();
+    this.catalogSearch.clear();
+    this.openPickers.clear();
     this.expanded.clear();
+    this.configuringDiscoveredId = null;
+    this.pendingSwitch = null;
     this.deleteConfirm = null;
     this.snapshot = null;
     this.renderedRevision = null;
+    this.renderedDiscoverySig = null;
     this.notice = null;
     this.root?.replaceChildren();
     this.root = null;
+  }
+
+  private async performAddAndChooseModels(
+    toolId: string,
+    label: string,
+    path: string,
+    setup: DiscoveryCliSetup
+  ): Promise<void> {
+    if (this.disposed || !this.snapshot) return;
+    const existing = findRegisteredToolForDiscovery(
+      { id: toolId, label, availability: 'found', executable_path: path },
+      this.snapshot.tools
+    );
+    if (existing) {
+      this.openPickers.add(existing.id);
+      this.rewrite();
+      await this.probe(existing);
+      this.focusAndScroll(`probe:${existing.id}-search`);
+      return;
+    }
+
+    const tool: ToolDefinition = {
+      id: uniqueToolId(setup.idBase, this.snapshot.tools),
+      label: setup.label,
+      adapter: setup.adapter,
+      executable_path: path,
+      enabled: true,
+    };
+    const key = `add-choose:${toolId}`;
+    const saved = await this.apply(key, { op: 'upsert_tool', tool }, (next) => {
+      if (this.configuringDiscoveredId === toolId) {
+        this.configuringDiscoveredId = null;
+        this.expanded.delete('create-tool');
+        this.newTool = emptyTool(next.revision);
+      }
+      this.openPickers.add(tool.id);
+      this.notice = {
+        tone: 'info',
+        title: `${tool.label} added`,
+        text: `Saved ${tool.label} and reading its model catalog. Select the models you want to use in Profiles.`,
+      };
+    });
+    if (saved && !this.disposed) {
+      await this.probe(tool);
+      this.focusAndScroll(`probe:${tool.id}-search`);
+    }
+  }
+
+  private getActiveDirtyToolEditor(): {
+    kind: 'create-tool' | 'edit-tool';
+    toolId: string | null;
+    label: string;
+    focusKey: string;
+  } | null {
+    if (this.expanded.has('create-tool') && this.newTool.dirty && hasNewToolContent(this.newTool)) {
+      return {
+        kind: 'create-tool',
+        toolId: this.configuringDiscoveredId,
+        label: this.newTool.label.trim() || 'new tool draft',
+        focusKey: 'new-tool-label',
+      };
+    }
+    if (this.snapshot) {
+      for (const tool of this.snapshot.tools) {
+        if (!this.expanded.has(`tool:${tool.id}`)) continue;
+        const draft = this.toolDrafts.get(tool.id);
+        if (draft && (draft.dirty || draft.conflict) && !sameTool(tool, draft)) {
+          return {
+            kind: 'edit-tool',
+            toolId: tool.id,
+            label: tool.label,
+            focusKey: `tool-${tool.id}-label`,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
+  private requestToolSwitch(
+    toLabel: string,
+    targetKey: string,
+    action: () => void
+  ): void {
+    const activeDirty = this.getActiveDirtyToolEditor();
+    if (!activeDirty) {
+      this.pendingSwitch = null;
+      this.closeCleanToolFormsExcept(targetKey);
+      action();
+      return;
+    }
+    const isSameCreateTarget =
+      activeDirty.kind === 'create-tool' &&
+      ((activeDirty.toolId !== null && targetKey === `configure:${activeDirty.toolId}`) ||
+        (activeDirty.toolId === null && targetKey === 'create-custom'));
+    const isSameEditTarget =
+      activeDirty.kind === 'edit-tool' &&
+      activeDirty.toolId !== null &&
+      targetKey === `edit:${activeDirty.toolId}`;
+    if (isSameCreateTarget || isSameEditTarget) {
+      this.pendingSwitch = null;
+      action();
+      return;
+    }
+
+    this.pendingSwitch = {
+      fromKind: activeDirty.kind,
+      fromToolId: activeDirty.toolId,
+      fromLabel: activeDirty.label,
+      toLabel,
+      returnFocusKey: activeDirty.focusKey,
+      proceed: () => {
+        if (activeDirty.kind === 'create-tool') {
+          this.discardCreateToolDraft();
+        } else if (activeDirty.toolId) {
+          this.discardToolEditDraft(activeDirty.toolId);
+        }
+        this.pendingSwitch = null;
+        this.closeCleanToolFormsExcept(targetKey);
+        action();
+      },
+    };
+    this.rewrite();
+    this.focusAndScroll('switch-keep-editing');
+  }
+
+  private closeCleanToolFormsExcept(targetKey: string): void {
+    if (
+      this.expanded.has('create-tool') &&
+      (!this.newTool.dirty || !hasNewToolContent(this.newTool)) &&
+      !targetKey.startsWith('configure:') &&
+      targetKey !== 'create-custom'
+    ) {
+      this.expanded.delete('create-tool');
+      this.configuringDiscoveredId = null;
+      if (this.snapshot) {
+        this.newTool = emptyTool(this.snapshot.revision);
+      }
+    }
+    if (this.snapshot) {
+      for (const tool of this.snapshot.tools) {
+        if (targetKey === `edit:${tool.id}`) continue;
+        const cardKey = `tool:${tool.id}`;
+        if (!this.expanded.has(cardKey)) continue;
+        const draft = this.toolDrafts.get(tool.id);
+        if (!draft || (!draft.dirty && !draft.conflict) || sameTool(tool, draft)) {
+          this.expanded.delete(cardKey);
+          this.toolDrafts.delete(tool.id);
+        }
+      }
+    }
+  }
+
+  private discardCreateToolDraft(): void {
+    this.expanded.delete('create-tool');
+    this.configuringDiscoveredId = null;
+    this.pendingSwitch = null;
+    this.newTool = emptyTool(this.snapshot?.revision ?? -1);
+  }
+
+  private discardToolEditDraft(toolId: string): void {
+    this.clearSecretInputs(toolId);
+    this.toolDrafts.delete(toolId);
+    this.expanded.delete(`tool:${toolId}`);
+    if (this.deleteConfirm?.kind === 'tool' && this.deleteConfirm.id === toolId) {
+      this.deleteConfirm = null;
+    }
+    const secret = this.secrets.get(toolId);
+    if (secret) secret.confirmDelete = false;
+    this.pendingSwitch = null;
+  }
+
+  private closeModelPicker(toolId: string, clearSelection: boolean): void {
+    this.openPickers.delete(toolId);
+    const probeKey = `probe:${toolId}`;
+    const apiKey = `api:${toolId}`;
+    if (clearSelection) {
+      this.selections.delete(probeKey);
+      this.selections.delete(apiKey);
+    }
+    this.catalogSearch.delete(probeKey);
+    this.catalogSearch.delete(apiKey);
+    const probe = this.probes.get(toolId);
+    if (probe && !probe.loading) {
+      probe.error = null;
+    }
+    const api = this.apiStates.get(toolId);
+    if (api && !api.loading) {
+      api.error = null;
+    }
+    this.refresh();
+    this.focusAndScroll(`tool-${toolId}-probe`);
+  }
+
+  private openCustomToolForm(): void {
+    const focusTarget = this.configuringDiscoveredId
+      ? `configure-discovery-${this.configuringDiscoveredId}`
+      : 'toggle-create-tool';
+    if (this.expanded.has('create-tool') && this.configuringDiscoveredId === null) {
+      this.discardCreateToolDraft();
+      this.refresh();
+      this.focusAndScroll(focusTarget);
+      return;
+    }
+    this.requestToolSwitch('custom tool form', 'create-custom', () => {
+      this.configuringDiscoveredId = null;
+      this.newTool = emptyTool(this.snapshot?.revision ?? -1);
+      this.expanded.add('create-tool');
+      this.rewrite();
+      this.focusAndScroll('new-tool-label');
+    });
+  }
+
+  private clearSecretInputs(toolId?: string): void {
+    if (!this.root) return;
+    for (const input of this.root.querySelectorAll<HTMLInputElement>('input[type="password"]')) {
+      if (!toolId || input.id.includes(token(`api-${toolId}-credential`))) {
+        input.value = '';
+      }
+    }
   }
 
   private id(key: string): string {
@@ -576,9 +954,7 @@ export class ToolsPage {
     const focusKey = token(key);
     const attempt = (): boolean => {
       if (this.disposed || !this.root || !this.root.isConnected) return false;
-      const target = Array.from(
-        this.root.querySelectorAll<HTMLElement>('[data-focus-key]')
-      ).find((element) => element.dataset.focusKey === focusKey);
+      const target = findByFocusKey(this.root, focusKey);
       if (!target) return false;
       target.focus({ preventScroll: true });
       target.scrollIntoView?.({ block: 'nearest' });
@@ -619,35 +995,55 @@ export class ToolsPage {
   private build(snapshot: RegistrySnapshot): Node[] {
     const nodes: Node[] = [this.buildHeader(snapshot)];
     if (this.notice) nodes.push(this.buildNotice(this.notice));
+    if (this.pendingSwitch) nodes.push(this.buildSwitchPrompt(this.pendingSwitch));
     nodes.push(this.buildTools(snapshot));
     nodes.push(this.buildModels(snapshot));
     return nodes;
   }
 
   private buildHeader(snapshot: RegistrySnapshot): HTMLElement {
+    const enabledTools = snapshot.tools.filter((tool) => tool.enabled);
+    const enabledToolIds = new Set(enabledTools.map((tool) => tool.id));
+    const readyModels = snapshot.models.filter((model) => enabledToolIds.has(model.tool_id));
+
     return h(
       'div',
       { className: 'aq-tools-hero' },
       h(
         'div',
         undefined,
-        h('p', { className: 'aq-kicker' }, 'Global registry'),
+        h('p', { className: 'aq-kicker' }, 'Guided setup & registry'),
         h('h2', { className: 'aq-page-title', id: `${this.pageId}-title` }, 'Tools and models'),
         h(
           'p',
           { className: 'aq-note' },
-          'Configure adapters, executable paths, and manual model efforts. Registry actions are explicit and do not change running jobs.'
+          'Add detected CLIs, choose models from their catalog, and assign them in Profiles. Nothing is probed or executed in the background.'
         )
       ),
       h(
         'div',
-        { className: 'aq-tools-hero-actions' },
+        { className: 'aq-tools-hero-actions aq-tools-progress' },
         h('span', { className: 'aq-badge' }, `Revision ${snapshot.revision}`),
         h(
           'span',
-          { className: 'aq-badge' },
-          `${snapshot.tools.length} tool${snapshot.tools.length === 1 ? '' : 's'} · ${snapshot.models.length} model${snapshot.models.length === 1 ? '' : 's'}`
+          { className: 'aq-badge', 'data-status': snapshot.tools.length > 0 ? 'active' : undefined },
+          `${snapshot.tools.length} tool${snapshot.tools.length === 1 ? '' : 's'}`
         ),
+        h(
+          'span',
+          { className: 'aq-badge', 'data-status': readyModels.length > 0 ? 'active' : 'warn' },
+          readyModels.length > 0
+            ? `${readyModels.length} model${readyModels.length === 1 ? '' : 's'} ready`
+            : 'No models added'
+        ),
+        readyModels.length > 0 && this.onOpenProfiles
+          ? this.button(
+              'Open Profiles',
+              () => this.onOpenProfiles?.(),
+              'open-profiles-hero',
+              'primary'
+            )
+          : null,
         this.button('Reload registry', () => this.notifyOuter(), 'reload-registry')
       )
     );
@@ -675,22 +1071,151 @@ export class ToolsPage {
         ),
         h('p', { className: 'aq-tools-notice-text' }, notice.text)
       ),
-      this.button(
-        'Dismiss',
-        () => {
-          this.notice = null;
-          this.refresh();
-        },
-        'dismiss-notice'
+      h(
+        'div',
+        { className: 'aq-tools-actions aq-tools-form-actions' },
+        notice.showOpenProfiles && this.onOpenProfiles
+          ? this.button(
+              'Open Profiles',
+              () => this.onOpenProfiles?.(),
+              'open-profiles',
+              'primary'
+            )
+          : null,
+        this.button(
+          'Dismiss',
+          () => {
+            this.notice = null;
+            this.refresh();
+          },
+          'dismiss-notice'
+        )
+      )
+    );
+  }
+
+  private buildSwitchPrompt(prompt: PendingToolSwitch): HTMLElement {
+    return h(
+      'div',
+      {
+        className: 'aq-tools-switch',
+        role: 'region',
+        'aria-label': 'Unsaved tool changes',
+      },
+      h(
+        'div',
+        { className: 'aq-tools-notice-copy' },
+        h(
+          'strong',
+          undefined,
+          `Switch from ${prompt.fromLabel} to ${prompt.toLabel}?`
+        ),
+        h(
+          'p',
+          { className: 'aq-tools-notice-text' },
+          `You have unsaved changes for ${prompt.fromLabel}. Keep editing to finish or save them, or discard those unsaved edits and switch to ${prompt.toLabel}.`
+        )
+      ),
+      h(
+        'div',
+        { className: 'aq-tools-actions aq-tools-switch-actions' },
+        this.button(
+          `Keep editing ${prompt.fromLabel}`,
+          () => {
+            const focusKey = prompt.returnFocusKey;
+            this.pendingSwitch = null;
+            this.refresh();
+            this.focusAndScroll(focusKey);
+          },
+          'switch-keep-editing',
+          'primary'
+        ),
+        this.button(
+          `Discard and switch to ${prompt.toLabel}`,
+          () => {
+            prompt.proceed();
+          },
+          'switch-discard-and-switch'
+        ),
+        this.button(
+          'Cancel',
+          () => {
+            const focusKey = prompt.returnFocusKey;
+            this.pendingSwitch = null;
+            this.refresh();
+            this.focusAndScroll(focusKey);
+          },
+          'switch-cancel'
+        )
       )
     );
   }
 
   private buildTools(snapshot: RegistrySnapshot): HTMLElement {
     const enabled = snapshot.tools.filter((tool) => tool.enabled).length;
+    const unregisteredFoundClis: Array<{
+      item: ToolsDiscoveryItem;
+      setup: DiscoveryCliSetup;
+      path: string;
+    }> = [];
+    const registeredMatches = new Map<string, ToolsDiscoveryItem>();
+    const diagnosticItems: ToolsDiscoveryItem[] = [];
+
+    for (const item of this.discoveredTools) {
+      const matched = findRegisteredToolForDiscovery(item, snapshot.tools);
+      if (matched) {
+        if (!registeredMatches.has(matched.id)) {
+          registeredMatches.set(matched.id, item);
+        }
+        continue;
+      }
+      const path = item.executable_path?.trim() ?? '';
+      const setup = discoveryCliSetup(item.id, item.label);
+      if (item.availability === 'found' && path.length > 0 && setup !== null) {
+        unregisteredFoundClis.push({ item, setup, path });
+      } else {
+        diagnosticItems.push(item);
+      }
+    }
+
+    const createOpen = this.expanded.has('create-tool');
+    const inlineConfigureTarget =
+      createOpen &&
+      this.configuringDiscoveredId !== null &&
+      unregisteredFoundClis.some((entry) => entry.item.id === this.configuringDiscoveredId)
+        ? this.configuringDiscoveredId
+        : null;
+
+    const refreshBtn = this.button(
+      this.discoveryLoading ? 'Refreshing…' : 'Refresh discovery',
+      () => {
+        if (this.onRefreshDiscovery) {
+          this.onRefreshDiscovery();
+        }
+      },
+      'discovery-refresh',
+      undefined,
+      this.discoveryLoading
+    );
+    refreshBtn.dataset.action = 'refresh-tools';
+    refreshBtn.dataset.focus = 'discovery-refresh';
+    refreshBtn.setAttribute('aria-label', 'Refresh discovery');
+
+    const customFormOpen = createOpen && inlineConfigureTarget === null;
+    const customToggleBtn = this.button(
+      customFormOpen ? 'Cancel custom tool' : 'Add custom or API tool',
+      () => this.openCustomToolForm(),
+      'toggle-create-tool'
+    );
+    customToggleBtn.setAttribute('aria-expanded', String(customFormOpen));
+
     return h(
       'section',
-      { className: 'aq-tools-section', 'aria-labelledby': `${this.pageId}-tools-title` },
+      {
+        className: 'aq-tools-section aq-tools-setup',
+        'aria-labelledby': `${this.pageId}-tools-title`,
+        'aria-busy': this.discoveryLoading ? 'true' : undefined,
+      },
       h(
         'div',
         { className: 'aq-tools-section-head' },
@@ -701,38 +1226,216 @@ export class ToolsPage {
           h(
             'p',
             { className: 'aq-note' },
-            'Custom executable paths and enabled state live here. API adapters never spawn a CLI. Setup: save a tool, load its models, select and import entries, then assign them in Profiles.'
+            'Step 1: Add a detected CLI or custom tool. Step 2: Click Choose models and add the models you want to assign in Profiles.'
           )
         ),
-        h('span', { className: 'aq-badge' }, `${enabled} enabled`)
+        h(
+          'div',
+          { className: 'aq-tools-actions aq-tools-progress' },
+          h('span', { className: 'aq-badge' }, `${enabled} enabled`),
+          this.discoveryLoading
+            ? h(
+                'span',
+                { className: 'aq-badge', role: 'status', 'aria-live': 'polite' },
+                'Checking PATH…'
+              )
+            : null,
+          refreshBtn,
+          customToggleBtn
+        )
       ),
-      this.buildCreateTool(snapshot),
-      snapshot.tools.length === 0
+      this.discoveryError
+        ? h(
+            'div',
+            { className: 'aq-tools-error', role: 'alert' },
+            h('span', undefined, this.discoveryError),
+            (() => {
+              const retryBtn = this.button(
+                'Retry discovery',
+                () => this.onRefreshDiscovery?.(),
+                'retry-discovery'
+              );
+              retryBtn.dataset.action = 'refresh-tools';
+              return retryBtn;
+            })()
+          )
+        : null,
+      customFormOpen ? this.buildCreateTool(snapshot, null) : null,
+      unregisteredFoundClis.length === 0 && snapshot.tools.length === 0
         ? h(
             'p',
             { className: 'aq-note aq-tools-empty' },
-            'No tools are configured. Add a tool explicitly; no model defaults are created.'
+            this.discoveryLoading
+              ? 'Checking local PATH for supported CLIs…'
+              : 'No tools are registered yet. Refresh discovery to check local PATH or click Add custom or API tool.'
           )
         : h(
             'div',
             { className: 'aq-tools-list' },
-            ...snapshot.tools.map((tool) => this.buildTool(snapshot, tool))
+            ...unregisteredFoundClis.map(({ item, setup, path }) =>
+              this.buildDiscoveredChoiceCard(
+                snapshot,
+                item,
+                setup,
+                path,
+                inlineConfigureTarget === item.id
+              )
+            ),
+            ...snapshot.tools.map((tool) =>
+              this.buildTool(snapshot, tool, registeredMatches.get(tool.id) ?? null)
+            )
+          ),
+      diagnosticItems.length > 0
+        ? h(
+            'details',
+            { className: 'aq-tools-advanced' },
+            h(
+              'summary',
+              undefined,
+              `Other local PATH checks (${diagnosticItems.length})`
+            ),
+            h(
+              'p',
+              { className: 'aq-tools-hint' },
+              'Read-only PATH lookup on this device. Commands below were not found on PATH or are configured via custom/API adapters.'
+            ),
+            h(
+              'div',
+              { className: 'aq-tools-status-grid' },
+              ...diagnosticItems.map((item) =>
+                this.statusRow(
+                  item.label,
+                  item.executable_path?.trim()
+                    ? `${formatAvailability(item.availability)} · ${item.executable_path.trim()}`
+                    : formatAvailability(item.availability),
+                  availabilityTone(item.availability)
+                )
+              )
+            )
+          )
+        : null
+    );
+  }
+
+  private buildDiscoveredChoiceCard(
+    snapshot: RegistrySnapshot,
+    item: ToolsDiscoveryItem,
+    setup: DiscoveryCliSetup,
+    path: string,
+    isConfiguringInline: boolean
+  ): HTMLElement {
+    const busyKey = `add-choose:${item.id}`;
+    const isAdding = this.pending.has(busyKey);
+    const defaultId = uniqueToolId(setup.idBase, snapshot.tools);
+
+    const primaryBtn = this.button(
+      isAdding ? 'Adding & loading models…' : 'Add and choose models',
+      () => this.addAndChooseModels(item.id, item.label, path),
+      `add-choose-discovery-${item.id}`,
+      'primary',
+      isAdding
+    );
+    primaryBtn.classList.add('aq-tools-primary');
+    primaryBtn.dataset.focus = `add-choose-discovery-${item.id}`;
+
+    const configureBtn = this.button(
+      isConfiguringInline ? 'Cancel' : 'Configure',
+      () => {
+        if (isConfiguringInline) {
+          this.discardCreateToolDraft();
+          this.refresh();
+          this.focusAndScroll(`configure-discovery-${item.id}`);
+        } else {
+          this.configureDiscoveredTool(item.id, item.label, path);
+        }
+      },
+      `configure-discovery-${item.id}`,
+      undefined,
+      isAdding
+    );
+    if (!isConfiguringInline) {
+      configureBtn.dataset.action = 'configure-discovered-tool';
+      configureBtn.dataset.discoveryToolId = item.id;
+      configureBtn.dataset.discoveryToolLabel = item.label;
+      configureBtn.dataset.discoveryExecutable = path;
+    }
+    configureBtn.dataset.focus = `configure-discovery-${item.id}`;
+
+    return h(
+      'article',
+      {
+        className: 'aq-tools-card aq-tools-choice',
+        'data-discovery-card': item.id,
+      },
+      h(
+        'div',
+        { className: 'aq-tools-tool-head' },
+        createBrandIconElement(brandFor(setup.adapter)),
+        h(
+          'div',
+          { className: 'aq-tools-tool-title' },
+          h('h4', undefined, setup.label),
+          h(
+            'span',
+            { className: 'aq-tools-hint' },
+            'Detected on this device · Not yet added to registry'
+          )
+        ),
+        h(
+          'div',
+          { className: 'aq-tools-card-controls' },
+          h(
+            'div',
+            { className: 'aq-tools-badges' },
+            h('span', { className: 'aq-badge', 'data-status': 'found' }, 'Detected on PATH'),
+            h('span', { className: 'aq-badge' }, 'Not added')
+          ),
+          h(
+            'div',
+            { className: 'aq-tools-actions aq-tools-form-actions' },
+            primaryBtn,
+            configureBtn
+          )
+        )
+      ),
+      h(
+        'p',
+        { className: 'aq-tools-hint' },
+        'Add and choose models saves this detected CLI to the registry and reads its model catalog without running a task.'
+      ),
+      isConfiguringInline
+        ? this.buildCreateTool(snapshot, item)
+        : h(
+            'details',
+            { className: 'aq-tools-advanced' },
+            h('summary', undefined, 'Advanced details'),
+            h(
+              'p',
+              { className: 'aq-tools-hint' },
+              `Executable: ${path} · Adapter: ${ADAPTER_LABELS[setup.adapter]} · Default ID: ${defaultId}`
+            )
           )
     );
   }
 
-  private buildCreateTool(snapshot: RegistrySnapshot): HTMLElement {
+  private buildCreateTool(
+    snapshot: RegistrySnapshot,
+    inlineItem: ToolsDiscoveryItem | null = null
+  ): HTMLElement {
     const draft = this.newTool;
     const duplicate =
       draft.id.trim() !== '' && snapshot.tools.some((tool) => tool.id === draft.id.trim());
-    const key = 'create-tool';
-    const open = this.expanded.has(key);
     const bodyId = `${this.pageId}-create-tool-body`;
-    const id = this.input('new-tool-id', draft.id, 'unique-tool-id');
+    const id = this.input('new-tool-id', draft.id, 'Auto-generated if left blank');
     const label = this.input('new-tool-label', draft.label, 'Display label');
     const adapter = this.adapterSelect('new-tool-adapter', draft.adapter, (value) => {
       draft.adapter = value;
+      if (!draft.label.trim()) {
+        draft.label = ADAPTER_LABELS[value];
+        label.value = draft.label;
+      }
       draft.dirty = true;
+      this.refresh();
     });
     const executable = this.input(
       'new-tool-executable',
@@ -756,18 +1459,26 @@ export class ToolsPage {
       draft.enabled = enabled.checked;
       draft.dirty = true;
     });
-    const toggle = this.button(
-      open ? 'Hide form' : 'Add tool',
-      () => this.toggleExpanded(key),
-      'toggle-create-tool'
-    );
-    toggle.setAttribute('aria-expanded', String(open));
-    toggle.setAttribute('aria-controls', bodyId);
-    toggle.setAttribute('aria-label', open ? 'Hide add tool form' : 'Show add tool form');
+
+    const cancelForm = (): void => {
+      const returnFocus = inlineItem
+        ? `configure-discovery-${inlineItem.id}`
+        : 'toggle-create-tool';
+      this.discardCreateToolDraft();
+      this.refresh();
+      this.focusAndScroll(returnFocus);
+    };
+
+    const closeBtn = this.button('Cancel', cancelForm, 'new-tool-close');
+    closeBtn.setAttribute('aria-label', 'Cancel add tool form');
+
+    const isCliAdapter = providerFor(draft.adapter) === null;
+    const creating = this.pending.has('tool-create');
+
     return h(
       'div',
       {
-        className: `aq-tools-form aq-tools-create${open ? '' : ' aq-tools-create-collapsed'}`,
+        className: 'aq-tools-form aq-tools-create',
         role: 'group',
         'aria-labelledby': `${this.pageId}-add-tool`,
       },
@@ -777,65 +1488,108 @@ export class ToolsPage {
         h(
           'div',
           { className: 'aq-tools-create-heading' },
-          h('h4', { id: `${this.pageId}-add-tool` }, 'Add tool'),
-          open
-            ? h(
-                'p',
-                { className: 'aq-note' },
-                draft.dirty
-                  ? 'Unsaved Add tool draft. Configure preserves existing input; save this tool before loading models.'
-                  : 'ID and label are required. The executable path is optional and is never executed by the registry.'
-              )
-            : null
+          h(
+            'h4',
+            { id: `${this.pageId}-add-tool` },
+            inlineItem ? `Configure ${inlineItem.label}` : 'Add custom or API tool'
+          ),
+          h(
+            'p',
+            { className: 'aq-note' },
+            inlineItem
+              ? 'Review the label or open Advanced to customize the registry ID, adapter, or executable path.'
+              : 'Enter a display label. Technical IDs and custom paths are optional under Advanced.'
+          )
         ),
-        toggle
+        closeBtn
       ),
-      open
-        ? h(
+      h(
+        'div',
+        { className: 'aq-tools-create-body', id: bodyId },
+        h(
+          'div',
+          { className: 'aq-tools-form-grid' },
+          this.field('Label', label, 'Shown on tool cards and in Profiles.'),
+          inlineItem === null
+            ? this.field('Adapter', adapter, 'API adapters use the OS keychain vault and never spawn a CLI.')
+            : null,
+          this.checkField('Enabled for profiles', enabled)
+        ),
+        h(
+          'details',
+          { className: 'aq-tools-advanced', open: duplicate ? true : undefined },
+          h('summary', undefined, 'Advanced (ID, executable path & adapter)'),
+          h(
             'div',
-            { className: 'aq-tools-create-body', id: bodyId },
-            h(
-              'div',
-              { className: 'aq-tools-form-grid' },
-              this.field('Tool ID', id, 'Unique registry key. Existing IDs are not overwritten here.'),
-              this.field('Label', label),
-              this.field('Adapter', adapter, 'API adapters use the Rust vault and never spawn a CLI.'),
-              this.field(
-                'Executable path',
-                executable,
-                'Optional absolute path for custom tools. PATH discovery is explicit.'
-              ),
-              this.checkField('Enabled for profiles', enabled)
+            { className: 'aq-tools-form-grid' },
+            this.field(
+              'Tool ID',
+              id,
+              'Optional unique registry key. Derived automatically if left blank.'
             ),
-            duplicate
-              ? h('p', { className: 'aq-tools-inline-error' }, 'This tool ID already exists.')
+            inlineItem !== null
+              ? this.field('Adapter', adapter, 'API adapters use the OS keychain vault and never spawn a CLI.')
               : null,
-            h(
-              'div',
-              { className: 'aq-tools-actions' },
-              this.button(
-                this.pending.has('tool-create') ? 'Adding…' : 'Add tool',
-                () => void this.createTool(),
-                'new-tool-submit',
-                'primary',
-                this.pending.has('tool-create')
-              )
+            this.field(
+              'Executable path',
+              executable,
+              'Optional absolute path for CLI tools. Never executed until you explicitly load models or run a task.'
             )
           )
-        : null
+        ),
+        duplicate
+          ? h('p', { className: 'aq-tools-inline-error' }, 'This tool ID already exists.')
+          : null,
+        h(
+          'div',
+          { className: 'aq-tools-actions aq-tools-form-actions' },
+          isCliAdapter
+            ? this.button(
+                creating ? 'Saving…' : 'Save and choose models',
+                () => void this.createTool(true),
+                'new-tool-save-and-probe',
+                'primary',
+                creating
+              )
+            : null,
+          this.button(
+            creating ? 'Adding…' : 'Add tool',
+            () => void this.createTool(false),
+            'new-tool-submit',
+            isCliAdapter ? undefined : 'primary',
+            creating
+          ),
+          this.button(
+            'Cancel',
+            cancelForm,
+            'new-tool-cancel',
+            undefined,
+            creating
+          )
+        )
+      )
     );
   }
 
-  private buildTool(snapshot: RegistrySnapshot, tool: ToolDefinition): HTMLElement {
+  private buildTool(
+    snapshot: RegistrySnapshot,
+    tool: ToolDefinition,
+    discoveredMatch: ToolsDiscoveryItem | null = null
+  ): HTMLElement {
     const draft = this.toolEdit(tool);
     const changed = !sameTool(tool, draft);
     const provider = providerFor(tool.adapter);
     const probe = this.probes.get(tool.id);
+    const api = provider ? this.apiState(tool.id) : null;
     const using = snapshot.models.filter((model) => model.tool_id === tool.id);
     const deleting = this.pending.has(`tool-delete:${tool.id}`);
     const confirming = this.deleteConfirm?.kind === 'tool' && this.deleteConfirm?.id === tool.id;
     const cardKey = `tool:${tool.id}`;
     const open = this.expanded.has(cardKey);
+    const pickerOpen =
+      this.openPickers.has(tool.id) ||
+      Boolean(probe && (probe.loading || probe.result || probe.error)) ||
+      Boolean(api && (api.loading || api.loaded || api.error));
     const bodyId = `${this.pageId}-tool-${token(tool.id)}-body`;
     const label = this.input(`tool-${tool.id}-label`, draft.label, 'Display label');
     const adapter = this.adapterSelect(`tool-${tool.id}-adapter`, draft.adapter, (value) => {
@@ -862,17 +1616,64 @@ export class ToolsPage {
     });
     const saveDisabled =
       this.pending.has(`tool-save:${tool.id}`) || (draft.conflict && !draft.overwrite);
+
+    const probeBusy =
+      provider === null
+        ? this.pending.has(`probe:${tool.id}`)
+        : this.pending.has(`catalog:api:${tool.id}`);
+    const hasLoadedCatalog =
+      provider === null ? Boolean(probe?.result) : Boolean(api?.loaded);
+
+    const chooseModelsBtn = this.button(
+      probeBusy
+        ? 'Loading models…'
+        : pickerOpen && hasLoadedCatalog
+          ? 'Refresh models'
+          : 'Choose models',
+      () => {
+        this.openPickers.add(tool.id);
+        if (provider === null) {
+          void this.probe(tool);
+        } else {
+          void this.loadModels(tool, provider);
+        }
+      },
+      provider === null ? `tool-${tool.id}-probe` : `api-${tool.id}-catalog`,
+      using.length === 0 && !pickerOpen ? 'primary' : undefined,
+      probeBusy
+    );
+    if (using.length === 0 && !pickerOpen) {
+      chooseModelsBtn.classList.add('aq-tools-primary');
+    }
+
+    const handleToggleDetails = (): void => {
+      if (open) {
+        this.discardToolEditDraft(tool.id);
+        this.refresh();
+        this.focusAndScroll(`tool-${tool.id}-details`);
+        return;
+      }
+      this.requestToolSwitch(tool.label, `edit:${tool.id}`, () => {
+        this.expanded.add(cardKey);
+        this.rewrite();
+        this.focusAndScroll(`tool-${tool.id}-label`);
+      });
+    };
+
     const toggle = this.button(
-      open ? 'Close' : 'Details',
-      () => this.toggleExpanded(cardKey),
+      open ? 'Close' : 'Edit',
+      handleToggleDetails,
       `tool-${tool.id}-details`
     );
     toggle.setAttribute('aria-expanded', String(open));
     toggle.setAttribute('aria-controls', bodyId);
-    toggle.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} details for ${tool.label}`);
+    toggle.setAttribute('aria-label', `${open ? 'Close' : 'Edit'} details for ${tool.label}`);
+
     return h(
       'article',
-      { className: `aq-tools-card${tool.enabled ? '' : ' aq-tools-card-disabled'}` },
+      {
+        className: `aq-tools-card aq-tools-choice${tool.enabled ? '' : ' aq-tools-card-disabled'}`,
+      },
       h(
         'div',
         { className: 'aq-tools-tool-head' },
@@ -881,7 +1682,13 @@ export class ToolsPage {
           'div',
           { className: 'aq-tools-tool-title' },
           h('h4', undefined, tool.label),
-          h('code', { className: 'aq-tools-code' }, tool.id)
+          h(
+            'span',
+            { className: 'aq-tools-hint' },
+            using.length === 0
+              ? 'Registered · No models added yet'
+              : `${using.length} model${using.length === 1 ? '' : 's'} added for Profiles`
+          )
         ),
         h(
           'div',
@@ -894,12 +1701,39 @@ export class ToolsPage {
               { className: 'aq-badge', 'data-status': tool.enabled ? 'active' : 'warn' },
               tool.enabled ? 'Enabled' : 'Disabled'
             ),
+            discoveredMatch
+              ? h('span', { className: 'aq-badge', 'data-status': 'found' }, 'Added')
+              : null,
+            h(
+              'span',
+              { className: 'aq-badge', 'data-status': using.length > 0 ? 'active' : 'warn' },
+              using.length > 0
+                ? `${using.length} model${using.length === 1 ? '' : 's'}`
+                : 'No models added'
+            ),
             h('span', { className: 'aq-badge' }, ADAPTER_LABELS[tool.adapter]),
             changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null
           ),
-          toggle
+          h(
+            'div',
+            { className: 'aq-tools-actions aq-tools-form-actions' },
+            chooseModelsBtn,
+            toggle
+          )
         )
       ),
+      using.length === 0 && !pickerOpen && !open
+        ? h(
+            'p',
+            { className: 'aq-tools-hint' },
+            'Registration alone does not add models. Click Choose models to read the catalog and select models for Profiles.'
+          )
+        : null,
+      pickerOpen
+        ? provider === null
+          ? this.buildProbe(tool, probe)
+          : this.buildApiCatalogPicker(tool, provider)
+        : null,
       open
         ? h(
             'div',
@@ -908,25 +1742,88 @@ export class ToolsPage {
               'div',
               { className: 'aq-tools-form-grid aq-tools-edit-grid' },
               this.field('Label', label),
-              this.field('Adapter', adapter),
-              this.field(
-                'Executable path',
-                executable,
-                'Custom path applies to this tool only. Save before loading models from a changed path.'
-              ),
               this.checkField('Enabled for profiles', enabled)
+            ),
+            h(
+              'details',
+              { className: 'aq-tools-advanced' },
+              h('summary', undefined, 'Advanced (ID, adapter, executable path & diagnostics)'),
+              h(
+                'p',
+                { className: 'aq-tools-hint' },
+                `Tool ID: ${tool.id}`
+              ),
+              h(
+                'div',
+                { className: 'aq-tools-form-grid aq-tools-edit-grid' },
+                this.field('Adapter', adapter),
+                this.field(
+                  'Executable path',
+                  executable,
+                  'Custom path applies to this tool only. Save before loading models from a changed path.'
+                )
+              ),
+              this.buildStatus(provider, probe),
+              h(
+                'div',
+                { className: 'aq-tools-actions aq-tools-form-actions' },
+                using.length > 0
+                  ? h(
+                      'span',
+                      { className: 'aq-tools-hint aq-tools-delete-note' },
+                      `Remove ${using.length} model${using.length === 1 ? '' : 's'} before deleting this tool.`
+                    )
+                  : confirming
+                    ? h(
+                        'span',
+                        { className: 'aq-tools-delete-confirm' },
+                        h('span', undefined, `Delete ${tool.label}?`),
+                        provider
+                          ? h(
+                              'span',
+                              { className: 'aq-tools-hint' },
+                              'The OS vault credential is not removed by tool deletion.'
+                            )
+                          : null,
+                        this.button(
+                          deleting ? 'Deleting…' : 'Confirm delete',
+                          () => void this.deleteTool(tool),
+                          `tool-${tool.id}-confirm-delete`,
+                          'danger',
+                          deleting
+                        ),
+                        this.button(
+                          'Cancel',
+                          () => {
+                            this.deleteConfirm = null;
+                            this.refresh();
+                          },
+                          `tool-${tool.id}-cancel-delete`
+                        )
+                      )
+                    : this.button(
+                        'Delete tool',
+                        () => {
+                          this.deleteConfirm = { kind: 'tool', id: tool.id };
+                          this.refresh();
+                        },
+                        `tool-${tool.id}-delete`,
+                        'danger',
+                        deleting
+                      )
+              )
             ),
             this.conflictBlock(
               draft,
               () => {
-                this.toolDrafts.delete(tool.id);
+                this.discardToolEditDraft(tool.id);
                 this.refresh();
               },
               `tool-${tool.id}-conflict`
             ),
             h(
               'div',
-              { className: 'aq-tools-actions aq-tools-card-actions' },
+              { className: 'aq-tools-actions aq-tools-card-actions aq-tools-form-actions' },
               this.button(
                 this.pending.has(`tool-save:${tool.id}`)
                   ? 'Saving…'
@@ -939,80 +1836,26 @@ export class ToolsPage {
                 saveDisabled
               ),
               this.button(
-                'Discard draft',
+                'Cancel',
                 () => {
-                  this.toolDrafts.delete(tool.id);
+                  this.discardToolEditDraft(tool.id);
                   this.refresh();
+                  this.focusAndScroll(`tool-${tool.id}-details`);
                 },
                 `tool-${tool.id}-discard`,
                 undefined,
                 this.pending.has(`tool-save:${tool.id}`)
-              ),
-              provider === null
-                ? this.button(
-                    this.pending.has(`probe:${tool.id}`) ? 'Loading models…' : 'Load models',
-                    () => void this.probe(tool),
-                    `tool-${tool.id}-probe`,
-                    undefined,
-                    this.pending.has(`probe:${tool.id}`)
-                  )
-                : null,
-              using.length > 0
-                ? h(
-                    'span',
-                    { className: 'aq-tools-hint aq-tools-delete-note' },
-                    `Delete ${using.length} model${using.length === 1 ? '' : 's'} first.`
-                  )
-                : confirming
-                  ? h(
-                      'span',
-                      { className: 'aq-tools-delete-confirm' },
-                      h('span', undefined, `Delete ${tool.label}?`),
-                      provider
-                        ? h(
-                            'span',
-                            { className: 'aq-tools-hint' },
-                            'The OS vault credential is not removed by tool deletion.'
-                          )
-                        : null,
-                      this.button(
-                        deleting ? 'Deleting…' : 'Confirm delete',
-                        () => void this.deleteTool(tool),
-                        `tool-${tool.id}-confirm-delete`,
-                        'danger',
-                        deleting
-                      ),
-                      this.button(
-                        'Cancel',
-                        () => {
-                          this.deleteConfirm = null;
-                          this.refresh();
-                        },
-                        `tool-${tool.id}-cancel-delete`
-                      )
-                    )
-                  : this.button(
-                      'Delete tool',
-                      () => {
-                        this.deleteConfirm = { kind: 'tool', id: tool.id };
-                        this.refresh();
-                      },
-                      `tool-${tool.id}-delete`,
-                      'danger',
-                      deleting
-                    )
+              )
             ),
             h(
               'p',
               { className: 'aq-tools-hint' },
               changed
-                ? 'Draft changes are not used by loading models or API controls until saved.'
+                ? 'Save changes before loading models from an updated path or adapter.'
                 : provider === null
-                  ? 'Load models uses the saved tool definition. A found executable is not login or subscription proof.'
+                  ? 'Choose models reads the catalog from the saved tool definition.'
                   : 'API adapters never spawn a CLI. Credential and synthetic controls use the saved tool definition.'
             ),
-            this.buildStatus(provider, probe),
-            provider === null ? this.buildProbe(tool, probe) : null,
             provider ? this.buildApi(tool, provider) : null
           )
         : null
@@ -1058,77 +1901,240 @@ export class ToolsPage {
   }
 
   private buildProbe(tool: ToolDefinition, probe: ProbeState | undefined): HTMLElement {
-    if (!probe || (!probe.result && !probe.error && !probe.loading)) {
-      return h(
+    const key = `probe:${tool.id}`;
+    return this.buildCatalogPicker(
+      tool,
+      key,
+      Boolean(probe?.loading),
+      probe?.error ?? null,
+      probe?.result ? probe.result.models : null,
+      () => void this.probe(tool)
+    );
+  }
+
+  private buildApiCatalogPicker(tool: ToolDefinition, provider: Provider): HTMLElement {
+    const api = this.apiState(tool.id);
+    const key = `api:${tool.id}`;
+    return this.buildCatalogPicker(
+      tool,
+      key,
+      api.loading,
+      api.error,
+      api.loaded ? api.models : null,
+      () => void this.loadModels(tool, provider)
+    );
+  }
+
+  private buildCatalogPicker(
+    tool: ToolDefinition,
+    key: string,
+    loading: boolean,
+    error: SafeError | null,
+    catalogModels: readonly ModelDefinition[] | null,
+    onRefreshCatalog: () => void
+  ): HTMLElement {
+    const closePicker = (): void => {
+      this.closeModelPicker(tool.id, true);
+    };
+
+    const head = h(
+      'div',
+      { className: 'aq-tools-form-head' },
+      h(
         'div',
-        { className: 'aq-tools-probe aq-tools-probe-empty' },
-        h('h5', undefined, 'Model catalog'),
+        { className: 'aq-tools-create-heading' },
+        h('h5', undefined, `Choose models for ${tool.label}`),
         h(
           'p',
           { className: 'aq-tools-hint' },
-          'No catalog loaded. Choose Load models when you want to query the saved tool; nothing is fetched automatically.'
-        ),
-        h(
-          'p',
-          { className: 'aq-tools-hint' },
-          'Setup: save this tool, load models, select and import desired entries, then assign them in Profiles.'
+          'Select the models you want to use in Profiles, then click Add selected models. Unchecking a row never deletes an already-saved model.'
         )
-      );
-    }
-    if (!probe.result) {
+      ),
+      this.button('Close', closePicker, `close-picker-${tool.id}`)
+    );
+
+    if (loading) {
       return h(
         'div',
         { className: 'aq-tools-probe' },
-        h('h5', undefined, 'Model catalog'),
-        probe.error ? this.errorBlock(probe.error) : null
+        head,
+        h(
+          'p',
+          { className: 'aq-tools-inline-status', role: 'status' },
+          `Reading model catalog from ${tool.label}…`
+        ),
+        h(
+          'div',
+          { className: 'aq-tools-actions aq-tools-form-actions' },
+          this.button('Cancel', closePicker, `${key}-cancel`)
+        )
       );
     }
-    const key = `probe:${tool.id}`;
-    const models = probe.result.models.filter((model) => this.importable(model));
-    const selection = this.selection(key, models);
-    const existing = models.filter(
-      (model) =>
-        selection.has(model.id) &&
-        this.snapshot?.models.some((saved) => saved.id === model.id)
-    ).length;
+
+    if (error) {
+      return h(
+        'div',
+        { className: 'aq-tools-probe' },
+        head,
+        this.errorBlock(error),
+        h(
+          'div',
+          { className: 'aq-tools-actions aq-tools-form-actions' },
+          this.button('Retry catalog', onRefreshCatalog, `${key}-retry`, 'primary'),
+          this.button('Cancel', closePicker, `${key}-cancel`)
+        )
+      );
+    }
+
+    if (!catalogModels) {
+      return h(
+        'div',
+        { className: 'aq-tools-probe aq-tools-probe-empty' },
+        head,
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          'No catalog loaded yet. Click Load catalog to query the saved tool.'
+        ),
+        h(
+          'div',
+          { className: 'aq-tools-actions aq-tools-form-actions' },
+          this.button('Load catalog', onRefreshCatalog, `${key}-load`, 'primary'),
+          this.button('Cancel', closePicker, `${key}-cancel`)
+        )
+      );
+    }
+
+    const importableModels = catalogModels.filter((model) => this.importable(model));
+    const selection = this.selection(key, importableModels);
+    const currentQuery = this.catalogSearch.get(key) ?? '';
+    const searchInput = this.input(
+      `${key}-search`,
+      currentQuery,
+      'Search models by name, ID, or effort…'
+    );
+    searchInput.classList.add('aq-tools-catalog-search');
+    searchInput.setAttribute('aria-label', `Search models for ${tool.label}`);
+
+    const stateEl = h('div', { className: 'aq-tools-catalog-state', role: 'status' });
+    const listEl = h('div', { className: 'aq-tools-catalog aq-tools-catalog-list' });
+    const actionsEl = h('div', { className: 'aq-tools-actions aq-tools-form-actions' });
+
+    const matchesSearch = (model: ModelDefinition, rawQuery: string): boolean => {
+      const q = rawQuery.trim().toLowerCase();
+      if (!q) return true;
+      const haystack = `${model.label} ${model.id} ${model.model_arg} ${(model.efforts ?? []).join(' ')}`.toLowerCase();
+      return haystack.includes(q);
+    };
+
+    const renderPickerBody = (): void => {
+      const query = this.catalogSearch.get(key) ?? '';
+      const filtered = catalogModels.filter((model) => matchesSearch(model, query));
+      const addedForToolCount = catalogModels.filter((model) =>
+        this.snapshot?.models.some((saved) => saved.id === model.id && saved.tool_id === tool.id)
+      ).length;
+      const selectedUpdateCount = importableModels.filter(
+        (model) =>
+          selection.has(model.id) &&
+          this.snapshot?.models.some((saved) => saved.id === model.id && saved.tool_id === tool.id)
+      ).length;
+
+      stateEl.replaceChildren(
+        h(
+          'span',
+          undefined,
+          selection.size > 0
+            ? `${selection.size} selected to add${selectedUpdateCount > 0 ? ` (${selectedUpdateCount} already added; saved efforts preserved)` : ''}`
+            : '0 selected'
+        ),
+        h('span', undefined, `${addedForToolCount} already added for ${tool.label}`),
+        h('span', undefined, `Showing ${filtered.length} of ${catalogModels.length}`),
+        selection.size > 0
+          ? this.button(
+              'Clear selection',
+              () => {
+                selection.clear();
+                renderPickerBody();
+              },
+              `${key}-clear-selection`
+            )
+          : null
+      );
+
+      if (catalogModels.length === 0) {
+        listEl.replaceChildren(
+          h('p', { className: 'aq-note' }, 'The catalog reported no models.')
+        );
+      } else if (filtered.length === 0) {
+        listEl.replaceChildren(
+          h('p', { className: 'aq-note' }, `No models match "${query.trim()}".`)
+        );
+      } else {
+        listEl.replaceChildren(
+          ...filtered.map((model, index) =>
+            this.catalogRow(tool, key, model, selection, index, renderPickerBody)
+          )
+        );
+      }
+
+      const importing = this.pending.has(`import:${key}`);
+      const toolHasSavedModels = Boolean(
+        this.snapshot?.models.some((saved) => saved.tool_id === tool.id)
+      );
+      const importBtn = this.button(
+        importing
+          ? 'Adding models…'
+          : `Add selected models${selection.size > 0 ? ` (${selection.size})` : ''}`,
+        () => void this.importModels(tool, key, importableModels),
+        `${key}-import`,
+        selection.size > 0 ? 'primary' : undefined,
+        selection.size === 0 || importing
+      );
+      if (selection.size > 0) {
+        importBtn.classList.add('aq-tools-primary');
+      }
+
+      actionsEl.replaceChildren(
+        importBtn,
+        this.button(
+          'Refresh catalog',
+          onRefreshCatalog,
+          `${key}-refresh`,
+          undefined,
+          importing
+        ),
+        toolHasSavedModels && this.onOpenProfiles
+          ? this.button(
+              'Open Profiles',
+              () => this.onOpenProfiles?.(),
+              `${key}-open-profiles`
+            )
+          : null,
+        this.button(
+          'Cancel',
+          closePicker,
+          `${key}-cancel`,
+          undefined,
+          importing
+        )
+      );
+    };
+
+    searchInput.addEventListener('input', () => {
+      this.catalogSearch.set(key, searchInput.value);
+      renderPickerBody();
+    });
+
+    renderPickerBody();
+
     return h(
       'div',
       { className: 'aq-tools-probe' },
-      h('h5', undefined, 'Model catalog'),
-      h(
-        'p',
-        { className: 'aq-tools-hint' },
-        'Setup: select and import desired entries, then assign them in Profiles. Catalog metadata only; import uses upsert_models at the latest registry revision. Entitlement and effort support remain unverified.'
-      ),
-      existing > 0
-        ? h(
-            'p',
-            { className: 'aq-tools-hint' },
-            `${existing} catalog model${existing === 1 ? '' : 's'} already exist and would be updated by this explicit import.`
-          )
-        : null,
-      probe.result.models.length === 0
-        ? h('p', { className: 'aq-note' }, 'The catalog reported no models.')
-        : h(
-            'div',
-            { className: 'aq-tools-catalog' },
-            ...probe.result.models.map((model, index) =>
-              this.catalogRow(key, model, selection, index)
-            )
-          ),
-      h(
-        'div',
-        { className: 'aq-tools-actions' },
-        this.button(
-          this.pending.has(`import:${key}`)
-            ? 'Importing…'
-            : `Import selected${selection.size > 0 ? ` (${selection.size})` : ''}`,
-          () => void this.importModels(tool, key, models),
-          `${key}-import`,
-          selection.size > 0 ? 'primary' : undefined,
-          selection.size === 0 || this.pending.has(`import:${key}`)
-        )
-      )
+      head,
+      catalogModels.length > 0 ? searchInput : null,
+      stateEl,
+      listEl,
+      actionsEl
     );
   }
 
@@ -1168,13 +2174,7 @@ export class ToolsPage {
       api.advice = null;
       api.testError = null;
     });
-    const catalogKey = `api:${tool.id}`;
-    const selection = this.selection(catalogKey, api.models);
-    const existingCatalog = api.models.filter(
-      (model) =>
-        selection.has(model.id) &&
-        this.snapshot?.models.some((saved) => saved.id === model.id)
-    ).length;
+
     return h(
       'div',
       { className: 'aq-tools-api' },
@@ -1202,7 +2202,7 @@ export class ToolsPage {
         secret.confirmDelete
           ? h(
               'div',
-              { className: 'aq-tools-actions' },
+              { className: 'aq-tools-actions aq-tools-form-actions' },
               h('span', { className: 'aq-tools-hint' }, 'Remove the stored credential?'),
               this.button(
                 secretBusy ? 'Removing…' : 'Confirm remove',
@@ -1222,7 +2222,7 @@ export class ToolsPage {
             )
           : h(
               'div',
-              { className: 'aq-tools-actions' },
+              { className: 'aq-tools-actions aq-tools-form-actions' },
               this.button(
                 secret.loading ? 'Checking…' : 'Check credential status',
                 () => void this.checkSecret(tool.id),
@@ -1249,71 +2249,25 @@ export class ToolsPage {
       ),
       h(
         'div',
-        { className: 'aq-tools-actions' },
+        { className: 'aq-tools-actions aq-tools-form-actions' },
         this.button(
           this.pending.has(`secret-set:${tool.id}`) ? 'Saving credential…' : 'Set credential',
           () => void this.saveSecret(tool, credential),
           `api-${tool.id}-secret-set`,
           'primary',
           secretBusy
-        )
-      ),
-      h('hr', { className: 'aq-tools-rule' }),
-      h('h5', undefined, 'API model catalog'),
-      h(
-        'p',
-        { className: 'aq-tools-hint' },
-        'Explicit metadata request only. A model listed by the provider catalog is not proof of entitlement.'
-      ),
-      h(
-        'div',
-        { className: 'aq-tools-actions' },
+        ),
         this.button(
-          api.loading ? 'Loading catalog…' : 'Load API model catalog',
-          () => void this.loadModels(tool, provider),
-          `api-${tool.id}-catalog`,
+          'Clear',
+          () => {
+            credential.value = '';
+            credential.focus({ preventScroll: true });
+          },
+          `api-${tool.id}-secret-clear`,
           undefined,
-          this.pending.has(`catalog:${catalogKey}`)
+          secretBusy
         )
       ),
-      api.error ? this.errorBlock(api.error) : null,
-      api.loaded
-        ? h(
-            'div',
-            { className: 'aq-tools-catalog' },
-            api.models.length === 0
-              ? h('p', { className: 'aq-note' }, 'The provider returned no model metadata.')
-              : h(
-                  'div',
-                  undefined,
-                  ...api.models.map((model, index) =>
-                    this.catalogRow(catalogKey, model, selection, index)
-                  )
-                )
-          )
-        : null,
-      existingCatalog > 0
-        ? h(
-            'p',
-            { className: 'aq-tools-hint' },
-            `${existingCatalog} selected catalog model${existingCatalog === 1 ? '' : 's'} already exist and would be updated by this explicit import.`
-          )
-        : null,
-      api.loaded
-        ? h(
-            'div',
-            { className: 'aq-tools-actions' },
-            this.button(
-              this.pending.has(`import:${catalogKey}`)
-                ? 'Importing…'
-                : `Import selected${selection.size > 0 ? ` (${selection.size})` : ''}`,
-              () => void this.importModels(tool, catalogKey, api.models),
-              `api-${tool.id}-catalog-import`,
-              selection.size > 0 ? 'primary' : undefined,
-              selection.size === 0 || this.pending.has(`import:${catalogKey}`)
-            )
-          )
-        : null,
       h('hr', { className: 'aq-tools-rule' }),
       h('h5', undefined, 'Synthetic decision test'),
       h(
@@ -1329,11 +2283,11 @@ export class ToolsPage {
       h(
         'datalist',
         { id: listId },
-        ...Array.from(suggestions, ([value, label]) => h('option', { value }, label))
+        ...Array.from(suggestions, ([value, labelText]) => h('option', { value }, labelText))
       ),
       h(
         'div',
-        { className: 'aq-tools-actions' },
+        { className: 'aq-tools-actions aq-tools-form-actions' },
         this.button(
           api.testLoading ? 'Running synthetic test…' : 'Run synthetic decision test',
           () => void this.testDecision(tool, provider),
@@ -1396,6 +2350,7 @@ export class ToolsPage {
       const rightTool = toolById.get(right.tool_id)?.label ?? right.tool_id;
       return leftTool.localeCompare(rightTool) || left.label.localeCompare(right.label);
     });
+    const manualOpen = this.expanded.has('create-model');
     return h(
       'section',
       { className: 'aq-tools-section', 'aria-labelledby': `${this.pageId}-models-title` },
@@ -1405,27 +2360,52 @@ export class ToolsPage {
         h(
           'div',
           undefined,
-          h('h3', { className: 'aq-tools-heading', id: `${this.pageId}-models-title` }, 'Models'),
+          h(
+            'h3',
+            { className: 'aq-tools-heading', id: `${this.pageId}-models-title` },
+            'Saved models'
+          ),
           h(
             'p',
             { className: 'aq-note' },
-            'Manual model and effort entries are authoritative here. Catalog imports do not mark efforts as verified.'
+            'Models added from tool catalogs or manual setup appear here. You can customize supported effort levels on any saved model.'
           )
         ),
-        h('span', { className: 'aq-badge' }, `${models.length} model${models.length === 1 ? '' : 's'}`)
+        h(
+          'div',
+          { className: 'aq-tools-actions aq-tools-progress' },
+          h(
+            'span',
+            { className: 'aq-badge', 'data-status': models.length > 0 ? 'active' : 'warn' },
+            `${models.length} model${models.length === 1 ? '' : 's'}`
+          ),
+          models.length > 0 && this.onOpenProfiles
+            ? this.button(
+                'Open Profiles',
+                () => this.onOpenProfiles?.(),
+                'open-profiles-models',
+                'primary'
+              )
+            : null
+        )
       ),
-      this.buildCreateModel(snapshot),
       models.length === 0
         ? h(
             'p',
             { className: 'aq-note aq-tools-empty' },
-            'No models are configured. Add a manual model and its explicit effort list.'
+            'No models are added yet. Use Add and choose models or Choose models on a tool above, or open Advanced below to add a manual model.'
           )
         : h(
             'div',
             { className: 'aq-tools-list' },
             ...models.map((model) => this.buildModel(snapshot, model))
-          )
+          ),
+      h(
+        'details',
+        { className: 'aq-tools-advanced', open: manualOpen ? true : undefined },
+        h('summary', undefined, 'Advanced: Add manual model'),
+        this.buildCreateModel(snapshot)
+      )
     );
   }
 
@@ -1466,14 +2446,29 @@ export class ToolsPage {
     const duplicate =
       draft.id.trim() !== '' && snapshot.models.some((model) => model.id === draft.id.trim());
     const noTools = snapshot.tools.length === 0;
+    const cancelManualModel = (): void => {
+      const defaultToolId = snapshot.tools[0]?.id ?? '';
+      this.newModel = emptyModel(snapshot.revision, defaultToolId);
+      this.expanded.delete(key);
+      this.refresh();
+      this.focusAndScroll('toggle-create-model');
+    };
     const toggle = this.button(
-      open ? 'Hide form' : 'Add manual model',
-      () => this.toggleExpanded(key),
+      open ? 'Cancel' : 'Add manual model',
+      () => {
+        if (open) {
+          cancelManualModel();
+        } else {
+          this.expanded.add(key);
+          this.refresh();
+          this.focusAndScroll('new-model-label');
+        }
+      },
       'toggle-create-model'
     );
     toggle.setAttribute('aria-expanded', String(open));
     toggle.setAttribute('aria-controls', bodyId);
-    toggle.setAttribute('aria-label', open ? 'Hide add model form' : 'Show add model form');
+    toggle.setAttribute('aria-label', open ? 'Cancel add model form' : 'Show add model form');
     return h(
       'div',
       {
@@ -1533,13 +2528,20 @@ export class ToolsPage {
               : null,
             h(
               'div',
-              { className: 'aq-tools-actions' },
+              { className: 'aq-tools-actions aq-tools-form-actions' },
               this.button(
                 this.pending.has('model-create') ? 'Adding…' : 'Add model',
                 () => void this.createModel(),
                 'new-model-submit',
                 'primary',
                 noTools || this.pending.has('model-create')
+              ),
+              this.button(
+                'Cancel',
+                cancelManualModel,
+                'new-model-cancel',
+                undefined,
+                this.pending.has('model-create')
               )
             )
           )
@@ -1582,14 +2584,31 @@ export class ToolsPage {
       draft.allowNoEffort = allow.checked;
       draft.dirty = true;
     });
+    const closeModelEdit = (): void => {
+      this.modelDrafts.delete(model.id);
+      this.expanded.delete(cardKey);
+      if (this.deleteConfirm?.kind === 'model' && this.deleteConfirm.id === model.id) {
+        this.deleteConfirm = null;
+      }
+      this.refresh();
+      this.focusAndScroll(`model-${model.id}-details`);
+    };
     const toggle = this.button(
-      open ? 'Close' : 'Details',
-      () => this.toggleExpanded(cardKey),
+      open ? 'Close' : 'Edit',
+      () => {
+        if (open) {
+          closeModelEdit();
+        } else {
+          this.expanded.add(cardKey);
+          this.refresh();
+          this.focusAndScroll(`model-${model.id}-label`);
+        }
+      },
       `model-${model.id}-details`
     );
     toggle.setAttribute('aria-expanded', String(open));
     toggle.setAttribute('aria-controls', bodyId);
-    toggle.setAttribute('aria-label', `${open ? 'Hide' : 'Show'} details for ${model.label}`);
+    toggle.setAttribute('aria-label', `${open ? 'Close' : 'Edit'} details for ${model.label}`);
     return h(
       'article',
       { className: 'aq-tools-card aq-tools-model-card' },
@@ -1605,7 +2624,7 @@ export class ToolsPage {
           h(
             'span',
             { className: 'aq-tools-hint' },
-            modelTool?.label ?? 'Missing tool'
+            `${modelTool?.label ?? 'Missing tool'} · ${effortText(model)}`
           )
         ),
         h(
@@ -1637,7 +2656,7 @@ export class ToolsPage {
                 'Tool',
                 tool,
                 toolMissing
-                  ? 'The referenced tool is missing. Choose a current tool or discard.'
+                  ? 'The referenced tool is missing. Choose a current tool or cancel.'
                   : undefined
               ),
               this.field('Label', label),
@@ -1647,15 +2666,12 @@ export class ToolsPage {
             ),
             this.conflictBlock(
               draft,
-              () => {
-                this.modelDrafts.delete(model.id);
-                this.refresh();
-              },
+              closeModelEdit,
               `model-${model.id}-conflict`
             ),
             h(
               'div',
-              { className: 'aq-tools-actions aq-tools-card-actions' },
+              { className: 'aq-tools-actions aq-tools-card-actions aq-tools-form-actions' },
               this.button(
                 this.pending.has(`model-save:${model.id}`)
                   ? 'Saving…'
@@ -1670,11 +2686,8 @@ export class ToolsPage {
                   (draft.conflict && !draft.overwrite)
               ),
               this.button(
-                'Discard draft',
-                () => {
-                  this.modelDrafts.delete(model.id);
-                  this.refresh();
-                },
+                'Cancel',
+                closeModelEdit,
                 `model-${model.id}-discard`,
                 undefined,
                 this.pending.has(`model-save:${model.id}`)
@@ -1740,7 +2753,7 @@ export class ToolsPage {
       ),
       h(
         'div',
-        { className: 'aq-tools-actions' },
+        { className: 'aq-tools-actions aq-tools-form-actions' },
         this.button(
           'Reload latest',
           () => {
@@ -1750,7 +2763,7 @@ export class ToolsPage {
           },
           `${key}-reload`
         ),
-        this.button('Discard draft', discard, `${key}-discard`)
+        this.button('Cancel', discard, `${key}-discard`)
       ),
       this.checkField(
         'Allow overwrite with this draft',
@@ -1761,25 +2774,41 @@ export class ToolsPage {
   }
 
   private catalogRow(
+    tool: ToolDefinition,
     key: string,
     model: ModelDefinition,
     selection: Set<string>,
-    index: number
+    index: number,
+    onSelectionChanged?: () => void
   ): HTMLElement {
     const importable = this.importable(model);
+    const saved = this.snapshot?.models.find((entry) => entry.id === model.id) ?? null;
+    const alreadyOnThisTool = saved !== null && saved.tool_id === tool.id;
+    const usedByOtherTool = saved !== null && saved.tool_id !== tool.id;
+    const otherToolLabel = usedByOtherTool
+      ? this.snapshot?.tools.find((entry) => entry.id === saved.tool_id)?.label ?? saved.tool_id
+      : null;
+    const canSelect = importable && !usedByOtherTool;
+
     const check = this.checkbox(
       `${key}-model-${index}-${model.id || 'missing'}`,
-      importable && selection.has(model.id)
+      canSelect && selection.has(model.id)
     );
-    check.disabled = !importable;
+    check.disabled = !canSelect;
     check.addEventListener('change', () => {
-      if (check.checked) selection.add(model.id);
+      if (check.checked && canSelect) selection.add(model.id);
       else selection.delete(model.id);
-      this.refresh();
+      if (onSelectionChanged) {
+        onSelectionChanged();
+      } else {
+        this.refresh();
+      }
     });
     return h(
       'div',
-      { className: `aq-tools-catalog-row${importable ? '' : ' aq-tools-catalog-row-invalid'}` },
+      {
+        className: `aq-tools-catalog-row${canSelect ? '' : ' aq-tools-catalog-row-invalid'}`,
+      },
       h(
         'label',
         { className: 'aq-tools-catalog-check', for: check.id },
@@ -1787,17 +2816,49 @@ export class ToolsPage {
         h(
           'span',
           { className: 'aq-tools-catalog-copy' },
-          h('strong', undefined, safeText(model.label, model.id || 'Unnamed model')),
+          h(
+            'span',
+            { className: 'aq-tools-badges' },
+            h('strong', undefined, safeText(model.label, model.id || 'Unnamed model')),
+            alreadyOnThisTool
+              ? h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Added')
+              : null,
+            usedByOtherTool
+              ? h(
+                  'span',
+                  { className: 'aq-badge', 'data-status': 'warn' },
+                  `ID used by ${otherToolLabel}`
+                )
+              : null
+          ),
           h('code', { className: 'aq-tools-code' }, model.id || 'missing-id'),
           h(
             'span',
             { className: 'aq-tools-hint' },
             `Model arg: ${safeText(model.model_arg, 'missing')} · ${effortText(model)}`
           ),
-          h('span', { className: 'aq-tools-hint' }, 'Effort entries are catalog-reported and unverified.')
+          alreadyOnThisTool
+            ? h(
+                'span',
+                { className: 'aq-tools-hint' },
+                'Already added for this tool. Leaving unchecked keeps your saved model; selecting updates it while preserving saved efforts.'
+              )
+            : usedByOtherTool
+              ? h(
+                  'span',
+                  { className: 'aq-tools-hint' },
+                  `Model ID "${model.id}" already belongs to ${otherToolLabel} and cannot be overwritten from ${tool.label}.`
+                )
+              : h(
+                  'span',
+                  { className: 'aq-tools-hint' },
+                  'Catalog-reported metadata; effort support remains unverified.'
+                )
         )
       ),
-      importable ? null : h('span', { className: 'aq-tools-inline-error' }, 'Missing required catalog metadata.')
+      !importable
+        ? h('span', { className: 'aq-tools-inline-error' }, 'Missing required catalog metadata.')
+        : null
     );
   }
 
@@ -2030,11 +3091,15 @@ export class ToolsPage {
   }
 
   private validateTool(draft: ToolDraft, isNew: boolean): ToolDefinition | string {
-    const id = draft.id.trim();
     const label = draft.label.trim();
-    if (!id) return 'Enter a tool ID.';
     if (!label) return 'Enter a tool label.';
-    if (isNew && this.snapshot?.tools.some((tool) => tool.id === id)) {
+    const existingTools = this.snapshot?.tools ?? [];
+    const id =
+      isNew && !draft.id.trim()
+        ? uniqueToolId(deriveToolIdFromLabel(label, draft.adapter), existingTools)
+        : draft.id.trim();
+    if (!id) return 'Enter a tool ID.';
+    if (isNew && existingTools.some((tool) => tool.id === id)) {
       return 'A tool with this ID already exists. Edit the existing tool instead.';
     }
     return {
@@ -2110,7 +3175,7 @@ export class ToolsPage {
     return notify;
   }
 
-  private async createTool(): Promise<void> {
+  private async createTool(chooseModelsAfter = false): Promise<void> {
     if (!this.snapshot || this.disposed) return;
     const draft = this.newTool;
     const tool = this.validateTool(draft, true);
@@ -2118,10 +3183,32 @@ export class ToolsPage {
       this.validationError(tool);
       return;
     }
-    await this.apply('tool-create', { op: 'upsert_tool', tool }, (next) => {
+    const saved = await this.apply('tool-create', { op: 'upsert_tool', tool }, (next) => {
       this.newTool = emptyTool(next.revision);
-      this.notice = { tone: 'success', text: `Added tool "${tool.label}" at revision ${next.revision}.` };
+      this.expanded.delete('create-tool');
+      this.configuringDiscoveredId = null;
+      this.pendingSwitch = null;
+      if (chooseModelsAfter) {
+        this.openPickers.add(tool.id);
+      }
+      this.notice = {
+        tone: 'success',
+        title: `${tool.label} added`,
+        text: chooseModelsAfter
+          ? `Added "${tool.label}" at revision ${next.revision} and reading its model catalog.`
+          : `Added tool "${tool.label}" at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
+      };
     });
+    if (saved && chooseModelsAfter && !this.disposed) {
+      const provider = providerFor(tool.adapter);
+      if (provider === null) {
+        await this.probe(tool);
+        this.focusAndScroll(`probe:${tool.id}-search`);
+      } else {
+        await this.loadModels(tool, provider);
+        this.focusAndScroll(`api:${tool.id}-search`);
+      }
+    }
   }
 
   private async saveTool(tool: ToolDefinition): Promise<void> {
@@ -2141,6 +3228,8 @@ export class ToolsPage {
       { op: 'upsert_tool', tool: value },
       (next) => {
         this.toolDrafts.delete(tool.id);
+        this.expanded.delete(`tool:${tool.id}`);
+        this.pendingSwitch = null;
         this.probes.delete(tool.id);
         this.selections.delete(`probe:${tool.id}`);
         if (tool.adapter !== draft.adapter) {
@@ -2172,11 +3261,15 @@ export class ToolsPage {
       (next) => {
         this.deleteConfirm = null;
         this.toolDrafts.delete(tool.id);
+        this.expanded.delete(`tool:${tool.id}`);
+        this.openPickers.delete(tool.id);
         this.probes.delete(tool.id);
         this.secrets.delete(tool.id);
         this.apiStates.delete(tool.id);
         this.selections.delete(`probe:${tool.id}`);
         this.selections.delete(`api:${tool.id}`);
+        this.catalogSearch.delete(`probe:${tool.id}`);
+        this.catalogSearch.delete(`api:${tool.id}`);
         this.notice = { tone: 'success', text: `Deleted tool "${tool.label}" at revision ${next.revision}.` };
       }
     );
@@ -2185,6 +3278,7 @@ export class ToolsPage {
 
   private async probe(tool: ToolDefinition): Promise<void> {
     if (this.disposed || this.pending.has(`probe:${tool.id}`)) return;
+    this.openPickers.add(tool.id);
     const state = this.probeState(tool.id);
     state.loading = true;
     state.error = null;
@@ -2201,7 +3295,7 @@ export class ToolsPage {
     } catch (err) {
       if (!this.disposed) {
         state.error = safeError(err);
-        this.expanded.add(`tool:${tool.id}`);
+        this.openPickers.add(tool.id);
       }
     } finally {
       if (!this.disposed) {
@@ -2219,24 +3313,54 @@ export class ToolsPage {
   ): Promise<void> {
     if (!this.snapshot || this.disposed) return;
     const selection = this.selection(key, source);
-    const selected = source.filter((model) => this.importable(model) && selection.has(model.id));
+    const selected = source.filter((model) => {
+      if (!this.importable(model) || !selection.has(model.id)) return false;
+      const existing = this.snapshot?.models.find((saved) => saved.id === model.id);
+      return !existing || existing.tool_id === tool.id;
+    });
     if (selected.length === 0) {
-      this.validationError('Select at least one complete catalog model to import.');
+      this.validationError('Select at least one available catalog model to add.');
       return;
     }
-    const models: ModelDefinition[] = selected.map((model) => ({
-      id: model.id.trim(),
-      tool_id: tool.id,
-      label: model.label.trim(),
-      model_arg: model.model_arg.trim(),
-      efforts: [...model.efforts],
-      allow_no_effort: Boolean(model.allow_no_effort),
-    }));
+    const models: ModelDefinition[] = selected.map((model) => {
+      const id = model.id.trim();
+      const existingSameTool = this.snapshot?.models.find(
+        (saved) => saved.id === id && saved.tool_id === tool.id
+      );
+      if (existingSameTool) {
+        return {
+          id,
+          tool_id: tool.id,
+          label: existingSameTool.label.trim() || model.label.trim(),
+          model_arg: existingSameTool.model_arg.trim() || model.model_arg.trim(),
+          efforts:
+            existingSameTool.efforts.length > 0
+              ? [...existingSameTool.efforts]
+              : [...model.efforts],
+          allow_no_effort:
+            existingSameTool.efforts.length > 0
+              ? existingSameTool.allow_no_effort
+              : Boolean(model.allow_no_effort) || model.efforts.length === 0,
+        };
+      }
+      return {
+        id,
+        tool_id: tool.id,
+        label: model.label.trim(),
+        model_arg: model.model_arg.trim(),
+        efforts: [...model.efforts],
+        allow_no_effort: Boolean(model.allow_no_effort) || model.efforts.length === 0,
+      };
+    });
     await this.apply(`import:${key}`, { op: 'upsert_models', models }, (next) => {
       this.selections.delete(key);
+      this.catalogSearch.delete(key);
+      this.openPickers.delete(tool.id);
       this.notice = {
         tone: 'success',
-        text: `Imported ${models.length} catalog model${models.length === 1 ? '' : 's'} at revision ${next.revision}. Effort entries remain unverified.`,
+        title: 'Models added',
+        text: `Added ${models.length} model${models.length === 1 ? '' : 's'} for ${tool.label} at revision ${next.revision}. You can now assign ${models.length === 1 ? 'it' : 'them'} in Profiles.`,
+        showOpenProfiles: true,
       };
     });
   }
@@ -2255,7 +3379,13 @@ export class ToolsPage {
         ? preferredTool
         : next.tools[0]?.id ?? '';
       this.newModel = emptyModel(next.revision, toolId);
-      this.notice = { tone: 'success', text: `Added model "${model.label}" at revision ${next.revision}.` };
+      this.expanded.delete('create-model');
+      this.notice = {
+        tone: 'success',
+        title: 'Model added',
+        text: `Added model "${model.label}" at revision ${next.revision}.`,
+        showOpenProfiles: true,
+      };
     });
   }
 
@@ -2276,6 +3406,7 @@ export class ToolsPage {
       { op: 'upsert_model', model: value },
       (next) => {
         this.modelDrafts.delete(model.id);
+        this.expanded.delete(`model:${model.id}`);
         this.notice = { tone: 'success', text: `Saved model "${value.label}" at revision ${next.revision}.` };
       },
       (error) => {
@@ -2300,6 +3431,7 @@ export class ToolsPage {
       (next) => {
         this.deleteConfirm = null;
         this.modelDrafts.delete(model.id);
+        this.expanded.delete(`model:${model.id}`);
         this.notice = { tone: 'success', text: `Deleted model "${model.label}" at revision ${next.revision}.` };
       }
     );
@@ -2453,6 +3585,7 @@ export class ToolsPage {
   private async loadModels(tool: ToolDefinition, provider: Provider): Promise<void> {
     const key = `catalog:api:${tool.id}`;
     if (this.disposed || this.pending.has(key)) return;
+    this.openPickers.add(tool.id);
     const state = this.apiState(tool.id);
     state.loading = true;
     state.error = null;
@@ -2474,7 +3607,7 @@ export class ToolsPage {
     } catch (err) {
       if (!this.disposed) {
         state.error = safeError(err);
-        this.expanded.add(`tool:${tool.id}`);
+        this.openPickers.add(tool.id);
       }
     } finally {
       if (!this.disposed) {

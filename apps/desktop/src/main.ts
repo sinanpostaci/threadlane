@@ -15,7 +15,6 @@ import {
   type TaskProviderFilter,
   type TaskSummary,
   type ThemeMode,
-  type ToolStatus,
 } from './types.ts';
 import {
   classifyTaskBucket,
@@ -28,10 +27,8 @@ import {
   formatProviderName,
   formatRelativeTimestamp,
   formatStatusLabel,
-  formatToolAvailability,
   matchesProviderFilter,
   resolveTaskBrand,
-  resolveToolBrand,
   sanitizeAppearancePreferences,
   sanitizeExecutionPreferences,
 } from './format.ts';
@@ -102,7 +99,7 @@ import {
 } from './registry/ipc.ts';
 import { createBrandIconElement, createUiIcon, type UiIconName } from './icons.ts';
 import { createButton, h } from './ui/dom.ts';
-import { ToolsPage, isConfigurableDiscoveredCli } from './pages/tools.ts';
+import { ToolsPage } from './pages/tools.ts';
 import { ProfilesPage } from './pages/profiles.ts';
 import { PlansPage } from './pages/plans.ts';
 import { NativeLinkingPanel } from './pages/native.ts';
@@ -221,9 +218,19 @@ class ThreadlaneDesktopApp {
     this.state = createInitialState(savedAppearance, Date.now(), savedExecPrefs);
     this.state.isDevPreviewFixture = isDevPreviewFixtureMode();
 
-    this.toolsPage = new ToolsPage(() => {
-      void this.refreshRegistry();
-    });
+    this.toolsPage = new ToolsPage(
+      () => {
+        void this.refreshRegistry();
+      },
+      {
+        onOpenProfiles: () => {
+          this.handleOpenProfilesFromTools();
+        },
+        onRefreshDiscovery: () => {
+          void this.refreshTools();
+        },
+      }
+    );
     this.profilesPage = new ProfilesPage(
       () => {
         void this.refreshRegistry();
@@ -1932,9 +1939,22 @@ class ThreadlaneDesktopApp {
     );
   }
 
+  private handleOpenProfilesFromTools(): void {
+    this.returnFocusKey = null;
+    this.state = navigateToPage(this.state, 'profiles');
+    this.render();
+    const draftNameTarget = this.findFocusTarget('focusKey', 'profile-name');
+    const newProfileTarget = this.findFocusTarget('focusKey', 'new-profile');
+    const navTarget = this.findFocusTarget('focus', 'nav-profiles');
+    const focusEl = draftNameTarget ?? newProfileTarget ?? navTarget;
+    if (focusEl && !(focusEl as { disabled?: boolean }).disabled) {
+      focusEl.focus({ preventScroll: true });
+    }
+    this.mainEl.scrollTop = 0;
+  }
+
   private buildToolsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
-    frag.appendChild(this.buildLocalDiscoverySection());
     frag.appendChild(this.buildRegistryHeaderBar());
 
     if (this.state.registryError) {
@@ -1947,183 +1967,20 @@ class ThreadlaneDesktopApp {
       );
     }
 
-    frag.appendChild(this.toolsPage.render(this.state.registrySnapshot));
+    frag.appendChild(
+      this.toolsPage.render(this.state.registrySnapshot, {
+        tools: this.state.tools,
+        loading: this.state.toolsLoading,
+        error: this.state.toolsError,
+        onRefreshDiscovery: () => {
+          void this.refreshTools();
+        },
+        onOpenProfiles: () => {
+          this.handleOpenProfilesFromTools();
+        },
+      })
+    );
     return frag;
-  }
-
-  private buildLocalDiscoverySection(): HTMLElement {
-    const { tools, toolsLoading, toolsError } = this.state;
-    const hasResults = tools.length > 0;
-    const titleId = 'aq-local-discovery-title';
-    const refreshLabel = toolsLoading ? 'Refreshing…' : 'Refresh discovery';
-
-    const section = h(
-      'section',
-      { className: 'aq-discovery', 'aria-labelledby': titleId, 'aria-busy': toolsLoading ? 'true' : undefined },
-      h(
-        'div',
-        { className: 'aq-discovery-head' },
-        h(
-          'div',
-          { className: 'aq-discovery-heading' },
-          h('p', { className: 'aq-kicker' }, 'Local discovery'),
-          h('h2', { className: 'aq-discovery-title', id: titleId }, 'Tools on this device')
-        ),
-        h(
-          'button',
-          {
-            type: 'button',
-            className: 'aq-btn aq-discovery-refresh',
-            'data-action': 'refresh-tools',
-            'data-focus': 'discovery-refresh',
-            'aria-label': 'Refresh discovery',
-            title: 'Refresh discovery',
-            disabled: toolsLoading,
-          },
-          createUiIcon('refresh-cw'),
-          h('span', undefined, refreshLabel)
-        )
-      ),
-      h(
-        'p',
-        { className: 'aq-discovery-note' },
-        'Read-only PATH lookup on this device. It does not verify login, credentials, version, model, or effort, and never adds registry tools or models.'
-      )
-    );
-
-    if (toolsLoading) {
-      section.appendChild(
-        h(
-          'p',
-          { className: 'aq-discovery-status', role: 'status', 'aria-live': 'polite' },
-          hasResults
-            ? 'Refreshing discovery. Previous results stay visible until the check completes.'
-            : 'Checking local PATH…'
-        )
-      );
-    }
-
-    if (toolsError) {
-      section.appendChild(
-        h(
-          'div',
-          { className: 'aq-discovery-error', role: 'alert' },
-          h('span', undefined, toolsError),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'aq-btn',
-              'data-action': 'refresh-tools',
-              'aria-label': 'Retry local PATH discovery',
-              title: 'Retry local PATH discovery',
-            },
-            createUiIcon('refresh-cw'),
-            h('span', undefined, 'Retry discovery')
-          )
-        )
-      );
-      if (hasResults) {
-        section.appendChild(
-          h(
-            'p',
-            { className: 'aq-discovery-status' },
-            'The latest discovery refresh failed. Results below are from the last successful check.'
-          )
-        );
-      }
-    }
-
-    if (hasResults) {
-      section.appendChild(
-        h(
-          'ul',
-          { className: 'aq-discovery-list', 'aria-label': 'Tools discovered on this device' },
-          ...tools.map((tool) => this.buildDiscoveryRow(tool))
-        )
-      );
-    } else if (!toolsLoading && !toolsError) {
-      section.appendChild(
-        h(
-          'p',
-          { className: 'aq-discovery-empty', role: 'status' },
-          'Local discovery returned no commands. Add tools explicitly in the registry below.'
-        )
-      );
-    }
-
-    section.appendChild(
-      h(
-        'p',
-        { className: 'aq-discovery-note' },
-        'Registry tools, models, and API adapters are configured below. Configure only prefills a draft; save it, load models, import entries, then assign them in Profiles. Discovery does not change the registry.'
-      )
-    );
-    return section;
-  }
-
-  private buildDiscoveryRow(tool: ToolStatus): HTMLElement {
-    const status = formatToolAvailability(tool.availability);
-    const executablePath = tool.executable_path?.trim() ?? '';
-    const canConfigure =
-      tool.availability === 'found' &&
-      executablePath.length > 0 &&
-      isConfigurableDiscoveredCli(tool.id, tool.label);
-    const statusTone =
-      tool.availability === 'found'
-        ? 'found'
-        : tool.availability === 'not_found'
-          ? 'warn'
-          : undefined;
-    const detail = executablePath
-      ? executablePath
-      : tool.availability === 'not_configured'
-        ? 'No executable reported for discovery. Registry and API configuration is below.'
-        : tool.availability === 'found'
-          ? 'Found on PATH; no executable path reported.'
-          : 'No executable found on PATH.';
-
-    return h(
-      'li',
-      { className: 'aq-discovery-row' },
-      createBrandIconElement(resolveToolBrand(tool.id, tool.label)),
-      h(
-        'div',
-        { className: 'aq-discovery-body' },
-        h(
-          'div',
-          { className: 'aq-discovery-name-row' },
-          h('span', { className: 'aq-discovery-name' }, tool.label),
-          h(
-            'span',
-            { className: 'aq-badge aq-discovery-badge', 'data-status': statusTone },
-            status
-          )
-        ),
-        h('code', { className: 'aq-discovery-detail' }, detail),
-        canConfigure
-          ? h(
-              'div',
-              { className: 'aq-discovery-actions' },
-              h(
-                'button',
-                {
-                  type: 'button',
-                  className: 'aq-btn aq-discovery-configure',
-                  'data-action': 'configure-discovered-tool',
-                  'data-discovery-tool-id': tool.id,
-                  'data-discovery-tool-label': tool.label,
-                  'data-discovery-executable': executablePath,
-                  'data-focus': `configure-discovery-${tool.id}`,
-                  'aria-label': `Configure ${tool.label} from local discovery`,
-                  title: `Prefill the Add tool form with ${tool.label}`,
-                },
-                'Configure'
-              )
-            )
-          : null
-      )
-    );
   }
 
   private buildProfilesView(): DocumentFragment {
@@ -2824,19 +2681,6 @@ class ThreadlaneDesktopApp {
       }
       if (action === 'refresh-registry') {
         void this.refreshRegistry();
-        return;
-      }
-      if (action === 'refresh-tools') {
-        void this.refreshTools();
-        return;
-      }
-      if (action === 'configure-discovered-tool') {
-        const toolId = button.dataset.discoveryToolId;
-        const toolLabel = button.dataset.discoveryToolLabel;
-        const executablePath = button.dataset.discoveryExecutable;
-        if (toolId && toolLabel && executablePath) {
-          this.toolsPage.configureDiscoveredTool(toolId, toolLabel, executablePath);
-        }
         return;
       }
       if (action === 'start-demo') {

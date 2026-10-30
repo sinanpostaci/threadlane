@@ -80,6 +80,7 @@ export interface ProfileDraft {
   mode: 'create' | 'edit';
   id: string;
   name: string;
+  nameTouched?: boolean;
   sourceId: string | null;
   sourceRevision: number;
   sourceSignature: string | null;
@@ -483,7 +484,16 @@ function banner(
   );
 }
 
-function buildDraftStatus(analysis: DraftAnalysis): HTMLElement {
+function buildDraftStatus(
+  analysis: DraftAnalysis,
+  draft?: ProfileDraft | null
+): HTMLElement {
+  const suppressInitialBlankNameError =
+    Boolean(draft) && !draft?.nameTouched && draft?.name.trim() === '';
+  const visibleErrors = suppressInitialBlankNameError
+    ? analysis.errors.filter((message) => message !== 'Profile name is required.')
+    : analysis.errors;
+
   const status = h(
     'div',
     { class: 'aq-profiles-status' },
@@ -498,6 +508,16 @@ function buildDraftStatus(analysis: DraftAnalysis): HTMLElement {
         : pill('Role defaults complete', 'accent')
     )
   );
+
+  if (suppressInitialBlankNameError) {
+    status.append(
+      h(
+        'p',
+        { class: 'aq-profiles-note', 'data-tone': 'muted' },
+        'Enter a profile name to enable saving. Role assignments are optional and can be completed later.'
+      )
+    );
+  }
 
   if (analysis.missingDefaults.length > 0) {
     status.append(
@@ -519,13 +539,13 @@ function buildDraftStatus(analysis: DraftAnalysis): HTMLElement {
       )
     );
   }
-  if (analysis.errors.length > 0) {
+  if (visibleErrors.length > 0) {
     status.append(
       h(
         'div',
         { class: 'aq-profiles-errors', role: 'alert' },
         h('p', {}, 'Fix these before saving:'),
-        h('ul', {}, ...analysis.errors.map((message) => h('li', {}, message)))
+        h('ul', {}, ...visibleErrors.map((message) => h('li', {}, message)))
       )
     );
   }
@@ -718,6 +738,16 @@ export class ProfilesPage {
   }
 
   private buildModelSetupNotice(snapshot: RegistrySnapshot): HTMLElement | null {
+    if (this.draft !== null) {
+      return null;
+    }
+    return this.buildModelSetupCard(snapshot, false);
+  }
+
+  private buildModelSetupCard(
+    snapshot: RegistrySnapshot,
+    inEditor: boolean
+  ): HTMLElement | null {
     const enabledTools = snapshot.tools.filter((tool) => tool.enabled);
     const enabledToolIds = new Set(enabledTools.map((tool) => tool.id));
     const enabledModels = snapshot.models.filter((model) => enabledToolIds.has(model.tool_id));
@@ -725,38 +755,49 @@ export class ProfilesPage {
       return null;
     }
 
-    let title = 'No models available for profiles';
+    let title = 'No models chosen for profiles yet';
     let detail = '';
     if (snapshot.tools.length === 0) {
-      title = 'No tools registered';
+      title = 'No tools or models added yet';
       detail =
-        'Profile model selectors are empty because no tools are registered. Open Tools to configure a discovered CLI, save the tool, and import its model catalog. PATH discovery alone does not register or authenticate a tool.';
+        'Add a detected CLI tool and choose its models in Tools so you can assign workflow roles here.';
     } else if (enabledTools.length === 0) {
-      title = 'All tools disabled';
+      title = 'All registered tools are disabled';
       detail =
-        'Profile model selectors are empty because every registered tool is disabled. Open Tools to enable a tool, then load and import its model catalog.';
+        'Enable a tool in Tools or choose models for an enabled tool to assign workflow roles here.';
     } else if (snapshot.models.length === 0) {
-      title = 'No models registered';
+      title = 'No models chosen yet';
       detail =
-        'Profile model selectors are empty because no models are registered for enabled tools. Open Tools, load models for a saved tool, and import the entries you want. Model and effort values are never inferred.';
+        'Choose models for your enabled tools in Tools so they appear in profile role selectors.';
     } else {
-      title = 'No enabled-tool models';
+      title = 'No models available from enabled tools';
       detail =
-        'Models exist only under disabled tools, so no models are selectable here. Open Tools to enable a tool or import models for an enabled tool.';
+        'Saved models currently belong to disabled tools. Enable those tools or choose models for an enabled tool in Tools.';
     }
 
-    return banner(
-      'info',
-      title,
-      `${detail} Loading catalog metadata does not verify login, entitlement, or execution readiness.`,
-      [
-        button('Open Tools', () => this.onOpenTools(), {
+    const extra = inEditor
+      ? ' Your current profile draft and name stay intact while you choose models, or you can save a named partial profile now and assign roles later.'
+      : ' You can still create and save a named partial profile now, then assign roles after choosing models.';
+
+    return h(
+      'section',
+      { class: 'aq-profiles-setup', role: 'status' },
+      h(
+        'div',
+        { class: 'aq-profiles-banner-copy' },
+        h('strong', {}, title),
+        h('p', {}, `${detail}${extra}`)
+      ),
+      h(
+        'div',
+        { class: 'aq-profiles-setup-actions' },
+        button('Choose models', () => this.onOpenTools(), {
           className: 'aq-btn aq-btn-primary',
           disabled: this.pending !== null,
           focusKey: 'open-tools',
-          ariaLabel: 'Open Tools to configure tools and models',
-        }),
-      ]
+          ariaLabel: 'Choose models in Tools',
+        })
+      )
     );
   }
 
@@ -1068,9 +1109,14 @@ export class ProfilesPage {
     nameInput.addEventListener('input', () => {
       if (this.draft) {
         this.draft.name = nameInput.value;
+        this.draft.nameTouched = true;
         this.refreshDraftStatus();
       }
     });
+
+    const hasAssignableModels =
+      this.index?.groups.some((group) => group.models.length > 0) ?? false;
+    const showRoleEditors = hasAssignableModels || analysis.assignmentCount > 0;
 
     return h(
       'section',
@@ -1108,12 +1154,15 @@ export class ProfilesPage {
           `${draft.id} · Saves against registry revision ${snapshot.revision}.`
         )
       ),
-      h('div', { 'data-draft-status': 'true' }, buildDraftStatus(analysis)),
-      h(
-        'div',
-        { class: 'aq-profiles-roles' },
-        ...ROLES.map((role) => this.buildRoleEditor(role, draft, analysis, busy))
-      ),
+      h('div', { 'data-draft-status': 'true' }, buildDraftStatus(analysis, draft)),
+      this.buildModelSetupCard(snapshot, true),
+      showRoleEditors
+        ? h(
+            'div',
+            { class: 'aq-profiles-roles' },
+            ...ROLES.map((role) => this.buildRoleEditor(role, draft, analysis, busy))
+          )
+        : null,
       h(
         'div',
         { class: 'aq-profiles-editor-actions' },
@@ -1478,7 +1527,7 @@ export class ProfilesPage {
     const analysis = analyzeWithIndex(this.index, this.draft);
     const status = this.root.querySelector<HTMLElement>('[data-draft-status]');
     if (status) {
-      status.replaceChildren(buildDraftStatus(analysis));
+      status.replaceChildren(buildDraftStatus(analysis, this.draft));
     }
 
     const save = this.root.querySelector<HTMLButtonElement>(
@@ -1670,6 +1719,8 @@ export class ProfilesPage {
     }
     const analysis = analyzeWithIndex(this.index, this.draft);
     if (analysis.errors.length > 0) {
+      this.draft.nameTouched = true;
+      this.refreshDraftStatus();
       return;
     }
 
