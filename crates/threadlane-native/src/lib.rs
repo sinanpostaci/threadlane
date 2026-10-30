@@ -41,11 +41,14 @@ pub mod rpc;
 pub mod wakeup;
 
 pub use approved_mcp::{
-    open_host_stores, open_host_stores_with_known_dirs, ApprovalSummaryPage, ApprovedActivityPage,
-    ApprovedActivityParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
-    HostStoreHandles, ListApprovalsParams, StartApprovedTaskParams, DEFAULT_APPROVAL_LIST_LIMIT,
-    DEFAULT_APPROVED_ACTIVITY_LIMIT, HOST_NOT_CONFIGURED_MESSAGE, MAX_APPROVAL_CURSOR_LEN,
+    open_host_stores, open_host_stores_with_known_dirs, ApprovalSummaryPage,
+    ApprovedAckEventsParams, ApprovedActivityPage, ApprovedActivityParams, ApprovedEventAck,
+    ApprovedEventBatch, ApprovedPullEventsParams, ApprovedSessionParams, ApprovedTaskParams,
+    CancelApprovedTaskParams, HostStoreHandles, ListApprovalsParams, StartApprovedTaskParams,
+    DEFAULT_APPROVAL_LIST_LIMIT, DEFAULT_APPROVED_ACTIVITY_LIMIT,
+    DEFAULT_APPROVED_EVENT_BATCH_LIMIT, HOST_NOT_CONFIGURED_MESSAGE, MAX_APPROVAL_CURSOR_LEN,
     MAX_APPROVAL_LIST_LIMIT, MAX_APPROVED_ACTIVITY_LIMIT, MAX_APPROVED_CANCEL_REASON_LEN,
+    MAX_APPROVED_EVENT_BATCH_LIMIT,
 };
 pub use client::{
     NativeClient, NativeConfig, NativeDiagnosticReport, NativeMcpServerStatus,
@@ -72,6 +75,7 @@ pub use threadlane_authority::{
 pub use threadlane_host::{
     ApprovedHostClient, HostError, HostExecutionGates, HostPhase, HostSessionManifest,
     HostSessionSummary, TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot,
+    APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
 };
 pub use threadlane_workflow::{
     CatalogAssignment, CatalogPage, CatalogProfile, CatalogRoleAssignment, DeliveryReceipt,
@@ -813,9 +817,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Verify capability count: `connection_identity` + 15 delegated runtime tools + 5 workflow tools + 6 approved-task tools = 27 tools.
+        // Verify capability count: `connection_identity` + 15 delegated runtime tools + 5 workflow tools + 8 approved-task tools = 29 tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 27, "PairedMcpServer must expose 27 tools");
+        assert_eq!(tools.len(), 29, "PairedMcpServer must expose 29 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1149,7 +1153,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 27);
+        assert_eq!(tools.len(), 29);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),

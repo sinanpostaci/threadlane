@@ -8,26 +8,34 @@ use std::time::{Duration, Instant};
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::{json, Value};
 use tempfile::TempDir;
-use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
+use threadlane::{
+    ScopedClient, Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle,
+    ThreadlaneMcpServer, DATABASE_FILENAME,
+};
 use threadlane_authority::{ApprovalSummary, AuthorityStore, OperatorApprovalRequest};
-use threadlane_core::{ActivityPage, EventKind};
+use threadlane_core::{
+    AckResult, ActivityPage, Command, CommandOutput, Core, Event, EventBatch, EventKind,
+    EventPayload,
+};
 use threadlane_host::{
     ensure_private_dir, write_host_manifest, ApprovedHost, ApprovedHostConfig, HostPhase,
     HostSessionLock, HostSessionManifest, HostSessionSummary, TaskExecutionStatus,
-    TaskStateSnapshot, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
+    RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::{
-    compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStore,
-    PlanTask, RegistryChange, RegistryStore, RoleAssignment, ToolAdapter, ToolDefinition,
-    WorkflowProfile, WorkflowRole,
+    compile_plan_revision, ensure_mcp_response_budget, Difficulty, ModelChoice, ModelDefinition,
+    PlanChange, PlanStore, PlanTask, RegistryChange, RegistryStore, RoleAssignment, ToolAdapter,
+    ToolDefinition, WorkflowProfile, WorkflowRole, MAX_MCP_RESPONSE_BYTES,
 };
 
 use crate::{
-    open_host_stores, open_workflow_stores, ApprovalSummaryPage, ApprovedActivityPage,
-    ApprovedActivityParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
+    open_host_stores, open_workflow_stores, ApprovalSummaryPage, ApprovedAckEventsParams,
+    ApprovedActivityPage, ApprovedActivityParams, ApprovedEventAck, ApprovedEventBatch,
+    ApprovedPullEventsParams, ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams,
     ListApprovalsParams, NativeErrorCode, OperatorEnrollRequest, PairedMcpServer, PairingStore,
     StartApprovedTaskParams, CONNECTION_IDENTITY_TOOL,
 };
@@ -35,6 +43,22 @@ use crate::{
 const THREAD_UUID_A: &str = "018f1a2b-3c4d-7e00-8000-0000000000a1";
 const THREAD_UUID_A_ALT: &str = "018f1a2b-3c4d-7e00-8000-0000000000a2";
 const THREAD_UUID_B: &str = "018f1a2b-3c4d-7e00-8000-0000000000b1";
+
+/// Counts persisted `event_batches` rows for `binding_id` by querying the runtime SQLite database
+/// directly, proving read-only or rejected calls did not create a delivery batch.
+fn event_batch_row_count(state_dir: &Path, binding_id: &str) -> i64 {
+    let db_path = state_dir.join(DATABASE_FILENAME);
+    let conn = rusqlite::Connection::open(&db_path)
+        .unwrap_or_else(|err| panic!("open runtime database {}: {err}", db_path.display()));
+    conn.busy_timeout(Duration::from_secs(2))
+        .expect("set sqlite busy timeout");
+    conn.query_row(
+        "SELECT COUNT(*) FROM event_batches WHERE binding_id = ?1",
+        rusqlite::params![binding_id],
+        |row| row.get(0),
+    )
+    .expect("count event_batches rows")
+}
 
 struct ApprovedMcpFixture {
     // Keeps the control-plane supervisor alive for generic `status`/scope assertions.
@@ -665,33 +689,43 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
         configured_mcp.plan_store().unwrap()
     ));
 
-    // 3. Verify all 6 new tools are registered in the actual `rmcp` tool router with strict schemas.
+    // 3. Verify all 8 approved-task tools are registered in the actual `rmcp` tool router with strict schemas.
     let tools = configured_mcp.list_tools();
-    assert_eq!(tools.len(), 27);
+    assert_eq!(tools.len(), 29);
 
-    for (tool_name, expected_read_only, expected_destructive, expected_props) in [
+    for (
+        tool_name,
+        expected_read_only,
+        expected_destructive,
+        expected_idempotent,
+        expected_props,
+    ) in [
         (
             "list_approvals",
             true,
             false,
+            true,
             &["cursor", "after_id", "limit"][..],
         ),
-        ("approved_session", true, false, &["approval_id"][..]),
+        ("approved_session", true, false, true, &["approval_id"][..]),
         (
             "start_approved_task",
             false,
             false,
+            true,
             &["approval_id", "task_id"][..],
         ),
         (
             "approved_task",
             true,
             false,
+            true,
             &["approval_id", "task_id"][..],
         ),
         (
             "cancel_approved_task",
             false,
+            true,
             true,
             &["approval_id", "task_id", "expected_revision", "reason"][..],
         ),
@@ -699,6 +733,7 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
             "approved_activity",
             true,
             false,
+            true,
             &[
                 "approval_id",
                 "task_id",
@@ -708,6 +743,20 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
                 "kind",
             ][..],
         ),
+        (
+            "approved_pull_events",
+            false,
+            false,
+            false,
+            &["approval_id", "after_seq", "limit"][..],
+        ),
+        (
+            "approved_ack_events",
+            false,
+            false,
+            true,
+            &["approval_id", "batch_id"][..],
+        ),
     ] {
         let tool = tools
             .iter()
@@ -716,7 +765,7 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
         let ann = tool.annotations.as_ref().expect("tool annotations");
         assert_eq!(ann.read_only_hint, Some(expected_read_only));
         assert_eq!(ann.destructive_hint, Some(expected_destructive));
-        assert_eq!(ann.idempotent_hint, Some(true));
+        assert_eq!(ann.idempotent_hint, Some(expected_idempotent));
         assert_eq!(ann.open_world_hint, Some(false));
 
         let schema_val = serde_json::to_value(&tool.input_schema).expect("schema json");
@@ -760,6 +809,9 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
             "sessions_dir",
             "approved",
             "operator_approved",
+            "policy",
+            "notify_codex",
+            "max_bytes",
         ] {
             assert!(
                 !props.contains_key(forbidden),
@@ -777,8 +829,22 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
         );
     }
 
-    // Verify `approve` and `start_host` are never exposed in the tool router or `invoke_tool_json`.
-    for forbidden_tool in ["approve", "approve_plan", "start_host", "run_host"] {
+    // Verify operator approval, host lifecycle, and notification configuration/retry tools are never exposed.
+    for forbidden_tool in [
+        "approve",
+        "approve_plan",
+        "start_host",
+        "run_host",
+        "enable_notifications",
+        "disable_notifications",
+        "configure_notifications",
+        "set_notifications",
+        "set_notification_policy",
+        "retry_notification",
+        "retry_notifications",
+        "retry_wakeup",
+        "notify_codex",
+    ] {
         assert!(!tools.iter().any(|t| t.name == forbidden_tool));
         let err = configured_mcp
             .invoke_tool_json(forbidden_tool, json!({}), None)
@@ -832,6 +898,17 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
         (
             "approved_activity",
             json!({ "approval_id": "apr_0123456789abcdef0123456789abcdef" }),
+        ),
+        (
+            "approved_pull_events",
+            json!({ "approval_id": "apr_0123456789abcdef0123456789abcdef" }),
+        ),
+        (
+            "approved_ack_events",
+            json!({
+                "approval_id": "apr_0123456789abcdef0123456789abcdef",
+                "batch_id": "evt_batch_1"
+            }),
         ),
     ] {
         let err = wf_only_mcp
@@ -898,6 +975,17 @@ async fn approved_mcp_enrollment_isolation_list_approvals_pagination_and_cursor_
         (
             "approved_activity",
             json!({ "approval_id": "apr_0123456789abcdef0123456789abcdef" }),
+        ),
+        (
+            "approved_pull_events",
+            json!({ "approval_id": "apr_0123456789abcdef0123456789abcdef" }),
+        ),
+        (
+            "approved_ack_events",
+            json!({
+                "approval_id": "apr_0123456789abcdef0123456789abcdef",
+                "batch_id": "evt_batch_1"
+            }),
         ),
     ] {
         let err = mcp_unbound
@@ -1828,4 +1916,911 @@ async fn approved_mcp_session_live_auth_verification_task_dispatch_retry_cancel_
     assert!(!cancelled_snap.accepted);
 
     host_slow.shutdown().await.expect("shutdown host_slow");
+}
+
+#[tokio::test]
+async fn approved_mcp_pull_and_ack_events_enrollment_isolation_cursors_and_256kib_budget() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let mcp_unbound = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create unbound mcp")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+
+    let mcp_expired = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create expired mcp")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+
+    let mcp_quarantined = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create quarantined mcp")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+
+    let mcp_a = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp A")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+
+    let mcp_b = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create mcp B")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+
+    enroll_server(&fixture, &mcp_a, &fixture.binding_a, THREAD_UUID_A).await;
+    enroll_server(&fixture, &mcp_b, &fixture.binding_b, THREAD_UUID_B).await;
+
+    // Enroll and then expire `mcp_expired`.
+    enroll_server(&fixture, &mcp_expired, &fixture.binding_a, THREAD_UUID_A).await;
+    fixture
+        .pairing_store
+        .expire_epoch(&fixture.operator_token, mcp_expired.epoch_id())
+        .expect("expire mcp_expired epoch");
+
+    // Enroll `mcp_quarantined` to Chat A, then attempt shared enrollment to Chat B to quarantine it.
+    enroll_server(
+        &fixture,
+        &mcp_quarantined,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+    )
+    .await;
+    let quarantine_err = fixture
+        .pairing_store
+        .enroll(
+            &fixture.operator_token,
+            OperatorEnrollRequest {
+                connection_nonce: mcp_quarantined.connection_nonce().to_string(),
+                epoch_id: mcp_quarantined.epoch_id().to_string(),
+                binding_id: fixture.binding_b.clone(),
+                thread_id: THREAD_UUID_B.to_string(),
+                project_id: Some("proj-m4-approved".to_string()),
+            },
+        )
+        .expect_err("shared connection enrollment must fail");
+    assert_eq!(quarantine_err.code(), "shared_connection_rejected");
+
+    // Create approvals for `(binding_a, THREAD_UUID_A)`, `(binding_a, THREAD_UUID_A_ALT)`, and `(binding_b, THREAD_UUID_B)`.
+    let (rev_a, digest_a) = create_published_plan(
+        &fixture,
+        "plan-alpha-events",
+        &fixture.binding_a,
+        default_plan_tasks("Implement frozen root AGY task for events"),
+    );
+    let approval_a = approve_published_plan(
+        &fixture,
+        "plan-alpha-events",
+        rev_a,
+        &digest_a,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_400_000,
+    )
+    .approval_id;
+
+    let approval_a_alt_thread = approve_published_plan(
+        &fixture,
+        "plan-alpha-events",
+        rev_a,
+        &digest_a,
+        &fixture.binding_a,
+        THREAD_UUID_A_ALT,
+        vec!["task-root-agy".to_string()],
+        1_700_000_401_000,
+    )
+    .approval_id;
+
+    let (rev_b, digest_b) = create_published_plan(
+        &fixture,
+        "plan-beta-events",
+        &fixture.binding_b,
+        default_plan_tasks("Implement frozen beta task for events"),
+    );
+    let approval_b = approve_published_plan(
+        &fixture,
+        "plan-beta-events",
+        rev_b,
+        &digest_b,
+        &fixture.binding_b,
+        THREAD_UUID_B,
+        vec!["task-root-agy".to_string()],
+        1_700_000_402_000,
+    )
+    .approval_id;
+
+    // Before host starts, both `approved_pull_events` and `approved_ack_events` fail with `host_not_ready`.
+    let pull_not_ready = mcp_a
+        .approved_pull_events(Parameters(ApprovedPullEventsParams {
+            approval_id: approval_a.clone(),
+            after_seq: None,
+            limit: None,
+        }))
+        .await
+        .expect_err("pull before host start must fail");
+    assert_eq!(
+        pull_not_ready.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+
+    let ack_not_ready = mcp_a
+        .approved_ack_events(Parameters(ApprovedAckEventsParams {
+            approval_id: approval_a.clone(),
+            batch_id: "evt_batch_1".to_string(),
+        }))
+        .await
+        .expect_err("ack before host start must fail");
+    assert_eq!(
+        ack_not_ready.structured_content.unwrap()["error"]["code"],
+        "host_not_ready"
+    );
+
+    // Start live separate `ApprovedHost` instances for `approval_a` and `approval_b`.
+    let host_a = ApprovedHost::start(
+        ApprovedHostConfig::new(
+            fixture.registry_dir.clone(),
+            fixture.plans_dir.clone(),
+            fixture.authority_dir.clone(),
+            fixture.sessions_dir.clone(),
+            approval_a.clone(),
+        )
+        .with_tick_interval(Duration::from_millis(20)),
+    )
+    .await
+    .expect("start host_a");
+    let host_session_binding_a = host_a.session_binding_id().to_string();
+    assert_ne!(host_session_binding_a, fixture.binding_a);
+
+    let host_b = ApprovedHost::start(
+        ApprovedHostConfig::new(
+            fixture.registry_dir.clone(),
+            fixture.plans_dir.clone(),
+            fixture.authority_dir.clone(),
+            fixture.sessions_dir.clone(),
+            approval_b.clone(),
+        )
+        .with_tick_interval(Duration::from_millis(20)),
+    )
+    .await
+    .expect("start host_b");
+    let host_session_binding_b = host_b.session_binding_id().to_string();
+    assert_ne!(host_session_binding_b, fixture.binding_b);
+    assert_ne!(host_session_binding_a, host_session_binding_b);
+
+    // Dispatch `task-root-agy` on `mcp_a` and `mcp_b` and wait until both reach `ReadyForReview`.
+    mcp_a
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({ "approval_id": approval_a, "task_id": "task-root-agy" }),
+            None,
+        )
+        .await
+        .expect("start task on host_a");
+    mcp_b
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({ "approval_id": approval_b, "task_id": "task-root-agy" }),
+            None,
+        )
+        .await
+        .expect("start task on host_b");
+
+    let wait_deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let res_a = mcp_a
+            .invoke_tool_json(
+                "approved_task",
+                json!({ "approval_id": approval_a, "task_id": "task-root-agy" }),
+                None,
+            )
+            .await
+            .expect("poll task A");
+        let snap_a: TaskStateSnapshot =
+            serde_json::from_value(res_a.structured_content.unwrap()["data"].clone()).unwrap();
+
+        let res_b = mcp_b
+            .invoke_tool_json(
+                "approved_task",
+                json!({ "approval_id": approval_b, "task_id": "task-root-agy" }),
+                None,
+            )
+            .await
+            .expect("poll task B");
+        let snap_b: TaskStateSnapshot =
+            serde_json::from_value(res_b.structured_content.unwrap()["data"].clone()).unwrap();
+
+        if snap_a.status == TaskExecutionStatus::ReadyForReview
+            && snap_b.status == TaskExecutionStatus::ReadyForReview
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "timed out waiting for tasks to finish"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let host_state_dir_a = fixture
+        .sessions_dir
+        .join(&approval_a)
+        .join(RUNTIME_STATE_SUBDIR);
+    let host_sup_a =
+        SupervisorClient::from_state_dir(&host_state_dir_a).expect("host_a supervisor client");
+    let control_sup =
+        SupervisorClient::from_state_dir(&fixture.state_dir).expect("control supervisor client");
+
+    let initial_host_binding = host_sup_a
+        .get_binding(&host_session_binding_a)
+        .await
+        .expect("get initial host_a binding");
+    assert_eq!(initial_host_binding.delivered_seq, 0);
+    assert_eq!(initial_host_binding.acked_seq, 0);
+    assert_eq!(
+        event_batch_row_count(&host_state_dir_a, &host_session_binding_a),
+        0
+    );
+
+    // 1. Unbound, expired, and quarantined connections must be rejected BEFORE any state access or cursor mutation.
+    let spoofed_meta = Some(json!({
+        "binding_id": fixture.binding_a,
+        "thread_id": THREAD_UUID_A,
+        "thread_uuid": THREAD_UUID_A,
+    }));
+    for (bad_mcp, expected_code) in [
+        (&mcp_unbound, "unbound_connection"),
+        (&mcp_expired, "expired_epoch"),
+        (&mcp_quarantined, "shared_connection_rejected"),
+    ] {
+        let pull_err = bad_mcp
+            .invoke_tool_json(
+                "approved_pull_events",
+                json!({ "approval_id": approval_a }),
+                spoofed_meta.clone(),
+            )
+            .await
+            .expect_err("unverified connection must fail pull");
+        assert_eq!(
+            pull_err.structured_content.unwrap()["error"]["code"],
+            expected_code
+        );
+
+        let ack_err = bad_mcp
+            .invoke_tool_json(
+                "approved_ack_events",
+                json!({ "approval_id": approval_a, "batch_id": "evt_batch_1" }),
+                spoofed_meta.clone(),
+            )
+            .await
+            .expect_err("unverified connection must fail ack");
+        assert_eq!(
+            ack_err.structured_content.unwrap()["error"]["code"],
+            expected_code
+        );
+    }
+
+    // 2. Forbidden identity fields (`rebind_rejected`) and unknown/override fields (`validation_failed`)
+    // must be rejected BEFORE any state mutation.
+    for forbidden_identity_key in [
+        "binding_id",
+        "bindingId",
+        "control_binding_id",
+        "controlBindingId",
+        "session_binding_id",
+        "sessionBindingId",
+        "thread_id",
+        "threadId",
+        "thread_uuid",
+        "threadUuid",
+        "native_thread_uuid",
+        "nativeThreadUuid",
+        "session_id",
+        "sessionId",
+        "connection_nonce",
+        "connectionNonce",
+        "epoch_id",
+        "epochId",
+    ] {
+        let mut pull_args = serde_json::Map::new();
+        pull_args.insert("approval_id".to_string(), json!(approval_a));
+        pull_args.insert(
+            forbidden_identity_key.to_string(),
+            json!(fixture.binding_a.clone()),
+        );
+        let pull_err = mcp_a
+            .invoke_tool_json("approved_pull_events", Value::Object(pull_args), None)
+            .await
+            .expect_err("identity field on approved_pull_events must fail");
+        assert_eq!(
+            pull_err.structured_content.unwrap()["error"]["code"],
+            "rebind_rejected"
+        );
+
+        let mut ack_args = serde_json::Map::new();
+        ack_args.insert("approval_id".to_string(), json!(approval_a));
+        ack_args.insert("batch_id".to_string(), json!("evt_batch_1"));
+        ack_args.insert(
+            forbidden_identity_key.to_string(),
+            json!(fixture.binding_a.clone()),
+        );
+        let ack_err = mcp_a
+            .invoke_tool_json("approved_ack_events", Value::Object(ack_args), None)
+            .await
+            .expect_err("identity field on approved_ack_events must fail");
+        assert_eq!(
+            ack_err.structured_content.unwrap()["error"]["code"],
+            "rebind_rejected"
+        );
+    }
+
+    for unknown_key in [
+        "task_id",
+        "run_id",
+        "worker_id",
+        "kind",
+        "cursor",
+        "command_key",
+        "model",
+        "effort",
+        "executable",
+        "executable_path",
+        "policy",
+        "notify_codex",
+        "authority_dir",
+        "sessions_dir",
+        "state_dir",
+        "max_bytes",
+    ] {
+        let mut pull_args = serde_json::Map::new();
+        pull_args.insert("approval_id".to_string(), json!(approval_a));
+        pull_args.insert(unknown_key.to_string(), json!("unexpected"));
+        let pull_err = mcp_a
+            .invoke_tool_json("approved_pull_events", Value::Object(pull_args), None)
+            .await
+            .expect_err("unknown field on approved_pull_events must fail");
+        assert_eq!(
+            pull_err.structured_content.unwrap()["error"]["code"],
+            "validation_failed",
+            "approved_pull_events must reject `{unknown_key}`"
+        );
+
+        let mut ack_args = serde_json::Map::new();
+        ack_args.insert("approval_id".to_string(), json!(approval_a));
+        ack_args.insert("batch_id".to_string(), json!("evt_batch_1"));
+        ack_args.insert(unknown_key.to_string(), json!("unexpected"));
+        let ack_err = mcp_a
+            .invoke_tool_json("approved_ack_events", Value::Object(ack_args), None)
+            .await
+            .expect_err("unknown field on approved_ack_events must fail");
+        assert_eq!(
+            ack_err.structured_content.unwrap()["error"]["code"],
+            "validation_failed",
+            "approved_ack_events must reject `{unknown_key}`"
+        );
+    }
+
+    // 3. `limit` precheck (`0`, `21`) on `approved_pull_events` is rejected with `invalid_input`
+    // BEFORE any delivery effect.
+    for bad_limit in [0usize, 21usize, 100usize] {
+        let lim_err = mcp_a
+            .invoke_tool_json(
+                "approved_pull_events",
+                json!({ "approval_id": approval_a, "limit": bad_limit }),
+                None,
+            )
+            .await
+            .expect_err("out-of-range limit must fail before mutation");
+        assert_eq!(
+            lim_err.structured_content.unwrap()["error"]["code"],
+            "invalid_input"
+        );
+    }
+
+    // 4. Cross-approval, cross-binding, and same-binding-different-thread (`THREAD_UUID_A_ALT`)
+    // are rejected with `scope_mismatch`; foreign batch ID from Chat B is rejected with `invalid_ack`.
+    let b_pull_res = mcp_b
+        .invoke_tool_json(
+            "approved_pull_events",
+            json!({ "approval_id": approval_b, "limit": 2 }),
+            None,
+        )
+        .await
+        .expect("Chat B pulls its own host events");
+    let b_batch_view: ApprovedEventBatch =
+        serde_json::from_value(b_pull_res.structured_content.unwrap()["data"].clone())
+            .expect("deserialize Chat B ApprovedEventBatch");
+    let foreign_batch_id = b_batch_view.batch.batch_id;
+    assert!(
+        !foreign_batch_id.is_empty(),
+        "Chat B batch_id must be non-empty"
+    );
+
+    for bad_approval_id in [&approval_a_alt_thread, &approval_b] {
+        let pull_scope_err = mcp_a
+            .invoke_tool_json(
+                "approved_pull_events",
+                json!({ "approval_id": bad_approval_id }),
+                None,
+            )
+            .await
+            .expect_err("wrong thread/binding approval must fail pull");
+        assert_eq!(
+            pull_scope_err.structured_content.unwrap()["error"]["code"],
+            "scope_mismatch"
+        );
+
+        let ack_scope_err = mcp_a
+            .invoke_tool_json(
+                "approved_ack_events",
+                json!({ "approval_id": bad_approval_id, "batch_id": foreign_batch_id }),
+                None,
+            )
+            .await
+            .expect_err("wrong thread/binding approval must fail ack");
+        assert_eq!(
+            ack_scope_err.structured_content.unwrap()["error"]["code"],
+            "scope_mismatch"
+        );
+    }
+
+    let b_on_a_pull_err = mcp_b
+        .invoke_tool_json(
+            "approved_pull_events",
+            json!({ "approval_id": approval_a }),
+            None,
+        )
+        .await
+        .expect_err("Chat B cannot pull Chat A approval events");
+    assert_eq!(
+        b_on_a_pull_err.structured_content.unwrap()["error"]["code"],
+        "scope_mismatch"
+    );
+
+    // Chat A attempting to ACK Chat B's `foreign_batch_id` (or an unknown batch ID) against `approval_a`
+    // fails with `invalid_ack`.
+    for bad_batch_id in [foreign_batch_id.as_str(), "batch-unknown-does-not-exist"] {
+        let bad_ack_err = mcp_a
+            .invoke_tool_json(
+                "approved_ack_events",
+                json!({ "approval_id": approval_a, "batch_id": bad_batch_id }),
+                None,
+            )
+            .await
+            .expect_err("foreign or unknown batch_id must fail with invalid_ack");
+        assert_eq!(
+            bad_ack_err.structured_content.unwrap()["error"]["code"],
+            "invalid_ack"
+        );
+    }
+
+    // 5. Read-only `approved_activity` and control-plane `list_activity` never advance cursors or auto-ACK.
+    let ro_act = mcp_a
+        .invoke_tool_json(
+            "approved_activity",
+            json!({ "approval_id": approval_a, "limit": 10 }),
+            None,
+        )
+        .await
+        .expect("read-only approved_activity");
+    let ro_page: ApprovedActivityPage =
+        serde_json::from_value(ro_act.structured_content.unwrap()["data"].clone()).unwrap();
+    let total_initial_events = ro_page.page.events.len();
+    assert!(
+        total_initial_events >= 4,
+        "expected at least 4 worker lifecycle events, got {total_initial_events}"
+    );
+
+    let _ = mcp_a
+        .invoke_tool_json("list_activity", json!({ "limit": 10 }), None)
+        .await
+        .expect("read-only control list_activity");
+
+    // Verify ZERO cursor or batch mutations occurred on `host_a` or `control_sup` across all checks 1-5!
+    let host_binding_before_pull = host_sup_a
+        .get_binding(&host_session_binding_a)
+        .await
+        .expect("get host_a binding after rejected/read-only calls");
+    assert_eq!(host_binding_before_pull.delivered_seq, 0);
+    assert_eq!(host_binding_before_pull.acked_seq, 0);
+    assert_eq!(
+        event_batch_row_count(&host_state_dir_a, &host_session_binding_a),
+        0
+    );
+
+    let control_binding_before_pull = control_sup
+        .get_binding(&fixture.binding_a)
+        .await
+        .expect("get control binding_a");
+    assert_eq!(control_binding_before_pull.delivered_seq, 0);
+    assert_eq!(control_binding_before_pull.acked_seq, 0);
+    assert_eq!(
+        event_batch_row_count(&fixture.state_dir, &fixture.binding_a),
+        0
+    );
+
+    // 6. Pull first batch (`limit: 2`) on `mcp_a`; verify nested `ApprovedEventBatch`, untrusted payload marking,
+    // host-only cursor advancement, and unchanged outer control binding enrollment.
+    let pull_1_res = mcp_a
+        .invoke_tool_json(
+            "approved_pull_events",
+            json!({ "approval_id": approval_a, "limit": 2 }),
+            None,
+        )
+        .await
+        .expect("pull first 2 events on approval_a");
+    let pull_1_wire = serde_json::to_vec(&pull_1_res).expect("serialize pull_1 CallToolResult");
+    assert!(pull_1_wire.len() <= MAX_MCP_RESPONSE_BYTES);
+
+    let pull_1_env = pull_1_res.structured_content.expect("pull_1 envelope");
+    assert_eq!(pull_1_env["untrusted_data"], Value::Bool(true));
+    assert_eq!(pull_1_env["demo_only"], Value::Bool(false));
+    assert_eq!(pull_1_env["binding_id"], fixture.binding_a);
+    assert_eq!(pull_1_env["tool"], "approved_pull_events");
+    assert!(
+        pull_1_env["data"].get("binding_id").is_none(),
+        "ApprovedEventBatch must not flatten inner binding_id at top level of data"
+    );
+
+    let pull_1_view: ApprovedEventBatch =
+        serde_json::from_value(pull_1_env["data"].clone()).expect("deserialize ApprovedEventBatch");
+    assert_eq!(pull_1_view.approval_id, approval_a);
+    assert_eq!(pull_1_view.control_binding_id, fixture.binding_a);
+    assert_eq!(pull_1_view.session_binding_id, host_session_binding_a);
+    assert_eq!(pull_1_view.batch.binding_id, host_session_binding_a);
+    assert_eq!(pull_1_view.batch.events.len(), 2);
+    assert!(pull_1_view.batch.has_more);
+    assert_eq!(pull_1_view.batch.events[0].seq, 1);
+    assert_eq!(pull_1_view.batch.events[1].seq, 2);
+    for ev in &pull_1_view.batch.events {
+        assert!(ev.payload.untrusted_data);
+        assert_eq!(ev.binding_id, host_session_binding_a);
+    }
+    let batch_1_id = pull_1_view.batch.batch_id.clone();
+    assert!(!batch_1_id.is_empty(), "batch_1_id must be non-empty");
+
+    // Host session `delivered_seq` is now 2 and `acked_seq` is 0; outer control binding is still 0/0.
+    let host_after_pull_1 = host_sup_a
+        .get_binding(&host_session_binding_a)
+        .await
+        .expect("host_a after pull 1");
+    assert_eq!(host_after_pull_1.delivered_seq, 2);
+    assert_eq!(host_after_pull_1.acked_seq, 0);
+
+    let control_after_pull_1 = control_sup
+        .get_binding(&fixture.binding_a)
+        .await
+        .expect("control binding_a after pull 1");
+    assert_eq!(control_after_pull_1.delivered_seq, 0);
+    assert_eq!(control_after_pull_1.acked_seq, 0);
+
+    // Reject `after_seq > delivered_seq` with `unseen_event_cursor` without mutating `delivered_seq`.
+    let unseen_err = mcp_a
+        .invoke_tool_json(
+            "approved_pull_events",
+            json!({ "approval_id": approval_a, "after_seq": 99 }),
+            None,
+        )
+        .await
+        .expect_err("after_seq beyond delivered_seq must fail");
+    assert_eq!(
+        unseen_err.structured_content.unwrap()["error"]["code"],
+        "unseen_event_cursor"
+    );
+    assert_eq!(
+        host_sup_a
+            .get_binding(&host_session_binding_a)
+            .await
+            .unwrap()
+            .delivered_seq,
+        2
+    );
+
+    // 7. Acknowledge `batch_1_id` via `approved_ack_events` and verify duplicate ACK is idempotent.
+    let ack_1_res = mcp_a
+        .approved_ack_events(Parameters(ApprovedAckEventsParams {
+            approval_id: approval_a.clone(),
+            batch_id: batch_1_id.clone(),
+        }))
+        .await
+        .expect("ack batch 1");
+    let ack_1_env = ack_1_res.structured_content.expect("ack_1 envelope");
+    assert_eq!(ack_1_env["untrusted_data"], Value::Bool(true));
+    assert_eq!(ack_1_env["demo_only"], Value::Bool(false));
+    assert_eq!(ack_1_env["binding_id"], fixture.binding_a);
+    assert_eq!(ack_1_env["tool"], "approved_ack_events");
+    assert!(
+        ack_1_env["data"].get("binding_id").is_none(),
+        "ApprovedEventAck must not flatten inner binding_id at top level of data"
+    );
+
+    let ack_1_view: ApprovedEventAck =
+        serde_json::from_value(ack_1_env["data"].clone()).expect("deserialize ApprovedEventAck");
+    assert_eq!(ack_1_view.approval_id, approval_a);
+    assert_eq!(ack_1_view.control_binding_id, fixture.binding_a);
+    assert_eq!(ack_1_view.session_binding_id, host_session_binding_a);
+    assert_eq!(ack_1_view.ack.binding_id, host_session_binding_a);
+    assert_eq!(ack_1_view.ack.batch_id, batch_1_id);
+    assert_eq!(ack_1_view.ack.acked_seq, 2);
+    assert!(ack_1_view.ack.advanced);
+
+    // Duplicate ACK of the same `batch_1_id` succeeds idempotently without regressing `acked_seq`.
+    let ack_1_dup_res = mcp_a
+        .invoke_tool_json(
+            "approved_ack_events",
+            json!({ "approval_id": approval_a, "batch_id": batch_1_id }),
+            None,
+        )
+        .await
+        .expect("duplicate ack batch 1 succeeds");
+    let ack_1_dup: ApprovedEventAck =
+        serde_json::from_value(ack_1_dup_res.structured_content.unwrap()["data"].clone()).unwrap();
+    assert_eq!(ack_1_dup.ack.acked_seq, 2);
+
+    // Follow-up `approved_pull_events` with `after_seq: None` starts at `acked_seq` (seq 3..).
+    let pull_2_res = mcp_a
+        .approved_pull_events(Parameters(ApprovedPullEventsParams {
+            approval_id: approval_a.clone(),
+            after_seq: None,
+            limit: None,
+        }))
+        .await
+        .expect("pull remaining initial events");
+    let pull_2_view: ApprovedEventBatch =
+        serde_json::from_value(pull_2_res.structured_content.unwrap()["data"].clone()).unwrap();
+    assert_eq!(pull_2_view.batch.events.first().unwrap().seq, 3);
+    assert!(!pull_2_view.batch.has_more);
+    let initial_high_seq = pull_2_view.batch.events.last().unwrap().seq;
+    let batch_2_id = pull_2_view.batch.batch_id;
+    assert!(!batch_2_id.is_empty(), "batch_2_id must be non-empty");
+
+    let ack_2_res = mcp_a
+        .invoke_tool_json(
+            "approved_ack_events",
+            json!({ "approval_id": approval_a, "batch_id": batch_2_id }),
+            None,
+        )
+        .await
+        .expect("ack batch 2");
+    let ack_2_view: ApprovedEventAck =
+        serde_json::from_value(ack_2_res.structured_content.unwrap()["data"].clone()).unwrap();
+    assert_eq!(ack_2_view.ack.acked_seq, initial_high_seq);
+
+    // Verify outer control binding enrollment and cursors are still completely untouched.
+    let status_check = mcp_a
+        .invoke_tool_json("status", json!({}), None)
+        .await
+        .expect("status on mcp_a")
+        .structured_content
+        .unwrap();
+    assert_eq!(status_check["binding_id"], fixture.binding_a);
+    assert_eq!(status_check["data"]["binding"]["delivered_seq"], 0);
+    assert_eq!(status_check["data"]["binding"]["acked_seq"], 0);
+
+    // 8. Full ordered prefix delivery across >20 events AND >49_152 bytes of worst-case JSON-escaped
+    // payloads, verifying the actual serialized `CallToolResult` fits strictly within 256 KiB.
+    let host_scoped_a = ScopedClient::from_state_dir(&host_state_dir_a, &host_session_binding_a)
+        .expect("scoped client for host_a");
+    let escaped_instruction = "\"\\\n\t".repeat(900); // 3,600 raw bytes; >7,200 JSON-escaped bytes per event.
+    let demo_run = host_scoped_a
+        .start_demo(
+            "cmd-escaped-demo".to_string(),
+            escaped_instruction.clone(),
+            Some(60_000),
+        )
+        .await
+        .expect("start escaped demo run on host_a");
+    let mut rev = demo_run.revision;
+    for idx in 1..=24u32 {
+        let updated = host_scoped_a
+            .steer(
+                format!("cmd-escaped-steer-{idx}"),
+                demo_run.run_id.clone(),
+                rev,
+                escaped_instruction.clone(),
+            )
+            .await
+            .expect("steer escaped demo run");
+        rev = updated.revision;
+    }
+
+    let mut drained_seqs = Vec::new();
+    let mut batch_count = 0usize;
+    loop {
+        let pull_res = mcp_a
+            .invoke_tool_json(
+                "approved_pull_events",
+                json!({ "approval_id": approval_a }),
+                None,
+            )
+            .await
+            .expect("pull escaped event batch");
+        let wire_bytes = serde_json::to_vec(&pull_res).expect("encode CallToolResult");
+        assert!(
+            wire_bytes.len() <= MAX_MCP_RESPONSE_BYTES,
+            "actual serialized CallToolResult {} bytes exceeded 256 KiB ({})",
+            wire_bytes.len(),
+            MAX_MCP_RESPONSE_BYTES
+        );
+
+        let view: ApprovedEventBatch =
+            serde_json::from_value(pull_res.structured_content.unwrap()["data"].clone())
+                .expect("decode ApprovedEventBatch");
+        let raw_batch_bytes = serde_json::to_vec(&view.batch).expect("encode inner EventBatch");
+        assert!(
+            raw_batch_bytes.len() <= APPROVED_EVENT_BATCH_MAX_BYTES,
+            "inner EventBatch {} bytes exceeded APPROVED_EVENT_BATCH_MAX_BYTES ({})",
+            raw_batch_bytes.len(),
+            APPROVED_EVENT_BATCH_MAX_BYTES
+        );
+        assert!(view.batch.events.len() <= APPROVED_EVENT_BATCH_MAX_EVENTS);
+        assert!(!view.batch.events.is_empty());
+
+        for ev in &view.batch.events {
+            assert!(ev.payload.untrusted_data);
+            drained_seqs.push(ev.seq);
+        }
+
+        let batch_last_seq = view.batch.events.last().unwrap().seq;
+        // Verify `delivered_seq` advanced ONLY to the delivered prefix (`batch_last_seq`), not beyond!
+        let cur_host_binding = host_sup_a
+            .get_binding(&host_session_binding_a)
+            .await
+            .expect("inspect host binding after prefix pull");
+        assert_eq!(cur_host_binding.delivered_seq, batch_last_seq);
+
+        let b_id = view.batch.batch_id.clone();
+        assert!(
+            !b_id.is_empty(),
+            "non-empty batch must have a non-empty batch_id"
+        );
+        let ack_res = mcp_a
+            .invoke_tool_json(
+                "approved_ack_events",
+                json!({ "approval_id": approval_a, "batch_id": b_id }),
+                None,
+            )
+            .await
+            .expect("ack prefix batch");
+        let ack_wire = serde_json::to_vec(&ack_res).expect("encode ack CallToolResult");
+        assert!(ack_wire.len() <= MAX_MCP_RESPONSE_BYTES);
+        let ack_view: ApprovedEventAck =
+            serde_json::from_value(ack_res.structured_content.unwrap()["data"].clone()).unwrap();
+        assert_eq!(ack_view.ack.acked_seq, batch_last_seq);
+
+        batch_count += 1;
+        if !view.batch.has_more {
+            break;
+        }
+    }
+
+    assert!(
+        batch_count >= 4,
+        "25 escaped 3.6 KiB events must span at least 4 byte-bounded batches, got {batch_count}"
+    );
+    let expected_seqs: Vec<u64> = ((initial_high_seq + 1)..=(initial_high_seq + 25)).collect();
+    assert_eq!(drained_seqs, expected_seqs);
+
+    // 9. Direct Core + MCP envelope worst-case escaped 49_152-byte batch verification using
+    // `EventKind::RunProgress`, `EventPayload` struct fields, and `CommandOutput::AckResult`.
+    let core_tmp = TempDir::new().expect("core direct tempdir");
+    let core_db_path = core_tmp.path().join("core-direct.db");
+    let mut core = Core::open(&core_db_path).expect("open core");
+    let core_binding = core
+        .create_binding(THREAD_UUID_A, "Core Direct Test")
+        .expect("core create binding");
+    let core_binding_id = core_binding.binding_id;
+    let _ = core
+        .execute(
+            &core_binding_id,
+            Command::StartDemo {
+                command_key: "core-demo-1".to_string(),
+                instruction: "direct core test".to_string(),
+                step_delay_ms: Some(1_000),
+                now_ms: 1_700_000_500_100,
+            },
+        )
+        .expect("core start demo");
+    let core_pull_out = core
+        .execute(
+            &core_binding_id,
+            Command::PullEventsBounded {
+                after_seq: None,
+                limit: APPROVED_EVENT_BATCH_MAX_EVENTS,
+                max_batch_bytes: APPROVED_EVENT_BATCH_MAX_BYTES,
+                now_ms: 1_700_000_500_200,
+            },
+        )
+        .expect("core pull events");
+    let core_batch = match core_pull_out {
+        CommandOutput::EventBatch(batch) => batch,
+        other => panic!("unexpected output: {other:?}"),
+    };
+    assert!(
+        !core_batch.batch_id.is_empty(),
+        "core batch_id must be non-empty"
+    );
+    let core_ack_out = core
+        .execute(
+            &core_binding_id,
+            Command::AcknowledgeEvents {
+                command_key: "core-ack-1".to_string(),
+                batch_id: core_batch.batch_id.clone(),
+                now_ms: 1_700_000_500_300,
+            },
+        )
+        .expect("core ack events");
+    let core_ack: AckResult = match core_ack_out {
+        CommandOutput::AckResult(ack) => ack,
+        other => panic!("unexpected output: {other:?}"),
+    };
+    assert!(core_ack.advanced);
+
+    // Construct a synthetic `EventBatch` near the 49_152-byte cap filled with quotes/backslashes
+    // using `EventKind::RunProgress` and all `EventPayload` struct fields, and verify the actual
+    // serialized `CallToolResult` fits strictly within `MAX_MCP_RESPONSE_BYTES` (256 KiB).
+    let synthetic_events: Vec<Event> = (1..=6u64)
+        .map(|seq| Event {
+            event_id: format!("evt_synthetic_{seq}"),
+            binding_id: host_session_binding_a.clone(),
+            seq,
+            run_id: "run_synthetic_progress".to_string(),
+            revision: seq,
+            step_seq: seq,
+            kind: EventKind::RunProgress,
+            important: EventKind::RunProgress.is_important(),
+            created_at_ms: 1_700_000_600_000 + (seq as i64),
+            payload: EventPayload {
+                untrusted_data: true,
+                summary: "\"\\".repeat(120),
+                question_id: Some(format!("q_{seq}")),
+                question_prompt: Some("\"\\\n".repeat(150)),
+                answer: Some("\"\\\t".repeat(150)),
+                instruction: Some("\"\\\n\r\t".repeat(520)),
+                cancel_reason: Some("\"\\".repeat(80)),
+            },
+        })
+        .collect();
+    let synthetic_batch = EventBatch {
+        binding_id: host_session_binding_a.clone(),
+        batch_id: "batch_synthetic_max_escaped".to_string(),
+        from_seq: 1,
+        to_seq: 6,
+        delivered_seq: 6,
+        acked_seq: 0,
+        events: synthetic_events,
+        has_more: true,
+    };
+    let synthetic_batch_bytes =
+        serde_json::to_vec(&synthetic_batch).expect("serialize synthetic EventBatch");
+    assert!(
+        synthetic_batch_bytes.len() <= APPROVED_EVENT_BATCH_MAX_BYTES,
+        "synthetic batch {} bytes must be <= {}",
+        synthetic_batch_bytes.len(),
+        APPROVED_EVENT_BATCH_MAX_BYTES
+    );
+
+    let synthetic_view = ApprovedEventBatch {
+        approval_id: approval_a.clone(),
+        control_binding_id: fixture.binding_a.clone(),
+        session_binding_id: host_session_binding_a.clone(),
+        batch: synthetic_batch,
+    };
+    ensure_mcp_response_budget(&fixture.binding_a, "approved_pull_events", &synthetic_view)
+        .expect("48 KiB worst-case escaped ApprovedEventBatch must pass 256 KiB MCP budget");
+    let synthetic_call_res = ThreadlaneMcpServer::build_structured_tool_result(
+        &fixture.binding_a,
+        "approved_pull_events",
+        &synthetic_view,
+    );
+    let synthetic_wire =
+        serde_json::to_vec(&synthetic_call_res).expect("serialize synthetic CallToolResult");
+    assert!(
+        synthetic_wire.len() <= MAX_MCP_RESPONSE_BYTES,
+        "serialized CallToolResult {} bytes exceeded 256 KiB ({})",
+        synthetic_wire.len(),
+        MAX_MCP_RESPONSE_BYTES
+    );
+
+    host_a.shutdown().await.expect("shutdown host_a");
+    host_b.shutdown().await.expect("shutdown host_b");
 }
