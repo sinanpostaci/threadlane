@@ -41,7 +41,17 @@ describe('OpenCode model catalog providers', () => {
       { value: 'all', label: 'All providers (0)' },
       { value: 'opencode-go', label: 'OpenCode Go (0)' },
       { value: 'opencode', label: 'OpenCode API (0)' },
+      { value: 'other', label: 'Other providers (0)' },
     ]);
+  });
+
+  it('keeps the selected Other source valid when refresh removes its last entry', () => {
+    const before = [{ model_arg: 'openai/model' }, { model_arg: 'opencode-go/model' }];
+    const after = [{ model_arg: 'opencode-go/model' }, { model_arg: 'opencode/model' }];
+    assert.equal(catalogProviderOptions(before).find(o => o.value === 'other')?.label, 'Other providers (1)');
+    assert.equal(catalogProviderOptions(after).find(o => o.value === 'other')?.label, 'Other providers (0)');
+    assert.equal(catalogProvider('other'), 'other');
+    assert.deepEqual(after.filter(m => matchesCatalogProvider(m.model_arg, 'other')), []);
   });
 
   it('defaults an unknown filter to the complete catalog', () => {

@@ -28,6 +28,6 @@ export function catalogProviderOptions(models: readonly { model_arg: string }[])
     { value: 'opencode-go', label: `OpenCode Go (${counts['opencode-go']})` },
     { value: 'opencode', label: `OpenCode API (${counts.opencode})` },
   ];
-  if (counts.other > 0) options.push({ value: 'other', label: `Other providers (${counts.other})` });
+  options.push({ value: 'other', label: `Other providers (${counts.other})` });
   return options;
 }
