@@ -13,13 +13,13 @@ use threadlane_registry::{RegistryStore, ToolAdapter};
 use crate::error::HostError;
 use crate::storage::{
     derive_cancel_command_key, is_host_lock_held, now_epoch_ms, read_host_manifest_optional,
-    read_task_receipt, record_task_receipt, validate_approval_id, validate_canonical_thread_uuid,
-    validate_identifier, validate_sessions_root, verify_existing_private_dir,
-    verify_existing_session_dir,
+    read_task_ledger_entry, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
+    validate_canonical_thread_uuid, validate_identifier, validate_sessions_root,
+    verify_existing_private_dir, verify_existing_session_dir,
 };
 use crate::types::{
-    HostPhase, HostSessionSummary, TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot,
-    RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    HostPhase, HostSessionSummary, TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt,
+    TaskStateSnapshot, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 
 struct VerifiedSession {
@@ -158,9 +158,10 @@ impl ApprovedHostClient {
     /// - Verifies caller `control_binding_id` and `native_thread_uuid` before accessing session state.
     /// - Rejects tasks with non-empty `depends_on` with [`HostError::DependencyInputsUnverified`].
     /// - Rejects manual `codex_cli` tasks with [`HostError::NativeRouteRequired`].
-    /// - Materializes the frozen approval against the active host's single `session_binding` and
-    ///   calls `ScopedClient::start_worker` with the frozen deterministic `command_key`,
-    ///   `profile_id`, and `instruction`.
+    /// - Materializes the frozen approval against the active host's single `session_binding`,
+    ///   commits a validated [`TaskDispatchIntent`] to `task-receipts.json` **before** invoking
+    ///   `ScopedClient::start_worker`, and calls `ScopedClient::start_worker` with the frozen
+    ///   deterministic `command_key`, `profile_id`, and `instruction`.
     /// - Persists the actual returned `WorkerSnapshot::run_id` and `worker_id` in private
     ///   `task-receipts.json` and never mutates plan status to `Received` or `Applied`.
     pub async fn dispatch_task(
@@ -224,11 +225,25 @@ impl ApprovedHostClient {
             });
         }
 
+        let intent = TaskDispatchIntent {
+            task_id: task.task_id.clone(),
+            task_digest: dispatch.task_digest.clone(),
+            profile_id: dispatch.profile_id.clone(),
+            command_key: dispatch.command_key.clone(),
+            recorded_at_ms: now_epoch_ms(),
+        };
+        let recorded_intent = record_task_dispatch_intent(
+            &session.session_dir,
+            &session.record,
+            &session.live_binding.binding_id,
+            intent,
+        )?;
+
         let started = session
             .scoped_client
             .start_worker(
-                dispatch.command_key.clone(),
-                dispatch.profile_id.clone(),
+                recorded_intent.command_key.clone(),
+                recorded_intent.profile_id.clone(),
                 dispatch.instruction.clone(),
             )
             .await?;
@@ -244,9 +259,9 @@ impl ApprovedHostClient {
 
         let receipt = TaskRunReceipt {
             task_id: task.task_id.clone(),
-            task_digest: dispatch.task_digest.clone(),
-            profile_id: dispatch.profile_id.clone(),
-            command_key: dispatch.command_key.clone(),
+            task_digest: recorded_intent.task_digest.clone(),
+            profile_id: recorded_intent.profile_id.clone(),
+            command_key: recorded_intent.command_key.clone(),
             run_id: started.run_id.clone(),
             worker_id: started.worker_id.clone(),
             recorded_at_ms: now_epoch_ms(),
@@ -271,6 +286,7 @@ impl ApprovedHostClient {
             &session.record,
             &session.live_binding.binding_id,
             task,
+            Some(&recorded_intent),
             Some(&sealed),
             Some(live_worker),
         ))
@@ -278,8 +294,12 @@ impl ApprovedHostClient {
 
     /// Queries the current execution status of `task_id` in `approval_id`.
     ///
+    /// - Strictly read-only: never dispatches a worker or writes to session storage.
     /// - Never invents a `run_id` from a `command_key`.
-    /// - If a root worker task has no sealed receipt yet, returns [`TaskExecutionStatus::NotStarted`].
+    /// - If a root worker task has neither a durable dispatch intent nor a sealed receipt, returns
+    ///   [`TaskExecutionStatus::NotStarted`].
+    /// - If a root worker task has a durable dispatch intent without a sealed receipt, returns
+    ///   [`TaskExecutionStatus::Unknown`].
     /// - If a task has non-empty `depends_on`, returns [`TaskExecutionStatus::DependencyInputsUnverified`].
     /// - If a task uses `codex_cli`, returns [`TaskExecutionStatus::NativeRouteRequired`].
     /// - If a worker completed, reports [`TaskExecutionStatus::ReadyForReview`] (`accepted: false`).
@@ -345,17 +365,19 @@ impl ApprovedHostClient {
             });
         }
 
-        let Some(receipt) = read_task_receipt(
+        let (intent, receipt) = read_task_ledger_entry(
             &session.session_dir,
             &session.record,
             &session.live_binding.binding_id,
             task_id,
-        )?
-        else {
+        )?;
+
+        let Some(receipt) = receipt else {
             return Ok(build_task_snapshot(
                 &session.record,
                 &session.live_binding.binding_id,
                 task,
+                intent.as_ref(),
                 None,
                 None,
             ));
@@ -379,6 +401,7 @@ impl ApprovedHostClient {
                     &session.record,
                     &session.live_binding.binding_id,
                     task,
+                    intent.as_ref(),
                     Some(&receipt),
                     Some(worker),
                 ))
@@ -390,6 +413,7 @@ impl ApprovedHostClient {
                     &session.record,
                     &session.live_binding.binding_id,
                     task,
+                    intent.as_ref(),
                     Some(&receipt),
                     None,
                 ))
@@ -442,16 +466,29 @@ impl ApprovedHostClient {
             });
         }
 
-        let receipt = read_task_receipt(
+        let (intent, receipt) = read_task_ledger_entry(
             &session.session_dir,
             &session.record,
             &session.live_binding.binding_id,
             task_id,
-        )?
-        .ok_or_else(|| HostError::TaskNotStarted {
-            approval_id: session.record.approval_id.clone(),
-            task_id: task.task_id.clone(),
-        })?;
+        )?;
+
+        let Some(receipt) = receipt else {
+            if let Some(intent) = intent {
+                return Err(HostError::InvalidRunState {
+                    run_id: task.task_id.clone(),
+                    action: "cancel_task".to_string(),
+                    reason: format!(
+                        "task `{}` in approval `{}` has an unresolved dispatch intent (command_key `{}`) in unknown state without a sealed run_id receipt",
+                        task.task_id, session.record.approval_id, intent.command_key
+                    ),
+                });
+            }
+            return Err(HostError::TaskNotStarted {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+            });
+        };
 
         let cancel_key = derive_cancel_command_key(
             &session.record.subject_digest,
@@ -483,6 +520,7 @@ impl ApprovedHostClient {
             &session.record,
             &session.live_binding.binding_id,
             task,
+            intent.as_ref(),
             Some(&receipt),
             Some(live_worker),
         ))
@@ -543,16 +581,29 @@ impl ApprovedHostClient {
             });
         }
 
-        let receipt = read_task_receipt(
+        let (intent, receipt) = read_task_ledger_entry(
             &session.session_dir,
             &session.record,
             &session.live_binding.binding_id,
             task_id,
-        )?
-        .ok_or_else(|| HostError::TaskNotStarted {
-            approval_id: session.record.approval_id.clone(),
-            task_id: task.task_id.clone(),
-        })?;
+        )?;
+
+        let Some(receipt) = receipt else {
+            if let Some(intent) = intent {
+                return Err(HostError::InvalidRunState {
+                    run_id: task.task_id.clone(),
+                    action: "list_task_activity".to_string(),
+                    reason: format!(
+                        "task `{}` in approval `{}` has an unresolved dispatch intent (command_key `{}`) in unknown state without a sealed run_id receipt",
+                        task.task_id, session.record.approval_id, intent.command_key
+                    ),
+                });
+            }
+            return Err(HostError::TaskNotStarted {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+            });
+        };
 
         let page = session
             .scoped_client
@@ -705,13 +756,14 @@ fn build_task_snapshot(
     record: &ApprovalRecord,
     session_binding_id: &str,
     task: &ApprovedTaskRecord,
+    intent: Option<&TaskDispatchIntent>,
     receipt: Option<&TaskRunReceipt>,
     worker: Option<WorkerSnapshot>,
 ) -> TaskStateSnapshot {
-    let status = match (&receipt, &worker) {
-        (_, Some(w)) => TaskExecutionStatus::from_worker_snapshot(w),
-        (Some(_), None) => TaskExecutionStatus::Unknown,
-        (None, None) => TaskExecutionStatus::NotStarted,
+    let status = match (intent, receipt, &worker) {
+        (_, _, Some(w)) => TaskExecutionStatus::from_worker_snapshot(w),
+        (_, Some(_), None) | (Some(_), None, None) => TaskExecutionStatus::Unknown,
+        (None, None, None) => TaskExecutionStatus::NotStarted,
     };
 
     TaskStateSnapshot {

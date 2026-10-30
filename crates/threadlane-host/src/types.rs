@@ -267,6 +267,29 @@ pub struct HostSessionSummary {
     pub last_error: Option<String>,
 }
 
+/// Private persisted dispatch intent recorded in `task-receipts.json` before invoking
+/// `ScopedClient::start_worker` for an approved root worker task.
+///
+/// Committing this intent before the runtime `start_worker` effect ensures that if worker
+/// startup or receipt sealing is interrupted, task inspection reports
+/// [`TaskExecutionStatus::Unknown`] rather than [`TaskExecutionStatus::NotStarted`], and
+/// ambiguous cancellation is refused until an explicit idempotent `dispatch_task` retry seals
+/// the `task_id -> run_id` mapping.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDispatchIntent {
+    /// Approved task identifier.
+    pub task_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the compiled task specification.
+    pub task_digest: String,
+    /// Deterministic worker profile identifier.
+    pub profile_id: String,
+    /// Deterministic idempotency command key used with `ScopedClient::start_worker`.
+    pub command_key: String,
+    /// Timestamp (ms since Unix epoch) when the dispatch intent was recorded.
+    pub recorded_at_ms: i64,
+}
+
 /// Private persisted receipt sealing the mapping from an approved `task_id` and deterministic
 /// `command_key` to the actual runtime `WorkerSnapshot::run_id` and `worker_id`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,7 +318,7 @@ pub struct TaskRunReceipt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskExecutionStatus {
-    /// Root worker task has not been dispatched yet (no sealed task-to-run receipt exists).
+    /// Root worker task has not been dispatched yet (no durable dispatch intent or sealed task-to-run receipt exists).
     NotStarted,
     /// Task has non-empty `depends_on` and is blocked because predecessor code is not verified in static `base_commit`.
     DependencyInputsUnverified,
@@ -317,7 +340,7 @@ pub enum TaskExecutionStatus {
     Cancelled,
     /// Worker exceeded its execution timeout budget.
     TimedOut,
-    /// Worker outcome or run mapping is in an uncertain `Unknown` state (e.g. across supervisor restart) and is never auto-replayed.
+    /// Worker outcome or run mapping is in an uncertain `Unknown` state (e.g. across supervisor restart or when a durable dispatch intent exists without a sealed receipt) and is never auto-replayed.
     Unknown,
 }
 
