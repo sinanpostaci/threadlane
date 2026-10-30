@@ -737,7 +737,9 @@ export class ToolsPage {
       this.openPickers.add(existing.id);
       this.rewrite();
       await this.probe(existing);
-      this.focusAndScroll(`probe:${existing.id}-search`);
+      if (!this.disposed && this.openPickers.has(existing.id)) {
+        this.focusAndScroll(`probe:${existing.id}-search`);
+      }
       return;
     }
 
@@ -762,9 +764,11 @@ export class ToolsPage {
         text: `Saved ${tool.label} and reading its model catalog. Select the models you want to use in Profiles.`,
       };
     });
-    if (saved && !this.disposed) {
+    if (saved && !this.disposed && this.openPickers.has(tool.id)) {
       await this.probe(tool);
-      this.focusAndScroll(`probe:${tool.id}-search`);
+      if (!this.disposed && this.openPickers.has(tool.id)) {
+        this.focusAndScroll(`probe:${tool.id}-search`);
+      }
     }
   }
 
@@ -965,12 +969,6 @@ export class ToolsPage {
       if (attempt()) return;
       setTimeout(attempt, 0);
     });
-  }
-
-  private toggleExpanded(key: string): void {
-    if (this.expanded.has(key)) this.expanded.delete(key);
-    else this.expanded.add(key);
-    this.refresh();
   }
 
   private rewrite(): void {
@@ -1586,10 +1584,7 @@ export class ToolsPage {
     const confirming = this.deleteConfirm?.kind === 'tool' && this.deleteConfirm?.id === tool.id;
     const cardKey = `tool:${tool.id}`;
     const open = this.expanded.has(cardKey);
-    const pickerOpen =
-      this.openPickers.has(tool.id) ||
-      Boolean(probe && (probe.loading || probe.result || probe.error)) ||
-      Boolean(api && (api.loading || api.loaded || api.error));
+    const pickerOpen = this.openPickers.has(tool.id);
     const bodyId = `${this.pageId}-tool-${token(tool.id)}-body`;
     const label = this.input(`tool-${tool.id}-label`, draft.label, 'Display label');
     const adapter = this.adapterSelect(`tool-${tool.id}-adapter`, draft.adapter, (value) => {
@@ -1947,7 +1942,7 @@ export class ToolsPage {
         h(
           'p',
           { className: 'aq-tools-hint' },
-          'Select the models you want to use in Profiles, then click Add selected models. Unchecking a row never deletes an already-saved model.'
+          'Select new models to use in Profiles, then click Add selected models. Already-added models stay saved with their existing settings.'
         )
       ),
       this.button('Close', closePicker, `close-picker-${tool.id}`)
@@ -2006,7 +2001,6 @@ export class ToolsPage {
     }
 
     const importableModels = catalogModels.filter((model) => this.importable(model));
-    const selection = this.selection(key, importableModels);
     const currentQuery = this.catalogSearch.get(key) ?? '';
     const searchInput = this.input(
       `${key}-search`,
@@ -2028,38 +2022,39 @@ export class ToolsPage {
     };
 
     const renderPickerBody = (): void => {
+      const currentSelection = this.selection(key, importableModels);
       const query = this.catalogSearch.get(key) ?? '';
       const filtered = catalogModels.filter((model) => matchesSearch(model, query));
       const addedForToolCount = catalogModels.filter((model) =>
-        this.snapshot?.models.some((saved) => saved.id === model.id && saved.tool_id === tool.id)
-      ).length;
-      const selectedUpdateCount = importableModels.filter(
-        (model) =>
-          selection.has(model.id) &&
-          this.snapshot?.models.some((saved) => saved.id === model.id && saved.tool_id === tool.id)
+        this.snapshot?.models.some(
+          (saved) => saved.id.trim() === model.id.trim() && saved.tool_id === tool.id
+        )
       ).length;
 
-      stateEl.replaceChildren(
+      const stateNodes: HTMLElement[] = [
         h(
           'span',
           undefined,
-          selection.size > 0
-            ? `${selection.size} selected to add${selectedUpdateCount > 0 ? ` (${selectedUpdateCount} already added; saved efforts preserved)` : ''}`
+          currentSelection.size > 0
+            ? `${currentSelection.size} selected to add`
             : '0 selected'
         ),
         h('span', undefined, `${addedForToolCount} already added for ${tool.label}`),
         h('span', undefined, `Showing ${filtered.length} of ${catalogModels.length}`),
-        selection.size > 0
-          ? this.button(
-              'Clear selection',
-              () => {
-                selection.clear();
-                renderPickerBody();
-              },
-              `${key}-clear-selection`
-            )
-          : null
-      );
+      ];
+      if (currentSelection.size > 0) {
+        stateNodes.push(
+          this.button(
+            'Clear selection',
+            () => {
+              currentSelection.clear();
+              renderPickerBody();
+            },
+            `${key}-clear-selection`
+          )
+        );
+      }
+      stateEl.replaceChildren(...stateNodes);
 
       if (catalogModels.length === 0) {
         listEl.replaceChildren(
@@ -2072,7 +2067,7 @@ export class ToolsPage {
       } else {
         listEl.replaceChildren(
           ...filtered.map((model, index) =>
-            this.catalogRow(tool, key, model, selection, index, renderPickerBody)
+            this.catalogRow(tool, key, model, currentSelection, index, renderPickerBody)
           )
         );
       }
@@ -2084,17 +2079,17 @@ export class ToolsPage {
       const importBtn = this.button(
         importing
           ? 'Adding models…'
-          : `Add selected models${selection.size > 0 ? ` (${selection.size})` : ''}`,
+          : `Add selected models${currentSelection.size > 0 ? ` (${currentSelection.size})` : ''}`,
         () => void this.importModels(tool, key, importableModels),
         `${key}-import`,
-        selection.size > 0 ? 'primary' : undefined,
-        selection.size === 0 || importing
+        currentSelection.size > 0 ? 'primary' : undefined,
+        currentSelection.size === 0 || importing
       );
-      if (selection.size > 0) {
+      if (currentSelection.size > 0) {
         importBtn.classList.add('aq-tools-primary');
       }
 
-      actionsEl.replaceChildren(
+      const actionNodes: HTMLElement[] = [
         importBtn,
         this.button(
           'Refresh catalog',
@@ -2103,13 +2098,18 @@ export class ToolsPage {
           undefined,
           importing
         ),
-        toolHasSavedModels && this.onOpenProfiles
-          ? this.button(
-              'Open Profiles',
-              () => this.onOpenProfiles?.(),
-              `${key}-open-profiles`
-            )
-          : null,
+      ];
+      if (toolHasSavedModels && this.onOpenProfiles) {
+        const openProfiles = this.onOpenProfiles;
+        actionNodes.push(
+          this.button(
+            'Open Profiles',
+            () => openProfiles(),
+            `${key}-open-profiles`
+          )
+        );
+      }
+      actionNodes.push(
         this.button(
           'Cancel',
           closePicker,
@@ -2118,6 +2118,7 @@ export class ToolsPage {
           importing
         )
       );
+      actionsEl.replaceChildren(...actionNodes);
     };
 
     searchInput.addEventListener('input', () => {
@@ -2782,21 +2783,26 @@ export class ToolsPage {
     onSelectionChanged?: () => void
   ): HTMLElement {
     const importable = this.importable(model);
-    const saved = this.snapshot?.models.find((entry) => entry.id === model.id) ?? null;
+    const modelId = model.id?.trim() ?? '';
+    const saved = this.snapshot?.models.find((entry) => entry.id.trim() === modelId) ?? null;
     const alreadyOnThisTool = saved !== null && saved.tool_id === tool.id;
     const usedByOtherTool = saved !== null && saved.tool_id !== tool.id;
     const otherToolLabel = usedByOtherTool
       ? this.snapshot?.tools.find((entry) => entry.id === saved.tool_id)?.label ?? saved.tool_id
       : null;
-    const canSelect = importable && !usedByOtherTool;
+    const canSelect = importable && saved === null;
 
     const check = this.checkbox(
       `${key}-model-${index}-${model.id || 'missing'}`,
-      canSelect && selection.has(model.id)
+      alreadyOnThisTool || (canSelect && selection.has(model.id))
     );
     check.disabled = !canSelect;
     check.addEventListener('change', () => {
-      if (check.checked && canSelect) selection.add(model.id);
+      if (!canSelect) {
+        check.checked = alreadyOnThisTool;
+        return;
+      }
+      if (check.checked) selection.add(model.id);
       else selection.delete(model.id);
       if (onSelectionChanged) {
         onSelectionChanged();
@@ -2807,7 +2813,7 @@ export class ToolsPage {
     return h(
       'div',
       {
-        className: `aq-tools-catalog-row${canSelect ? '' : ' aq-tools-catalog-row-invalid'}`,
+        className: `aq-tools-catalog-row${!importable || usedByOtherTool ? ' aq-tools-catalog-row-invalid' : ''}`,
       },
       h(
         'label',
@@ -2841,7 +2847,7 @@ export class ToolsPage {
             ? h(
                 'span',
                 { className: 'aq-tools-hint' },
-                'Already added for this tool. Leaving unchecked keeps your saved model; selecting updates it while preserving saved efforts.'
+                'Already added for this tool. Existing label, model arg, and effort settings are preserved.'
               )
             : usedByOtherTool
               ? h(
@@ -3005,8 +3011,13 @@ export class ToolsPage {
       selection = new Set<string>();
       this.selections.set(key, selection);
     }
+    const registeredIds = new Set(
+      (this.snapshot?.models ?? []).map((saved) => saved.id.trim())
+    );
     const valid = new Set(
-      models.filter((model) => this.importable(model)).map((model) => model.id)
+      models
+        .filter((model) => this.importable(model) && !registeredIds.has(model.id.trim()))
+        .map((model) => model.id)
     );
     for (const id of Array.from(selection)) {
       if (!valid.has(id)) selection.delete(id);
@@ -3199,14 +3210,18 @@ export class ToolsPage {
           : `Added tool "${tool.label}" at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
       };
     });
-    if (saved && chooseModelsAfter && !this.disposed) {
+    if (saved && chooseModelsAfter && !this.disposed && this.openPickers.has(tool.id)) {
       const provider = providerFor(tool.adapter);
       if (provider === null) {
         await this.probe(tool);
-        this.focusAndScroll(`probe:${tool.id}-search`);
+        if (!this.disposed && this.openPickers.has(tool.id)) {
+          this.focusAndScroll(`probe:${tool.id}-search`);
+        }
       } else {
         await this.loadModels(tool, provider);
-        this.focusAndScroll(`api:${tool.id}-search`);
+        if (!this.disposed && this.openPickers.has(tool.id)) {
+          this.focusAndScroll(`api:${tool.id}-search`);
+        }
       }
     }
   }
@@ -3290,12 +3305,15 @@ export class ToolsPage {
       const result = await desktop_probe_tool({ toolId: tool.id });
       if (!this.disposed) {
         state.result = result;
-        this.selections.set(`probe:${tool.id}`, new Set());
+        if (this.openPickers.has(tool.id)) {
+          this.selections.set(`probe:${tool.id}`, new Set());
+        } else {
+          this.selections.delete(`probe:${tool.id}`);
+        }
       }
     } catch (err) {
       if (!this.disposed) {
         state.error = safeError(err);
-        this.openPickers.add(tool.id);
       }
     } finally {
       if (!this.disposed) {
@@ -3312,46 +3330,37 @@ export class ToolsPage {
     source: readonly ModelDefinition[]
   ): Promise<void> {
     if (!this.snapshot || this.disposed) return;
+    const rawSelection = this.selections.get(key);
+    const hadAlreadyRegistered = Boolean(
+      rawSelection &&
+        Array.from(rawSelection).some((id) =>
+          this.snapshot?.models.some((saved) => saved.id.trim() === id.trim())
+        )
+    );
     const selection = this.selection(key, source);
-    const selected = source.filter((model) => {
-      if (!this.importable(model) || !selection.has(model.id)) return false;
-      const existing = this.snapshot?.models.find((saved) => saved.id === model.id);
-      return !existing || existing.tool_id === tool.id;
-    });
+    const existingIds = new Set(this.snapshot.models.map((saved) => saved.id.trim()));
+    const selected = source.filter(
+      (model) =>
+        this.importable(model) &&
+        selection.has(model.id) &&
+        !existingIds.has(model.id.trim())
+    );
     if (selected.length === 0) {
-      this.validationError('Select at least one available catalog model to add.');
+      this.validationError(
+        hadAlreadyRegistered
+          ? 'All selected models are already added. Existing model settings were preserved.'
+          : 'Select at least one new catalog model to add.'
+      );
       return;
     }
-    const models: ModelDefinition[] = selected.map((model) => {
-      const id = model.id.trim();
-      const existingSameTool = this.snapshot?.models.find(
-        (saved) => saved.id === id && saved.tool_id === tool.id
-      );
-      if (existingSameTool) {
-        return {
-          id,
-          tool_id: tool.id,
-          label: existingSameTool.label.trim() || model.label.trim(),
-          model_arg: existingSameTool.model_arg.trim() || model.model_arg.trim(),
-          efforts:
-            existingSameTool.efforts.length > 0
-              ? [...existingSameTool.efforts]
-              : [...model.efforts],
-          allow_no_effort:
-            existingSameTool.efforts.length > 0
-              ? existingSameTool.allow_no_effort
-              : Boolean(model.allow_no_effort) || model.efforts.length === 0,
-        };
-      }
-      return {
-        id,
-        tool_id: tool.id,
-        label: model.label.trim(),
-        model_arg: model.model_arg.trim(),
-        efforts: [...model.efforts],
-        allow_no_effort: Boolean(model.allow_no_effort) || model.efforts.length === 0,
-      };
-    });
+    const models: ModelDefinition[] = selected.map((model) => ({
+      id: model.id.trim(),
+      tool_id: tool.id,
+      label: model.label.trim(),
+      model_arg: model.model_arg.trim(),
+      efforts: [...model.efforts],
+      allow_no_effort: Boolean(model.allow_no_effort) || model.efforts.length === 0,
+    }));
     await this.apply(`import:${key}`, { op: 'upsert_models', models }, (next) => {
       this.selections.delete(key);
       this.catalogSearch.delete(key);
@@ -3602,12 +3611,15 @@ export class ToolsPage {
       if (!this.disposed) {
         state.models = models;
         state.loaded = true;
-        this.selections.set(`api:${tool.id}`, new Set());
+        if (this.openPickers.has(tool.id)) {
+          this.selections.set(`api:${tool.id}`, new Set());
+        } else {
+          this.selections.delete(`api:${tool.id}`);
+        }
       }
     } catch (err) {
       if (!this.disposed) {
         state.error = safeError(err);
-        this.openPickers.add(tool.id);
       }
     } finally {
       if (!this.disposed) {
