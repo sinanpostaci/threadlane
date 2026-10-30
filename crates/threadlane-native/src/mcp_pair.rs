@@ -1623,6 +1623,7 @@ impl PairedMcpServer {
             self.verified_host_context("start_approved_task")?;
         let expected_binding_id = trusted_binding_id.clone();
         let expected_thread_uuid = trusted_thread_uuid.clone();
+        let server_for_recheck = self.clone();
         execute_start_approved_task_with_launcher(
             stores.authority,
             stores.sessions_dir,
@@ -1630,8 +1631,9 @@ impl PairedMcpServer {
             trusted_thread_uuid,
             params,
             self.host_launcher.clone(),
-            || {
-                let enrollment = self.verify_enrolled_binding_for_tool("start_approved_task")?;
+            move || {
+                let enrollment =
+                    server_for_recheck.verify_enrolled_binding_for_tool("start_approved_task")?;
                 if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
                     || !constant_time_str_eq(&enrollment.thread_id, &expected_thread_uuid)
                 {

@@ -4804,3 +4804,6 @@ async fn codex_first_held_intent_lock_bounds_wait_and_prevents_late_spawn_after_
         "enrollment revocation before lock release must prevent launch intent creation"
     );
 }
+
+#[path = "approved_tests/closure_regressions.rs"]
+mod closure_regressions;

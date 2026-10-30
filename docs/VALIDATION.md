@@ -6,8 +6,10 @@ that every milestone or platform is supported.
 ## Approved native startup checkpoint (2026-10-30)
 
 The integrated Linux candidate passed `cargo test --locked --workspace
---all-targets`: **261 tests**, zero failures or ignored cases across 40 test
-binaries. Workspace formatting and Clippy with warnings denied also passed.
+--all-targets -- --test-threads=1`: **264 tests**, zero failures or ignored cases
+across 40 test binaries. Workspace formatting and Clippy with warnings denied
+also passed. The serial harness setting isolates timing-sensitive fixtures;
+the explicit concurrent-start cases still exercise their own parallel calls.
 
 Coverage includes default-off startup policy, CLI prerequisites, unchanged MCP
 tools, frozen scope/task checks, enrollment revocation, exact process arguments,
@@ -27,9 +29,34 @@ nor the scheduling pause is included in product source. Additional regressions
 verify private marker/directories and zero workers before dispatch, and preserve
 a Stopped manifest when its work-area marker refers to a foreign repository.
 
+The single closing review exposed two additional startup defects even though
+the earlier 261-test candidate and its Nix build had passed: blocking authority
+and enrollment checks could exceed the deadline and permit a late spawn, and
+pre-manifest observer probes could compete with the starting owner's host lock.
+That candidate was held from main. The corrections bound read-only validation
+and enrollment off the async executor, persist intent through a bounded
+write-only handoff, and leave process spawning with the live request after
+current deadline/enrollment checks. Cancellation retains conservative intent
+evidence without giving detached jobs a process-spawn capability. Initial
+inspection, locked preparation and polling now share the intent-aware guard.
+
+Three committed regressions compile against the rejected candidate and fail on
+its authority wait, final enrollment wait and stage-gated caller cancellation;
+all pass on the corrected source. The cancellation window starts only after the
+contended callback actually holds the pairing lock, independently of the longer
+startup deadline. The targeted closing recheck also passed four disposable test
+functions covering six cases: both real lock-contention deadlines, timeout and
+after-entry cancellation during a 700 ms Pending-write/fsync delay, and both
+pre-manifest inspection entries. The 250 ms cases returned in 250-251 ms with no
+late process; both lock entries reached authenticated Ready with one owner and
+no replacement. These additional instrumented probes are separate from the
+264-test total; their scheduling hooks are not product source. No second broad
+closing review was run.
+
 The Tauri workspace passed **23 tests**, formatting and Clippy. Its production
-Rust and Cargo inputs were compared with the final candidate after three
-test-only import corrections; all 132 compared inputs remained identical.
+Rust and Cargo inputs were compared with the final candidate after the final
+cancellation-test refinement; only that test module differs from the Tauri
+snapshot, and all compiled production inputs remain identical.
 Frontend inputs are unchanged from the existing 70-test/typecheck/build gate.
 The built frontend assets were reused rather than running an unchanged suite
 again. The standalone embedded-asset fix separately passed 11 Python tests and
