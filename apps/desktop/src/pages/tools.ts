@@ -502,24 +502,21 @@ function findRegisteredToolForDiscovery(
   item: ToolsDiscoveryItem,
   tools: readonly ToolDefinition[]
 ): ToolDefinition | null {
+  if (item.availability !== 'found') {
+    return null;
+  }
   const setup = discoveryCliSetup(item.id, item.label);
   const path = item.executable_path?.trim() ?? '';
-  if (setup) {
-    const exactMatch = tools.find(
+  if (!setup || path.length === 0) {
+    return null;
+  }
+  return (
+    tools.find(
       (tool) =>
         tool.adapter === setup.adapter &&
-        path.length > 0 &&
         (tool.executable_path ?? '').trim() === path
-    );
-    if (exactMatch) return exactMatch;
-    const adapterMatch = tools.find((tool) => tool.adapter === setup.adapter);
-    if (adapterMatch) return adapterMatch;
-  }
-  if (path.length > 0) {
-    const pathMatch = tools.find((tool) => (tool.executable_path ?? '').trim() === path);
-    if (pathMatch) return pathMatch;
-  }
-  return tools.find((tool) => tool.id === item.id) ?? null;
+    ) ?? null
+  );
 }
 
 function deriveToolIdFromLabel(label: string, adapter: Adapter): string {
@@ -751,20 +748,37 @@ export class ToolsPage {
       enabled: true,
     };
     const key = `add-choose:${toolId}`;
+    const hadCreateOpenAtStart = this.expanded.has('create-tool');
+    const createDraftAtStart = this.newTool;
+    let openModelsAfter = false;
     const saved = await this.apply(key, { op: 'upsert_tool', tool }, (next) => {
-      if (this.configuringDiscoveredId === toolId) {
+      if (
+        this.configuringDiscoveredId === toolId &&
+        (!this.expanded.has('create-tool') ||
+          (this.newTool === createDraftAtStart && !hasNewToolContent(this.newTool)))
+      ) {
         this.configuringDiscoveredId = null;
         this.expanded.delete('create-tool');
         this.newTool = emptyTool(next.revision);
+      } else if (this.configuringDiscoveredId === toolId) {
+        this.configuringDiscoveredId = null;
       }
-      this.openPickers.add(tool.id);
+      const userOpenedFormWhileSaving =
+        (!hadCreateOpenAtStart && this.expanded.has('create-tool')) ||
+        this.getActiveDirtyToolEditor() !== null;
+      if (!userOpenedFormWhileSaving) {
+        this.openPickers.add(tool.id);
+        openModelsAfter = true;
+      }
       this.notice = {
         tone: 'info',
         title: `${tool.label} added`,
-        text: `Saved ${tool.label} and reading its model catalog. Select the models you want to use in Profiles.`,
+        text: openModelsAfter
+          ? `Saved ${tool.label} and reading its model catalog. Select the models you want to use in Profiles.`
+          : `Saved ${tool.label} at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
       };
     });
-    if (saved && !this.disposed && this.openPickers.has(tool.id)) {
+    if (saved && openModelsAfter && !this.disposed && this.openPickers.has(tool.id)) {
       await this.probe(tool);
       if (!this.disposed && this.openPickers.has(tool.id)) {
         this.focusAndScroll(`probe:${tool.id}-search`);
@@ -1560,9 +1574,7 @@ export class ToolsPage {
           this.button(
             'Cancel',
             cancelForm,
-            'new-tool-cancel',
-            undefined,
-            creating
+            'new-tool-cancel'
           )
         )
       )
@@ -1837,9 +1849,7 @@ export class ToolsPage {
                   this.refresh();
                   this.focusAndScroll(`tool-${tool.id}-details`);
                 },
-                `tool-${tool.id}-discard`,
-                undefined,
-                this.pending.has(`tool-save:${tool.id}`)
+                `tool-${tool.id}-discard`
               )
             ),
             h(
@@ -2540,9 +2550,7 @@ export class ToolsPage {
               this.button(
                 'Cancel',
                 cancelManualModel,
-                'new-model-cancel',
-                undefined,
-                this.pending.has('model-create')
+                'new-model-cancel'
               )
             )
           )
@@ -2689,9 +2697,7 @@ export class ToolsPage {
               this.button(
                 'Cancel',
                 closeModelEdit,
-                `model-${model.id}-discard`,
-                undefined,
-                this.pending.has(`model-save:${model.id}`)
+                `model-${model.id}-discard`
               ),
               references
                 ? h(
@@ -3194,23 +3200,48 @@ export class ToolsPage {
       this.validationError(tool);
       return;
     }
+    const submittedConfiguringId = this.configuringDiscoveredId;
+    const submittedState = {
+      id: draft.id,
+      label: draft.label,
+      adapter: draft.adapter,
+      executable: draft.executable,
+      enabled: draft.enabled,
+    };
+    const isSameCreateDraft = (): boolean =>
+      this.expanded.has('create-tool') &&
+      this.newTool === draft &&
+      this.configuringDiscoveredId === submittedConfiguringId &&
+      draft.id === submittedState.id &&
+      draft.label === submittedState.label &&
+      draft.adapter === submittedState.adapter &&
+      draft.executable === submittedState.executable &&
+      draft.enabled === submittedState.enabled;
+
+    let openModelsAfter = false;
     const saved = await this.apply('tool-create', { op: 'upsert_tool', tool }, (next) => {
-      this.newTool = emptyTool(next.revision);
-      this.expanded.delete('create-tool');
-      this.configuringDiscoveredId = null;
-      this.pendingSwitch = null;
-      if (chooseModelsAfter) {
-        this.openPickers.add(tool.id);
+      if (isSameCreateDraft()) {
+        this.newTool = emptyTool(next.revision);
+        this.expanded.delete('create-tool');
+        this.configuringDiscoveredId = null;
+        if (this.pendingSwitch?.fromKind === 'create-tool') {
+          this.pendingSwitch = null;
+        }
+        if (chooseModelsAfter) {
+          this.openPickers.add(tool.id);
+          openModelsAfter = true;
+        }
       }
       this.notice = {
         tone: 'success',
         title: `${tool.label} added`,
-        text: chooseModelsAfter
-          ? `Added "${tool.label}" at revision ${next.revision} and reading its model catalog.`
-          : `Added tool "${tool.label}" at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
+        text:
+          chooseModelsAfter && openModelsAfter
+            ? `Added "${tool.label}" at revision ${next.revision} and reading its model catalog.`
+            : `Added tool "${tool.label}" at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
       };
     });
-    if (saved && chooseModelsAfter && !this.disposed && this.openPickers.has(tool.id)) {
+    if (saved && openModelsAfter && !this.disposed && this.openPickers.has(tool.id)) {
       const provider = providerFor(tool.adapter);
       if (provider === null) {
         await this.probe(tool);
@@ -3238,16 +3269,40 @@ export class ToolsPage {
       this.validationError(value);
       return;
     }
+    const submittedState = {
+      label: draft.label,
+      adapter: draft.adapter,
+      executable: draft.executable,
+      enabled: draft.enabled,
+    };
+    const isSameToolDraft = (): boolean => {
+      const current = this.toolDrafts.get(tool.id);
+      return (
+        this.expanded.has(`tool:${tool.id}`) &&
+        current === draft &&
+        current.label === submittedState.label &&
+        current.adapter === submittedState.adapter &&
+        current.executable === submittedState.executable &&
+        current.enabled === submittedState.enabled
+      );
+    };
     await this.apply(
       `tool-save:${tool.id}`,
       { op: 'upsert_tool', tool: value },
       (next) => {
-        this.toolDrafts.delete(tool.id);
-        this.expanded.delete(`tool:${tool.id}`);
-        this.pendingSwitch = null;
+        if (isSameToolDraft()) {
+          this.toolDrafts.delete(tool.id);
+          this.expanded.delete(`tool:${tool.id}`);
+          if (
+            this.pendingSwitch?.fromKind === 'edit-tool' &&
+            this.pendingSwitch.fromToolId === tool.id
+          ) {
+            this.pendingSwitch = null;
+          }
+        }
         this.probes.delete(tool.id);
         this.selections.delete(`probe:${tool.id}`);
-        if (tool.adapter !== draft.adapter) {
+        if (tool.adapter !== value.adapter) {
           this.secrets.delete(tool.id);
           this.apiStates.delete(tool.id);
           this.selections.delete(`api:${tool.id}`);
@@ -3255,7 +3310,7 @@ export class ToolsPage {
         this.notice = { tone: 'success', text: `Saved tool "${value.label}" at revision ${next.revision}.` };
       },
       (error) => {
-        if (isConflict(error)) {
+        if (isConflict(error) && isSameToolDraft()) {
           draft.conflict = true;
           draft.overwrite = false;
           this.expanded.add(`tool:${tool.id}`);
@@ -3383,12 +3438,32 @@ export class ToolsPage {
       return;
     }
     const preferredTool = draft.toolId;
+    const submittedState = {
+      toolId: draft.toolId,
+      id: draft.id,
+      label: draft.label,
+      modelArg: draft.modelArg,
+      efforts: draft.efforts,
+      allowNoEffort: draft.allowNoEffort,
+    };
+    const isSameCreateModelDraft = (): boolean =>
+      this.expanded.has('create-model') &&
+      this.newModel === draft &&
+      draft.toolId === submittedState.toolId &&
+      draft.id === submittedState.id &&
+      draft.label === submittedState.label &&
+      draft.modelArg === submittedState.modelArg &&
+      draft.efforts === submittedState.efforts &&
+      draft.allowNoEffort === submittedState.allowNoEffort;
+
     await this.apply('model-create', { op: 'upsert_model', model }, (next) => {
-      const toolId = next.tools.some((tool) => tool.id === preferredTool)
-        ? preferredTool
-        : next.tools[0]?.id ?? '';
-      this.newModel = emptyModel(next.revision, toolId);
-      this.expanded.delete('create-model');
+      if (isSameCreateModelDraft()) {
+        const toolId = next.tools.some((tool) => tool.id === preferredTool)
+          ? preferredTool
+          : next.tools[0]?.id ?? '';
+        this.newModel = emptyModel(next.revision, toolId);
+        this.expanded.delete('create-model');
+      }
       this.notice = {
         tone: 'success',
         title: 'Model added',
@@ -3410,16 +3485,37 @@ export class ToolsPage {
       this.validationError(value);
       return;
     }
+    const submittedState = {
+      toolId: draft.toolId,
+      label: draft.label,
+      modelArg: draft.modelArg,
+      efforts: draft.efforts,
+      allowNoEffort: draft.allowNoEffort,
+    };
+    const isSameModelDraft = (): boolean => {
+      const current = this.modelDrafts.get(model.id);
+      return (
+        this.expanded.has(`model:${model.id}`) &&
+        current === draft &&
+        current.toolId === submittedState.toolId &&
+        current.label === submittedState.label &&
+        current.modelArg === submittedState.modelArg &&
+        current.efforts === submittedState.efforts &&
+        current.allowNoEffort === submittedState.allowNoEffort
+      );
+    };
     await this.apply(
       `model-save:${model.id}`,
       { op: 'upsert_model', model: value },
       (next) => {
-        this.modelDrafts.delete(model.id);
-        this.expanded.delete(`model:${model.id}`);
+        if (isSameModelDraft()) {
+          this.modelDrafts.delete(model.id);
+          this.expanded.delete(`model:${model.id}`);
+        }
         this.notice = { tone: 'success', text: `Saved model "${value.label}" at revision ${next.revision}.` };
       },
       (error) => {
-        if (isConflict(error)) {
+        if (isConflict(error) && isSameModelDraft()) {
           draft.conflict = true;
           draft.overwrite = false;
           this.expanded.add(`model:${model.id}`);
