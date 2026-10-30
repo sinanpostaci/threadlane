@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
 use threadlane_workers::{
-    run_worker, run_worker_with_cancel, ExecutionBudgets, FieldEvidence, OpenCodeMetadataEvidence,
-    WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorkerSpec,
+    execute_worker_task, run_worker, run_worker_with_cancel, ExecutionBudgets, FieldEvidence,
+    OpenCodeMetadataEvidence, WorkAcceptanceState, WorkerFilePermissions, WorkerProvider,
+    WorkerRunStatus, WorkerSpec,
 };
 
 static SCRIPT_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -790,4 +791,369 @@ exit 1
         vec!["run:ses_preexisting_777".to_string()],
         "explicit preexisting session_id must never invoke session.create, session.get, or session export"
     );
+}
+
+fn init_git_repo_with_tracked_lib_rs(repo_dir: &Path) -> String {
+    let run_git = |args: &[&str]| -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_dir)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("spawn git in test fixture");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("utf8 git stdout")
+            .trim()
+            .to_string()
+    };
+
+    run_git(&["init", "-q"]);
+    run_git(&["config", "user.name", "Threadlane Test"]);
+    run_git(&["config", "user.email", "test@threadlane.local"]);
+    let src_dir = repo_dir.join("src");
+    fs::create_dir_all(&src_dir).expect("create src dir");
+    fs::write(src_dir.join("lib.rs"), "pub fn value() -> i32 { 1 }\n").expect("write src/lib.rs");
+    run_git(&["add", "src/lib.rs"]);
+    run_git(&["commit", "-q", "-m", "initial"]);
+    run_git(&["rev-parse", "--verify", "HEAD^{commit}"])
+}
+
+#[tokio::test]
+async fn execute_worker_task_rejects_metadata_missing_effort_and_preserves_verified_stream_fields_while_retaining_legacy_stream_pending_effort(
+) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (repo_dir, work_area, _workdir) = setup_test_env(temp.path());
+    let base_commit = init_git_repo_with_tracked_lib_rs(&repo_dir);
+
+    // 1. Owned OpenCode run with matching stream session/model, missing assistant variant in
+    // metadata, AND non-stop finish (`finish: "length"`) or invalid idle coverage / later error
+    // must remain RejectedByWorkerOutcome, never FinishedNeedsEvidenceAndReview or ready.
+    for (idx, mode) in [
+        "missing_variant_no_stop",
+        "missing_variant_bad_idle_and_later_error",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let base_ts = current_epoch_ms().saturating_add(15_000);
+        let log_path = temp.path().join(format!("exec-task-{mode}.log"));
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+LOG="{log}"
+WORKDIR="$(pwd -P)"
+BASE_TS={base_ts}
+MODE="{mode}"
+
+if [[ "${{1:-}}" == "api" && "${{2:-}}" == "--standalone" && "${{3:-}}" == "session.create" ]]; then
+  echo "create" >> "$LOG"
+  printf '{{"data":{{"id":"ses_task_neg_01","location":{{"directory":"%s"}},"time":{{"created":%s}}}}}}\n' "$WORKDIR" "$BASE_TS"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "--standalone" && "${{2:-}}" == "run" ]]; then
+  shift
+  echo "run" >> "$LOG"
+  printf 'pub fn value() -> i32 {{ 2 }}\n' > "$WORKDIR/src/lib.rs"
+  printf '{{"type":"step_start","sessionID":"ses_task_neg_01","model":"opencode-go/deepseek-v4.1-flash"}}\n'
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "api" && "${{2:-}}" == "--standalone" && "${{3:-}}" == "session.get" ]]; then
+  echo "get" >> "$LOG"
+  IDLE_TS="$((BASE_TS + 30))"
+  if [[ "$MODE" == "missing_variant_bad_idle_and_later_error" ]]; then
+    IDLE_TS="$((BASE_TS + 5))"
+  fi
+  printf '{{"data":{{"id":"ses_task_neg_01","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}}}}\n' \
+    "$WORKDIR" "$BASE_TS" "$((BASE_TS + 20))" "$IDLE_TS"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "session" && "${{2:-}}" == "export" ]]; then
+  echo "export" >> "$LOG"
+  if [[ "$MODE" == "missing_variant_no_stop" ]]; then
+    printf '{{"info":{{"id":"ses_task_neg_01","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_ast_1","sessionID":"ses_task_neg_01","type":"assistant","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash"}},"finish":"length","time":{{"created":%s,"completed":%s}}}}]}}\n' \
+      "$WORKDIR" "$BASE_TS" "$((BASE_TS + 20))" "$((BASE_TS + 30))" "$((BASE_TS + 10))" "$((BASE_TS + 20))"
+  else
+    printf '{{"info":{{"id":"ses_task_neg_01","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_ast_1","sessionID":"ses_task_neg_01","type":"assistant","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash"}},"finish":"stop","time":{{"created":%s,"completed":%s}}}},{{"id":"msg_ast_2","sessionID":"ses_task_neg_01","type":"assistant","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"error":{{"message":"later provider error"}},"finish":"error","time":{{"created":%s,"completed":%s}}}}]}}\n' \
+      "$WORKDIR" "$BASE_TS" "$((BASE_TS + 20))" "$((BASE_TS + 5))" "$((BASE_TS + 10))" "$((BASE_TS + 15))" "$((BASE_TS + 16))" "$((BASE_TS + 20))"
+  fi
+  exit 0
+fi
+
+exit 2
+"#,
+            log = log_path.display(),
+            base_ts = base_ts,
+            mode = mode,
+        );
+
+        let exe = write_executable_script(
+            temp.path(),
+            &format!("fake-opencode-task-neg-{idx}"),
+            &script_body,
+        );
+        let mut spec = make_opencode_spec(exe, repo_dir.clone(), work_area.clone(), None);
+        spec.base_commit = base_commit.clone();
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task_report = execute_worker_task(
+            &spec,
+            &format!("r_neg_{idx}"),
+            &format!("t_neg_{idx}"),
+            None,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("execute_worker_task");
+
+        assert!(
+            task_report.diff_gate.passed,
+            "scoped edit to src/lib.rs should pass diff gate in `{mode}`"
+        );
+        assert_eq!(
+            task_report.worker_report.status,
+            WorkerRunStatus::MissingEffortEvidence
+        );
+        assert_eq!(
+            task_report.worker_report.opencode_metadata_error.as_deref(),
+            Some("missing_effort")
+        );
+        assert!(!task_report.worker_report.evidence.saw_result_event);
+        assert!(!task_report
+            .worker_report
+            .has_complete_natural_completion_evidence());
+        assert!(
+            !task_report
+                .worker_report
+                .is_completed_pending_effort_evidence(),
+            "metadata missing_effort in `{mode}` must never qualify as completed_pending_effort_evidence"
+        );
+        assert!(
+            task_report.worker_report.has_satisfied_model_evidence(),
+            "verified stream model must remain satisfied in `{mode}`"
+        );
+        assert!(!task_report.worker_report.has_satisfied_effort_evidence());
+        assert_eq!(
+            task_report.overall_acceptance_state,
+            WorkAcceptanceState::RejectedByWorkerOutcome,
+            "mode `{mode}` must be RejectedByWorkerOutcome, never FinishedNeedsEvidenceAndReview"
+        );
+        assert_eq!(
+            read_invocations(&log_path),
+            vec![
+                "create".to_string(),
+                "run".to_string(),
+                "get".to_string(),
+                "export".to_string(),
+            ]
+        );
+    }
+
+    // 2. Owned OpenCode run with verified stream model + effort (`max`) + session and metadata
+    // `missing_completion` or `nonzero_exit` preserves observed fields and model/effort
+    // satisfaction flags while failing overall acceptance.
+    for (idx, (err_mode, expected_status, expected_err)) in [
+        (
+            "missing_completion",
+            WorkerRunStatus::MissingResultEvidence,
+            "missing_completion",
+        ),
+        ("nonzero_exit", WorkerRunStatus::NonZeroExit, "nonzero_exit"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let base_ts = current_epoch_ms().saturating_add(15_000);
+        let log_path = temp
+            .path()
+            .join(format!("exec-task-preserve-{err_mode}.log"));
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+LOG="{log}"
+WORKDIR="$(pwd -P)"
+BASE_TS={base_ts}
+MODE="{err_mode}"
+
+if [[ "${{1:-}}" == "api" && "${{2:-}}" == "--standalone" && "${{3:-}}" == "session.create" ]]; then
+  echo "create" >> "$LOG"
+  printf '{{"data":{{"id":"ses_task_pres_01","location":{{"directory":"%s"}},"time":{{"created":%s}}}}}}\n' "$WORKDIR" "$BASE_TS"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "--standalone" && "${{2:-}}" == "run" ]]; then
+  shift
+  echo "run" >> "$LOG"
+  printf 'pub fn value() -> i32 {{ 3 }}\n' > "$WORKDIR/src/lib.rs"
+  printf '{{"type":"step_start","sessionID":"ses_task_pres_01","model":"opencode-go/deepseek-v4.1-flash","variant":"max"}}\n'
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "api" && "${{2:-}}" == "--standalone" && "${{3:-}}" == "session.get" ]]; then
+  echo "get" >> "$LOG"
+  printf '{{"data":{{"id":"ses_task_pres_01","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}}}}\n' \
+    "$WORKDIR" "$BASE_TS" "$((BASE_TS + 20))" "$((BASE_TS + 30))"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "session" && "${{2:-}}" == "export" ]]; then
+  echo "export" >> "$LOG"
+  if [[ "$MODE" == "nonzero_exit" ]]; then
+    exit 1
+  fi
+  printf '{{"info":{{"id":"ses_task_pres_01","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_ast_1","sessionID":"ses_task_pres_01","type":"assistant","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"finish":"length","time":{{"created":%s,"completed":%s}}}}]}}\n' \
+    "$WORKDIR" "$BASE_TS" "$((BASE_TS + 20))" "$((BASE_TS + 30))" "$((BASE_TS + 10))" "$((BASE_TS + 20))"
+  exit 0
+fi
+
+exit 2
+"#,
+            log = log_path.display(),
+            base_ts = base_ts,
+            err_mode = err_mode,
+        );
+
+        let exe = write_executable_script(
+            temp.path(),
+            &format!("fake-opencode-preserve-{idx}"),
+            &script_body,
+        );
+        let mut spec = make_opencode_spec(exe, repo_dir.clone(), work_area.clone(), None);
+        spec.base_commit = base_commit.clone();
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task_report = execute_worker_task(
+            &spec,
+            &format!("r_pres_{idx}"),
+            &format!("t_pres_{idx}"),
+            None,
+            &mut cancel_rx,
+        )
+        .await
+        .expect("execute_worker_task");
+
+        assert!(task_report.diff_gate.passed);
+        assert_eq!(task_report.worker_report.status, *expected_status);
+        assert_eq!(
+            task_report.worker_report.opencode_metadata_error.as_deref(),
+            Some(*expected_err)
+        );
+        assert!(!task_report.worker_report.evidence.saw_result_event);
+        assert_eq!(
+            task_report.worker_report.effective_observed_model(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            task_report.worker_report.effective_observed_effort(),
+            Some("max")
+        );
+        assert!(task_report.worker_report.has_satisfied_model_evidence());
+        assert!(task_report.worker_report.has_satisfied_effort_evidence());
+        assert!(task_report.worker_report.has_satisfied_session_evidence());
+        assert!(!task_report.worker_report.has_satisfied_result_evidence());
+        assert!(!task_report
+            .worker_report
+            .has_complete_natural_completion_evidence());
+        assert!(!task_report
+            .worker_report
+            .is_completed_pending_effort_evidence());
+        assert_eq!(
+            task_report.overall_acceptance_state,
+            WorkAcceptanceState::RejectedByWorkerOutcome
+        );
+        assert_eq!(
+            read_invocations(&log_path),
+            vec![
+                "create".to_string(),
+                "run".to_string(),
+                "get".to_string(),
+                "export".to_string(),
+            ]
+        );
+    }
+
+    // 3. Positive legacy stream-only missing-effort control (explicit preexisting session with
+    // verified stream model, session, and terminal result event, omitting effort) preserves
+    // FinishedNeedsEvidenceAndReview.
+    {
+        let log_path = temp.path().join("exec-task-legacy-pending-effort.log");
+        let script_body = format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+LOG="{log}"
+WORKDIR="$(pwd -P)"
+
+if [[ "${{1:-}}" == "--standalone" && "${{2:-}}" == "run" ]]; then
+  shift
+  SID=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--session" ]]; then
+      SID="$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+  echo "run:$SID" >> "$LOG"
+  printf 'pub fn value() -> i32 {{ 4 }}\n' > "$WORKDIR/src/lib.rs"
+  printf '{{"type":"step_start","sessionID":"%s","model":"opencode-go/deepseek-v4.1-flash"}}\n' "$SID"
+  printf '{{"type":"step_finish","sessionID":"%s","part":{{"type":"step-finish","reason":"stop"}}}}\n' "$SID"
+  exit 0
+fi
+
+echo "forbidden_metadata:$*" >> "$LOG"
+exit 1
+"#,
+            log = log_path.display(),
+        );
+
+        let exe =
+            write_executable_script(temp.path(), "fake-opencode-legacy-pending", &script_body);
+        let mut spec = make_opencode_spec(
+            exe,
+            repo_dir.clone(),
+            work_area.clone(),
+            Some("ses_legacy_stream_777".to_string()),
+        );
+        spec.base_commit = base_commit;
+
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let task_report =
+            execute_worker_task(&spec, "r_legacy_01", "t_legacy_01", None, &mut cancel_rx)
+                .await
+                .expect("execute_worker_task legacy control");
+
+        assert!(task_report.diff_gate.passed);
+        assert!(task_report.worker_report.allocated_session_id.is_none());
+        assert!(task_report.worker_report.opencode_metadata.is_none());
+        assert!(task_report.worker_report.opencode_metadata_error.is_none());
+        assert!(task_report.worker_report.evidence.saw_result_event);
+        assert_eq!(
+            task_report.worker_report.status,
+            WorkerRunStatus::MissingEffortEvidence
+        );
+        assert!(task_report.worker_report.has_satisfied_model_evidence());
+        assert!(!task_report.worker_report.has_satisfied_effort_evidence());
+        assert!(task_report
+            .worker_report
+            .is_completed_pending_effort_evidence());
+        assert_eq!(
+            task_report.overall_acceptance_state,
+            WorkAcceptanceState::FinishedNeedsEvidenceAndReview
+        );
+        assert_eq!(
+            read_invocations(&log_path),
+            vec!["run:ses_legacy_stream_777".to_string()]
+        );
+    }
 }

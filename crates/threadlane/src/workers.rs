@@ -1216,6 +1216,16 @@ fn build_failure_reason(
         }
     } else if let Some(blocked) = worker_report.evidence.blocked_events.first() {
         format!("worker blocked ({:?}): {}", blocked.kind, blocked.summary)
+    } else if worker_report.cleanup_incomplete
+        || worker_report.status == WorkerRunStatus::IncompleteCleanup
+    {
+        "worker process group or pipe drain cleanup remained incomplete".to_string()
+    } else if let Some(overflow) = worker_report.overflow {
+        format!("worker output exceeded configured budget ({overflow:?})")
+    } else if worker_report.status == WorkerRunStatus::MalformedStream {
+        "worker stdout stream contained malformed non-JSON lines".to_string()
+    } else if let Some(meta_err) = worker_report.opencode_metadata_error.as_deref() {
+        format!("OpenCode session metadata verification failed ({meta_err})")
     } else if matches!(
         worker_report.status,
         WorkerRunStatus::ModelMismatch | WorkerRunStatus::MissingModelEvidence
@@ -1234,16 +1244,6 @@ fn build_failure_reason(
             worker_report.status.as_str(),
             worker_report.evidence.effort_evidence
         )
-    } else if worker_report.cleanup_incomplete
-        || worker_report.status == WorkerRunStatus::IncompleteCleanup
-    {
-        "worker process group or pipe drain cleanup remained incomplete".to_string()
-    } else if let Some(overflow) = worker_report.overflow {
-        format!("worker output exceeded configured budget ({overflow:?})")
-    } else if worker_report.status == WorkerRunStatus::MalformedStream {
-        "worker stdout stream contained malformed non-JSON lines".to_string()
-    } else if let Some(meta_err) = worker_report.opencode_metadata_error.as_deref() {
-        format!("OpenCode session metadata verification failed ({meta_err})")
     } else if !diff_gate_passed {
         if let Some(first_violation) = violation_summaries.first() {
             format!("post-run diff gate rejected changes: {first_violation}")
@@ -1634,5 +1634,261 @@ mod tests {
             conflict_snapshot.outcome.expect("outcome").acceptance_state,
             WorkerAcceptanceState::ExecutionFailed
         );
+    }
+
+    #[test]
+    fn opencode_metadata_errors_preserve_verified_stream_fields_and_report_finite_metadata_provenance(
+    ) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        crate::descriptor::prepare_state_dir(&state_dir).expect("prepare_state_dir");
+        let db_path = state_dir.join(crate::descriptor::DATABASE_FILENAME);
+        let mut core = Core::open(&db_path).expect("open core");
+
+        let binding = core
+            .create_binding("22222222-2222-4222-8222-222222222222", "opencode-meta-err")
+            .expect("create_binding");
+        let profile_digest = "b".repeat(64);
+        let base_commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+
+        // 1. Verified stream model + effort (`max`) + session with non-model/effort metadata
+        // errors (`missing_completion`, `nonzero_exit`, `timed_out`) must fail execution while
+        // preserving observed model/effort and keeping missing_model/effort_evidence false.
+        let non_field_cases: &[(&str, WorkerRunStatus, WorkerStatus, &str)] = &[
+            (
+                "missing_completion",
+                WorkerRunStatus::MissingResultEvidence,
+                WorkerStatus::Failed,
+                "OpenCode session metadata verification failed (missing_completion)",
+            ),
+            (
+                "nonzero_exit",
+                WorkerRunStatus::NonZeroExit,
+                WorkerStatus::Failed,
+                "OpenCode session metadata verification failed (nonzero_exit)",
+            ),
+            (
+                "timed_out",
+                WorkerRunStatus::TimedOut,
+                WorkerStatus::TimedOut,
+                "worker execution exceeded configured timeout budget",
+            ),
+        ];
+
+        for (idx, &(err_code, run_status, expected_worker_status, expected_reason)) in
+            non_field_cases.iter().enumerate()
+        {
+            let now_base = 3_000 + (idx as i64) * 100;
+            let queued = core
+                .execute(
+                    &binding.binding_id,
+                    Command::StartWorker {
+                        command_key: format!("wk-meta-nonfield-{err_code}"),
+                        profile_id: "prof_opencode".to_string(),
+                        profile_digest: profile_digest.clone(),
+                        provider: "opencode_v2".to_string(),
+                        requested_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                        requested_effort: "max".to_string(),
+                        base_commit: base_commit.clone(),
+                        instruction: "verify stream preservation on metadata failure".to_string(),
+                        now_ms: now_base,
+                    },
+                )
+                .expect("start_worker")
+                .into_worker()
+                .expect("worker snapshot");
+
+            let claim = core
+                .claim_worker(
+                    &binding.binding_id,
+                    &queued.run_id,
+                    queued.revision,
+                    &profile_digest,
+                    now_base + 1,
+                )
+                .expect("claim_worker");
+
+            let mut report = sample_opencode_task_report(temp.path());
+            report.overall_acceptance_state = WorkAcceptanceState::RejectedByWorkerOutcome;
+            report.worker_report.status = run_status;
+            report.worker_report.opencode_metadata = None;
+            report.worker_report.opencode_metadata_error = Some(err_code.to_string());
+            report.worker_report.evidence.saw_result_event = false;
+            report.worker_report.evidence.model_evidence = FieldEvidence::VerifiedMatch {
+                value: "opencode-go/deepseek-v4.1-flash".to_string(),
+            };
+            report.worker_report.evidence.effort_evidence = FieldEvidence::VerifiedMatch {
+                value: "max".to_string(),
+            };
+
+            assert!(!report.worker_report.evidence.saw_result_event);
+            assert!(!report
+                .worker_report
+                .has_complete_natural_completion_evidence());
+            assert!(!report.worker_report.is_completed_pending_effort_evidence());
+            assert!(report.worker_report.has_satisfied_model_evidence());
+            assert!(report.worker_report.has_satisfied_effort_evidence());
+            assert!(report.worker_report.has_satisfied_session_evidence());
+            assert!(!report.worker_report.has_satisfied_result_evidence());
+
+            let completion = build_completion_record(&state_dir, &claim, Ok(report), false);
+            assert_eq!(completion.status, expected_worker_status);
+            assert_eq!(
+                completion.observed_model.as_deref(),
+                Some("opencode-go/deepseek-v4.1-flash")
+            );
+            assert_eq!(completion.observed_effort.as_deref(), Some("max"));
+            assert_eq!(
+                completion.outcome.acceptance_state,
+                WorkerAcceptanceState::ExecutionFailed
+            );
+            assert!(
+                !completion.outcome.missing_model_evidence,
+                "verified stream model must not be marked missing for `{err_code}`"
+            );
+            assert!(
+                !completion.outcome.missing_effort_evidence,
+                "verified stream effort must not be marked missing for `{err_code}`"
+            );
+            let reason = completion
+                .outcome
+                .failure_reason
+                .as_deref()
+                .expect("failure_reason present");
+            assert_eq!(reason, expected_reason);
+            assert!(
+                !reason.contains("VerifiedMatch"),
+                "failure_reason must not print misleading VerifiedMatch debug for `{err_code}`"
+            );
+
+            let snapshot = core
+                .record_worker_outcome(&claim, completion, now_base + 2)
+                .expect("record_worker_outcome");
+            assert_eq!(snapshot.status, expected_worker_status);
+            let outcome = snapshot.outcome.expect("outcome");
+            assert_eq!(
+                outcome.acceptance_state,
+                WorkerAcceptanceState::ExecutionFailed
+            );
+            assert!(!outcome.missing_model_evidence);
+            assert!(!outcome.missing_effort_evidence);
+        }
+
+        // 2. Metadata-specific model/effort errors (`model_mismatch`, `missing_model`,
+        // `effort_mismatch`, `missing_effort`) reject the relevant dimension, do not supplement
+        // absent fields, and report the finite metadata error code instead of VerifiedMatch debug.
+        let field_cases: &[(&str, WorkerRunStatus, bool, bool)] = &[
+            (
+                "model_mismatch",
+                WorkerRunStatus::ModelMismatch,
+                true,
+                false,
+            ),
+            (
+                "missing_model",
+                WorkerRunStatus::MissingModelEvidence,
+                true,
+                false,
+            ),
+            (
+                "effort_mismatch",
+                WorkerRunStatus::EffortMismatch,
+                false,
+                true,
+            ),
+            (
+                "missing_effort",
+                WorkerRunStatus::MissingEffortEvidence,
+                false,
+                true,
+            ),
+        ];
+
+        for (idx, &(err_code, run_status, expect_missing_model, expect_missing_effort)) in
+            field_cases.iter().enumerate()
+        {
+            let now_base = 4_000 + (idx as i64) * 100;
+            let queued = core
+                .execute(
+                    &binding.binding_id,
+                    Command::StartWorker {
+                        command_key: format!("wk-meta-field-{err_code}"),
+                        profile_id: "prof_opencode".to_string(),
+                        profile_digest: profile_digest.clone(),
+                        provider: "opencode_v2".to_string(),
+                        requested_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                        requested_effort: "max".to_string(),
+                        base_commit: base_commit.clone(),
+                        instruction: "verify metadata field error provenance".to_string(),
+                        now_ms: now_base,
+                    },
+                )
+                .expect("start_worker")
+                .into_worker()
+                .expect("worker snapshot");
+
+            let claim = core
+                .claim_worker(
+                    &binding.binding_id,
+                    &queued.run_id,
+                    queued.revision,
+                    &profile_digest,
+                    now_base + 1,
+                )
+                .expect("claim_worker");
+
+            let mut report = sample_opencode_task_report(temp.path());
+            report.overall_acceptance_state = WorkAcceptanceState::RejectedByWorkerOutcome;
+            report.worker_report.status = run_status;
+            report.worker_report.opencode_metadata = None;
+            report.worker_report.opencode_metadata_error = Some(err_code.to_string());
+            report.worker_report.evidence.model_evidence = FieldEvidence::VerifiedMatch {
+                value: "opencode-go/deepseek-v4.1-flash".to_string(),
+            };
+            report.worker_report.evidence.effort_evidence = FieldEvidence::VerifiedMatch {
+                value: "max".to_string(),
+            };
+
+            assert!(!report
+                .worker_report
+                .has_complete_natural_completion_evidence());
+            assert!(!report.worker_report.is_completed_pending_effort_evidence());
+            assert_eq!(
+                !report.worker_report.has_satisfied_model_evidence(),
+                expect_missing_model
+            );
+            assert_eq!(
+                !report.worker_report.has_satisfied_effort_evidence(),
+                expect_missing_effort
+            );
+
+            let completion = build_completion_record(&state_dir, &claim, Ok(report), false);
+            assert_eq!(completion.status, WorkerStatus::Failed);
+            assert_eq!(
+                completion.outcome.acceptance_state,
+                WorkerAcceptanceState::ExecutionFailed
+            );
+            assert_eq!(
+                completion.outcome.missing_model_evidence,
+                expect_missing_model
+            );
+            assert_eq!(
+                completion.outcome.missing_effort_evidence,
+                expect_missing_effort
+            );
+            let reason = completion
+                .outcome
+                .failure_reason
+                .as_deref()
+                .expect("failure_reason present");
+            assert_eq!(
+                reason,
+                format!("OpenCode session metadata verification failed ({err_code})")
+            );
+            assert!(
+                !reason.contains("VerifiedMatch"),
+                "failure_reason must report finite metadata error rather than VerifiedMatch for `{err_code}`"
+            );
+        }
     }
 }

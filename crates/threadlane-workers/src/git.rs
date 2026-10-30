@@ -1717,17 +1717,17 @@ pub async fn execute_worker_task_with_observer(
     let updated_manifest = guard.finish()?;
 
     let worker_succeeded = worker_report.has_complete_natural_completion_evidence();
-    let overall_acceptance_state = if !diff_gate.passed
-        && (worker_succeeded || worker_report.status.is_completed_pending_effort_evidence())
-    {
-        WorkAcceptanceState::RejectedByDiffGate
-    } else if worker_succeeded {
-        WorkAcceptanceState::DiffGatePassedPendingReview
-    } else if worker_report.status.is_completed_pending_effort_evidence() {
-        WorkAcceptanceState::FinishedNeedsEvidenceAndReview
-    } else {
-        WorkAcceptanceState::RejectedByWorkerOutcome
-    };
+    let completed_pending_effort = worker_report.is_completed_pending_effort_evidence();
+    let overall_acceptance_state =
+        if !diff_gate.passed && (worker_succeeded || completed_pending_effort) {
+            WorkAcceptanceState::RejectedByDiffGate
+        } else if worker_succeeded {
+            WorkAcceptanceState::DiffGatePassedPendingReview
+        } else if completed_pending_effort {
+            WorkAcceptanceState::FinishedNeedsEvidenceAndReview
+        } else {
+            WorkAcceptanceState::RejectedByWorkerOutcome
+        };
 
     Ok(TaskExecutionReport {
         manifest: updated_manifest,

@@ -5,14 +5,14 @@ that every milestone or platform is supported.
 
 ## Owned OpenCode execution evidence (2026-10-31)
 
-Ten new tests cover the bounded metadata collector (four), owned worker execution
-(five, including parameterized failures), and runtime completion mapping (one).
+Focused tests cover the bounded metadata collector, owned worker execution,
+parameterized failure cases and runtime completion mapping.
 The existing 24 worker/Git foundation regressions also passed before the live
 probe. All 21 host tests also passed after adapting their shared fake CLI to
 metadata-only commands without counting them as inference. Fixtures retain the
 documented scalar `outcome` schema and actual CLI argument ordering; the validator was not weakened to accept a failing fixture.
 
-One disposable live task used OpenCode 2.2.2 with
+One disposable live task on candidate `a36bd0b` used OpenCode 2.2.2 with
 `opencode-go/deepseek-v4.1-flash#max`. It completed in 15.34 seconds, changed only
 `result.py`, passed the diff gate and remained
 `diff_gate_passed_pending_review`. The generated addition function matched the
@@ -24,6 +24,12 @@ model and `max` effort. The report retained `saw_result_event: false` because th
 stream never emitted that evidence. No raw export was persisted. This is
 CLI-reported evidence from one bounded Linux task, not cloud attestation, long
 session qualification or a live approved-host-to-native-chat workflow.
+
+The single closing review found two reporting/state issues. Follow-up regressions
+preserve already verified stream fields on unrelated metadata failures, report
+finite metadata errors accurately, and require terminal completion proof before
+the legacy pending-effort state. These corrections use synthetic/fake-process
+checks; the paid live task was not replayed.
 
 The separate [native single-chat pilot](NATIVE-PILOT-2026-10-30.md) records its
 qualified simulated loop and restored temporary configuration. Automatic native

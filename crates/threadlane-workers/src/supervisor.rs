@@ -306,43 +306,89 @@ impl WorkerExecutionReport {
     }
 
     /// Returns `true` if model evidence is satisfied by the stream or by validated OpenCode v2
-    /// session metadata without any stream conflict.
+    /// session metadata without any model conflict.
     pub fn has_satisfied_model_evidence(&self) -> bool {
         if matches!(self.evidence.model_evidence, FieldEvidence::Mismatch { .. })
-            || self.status == WorkerRunStatus::ModelMismatch
+            || matches!(
+                self.status,
+                WorkerRunStatus::ModelMismatch | WorkerRunStatus::MissingModelEvidence
+            )
+            || matches!(
+                self.opencode_metadata_error.as_deref(),
+                Some("model_mismatch" | "missing_model")
+            )
         {
             return false;
         }
-        if self.validated_opencode_metadata().is_some() {
+        if let Some(meta) = self.opencode_metadata.as_ref() {
+            let model_matches_requested = meta.observed_model == self.requested_model.base_model
+                || meta.observed_model == self.requested_model.cli_model_arg;
+            let model_matches_stream = match &self.evidence.model_evidence {
+                FieldEvidence::VerifiedMatch { value } => {
+                    value == &meta.observed_model || value == &self.requested_model.base_model
+                }
+                _ => true,
+            };
+            if !model_matches_requested || !model_matches_stream {
+                return false;
+            }
+        }
+        if self.evidence.model_evidence.is_satisfied() {
             return true;
         }
-        self.evidence.model_evidence.is_satisfied()
-            && self.status != WorkerRunStatus::MissingModelEvidence
-            && self.opencode_metadata_error.is_none()
+        self.validated_opencode_metadata().is_some()
     }
 
     /// Returns `true` if effort/variant evidence is satisfied by the stream or by validated
-    /// OpenCode v2 session metadata without any stream conflict.
+    /// OpenCode v2 session metadata without any effort conflict.
     pub fn has_satisfied_effort_evidence(&self) -> bool {
         if matches!(
             self.evidence.effort_evidence,
             FieldEvidence::Mismatch { .. }
-        ) || self.status == WorkerRunStatus::EffortMismatch
-        {
+        ) || matches!(
+            self.status,
+            WorkerRunStatus::EffortMismatch | WorkerRunStatus::MissingEffortEvidence
+        ) || matches!(
+            self.opencode_metadata_error.as_deref(),
+            Some("effort_mismatch" | "missing_effort")
+        ) {
             return false;
         }
-        if self.validated_opencode_metadata().is_some() {
+        if let Some(meta) = self.opencode_metadata.as_ref() {
+            if let Some(req_effort) = self.requested_model.effort.as_deref() {
+                if meta.observed_effort.as_deref() != Some(req_effort) {
+                    return false;
+                }
+            }
+            match &self.evidence.effort_evidence {
+                FieldEvidence::VerifiedMatch { value } => {
+                    if meta.observed_effort.as_deref() != Some(value.as_str()) {
+                        return false;
+                    }
+                }
+                FieldEvidence::NotRequested {
+                    observed: Some(value),
+                } => {
+                    if let Some(meta_eff) = meta.observed_effort.as_deref() {
+                        if meta_eff != value.as_str() {
+                            return false;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.evidence.effort_evidence.is_satisfied() {
             return true;
         }
-        self.evidence.effort_evidence.is_satisfied()
-            && self.status != WorkerRunStatus::MissingEffortEvidence
-            && self.opencode_metadata_error.is_none()
+        self.validated_opencode_metadata().is_some()
     }
 
     /// Returns `true` if session identity evidence is satisfied by the stream (and matches any
-    /// software-allocated session ID).
+    /// software-allocated session ID without metadata ownership conflict).
     pub fn has_satisfied_session_evidence(&self) -> bool {
         if self.status == WorkerRunStatus::SessionMismatch
+            || self.opencode_metadata_error.as_deref() == Some("ownership_mismatch")
             || !self.evidence.session_evidence.is_satisfied()
         {
             return false;
@@ -369,6 +415,27 @@ impl WorkerExecutionReport {
         self.evidence.saw_result_event
             && self.status != WorkerRunStatus::MissingResultEvidence
             && self.opencode_metadata_error.is_none()
+    }
+
+    /// Returns `true` if the worker completed a legacy stream-only run cleanly with verified
+    /// model, session, and terminal result evidence, no OpenCode session allocation or metadata
+    /// error, and only effort/variant evidence missing (`WorkerRunStatus::MissingEffortEvidence`).
+    pub fn is_completed_pending_effort_evidence(&self) -> bool {
+        self.status.is_completed_pending_effort_evidence()
+            && self.allocated_session_id.is_none()
+            && self.opencode_metadata.is_none()
+            && self.opencode_metadata_error.is_none()
+            && self.exit_code == Some(0)
+            && self.signal.is_none()
+            && !self.cleanup_incomplete
+            && self.overflow.is_none()
+            && self.evidence.blocked_events.is_empty()
+            && self.evidence.provider_errors.is_empty()
+            && self.evidence.malformed_lines_count == 0
+            && self.evidence.model_evidence.is_satisfied()
+            && self.evidence.session_evidence.is_satisfied()
+            && self.evidence.saw_result_event
+            && matches!(self.evidence.effort_evidence, FieldEvidence::Missing { .. })
     }
 
     /// Returns `true` if the worker exited 0 cleanly without timeout, overflow, cleanup issues,
