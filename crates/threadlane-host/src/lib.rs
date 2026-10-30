@@ -52,19 +52,24 @@ pub use client::ApprovedHostClient;
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
 pub use storage::{
-    derive_cancel_command_key, ensure_no_symlink_components, ensure_private_dir, is_host_lock_held,
-    paths_overlap, prepare_session_dir, read_and_verify_host_manifest, read_host_manifest_optional,
-    read_task_dispatch_intent, read_task_receipt, record_task_dispatch_intent, record_task_receipt,
-    validate_approval_id, validate_canonical_thread_uuid, validate_hex_digest, validate_identifier,
+    derive_ack_command_key, derive_cancel_command_key, ensure_no_symlink_components,
+    ensure_private_dir, is_host_lock_held, paths_overlap, prepare_session_dir,
+    read_and_verify_host_manifest, read_host_manifest_optional, read_task_dispatch_intent,
+    read_task_receipt, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
+    validate_canonical_thread_uuid, validate_hex_digest, validate_identifier,
     validate_sessions_root, verify_existing_private_dir, verify_existing_session_dir,
     write_host_manifest, HostSessionLock,
 };
+pub use threadlane::{DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS};
+pub use threadlane_core::{AckResult, EventBatch};
 pub use types::{
-    HostExecutionGates, HostPhase, HostSessionManifest, HostSessionSummary, TaskDispatchIntent,
-    TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot, HOST_LOCK_FILENAME,
-    HOST_MANIFEST_FILENAME, HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES,
-    MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
-    TASK_RECEIPTS_LOCK_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
+    ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
+    HostSessionManifest, HostSessionSummary, TaskDispatchIntent, TaskExecutionStatus,
+    TaskRunReceipt, TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES,
+    APPROVED_EVENT_BATCH_MAX_EVENTS, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
+    HOST_MANIFEST_SCHEMA_VERSION, MAX_HOST_MANIFEST_BYTES, MAX_TASK_RECEIPTS_BYTES,
+    RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME, TASK_RECEIPTS_LOCK_FILENAME,
+    TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
 };
 
 #[cfg(test)]
@@ -2394,6 +2399,853 @@ exit 0
                 raw_bytes
             );
         }
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    fn write_fake_codex_script(script_path: &Path, log_file: &Path, sleep_seconds: Option<u32>) {
+        if let Some(parent) = script_path.parent() {
+            fs::create_dir_all(parent).expect("create fake codex parent dir");
+        }
+        let sleep_cmd = sleep_seconds
+            .map(|secs| format!("sleep {secs}\n"))
+            .unwrap_or_default();
+        let script = format!(
+            "#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s\\n' \"$1\" \"$2\" \"$3\" \"$4\" \"$5\" \"$#\" >> \"{}\"\n{}exit 0\n",
+            log_file.display(),
+            sleep_cmd
+        );
+        let mut f = File::create(script_path).expect("create fake-codex");
+        f.write_all(script.as_bytes()).expect("write fake-codex");
+        f.sync_all().expect("sync fake-codex");
+        fs::set_permissions(script_path, fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755 fake-codex");
+    }
+
+    #[test]
+    fn notification_config_cli_flags_and_legacy_manifest_compatibility() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-compat",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Notification config & manifest compatibility"),
+        );
+
+        let codex_log = fixture.root.join("codex-cli-parse.log");
+        let fake_codex = fixture.root.join("bin/fake-codex-cli");
+        write_fake_codex_script(&fake_codex, &codex_log, None);
+
+        // Symlink launcher pointing to fake_codex is canonicalized to the real executable.
+        let launcher_symlink = fixture.root.join("bin/codex-launcher-link");
+        symlink(&fake_codex, &launcher_symlink).expect("create launcher symlink");
+
+        let notify_cfg = ApprovedHostNotificationConfig::new(launcher_symlink.clone(), 15_000)
+            .expect("canonicalize launcher symlink and validate executable");
+        assert_eq!(
+            notify_cfg.executable,
+            fs::canonicalize(&fake_codex).expect("canonical fake_codex")
+        );
+        let summary = notify_cfg.summary();
+        assert!(summary.enabled);
+        assert_eq!(summary.timeout_ms, Some(15_000));
+        let digest = summary
+            .executable_digest
+            .as_ref()
+            .expect("executable_digest present");
+        assert_eq!(digest.len(), 64);
+        assert!(!serde_json::to_string(&summary)
+            .expect("serialize summary")
+            .contains(&fixture.root.display().to_string()));
+
+        // Invalid executable paths and timeouts fail closed.
+        assert_eq!(
+            ApprovedHostNotificationConfig::new(PathBuf::new(), 1_000)
+                .expect_err("empty path rejected")
+                .code(),
+            "validation"
+        );
+        assert_eq!(
+            ApprovedHostNotificationConfig::new(PathBuf::from("relative/codex"), 1_000)
+                .expect_err("relative path rejected")
+                .code(),
+            "validation"
+        );
+        assert_eq!(
+            ApprovedHostNotificationConfig::new(
+                fixture.root.join("bin/../bin/fake-codex-cli"),
+                1_000
+            )
+            .expect_err("parent traversal rejected")
+            .code(),
+            "validation"
+        );
+        assert_eq!(
+            ApprovedHostNotificationConfig::new(fake_codex.clone(), 0)
+                .expect_err("0ms timeout rejected")
+                .code(),
+            "validation"
+        );
+        assert_eq!(
+            ApprovedHostNotificationConfig::new(fake_codex.clone(), MAX_CODEX_TIMEOUT_MS + 1)
+                .expect_err("excessive timeout rejected")
+                .code(),
+            "validation"
+        );
+        let non_exec = fixture.root.join("bin/non-exec-codex");
+        fs::write(&non_exec, "#!/bin/sh\nexit 0\n").expect("write non-exec");
+        fs::set_permissions(&non_exec, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 non-exec");
+        assert_eq!(
+            ApprovedHostNotificationConfig::new(non_exec, 1_000)
+                .expect_err("non-executable file rejected")
+                .code(),
+            "validation"
+        );
+
+        // CLI flag parsing: --notify-timeout-ms without --notify-codex fails closed.
+        let cli_timeout_only = HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--approval-id",
+            &approval_id,
+            "--notify-timeout-ms",
+            "5000",
+        ])
+        .expect("clap parses args");
+        match cli_timeout_only.command {
+            HostCommand::Serve(args) => {
+                let err = args
+                    .into_host_config()
+                    .expect_err("--notify-timeout-ms without --notify-codex must fail");
+                assert_eq!(err.code(), "validation");
+            }
+        }
+
+        // CLI flag parsing: --notify-codex without --notify-timeout-ms uses DEFAULT_CODEX_TIMEOUT_MS.
+        let cli_with_codex = HostCli::try_parse_from([
+            "threadlane-host",
+            "serve",
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--approval-id",
+            &approval_id,
+            "--notify-codex",
+            launcher_symlink.to_str().unwrap(),
+        ])
+        .expect("clap parses --notify-codex");
+        match cli_with_codex.command {
+            HostCommand::Serve(args) => {
+                let cfg = args.into_host_config().expect("valid host config");
+                let notif = cfg.notifications.expect("notifications enabled");
+                assert_eq!(notif.timeout_ms, DEFAULT_CODEX_TIMEOUT_MS);
+                assert_eq!(
+                    notif.executable,
+                    fs::canonicalize(&fake_codex).expect("canonical fake_codex")
+                );
+            }
+        }
+
+        // Legacy manifest JSON without `notifications` deserializes with disabled defaults.
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get approval record");
+        ensure_private_dir(&fixture.sessions_dir).expect("create sessions_dir");
+        let session_dir =
+            prepare_session_dir(&fixture.sessions_dir, &approval_id).expect("prepare session_dir");
+        let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+
+        let full_manifest = HostSessionManifest::from_approval_record(
+            &record,
+            Some("bnd_legacy_session".to_string()),
+            HostPhase::Stopped,
+            None,
+            None,
+            1_700_000_000_000,
+            1_700_000_000_500,
+        );
+        let mut legacy_json: serde_json::Value =
+            serde_json::to_value(&full_manifest).expect("manifest to value");
+        legacy_json
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("notifications");
+        let mut legacy_bytes = serde_json::to_vec_pretty(&legacy_json).expect("serialize legacy");
+        legacy_bytes.push(b'\n');
+        fs::write(&manifest_path, &legacy_bytes).expect("write legacy manifest");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 legacy manifest");
+
+        let loaded_legacy =
+            read_and_verify_host_manifest(&manifest_path, &record).expect("read legacy manifest");
+        assert_eq!(
+            loaded_legacy.notifications,
+            HostNotificationSummary::disabled()
+        );
+        assert_eq!(
+            loaded_legacy.to_summary().notifications,
+            HostNotificationSummary::disabled()
+        );
+
+        // Inconsistent notifications summaries in manifest fail closed with corrupt_manifest.
+        for bad_notifications in [
+            serde_json::json!({
+                "enabled": false,
+                "executable_digest": digest,
+                "timeout_ms": null
+            }),
+            serde_json::json!({
+                "enabled": false,
+                "executable_digest": null,
+                "timeout_ms": 5000
+            }),
+            serde_json::json!({
+                "enabled": true,
+                "executable_digest": null,
+                "timeout_ms": 5000
+            }),
+            serde_json::json!({
+                "enabled": true,
+                "executable_digest": digest,
+                "timeout_ms": null
+            }),
+            serde_json::json!({
+                "enabled": true,
+                "executable_digest": "not-a-valid-sha256",
+                "timeout_ms": 5000
+            }),
+            serde_json::json!({
+                "enabled": true,
+                "executable_digest": digest,
+                "timeout_ms": 0
+            }),
+            serde_json::json!({
+                "enabled": true,
+                "executable_digest": digest,
+                "timeout_ms": MAX_CODEX_TIMEOUT_MS + 1
+            }),
+        ] {
+            let mut bad_manifest = legacy_json.clone();
+            bad_manifest["notifications"] = bad_notifications;
+            let raw = serde_json::to_vec_pretty(&bad_manifest).expect("serialize bad manifest");
+            fs::write(&manifest_path, &raw).expect("write bad manifest");
+            fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 bad manifest");
+
+            let err = read_and_verify_host_manifest(&manifest_path, &record)
+                .expect_err("inconsistent notifications in manifest must fail closed");
+            assert_eq!(err.code(), "corrupt_manifest");
+            assert_eq!(
+                fs::read(&manifest_path).expect("preserved corrupt manifest"),
+                raw
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn host_notifications_default_off_opt_in_argv_pull_ack_coalescing_and_restart_reset() {
+        let fixture = setup_fixture();
+        let confidential_instruction =
+            "CONFIDENTIAL_WORKER_TASK_INSTRUCTION --model gemini-4-argon-high --effort high";
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-e2e",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks(confidential_instruction),
+        );
+
+        let codex_log = fixture.root.join("host-codex-invocations.log");
+        let fake_codex = fixture.root.join("bin/fake-codex-host");
+        write_fake_codex_script(&fake_codex, &codex_log, None);
+
+        // 1. Default OFF: starting ApprovedHost without notifications sends zero Codex wake-ups.
+        let host_off = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host with default notifications off");
+
+        assert_eq!(
+            host_off.summary().notifications,
+            HostNotificationSummary::disabled()
+        );
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect("dispatch task-root-oc while notifications disabled");
+        wait_for_task_status(&client, &approval_id, "task-root-oc", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !codex_log.exists(),
+            "disabled notifications must never invoke codex"
+        );
+
+        // Pull and ack the events from task-root-oc while notifications are off, verifying
+        // pull_events limit validation and scope checks.
+        for bad_limit in [0usize, APPROVED_EVENT_BATCH_MAX_EVENTS + 1, 50] {
+            let limit_err = client
+                .pull_events(&approval_id, None, Some(bad_limit))
+                .await
+                .expect_err("invalid pull_events limit must fail before mutation");
+            assert_eq!(limit_err.code(), "validation");
+        }
+
+        let wrong_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+        )
+        .expect("open wrong binding client");
+        assert_eq!(
+            wrong_client
+                .pull_events(&approval_id, None, None)
+                .await
+                .expect_err("wrong binding pull denied")
+                .code(),
+            "scope_mismatch"
+        );
+        assert_eq!(
+            wrong_client
+                .ack_events(&approval_id, "bat_fake".to_string())
+                .await
+                .expect_err("wrong binding ack denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        let initial_batch = client
+            .pull_events(&approval_id, None, None)
+            .await
+            .expect("pull initial batch");
+        assert!(!initial_batch.events.is_empty());
+        assert!(initial_batch.events.len() <= APPROVED_EVENT_BATCH_MAX_EVENTS);
+        let initial_ack = client
+            .ack_events(&approval_id, initial_batch.batch_id.clone())
+            .await
+            .expect("ack initial batch");
+        assert!(initial_ack.advanced);
+        assert_eq!(initial_ack.acked_seq, initial_batch.to_seq);
+        let prior_acked_seq = initial_ack.acked_seq;
+
+        // Retrying ack_events with the same batch_id uses the deterministic derived command_key
+        // and succeeds idempotently.
+        let retry_ack = client
+            .ack_events(&approval_id, initial_batch.batch_id.clone())
+            .await
+            .expect("idempotent retry ack_events");
+        assert_eq!(retry_ack, initial_ack);
+
+        host_off.shutdown().await.expect("shutdown host_off");
+
+        // 2. Restart with explicit opt-in notifications:
+        //    - Bootstrap phase must NOT send any wake-ups.
+        //    - Final supervisor sends exact 5-element argv for new events on session_binding.
+        let notify_cfg = ApprovedHostNotificationConfig::new(fake_codex.clone(), 2_000)
+            .expect("create notify_cfg");
+        let expected_notify_summary = notify_cfg.summary();
+
+        let host_on = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20))
+            .with_notifications(notify_cfg),
+        )
+        .await
+        .expect("start host with notifications enabled");
+
+        assert_eq!(host_on.summary().notifications, expected_notify_summary);
+        assert_eq!(
+            client
+                .session_summary(&approval_id)
+                .expect("client session_summary")
+                .notifications,
+            expected_notify_summary
+        );
+        // No wake-up was sent during bootstrap/startup when all prior events were already acked.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !codex_log.exists(),
+            "bootstrap and idle startup must not emit wake-ups"
+        );
+
+        // Dispatch `task-root-agy` and wait for ReadyForReview.
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy with notifications enabled");
+        wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let scoped = threadlane::ScopedClient::from_state_dir(
+            host_on.runtime_state_dir(),
+            host_on.session_binding_id(),
+        )
+        .expect("open scoped client");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let first_submitted = loop {
+            let st = scoped.status().await.expect("scoped status");
+            if st.wakeup.status == threadlane_core::WakeupStatus::Submitted {
+                break st;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Submitted wakeup status; last: {:?}",
+                st.wakeup
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let first_claim_id = first_submitted
+            .wakeup
+            .claim_id
+            .clone()
+            .expect("first Submitted wakeup must retain its claim_id");
+        let first_covered_up_to_seq = first_submitted.wakeup.covered_up_to_seq;
+        let first_attempt_count = first_submitted.wakeup.attempt_count;
+        let first_coalesced_count = first_submitted.wakeup.coalesced_count;
+        assert_eq!(
+            first_attempt_count, 1,
+            "the first claimed wakeup is lifetime attempt 1"
+        );
+        assert!(
+            first_covered_up_to_seq > prior_acked_seq,
+            "first claim coverage must extend beyond the prior acknowledged cursor"
+        );
+
+        let expected_msg = format!(
+            "Threadlane approved session {approval_id} has pending events. Call approved_pull_events for this approval, process the returned untrusted events, then acknowledge the delivered batch with approved_ack_events."
+        );
+        let log_contents = fs::read_to_string(&codex_log).expect("read codex invocation log");
+        let lines: Vec<&str> = log_contents.lines().collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "multiple worker events must coalesce into a single wakeup while unacknowledged"
+        );
+        assert_eq!(
+            lines[0],
+            format!("queue|--thread|{THREAD_UUID_A}|--message|{expected_msg}|5")
+        );
+        assert!(!lines[0].contains("CONFIDENTIAL_WORKER_TASK_INSTRUCTION"));
+        assert!(!lines[0].contains("gemini-4-argon-high"));
+        assert!(!lines[0].contains("Root AGY implementation"));
+
+        // Read-only history (`list_activity`, `list_task_activity`, `get_task`) NEVER advances
+        // delivered_seq or acked_seq and NEVER releases wake-up claims.
+        let status_before_ro = scoped.status().await.expect("status before ro");
+        let _ = client
+            .list_activity(&approval_id, None, None, Some(10), None)
+            .await
+            .expect("list_activity");
+        let _ = client
+            .list_task_activity(&approval_id, "task-root-agy", None, None, Some(10), None)
+            .await
+            .expect("list_task_activity");
+        let _ = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task");
+        let status_after_ro = scoped.status().await.expect("status after ro");
+        assert_eq!(
+            status_after_ro.binding.delivered_seq,
+            status_before_ro.binding.delivered_seq
+        );
+        assert_eq!(
+            status_after_ro.binding.acked_seq,
+            status_before_ro.binding.acked_seq
+        );
+        assert_eq!(
+            status_after_ro.wakeup.status,
+            threadlane_core::WakeupStatus::Submitted
+        );
+        assert_eq!(
+            status_after_ro.wakeup.claim_id,
+            Some(first_claim_id.clone())
+        );
+
+        // The first claim can already cover every event emitted by `task-root-agy`. Start a real
+        // scoped demo run on the same host session after the claim so later important events exist,
+        // and prove they coalesce into the existing unacknowledged claim without another invocation.
+        let extra_demo_instruction =
+            "CONFIDENTIAL_EXTRA_DEMO_PROSE_DO_NOT_LEAK --model gemini-4-argon-high";
+        let extra_demo = scoped
+            .start_demo(
+                "notify-e2e-extra-demo-start".to_string(),
+                extra_demo_instruction.to_string(),
+                Some(10),
+            )
+            .await
+            .expect("start extra scoped demo run");
+        let demo_deadline = Instant::now() + Duration::from_secs(5);
+        let extra_demo_waiting = loop {
+            let run = scoped
+                .get_run(extra_demo.run_id.clone())
+                .await
+                .expect("get_run extra demo");
+            if run.status == threadlane_core::RunStatus::WaitingInput {
+                break run;
+            }
+            assert!(
+                Instant::now() < demo_deadline,
+                "timed out waiting for extra demo WaitingInput; last run: {run:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(extra_demo_waiting.revision, 1);
+        assert!(extra_demo_waiting.active_question_id.is_some());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let coalesced_status = scoped.status().await.expect("status after extra demo");
+        assert_eq!(
+            coalesced_status.wakeup.status,
+            threadlane_core::WakeupStatus::Submitted
+        );
+        assert_eq!(
+            coalesced_status.wakeup.claim_id.as_deref(),
+            Some(first_claim_id.as_str())
+        );
+        assert_eq!(
+            coalesced_status.wakeup.covered_up_to_seq,
+            first_covered_up_to_seq
+        );
+        assert_eq!(
+            coalesced_status.wakeup.attempt_count, first_attempt_count,
+            "coalesced important events must not increment the lifetime attempt count"
+        );
+        assert!(
+            coalesced_status.wakeup.latest_important_seq > first_covered_up_to_seq,
+            "extra demo must emit a later important event beyond the first claim coverage"
+        );
+        assert!(
+            coalesced_status.wakeup.coalesced_count > first_coalesced_count,
+            "later important events must remain coalesced into the unacknowledged claim"
+        );
+
+        let log_after_coalescing =
+            fs::read_to_string(&codex_log).expect("read codex log after coalescing");
+        assert_eq!(
+            log_after_coalescing.lines().count(),
+            1,
+            "later important events must coalesce into the existing single unacknowledged wakeup"
+        );
+        assert!(!log_after_coalescing.contains("CONFIDENTIAL_EXTRA_DEMO_PROSE_DO_NOT_LEAK"));
+
+        // Acknowledge exactly through the first claim's coverage. The bounded count is derived from
+        // the real prior acknowledged cursor, and the resulting batch must end at that exact seq.
+        let first_claim_span = first_covered_up_to_seq - prior_acked_seq;
+        assert!(
+            (1..=APPROVED_EVENT_BATCH_MAX_EVENTS as u64).contains(&first_claim_span),
+            "first claim span {first_claim_span} must fit one approved batch (1..={APPROVED_EVENT_BATCH_MAX_EVENTS})"
+        );
+        let batch_part1 = client
+            .pull_events(
+                &approval_id,
+                Some(prior_acked_seq),
+                Some(first_claim_span as usize),
+            )
+            .await
+            .expect("pull through first claim coverage");
+        assert_eq!(batch_part1.from_seq, prior_acked_seq + 1);
+        assert_eq!(
+            batch_part1.to_seq, first_covered_up_to_seq,
+            "partial pull must end exactly at the first claim's covered_up_to_seq"
+        );
+        assert_eq!(batch_part1.events.len() as u64, first_claim_span);
+        let first_ack = client
+            .ack_events(&approval_id, batch_part1.batch_id.clone())
+            .await
+            .expect("ack first claim coverage");
+        assert!(first_ack.advanced);
+        assert_eq!(first_ack.acked_seq, first_covered_up_to_seq);
+
+        let deadline_second = Instant::now() + Duration::from_secs(5);
+        let second_submitted = loop {
+            let st = scoped
+                .status()
+                .await
+                .expect("scoped status after first coverage ack");
+            if st.wakeup.status == threadlane_core::WakeupStatus::Submitted
+                && st.wakeup.claim_id.as_deref() != Some(first_claim_id.as_str())
+            {
+                break st;
+            }
+            assert!(
+                Instant::now() < deadline_second,
+                "timed out waiting for the second Submitted wakeup claim; last: {:?}",
+                st.wakeup
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let second_claim_id = second_submitted
+            .wakeup
+            .claim_id
+            .clone()
+            .expect("second Submitted wakeup must retain its claim_id");
+        assert_ne!(second_claim_id, first_claim_id);
+        assert_eq!(
+            second_submitted.wakeup.attempt_count,
+            first_attempt_count + 1,
+            "attempt_count is cumulative across the binding lifetime"
+        );
+        assert!(
+            second_submitted.wakeup.covered_up_to_seq > first_covered_up_to_seq,
+            "second claim coverage must include the later important events"
+        );
+        let second_covered_up_to_seq = second_submitted.wakeup.covered_up_to_seq;
+
+        let log_after_second =
+            fs::read_to_string(&codex_log).expect("read codex log after second wakeup");
+        let second_lines: Vec<&str> = log_after_second.lines().collect();
+        assert_eq!(
+            second_lines.len(),
+            2,
+            "releasing the first claim must produce exactly one additional wakeup invocation"
+        );
+        assert_eq!(
+            second_lines[1],
+            format!("queue|--thread|{THREAD_UUID_A}|--message|{expected_msg}|5")
+        );
+        assert!(!second_lines[1].contains("CONFIDENTIAL_EXTRA_DEMO_PROSE_DO_NOT_LEAK"));
+        assert!(!second_lines[1].contains("gemini-4-argon-high"));
+        assert!(!second_lines[1].contains("Root AGY implementation"));
+
+        // Stop the extra demo while the second claim is still Submitted. The demo cancel endpoint
+        // is revision-free, so fetch the real current Run first and bind the deterministic
+        // idempotency key to its actual revision before cleaning up the fixture.
+        let extra_demo_current = scoped
+            .get_run(extra_demo_waiting.run_id.clone())
+            .await
+            .expect("get_run before cancelling extra demo");
+        assert_eq!(
+            extra_demo_current.status,
+            threadlane_core::RunStatus::WaitingInput
+        );
+        assert_eq!(extra_demo_current.revision, extra_demo_waiting.revision);
+        let cancelled_extra_demo = scoped
+            .cancel(
+                format!(
+                    "notify-e2e-extra-demo-cancel-r{}",
+                    extra_demo_current.revision
+                ),
+                extra_demo_current.run_id.clone(),
+                Some("notification coalescing fixture cleanup".to_string()),
+            )
+            .await
+            .expect("cancel extra demo before final ack");
+        assert_eq!(
+            cancelled_extra_demo.status,
+            threadlane_core::RunStatus::Cancelled
+        );
+        assert_eq!(cancelled_extra_demo.revision, extra_demo_current.revision);
+        let status_after_cancel = scoped
+            .status()
+            .await
+            .expect("status after extra demo cancel");
+        assert_eq!(
+            status_after_cancel.wakeup.status,
+            threadlane_core::WakeupStatus::Submitted
+        );
+        assert_eq!(
+            status_after_cancel.wakeup.claim_id.as_deref(),
+            Some(second_claim_id.as_str())
+        );
+        assert_eq!(
+            status_after_cancel.wakeup.attempt_count,
+            first_attempt_count + 1
+        );
+        assert_eq!(
+            fs::read_to_string(&codex_log)
+                .expect("read codex log after extra demo cancel")
+                .lines()
+                .count(),
+            2,
+            "cancelling the extra demo is not important and must not wake again"
+        );
+
+        let batch_rest = client
+            .pull_events(&approval_id, None, Some(APPROVED_EVENT_BATCH_MAX_EVENTS))
+            .await
+            .expect("pull remaining events");
+        assert_eq!(batch_rest.from_seq, first_covered_up_to_seq + 1);
+        assert!(!batch_rest.events.is_empty());
+        assert!(batch_rest.to_seq >= second_covered_up_to_seq);
+        let ack_rest = client
+            .ack_events(&approval_id, batch_rest.batch_id)
+            .await
+            .expect("ack remaining events");
+        assert_eq!(ack_rest.acked_seq, batch_rest.to_seq);
+
+        let st_idle = scoped.status().await.expect("status after full ack");
+        assert_eq!(st_idle.wakeup.status, threadlane_core::WakeupStatus::Idle);
+        assert_eq!(st_idle.wakeup.claim_id, None);
+        assert_eq!(st_idle.binding.acked_seq, batch_rest.to_seq);
+
+        host_on.shutdown().await.expect("shutdown host_on");
+
+        // 3. Restarting without `.with_notifications(...)` must NOT silently restore notifications
+        //    from the prior manifest; it resets to disabled (`enabled: false`).
+        let host_restarted_default = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("restart host with default config");
+        assert_eq!(
+            host_restarted_default.summary().notifications,
+            HostNotificationSummary::disabled()
+        );
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            fs::read_to_string(&codex_log)
+                .expect("read codex log after default restart")
+                .lines()
+                .count(),
+            2,
+            "restarting without explicit opt-in must not restore notifications"
+        );
+        host_restarted_default
+            .shutdown()
+            .await
+            .expect("shutdown restarted host");
+    }
+
+    #[tokio::test]
+    async fn host_notification_timeout_records_unknown_without_replay_and_worker_completes() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-timeout",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Timeout notification test"),
+        );
+
+        let slow_codex_log = fixture.root.join("slow-codex-host.log");
+        let slow_codex = fixture.root.join("bin/slow-codex-host");
+        write_fake_codex_script(&slow_codex, &slow_codex_log, Some(30));
+
+        let notify_cfg =
+            ApprovedHostNotificationConfig::new(slow_codex, 80).expect("80ms timeout config");
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(15))
+            .with_notifications(notify_cfg),
+        )
+        .await
+        .expect("start host with slow codex");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+
+        let completed = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(completed.status, TaskExecutionStatus::ReadyForReview);
+        assert!(!completed.accepted);
+
+        let scoped = threadlane::ScopedClient::from_state_dir(
+            host.runtime_state_dir(),
+            host.session_binding_id(),
+        )
+        .expect("open scoped client");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = scoped.status().await.expect("scoped status");
+            if st.wakeup.status == threadlane_core::WakeupStatus::Unknown {
+                assert_eq!(st.wakeup.attempt_count, 1);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Unknown wakeup status; last: {:?}",
+                st.wakeup
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Wait several ticks to prove Unknown wake-up claim is never automatically replayed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let st_after = scoped.status().await.expect("scoped status after wait");
+        assert_eq!(
+            st_after.wakeup.status,
+            threadlane_core::WakeupStatus::Unknown
+        );
+        assert_eq!(st_after.wakeup.attempt_count, 1);
+        let logged = fs::read_to_string(&slow_codex_log).expect("read slow codex log");
+        assert_eq!(logged.lines().count(), 1);
 
         host.shutdown().await.expect("shutdown host");
     }

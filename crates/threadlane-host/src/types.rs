@@ -1,8 +1,15 @@
+use std::fs;
+use std::path::{Component, PathBuf};
+
 use serde::{Deserialize, Serialize};
-use threadlane::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus};
+use sha2::{Digest, Sha256};
+use threadlane::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus, MAX_CODEX_TIMEOUT_MS};
 use threadlane_authority::ApprovalRecord;
 use threadlane_registry::ToolAdapter;
-use threadlane_workers::WorkerProvider;
+use threadlane_workers::{validate_executable_file, WorkerProvider};
+
+use crate::error::HostError;
+use crate::storage::{ensure_no_symlink_components, validate_hex_digest};
 
 /// Current on-disk schema version for `host-manifest.json`.
 pub const HOST_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -33,6 +40,178 @@ pub const MAX_HOST_MANIFEST_BYTES: usize = 65_536;
 
 /// Maximum permitted byte size when reading or writing `task-receipts.json` (`64 KiB`).
 pub const MAX_TASK_RECEIPTS_BYTES: usize = 65_536;
+
+/// Default and maximum event batch count (`20`) for [`crate::ApprovedHostClient::pull_events`].
+pub const APPROVED_EVENT_BATCH_MAX_EVENTS: usize = 20;
+
+/// Maximum serialized JSON byte budget (`49_152` bytes / `48 KiB`) for [`crate::ApprovedHostClient::pull_events`].
+pub const APPROVED_EVENT_BATCH_MAX_BYTES: usize = 49_152;
+
+/// Explicit opt-in configuration for approved-session Codex wake-up notifications on [`crate::ApprovedHost`].
+///
+/// Disabled by default. When configured, the executable path is canonicalized and validated as an
+/// absolute regular executable file and `timeout_ms` is bounded to `1..=MAX_CODEX_TIMEOUT_MS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovedHostNotificationConfig {
+    /// Canonical absolute path to the validated Codex executable.
+    pub executable: PathBuf,
+    /// Bounded timeout in milliseconds (`1..=MAX_CODEX_TIMEOUT_MS`) for each Codex queue invocation.
+    pub timeout_ms: u64,
+}
+
+impl ApprovedHostNotificationConfig {
+    /// Canonicalizes trusted launcher symlinks (such as `/bin/sh` on NixOS) and validates that the
+    /// resulting canonical path is an absolute non-symlink regular executable file and that
+    /// `timeout_ms` is within `1..=MAX_CODEX_TIMEOUT_MS`.
+    pub fn new(executable: PathBuf, timeout_ms: u64) -> Result<Self, HostError> {
+        if executable.as_os_str().is_empty() {
+            return Err(HostError::validation(
+                "executable",
+                "codex executable path must not be empty",
+            ));
+        }
+        for comp in executable.components() {
+            if matches!(comp, Component::CurDir | Component::ParentDir) {
+                return Err(HostError::validation(
+                    "executable",
+                    format!(
+                        "codex executable path `{}` must not contain `.` or `..` traversal components",
+                        executable.display()
+                    ),
+                ));
+            }
+        }
+        if !executable.is_absolute() {
+            return Err(HostError::validation(
+                "executable",
+                format!(
+                    "codex executable path `{}` must be an absolute path",
+                    executable.display()
+                ),
+            ));
+        }
+        if timeout_ms == 0 || timeout_ms > MAX_CODEX_TIMEOUT_MS {
+            return Err(HostError::validation(
+                "timeout_ms",
+                format!("notify timeout_ms must be between 1 and {MAX_CODEX_TIMEOUT_MS} ms"),
+            ));
+        }
+
+        let canonical = fs::canonicalize(&executable).map_err(|err| {
+            HostError::validation(
+                "executable",
+                format!(
+                    "failed to canonicalize codex executable `{}`: {err}",
+                    executable.display()
+                ),
+            )
+        })?;
+        let checked = ensure_no_symlink_components(&canonical)?;
+        let validated = validate_executable_file(&checked).map_err(|err| {
+            HostError::validation(
+                "executable",
+                format!(
+                    "canonical target `{}` (resolved from `{}`) is not a valid regular executable: {err}",
+                    checked.display(),
+                    executable.display()
+                ),
+            )
+        })?;
+
+        Ok(Self {
+            executable: validated,
+            timeout_ms,
+        })
+    }
+
+    /// Returns a safe, path-free [`HostNotificationSummary`] where `executable_digest` is the
+    /// 64-character lowercase hex SHA-256 of the canonical executable path string.
+    pub fn summary(&self) -> HostNotificationSummary {
+        let canonical_str = fs::canonicalize(&self.executable)
+            .unwrap_or_else(|_| self.executable.clone())
+            .to_string_lossy()
+            .into_owned();
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_str.as_bytes());
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in &digest {
+            use std::fmt::Write as _;
+            let _ = write!(&mut hex, "{byte:02x}");
+        }
+        HostNotificationSummary {
+            enabled: true,
+            executable_digest: Some(hex),
+            timeout_ms: Some(self.timeout_ms),
+        }
+    }
+}
+
+/// Safe, path-free notification policy summary recorded in [`HostSessionManifest`] and
+/// [`HostSessionSummary`].
+///
+/// Reports only whether host notification policy is configured for the session (never delivery
+/// proof) and never contains raw local filesystem paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct HostNotificationSummary {
+    /// Whether optional Codex wake-up notifications are enabled for this host session.
+    pub enabled: bool,
+    /// 64-character lowercase hex SHA-256 digest of the canonical Codex executable path when `enabled` is `true`; `None` when disabled.
+    pub executable_digest: Option<String>,
+    /// Bounded timeout in milliseconds (`1..=MAX_CODEX_TIMEOUT_MS`) when `enabled` is `true`; `None` when disabled.
+    pub timeout_ms: Option<u64>,
+}
+
+impl HostNotificationSummary {
+    /// Returns the default disabled notification summary (`enabled: false`, no digest or timeout).
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            executable_digest: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// Validates internal field consistency of this [`HostNotificationSummary`]:
+    /// - When `enabled == false`, both `executable_digest` and `timeout_ms` must be `None`.
+    /// - When `enabled == true`, `executable_digest` must be a valid 64-char lowercase hex SHA-256
+    ///   digest and `timeout_ms` must be in `1..=MAX_CODEX_TIMEOUT_MS`.
+    pub fn validate(&self) -> Result<(), HostError> {
+        if !self.enabled {
+            if self.executable_digest.is_some() || self.timeout_ms.is_some() {
+                return Err(HostError::validation(
+                    "notifications",
+                    "disabled notifications summary must have executable_digest=None and timeout_ms=None",
+                ));
+            }
+            return Ok(());
+        }
+
+        let Some(ref digest) = self.executable_digest else {
+            return Err(HostError::validation(
+                "notifications.executable_digest",
+                "enabled notifications summary requires executable_digest",
+            ));
+        };
+        validate_hex_digest("notifications.executable_digest", digest)?;
+
+        let Some(timeout_ms) = self.timeout_ms else {
+            return Err(HostError::validation(
+                "notifications.timeout_ms",
+                "enabled notifications summary requires timeout_ms",
+            ));
+        };
+        if timeout_ms == 0 || timeout_ms > MAX_CODEX_TIMEOUT_MS {
+            return Err(HostError::validation(
+                "notifications.timeout_ms",
+                format!("notifications timeout_ms must be between 1 and {MAX_CODEX_TIMEOUT_MS} ms"),
+            ));
+        }
+
+        Ok(())
+    }
+}
 
 /// Lifecycle phase recorded in a per-session [`HostSessionManifest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +321,9 @@ pub struct HostSessionManifest {
     pub native_route_task_ids: Vec<String>,
     /// Explicit execution and review gates enforced by this host session.
     pub gates: HostExecutionGates,
+    /// Configured host notification policy summary (disabled by default; never implies delivery proof).
+    #[serde(default)]
+    pub notifications: HostNotificationSummary,
     /// Sanitized, bounded failure diagnostic when `phase` is [`HostPhase::Failed`].
     pub last_error: Option<String>,
     /// Timestamp (ms since Unix epoch) when the session manifest was first created.
@@ -203,10 +385,17 @@ impl HostSessionManifest {
             dependent_task_ids,
             native_route_task_ids,
             gates: HostExecutionGates::for_ready_state(ready),
+            notifications: HostNotificationSummary::disabled(),
             last_error,
             created_at_ms,
             updated_at_ms,
         }
+    }
+
+    /// Sets the configured [`HostNotificationSummary`] on this manifest.
+    pub fn with_notifications(mut self, notifications: HostNotificationSummary) -> Self {
+        self.notifications = notifications;
+        self
     }
 
     /// Projects this manifest into a safe [`HostSessionSummary`] omitting any local path material or PIDs.
@@ -226,6 +415,7 @@ impl HostSessionManifest {
             dependent_task_ids: self.dependent_task_ids.clone(),
             native_route_task_ids: self.native_route_task_ids.clone(),
             gates: self.gates.clone(),
+            notifications: self.notifications.clone(),
             last_error: self.last_error.clone(),
         }
     }
@@ -263,6 +453,9 @@ pub struct HostSessionSummary {
     pub native_route_task_ids: Vec<String>,
     /// Explicit execution and review gates enforced by this host session.
     pub gates: HostExecutionGates,
+    /// Configured host notification policy summary (disabled by default; never implies delivery proof).
+    #[serde(default)]
+    pub notifications: HostNotificationSummary,
     /// Sanitized failure diagnostic when `phase` is [`HostPhase::Failed`].
     pub last_error: Option<String>,
 }

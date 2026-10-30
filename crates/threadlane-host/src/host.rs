@@ -1,8 +1,12 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use threadlane::{ScopedClient, Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
+use threadlane::{
+    ApprovedSessionWakeupContext, CodexWakeupConfig, ScopedClient, Supervisor, SupervisorClient,
+    SupervisorConfig, SupervisorHandle,
+};
 use threadlane_authority::{ApprovalRecord, AuthorityStore, MaterializedPlan};
 use threadlane_core::Binding;
 use threadlane_plans::PlanStore;
@@ -14,8 +18,8 @@ use crate::storage::{
     validate_approval_id, validate_sessions_root, write_host_manifest, HostSessionLock,
 };
 use crate::types::{
-    HostExecutionGates, HostPhase, HostSessionManifest, HostSessionSummary, RUNTIME_STATE_SUBDIR,
-    WORK_AREA_SUBDIR,
+    ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
+    HostSessionManifest, HostSessionSummary, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 
 /// Default supervisor tick interval (`50ms`) used by [`ApprovedHostConfig`].
@@ -36,10 +40,12 @@ pub struct ApprovedHostConfig {
     pub approval_id: String,
     /// Background tick interval for the session supervisor.
     pub tick_interval: Duration,
+    /// Optional explicit opt-in Codex wake-up notification configuration (`None` / disabled by default).
+    pub notifications: Option<ApprovedHostNotificationConfig>,
 }
 
 impl ApprovedHostConfig {
-    /// Creates a new [`ApprovedHostConfig`] with [`DEFAULT_HOST_TICK_INTERVAL`].
+    /// Creates a new [`ApprovedHostConfig`] with [`DEFAULT_HOST_TICK_INTERVAL`] and notifications disabled (`None`).
     pub fn new(
         registry_dir: impl Into<PathBuf>,
         plans_dir: impl Into<PathBuf>,
@@ -54,12 +60,19 @@ impl ApprovedHostConfig {
             sessions_dir: sessions_dir.into(),
             approval_id: approval_id.into(),
             tick_interval: DEFAULT_HOST_TICK_INTERVAL,
+            notifications: None,
         }
     }
 
     /// Overrides the supervisor background tick interval.
     pub fn with_tick_interval(mut self, tick_interval: Duration) -> Self {
         self.tick_interval = tick_interval;
+        self
+    }
+
+    /// Enables optional Codex wake-up notifications for this host session.
+    pub fn with_notifications(mut self, config: ApprovedHostNotificationConfig) -> Self {
+        self.notifications = Some(config);
         self
     }
 }
@@ -93,24 +106,57 @@ impl ApprovedHost {
                 ("authority_dir", authority.dir()),
             ],
         )?;
-        Self::start_with_authority(
+        Self::start_with_authority_and_notifications(
             authority,
             &config.sessions_dir,
             &config.approval_id,
             config.tick_interval,
+            config.notifications,
         )
         .await
     }
 
-    /// Starts the host session for `approval_id` using an already opened [`AuthorityStore`].
+    /// Starts the host session for `approval_id` using an already opened [`AuthorityStore`]
+    /// with notifications disabled (`None`).
     pub async fn start_with_authority(
         authority: Arc<AuthorityStore>,
         sessions_dir: impl AsRef<Path>,
         approval_id: impl AsRef<str>,
         tick_interval: Duration,
     ) -> Result<ApprovedHostHandle, HostError> {
+        Self::start_with_authority_and_notifications(
+            authority,
+            sessions_dir,
+            approval_id,
+            tick_interval,
+            None,
+        )
+        .await
+    }
+
+    /// Starts the host session for `approval_id` using an already opened [`AuthorityStore`]
+    /// and an optional explicit [`ApprovedHostNotificationConfig`].
+    pub async fn start_with_authority_and_notifications(
+        authority: Arc<AuthorityStore>,
+        sessions_dir: impl AsRef<Path>,
+        approval_id: impl AsRef<str>,
+        tick_interval: Duration,
+        notifications: Option<ApprovedHostNotificationConfig>,
+    ) -> Result<ApprovedHostHandle, HostError> {
         let approval_id = approval_id.as_ref();
         validate_approval_id(approval_id)?;
+
+        let validated_notifications = match notifications {
+            Some(cfg) => Some(ApprovedHostNotificationConfig::new(
+                cfg.executable,
+                cfg.timeout_ms,
+            )?),
+            None => None,
+        };
+        let notify_summary = validated_notifications
+            .as_ref()
+            .map(ApprovedHostNotificationConfig::summary)
+            .unwrap_or_default();
 
         // Read and integrity-verify the persisted immutable approval record.
         // Host startup never calls `approve`.
@@ -129,6 +175,8 @@ impl ApprovedHost {
 
         // Read and validate any pre-existing manifest before touching state.
         // If the manifest on disk is corrupt, preserve it untouched and release host_lock.
+        // Note: notification config is NEVER restored from an old manifest on restart;
+        // notification opt-in is strictly an explicit startup choice on each host start.
         let existing_manifest = read_host_manifest_optional(&session_dir, &record)?;
         let prior_session_binding_id = existing_manifest
             .as_ref()
@@ -147,7 +195,8 @@ impl ApprovedHost {
             None,
             created_at_ms,
             now_epoch_ms(),
-        );
+        )
+        .with_notifications(notify_summary.clone());
         write_host_manifest(&session_dir, &boot_manifest)?;
 
         let mut known_session_binding_id = prior_session_binding_id;
@@ -159,6 +208,8 @@ impl ApprovedHost {
             created_at_ms,
             pid,
             tick_interval,
+            validated_notifications.as_ref(),
+            &notify_summary,
             &mut known_session_binding_id,
         )
         .await;
@@ -192,7 +243,8 @@ impl ApprovedHost {
                     Some(sanitize_error_diagnostic(&err)),
                     created_at_ms,
                     now_epoch_ms(),
-                );
+                )
+                .with_notifications(notify_summary);
                 let _ = write_host_manifest(&session_dir, &failed_manifest);
                 drop(host_lock);
                 Err(err)
@@ -200,6 +252,8 @@ impl ApprovedHost {
         }
     }
 
+    // Bootstrap and launch receives the validated host startup context in one place.
+    #[allow(clippy::too_many_arguments)]
     async fn bootstrap_and_launch(
         authority: &AuthorityStore,
         record: &ApprovalRecord,
@@ -207,6 +261,8 @@ impl ApprovedHost {
         created_at_ms: i64,
         pid: u32,
         tick_interval: Duration,
+        notifications: Option<&ApprovedHostNotificationConfig>,
+        notify_summary: &HostNotificationSummary,
         known_session_binding_id: &mut Option<String>,
     ) -> Result<
         (
@@ -323,7 +379,8 @@ impl ApprovedHost {
             None,
             created_at_ms,
             now_epoch_ms(),
-        );
+        )
+        .with_notifications(notify_summary.clone());
         write_host_manifest(session_dir, &mid_manifest)?;
 
         // Phase 2: Materialize the frozen approval against the actual session Binding and
@@ -338,10 +395,25 @@ impl ApprovedHost {
             });
         }
 
+        let final_codex = match notifications {
+            Some(notify_cfg) => {
+                let approved_ctx = ApprovedSessionWakeupContext::new(record.approval_id.clone())?;
+                let codex_cfg = CodexWakeupConfig {
+                    executable: notify_cfg.executable.clone(),
+                    notify_bindings: BTreeSet::from([session_binding.binding_id.clone()]),
+                    timeout: Duration::from_millis(notify_cfg.timeout_ms),
+                    approved_session: Some(approved_ctx),
+                };
+                codex_cfg.validate()?;
+                Some(codex_cfg)
+            }
+            None => None,
+        };
+
         let final_config = SupervisorConfig {
             state_dir: runtime_state_dir.clone(),
             tick_interval,
-            codex: None,
+            codex: final_codex,
             workers: materialized.workers.clone(),
         };
         let final_handle = Supervisor::start(final_config).await?;
@@ -407,7 +479,8 @@ impl ApprovedHost {
                 None,
                 created_at_ms,
                 now_epoch_ms(),
-            );
+            )
+            .with_notifications(notify_summary.clone());
             write_host_manifest(session_dir, &ready_manifest)?;
             Ok(ready_manifest)
         }
