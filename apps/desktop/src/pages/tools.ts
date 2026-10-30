@@ -10,6 +10,7 @@ import type {
   ToolDefinition,
 } from '../registry/types.ts';
 import { createButton, h } from '../ui/dom.ts';
+import { planDetectedEffortUpdates } from './effort-setup.ts';
 
 type Adapter = ToolDefinition['adapter'];
 type Provider = 'jev' | 'openai';
@@ -1952,7 +1953,7 @@ export class ToolsPage {
         h(
           'p',
           { className: 'aq-tools-hint' },
-          'Select new models to use in Profiles, then click Add selected models. Already-added models stay saved with their existing settings.'
+          'Select new models to use in Profiles, then click Add selected models. Imported models keep any detected effort options. Already-added models stay saved with their existing settings.'
         )
       ),
       this.button('Close', closePicker, `close-picker-${tool.id}`)
@@ -2023,6 +2024,42 @@ export class ToolsPage {
     const stateEl = h('div', { className: 'aq-tools-catalog-state', role: 'status' });
     const listEl = h('div', { className: 'aq-tools-catalog aq-tools-catalog-list' });
     const actionsEl = h('div', { className: 'aq-tools-actions aq-tools-form-actions' });
+    const effortPlan = planDetectedEffortUpdates(
+      this.snapshot?.models ?? [],
+      catalogModels,
+      tool.id
+    );
+    const effortUpdateCount = effortPlan.updates.length;
+    const effortUpdating = this.pending.has(`effort-fill:${tool.id}`);
+    const effortBlock =
+      effortUpdateCount > 0
+        ? h(
+            'div',
+            {
+              className: 'aq-tools-catalog-state',
+              role: 'group',
+              'aria-label': 'Fill missing effort options',
+            },
+            h(
+              'p',
+              { className: 'aq-tools-hint' },
+              `Detected effort options are available for ${effortUpdateCount} saved model${effortUpdateCount === 1 ? '' : 's'} on this tool with no saved effort metadata. This fills only the missing options and never overwrites a nonempty customized effort list. It keeps saved labels, model arguments, allow-without-effort choices, and existing profile assignments, and it does not add or remove models. Detected options are catalog metadata, not runtime verification.`
+            ),
+            h(
+              'div',
+              { className: 'aq-tools-actions aq-tools-form-actions' },
+              this.button(
+                effortUpdating
+                  ? 'Updating effort options…'
+                  : `Use detected effort options (${effortUpdateCount})`,
+                () => void this.applyDetectedEfforts(tool, catalogModels),
+                `${key}-fill-efforts`,
+                undefined,
+                effortUpdating
+              )
+            )
+          )
+        : null;
 
     const matchesSearch = (model: ModelDefinition, rawQuery: string): boolean => {
       const q = rawQuery.trim().toLowerCase();
@@ -2145,6 +2182,7 @@ export class ToolsPage {
       catalogModels.length > 0 ? searchInput : null,
       stateEl,
       listEl,
+      effortBlock,
       actionsEl
     );
   }
@@ -2379,7 +2417,7 @@ export class ToolsPage {
           h(
             'p',
             { className: 'aq-note' },
-            'Models added from tool catalogs or manual setup appear here. You can customize supported effort levels on any saved model.'
+            'Models added from tool catalogs or manual setup appear here. Catalog imports keep any detected effort options; you can review or edit them on any saved model. Detected options are metadata, not runtime verification.'
           )
         ),
         h(
@@ -2498,7 +2536,7 @@ export class ToolsPage {
             ? h(
                 'p',
                 { className: 'aq-note' },
-                'Efforts are entered manually. Do not add an effort the provider may not support; catalog metadata is not verification.'
+                'Optional manual override: enter effort options yourself. Catalog metadata is not runtime verification.'
               )
             : null
         ),
@@ -2670,7 +2708,11 @@ export class ToolsPage {
               ),
               this.field('Label', label),
               this.field('Model arg', arg),
-              this.field('Efforts', efforts, 'Manual entries only. No effort is inferred from a model name.'),
+              this.field(
+                'Efforts',
+                efforts,
+                'Detected options come from the catalog when available. You can edit them or add manual entries; catalog metadata is not runtime verification.'
+              ),
               this.checkField('Allow selection without effort', allow)
             ),
             this.conflictBlock(
@@ -2853,7 +2895,7 @@ export class ToolsPage {
             ? h(
                 'span',
                 { className: 'aq-tools-hint' },
-                'Already added for this tool. Existing label, model arg, and effort settings are preserved.'
+                'Already added for this tool. Existing label, model argument, effort options, and profile assignments are preserved.'
               )
             : usedByOtherTool
               ? h(
@@ -2864,7 +2906,7 @@ export class ToolsPage {
               : h(
                   'span',
                   { className: 'aq-tools-hint' },
-                  'Catalog-reported metadata; effort support remains unverified.'
+                  'Detected effort options are catalog metadata, not runtime verification.'
                 )
         )
       ),
@@ -3423,10 +3465,42 @@ export class ToolsPage {
       this.notice = {
         tone: 'success',
         title: 'Models added',
-        text: `Added ${models.length} model${models.length === 1 ? '' : 's'} for ${tool.label} at revision ${next.revision}. You can now assign ${models.length === 1 ? 'it' : 'them'} in Profiles.`,
+        text: `Added ${models.length} model${models.length === 1 ? '' : 's'} for ${tool.label} at revision ${next.revision}. Catalog metadata, including any detected effort options, was kept. You can now assign ${models.length === 1 ? 'it' : 'them'} in Profiles.`,
         showOpenProfiles: true,
       };
     });
+  }
+
+  private async applyDetectedEfforts(
+    tool: ToolDefinition,
+    catalogModels: readonly ModelDefinition[]
+  ): Promise<void> {
+    if (this.disposed || !this.snapshot) return;
+    const key = `effort-fill:${tool.id}`;
+    if (this.pending.has(key)) return;
+    const plan = planDetectedEffortUpdates(this.snapshot.models, catalogModels, tool.id);
+    const count = plan.updates.length;
+    if (count === 0) {
+      this.notice = {
+        tone: 'info',
+        title: 'No missing effort options',
+        text: `No saved model on ${tool.label} matches a catalog model ID and model argument with empty effort options. Nothing was written.`,
+      };
+      this.refresh();
+      return;
+    }
+    await this.apply(
+      key,
+      { op: 'upsert_models', models: plan.updates },
+      () => {
+        this.notice = {
+          tone: 'success',
+          title: 'Effort options updated',
+          text: `Updated effort options for ${count} saved model${count === 1 ? '' : 's'} on ${tool.label}. You can now select them in Profiles.`,
+          showOpenProfiles: true,
+        };
+      }
+    );
   }
 
   private async createModel(): Promise<void> {
