@@ -26,6 +26,8 @@
 //!   with zero plaintext fallback, zero ambient token migration, and zero secret exposure in
 //!   `Debug`, `Display`, or serialized errors.
 
+/// Trusted native-launcher XDG environment restoration for external CLI child processes.
+pub mod cli_environment;
 /// OS keychain credential boundary (`CredentialStore`, `KeyringCredentialStore`, and test vault).
 pub mod credentials;
 /// Safe static connector error types and wire codes.
@@ -35,6 +37,10 @@ pub mod parsers;
 /// Explicit bounded CLI metadata probing (`ToolProbe`, `probe_tool`).
 pub mod probe;
 
+pub use cli_environment::{
+    restore_cli_environment, THREADLANE_CLI_XDG_CACHE_HOME, THREADLANE_CLI_XDG_CONFIG_HOME,
+    THREADLANE_CLI_XDG_DATA_HOME, THREADLANE_CLI_XDG_STATE_HOME,
+};
 pub use credentials::{
     validate_tool_id, CredentialStore, FakeCredentialStore, InMemoryCredentialStore,
     KeyringCredentialStore, SecretStatus, SimulatedVaultState, DEFAULT_KEYRING_SERVICE,

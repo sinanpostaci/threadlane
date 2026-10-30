@@ -271,6 +271,7 @@ impl HostControlHub {
                 .stderr(Stdio::null())
                 .kill_on_drop(false)
                 .process_group(0);
+            threadlane_connectors::restore_cli_environment(cmd.as_std_mut());
 
             let child = cmd.spawn().map_err(|_| {
                 AppError::new(

@@ -30,6 +30,15 @@ current catalog. Filtering never changes a model's execution route or imports it
 Selections outside the current view are reported explicitly. A catalog entry does
 not confirm that the active subscription permits that model.
 
+Native preview launchers that isolate Threadlane's XDG folders must preserve the
+original CLI account directories. The trusted launcher records the original
+`XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `XDG_STATE_HOME` in fixed
+`THREADLANE_CLI_XDG_*` markers before isolating the GUI. CLI probes and detached
+execution hosts restore those values only for their child processes and remove
+the markers there. Threadlane's parent stores remain isolated. No credentials are
+copied, migrated or exposed to the frontend; missing markers preserve ordinary
+inherited CLI behavior.
+
 For example, an OpenCode Go model uses provider argument
 `opencode-go/deepseek-v4.1-flash`, with `max` configured as a separate effort. The
 worker combines them as `opencode-go/deepseek-v4.1-flash#max`.

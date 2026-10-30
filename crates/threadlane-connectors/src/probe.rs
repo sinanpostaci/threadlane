@@ -10,6 +10,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
+use crate::cli_environment::restore_cli_environment;
 use crate::credentials::validate_tool_id;
 use crate::error::ConnectorError;
 use crate::parsers::{
@@ -773,6 +774,7 @@ async fn run_bounded_probe_command(
         .kill_on_drop(true);
 
     configure_sanitized_probe_env(&mut cmd);
+    restore_cli_environment(cmd.as_std_mut());
 
     let temp_dir = std::env::temp_dir();
     if temp_dir.is_dir() {
