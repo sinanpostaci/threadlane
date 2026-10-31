@@ -13,10 +13,12 @@ use threadlane_authority::{AuthorityError, AuthorityStore};
 use threadlane_host::{ApprovedHostClient, HostError, HostPhase};
 use threadlane_native::fs_safety::constant_time_str_eq;
 use threadlane_native::operator_cli::{
-    emit_error, validate_dirs, verify_binding, write_result, OperatorCliError,
+    emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
 };
 use threadlane_native::{
-    open_workflow_stores, NativeError, NativeErrorCode, DEFAULT_APPROVED_ACTIVITY_LIMIT,
+    open_workflow_stores, ConversationChangeError, ConversationChangeRequest,
+    ConversationChangeStore, ListConversationChangesParams, NativeError, NativeErrorCode,
+    ResolveConversationChangeRequest, DEFAULT_APPROVED_ACTIVITY_LIMIT,
     DEFAULT_APPROVED_EVENT_BATCH_LIMIT, MAX_APPROVAL_CURSOR_LEN, MAX_APPROVED_ACTIVITY_LIMIT,
     MAX_APPROVED_CANCEL_REASON_LEN, MAX_APPROVED_EVENT_BATCH_LIMIT,
 };
@@ -186,6 +188,58 @@ enum SessionCommand {
         /// Batch identifier returned by `pull`.
         #[arg(long = "batch-id", value_name = "ID")]
         batch_id: String,
+    },
+    /// Preview how an interpreted conversational change will be routed without mutating state.
+    #[command(name = "preview-change", visible_alias = "change-preview")]
+    PreviewChange {
+        /// Absolute path to the private (`0600`) JSON [`ConversationChangeRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+    },
+    /// Record a scoped conversational change with revision checking, idempotency, and optional task cancellation.
+    #[command(name = "record-change", visible_alias = "change-record")]
+    RecordChange {
+        /// Absolute path to the private (`0600`) JSON [`ConversationChangeRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+
+        /// Optional lowercase 64-character SHA-256 hex digest matching the approval record's `subject_digest` when cancelling a task.
+        #[arg(long = "confirm-approval", value_name = "SHA256")]
+        confirm_approval: Option<String>,
+
+        /// Optional explicit operator approval confirmation flag when cancelling a task.
+        #[arg(long = "operator-approved")]
+        operator_approved: bool,
+    },
+    /// List a bounded page of scoped conversational change records and unresolved blocking summary.
+    #[command(name = "list-changes", visible_alias = "changes")]
+    ListChanges {
+        /// Optional approval identifier filter (`apr_<32hex>`).
+        #[arg(long = "approval-id", value_name = "ID")]
+        approval_id: Option<String>,
+
+        /// Optional task identifier filter.
+        #[arg(long = "task-id", value_name = "ID")]
+        task_id: Option<String>,
+
+        /// Return only unresolved blocking changes (`pending_clarification` and `pending_replan`).
+        #[arg(long = "unresolved-only")]
+        unresolved_only: bool,
+
+        /// Optional opaque pagination cursor (`change_id`).
+        #[arg(long = "cursor", value_name = "TEXT")]
+        cursor: Option<String>,
+
+        /// Maximum number of change records to return (`1..=20`, default `20`).
+        #[arg(long = "limit", value_name = "N")]
+        limit: Option<usize>,
+    },
+    /// Explicitly resolve a pending conversational change after verifying stop proof and plan/approval links.
+    #[command(name = "resolve-change", visible_alias = "change-resolve")]
+    ResolveChange {
+        /// Absolute path to the private (`0600`) JSON [`ResolveConversationChangeRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
     },
 }
 
@@ -590,6 +644,145 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             }
             write_result(&globals.binding, &ack, true)
         }
+        SessionCommand::PreviewChange { request } => {
+            let change_request: ConversationChangeRequest = read_request(&request)?;
+            let change_store = ConversationChangeStore::open_readonly(&plans_dir)
+                .map_err(|err| map_conversation_change_error(&err, false))?;
+            let preview = change_store
+                .preview_change(
+                    &globals.binding,
+                    &globals.thread,
+                    &change_request,
+                    &plans,
+                    &authority,
+                    &client,
+                )
+                .await
+                .map_err(|err| map_conversation_change_error(&err, false))?;
+            if preview.binding_id != globals.binding || preview.thread_uuid != globals.thread {
+                return Err(OperatorCliError::new(
+                    "scope_mismatch",
+                    "Conversation change preview does not belong to the requested binding and thread scope.",
+                ));
+            }
+            write_result(&globals.binding, &preview, false)
+        }
+        SessionCommand::RecordChange {
+            request,
+            confirm_approval,
+            operator_approved,
+        } => {
+            let mut change_request: ConversationChangeRequest = read_request(&request)?;
+            if let Some(ref raw_cli_confirm) = confirm_approval {
+                let checked_confirm = validate_confirm_approval(raw_cli_confirm)?;
+                let Some(ref mut cancel_action) = change_request.cancel_action else {
+                    return Err(OperatorCliError::invalid_input(
+                        "`--confirm-approval` requires a `cancel_action` in the change request.",
+                    ));
+                };
+                if !constant_time_str_eq(&cancel_action.confirm_approval_digest, &checked_confirm) {
+                    return Err(OperatorCliError::new(
+                        "subject_mismatch",
+                        "`--confirm-approval` does not match `cancel_action.confirm_approval_digest`.",
+                    ));
+                }
+                if operator_approved {
+                    cancel_action.operator_approved = true;
+                }
+            } else if operator_approved {
+                if let Some(ref mut cancel_action) = change_request.cancel_action {
+                    cancel_action.operator_approved = true;
+                } else {
+                    return Err(OperatorCliError::invalid_input(
+                        "`--operator-approved` requires a `cancel_action` in the change request.",
+                    ));
+                }
+            }
+
+            let change_store = ConversationChangeStore::open(&plans_dir)
+                .map_err(|err| map_conversation_change_error(&err, false))?;
+            verify_binding(&state_dir, &globals.binding, &globals.thread).await?;
+            let record = change_store
+                .record_change(
+                    &globals.binding,
+                    &globals.thread,
+                    &change_request,
+                    &plans,
+                    &authority,
+                    &client,
+                )
+                .await
+                .map_err(|err| map_conversation_change_error(&err, true))?;
+            if record.binding_id != globals.binding || record.thread_uuid != globals.thread {
+                return Err(OperatorCliError::new(
+                    "outcome_unknown",
+                    "Conversation change was recorded, but returned record scope failed validation.",
+                ));
+            }
+            write_result(&globals.binding, &record, true)
+        }
+        SessionCommand::ListChanges {
+            approval_id,
+            task_id,
+            unresolved_only,
+            cursor,
+            limit,
+        } => {
+            if let Some(ref apr_id) = approval_id {
+                verify_operator_approval(
+                    &authority,
+                    apr_id,
+                    &globals.binding,
+                    &globals.thread,
+                    None,
+                )?;
+            }
+            let change_store = ConversationChangeStore::open_readonly(&plans_dir)
+                .map_err(|err| map_conversation_change_error(&err, false))?;
+            let page = change_store
+                .list_changes(
+                    &globals.binding,
+                    &ListConversationChangesParams {
+                        approval_id,
+                        task_id,
+                        unresolved_only,
+                        cursor,
+                        limit,
+                    },
+                )
+                .map_err(|err| map_conversation_change_error(&err, false))?;
+            if page.binding_id != globals.binding {
+                return Err(OperatorCliError::new(
+                    "scope_mismatch",
+                    "Conversation change page does not belong to the requested binding scope.",
+                ));
+            }
+            write_result(&globals.binding, &page, false)
+        }
+        SessionCommand::ResolveChange { request } => {
+            let resolve_request: ResolveConversationChangeRequest = read_request(&request)?;
+            let change_store = ConversationChangeStore::open(&plans_dir)
+                .map_err(|err| map_conversation_change_error(&err, false))?;
+            verify_binding(&state_dir, &globals.binding, &globals.thread).await?;
+            let record = change_store
+                .resolve_change(
+                    &globals.binding,
+                    &globals.thread,
+                    &resolve_request,
+                    &plans,
+                    &authority,
+                    &client,
+                )
+                .await
+                .map_err(|err| map_conversation_change_error(&err, true))?;
+            if record.binding_id != globals.binding || record.thread_uuid != globals.thread {
+                return Err(OperatorCliError::new(
+                    "outcome_unknown",
+                    "Conversation change resolution completed, but returned record scope failed validation.",
+                ));
+            }
+            write_result(&globals.binding, &record, true)
+        }
     }
 }
 
@@ -895,6 +1088,16 @@ fn map_host_mutation_error(error: &HostError) -> OperatorCliError {
         | HostError::SecurityViolation { .. }
         | HostError::Authority { .. } => map_host_error(error),
     }
+}
+
+fn map_conversation_change_error(
+    error: &ConversationChangeError,
+    is_mutation: bool,
+) -> OperatorCliError {
+    if is_mutation && matches!(error, ConversationChangeError::OutcomeUnknown { .. }) {
+        return OperatorCliError::new("outcome_unknown", error.safe_message());
+    }
+    OperatorCliError::new(error.code(), error.safe_message())
 }
 
 #[cfg(test)]
@@ -1658,6 +1861,10 @@ mod tests {
             vec!["threadlane-session", "activity", "--help"],
             vec!["threadlane-session", "pull", "--help"],
             vec!["threadlane-session", "ack", "--help"],
+            vec!["threadlane-session", "preview-change", "--help"],
+            vec!["threadlane-session", "record-change", "--help"],
+            vec!["threadlane-session", "list-changes", "--help"],
+            vec!["threadlane-session", "resolve-change", "--help"],
         ] {
             let err = Cli::try_parse_from(&help_args)
                 .expect_err("help invocation should return clap DisplayHelp");
@@ -1680,5 +1887,123 @@ mod tests {
                 "expected DisplayVersion for {version_args:?}"
             );
         }
+    }
+
+    #[test]
+    fn cli_parses_conversation_change_subcommands_and_maps_static_errors() {
+        let preview = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "preview-change",
+            "--request",
+            "/tmp/change.json",
+        ])
+        .expect("parse preview-change");
+        assert!(matches!(
+            preview.command,
+            SessionCommand::PreviewChange { .. }
+        ));
+
+        let record = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "record-change",
+            "--request",
+            "/tmp/change.json",
+            "--confirm-approval",
+            DIGEST_A,
+            "--operator-approved",
+        ])
+        .expect("parse record-change");
+        assert!(matches!(
+            record.command,
+            SessionCommand::RecordChange { .. }
+        ));
+
+        let list = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "list-changes",
+            "--approval-id",
+            "apr_0123456789abcdef0123456789abcdef",
+            "--unresolved-only",
+            "--limit",
+            "10",
+        ])
+        .expect("parse list-changes");
+        assert!(matches!(list.command, SessionCommand::ListChanges { .. }));
+
+        let resolve = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "resolve-change",
+            "--request",
+            "/tmp/resolve.json",
+        ])
+        .expect("parse resolve-change");
+        assert!(matches!(
+            resolve.command,
+            SessionCommand::ResolveChange { .. }
+        ));
+
+        let mapped = map_conversation_change_error(
+            &ConversationChangeError::TaskNotProvenStopped {
+                reason: "Affected task is still running or cancel_requested and is not yet proven stopped.",
+            },
+            true,
+        );
+        assert_eq!(mapped.code, "task_not_proven_stopped");
     }
 }
