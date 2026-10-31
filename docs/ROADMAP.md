@@ -65,9 +65,12 @@ The additive [native tool-output transport](NATIVE-TOOL-OUTPUT.md) is a separate
 selected operator route over a private Unix WebSocket. Controlled Linux desktop
 experiments verified idle wake-up and delivery into an existing busy turn in one
 authorized disposable chat without converting the machine event into user text.
-The temporary desktop launcher, product host end-to-end delivery, restart
-recovery, general multi-chat identity and other operating systems have separate
-acceptance boundaries. Legacy queue notifications are not an automatic fallback.
+The [qualified product pilot](NATIVE-TOOL-OUTPUT-PILOT-2026-10-31.md) subsequently
+verified one real DeepSeek Go task, a native Luna pull/ACK cycle and scoped
+teardown. Its launcher is available as an optional Linux Nix helper. Restart
+recovery, concurrent human steering, general multi-chat identity and other
+operating systems retain separate acceptance boundaries. Legacy queue
+notifications are not an automatic fallback.
 
 Milestone 1's deterministic native conversation loop and Milestone 2A's bounded
 history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker

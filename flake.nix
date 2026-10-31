@@ -22,6 +22,9 @@
         };
     in
     {
+      lib.wrapCodexDesktop = { pkgs, chatgpt }:
+        import ./tools/native-bridge/package.nix { inherit pkgs chatgpt; };
+
       devShells = forAllSystems (system:
         let
           pkgs = import nixpkgs { inherit system; };

@@ -96,13 +96,16 @@ native chat, using its existing Luna Max configuration:
   independently generated event ID. Only the intentional setup was a user
   message; the machine event remained `functionCallOutput`.
 
-These controlled protocol experiments do not by themselves establish the new
-product host's full end-to-end delivery, app-closed wake-up, restart persistence,
-general multi-chat routing, or platform release support. Tests with fake local
-WebSocket servers are transport and lifecycle evidence, not live user delivery.
+The separate [qualified product pilot](NATIVE-TOOL-OUTPUT-PILOT-2026-10-31.md)
+then verified a real DeepSeek Go task, one native notice, Luna's scoped pull/ACK,
+12 durably acknowledged events, and restoration of the original test chat.
+App-closed wake-up, restart persistence, general multi-chat routing and platform
+release support remain separate gates. Tests with fake local WebSocket servers
+are transport and lifecycle evidence, not live user delivery.
 
-The native desktop launcher used by that experiment is still a private test
-package. This change does not install it, alter the user's NixOS configuration,
+The native desktop launcher used by that experiment is an explicit optional
+Linux package wrapper, exported as `lib.wrapCodexDesktop`. This change does not
+install it, alter the user's NixOS configuration,
 change global MCP settings, or install a background service. macOS needs its own
 native launch, identity, application signature and update validation; Windows
 needs a separately implemented local transport. A Tauri build alone does not
