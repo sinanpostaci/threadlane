@@ -3,6 +3,27 @@
 Verified on 2026-10-29 on Linux/NixOS. This is a checkpoint report, not a claim
 that every milestone or platform is supported.
 
+## Packaged operator context checkpoint (2026-10-31)
+
+The context command package passed **360 workspace tests** with the existing
+serial CI harness (`cargo test --locked --workspace -- --test-threads=1`) and
+**23 desktop tests**. Workspace and desktop Clippy passed with warnings denied;
+both formatting checks passed. Fixtures use local supervisors and fake children,
+not paid providers. Context validation and forwarding do not grant human approval
+or authenticate native per-call identity; see [context commands](NATIVE-CONTEXT.md).
+
+One earlier default-parallel workspace run failed the existing proxy overflow/
+timeout process fixture. The isolated test, its native-library group, and the
+complete serial workspace recheck passed. Its expected error-code guard and
+process-group cleanup assertions remain intact; a static failure-code diagnostic
+was added. The cause of that single parallel failure is not established, so it
+remains a fixture follow-up rather than a claimed production fix.
+
+The [qualified native CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md) separately records
+the earlier live callback, actual six-event ACK, local cancellation and explicit
+restart without replay. Those observations do not establish automatic native
+onboarding, authenticated two-chat routing, API entitlement or other platforms.
+
 ## Owned OpenCode execution evidence (2026-10-31)
 
 Focused tests cover the bounded metadata collector, owned worker execution,

@@ -292,7 +292,11 @@ sleep 60
             .thread("0196ed00-0000-7000-8000-000000000001")
             .await
             .expect_err("overflow or timeout expected");
-        assert!(matches!(err.code(), "output_overflow" | "timed_out"));
+        assert!(
+            matches!(err.code(), "output_overflow" | "timed_out"),
+            "unexpected proxy failure code: {}",
+            err.code()
+        );
 
         if let Ok(pid_str) = fs::read_to_string(&child_pid_file) {
             if let Ok(desc_pid) = pid_str.trim().parse::<u32>() {

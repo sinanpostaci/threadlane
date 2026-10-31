@@ -10,7 +10,7 @@ checkout; the existing development shells remain the normal development path.
 | Area | State in this lane |
 | --- | --- |
 | Python desktop build wrapper | Ten offline fixture tests pass. |
-| Nix CLI package | Source build passed using the root `Cargo.lock`. Includes `threadlane` and the paired `threadlane-native-mcp` bootstrap. |
+| Nix CLI package | Source build passed using the root `Cargo.lock`. Includes `threadlane`, the paired `threadlane-native-mcp` bootstrap, and the trusted `threadlane-context`, `threadlane-workflow`, `threadlane-session`, approval and operator commands. |
 | Nix desktop package | Linux source build passed with the standalone Tauri lockfile, a separately built frontend, and explicit Cargo build subdirectory. The resulting executable's `--help` passed. The latest native window creation was observed; visual human acceptance of the current window is still pending. |
 | GitHub Actions workflow | Manual `workflow_dispatch` source-build matrix added. It has not been dispatched from this checkout, so all three platform results remain unverified. |
 | Desktop runtime | The standalone M4 Linux binary builds and passes all-target Clippy. The earlier native Wayland preview rendered successfully. Current Tools/Profiles and History browser checks use explicit DEV fixtures; they do not prove native chat pairing. |

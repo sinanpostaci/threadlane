@@ -51,6 +51,13 @@ not require switching to the panel for each task. See
 
 ### Optional Approved-Session Controls
 
+- **Packaged context commands**: `threadlane-context --context /private/context.json
+  check` validates the selected private context and live target. Use the same
+  prefix with `workflow ...` or `session ...` for everyday commands. Executables
+  are fixed package siblings and bound scope flags cannot be overridden. It does
+  not create stores, start a daemon, grant approval, or call a provider. See
+  [native context commands](docs/NATIVE-CONTEXT.md).
+
 - **Trusted local review and integration**: `threadlane-operator` provides
   explicit task commit, review inspection/acceptance, and owned integration
   commands. It preserves the existing digest/receipt and same-run checks; no

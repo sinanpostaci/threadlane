@@ -25,6 +25,10 @@ path = "src/bin/threadlane-workflow.rs"
 name = "threadlane-session"
 path = "src/bin/threadlane-session.rs"
 
+[[bin]]
+name = "threadlane-context"
+path = "src/bin/threadlane-context.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
