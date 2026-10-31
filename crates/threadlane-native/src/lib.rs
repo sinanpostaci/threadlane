@@ -43,6 +43,8 @@ pub mod operator_cli;
 pub mod pairing;
 /// Pure profile selection, role/difficulty preflight, and deny-by-default execution policy admission core.
 pub mod profile_flow;
+/// Durable profile-driven role handoffs and package closure reservations.
+pub mod role_flow;
 /// Bounded newline-delimited JSON-RPC proxy session and Unix process-group cleanup.
 pub mod rpc;
 /// Durable `Pending`/`Submitted`/`Unknown`/`Received` busy-turn wake-up store and `turn/steer` builder.
@@ -97,6 +99,14 @@ pub use profile_flow::{
     PreflightBlockReason, PreflightReport, PreflightRequest, RoleExecutionRoute,
     RolePreflightOutcome, RolePreflightRequest, SelectedRoleChoice,
     EXECUTION_POLICY_SCHEMA_VERSION, MAX_POLICY_ALLOW_RULES, MAX_PREFLIGHT_ROLES,
+};
+pub use role_flow::{
+    preflight_from_dir_readonly, read_registry_snapshot_readonly, ClosureSubjectSource,
+    CreateRoleFlowCycleRequest, FrozenCycleTask, HandoffStatus, NativeRoleHandoff,
+    PackageClosureReservation, ReconcileRoleHandoffRequest, ReservePackageClosureRequest,
+    RoleEvidenceReference, RoleFlowBindingSnapshot, RoleFlowCycle, RoleFlowStore,
+    RoleHandoffRecord, RoleHandoffRequest, MAX_CLOSURES_PER_BINDING, MAX_CYCLES_PER_BINDING,
+    MAX_HANDOFFS_PER_CYCLE, MAX_ROLE_FLOW_LEDGER_BYTES, ROLE_FLOW_SCHEMA_VERSION,
 };
 pub use rpc::{
     build_proxy_args, is_process_alive, is_process_group_alive, InitializeResult, ProxyCallError,

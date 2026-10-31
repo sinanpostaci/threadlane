@@ -53,10 +53,24 @@ not require switching to the panel for each task. See
 
 - **Packaged context commands**: `threadlane-context --context /private/context.json
   check` validates the selected private context and live target. Use the same
-  prefix with `workflow ...` or `session ...` for everyday commands. Executables
+  prefix with `workflow ...`, `flow ...` or `session ...` for everyday commands. Executables
   are fixed package siblings and bound scope flags cannot be overridden. It does
   not create stores, start a daemon, grant approval, or call a provider. See
   [native context commands](docs/NATIVE-CONTEXT.md).
+
+- **Profile-selected role cycles**: `threadlane-flow` validates only requested
+  roles against an explicit model/effort policy, freezes an approved cycle, and
+  records idempotent role handoffs. Native Codex handoffs remain manual routing;
+  headless tasks use the existing approved host. A closure reservation prevents
+  repeated closing handoffs for the same approved package candidate. See
+  [profile flows](docs/PROFILE-FLOW.md) and [commands](docs/ROLE-FLOW-CLI.md).
+- **Truthful progress and conversation changes**: The desktop distinguishes
+  execution from verified review/integration receipts, including historical or
+  invalidated evidence. `threadlane-session` records questions, clarifications,
+  scope/model changes and explicit cancellation without claiming unsupported
+  live provider steering. Blocking changes require a new plan/approval before
+  advancement. See [task lifecycle](docs/TASK-LIFECYCLE.md) and
+  [conversation changes](docs/CONVERSATION-CHANGES.md).
 
 - **Trusted local review and integration**: `threadlane-operator` provides
   explicit task commit, review inspection/acceptance, and owned integration

@@ -17,6 +17,9 @@ current milestone contract before editing.
   merely because it remains in the registry.
 - One writer per checkout. Parallel writers need independent worktrees and clear
   ownership. The first foundation has one implementation writer.
+- Keep `CARGO_TARGET_DIR` local to each checkout. Sharing a target directory
+  between changing worktrees can reuse stale dependency metadata; final gates
+  must run against the combined checkout and its own target directory.
 - Keep prose, comments, identifiers, and documentation in English.
 - Preserve user files. Do not reset, delete unexpected changes, or modify other
   repositories, global configuration, credentials, or `/etc/nixos`.
@@ -43,8 +46,13 @@ current milestone contract before editing.
 ## Native conversation workflow
 
 - When the operator supplies a private Threadlane context, use
-  `threadlane-workflow` for plans and `threadlane-session` for approved tasks and
-  events. Read `docs/NATIVE-OPERATOR.md`; preserve the supplied store/binding scope.
+  `threadlane-workflow` for plans, `threadlane-flow` for profile/policy admission
+  and durable role handoffs, and `threadlane-session` for approved tasks, events
+  and conversational changes. Read `docs/NATIVE-OPERATOR.md`; preserve the
+  supplied store/binding scope.
+- Read `docs/PROFILE-FLOW.md` before advancing a role cycle. Require an exact
+  execution policy; saved model assignments are not permission to use a model.
+  Unknown handoff outcomes require receipt reconciliation, not redispatch.
 - Existing approval, host startup and review/integration steps stay explicit.
   A context, CLI flag or worker response is not new human authorization.
 - Do not start a second Codex app-server or install a universal fixed-binding MCP

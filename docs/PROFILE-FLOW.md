@@ -1,30 +1,49 @@
-# Profile Selection, Execution Policy, and Preflight Admission (Phase A1)
+# Profile Selection, Execution Policy, and Durable Role-Flow Handoffs
 
-`crates/threadlane-native/src/profile_flow.rs` implements the **Phase A1** pure,
-side-effect-free profile selection, role/difficulty resolution, and
-deny-by-default execution policy admission core for Threadlane Milestone 4.
+`crates/threadlane-native/src/profile_flow.rs` (Phase A1) and
+`crates/threadlane-native/src/role_flow.rs` (Phase A2) implement Threadlane's
+profile-driven role admission, durable workflow cycles, native vs. headless role
+handoffs, explicit unknown-outcome reconciliation, and single-closure package
+reservations.
 
-## Scope Boundary (Phase A1 vs Phase A2)
+For the trusted-local operator CLI wrapper (`threadlane-flow`), see
+[`docs/ROLE-FLOW-CLI.md`](ROLE-FLOW-CLI.md).
 
-- **Implemented in Phase A1 (`profile_flow`)**:
+## Architecture Overview
+
+- **Phase A1 (`profile_flow`) — Pure Admission & Preflight**:
   - Generic deny-by-default [`ExecutionPolicy`] (`schema_version = 1`,
-    `policy_id`, and `allow_rules: Vec<PolicyAllowRule>`).
-  - Structural policy validation ([`ExecutionPolicy::validate`]) and canonical
-    64-character lowercase hex SHA-256 digest computation
-    ([`ExecutionPolicy::digest`]).
+    `policy_id`, and `allow_rules: Vec<PolicyAllowRule>`) with structural
+    validation ([`ExecutionPolicy::validate`]) and canonical 64-character
+    lowercase hex SHA-256 digest computation ([`ExecutionPolicy::digest`]).
   - Deterministic role/difficulty choice resolution ([`resolve_choice`]) that
     checks an exact `(role, Some(difficulty))` match first and falls back only
     to an explicit role default `(role, None)` without substituting another
     role, difficulty, or unapproved fallback model.
-  - Pure, read-only preflight over a [`RegistrySnapshot`] ([`preflight`]) or an
-    existing [`RegistryStore`] ([`preflight_from_store`]) using the store's
-    lock-free readonly snapshot API.
-- **Deferred to Phase A2 (not implemented yet)**:
-  - Durable workflow cycle state, idempotent persisted role handoff records,
-    and single-use package closure reservation.
-  - Headless dispatch handoff through `ApprovedHostClient`.
-  - The `threadlane-flow` binary and `threadlane-context ... flow ...` CLI
-    routing.
+  - Pure, lock-free read-only preflight over a [`RegistrySnapshot`]
+    ([`preflight`]), an existing [`RegistryStore`] ([`preflight_from_store`]),
+    or a private registry directory ([`preflight_from_dir_readonly`]) via
+    `RegistryStore::read_snapshot_readonly_at`.
+- **Phase A2 (`role_flow`) — Durable Cycles, Handoffs, Reconciliation & Closure**:
+  - Per-binding private (`0600`) role-flow ledgers managed by [`RoleFlowStore`]
+    inside an existing private (`0700`) `plans_dir`, protected by cross-process
+    file locks (`role-flow-<binding_tag>.lock`), monotonic ledger/cycle
+    revisions, and caller `request_key` idempotency.
+  - [`RoleFlowStore::create_cycle`] freezes a selected subset of tasks from an
+    existing [`ApprovalRecord`] after verifying binding/thread scope, active
+    published plan status, canonical repository and base commit/tree SHA,
+    registry revision equality, unresolved conversational-change gates, and A1
+    preflight admission (deduplicating shared `(role, difficulty)` requests
+    across tasks).
+  - [`RoleFlowStore::handoff_role`] records a native conversational handoff or
+    dispatches a headless worker task through an already-running
+    [`ApprovedHostClient`], persisting [`HandoffStatus::IntentRecorded`] before
+    crossing the host RPC boundary.
+  - [`RoleFlowStore::reconcile_handoff`] inspects [`ApprovedHostClient::get_task`]
+    without ever invoking `dispatch_task` or repeating a provider call.
+  - [`RoleFlowStore::reserve_closure`] enforces a single closure reservation per
+    `(repository_path, package_id, candidate_tree_sha)` across cycles in a
+    binding.
 
 ## Core Invariants
 
@@ -36,76 +55,107 @@ deny-by-default execution policy admission core for Threadlane Milestone 4.
      a profile whose `id` or `name` happens to be `"default"`. If
      `default_profile_id` is `None`, requested roles report
      `PreflightBlockReason::MissingDefaultProfile`.
-2. **Requested roles only**:
-   - Preflight resolves only the `(role, difficulty)` combinations listed in
-     `PreflightRequest::roles` (rejecting empty, duplicate, or overlong lists).
-   - Unrequested roles on the same profile (even if disabled, unassigned, or
-     blocked by policy) never block the requested roles.
-3. **Registry-sourced model and effort**:
+2. **Requested roles only & registry-sourced model/effort**:
+   - Preflight resolves only the `(role, difficulty)` pairs requested; unrequested
+     roles on the same profile never block admission.
    - `SelectedRoleChoice::model_arg` and `SelectedRoleChoice::effort` come
      exclusively from the resolved registry [`ModelDefinition`] and profile
      [`RoleAssignment`]. `RolePreflightRequest` accepts only `role` and optional
-     `difficulty` (`#[serde(deny_unknown_fields)]`), preventing caller model,
-     effort, tool, or executable overrides.
-   - For Antigravity and OpenCode v2 executable worker routes, admission also
-     runs the canonical pure `threadlane_workers::resolve_model_target` helper
-     over the resolved registry model argument and effort. Antigravity therefore
-     requires an explicit effort even when registry metadata sets
-     `allow_no_effort`, and an OpenCode inline `#variant` becomes the effective
-     effort used for policy evaluation. `SelectedRoleChoice::model_arg` remains
-     the original registry model argument; `SelectedRoleChoice::effort` is the
-     canonical effective effort. A missing or malformed executable worker target
-     is blocked with `PreflightBlockReason::UnsupportedEffort` before policy
-     evaluation and before any model invocation. Native Codex handoff does not
-     resolve a worker model target and invokes no model during preflight.
-4. **Truthful route classification**:
-   - `ToolAdapter::CodexCli` maps to `RoleExecutionRoute::NativeHandoff` (never
-     a headless worker).
-   - `ToolAdapter::Antigravity` and `ToolAdapter::OpencodeV2` map to
-     `RoleExecutionRoute::HeadlessWorker`.
-   - `ToolAdapter::JevApi`, `ToolAdapter::OpenaiDecisionsApi`,
-     `ToolAdapter::Git`, `ToolAdapter::Tmux`, and `ToolAdapter::Codegraph` map
-     to `RoleExecutionRoute::Unsupported` and report
-     `PreflightBlockReason::UnsupportedRoute`.
-5. **Generic deny-by-default execution policy**:
+     `difficulty` (`#[serde(deny_unknown_fields)]`).
+   - For Antigravity and OpenCode v2 executable worker routes, admission runs
+     `threadlane_workers::resolve_model_target` over the registry model argument
+     and effort. Antigravity requires an explicit effort even when registry
+     metadata sets `allow_no_effort`, and an OpenCode inline `#variant` becomes
+     the effective effort evaluated against policy. Missing or malformed worker
+     targets report `PreflightBlockReason::UnsupportedEffort` before policy
+     evaluation and before any model invocation.
+3. **Immutable deny-by-default execution policy**:
    - Empty `allow_rules` is a valid policy that denies every role with
      `PreflightBlockReason::PolicyBlocked`.
    - Each [`PolicyAllowRule`] specifies an exact `(tool_id, model_id)` pair,
      allowed `efforts`, explicit `allow_no_effort`, and optional `roles`
      restrictions (`roles: []` applies to all roles).
-   - No production model or provider names are hard-coded in code.
-6. **Side-effect-free execution**:
-   - `preflight` performs zero filesystem writes, creates no cycle/lock/store
-     files, queries no providers, and starts no model, host, approval, or Git
-     worktree.
-   - `preflight_from_store` reads through `RegistryStore::snapshot_readonly`
-     (the same parser is available statically as
-     `RegistryStore::read_snapshot_readonly_at`), reusing the existing validated
-     registry parser and private-directory checks without acquiring or creating
-     `registry.lock`. A deleted lock stays absent and a missing directory stays
-     absent. Atomic `registry.json` replacement yields a consistent complete
-     snapshot.
+   - Cycles freeze both the [`ExecutionPolicy`] and its SHA-256 `policy_digest`.
+     Any policy or registry drift between cycle creation and `handoff_role`
+     is refused before effect.
+4. **Native route requested vs. executed evidence**:
+   - `ToolAdapter::CodexCli` maps to `RoleExecutionRoute::NativeHandoff` and
+     never dispatches a headless worker.
+   - [`NativeRoleHandoff`] records the frozen instruction, `requested_model_id`,
+     `requested_model_arg`, and `requested_effort` with
+     `model_execution_verified: false` and
+     `native_per_call_identity_verified: false`. It is a manual native routing
+     record, never proof that native Codex executed with that model or effort.
+   - `ToolAdapter::Antigravity` and `ToolAdapter::OpencodeV2` map to
+     `RoleExecutionRoute::HeadlessWorker`. [`RoleEvidenceReference`] records
+     actual runtime `run_id`, `worker_id`, `task_worktree_id`,
+     `report_artifact_id`, `base_commit`, `head_commit`, `observed_model`, and
+     `observed_effort` directly from [`TaskStateSnapshot`], with
+     `final_summary_is_complete_evidence: false`.
+5. **Explicit approvals and separately started hosts**:
+   - Creating a cycle requires an existing frozen [`ApprovalRecord`] from
+     `threadlane-approve`.
+   - Headless worker handoffs require `operator_approved = true`, an exact
+     `confirm_approval_digest` matching `approval.subject_digest`, and a scoped
+     [`ApprovedHostClient`] connected to an already-running `threadlane-host`
+     session. Role-flow APIs and CLIs never auto-approve plans or auto-start
+     hosts.
+6. **Single closure reservation per `(repository_path, package_id, candidate_tree_sha)`**:
+   - Only `ClosureSubjectSource::ApprovedCycleBase` is supported: the candidate
+     tree SHA is resolved via sanitized read-only Git from the cycle's frozen
+     approved `base_commit`, and `subject_digest` must equal the cycle's
+     `approval_subject_digest`.
+   - `WorkflowRole::Closure` handoffs require a matching `closure_reservation_id`
+     bound to that exact cycle, approval, repository, base commit, and closure
+     task. Missing, foreign, or already-spent reservations are refused before
+     recording a native handoff or calling a provider.
+   - Re-reserving the same `(repository_path, package_id, candidate_tree_sha)`
+     with the same `subject_digest` across cycles returns the existing
+     reservation; a different `subject_digest` for the same tree conflicts; a
+     changed candidate tree requires a new commit, fresh approval, and new cycle.
+7. **Uncertain outcomes and explicit reconciliation**:
+   - Headless handoffs persist [`HandoffStatus::IntentRecorded`] before calling
+     `ApprovedHostClient::dispatch_task`, and transition transport/host errors
+     to [`HandoffStatus::OutcomeUnknown`].
+   - Ambiguous handoffs (`IntentRecorded` or `OutcomeUnknown`) block blind
+     replay with `NativeErrorCode::AmbiguousWakeupPendingReconciliation`.
+   - [`RoleFlowStore::reconcile_handoff`] queries `ApprovedHostClient::get_task`
+     without dispatching another run. If a sealed run receipt (`run_id` and
+     `worker_id`) exists on the host, the handoff recovers to the observed
+     status; if the host reports no sealed run (`NotStarted` or `Unknown`), the
+     handoff remains `OutcomeUnknown`.
+8. **Typed conversation-change gate**:
+   - Read-only `question_or_status` observations (`recorded_only`) never revise
+     plans, cancel tasks, or block cycle creation or role handoffs.
+   - Any unresolved `pending_clarification` or `pending_replan` record (or a
+     durably superseded approval) blocks `create_cycle`, `handoff_role`, and
+     `reserve_closure` for the affected approval/task scope until resolved.
+     Frozen approved prompts and write scopes are never silently reused after a
+     scope or model change.
 
-## Public Rust API (`threadlane_native::profile_flow`)
+## Honest Limitations
 
-- Constants:
-  - `EXECUTION_POLICY_SCHEMA_VERSION` (`1`)
-  - `MAX_POLICY_ALLOW_RULES` (`64`)
-  - `MAX_PREFLIGHT_ROLES` (`30`)
-- Types:
-  - `PolicyAllowRule` (`tool_id`, `model_id`, `efforts`, `allow_no_effort`, `roles`)
-  - `ExecutionPolicy` (`schema_version`, `policy_id`, `allow_rules`, `deny_all`, `validate`, `digest`, `allows`)
-  - `RoleExecutionRoute` (`NativeHandoff`, `HeadlessWorker`, `Unsupported`)
-  - `PreflightBlockReason` (`MissingDefaultProfile`, `MissingProfile`, `MissingAssignment`, `MissingModel`, `MissingTool`, `ToolDisabled`, `UnsupportedEffort`, `UnsupportedRoute`, `PolicyBlocked`)
-  - `RolePreflightRequest` (`role`, `difficulty`)
-  - `PreflightRequest` (`profile_id`, `roles`)
-  - `SelectedRoleChoice` (`tool_id`, `adapter`, `route`, `model_id`, `model_arg`, `effort`, `matched_difficulty`)
-  - `RolePreflightOutcome` (`role`, `requested_difficulty`, `ready`, `block_reason`, `detail`, `selected`)
-  - `PreflightReport` (`registry_revision`, `profile_id`, `used_default_profile`, `policy_id`, `policy_digest`, `ready`, `roles`)
-- Functions:
-  - `resolve_choice(&RegistrySnapshot, profile_id, WorkflowRole, Option<Difficulty>) -> Result<ModelChoice, RegistryError>` (canonical resolver re-exported by `threadlane_workflow` and `threadlane_native`)
-  - `preflight(&RegistrySnapshot, &PreflightRequest, &ExecutionPolicy) -> Result<PreflightReport, NativeError>`
-  - `preflight_from_store(&RegistryStore, &PreflightRequest, &ExecutionPolicy) -> Result<PreflightReport, NativeError>`
-- Registry readonly snapshot APIs:
-  - `RegistryStore::snapshot_readonly()`
-  - `RegistryStore::read_snapshot_readonly_at(config_dir)`
+- Native handoff records (`NativeRoleHandoff`) do not switch the active native
+  Codex model or prove per-call native chat identity.
+- Current headless worker providers (`antigravity`, `opencode_v2`) have no
+  verified live in-flight input, pause, or resume channel (`live_input_delivered:
+  false`, `process_paused: false`, `provider_resumed: false`).
+- `final_summary_preview` in [`RoleEvidenceReference`] is bounded preview text
+  and is never complete review evidence; full review and integration still
+  require inspecting the task worktree diff and report artifact.
+- Linux (`0700`/`0600` private permissions) is the supported and tested
+  platform; non-Unix platforms fail closed.
+
+## Public Rust API (`threadlane_native::profile_flow` & `role_flow`)
+
+- **Phase A1 (`profile_flow` / `role_flow` preflight)**:
+  - `EXECUTION_POLICY_SCHEMA_VERSION`, `MAX_POLICY_ALLOW_RULES`, `MAX_PREFLIGHT_ROLES`
+  - `PolicyAllowRule`, `ExecutionPolicy`, `RoleExecutionRoute`, `PreflightBlockReason`
+  - `RolePreflightRequest`, `PreflightRequest`, `SelectedRoleChoice`, `RolePreflightOutcome`, `PreflightReport`
+  - `resolve_choice`, `preflight`, `preflight_from_store`, `read_registry_snapshot_readonly`, `preflight_from_dir_readonly`
+- **Phase A2 (`role_flow`)**:
+  - `ROLE_FLOW_SCHEMA_VERSION`, `MAX_CYCLES_PER_BINDING`, `MAX_HANDOFFS_PER_CYCLE`, `MAX_CLOSURES_PER_BINDING`, `MAX_ROLE_FLOW_LEDGER_BYTES`
+  - `RoleFlowStore`, `RoleFlowBindingSnapshot`, `RoleFlowCycle`, `FrozenCycleTask`
+  - `CreateRoleFlowCycleRequest`, `RoleHandoffRequest`, `ReconcileRoleHandoffRequest`, `ReservePackageClosureRequest`
+  - `RoleHandoffRecord`, `HandoffStatus`, `NativeRoleHandoff`, `RoleEvidenceReference`
+  - `PackageClosureReservation`, `ClosureSubjectSource` (`ApprovedCycleBase`)

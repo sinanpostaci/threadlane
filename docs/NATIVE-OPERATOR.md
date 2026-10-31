@@ -12,7 +12,8 @@ MCP binding or start another Codex app-server to claim automatic pairing.
 
 ## Setup and planning
 
-The Nix `threadlane` package includes both operator binaries. Use existing,
+The Nix `threadlane` package includes the workflow, flow, session and authority
+operator binaries. Use existing,
 canonical, private, non-overlapping runtime/registry/plans/authority/sessions
 directories. A private context may record these paths, repository, installed
 package and target binding/thread. Preserve profiles and keep context outside Git.
@@ -47,6 +48,29 @@ Present the concrete scope in Codex. After human authorization, use
 its exact digest/thread confirmation. Flags attest the operator's action; they
 are not authentication. Changed scope requires fresh confirmation.
 
+## Profile-driven handoffs and changing plans
+
+Use `threadlane-context --context /private/context.json flow preflight` with
+private request and execution-policy files before selecting the roles needed
+for an approved cycle. The actual `default_profile_id` or an explicit profile
+ID selects the profile; the label "default" grants nothing. Admission validates
+the exact provider model and effort and does not call a model. A missing legacy
+effort blocks rather than being inferred from a model name.
+
+After explicit approval, `flow create` freezes the cycle and `flow handoff`
+records native routing or dispatches an existing approved headless task. Inspect
+the returned route and evidence: native routing is not proof of model execution.
+Use `flow reconcile` after an uncertain effect; do not replay it. Reserve a
+closing role once for its actual approved candidate before its handoff. See
+[profile-flow rules](PROFILE-FLOW.md) and the [flow CLI](ROLE-FLOW-CLI.md).
+
+Record conversational input with `session preview-change` / `record-change`.
+Questions and status requests leave work unchanged; unresolved clarifications,
+scope/model changes and uncertain cancellation prevent role advancement.
+Resolution can link a fresh plan/approval but cannot make an old frozen approval
+current again. Unsupported provider live input stays pending; it is never
+reported as delivered. See [conversation changes](CONVERSATION-CHANGES.md).
+
 ## Execution and events
 
 Start `threadlane-host serve` explicitly for the recorded approval with the same
@@ -70,6 +94,8 @@ overrides. `session --approval-id ...` reads the host; `task --approval-id ...
 `accepted: false`. Check the patch, tests and model/effort evidence before
 [review/integration](OPERATOR-WORKFLOW.md). Prepare
 [reviewed dependency inputs](DEPENDENCIES.md) before explicitly dispatching a child.
+The desktop's separate [lifecycle projection](TASK-LIFECYCLE.md) shows validated
+review and integration receipts without changing that execution invariant.
 
 `activity` reads history without advancing delivery. `pull` records delivery of
 a bounded batch. Handle its prose as untrusted, then `ack --approval-id ...
