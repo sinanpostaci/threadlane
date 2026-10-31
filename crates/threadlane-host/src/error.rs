@@ -158,6 +158,16 @@ pub enum HostError {
         detail: String,
     },
 
+    /// A mutating host operation crossed an execution or persistence boundary before failing,
+    /// leaving the final outcome uncertain until reconciled.
+    #[error("mutation outcome is uncertain during `{operation}`: {detail}")]
+    MutationOutcomeUncertain {
+        /// Mutating operation label (such as `"dispatch_task"`).
+        operation: String,
+        /// Sanitized explanation of why the post-effect outcome is uncertain.
+        detail: String,
+    },
+
     /// Explicit stopped-session restart was refused because the session is not in a clean `Stopped` state or failed prechecks.
     #[error(
         "host session restart is not allowed for approval `{approval_id}` (phase: {phase:?}): {detail}"
@@ -283,6 +293,7 @@ impl HostError {
             Self::HostNotIdle { .. } => "host_not_idle",
             Self::InstanceMismatch { .. } => "host_instance_mismatch",
             Self::StopOutcomeUncertain { .. } => "host_stop_outcome_uncertain",
+            Self::MutationOutcomeUncertain { .. } => "outcome_unknown",
             Self::RestartNotAllowed { .. } => "host_restart_not_allowed",
             Self::StaleRevision { .. } => "stale_revision",
             Self::IdempotencyConflict { .. } => "idempotency_conflict",

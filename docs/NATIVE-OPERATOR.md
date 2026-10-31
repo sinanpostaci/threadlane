@@ -79,14 +79,15 @@ at `data.events`; paired MCP has its own nested shape. Never invent a batch ID.
 `cancel` requires approval/task IDs, `--expected-revision`, the exact
 `--confirm-approval` digest and `--operator-approved`. Cancellation, process exit,
 review and integration remain distinct. On mutating session commands (`dispatch`,
-`cancel`, `stop`, `pull`, `ack`), ambiguous runtime/transport, I/O, post-effect
-scope/integrity failures, and uncertain stop outcomes conservatively report
-`outcome_unknown` while preserving known pre-effect refusal codes (`unknown_task`,
-`stale_revision`, `host_not_ready`, `invalid_input`,
-`dependency_inputs_unverified`, `host_not_idle`, `host_instance_mismatch`, etc.).
-Timeout or `outcome_unknown` requires reconciling current `session`, `task`, or
-`activity` state before retrying; never blindly replay. Failed stdout does not prove
-that nothing happened.
+`cancel`, `stop`, `pull`, `ack`), known pre-effect refusals preserve their refusal
+codes (`unknown_task`, `stale_revision`, `host_not_ready`, `invalid_input`,
+`dependency_inputs_unverified`, `host_not_idle`, `host_instance_mismatch`,
+`security_violation`, etc.), while stage-known post-effect failures (such as
+receipt sealing after worker start or manifest/instance changes during post-stop
+confirmation) and ambiguous runtime/transport, I/O, or scope/integrity errors
+report `outcome_unknown`. Timeout or `outcome_unknown` requires reconciling current
+`session`, `task`, or `activity` state before retrying; never blindly replay.
+Failed stdout does not prove that nothing happened.
 
 `stop` uses `--approval-id`, the exact `--expected-instance`, the approval digest
 and `--operator-approved` to stop an idle host. Active work or pending enabled

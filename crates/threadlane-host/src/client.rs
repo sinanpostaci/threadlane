@@ -360,11 +360,10 @@ impl ApprovedHostClient {
                             || resp.instance_id != expected_instance_id
                             || resp.state != HostControlRuntimeState::Stopping
                         {
-                            return Err(HostError::CorruptSessionState {
-                                reason:
-                                    "stop_idle_host response did not match Stopping owner scope"
-                                        .to_string(),
-                            });
+                            return Err(post_stop_outcome_uncertain(
+                                &record.approval_id,
+                                "stop_idle_host response did not match Stopping owner scope",
+                            ));
                         }
                     }
                     Err(threadlane::Error::Remote(api_err)) => match api_err.code {
@@ -407,7 +406,10 @@ impl ApprovedHostClient {
                         // reconciled by durable `Stopped` + released `host.lock` + matching
                         // `expected_instance_id` in the bounded confirmation loop below.
                     }
-                    Err(other) => return Err(other.into()),
+                    Err(_) => {
+                        // Any other post-request client or decoding failure after submitting
+                        // `stop_idle_host` is reconciled only via durable proof below.
+                    }
                 }
             }
             Err(threadlane::Error::SecurityViolation(reason)) => {
@@ -423,37 +425,37 @@ impl ApprovedHostClient {
 
         let deadline = tokio::time::Instant::now() + STOP_CONFIRM_TIMEOUT;
         loop {
-            let current_manifest = read_host_manifest_optional(&session_dir, &record)?;
-            let current_lock_held = is_host_lock_held(&session_dir)?;
+            let current_manifest =
+                read_host_manifest_optional(&session_dir, &record).map_err(|_| {
+                    post_stop_outcome_uncertain(
+                        &record.approval_id,
+                        "failed to verify host session manifest after stop request",
+                    )
+                })?;
+            let current_lock_held = is_host_lock_held(&session_dir).map_err(|_| {
+                post_stop_outcome_uncertain(
+                    &record.approval_id,
+                    "failed to verify host session lock after stop request",
+                )
+            })?;
 
             if let Some(m) = current_manifest {
-                if m.instance_id.as_deref() != Some(expected_instance_id) {
-                    return Err(HostError::InstanceMismatch {
-                        approval_id: record.approval_id.clone(),
-                        expected_instance_id: expected_instance_id.to_string(),
-                        actual_instance_id: m.instance_id,
-                    });
-                }
-                if m.phase == HostPhase::Stopped && !current_lock_held {
+                if classify_post_stop_manifest(
+                    &record.approval_id,
+                    expected_instance_id,
+                    m.instance_id.as_deref(),
+                    m.phase,
+                    current_lock_held,
+                )? {
                     return Ok(m.to_summary());
-                }
-                if m.phase == HostPhase::Failed {
-                    return Err(HostError::HostNotReady {
-                        approval_id: record.approval_id.clone(),
-                        phase: Some(HostPhase::Failed),
-                        reason: m
-                            .last_error
-                            .unwrap_or_else(|| "host shutdown failed".to_string()),
-                    });
                 }
             }
 
             if tokio::time::Instant::now() >= deadline {
-                return Err(HostError::StopOutcomeUncertain {
-                    approval_id: record.approval_id.clone(),
-                    detail: "timed out waiting for durable Stopped manifest and released host.lock"
-                        .to_string(),
-                });
+                return Err(post_stop_outcome_uncertain(
+                    &record.approval_id,
+                    "timed out waiting for durable Stopped manifest and released host.lock",
+                ));
             }
 
             tokio::time::sleep(STOP_CONFIRM_POLL_INTERVAL).await;
@@ -923,23 +925,12 @@ impl ApprovedHostClient {
             )
             .await?;
 
-        if started.binding_id != session.live_binding.binding_id {
-            return Err(HostError::ScopeMismatch {
-                field: "session_binding_id".to_string(),
-                expected: session.live_binding.binding_id.clone(),
-                actual: started.binding_id,
-                reason: "worker snapshot returned mismatched session_binding_id".to_string(),
-            });
-        }
-
-        if started.execution_binding != recorded_intent.execution_binding {
-            return Err(HostError::CorruptSessionState {
-                reason: format!(
-                    "worker snapshot execution_binding {:?} does not match recorded dispatch intent {:?}",
-                    started.execution_binding, recorded_intent.execution_binding
-                ),
-            });
-        }
+        verify_post_dispatch_worker_snapshot(
+            &started.binding_id,
+            &session.live_binding.binding_id,
+            started.execution_binding.as_ref(),
+            recorded_intent.execution_binding.as_ref(),
+        )?;
 
         let receipt = TaskRunReceipt {
             task_id: task.task_id.clone(),
@@ -956,7 +947,8 @@ impl ApprovedHostClient {
             &session.record,
             &session.live_binding.binding_id,
             receipt,
-        )?;
+        )
+        .map_err(|err| map_post_dispatch_receipt_error(&err))?;
 
         let live_worker = match session
             .scoped_client
@@ -2239,4 +2231,217 @@ pub(crate) fn verify_cached_predecessor_selection(
         }
     }
     Ok(cached.clone())
+}
+
+fn post_stop_outcome_uncertain(approval_id: &str, detail: &'static str) -> HostError {
+    HostError::StopOutcomeUncertain {
+        approval_id: approval_id.to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn classify_post_stop_manifest(
+    approval_id: &str,
+    expected_instance_id: &str,
+    observed_instance_id: Option<&str>,
+    phase: HostPhase,
+    current_lock_held: bool,
+) -> Result<bool, HostError> {
+    if observed_instance_id != Some(expected_instance_id) {
+        return Err(post_stop_outcome_uncertain(
+            approval_id,
+            "host session instance changed before durable stop confirmation",
+        ));
+    }
+    if phase == HostPhase::Stopped && !current_lock_held {
+        return Ok(true);
+    }
+    if phase == HostPhase::Failed {
+        return Err(post_stop_outcome_uncertain(
+            approval_id,
+            "host session entered failed phase during shutdown",
+        ));
+    }
+    Ok(false)
+}
+
+fn post_dispatch_outcome_uncertain(detail: &'static str) -> HostError {
+    HostError::MutationOutcomeUncertain {
+        operation: "dispatch_task".to_string(),
+        detail: detail.to_string(),
+    }
+}
+
+fn verify_post_dispatch_worker_snapshot(
+    started_binding_id: &str,
+    expected_session_binding_id: &str,
+    started_execution_binding: Option<&WorkerExecutionBinding>,
+    expected_execution_binding: Option<&WorkerExecutionBinding>,
+) -> Result<(), HostError> {
+    if started_binding_id != expected_session_binding_id {
+        return Err(post_dispatch_outcome_uncertain(
+            "worker started but returned snapshot session_binding_id did not match session scope; reconcile task state before retrying",
+        ));
+    }
+    if started_execution_binding != expected_execution_binding {
+        return Err(post_dispatch_outcome_uncertain(
+            "worker started but returned snapshot execution_binding did not match dispatch intent; reconcile task state before retrying",
+        ));
+    }
+    Ok(())
+}
+
+fn map_post_dispatch_receipt_error(error: &HostError) -> HostError {
+    let detail = match error {
+        HostError::SecurityViolation { .. } => {
+            "worker started but task receipt sealing failed security validation; reconcile task state before retrying"
+        }
+        HostError::CorruptReceipts { .. } | HostError::CorruptSessionState { .. } => {
+            "worker started but task receipt ledger failed integrity verification; reconcile task state before retrying"
+        }
+        HostError::Io { .. } => {
+            "worker started but task receipt persistence failed with an I/O error; reconcile task state before retrying"
+        }
+        _ => {
+            "worker started but task receipt sealing could not be completed; reconcile task state before retrying"
+        }
+    };
+    post_dispatch_outcome_uncertain(detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_APPROVAL_ID: &str = "apr_0123456789abcdef0123456789abcdef";
+    const TEST_INSTANCE_A: &str = "hst_0123456789abcdef0123456789abcdef";
+    const TEST_INSTANCE_B: &str = "hst_fedcba9876543210fedcba9876543210";
+    const SECRET_DETAIL: &str = "/secret/private/path/or/provider/diagnostic";
+
+    #[test]
+    fn post_stop_manifest_classifier_distinguishes_stopped_polling_and_concurrent_replacement() {
+        let confirmed = classify_post_stop_manifest(
+            TEST_APPROVAL_ID,
+            TEST_INSTANCE_A,
+            Some(TEST_INSTANCE_A),
+            HostPhase::Stopped,
+            false,
+        )
+        .expect("matching stopped manifest with released lock confirms stop");
+        assert!(confirmed);
+
+        let stopping = classify_post_stop_manifest(
+            TEST_APPROVAL_ID,
+            TEST_INSTANCE_A,
+            Some(TEST_INSTANCE_A),
+            HostPhase::Stopping,
+            true,
+        )
+        .expect("matching stopping manifest continues polling");
+        assert!(!stopping);
+
+        let locked_stopped = classify_post_stop_manifest(
+            TEST_APPROVAL_ID,
+            TEST_INSTANCE_A,
+            Some(TEST_INSTANCE_A),
+            HostPhase::Stopped,
+            true,
+        )
+        .expect("matching stopped manifest with lock still held continues polling");
+        assert!(!locked_stopped);
+
+        let replaced_err = classify_post_stop_manifest(
+            TEST_APPROVAL_ID,
+            TEST_INSTANCE_A,
+            Some(TEST_INSTANCE_B),
+            HostPhase::Ready,
+            true,
+        )
+        .expect_err("concurrent replacement instance after stop request must be uncertain");
+        assert_eq!(replaced_err.code(), "host_stop_outcome_uncertain");
+        match replaced_err {
+            HostError::StopOutcomeUncertain {
+                approval_id,
+                detail,
+            } => {
+                assert_eq!(approval_id, TEST_APPROVAL_ID);
+                assert!(!detail.contains(TEST_INSTANCE_B));
+            }
+            other => panic!("expected StopOutcomeUncertain, got {other:?}"),
+        }
+
+        let missing_instance_err = classify_post_stop_manifest(
+            TEST_APPROVAL_ID,
+            TEST_INSTANCE_A,
+            None,
+            HostPhase::Stopped,
+            false,
+        )
+        .expect_err("missing instance_id after stop request must be uncertain");
+        assert_eq!(missing_instance_err.code(), "host_stop_outcome_uncertain");
+
+        let failed_phase_err = classify_post_stop_manifest(
+            TEST_APPROVAL_ID,
+            TEST_INSTANCE_A,
+            Some(TEST_INSTANCE_A),
+            HostPhase::Failed,
+            false,
+        )
+        .expect_err("failed phase during post-stop confirmation must be uncertain");
+        assert_eq!(failed_phase_err.code(), "host_stop_outcome_uncertain");
+    }
+
+    #[test]
+    fn post_dispatch_stage_maps_receipt_and_snapshot_errors_to_outcome_unknown_without_leaks() {
+        let receipt_errors = [
+            HostError::SecurityViolation {
+                path: SECRET_DETAIL.to_string(),
+                reason: SECRET_DETAIL.to_string(),
+            },
+            HostError::CorruptReceipts {
+                path: SECRET_DETAIL.to_string(),
+                reason: SECRET_DETAIL.to_string(),
+            },
+            HostError::Io {
+                operation: "record_task_receipt".to_string(),
+                reason: SECRET_DETAIL.to_string(),
+            },
+        ];
+
+        for source_err in &receipt_errors {
+            let mapped = map_post_dispatch_receipt_error(source_err);
+            assert_eq!(mapped.code(), "outcome_unknown");
+            match mapped {
+                HostError::MutationOutcomeUncertain { operation, detail } => {
+                    assert_eq!(operation, "dispatch_task");
+                    assert!(!detail.contains(SECRET_DETAIL));
+                    assert!(detail.contains("reconcile"));
+                }
+                other => panic!("expected MutationOutcomeUncertain, got {other:?}"),
+            }
+        }
+
+        assert!(
+            verify_post_dispatch_worker_snapshot("bnd_sess_1", "bnd_sess_1", None, None).is_ok()
+        );
+
+        let scope_err =
+            verify_post_dispatch_worker_snapshot(SECRET_DETAIL, "bnd_sess_1", None, None)
+                .expect_err("mismatched post-start session_binding_id must be uncertain");
+        assert_eq!(scope_err.code(), "outcome_unknown");
+        assert!(!scope_err.to_string().contains(SECRET_DETAIL));
+
+        let binding = WorkerExecutionBinding::new(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "instruction",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("valid WorkerExecutionBinding");
+        let exec_err =
+            verify_post_dispatch_worker_snapshot("bnd_sess_1", "bnd_sess_1", None, Some(&binding))
+                .expect_err("mismatched post-start execution_binding must be uncertain");
+        assert_eq!(exec_err.code(), "outcome_unknown");
+    }
 }

@@ -818,6 +818,9 @@ fn map_host_error(error: &HostError) -> OperatorCliError {
         HostError::StopOutcomeUncertain { .. } => {
             "Approved host stop outcome could not be confirmed."
         }
+        HostError::MutationOutcomeUncertain { .. } => {
+            "Session mutation outcome is uncertain after crossing an execution or persistence boundary; inspect session, task, or activity state before retrying."
+        }
         HostError::RestartNotAllowed { .. } => {
             "Approved host restart is not allowed in the current session state."
         }
@@ -863,7 +866,8 @@ fn map_host_error(error: &HostError) -> OperatorCliError {
 /// pre-effect refusals preserve their original error codes.
 fn map_host_mutation_error(error: &HostError) -> OperatorCliError {
     match error {
-        HostError::StopOutcomeUncertain { .. }
+        HostError::MutationOutcomeUncertain { .. }
+        | HostError::StopOutcomeUncertain { .. }
         | HostError::ScopeMismatch { .. }
         | HostError::CorruptManifest { .. }
         | HostError::CorruptReceipts { .. }
@@ -1426,6 +1430,13 @@ mod tests {
     ) {
         let secret = "/secret/provider/or/internal/raw/detail";
         let ambiguous_cases = [
+            (
+                HostError::MutationOutcomeUncertain {
+                    operation: "dispatch_task".to_string(),
+                    detail: secret.to_string(),
+                },
+                "outcome_unknown",
+            ),
             (
                 HostError::StopOutcomeUncertain {
                     approval_id: "apr_1".to_string(),

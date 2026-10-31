@@ -388,6 +388,10 @@ impl AppError {
                 "host_stop_outcome_uncertain",
                 "Host shutdown could not be confirmed. The session is not reported stopped; refresh status before another action.",
             ),
+            HostError::MutationOutcomeUncertain { .. } => (
+                "outcome_unknown",
+                "Task mutation outcome is uncertain. Inspect the current task and session state before retrying.",
+            ),
             HostError::RestartNotAllowed { .. } => (
                 "host_restart_not_allowed",
                 "Only a cleanly stopped session with the expected prior instance can be restarted explicitly.",
@@ -3384,6 +3388,13 @@ mod tests {
                     detail: "leftover child at /private/session with Bearer tl_raw".to_string(),
                 },
                 "host_stop_outcome_uncertain",
+            ),
+            (
+                HostError::MutationOutcomeUncertain {
+                    operation: "private /home/secret-operator".to_string(),
+                    detail: "hidden /private/session with Bearer tl_raw".to_string(),
+                },
+                "outcome_unknown",
             ),
             (
                 HostError::RestartNotAllowed {

@@ -541,6 +541,10 @@ pub fn map_host_error_to_mcp(err: &HostError) -> (&'static str, &'static str) {
             "host_stop_outcome_uncertain",
             "Approved host stop could not be confirmed. Inspect its current state before retrying.",
         ),
+        HostError::MutationOutcomeUncertain { .. } => (
+            "outcome_unknown",
+            "Approved task mutation outcome is uncertain. Inspect task and session state before retrying.",
+        ),
         HostError::RestartNotAllowed { .. } => (
             "host_restart_not_allowed",
             "Approved host can restart only after a confirmed clean stop of the selected instance.",
@@ -1519,6 +1523,13 @@ mod lifecycle_error_tests {
                     detail: private.to_string(),
                 },
                 "host_stop_outcome_uncertain",
+            ),
+            (
+                HostError::MutationOutcomeUncertain {
+                    operation: private.to_string(),
+                    detail: private.to_string(),
+                },
+                "outcome_unknown",
             ),
             (
                 HostError::RestartNotAllowed {
