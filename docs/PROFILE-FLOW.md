@@ -42,7 +42,7 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
   - [`RoleFlowStore::reconcile_handoff`] inspects [`ApprovedHostClient::get_task`]
     without ever invoking `dispatch_task` or repeating a provider call.
   - [`RoleFlowStore::reserve_closure`] enforces a single closure reservation per
-    `(repository_path, package_id, candidate_tree_sha)` across cycles in a
+    `(repository_path, candidate_tree_sha)` across cycles in a
     binding.
 
 ## Core Invariants
@@ -100,7 +100,7 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
      [`ApprovedHostClient`] connected to an already-running `threadlane-host`
      session. Role-flow APIs and CLIs never auto-approve plans or auto-start
      hosts.
-6. **Single closure reservation per `(repository_path, package_id, candidate_tree_sha)`**:
+6. **Single closure reservation per `(repository_path, candidate_tree_sha)`**:
    - Only `ClosureSubjectSource::ApprovedCycleBase` is supported: the candidate
      tree SHA is resolved via sanitized read-only Git from the cycle's frozen
      approved `base_commit`, and `subject_digest` must equal the cycle's
@@ -109,7 +109,7 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
      bound to that exact cycle, approval, repository, base commit, and closure
      task. Missing, foreign, or already-spent reservations are refused before
      recording a native handoff or calling a provider.
-   - Re-reserving the same `(repository_path, package_id, candidate_tree_sha)`
+   - Re-reserving the same `(repository_path, candidate_tree_sha)`
      with the same `subject_digest` across cycles returns the existing
      reservation; a different `subject_digest` for the same tree conflicts; a
      changed candidate tree requires a new commit, fresh approval, and new cycle.
@@ -159,3 +159,31 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
   - `CreateRoleFlowCycleRequest`, `RoleHandoffRequest`, `ReconcileRoleHandoffRequest`, `ReservePackageClosureRequest`
   - `RoleHandoffRecord`, `HandoffStatus`, `NativeRoleHandoff`, `RoleEvidenceReference`
   - `PackageClosureReservation`, `ClosureSubjectSource` (`ApprovedCycleBase`)
+
+## Boundary hardening
+
+- `package_id` is a display/correlation label. Renaming it cannot mint closure
+  authority for the same repository and candidate tree. A reservation requires
+  an actual frozen Closure task; legacy taskless reservations cannot be spent.
+- Handoffs are unique for an approval/task across cycles in the binding. An
+  uncertain handoff in another cycle blocks new routing; creating a cycle does
+  not reset execution history.
+- Native tasks with `depends_on` fail closed as unsupported until accepted
+  predecessor input verification exists for that route. Use a separately
+  approved base candidate for a manual native review or closing phase.
+- Handoff advancement holds the actual conversation-change mutation lock
+  through the host reply and durable finalization. A scope/model change and
+  dispatch therefore have a defined order instead of a check/start race.
+- Only `HostNotReady` and `DependencyInputsUnverified`, which the host guarantees
+  before worker effect, become `refused_before_effect`. Exact retries read that
+  recorded refusal; a new explicit request key, current cycle revision and
+  fresh authorization checks may retry. Previous refusal history is retained.
+  Transport uncertainty and `MutationOutcomeUncertain` remain unreplayable;
+  observing `NotStarted` without a sealed run never clears an unknown outcome.
+- Reconciliation validates approval, task, thread/binding, task digest and sealed
+  run/worker continuity before storing evidence. Execution readiness remains
+  separate from `task_snapshot.lifecycle` review/integration validity.
+
+A sealed receipt without its corresponding worker snapshot is insufficient for
+reconciliation. The handoff remains unresolved until matching worker evidence
+becomes available; missing telemetry is never converted into completion.

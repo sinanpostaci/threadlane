@@ -1671,14 +1671,52 @@ impl ConversationChangeStore {
         }
         let record = existing_record.1;
 
-        // Verify live stop state for any affected approved task(s).
-        let verified_stop_state = if let Some(ref approval_id) = record.approval_id {
-            let approval_record =
-                load_scoped_approval(authority, approval_id, &checked_binding, &checked_thread)?;
-            if let Some(ref task_id) = record.task_id {
+        // A plan-only record can also cover already-approved executions. Omitting the
+        // approval ID must not hide those live tasks or their affected dependents.
+        let approvals = if let Some(ref approval_id) = record.approval_id {
+            vec![load_scoped_approval(
+                authority,
+                approval_id,
+                &checked_binding,
+                &checked_thread,
+            )?]
+        } else if let Some(ref plan_id) = record.plan_id {
+            let summaries = authority
+                .list_for_binding(&checked_binding)
+                .map_err(|err| map_authority_to_change_error(&err))?;
+            if summaries.len() > 256 {
+                return Err(ConversationChangeError::Validation {
+                    reason: "Approval scan exceeded the bounded resolution limit.",
+                });
+            }
+            summaries
+                .into_iter()
+                .filter(|a| a.plan_id == *plan_id && Some(a.plan_revision) == record.plan_revision)
+                .map(|a| {
+                    load_scoped_approval(
+                        authority,
+                        &a.approval_id,
+                        &checked_binding,
+                        &checked_thread,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
+        let mut aggregate_stop = ObservedTaskStopState::NotStarted;
+        for approval in &approvals {
+            for task in &approval.tasks {
+                if let Some(ref root) = record.task_id {
+                    if task.task_id != *root
+                        && !record.affected_dependent_task_ids.contains(&task.task_id)
+                    {
+                        continue;
+                    }
+                }
                 let task_ctx = observe_approved_task(
-                    &approval_record,
-                    task_id,
+                    approval,
+                    &task.task_id,
                     host_client,
                     &checked_binding,
                     &checked_thread,
@@ -1690,34 +1728,12 @@ impl ConversationChangeStore {
                     task_ctx.status,
                     task_ctx.stop_state,
                 )?;
-                Some(task_ctx.stop_state)
-            } else {
-                // Approval-wide change: verify every task in the approval is proven stopped.
-                let mut aggregate_stop = ObservedTaskStopState::NotStarted;
-                for task in &approval_record.tasks {
-                    let task_ctx = observe_approved_task(
-                        &approval_record,
-                        &task.task_id,
-                        host_client,
-                        &checked_binding,
-                        &checked_thread,
-                    )
-                    .await?;
-                    ensure_task_proven_stopped_for_resolution(
-                        &record,
-                        request.resolution_kind,
-                        task_ctx.status,
-                        task_ctx.stop_state,
-                    )?;
-                    if task_ctx.stop_state == ObservedTaskStopState::ProvenStopped {
-                        aggregate_stop = ObservedTaskStopState::ProvenStopped;
-                    }
+                if task_ctx.stop_state == ObservedTaskStopState::ProvenStopped {
+                    aggregate_stop = ObservedTaskStopState::ProvenStopped;
                 }
-                Some(aggregate_stop)
             }
-        } else {
-            None
-        };
+        }
+        let verified_stop_state = (!approvals.is_empty()).then_some(aggregate_stop);
 
         let (resolved_plan_rev, resolved_plan_digest, verified_new_approval_id) = match request
             .resolution_kind
@@ -1943,13 +1959,34 @@ impl ConversationChangeStore {
     }
 }
 
-/// Read-only helper describing unresolved blocking conversational changes (`pending_clarification`
-/// or `pending_replan`) and superseded-approval evidence for a `binding_id`, optionally filtered by
-/// `approval_id` and `task_id`.
-///
-/// Designed for workflow and `profile-flow` controllers to check whether advancing or dispatching
-/// work in `binding_id` is blocked by an unresolved conversational change or a superseded approval
-/// without creating directories or lock files.
+/// Serializes role advancement with the binding's actual conversation-change mutations.
+/// The guard must remain alive through dispatch; preflight and observation never acquire it.
+pub(crate) async fn acquire_conversation_advancement_guard(
+    plans_dir: &Path,
+    binding_id: &str,
+) -> Result<crate::fs_safety::CrossProcessLockGuard, NativeError> {
+    let plans_dir = plans_dir.to_path_buf();
+    let binding_id = binding_id.to_string();
+    tokio::task::spawn_blocking(move || -> Result<_, NativeError> {
+        let store = ConversationChangeStore::open(&plans_dir)?;
+        validate_binding_id(&binding_id)?;
+        let (_, filename) = ledger_paths_for_binding(&store.namespace_dir, &binding_id)?;
+        acquire_cross_process_lock(
+            &store.namespace_dir,
+            &filename,
+            "conversation_advancement_lock",
+        )
+    })
+    .await
+    .map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::IoError,
+            "Conversation advancement lock acquisition failed.",
+        )
+    })?
+}
+
+/// Reads blocking changes without creating a namespace or acquiring a mutation lock.
 pub fn inspect_unresolved_blocking_changes(
     plans_dir: &Path,
     binding_id: &str,
@@ -2461,14 +2498,23 @@ async fn evaluate_change_request(
         ),
     };
 
+    let dependent_task_ids = observed_task
+        .map(|c| c.dependent_task_ids)
+        .unwrap_or_else(|| match (&plan_tasks, resolved_task_id.as_deref()) {
+            (Some(tasks), Some(root)) => collect_dependent_ids(
+                tasks
+                    .iter()
+                    .map(|t| (t.id.as_str(), t.depends_on.as_slice())),
+                root,
+            ),
+            _ => Vec::new(),
+        });
     Ok(ValidatedChangeEvaluation {
         approval_record,
         plan_id: resolved_plan_id,
         plan_revision: resolved_plan_revision,
         task_id: resolved_task_id,
-        dependent_task_ids: observed_task
-            .map(|c| c.dependent_task_ids)
-            .unwrap_or_default(),
+        dependent_task_ids,
         summary: clean_summary,
         detail: clean_detail,
         proposed_write_paths: clean_write_paths,
@@ -2662,33 +2708,40 @@ fn ensure_task_proven_stopped_for_resolution(
 }
 
 fn collect_transitive_dependents(tasks: &[ApprovedTaskRecord], root_task_id: &str) -> Vec<String> {
+    collect_dependent_ids(
+        tasks
+            .iter()
+            .map(|t| (t.task_id.as_str(), t.depends_on.as_slice())),
+        root_task_id,
+    )
+}
+
+fn collect_dependent_ids<'a>(
+    tasks: impl Iterator<Item = (&'a str, &'a [String])>,
+    root_task_id: &str,
+) -> Vec<String> {
+    let graph: Vec<_> = tasks.collect();
     let mut visited = BTreeSet::new();
     let mut queue = vec![root_task_id.to_string()];
     while let Some(current) = queue.pop() {
-        for task in tasks {
-            if task.depends_on.iter().any(|dep| dep == &current)
-                && visited.insert(task.task_id.clone())
-            {
-                queue.push(task.task_id.clone());
+        for (id, deps) in &graph {
+            if deps.iter().any(|dep| dep == &current) && visited.insert((*id).to_string()) {
+                queue.push((*id).to_string());
             }
         }
     }
-    tasks
-        .iter()
-        .filter(|t| visited.contains(&t.task_id))
-        .map(|t| t.task_id.clone())
+    graph
+        .into_iter()
+        .filter(|(id, _)| visited.contains(*id))
+        .map(|(id, _)| id.to_string())
         .collect()
 }
 
 fn write_paths_within_allowed(proposed: &[String], allowed: &[String]) -> bool {
     proposed.iter().all(|prop| {
-        allowed.iter().any(|allow| {
-            prop == allow
-                || prop
-                    .strip_prefix(allow.as_str())
-                    .map(|rest| rest.starts_with('/'))
-                    .unwrap_or(false)
-        })
+        allowed
+            .iter()
+            .any(|allow| prop == allow || (allow.ends_with('/') && prop.starts_with(allow)))
     })
 }
 
@@ -3568,7 +3621,7 @@ mod tests {
 
     #[test]
     fn write_path_coverage_detects_expansions() {
-        let allowed = vec!["src/lib.rs".to_string(), "crates/sub".to_string()];
+        let allowed = vec!["src/lib.rs".to_string(), "crates/sub/".to_string()];
         assert!(write_paths_within_allowed(
             &["src/lib.rs".to_string(), "crates/sub/mod.rs".to_string()],
             &allowed
@@ -3611,5 +3664,65 @@ mod tests {
             map_host_cancel_error(&superseded),
             ConversationChangeError::UnpublishedOrSupersededPlan
         );
+    }
+}
+
+#[cfg(test)]
+mod write_scope_regressions {
+    use super::write_paths_within_allowed;
+    #[test]
+    fn directory_markers_cannot_expand_frozen_literal_file_scopes() {
+        assert!(!write_paths_within_allowed(
+            &["src/item/child.rs".into()],
+            &["src/item".into()]
+        ));
+        assert!(!write_paths_within_allowed(
+            &["src/item/".into()],
+            &["src/item".into()]
+        ));
+        assert!(write_paths_within_allowed(
+            &["src/item/child.rs".into()],
+            &["src/item/".into()]
+        ));
+        assert!(write_paths_within_allowed(
+            &["src/item".into()],
+            &["src/item".into()]
+        ));
+        assert!(!write_paths_within_allowed(
+            &["src/item-other/child.rs".into()],
+            &["src/item/".into()]
+        ));
+    }
+}
+
+#[cfg(test)]
+mod advancement_serialization_regressions {
+    use super::*;
+    use std::time::Duration;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn advancement_guard_excludes_the_actual_change_mutation_lock() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let store = ConversationChangeStore::open(temp.path()).expect("change store");
+        let binding = "bnd_advancement_lock";
+        let guard = acquire_conversation_advancement_guard(temp.path(), binding)
+            .await
+            .expect("guard");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            store
+                .with_binding_lock(binding, |_| {
+                    tx.send(()).expect("send mutation lock acquired");
+                    Ok(())
+                })
+                .expect("mutation lock");
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(3))
+            .expect("mutation proceeds after advancement");
+        writer.join().expect("writer joined");
     }
 }

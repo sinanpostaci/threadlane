@@ -88,6 +88,8 @@ pub struct FrozenCycleTask {
 pub enum HandoffStatus {
     /// Headless dispatch intent was persisted before calling `ApprovedHostClient::dispatch_task`.
     IntentRecorded,
+    /// The host proved refusal before worker effect; a new explicitly authorized request key may retry.
+    RefusedBeforeEffect,
     /// Native Codex conversational handoff was recorded (makes no model execution claim).
     NativeHandoffRecorded,
     /// Headless worker task was dispatched and sealed a `TaskRunReceipt` (`Queued`, `Claimed`, `Running`, or `CancelRequested`).
@@ -109,6 +111,7 @@ impl HandoffStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::IntentRecorded => "intent_recorded",
+            Self::RefusedBeforeEffect => "refused_before_effect",
             Self::NativeHandoffRecorded => "native_handoff_recorded",
             Self::Dispatched => "dispatched",
             Self::ReadyForReview => "ready_for_review",
@@ -314,7 +317,10 @@ pub enum ClosureSubjectSource {
     },
 }
 
-/// Cross-cycle single-closure reservation for a `(repository_path, package_id, candidate_tree_sha)` tuple.
+/// Cross-cycle single-closure reservation for a `(repository_path, candidate_tree_sha)` candidate tree.
+///
+/// `package_id` is retained on wire and storage records as a human display and correlation label,
+/// not as an independent closure authority key.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageClosureReservation {
@@ -425,7 +431,7 @@ pub struct ReconcileRoleHandoffRequest {
     pub handoff_id: String,
 }
 
-/// Request to reserve single-closure authority for `(repository_path, package_id, candidate_tree_sha)` across cycles.
+/// Request to reserve single-closure authority for `(repository_path, candidate_tree_sha)` across cycles.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReservePackageClosureRequest {
@@ -439,11 +445,11 @@ pub struct ReservePackageClosureRequest {
     pub expected_cycle_revision: u64,
     /// Caller-supplied idempotency key for this reservation.
     pub request_key: String,
-    /// Package or milestone closure identifier within the repository.
+    /// Human-readable package or milestone display/correlation label within the repository.
     pub package_id: String,
     /// Verified source from which the concrete `candidate_tree_sha` and `subject_digest` are derived.
     pub source: ClosureSubjectSource,
-    /// Optional closure reviewer task identifier within the cycle.
+    /// Required closure reviewer task identifier (`Some(...)`) referencing a frozen `WorkflowRole::Closure` task in the cycle.
     pub task_id: Option<String>,
 }
 
@@ -866,6 +872,11 @@ impl RoleFlowStore {
         }
         request.current_policy.validate()?;
         let current_policy_digest = request.current_policy.digest()?;
+        let _change_guard = crate::conversation_change::acquire_conversation_advancement_guard(
+            &self.plans_dir,
+            &request.binding_id,
+        )
+        .await?;
 
         let _ = validate_existing_private_store_dir(&self.plans_dir, "plans_dir")?;
         let lock_filename = lock_filename_for_binding(&request.binding_id);
@@ -938,7 +949,11 @@ impl RoleFlowStore {
             if let Some(existing_task) = ledger.cycles[cycle_idx]
                 .handoffs
                 .iter()
-                .find(|h| h.task_id == request.task_id)
+                .find(|h| {
+                    h.task_id == request.task_id
+                        && (h.status != HandoffStatus::RefusedBeforeEffect
+                            || h.request_key == request.request_key)
+                })
                 .cloned()
             {
                 verify_existing_handoff_match(
@@ -954,6 +969,37 @@ impl RoleFlowStore {
                     ));
                 }
                 return Ok(existing_task);
+            }
+
+            let target_approval_id = &ledger.cycles[cycle_idx].approval_id;
+            let mut cross_cycle_match = false;
+            for (idx, other_cycle) in ledger.cycles.iter().enumerate() {
+                if idx == cycle_idx {
+                    continue;
+                }
+                for existing_other in &other_cycle.handoffs {
+                    if existing_other.status == HandoffStatus::RefusedBeforeEffect {
+                        continue;
+                    }
+                    if (other_cycle.approval_id == *target_approval_id
+                        || existing_other.approval_id == *target_approval_id)
+                        && existing_other.task_id == request.task_id
+                    {
+                        if existing_other.status.is_ambiguous() {
+                            return Err(NativeError::new(
+                                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                                "Task handoff for this approval has an unknown outcome pending reconciliation in another cycle; replay is forbidden.",
+                            ));
+                        }
+                        cross_cycle_match = true;
+                    }
+                }
+            }
+            if cross_cycle_match {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Task handoff was already recorded for this approval and task in another role-flow cycle.",
+                ));
             }
 
             let cycle = &ledger.cycles[cycle_idx];
@@ -989,6 +1035,15 @@ impl RoleFlowStore {
                 &request.current_policy,
                 authority,
             )?;
+
+            if frozen_task.route == RoleExecutionRoute::NativeHandoff
+                && !frozen_task.depends_on.is_empty()
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedCapability,
+                    "Native handoff tasks with non-empty depends_on are not supported without verified accepted predecessor inputs; use a separately approved base candidate cycle.",
+                ));
+            }
 
             let verified_closure_id = verify_closure_handoff_reservation(
                 request,
@@ -1167,6 +1222,9 @@ impl RoleFlowStore {
                         "Requested handoff_id was not found in this role-flow cycle.",
                     )
                 })?;
+            if handoff.status == HandoffStatus::RefusedBeforeEffect {
+                return Ok(handoff.clone());
+            }
             if handoff.route != RoleExecutionRoute::HeadlessWorker {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
@@ -1222,6 +1280,17 @@ impl RoleFlowStore {
                 "Ledger revision overflow.",
             )
         })?;
+        let existing = ledger.cycles[cycle_idx]
+            .handoffs
+            .iter()
+            .find(|h| h.handoff_id == request.handoff_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "Reconciled handoff is missing.",
+                )
+            })?;
+        validate_handoff_snapshot(&ledger.cycles[cycle_idx], existing, &snapshot)?;
         let evidence = build_evidence_ref(&ledger.cycles[cycle_idx], &snapshot);
         let has_sealed_run = snapshot.run_id.is_some() && snapshot.worker_id.is_some();
         let cycle_mut = &mut ledger.cycles[cycle_idx];
@@ -1254,15 +1323,14 @@ impl RoleFlowStore {
         Ok(updated)
     }
 
-    /// Reserves single-closure authority once per `(repository_path, package_id, candidate_tree_sha)`
-    /// across all cycles in `binding_id`.
+    /// Reserves single-closure authority once per `(repository_path, candidate_tree_sha)`
+    /// across all cycles and closure tasks in `binding_id`.
     ///
     /// Derives the concrete `candidate_tree_sha` from the cycle's approved base commit via
     /// controlled read-only Git and requires `subject_digest` to equal the cycle's software-validated
-    /// `approval_subject_digest`. If the same `(repository_path, package_id, candidate_tree_sha)`
-    /// was already reserved with the same `subject_digest` (even in an earlier cycle), returns the
-    /// existing reservation without spending another closure call. If `subject_digest` differs for
-    /// the same tree key, fails with [`NativeErrorCode::ValidationFailed`].
+    /// `approval_subject_digest`. Requires `request.task_id` to be `Some(...)` referencing a frozen
+    /// `WorkflowRole::Closure` task in the cycle. `package_id` is a human display/correlation label
+    /// and cannot be aliased to mint a second reservation for the same `(repository_path, candidate_tree_sha)`.
     pub fn reserve_closure(
         &self,
         request: &ReservePackageClosureRequest,
@@ -1283,9 +1351,13 @@ impl RoleFlowStore {
                 "expected_cycle_revision must be >= 1.",
             ));
         }
-        if let Some(ref task_id) = request.task_id {
-            validate_bounded_identifier(task_id, "task_id", MAX_ID_LEN)?;
-        }
+        let task_id = request.task_id.as_deref().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ReservePackageClosureRequest.task_id is required and must reference a frozen WorkflowRole::Closure task.",
+            )
+        })?;
+        validate_bounded_identifier(task_id, "task_id", MAX_ID_LEN)?;
 
         let _ = validate_existing_private_store_dir(&self.plans_dir, "plans_dir")?;
         let lock_filename = lock_filename_for_binding(&request.binding_id);
@@ -1320,23 +1392,21 @@ impl RoleFlowStore {
             ));
         }
 
-        if let Some(ref task_id) = request.task_id {
-            let task = ledger.cycles[cycle_idx]
-                .tasks
-                .iter()
-                .find(|t| &t.task_id == task_id)
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "Closure task_id is not frozen in this role-flow cycle.",
-                    )
-                })?;
-            if task.role != WorkflowRole::Closure {
-                return Err(NativeError::new(
+        let task = ledger.cycles[cycle_idx]
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| {
+                NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "Only tasks with WorkflowRole::Closure may reserve a package closure.",
-                ));
-            }
+                    "Closure task_id is not frozen in this role-flow cycle.",
+                )
+            })?;
+        if task.role != WorkflowRole::Closure {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Only tasks with WorkflowRole::Closure may reserve a package closure.",
+            ));
         }
 
         let (candidate_tree_sha, subject_digest) =
@@ -1347,7 +1417,8 @@ impl RoleFlowStore {
             .iter()
             .find(|res| res.request_key == request.request_key)
         {
-            if existing_by_req.repository_path == ledger.cycles[cycle_idx].repository_path
+            if existing_by_req.cycle_id == request.cycle_id
+                && existing_by_req.repository_path == ledger.cycles[cycle_idx].repository_path
                 && existing_by_req.package_id == request.package_id
                 && existing_by_req.candidate_tree_sha == candidate_tree_sha
                 && existing_by_req.subject_digest == subject_digest
@@ -1361,18 +1432,48 @@ impl RoleFlowStore {
             ));
         }
 
-        if let Some(existing_by_key) = ledger.closures.iter().find(|res| {
-            res.repository_path == ledger.cycles[cycle_idx].repository_path
-                && res.package_id == request.package_id
-                && res.candidate_tree_sha == candidate_tree_sha
-        }) {
-            if existing_by_key.subject_digest == subject_digest {
-                return Ok(existing_by_key.clone());
-            }
+        let matching_tree_reservation_ids: BTreeSet<&str> = ledger
+            .closures
+            .iter()
+            .filter(|res| {
+                res.repository_path == ledger.cycles[cycle_idx].repository_path
+                    && res.candidate_tree_sha == candidate_tree_sha
+            })
+            .map(|res| res.reservation_id.as_str())
+            .collect();
+
+        if has_closure_spend_for_repo_tree(
+            &ledger.cycles,
+            &matching_tree_reservation_ids,
+            &ledger.cycles[cycle_idx].repository_path,
+            &candidate_tree_sha,
+            None,
+        ) {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "Conflicting closure subject_digest for an already-reserved (repository, package, candidate_tree_sha).",
+                "Closure authority for this repository and candidate_tree_sha was already spent.",
             ));
+        }
+
+        if let Some(existing_by_tree) = ledger.closures.iter().find(|res| {
+            res.repository_path == ledger.cycles[cycle_idx].repository_path
+                && res.candidate_tree_sha == candidate_tree_sha
+        }) {
+            if existing_by_tree.subject_digest != subject_digest {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Conflicting closure subject_digest for an already-reserved (repository, package, candidate_tree_sha).",
+                ));
+            }
+            if existing_by_tree.package_id != request.package_id
+                || existing_by_tree.task_id != request.task_id
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Candidate tree already has a closure reservation in this binding; alias package_id or alternative closure task cannot mint a reservation.",
+                ));
+            }
+            return Ok(existing_by_tree.clone());
         }
 
         let cycle = &ledger.cycles[cycle_idx];
@@ -1492,6 +1593,17 @@ impl RoleFlowStore {
 
         match dispatch_res {
             Ok(snapshot) => {
+                let existing = ledger.cycles[cycle_idx]
+                    .handoffs
+                    .iter()
+                    .find(|h| h.handoff_id == handoff_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "Dispatched handoff is missing.",
+                        )
+                    })?;
+                validate_handoff_snapshot(&ledger.cycles[cycle_idx], existing, &snapshot)?;
                 let evidence = build_evidence_ref(&ledger.cycles[cycle_idx], &snapshot);
                 let has_sealed_run = snapshot.run_id.is_some() && snapshot.worker_id.is_some();
                 let cycle_mut = &mut ledger.cycles[cycle_idx];
@@ -1535,17 +1647,30 @@ impl RoleFlowStore {
                             "Persisted handoff intent disappeared after failed headless dispatch.",
                         )
                     })?;
-                handoff_mut.status = HandoffStatus::OutcomeUnknown;
+                let known_refusal = host_dispatch_refused_before_effect(&host_err);
+                handoff_mut.status = if known_refusal {
+                    HandoffStatus::RefusedBeforeEffect
+                } else {
+                    HandoffStatus::OutcomeUnknown
+                };
                 handoff_mut.updated_at_cycle_revision = next_cycle_rev;
                 handoff_mut.last_error = Some(sanitized.clone());
                 cycle_mut.cycle_revision = next_cycle_rev;
                 ledger.ledger_revision = next_ledger_rev;
                 self.write_ledger_unlocked(binding_id, &ledger)?;
                 Err(NativeError::new(
-                    NativeErrorCode::AmbiguousTransportFailure,
-                    format!(
+                    if known_refusal {
+                        NativeErrorCode::ValidationFailed
+                    } else {
+                        NativeErrorCode::AmbiguousTransportFailure
+                    },
+                    if known_refusal {
+                        format!("Host refused dispatch before effect ({sanitized}); inspect readiness and retry only with a new authorized request key.")
+                    } else {
+                        format!(
                         "Headless dispatch outcome is unknown after durable intent ({sanitized}); reconcile before acting."
-                    ),
+                    )
+                    },
                 ))
             }
         }
@@ -1917,17 +2042,6 @@ fn verify_closure_handoff_reservation(
         ));
     }
 
-    if all_cycles.iter().any(|c| {
-        c.handoffs
-            .iter()
-            .any(|h| h.closure_reservation_id.as_deref() == Some(reservation_id.as_str()))
-    }) {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "Closure reservation was already spent by an existing closure handoff.",
-        ));
-    }
-
     let (actual_tree_sha, actual_subject_digest) =
         derive_and_verify_closure_subject(cycle, &reservation.source)?;
     if actual_tree_sha != reservation.candidate_tree_sha
@@ -1939,7 +2053,66 @@ fn verify_closure_handoff_reservation(
         ));
     }
 
+    let matching_tree_reservation_ids: BTreeSet<&str> = all_closures
+        .iter()
+        .filter(|res| {
+            res.repository_path == cycle.repository_path
+                && res.candidate_tree_sha == actual_tree_sha
+        })
+        .map(|res| res.reservation_id.as_str())
+        .collect();
+
+    if let Some(first_for_tree) = all_closures.iter().find(|res| {
+        res.repository_path == cycle.repository_path && res.candidate_tree_sha == actual_tree_sha
+    }) {
+        if first_for_tree.reservation_id != *reservation_id
+            || first_for_tree.subject_digest != actual_subject_digest
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Closure reservation conflicts with an earlier reservation for the same repository and candidate_tree_sha.",
+            ));
+        }
+    }
+
+    if has_closure_spend_for_repo_tree(
+        all_cycles,
+        &matching_tree_reservation_ids,
+        &cycle.repository_path,
+        &actual_tree_sha,
+        Some(reservation_id.as_str()),
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "Closure reservation was already spent by an existing closure handoff.",
+        ));
+    }
+
     Ok(Some(reservation_id.clone()))
+}
+
+fn has_closure_spend_for_repo_tree(
+    all_cycles: &[RoleFlowCycle],
+    matching_tree_reservation_ids: &BTreeSet<&str>,
+    repository_path: &str,
+    candidate_tree_sha: &str,
+    reservation_id: Option<&str>,
+) -> bool {
+    all_cycles.iter().any(|c| {
+        let same_repo_tree =
+            c.repository_path == repository_path && c.base_tree_sha == candidate_tree_sha;
+        c.handoffs.iter().any(|h| {
+            if h.status == HandoffStatus::RefusedBeforeEffect {
+                return false;
+            }
+            let matches_res_id = h.closure_reservation_id.as_deref().is_some_and(|id| {
+                reservation_id == Some(id) || matching_tree_reservation_ids.contains(id)
+            });
+            let matches_tree_closure = same_repo_tree
+                && (h.role == WorkflowRole::Closure || h.closure_reservation_id.is_some());
+            matches_res_id || matches_tree_closure
+        })
+    })
 }
 
 fn verify_headless_dispatch_authorization(
@@ -2456,4 +2629,54 @@ fn encode_lower_hex_16(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+fn host_dispatch_refused_before_effect(error: &HostError) -> bool {
+    // These variants are returned before start_worker. Unknown transport and
+    // MutationOutcomeUncertain are deliberately never classified by absence of a receipt.
+    matches!(
+        error,
+        HostError::HostNotReady { .. } | HostError::DependencyInputsUnverified { .. }
+    )
+}
+
+fn validate_handoff_snapshot(
+    cycle: &RoleFlowCycle,
+    handoff: &RoleHandoffRecord,
+    snapshot: &TaskStateSnapshot,
+) -> Result<(), NativeError> {
+    let frozen = cycle
+        .tasks
+        .iter()
+        .find(|t| t.task_id == handoff.task_id)
+        .ok_or_else(|| {
+            NativeError::new(NativeErrorCode::ProtocolError, "Frozen task is missing.")
+        })?;
+    let identity_matches = snapshot.approval_id == cycle.approval_id
+        && snapshot.subject_digest == cycle.approval_subject_digest
+        && snapshot.binding_id == cycle.binding_id
+        && snapshot.thread_uuid == cycle.thread_uuid
+        && snapshot.task_id == handoff.task_id
+        && snapshot.task_digest == frozen.task_digest
+        && handoff
+            .run_id
+            .as_ref()
+            .is_none_or(|id| snapshot.run_id.as_ref() == Some(id))
+        && handoff
+            .worker_id
+            .as_ref()
+            .is_none_or(|id| snapshot.worker_id.as_ref() == Some(id));
+    let worker_matches = match &snapshot.worker {
+        Some(worker) => {
+            snapshot.run_id.as_ref() == Some(&worker.run_id)
+                && snapshot.worker_id.as_ref() == Some(&worker.worker_id)
+                && snapshot.session_binding_id == worker.binding_id
+        }
+        None => snapshot.run_id.is_none() && snapshot.worker_id.is_none(),
+    };
+    if !identity_matches || !worker_matches {
+        return Err(NativeError::new(NativeErrorCode::ProtocolError,
+            "Host task snapshot identity or sealed run continuity does not match the frozen handoff."));
+    }
+    Ok(())
 }

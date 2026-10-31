@@ -1140,7 +1140,7 @@ async fn unknown_handoff_blocks_replay_and_reconciles_sealed_or_unstarted_host_s
     )
     .expect("create ApprovedHostClient");
 
-    // 1. Dispatching task-coder-hard-2 before the host session starts records durable intent and transitions to OutcomeUnknown.
+    // 1. An absent host is a proven pre-effect refusal, distinct from an uncertain transport outcome.
     let unstarted_req = RoleHandoffRequest {
         binding_id: BINDING_A.to_string(),
         thread_uuid: THREAD_UUID_A.to_string(),
@@ -1156,10 +1156,10 @@ async fn unknown_handoff_blocks_replay_and_reconciles_sealed_or_unstarted_host_s
     let unstarted_err = store
         .handoff_role(&unstarted_req, &fixture.authority, Some(&client))
         .await
-        .expect_err("dispatch before host start must fail with AmbiguousTransportFailure");
+        .expect_err("dispatch before host start must be refused before effect");
     assert_eq!(
         unstarted_err.error_code(),
-        NativeErrorCode::AmbiguousTransportFailure
+        NativeErrorCode::ValidationFailed
     );
 
     let cycle_after_unstarted = store
@@ -1169,7 +1169,25 @@ async fn unknown_handoff_blocks_replay_and_reconciles_sealed_or_unstarted_host_s
     assert_eq!(cycle_after_unstarted.cycle_revision, 3);
     let unknown_hnd_2 = &cycle_after_unstarted.handoffs[0];
     assert_eq!(unknown_hnd_2.task_id, "task-coder-hard-2");
-    assert_eq!(unknown_hnd_2.status, HandoffStatus::OutcomeUnknown);
+    assert_eq!(unknown_hnd_2.status, HandoffStatus::RefusedBeforeEffect);
+    // Inject a crash marker ONLY in this disposable ledger to exercise genuine
+    // uncertainty independently of a host's deterministic no-effect refusal.
+    let path = store.ledger_path_for_binding(BINDING_A).expect("ledger");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read")).expect("json");
+    let entry = value["cycles"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|c| c["cycle_id"] == cycle.cycle_id)
+        .unwrap()["handoffs"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|h| h["handoff_id"] == unknown_hnd_2.handoff_id)
+        .unwrap();
+    entry["status"] = serde_json::to_value(HandoffStatus::OutcomeUnknown).unwrap();
+    fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).expect("inject unknown");
 
     // Start the real ApprovedHost now.
     let host = ApprovedHost::start(ApprovedHostConfig {
@@ -1869,4 +1887,264 @@ async fn conversation_change_gate_allows_questions_and_blocks_handoff_on_pending
         NativeErrorCode::ValidationFailed
     );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
+}
+
+#[tokio::test]
+async fn cross_cycle_replay_alias_closure_and_known_refusal_boundaries() {
+    let fixture = setup_fixture();
+    let store = RoleFlowStore::new(&fixture.plans_dir).expect("store");
+    let policy = default_policy();
+    let mut tasks = default_tasks();
+    tasks
+        .iter_mut()
+        .find(|t| t.id == "task-closure")
+        .unwrap()
+        .depends_on = vec!["task-coder-hard-1".into()];
+    tasks
+        .iter_mut()
+        .find(|t| t.id == "task-coder-hard-2")
+        .unwrap()
+        .depends_on = vec!["task-coder-hard-1".into()];
+    let approval = create_approved_plan_at_commit(
+        &fixture,
+        "boundary-regressions",
+        BINDING_A,
+        THREAD_UUID_A,
+        &fixture.base_commit,
+        tasks,
+    );
+    let cycle_request = CreateRoleFlowCycleRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        request_key: "boundaries-cycle-one".into(),
+        expected_ledger_revision: Some(0),
+        approval_id: approval.clone(),
+        policy: policy.clone(),
+        task_ids: vec![
+            "task-coder-hard-1".into(),
+            "task-coder-hard-2".into(),
+            "task-native-follower".into(),
+            "task-closure".into(),
+        ],
+    };
+    let cycle = store
+        .create_cycle(&cycle_request, &fixture.authority)
+        .expect("cycle");
+    let make_request = |task: &str, key: &str, revision| RoleHandoffRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        cycle_id: cycle.cycle_id.clone(),
+        expected_cycle_revision: revision,
+        request_key: key.into(),
+        task_id: task.into(),
+        current_policy: policy.clone(),
+        operator_approved: true,
+        confirm_approval_digest: Some(cycle.approval_subject_digest.clone()),
+        closure_reservation_id: None,
+    };
+    let reserve = ReservePackageClosureRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        cycle_id: cycle.cycle_id.clone(),
+        expected_cycle_revision: 1,
+        request_key: "boundary-reserve".into(),
+        package_id: "package-original".into(),
+        source: ClosureSubjectSource::ApprovedCycleBase {
+            subject_digest: cycle.approval_subject_digest.clone(),
+            expected_candidate_tree_sha: None,
+        },
+        task_id: Some("task-closure".into()),
+    };
+    assert!(store
+        .reserve_closure(&ReservePackageClosureRequest {
+            task_id: None,
+            ..reserve.clone()
+        })
+        .is_err());
+    let reservation = store.reserve_closure(&reserve).expect("bound reservation");
+    let current = store
+        .get_cycle(BINDING_A, &cycle.cycle_id)
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .reserve_closure(&ReservePackageClosureRequest {
+                request_key: "alias-reservation".into(),
+                package_id: "package-renamed".into(),
+                expected_cycle_revision: current.cycle_revision,
+                ..reserve.clone()
+            })
+            .is_err(),
+        "renaming cannot mint closure authority"
+    );
+    let mut closure = make_request(
+        "task-closure",
+        "premature-native-close",
+        current.cycle_revision,
+    );
+    closure.closure_reservation_id = Some(reservation.reservation_id.clone());
+    let error = store
+        .handoff_role(&closure, &fixture.authority, None)
+        .await
+        .expect_err("unverified native dependency");
+    assert_eq!(error.error_code(), NativeErrorCode::UnsupportedCapability);
+    assert!(store
+        .get_cycle(BINDING_A, &cycle.cycle_id)
+        .unwrap()
+        .unwrap()
+        .handoffs
+        .is_empty());
+    assert_eq!(store.list_closure_reservations(BINDING_A).unwrap().len(), 1);
+
+    let native = make_request(
+        "task-native-follower",
+        "native-first",
+        current.cycle_revision,
+    );
+    store
+        .handoff_role(&native, &fixture.authority, None)
+        .await
+        .expect("native record");
+    let second = store
+        .create_cycle(
+            &CreateRoleFlowCycleRequest {
+                request_key: "boundaries-cycle-two".into(),
+                expected_ledger_revision: None,
+                ..cycle_request.clone()
+            },
+            &fixture.authority,
+        )
+        .expect("second cycle");
+    assert!(store
+        .handoff_role(
+            &RoleHandoffRequest {
+                cycle_id: second.cycle_id.clone(),
+                expected_cycle_revision: second.cycle_revision,
+                request_key: "native-alias-cycle".into(),
+                ..native.clone()
+            },
+            &fixture.authority,
+            None
+        )
+        .await
+        .is_err());
+    assert!(store
+        .get_cycle(BINDING_A, &second.cycle_id)
+        .unwrap()
+        .unwrap()
+        .handoffs
+        .is_empty());
+
+    fs::create_dir_all(&fixture.sessions_dir).expect("sessions");
+    fs::set_permissions(&fixture.sessions_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let client = ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        BINDING_A.to_string(),
+        THREAD_UUID_A.to_string(),
+    )
+    .expect("client");
+    let current = store
+        .get_cycle(BINDING_A, &cycle.cycle_id)
+        .unwrap()
+        .unwrap();
+    let first_request = make_request(
+        "task-coder-hard-1",
+        "host-not-ready",
+        current.cycle_revision,
+    );
+    assert!(store
+        .handoff_role(&first_request, &fixture.authority, Some(&client))
+        .await
+        .is_err());
+    let refused = store
+        .handoff_role(&first_request, &fixture.authority, Some(&client))
+        .await
+        .expect("idempotent refusal read");
+    assert_eq!(refused.status, HandoffStatus::RefusedBeforeEffect);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
+    let host = ApprovedHost::start(ApprovedHostConfig {
+        registry_dir: fixture.registry_dir.clone(),
+        plans_dir: fixture.plans_dir.clone(),
+        authority_dir: fixture.authority_dir.clone(),
+        sessions_dir: fixture.sessions_dir.clone(),
+        approval_id: approval.clone(),
+        tick_interval: Duration::from_millis(25),
+        notifications: None,
+    })
+    .await
+    .expect("host");
+    let current = store
+        .get_cycle(BINDING_A, &cycle.cycle_id)
+        .unwrap()
+        .unwrap();
+    let retry = make_request(
+        "task-coder-hard-1",
+        "explicit-new-ready-attempt",
+        current.cycle_revision,
+    );
+    let dispatched = store
+        .handoff_role(&retry, &fixture.authority, Some(&client))
+        .await
+        .expect("safe new attempt");
+    wait_for_task_ready(&client, &approval, "task-coder-hard-1").await;
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    let current = store
+        .get_cycle(BINDING_A, &cycle.cycle_id)
+        .unwrap()
+        .unwrap();
+    let dependent = make_request(
+        "task-coder-hard-2",
+        "unreviewed-dependency",
+        current.cycle_revision,
+    );
+    assert!(store
+        .handoff_role(&dependent, &fixture.authority, Some(&client))
+        .await
+        .is_err());
+    let current = store
+        .get_cycle(BINDING_A, &cycle.cycle_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current.handoffs.last().unwrap().status,
+        HandoffStatus::RefusedBeforeEffect
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    // An actual uncertain marker still blocks another cycle even though a real
+    // no-effect refusal is safely retried with a distinct explicit request key.
+    let path = store.ledger_path_for_binding(BINDING_A).unwrap();
+    let mut ledger: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let item = ledger["cycles"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|c| c["cycle_id"] == cycle.cycle_id)
+        .unwrap()["handoffs"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|h| h["handoff_id"] == dispatched.handoff_id)
+        .unwrap();
+    item["status"] = serde_json::to_value(HandoffStatus::OutcomeUnknown).unwrap();
+    fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+    let error = store
+        .handoff_role(
+            &RoleHandoffRequest {
+                cycle_id: second.cycle_id,
+                expected_cycle_revision: 1,
+                request_key: "cross-cycle-unknown".into(),
+                ..retry
+            },
+            &fixture.authority,
+            Some(&client),
+        )
+        .await
+        .expect_err("cross-cycle uncertain outcome cannot replay");
+    assert_eq!(
+        error.error_code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    host.shutdown().await.expect("shutdown host");
 }

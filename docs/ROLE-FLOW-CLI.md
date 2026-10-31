@@ -209,3 +209,15 @@ prove that no effect occurred when the code is `outcome_unknown`.
 - There is no transcript monitoring, automatic approval detection, authenticated
   two-chat routing, or implicit same-project child dispatch in this wrapper.
 - Linux is the tested platform. Non-Unix platforms fail closed as unsupported.
+
+A closure request must include `task_id` for a frozen Closure task. Its
+`package_id` is a label; changing it cannot create another reservation for the
+same repository/tree. Native tasks with nonempty `depends_on` are explicitly
+unsupported; use a separately approved candidate phase.
+
+A `refused_before_effect` handoff records an actual host readiness or dependency
+refusal, not an unknown effect. Inspect the cycle and retry only with a new
+request key after readiness and authorization are satisfied. A transport-unknown
+handoff still requires reconciliation and cannot be unlocked from an unstarted
+snapshot alone. Handoff and change recording share a mutation lock, preserving
+ordering at dispatch.

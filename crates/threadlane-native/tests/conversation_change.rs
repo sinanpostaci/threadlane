@@ -1637,3 +1637,155 @@ async fn stale_revisions_idempotency_cross_binding_isolation_and_unsupported_liv
 
     fx.shutdown().await;
 }
+
+#[tokio::test]
+async fn plan_only_clarification_preserves_literal_scopes_and_blocks_downstream_tasks() {
+    let mut fx = ChangeRoutingFixture::start().await;
+    let request = ConversationChangeRequest {
+        request_key: "plan-only-clarification".to_string(),
+        expected_change_revision: 0,
+        approval_id: None,
+        plan_id: Some(PLAN_ID.to_string()),
+        expected_plan_revision: Some(1),
+        task_id: Some("task-1".to_string()),
+        expected_task_revision: None,
+        kind: ConversationChangeKind::Clarification,
+        route: None,
+        summary: "Clarify the existing literal file at its checkpoint.".to_string(),
+        detail: None,
+        proposed_write_paths: vec!["src/lib.rs".to_string()],
+        proposed_profile_id: None,
+        proposed_model_id: None,
+        proposed_effort: None,
+        requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+        cancel_action: None,
+    };
+    let mut expansion = request.clone();
+    expansion.proposed_write_paths = vec!["src/lib.rs/child.rs".to_string()];
+    let path = fx.write_request_file("plan-only-expansion.json", &expansion);
+    let output = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &["record-change", "--request", path.to_str().unwrap()],
+        )
+        .await;
+    assert_eq!(parse_cli_error(&output).0, "route_mismatch");
+    let path = fx.write_request_file("plan-only-valid.json", &request);
+    let output = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &["record-change", "--request", path.to_str().unwrap()],
+        )
+        .await;
+    let record: ConversationChangeRecord = parse_cli_data(&output, &fx.binding_a);
+    assert_eq!(
+        record.affected_dependent_task_ids,
+        vec!["task-2".to_string()]
+    );
+    assert!(!record.decision.prior_task_proven_stopped);
+    for task in ["task-1", "task-2"] {
+        let block = inspect_unresolved_blocking_changes(
+            &fx.plans_dir,
+            &fx.binding_a,
+            Some(&fx.approval_a.approval_id),
+            Some(task),
+        )
+        .expect("inspect plan-only block");
+        assert!(block.blocked, "root and dependent must remain blocked");
+    }
+    let sibling = inspect_unresolved_blocking_changes(
+        &fx.plans_dir,
+        &fx.binding_a,
+        Some(&fx.approval_a.approval_id),
+        Some("task-3"),
+    )
+    .expect("inspect sibling");
+    assert!(!sibling.blocked);
+    assert_eq!(fx.worker_invocation_count(), 0);
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn plan_only_resolution_cannot_hide_an_active_approved_execution() {
+    let mut fx = ChangeRoutingFixture::start().await;
+    let host = fx.start_host_for_approval(&fx.approval_a.approval_id).await;
+    let client = fx.host_client_a();
+    client
+        .dispatch_task(&fx.approval_a.approval_id, "task-1")
+        .await
+        .expect("dispatch");
+    wait_for_task_status(
+        &client,
+        &fx.approval_a.approval_id,
+        "task-1",
+        TaskExecutionStatus::Running,
+    )
+    .await;
+    let request = ConversationChangeRequest {
+        request_key: "plan-only-live-clarification".to_string(),
+        expected_change_revision: 0,
+        approval_id: None,
+        plan_id: Some(PLAN_ID.to_string()),
+        expected_plan_revision: Some(1),
+        task_id: Some("task-1".to_string()),
+        expected_task_revision: None,
+        kind: ConversationChangeKind::Clarification,
+        route: None,
+        summary: "Clarify only at a stopped checkpoint.".to_string(),
+        detail: None,
+        proposed_write_paths: Vec::new(),
+        proposed_profile_id: None,
+        proposed_model_id: None,
+        proposed_effort: None,
+        requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+        cancel_action: None,
+    };
+    let path = fx.write_request_file("plan-only-live.json", &request);
+    let output = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &["record-change", "--request", path.to_str().unwrap()],
+        )
+        .await;
+    let record: ConversationChangeRecord = parse_cli_data(&output, &fx.binding_a);
+    let resolve = ResolveConversationChangeRequest {
+        request_key: "plan-only-live-resolve".to_string(),
+        change_id: record.change_id,
+        expected_change_revision: 1,
+        resolution_kind: ConversationChangeResolutionKind::CheckpointHandled,
+        target_plan_revision: Some(1),
+        new_approval_id: None,
+        resolution_note: None,
+    };
+    let path = fx.write_request_file("plan-only-live-resolve.json", &resolve);
+    let output = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &["resolve-change", "--request", path.to_str().unwrap()],
+        )
+        .await;
+    assert_eq!(parse_cli_error(&output).0, "task_not_proven_stopped");
+    let blocked = inspect_unresolved_blocking_changes(
+        &fx.plans_dir,
+        &fx.binding_a,
+        Some(&fx.approval_a.approval_id),
+        Some("task-2"),
+    )
+    .expect("still blocked");
+    assert!(blocked.blocked);
+    assert_eq!(
+        client
+            .get_task(&fx.approval_a.approval_id, "task-1")
+            .await
+            .expect("live")
+            .status,
+        TaskExecutionStatus::Running
+    );
+    assert_eq!(fx.worker_invocation_count(), 1);
+    host.shutdown().await.expect("shutdown host");
+    fx.shutdown().await;
+}

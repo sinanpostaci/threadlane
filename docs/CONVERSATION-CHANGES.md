@@ -270,3 +270,11 @@ Approval-wide requests without a specific observed task report
 `prior_task_proven_stopped: false`: omitting a task is not aggregate stop proof.
 Provider-qualified model proposals use the canonical opaque registry identifier
 rules and still require a new plan and approval; they never change a frozen task.
+
+Clarification containment preserves explicit directory markers: `src/file` is a
+literal file scope and cannot expand to `src/file/child`; `src/` permits its
+children. Plan-only task records retain transitive dependents even without a
+live task observation. Resolution scans the binding's bounded authority records
+for that plan revision and verifies every affected approved task is stopped;
+omitting `approval_id` does not bypass a running execution. The same binding
+mutation lock serializes a new role dispatch with change recording.
