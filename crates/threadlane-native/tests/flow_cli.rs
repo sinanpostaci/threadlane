@@ -19,8 +19,9 @@ use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_native::role_flow::CreateRoleFlowCycleRequest;
 use threadlane_native::{
-    Difficulty, ExecutionPolicy, PolicyAllowRule, PreflightReport, PreflightRequest, RegistryStore,
-    RoleExecutionRoute, RolePreflightRequest, ToolAdapter, EXECUTION_POLICY_SCHEMA_VERSION,
+    Difficulty, ExecutionPolicy, PolicyAllowRule, PreflightBlockReason, PreflightReport,
+    PreflightRequest, RegistryStore, RoleExecutionRoute, RolePreflightRequest, ToolAdapter,
+    EXECUTION_POLICY_SCHEMA_VERSION,
 };
 use threadlane_workflow::{
     ModelChoice, ModelDefinition, RegistryChange, RoleAssignment, ToolDefinition, WorkflowProfile,
@@ -526,6 +527,148 @@ async fn preflight_is_read_only_and_reports_the_live_bound_scope() {
         "preflight must not invoke the configured worker executable"
     );
     assert_no_secret_echo(&output, "preflight");
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn preflight_without_profile_id_uses_only_the_registry_default() {
+    let mut fixture = FlowFixture::start().await;
+    let registry = RegistryStore::open(&fixture.registry_dir).expect("open flow registry store");
+    let snapshot = registry.snapshot().expect("read fixture registry snapshot");
+
+    let with_named_default = registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    id: "default".to_string(),
+                    name: "default".to_string(),
+                    assignments: vec![RoleAssignment {
+                        role: WorkflowRole::Coder,
+                        difficulty: Some(Difficulty::Easy),
+                        choice: ModelChoice {
+                            model_id: MODEL_ID.to_string(),
+                            effort: Some("max".to_string()),
+                        },
+                    }],
+                },
+            },
+        )
+        .expect("upsert profile merely named default");
+    let configured = registry
+        .apply(
+            with_named_default.revision,
+            RegistryChange::SetDefaultProfile {
+                profile_id: Some(PROFILE_ID.to_string()),
+            },
+        )
+        .expect("set fixture profile as registry default");
+    assert_eq!(
+        configured.default_profile_id.as_deref(),
+        Some(PROFILE_ID),
+        "the fixture profile must be the real registry default"
+    );
+
+    let request = PreflightRequest {
+        profile_id: None,
+        roles: vec![RolePreflightRequest {
+            role: WorkflowRole::Coder,
+            difficulty: Some(Difficulty::Easy),
+        }],
+    };
+    let request_path = fixture.write_request("preflight-default.json", &request);
+    let policy_path = fixture.write_request("policy-default.json", &allowed_policy());
+    let preflight_args = fixture.flow_args(
+        "preflight",
+        &[
+            "--request".to_string(),
+            request_path.display().to_string(),
+            "--policy".to_string(),
+            policy_path.display().to_string(),
+        ],
+    );
+
+    let output = run_flow(&preflight_args).await;
+    let report: PreflightReport =
+        parse_envelope(&output, "default-profile preflight", &fixture.binding_id);
+    assert!(report.ready, "the configured default profile must resolve");
+    assert!(
+        report.used_default_profile,
+        "profile_id:null must select the registry default"
+    );
+    assert_eq!(
+        report.profile_id.as_deref(),
+        Some(PROFILE_ID),
+        "profile_id:null must not select the profile merely named default"
+    );
+    assert_eq!(report.registry_revision, configured.revision);
+    assert_eq!(report.roles.len(), 1);
+    let role = &report.roles[0];
+    assert!(role.ready);
+    assert_eq!(role.role, WorkflowRole::Coder);
+    assert_eq!(role.requested_difficulty, Some(Difficulty::Easy));
+    let selected = role
+        .selected
+        .as_ref()
+        .expect("selected default role choice");
+    assert_eq!(selected.route, RoleExecutionRoute::HeadlessWorker);
+    assert_eq!(selected.model_id, MODEL_ID);
+    assert_eq!(selected.model_arg, "opencode-go/deepseek-v4.1-flash");
+    assert_eq!(selected.effort.as_deref(), Some("max"));
+    assert!(
+        !fixture.worker_marker.exists(),
+        "default-profile preflight must not invoke the configured worker executable"
+    );
+
+    let cleared = registry
+        .apply(
+            configured.revision,
+            RegistryChange::SetDefaultProfile { profile_id: None },
+        )
+        .expect("clear registry default profile");
+    assert_eq!(
+        cleared.default_profile_id, None,
+        "clearing must remove the real registry default"
+    );
+    assert!(
+        cleared
+            .profiles
+            .iter()
+            .any(|profile| profile.id == "default" && profile.name == "default"),
+        "the profile merely named default must remain registered after clearing"
+    );
+
+    let output = run_flow(&preflight_args).await;
+    let report: PreflightReport =
+        parse_envelope(&output, "cleared-default preflight", &fixture.binding_id);
+    assert!(
+        !report.ready,
+        "profile_id:null without a real default must not resolve"
+    );
+    assert!(
+        report.used_default_profile,
+        "profile_id:null must still report default-profile selection"
+    );
+    assert_eq!(
+        report.profile_id, None,
+        "no profile may be selected when the real default is cleared"
+    );
+    assert_eq!(report.registry_revision, cleared.revision);
+    assert_eq!(report.roles.len(), 1);
+    assert!(!report.roles[0].ready);
+    assert_eq!(
+        report.roles[0].block_reason,
+        Some(PreflightBlockReason::MissingDefaultProfile)
+    );
+    assert_eq!(
+        report.roles[0].selected, None,
+        "a profile merely named default must not supply a role choice"
+    );
+    assert!(
+        !fixture.worker_marker.exists(),
+        "cleared-default preflight must not invoke the configured worker executable"
+    );
 
     fixture.shutdown().await;
 }
