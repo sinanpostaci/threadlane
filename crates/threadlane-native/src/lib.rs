@@ -39,6 +39,8 @@ pub mod mcp_pair;
 pub mod operator_cli;
 /// Private operator connection-epoch pairing store and verification gate types.
 pub mod pairing;
+/// Pure profile selection, role/difficulty preflight, and deny-by-default execution policy admission core.
+pub mod profile_flow;
 /// Bounded newline-delimited JSON-RPC proxy session and Unix process-group cleanup.
 pub mod rpc;
 /// Durable `Pending`/`Submitted`/`Unknown`/`Received` busy-turn wake-up store and `turn/steer` builder.
@@ -72,6 +74,12 @@ pub use mcp_pair::{
 pub use pairing::{
     ConnectionEpochState, ConnectionIdentity, EnrollmentRecord, NativeVerificationStatus,
     OperatorEnrollRequest, PairingStore, CONNECTION_IDENTITY_TOOL, MCP_SERVER_NAME,
+};
+pub use profile_flow::{
+    preflight, preflight_from_store, resolve_choice, ExecutionPolicy, PolicyAllowRule,
+    PreflightBlockReason, PreflightReport, PreflightRequest, RoleExecutionRoute,
+    RolePreflightOutcome, RolePreflightRequest, SelectedRoleChoice,
+    EXECUTION_POLICY_SCHEMA_VERSION, MAX_POLICY_ALLOW_RULES, MAX_PREFLIGHT_ROLES,
 };
 pub use rpc::{
     build_proxy_args, is_process_alive, is_process_group_alive, InitializeResult, ProxyCallError,
