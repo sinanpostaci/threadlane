@@ -76,10 +76,10 @@ pub use integration::{
 pub use review::{
     accept_review_subject, commit_task_worktree_changes, inspect_review_subject,
     inspect_review_subject_readonly, load_review_receipt, validate_worker_status_for_review,
-    verify_review_receipt, CommitTaskChangesRequest, InspectReviewSubjectRequest,
-    ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt, ReviewSubject, TaskCommitReport,
-    TestEvidenceSummary, MAX_RECEIPT_BYTES, MAX_REVIEW_NOTE_BYTES, RECEIPTS_SUBDIR,
-    REVIEW_RECEIPT_SCHEMA_VERSION, REVIEW_SUBJECT_SCHEMA_VERSION,
+    verify_review_receipt, verify_review_receipt_readonly, CommitTaskChangesRequest,
+    InspectReviewSubjectRequest, ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt,
+    ReviewSubject, TaskCommitReport, TestEvidenceSummary, MAX_RECEIPT_BYTES, MAX_REVIEW_NOTE_BYTES,
+    RECEIPTS_SUBDIR, REVIEW_RECEIPT_SCHEMA_VERSION, REVIEW_SUBJECT_SCHEMA_VERSION,
 };
 pub use threadlane_workers::{
     cleanup_integrated_worktree, IntegratedCleanupReport, IntegratedCleanupRequest,

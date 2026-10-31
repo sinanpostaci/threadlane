@@ -24,6 +24,7 @@ use threadlane_workers::{
 };
 
 use crate::error::HostError;
+use crate::lifecycle::project_task_lifecycle;
 use crate::storage::{
     build_validated_task_profile, derive_ack_command_key, derive_cancel_command_key,
     is_host_lock_held, now_epoch_ms, read_host_manifest_optional, read_task_ledger_entry,
@@ -964,6 +965,7 @@ impl ApprovedHostClient {
 
         Ok(build_task_snapshot(
             &session.record,
+            &session.session_dir,
             &session.live_binding.binding_id,
             task,
             Some(&recorded_intent),
@@ -996,6 +998,15 @@ impl ApprovedHostClient {
             })?;
 
         if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+            let status = TaskExecutionStatus::NativeRouteRequired;
+            let lifecycle = Some(project_task_lifecycle(
+                &session.record,
+                &session.session_dir,
+                task,
+                status,
+                None,
+                None,
+            ));
             return Ok(TaskStateSnapshot {
                 approval_id: session.record.approval_id.clone(),
                 subject_digest: session.record.subject_digest.clone(),
@@ -1010,11 +1021,12 @@ impl ApprovedHostClient {
                 dependency_input: None,
                 profile_id: task.profile_id.clone(),
                 command_key: task.command_key.clone(),
-                status: TaskExecutionStatus::NativeRouteRequired,
+                status,
                 run_id: None,
                 worker_id: None,
                 worker: None,
                 accepted: false,
+                lifecycle,
             });
         }
 
@@ -1042,6 +1054,14 @@ impl ApprovedHostClient {
                 ),
                 None => (TaskExecutionStatus::DependencyInputsUnverified, None),
             };
+            let lifecycle = Some(project_task_lifecycle(
+                &session.record,
+                &session.session_dir,
+                task,
+                status,
+                None,
+                None,
+            ));
 
             return Ok(TaskStateSnapshot {
                 approval_id: session.record.approval_id.clone(),
@@ -1062,6 +1082,7 @@ impl ApprovedHostClient {
                 worker_id: None,
                 worker: None,
                 accepted: false,
+                lifecycle,
             });
         }
 
@@ -1074,6 +1095,7 @@ impl ApprovedHostClient {
         let Some(receipt) = receipt else {
             return Ok(build_task_snapshot(
                 &session.record,
+                &session.session_dir,
                 &session.live_binding.binding_id,
                 task,
                 intent.as_ref(),
@@ -1099,6 +1121,7 @@ impl ApprovedHostClient {
                 }
                 Ok(build_task_snapshot(
                     &session.record,
+                    &session.session_dir,
                     &session.live_binding.binding_id,
                     task,
                     intent.as_ref(),
@@ -1112,6 +1135,7 @@ impl ApprovedHostClient {
             {
                 Ok(build_task_snapshot(
                     &session.record,
+                    &session.session_dir,
                     &session.live_binding.binding_id,
                     task,
                     intent.as_ref(),
@@ -1234,6 +1258,7 @@ impl ApprovedHostClient {
 
         Ok(build_task_snapshot(
             &session.record,
+            &session.session_dir,
             &session.live_binding.binding_id,
             task,
             intent.as_ref(),
@@ -2134,8 +2159,10 @@ impl ApprovedHostClient {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_task_snapshot(
     record: &ApprovalRecord,
+    session_dir: &Path,
     session_binding_id: &str,
     task: &ApprovedTaskRecord,
     intent: Option<&TaskDispatchIntent>,
@@ -2148,6 +2175,15 @@ fn build_task_snapshot(
         (_, Some(_), None) | (Some(_), None, None) => TaskExecutionStatus::Unknown,
         (None, None, None) => TaskExecutionStatus::NotStarted,
     };
+
+    let lifecycle = Some(project_task_lifecycle(
+        record,
+        session_dir,
+        task,
+        status,
+        receipt,
+        worker.as_ref(),
+    ));
 
     TaskStateSnapshot {
         approval_id: record.approval_id.clone(),
@@ -2168,6 +2204,7 @@ fn build_task_snapshot(
         worker_id: receipt.map(|r| r.worker_id.clone()),
         worker,
         accepted: false,
+        lifecycle,
     }
 }
 

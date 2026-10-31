@@ -27,6 +27,11 @@ import {
   formatHostLifecycleActionLabel,
   formatHostStatusLabel,
   formatTaskDependencyDetail,
+  formatTaskEvidenceVerificationStatus,
+  formatTaskIntegrationLifecycleStatus,
+  formatTaskLifecycleDisplay,
+  formatTaskLifecycleReceipts,
+  formatTaskReviewLifecycleStatus,
   formatTaskStatusLabel,
   formatTaskStatusTone,
   formatTaskTelemetry,
@@ -46,6 +51,10 @@ import {
   normalizeApprovedTaskIds,
   notificationToolIdForStart,
   resolveHostNotificationState,
+  resolveTaskLifecycleProjection,
+  selectTaskIdsForRead,
+  shouldPollTaskSnapshot,
+  syncTaskLifecycleTargets,
   taskReviewNote,
   TASK_DEPENDENCY_UNVERIFIED_NOTE,
   workerTelemetry,
@@ -55,7 +64,10 @@ import type {
   HostExecutionGates,
   HostPanelContext,
   HostSessionSummary,
+  TaskLifecycleProjection,
   TaskStateSnapshot,
+  VerifiedIntegrationReceiptSummary,
+  VerifiedReviewReceiptSummary,
   WorkerSnapshot,
 } from './types.ts';
 
@@ -1194,5 +1206,496 @@ describe('approved session notification opt-in', () => {
     const unsafeText = hostNotificationPolicyText(unsafeDigest);
     assert.ok(!unsafeText.includes('/private/bin/codex'));
     assert.ok(unsafeText.includes('sender digest unavailable'));
+  });
+});
+
+interface MockLifecycleSink {
+  textContent: string | null;
+  hidden: boolean;
+  attrs: Record<string, string>;
+  setAttribute(name: string, value: string): void;
+}
+
+function makeLifecycleSink(): MockLifecycleSink {
+  return {
+    textContent: '',
+    hidden: false,
+    attrs: {},
+    setAttribute(name: string, value: string): void {
+      this.attrs[name] = value;
+    },
+  };
+}
+
+function makeLifecycleTargets() {
+  return {
+    lifecycleGroup: makeLifecycleSink(),
+    executionPill: makeLifecycleSink(),
+    reviewPill: makeLifecycleSink(),
+    integrationPill: makeLifecycleSink(),
+    evidencePill: makeLifecycleSink(),
+    lifecycleReceipts: makeLifecycleSink(),
+    lifecycleNote: makeLifecycleSink(),
+    reviewDetail: makeLifecycleSink(),
+  };
+}
+
+function makeReviewReceiptSummary(
+  overrides: Partial<VerifiedReviewReceiptSummary> = {}
+): VerifiedReviewReceiptSummary {
+  return {
+    receipt_id: 'rev_0123456789abcdef',
+    subject_digest: 'b'.repeat(64),
+    receipt_digest: 'c'.repeat(64),
+    task_worktree_id: 'task-worktree-1',
+    base_commit: APPROVAL.base_commit,
+    task_head_commit: '1111222233334444555566667777888899990000',
+    task_tree_sha: 'aaaa222233334444555566667777888899990000',
+    diff_digest: 'd'.repeat(64),
+    reviewer_id: 'operator-native',
+    approved_at_ms: 1_730_000_010_000,
+    ...overrides,
+  };
+}
+
+function makeIntegrationReceiptSummary(
+  overrides: Partial<VerifiedIntegrationReceiptSummary> = {}
+): VerifiedIntegrationReceiptSummary {
+  return {
+    receipt_id: 'int_fedcba9876543210',
+    receipt_digest: 'e'.repeat(64),
+    review_receipt_id: 'rev_0123456789abcdef',
+    integration_worktree_id: 'run-worktree-1',
+    strategy: 'fast_forward_only',
+    accepted_task_head_commit: '1111222233334444555566667777888899990000',
+    integrated_target_commit: '9999888877776666555544443333222211110000',
+    integrated_tree_sha: 'aaaa222233334444555566667777888899990000',
+    operator_id: 'operator-native',
+    integrated_at_ms: 1_730_000_020_000,
+    ...overrides,
+  };
+}
+
+function makeLifecycleProjection(
+  overrides: Partial<TaskLifecycleProjection> = {}
+): TaskLifecycleProjection {
+  return {
+    review_status: 'pending_review',
+    integration_status: 'not_integrated',
+    evidence_status: 'pending_review',
+    task_checkout_present: true,
+    integration_checkout_present: true,
+    review_receipt: null,
+    integration_receipt: null,
+    verification_detail: 'Worker completed; awaiting operator review receipt.',
+    ...overrides,
+  };
+}
+
+describe('approved task lifecycle projection and polling', () => {
+  it('projects completion-only tasks as pending review and ignores worker summary claims', () => {
+    const workerClaimingAcceptance = makeWorker({
+      outcome: {
+        exit_code: 0,
+        signal: null,
+        duration_ms: 1,
+        timed_out: false,
+        cancelled: false,
+        cancel_requested_before_completion: false,
+        missing_model_evidence: false,
+        missing_effort_evidence: false,
+        provider_error: false,
+        incomplete_cleanup: false,
+        rejected_by_diff_gate: false,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        changed_paths_count: 0,
+        changed_paths_preview: [],
+        violation_count: 0,
+        violation_summaries: [],
+        report_artifact_id: null,
+        final_summary: 'Reviewed, accepted, and integrated onto main.',
+        failure_reason: null,
+        acceptance_state: 'ready_for_review',
+      },
+    });
+    const legacyCompletion = makeTask({
+      status: 'ready_for_review',
+      accepted: false,
+      worker: workerClaimingAcceptance,
+      lifecycle: undefined,
+    });
+    const legacyDisplay = formatTaskLifecycleDisplay(legacyCompletion);
+    assert.equal(legacyDisplay.visible, true);
+    assert.deepEqual(legacyDisplay.execution, {
+      label: 'Ready for review',
+      tone: 'default',
+    });
+    assert.deepEqual(legacyDisplay.review, {
+      label: 'Review pending',
+      tone: 'default',
+    });
+    assert.deepEqual(legacyDisplay.integration, {
+      label: 'Not integrated',
+      tone: 'default',
+    });
+    assert.deepEqual(legacyDisplay.evidence, {
+      label: 'Awaiting review receipt',
+      tone: 'default',
+    });
+    assert.equal(legacyDisplay.receiptSummary, null);
+    assert.equal(
+      legacyDisplay.detailNote,
+      'Review pending; not accepted, merged, or applied.'
+    );
+    assert.equal(legacyDisplay.detailTone, 'default');
+
+    const explicitCompletion = makeTask({
+      status: 'ready_for_review',
+      accepted: true,
+      worker: workerClaimingAcceptance,
+      lifecycle: makeLifecycleProjection(),
+    });
+    const targets = makeLifecycleTargets();
+    const synced = syncTaskLifecycleTargets(targets, explicitCompletion);
+    assert.ok(synced);
+    assert.equal(targets.lifecycleGroup.hidden, false);
+    assert.equal(targets.executionPill.textContent, 'Ready for review');
+    assert.equal(targets.reviewPill.textContent, 'Review pending');
+    assert.equal(targets.reviewPill.attrs['data-status'], 'default');
+    assert.equal(targets.integrationPill.textContent, 'Not integrated');
+    assert.equal(targets.evidencePill.textContent, 'Awaiting review receipt');
+    assert.equal(targets.lifecycleReceipts.hidden, true);
+    assert.equal(
+      targets.lifecycleNote.textContent,
+      'Review pending; not accepted, merged, or applied.'
+    );
+    assert.equal(
+      !targets.lifecycleNote.textContent?.includes('integrated onto main'),
+      true
+    );
+  });
+
+  it('distinguishes verified live review and integration from legacy execution status', () => {
+    const reviewReceipt = makeReviewReceiptSummary();
+    const reviewedTask = makeTask({
+      status: 'ready_for_review',
+      accepted: false,
+      lifecycle: makeLifecycleProjection({
+        review_status: 'accepted',
+        integration_status: 'ready_to_integrate',
+        evidence_status: 'verified_live',
+        review_receipt: reviewReceipt,
+        verification_detail: 'Review receipt rev_0123456789abcdef verified against live task checkout.',
+      }),
+    });
+
+    const reviewedDisplay = formatTaskLifecycleDisplay(reviewedTask);
+    assert.equal(reviewedDisplay.visible, true);
+    assert.deepEqual(reviewedDisplay.execution, {
+      label: 'Ready for review',
+      tone: 'default',
+    });
+    assert.deepEqual(reviewedDisplay.review, {
+      label: 'Review accepted',
+      tone: 'active',
+    });
+    assert.deepEqual(reviewedDisplay.integration, {
+      label: 'Ready to integrate',
+      tone: 'default',
+    });
+    assert.deepEqual(reviewedDisplay.evidence, {
+      label: 'Verified live',
+      tone: 'active',
+    });
+    assert.ok(
+      reviewedDisplay.receiptSummary?.includes(
+        'Review rev_0123456789abcdef (commit 111122223333…, reviewer operator-native)'
+      )
+    );
+    assert.ok(
+      reviewedDisplay.detailNote.includes('ready to integrate onto the run branch')
+    );
+    assert.equal(reviewedDisplay.detailTone, 'active');
+
+    const integratedTask = makeTask({
+      status: 'ready_for_review',
+      accepted: false,
+      lifecycle: makeLifecycleProjection({
+        review_status: 'accepted',
+        integration_status: 'integrated',
+        evidence_status: 'verified_live',
+        review_receipt: reviewReceipt,
+        integration_receipt: makeIntegrationReceiptSummary(),
+        verification_detail:
+          'Review receipt rev_0123456789abcdef and integration receipt int_fedcba9876543210 verified against live checkouts.',
+      }),
+    });
+
+    const integratedDisplay = formatTaskLifecycleDisplay(integratedTask);
+    assert.deepEqual(integratedDisplay.review, {
+      label: 'Review accepted',
+      tone: 'active',
+    });
+    assert.deepEqual(integratedDisplay.integration, {
+      label: 'Integrated',
+      tone: 'active',
+    });
+    assert.deepEqual(integratedDisplay.evidence, {
+      label: 'Verified live',
+      tone: 'active',
+    });
+    assert.ok(
+      integratedDisplay.receiptSummary?.includes('Integration int_fedcba9876543210')
+    );
+    assert.ok(
+      integratedDisplay.receiptSummary?.includes('target 999988887777…')
+    );
+    assert.ok(integratedDisplay.receiptSummary?.includes('fast-forward'));
+    assert.ok(
+      integratedDisplay.detailNote.includes(
+        'Reviewed and integrated on the run branch (verified live).'
+      )
+    );
+  });
+
+  it('marks wrong scope, bad digest, and post-review checkout mutations as invalidated', () => {
+    const wrongScopeTask = makeTask({
+      status: 'ready_for_review',
+      accepted: false,
+      lifecycle: makeLifecycleProjection({
+        review_status: 'invalidated',
+        integration_status: 'not_integrated',
+        evidence_status: 'invalidated',
+        review_receipt: makeReviewReceiptSummary({ receipt_id: 'rev_forged' }),
+        verification_detail:
+          'Review receipt rev_forged allowed_write_paths do not match the frozen task scope.',
+      }),
+    });
+
+    const wrongScopeDisplay = formatTaskLifecycleDisplay(wrongScopeTask);
+    assert.deepEqual(wrongScopeDisplay.review, {
+      label: 'Review invalidated',
+      tone: 'warn',
+    });
+    assert.deepEqual(wrongScopeDisplay.evidence, {
+      label: 'Evidence invalidated',
+      tone: 'warn',
+    });
+    assert.equal(wrongScopeDisplay.receiptSummary, null);
+    assert.equal(wrongScopeDisplay.detailTone, 'warn');
+    assert.ok(
+      wrongScopeDisplay.detailNote.includes(
+        'Lifecycle evidence invalidated; not treated as reviewed or integrated.'
+      )
+    );
+    assert.ok(
+      wrongScopeDisplay.detailNote.includes('allowed_write_paths do not match')
+    );
+
+    const laterTaskChanges = makeTask({
+      status: 'ready_for_review',
+      accepted: false,
+      lifecycle: makeLifecycleProjection({
+        review_status: 'invalidated',
+        integration_status: 'invalidated',
+        evidence_status: 'invalidated',
+        verification_detail:
+          'Live task checkout has uncommitted modifications or HEAD moved after review receipt rev_0123456789abcdef.',
+      }),
+    });
+    const targets = makeLifecycleTargets();
+    syncTaskLifecycleTargets(targets, laterTaskChanges);
+    assert.equal(targets.reviewPill.textContent, 'Review invalidated');
+    assert.equal(targets.reviewPill.attrs['data-status'], 'warn');
+    assert.equal(targets.integrationPill.textContent, 'Integration invalidated');
+    assert.equal(targets.integrationPill.attrs['data-status'], 'warn');
+    assert.equal(targets.evidencePill.textContent, 'Evidence invalidated');
+    assert.equal(targets.evidencePill.attrs['data-status'], 'warn');
+    assert.equal(targets.lifecycleReceipts.hidden, true);
+    assert.equal(targets.lifecycleNote.attrs['data-status'], 'warn');
+    assert.ok(targets.lifecycleNote.textContent?.includes('HEAD moved after review'));
+  });
+
+  it('represents missing historical checkouts after cleanup with explicit verification limits', () => {
+    const historicalTask = makeTask({
+      status: 'ready_for_review',
+      accepted: false,
+      lifecycle: makeLifecycleProjection({
+        review_status: 'historical_accepted',
+        integration_status: 'historical_integrated',
+        evidence_status: 'recorded_historical_only',
+        task_checkout_present: false,
+        integration_checkout_present: true,
+        review_receipt: makeReviewReceiptSummary(),
+        integration_receipt: makeIntegrationReceiptSummary({
+          strategy: 'merge_no_ff',
+        }),
+        verification_detail:
+          'Task worktree was cleaned up after integration; commit and tree digests verified in repository history.',
+      }),
+    });
+
+    const display = formatTaskLifecycleDisplay(historicalTask);
+    assert.deepEqual(display.review, {
+      label: 'Accepted (history)',
+      tone: 'default',
+    });
+    assert.deepEqual(display.integration, {
+      label: 'Integrated (history)',
+      tone: 'default',
+    });
+    assert.deepEqual(display.evidence, {
+      label: 'Recorded history (checkout cleaned up)',
+      tone: 'default',
+    });
+    assert.equal(display.detailTone, 'default');
+    assert.ok(display.receiptSummary?.includes('merge --no-ff'));
+    assert.ok(
+      display.detailNote.includes(
+        'Recorded history only (task checkout cleaned up; live checkout diff re-verification unavailable).'
+      )
+    );
+  });
+
+  it('continues polling ready_for_review tasks and updates lifecycle targets in place across poll cycles', () => {
+    const running = makeTask({ status: 'running', lifecycle: undefined });
+    const failed = makeTask({
+      task_id: 'task-failed',
+      status: 'failed',
+      lifecycle: undefined,
+    });
+    const completion = makeTask({
+      status: 'ready_for_review',
+      lifecycle: makeLifecycleProjection(),
+    });
+
+    assert.equal(shouldPollTaskSnapshot(running), true);
+    assert.equal(shouldPollTaskSnapshot(failed), false);
+    assert.equal(shouldPollTaskSnapshot(completion), true);
+
+    const snapshots = new Map<string, TaskStateSnapshot>();
+    const approvedIds = ['task-root', 'task-failed'];
+
+    // Poll 1: missing snapshots are queued.
+    assert.deepEqual(
+      selectTaskIdsForRead(approvedIds, 20, 'active', snapshots),
+      ['task-root', 'task-failed']
+    );
+
+    snapshots.set('task-root', completion);
+    snapshots.set('task-failed', failed);
+
+    // Poll 2: ready_for_review remains eligible in 'active' mode so review/integration
+    // receipts and post-review invalidations are picked up, while terminal failed is skipped.
+    assert.deepEqual(
+      selectTaskIdsForRead(approvedIds, 20, 'active', snapshots),
+      ['task-root']
+    );
+    assert.deepEqual(
+      selectTaskIdsForRead(
+        approvedIds,
+        20,
+        'active',
+        snapshots,
+        new Set(['task-root'])
+      ),
+      []
+    );
+
+    // Verify in-place target updates across repeated polling without replacing sink objects.
+    const targets = makeLifecycleTargets();
+    const groupRef = targets.lifecycleGroup;
+    const reviewRef = targets.reviewPill;
+    const integrationRef = targets.integrationPill;
+    const evidenceRef = targets.evidencePill;
+
+    // Cycle A: completion-only
+    syncTaskLifecycleTargets(targets, completion);
+    assert.equal(targets.reviewPill.textContent, 'Review pending');
+    assert.equal(targets.integrationPill.textContent, 'Not integrated');
+    assert.equal(targets.evidencePill.textContent, 'Awaiting review receipt');
+
+    // Cycle B: reviewed
+    const reviewed = makeTask({
+      status: 'ready_for_review',
+      lifecycle: makeLifecycleProjection({
+        review_status: 'accepted',
+        integration_status: 'ready_to_integrate',
+        evidence_status: 'verified_live',
+        review_receipt: makeReviewReceiptSummary(),
+      }),
+    });
+    syncTaskLifecycleTargets(targets, reviewed);
+    assert.equal(targets.reviewPill.textContent, 'Review accepted');
+    assert.equal(targets.reviewPill.attrs['data-status'], 'active');
+    assert.equal(targets.integrationPill.textContent, 'Ready to integrate');
+    assert.equal(targets.evidencePill.textContent, 'Verified live');
+
+    // Cycle C: integrated
+    const integrated = makeTask({
+      status: 'ready_for_review',
+      lifecycle: makeLifecycleProjection({
+        review_status: 'accepted',
+        integration_status: 'integrated',
+        evidence_status: 'verified_live',
+        review_receipt: reviewed.lifecycle!.review_receipt,
+        integration_receipt: makeIntegrationReceiptSummary(),
+      }),
+    });
+    syncTaskLifecycleTargets(targets, integrated);
+    assert.equal(targets.integrationPill.textContent, 'Integrated');
+    assert.equal(targets.integrationPill.attrs['data-status'], 'active');
+
+    // Cycle D: post-cleanup historical
+    const historical = makeTask({
+      status: 'ready_for_review',
+      lifecycle: makeLifecycleProjection({
+        review_status: 'historical_accepted',
+        integration_status: 'historical_integrated',
+        evidence_status: 'recorded_historical_only',
+        task_checkout_present: false,
+        integration_checkout_present: true,
+        review_receipt: reviewed.lifecycle!.review_receipt,
+        integration_receipt: integrated.lifecycle!.integration_receipt,
+      }),
+    });
+    syncTaskLifecycleTargets(targets, historical);
+    assert.equal(targets.reviewPill.textContent, 'Accepted (history)');
+    assert.equal(targets.reviewPill.attrs['data-status'], 'default');
+    assert.equal(targets.integrationPill.textContent, 'Integrated (history)');
+    assert.equal(
+      targets.evidencePill.textContent,
+      'Recorded history (checkout cleaned up)'
+    );
+
+    // Cycle E: invalidated after later branch mutation
+    const invalidated = makeTask({
+      status: 'ready_for_review',
+      lifecycle: makeLifecycleProjection({
+        review_status: 'invalidated',
+        integration_status: 'invalidated',
+        evidence_status: 'invalidated',
+        verification_detail: 'Integration branch HEAD moved away from integrated_target_commit.',
+      }),
+    });
+    syncTaskLifecycleTargets(targets, invalidated);
+    assert.equal(targets.reviewPill.textContent, 'Review invalidated');
+    assert.equal(targets.reviewPill.attrs['data-status'], 'warn');
+    assert.equal(targets.integrationPill.textContent, 'Integration invalidated');
+    assert.equal(targets.evidencePill.textContent, 'Evidence invalidated');
+    assert.equal(targets.lifecycleReceipts.hidden, true);
+
+    assert.equal(targets.lifecycleGroup, groupRef);
+    assert.equal(targets.reviewPill, reviewRef);
+    assert.equal(targets.integrationPill, integrationRef);
+    assert.equal(targets.evidencePill, evidenceRef);
+
+    // Format helpers cover all enum variants deterministically.
+    assert.equal(formatTaskReviewLifecycleStatus('not_ready').label, 'Not ready');
+    assert.equal(formatTaskIntegrationLifecycleStatus('not_integrated').label, 'Not integrated');
+    assert.equal(formatTaskEvidenceVerificationStatus('not_applicable').label, 'Evidence N/A');
+    assert.equal(resolveTaskLifecycleProjection(running).review_status, 'not_ready');
+    assert.equal(formatTaskLifecycleReceipts(null), null);
   });
 });

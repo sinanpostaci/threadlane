@@ -43,7 +43,6 @@ import {
   hostTaskMatchesContext,
   isCurrentHostRequest,
   isHostSummaryReady,
-  isTerminalTaskStatus,
   isUncertainHostErrorKind,
   isValidHostInstanceId,
   MAX_VISIBLE_APPROVED_TASKS,
@@ -52,10 +51,16 @@ import {
   notificationToolIdForStart,
   resolveHostNotificationState,
   resolveHostTaskBrand,
-  taskReviewNote,
+  selectTaskIdsForRead,
+  syncTaskLifecycleTargets,
   writeTaskDependencyText,
 } from './session-logic.ts';
-import type { HostErrorKind, HostLifecycleAction, HostNotificationUiState } from './session-logic.ts';
+import type {
+  HostErrorKind,
+  HostLifecycleAction,
+  HostNotificationUiState,
+  TaskReadMode,
+} from './session-logic.ts';
 import type {
   HostPanelContext,
   HostSessionSummary,
@@ -75,7 +80,6 @@ const PROGRESS_DISPLAY_LIMIT = 600;
 const OUTCOME_DISPLAY_LIMIT = 700;
 
 type StatusReadReason = 'open' | 'explicit' | 'poll' | 'context';
-type TaskReadMode = 'missing' | 'active' | 'all';
 
 interface TaskRowView {
   root: HTMLElement;
@@ -84,6 +88,13 @@ interface TaskRowView {
   badge: HTMLElement;
   meta: HTMLElement;
   dependency: HTMLElement;
+  lifecycleGroup: HTMLElement;
+  executionPill: HTMLElement;
+  reviewPill: HTMLElement;
+  integrationPill: HTMLElement;
+  evidencePill: HTMLElement;
+  lifecycleReceipts: HTMLElement;
+  lifecycleNote: HTMLElement;
   requested: HTMLElement;
   observed: HTMLElement;
   progress: HTMLElement;
@@ -165,12 +176,12 @@ function formatTaskOutcome(task: TaskStateSnapshot): string {
   const finalSummary = outcome.final_summary?.trim();
   const failureReason = outcome.failure_reason?.trim();
   if (finalSummary) {
-    parts.push(finalSummary);
+    parts.push(`Worker summary (unverified): ${finalSummary}`);
   }
   if (failureReason) {
     parts.push(`Failure: ${failureReason}`);
   }
-  parts.push(`Review state: ${formatAcceptanceState(outcome.acceptance_state)}`);
+  parts.push(`Worker execution gate: ${formatAcceptanceState(outcome.acceptance_state)}`);
   return compactDisplayText(parts.join(' · '), OUTCOME_DISPLAY_LIMIT);
 }
 
@@ -1073,19 +1084,14 @@ export class ApprovedSessionPanel {
     if (!approval || !this.currentReadySession()) {
       return;
     }
-    const taskIds = normalizeApprovedTaskIds(approval.approved_task_ids).slice(
-      0,
-      this.visibleTaskCount
+    const taskIds = selectTaskIdsForRead(
+      approval.approved_task_ids,
+      this.visibleTaskCount,
+      mode,
+      this.taskSnapshots,
+      this.taskPending
     );
     for (const taskId of taskIds) {
-      const snapshot = this.taskSnapshots.get(taskId);
-      const shouldRead =
-        mode === 'all' ||
-        !snapshot ||
-        (mode === 'active' && !isTerminalTaskStatus(snapshot.status));
-      if (!shouldRead || this.taskPending.has(taskId)) {
-        continue;
-      }
       const readKey = this.taskReadKeyFor(taskId);
       if (!readKey || this.taskInFlight.has(readKey)) {
         continue;
@@ -1228,6 +1234,66 @@ export class ApprovedSessionPanel {
       className: 'aq-host-session-task-text',
       hidden: true,
     });
+
+    const stagePill = (
+      stage: 'execution' | 'review' | 'integration' | 'evidence',
+      stageLabel: string
+    ): { container: HTMLElement; pill: HTMLElement } => {
+      const pill = h(
+        'span',
+        {
+          className: 'aq-host-session-task-lifecycle-pill',
+          'data-stage': stage,
+          'data-status': 'default',
+        },
+        'Waiting'
+      );
+      const container = h(
+        'span',
+        { className: 'aq-host-session-task-lifecycle-stage' },
+        h(
+          'span',
+          { className: 'aq-host-session-task-lifecycle-label' },
+          stageLabel
+        ),
+        pill
+      );
+      return { container, pill };
+    };
+
+    const executionStage = stagePill('execution', 'Execution');
+    const reviewStage = stagePill('review', 'Review');
+    const integrationStage = stagePill('integration', 'Integration');
+    const evidenceStage = stagePill('evidence', 'Evidence');
+    const lifecycleReceipts = h('p', {
+      className: 'aq-host-session-task-lifecycle-receipts',
+      hidden: true,
+    });
+    const lifecycleNote = h('p', {
+      className: 'aq-host-session-task-lifecycle-note',
+      'data-status': 'default',
+      hidden: true,
+    });
+    const lifecycleGroup = h(
+      'div',
+      {
+        className: 'aq-host-session-task-lifecycle',
+        role: 'group',
+        'aria-label': `Lifecycle stages for ${taskId}`,
+        hidden: true,
+      },
+      h(
+        'div',
+        { className: 'aq-host-session-task-lifecycle-stages' },
+        executionStage.container,
+        reviewStage.container,
+        integrationStage.container,
+        evidenceStage.container
+      ),
+      lifecycleReceipts,
+      lifecycleNote
+    );
+
     const requested = h('p', { className: 'aq-host-session-task-text' });
     const observed = h('p', { className: 'aq-host-session-task-text' });
     const progress = h('p', { className: 'aq-host-session-task-text' });
@@ -1259,6 +1325,7 @@ export class ApprovedSessionPanel {
       ),
       meta,
       dependency,
+      lifecycleGroup,
       h(
         'details',
         { className: 'aq-host-session-task-details' },
@@ -1283,6 +1350,13 @@ export class ApprovedSessionPanel {
       badge,
       meta,
       dependency,
+      lifecycleGroup,
+      executionPill: executionStage.pill,
+      reviewPill: reviewStage.pill,
+      integrationPill: integrationStage.pill,
+      evidencePill: evidenceStage.pill,
+      lifecycleReceipts,
+      lifecycleNote,
       requested,
       observed,
       progress,
@@ -1367,6 +1441,21 @@ export class ApprovedSessionPanel {
       view.dependency.setAttribute('data-status', dependencyDetail.tone);
     }
 
+    syncTaskLifecycleTargets(
+      {
+        lifecycleGroup: view.lifecycleGroup,
+        executionPill: view.executionPill,
+        reviewPill: view.reviewPill,
+        integrationPill: view.integrationPill,
+        evidencePill: view.evidencePill,
+        lifecycleReceipts: view.lifecycleReceipts,
+        lifecycleNote: view.lifecycleNote,
+        reviewDetail: view.review,
+      },
+      snapshot,
+      PROGRESS_DISPLAY_LIMIT
+    );
+
     if (snapshot) {
       const telemetry = formatTaskTelemetry(snapshot);
       setText(
@@ -1393,9 +1482,6 @@ export class ApprovedSessionPanel {
         view.outcome,
         outcomeText || 'No terminal outcome reported.'
       );
-      const reviewText = taskReviewNote(snapshot);
-      setText(view.review, reviewText);
-      view.review.hidden = reviewText.length === 0;
     } else {
       setText(
         view.meta,
@@ -1417,8 +1503,6 @@ export class ApprovedSessionPanel {
       );
       setText(view.instruction, 'Not available before dispatch.');
       setText(view.outcome, 'Not available before dispatch.');
-      setText(view.review, '');
-      view.review.hidden = true;
     }
 
     view.root.setAttribute('data-task-id', taskId);

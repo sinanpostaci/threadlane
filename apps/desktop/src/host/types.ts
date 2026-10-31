@@ -192,6 +192,73 @@ export interface DependencyInputSummary {
   predecessor_task_ids: string[];
 }
 
+/** Read-only review lifecycle status from `threadlane_host::TaskReviewLifecycleStatus`. */
+export type TaskReviewLifecycleStatus =
+  | 'not_ready'
+  | 'pending_review'
+  | 'accepted'
+  | 'historical_accepted'
+  | 'invalidated';
+
+/** Read-only integration lifecycle status from `threadlane_host::TaskIntegrationLifecycleStatus`. */
+export type TaskIntegrationLifecycleStatus =
+  | 'not_integrated'
+  | 'ready_to_integrate'
+  | 'integrated'
+  | 'historical_integrated'
+  | 'invalidated';
+
+/** Read-only evidence verification status from `threadlane_host::TaskEvidenceVerificationStatus`. */
+export type TaskEvidenceVerificationStatus =
+  | 'not_applicable'
+  | 'pending_review'
+  | 'verified_live'
+  | 'recorded_historical_only'
+  | 'invalidated';
+
+/** Deterministic integration strategy from `threadlane_operations::IntegrationStrategy`. */
+export type IntegrationStrategy = 'fast_forward_only' | 'merge_no_ff';
+
+/** Path-free, token-free summary of a verified `ReviewReceipt`. */
+export interface VerifiedReviewReceiptSummary {
+  receipt_id: string;
+  subject_digest: string;
+  receipt_digest: string;
+  task_worktree_id: string;
+  base_commit: string;
+  task_head_commit: string;
+  task_tree_sha: string;
+  diff_digest: string;
+  reviewer_id: string;
+  approved_at_ms: number;
+}
+
+/** Path-free, token-free summary of a verified `IntegrationReceipt`. */
+export interface VerifiedIntegrationReceiptSummary {
+  receipt_id: string;
+  receipt_digest: string;
+  review_receipt_id: string;
+  integration_worktree_id: string;
+  strategy: IntegrationStrategy;
+  accepted_task_head_commit: string;
+  integrated_target_commit: string;
+  integrated_tree_sha: string;
+  operator_id: string;
+  integrated_at_ms: number;
+}
+
+/** Separate read-only review and integration lifecycle projection from `threadlane_host::TaskLifecycleProjection`. */
+export interface TaskLifecycleProjection {
+  review_status: TaskReviewLifecycleStatus;
+  integration_status: TaskIntegrationLifecycleStatus;
+  evidence_status: TaskEvidenceVerificationStatus;
+  task_checkout_present: boolean;
+  integration_checkout_present: boolean;
+  review_receipt?: VerifiedReviewReceiptSummary | null;
+  integration_receipt?: VerifiedIntegrationReceiptSummary | null;
+  verification_detail?: string | null;
+}
+
 /** Safe `threadlane_host::TaskStateSnapshot` DTO. */
 export interface TaskStateSnapshot {
   approval_id: string;
@@ -216,6 +283,8 @@ export interface TaskStateSnapshot {
   worker: WorkerSnapshot | null;
   /** Always false in the backend contract; completion is never acceptance. */
   accepted: boolean;
+  /** Separate read-only review and integration lifecycle projection; omitted on legacy payloads. */
+  lifecycle?: TaskLifecycleProjection | null;
 }
 
 /** Enabled or disabled Codex CLI choice resolved from the trusted registry. */

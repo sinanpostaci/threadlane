@@ -1033,9 +1033,26 @@ pub fn verify_review_receipt(
     subject: &ReviewSubject,
     receipt: &ReviewReceipt,
 ) -> Result<(), OperationsError> {
+    verify_review_receipt_with_inspector(subject, receipt, inspect_review_subject)
+}
+
+/// Verifies the receipt and exact live subject without creating job locks or
+/// refreshing optional Git index state. Preserves all normal receipt checks.
+pub fn verify_review_receipt_readonly(
+    subject: &ReviewSubject,
+    receipt: &ReviewReceipt,
+) -> Result<(), OperationsError> {
+    verify_review_receipt_with_inspector(subject, receipt, inspect_review_subject_readonly)
+}
+
+fn verify_review_receipt_with_inspector(
+    subject: &ReviewSubject,
+    receipt: &ReviewReceipt,
+    inspector: fn(&InspectReviewSubjectRequest) -> Result<ReviewSubject, OperationsError>,
+) -> Result<(), OperationsError> {
     receipt.verify_against_subject(subject)?;
 
-    let live_subject = inspect_review_subject(&InspectReviewSubjectRequest {
+    let live_subject = inspector(&InspectReviewSubjectRequest {
         work_area_root: subject.work_area_root.clone(),
         task_worktree_id: subject.task_worktree_id.clone(),
         policy: subject.policy.clone(),

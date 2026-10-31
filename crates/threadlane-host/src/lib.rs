@@ -42,6 +42,7 @@ pub mod client;
 pub mod error;
 /// Per-approval host lifecycle (`ApprovedHost`, `ApprovedHostConfig`, `ApprovedHostHandle`).
 pub mod host;
+mod lifecycle;
 /// Private `0700`/`0600` filesystem validation, atomic manifest/receipt I/O, and `host.lock` management.
 pub mod storage;
 /// Serializable manifest, summary, receipt, and task state snapshot types.
@@ -76,11 +77,15 @@ pub use types::{
     ApprovedHostNotificationConfig, DependencyInputSummary, DependencyPredecessorSelection,
     HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus, HostNotificationRoute,
     HostNotificationSummary, HostPhase, HostSessionManifest, HostSessionSummary,
-    PrepareDependencyInputsRequest, TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt,
-    TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
+    PrepareDependencyInputsRequest, TaskDispatchIntent, TaskEvidenceVerificationStatus,
+    TaskExecutionStatus, TaskIntegrationLifecycleStatus, TaskLifecycleProjection,
+    TaskReviewLifecycleStatus, TaskRunReceipt, TaskStateSnapshot,
+    VerifiedIntegrationReceiptSummary, VerifiedReviewReceiptSummary,
+    APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
     HOST_LAUNCH_INTENT_SCHEMA_VERSION, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
     HOST_MANIFEST_SCHEMA_VERSION, LAUNCH_INTENTS_SUBDIR, MAX_HOST_MANIFEST_BYTES,
-    MAX_LAUNCH_INTENT_BYTES, MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
+    MAX_LAUNCH_INTENT_BYTES, MAX_LIFECYCLE_DETAIL_BYTES, MAX_RECEIPT_SCAN_ENTRIES,
+    MAX_TASK_RECEIPTS_BYTES, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
     TASK_RECEIPTS_LOCK_FILENAME, TASK_RECEIPTS_SCHEMA_VERSION, WORK_AREA_SUBDIR,
 };
 
@@ -5966,6 +5971,7 @@ exit 0
             worker_id: Some(rogue_done.worker_id.clone()),
             worker: Some(rogue_done.clone()),
             accepted: false,
+            lifecycle: None,
         };
         let rogue_pred_z = commit_review_and_integrate_task(
             &fixture,
@@ -6867,5 +6873,781 @@ exit 0
             HostNotificationRoute::OperatorCli
         );
         restarted.shutdown().await.expect("shutdown restarted host");
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle_projection_tracks_completion_review_integration_cleanup_and_repeated_polling(
+    ) {
+        use threadlane_operations::{
+            accept_review_subject, cleanup_integrated_task_worktree, commit_task_worktree_changes,
+            execute_integration, inspect_review_subject, propose_integration,
+            CommitTaskChangesRequest, ExecuteIntegrationRequest, InspectReviewSubjectRequest,
+            IntegrationProposalRequest, IntegrationStrategy, ReviewAcceptanceRequest,
+            ReviewPolicyBinding, TestEvidenceSummary, VerifiedIntegratedCleanupRequest,
+        };
+        use threadlane_workers::WorkerRunStatus;
+
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-lifecycle-happy",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Implement lifecycle projection test"),
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // 1. Before dispatch: NotStarted projects NotReady / NotIntegrated / NotApplicable.
+        let initial = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task before dispatch");
+        assert_eq!(initial.status, TaskExecutionStatus::NotStarted);
+        assert!(!initial.accepted);
+        let init_lc = initial
+            .lifecycle
+            .as_ref()
+            .expect("lifecycle projection present");
+        assert_eq!(init_lc.review_status, TaskReviewLifecycleStatus::NotReady);
+        assert_eq!(
+            init_lc.integration_status,
+            TaskIntegrationLifecycleStatus::NotIntegrated
+        );
+        assert_eq!(
+            init_lc.evidence_status,
+            TaskEvidenceVerificationStatus::NotApplicable
+        );
+        assert!(!init_lc.task_checkout_present);
+        assert!(!init_lc.integration_checkout_present);
+
+        // Legacy payload compatibility: omitting `lifecycle` on the wire deserializes to `None`.
+        let mut legacy_json = serde_json::to_value(&initial).expect("serialize snapshot");
+        legacy_json
+            .as_object_mut()
+            .expect("object")
+            .remove("lifecycle");
+        let parsed_legacy: TaskStateSnapshot =
+            serde_json::from_value(legacy_json).expect("deserialize legacy snapshot");
+        assert!(parsed_legacy.lifecycle.is_none());
+        let reserialized_legacy =
+            serde_json::to_value(&parsed_legacy).expect("reserialize legacy snapshot");
+        assert!(reserialized_legacy.get("lifecycle").is_none());
+
+        // 2. Dispatch and wait for ReadyForReview (completion-only stage).
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+
+        let completed = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(completed.status, TaskExecutionStatus::ReadyForReview);
+        assert!(!completed.accepted);
+        let comp_lc = completed
+            .lifecycle
+            .as_ref()
+            .expect("lifecycle on completed task");
+        assert_eq!(
+            comp_lc.review_status,
+            TaskReviewLifecycleStatus::PendingReview,
+            "completion projection: {comp_lc:?}"
+        );
+        assert_eq!(
+            comp_lc.integration_status,
+            TaskIntegrationLifecycleStatus::NotIntegrated
+        );
+        assert_eq!(
+            comp_lc.evidence_status,
+            TaskEvidenceVerificationStatus::PendingReview
+        );
+        assert!(comp_lc.task_checkout_present);
+        assert!(comp_lc.integration_checkout_present);
+        assert!(comp_lc.review_receipt.is_none());
+        assert!(comp_lc.integration_receipt.is_none());
+
+        // Ordinary Git checkout modes are protected by the private work-area
+        // ancestor; writable checkouts or an exposed ancestor invalidate evidence.
+        let checkout = PathBuf::from(
+            completed
+                .worker
+                .as_ref()
+                .unwrap()
+                .worktree
+                .task_worktree_path
+                .as_ref()
+                .unwrap(),
+        );
+        fs::set_permissions(&checkout, fs::Permissions::from_mode(0o777))
+            .expect("expose checkout writes");
+        let exposed = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("inspect exposed checkout");
+        assert_eq!(
+            exposed.lifecycle.unwrap().review_status,
+            TaskReviewLifecycleStatus::Invalidated
+        );
+        fs::set_permissions(&checkout, fs::Permissions::from_mode(0o755))
+            .expect("restore Git checkout mode");
+        fs::set_permissions(host.work_area_dir(), fs::Permissions::from_mode(0o755))
+            .expect("expose work area");
+        let exposed_root = client.get_task(&approval_id, "task-root-agy").await;
+        assert!(matches!(
+            exposed_root,
+            Err(HostError::SecurityViolation { .. })
+        ));
+        fs::set_permissions(host.work_area_dir(), fs::Permissions::from_mode(0o700))
+            .expect("restore private work area");
+        let restored = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("inspect restored checkout");
+        assert_eq!(
+            restored.lifecycle.unwrap().review_status,
+            TaskReviewLifecycleStatus::PendingReview
+        );
+
+        // 3. Commit task worktree changes and accept review subject.
+        let worker_snap = completed.worker.as_ref().expect("worker snapshot");
+        let task_worktree_id = worker_snap
+            .worktree
+            .task_worktree_id
+            .as_deref()
+            .expect("task_worktree_id");
+        let int_worktree_id = worker_snap
+            .worktree
+            .run_worktree_id
+            .as_deref()
+            .expect("run_worktree_id");
+
+        commit_task_worktree_changes(&CommitTaskChangesRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            commit_message: "commit task-root-agy for review".to_string(),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+            allow_missing_effort_evidence: false,
+        })
+        .expect("commit task changes");
+
+        let policy = ReviewPolicyBinding {
+            policy_id: "policy-task-root-agy".to_string(),
+            requested_provider: Some("antigravity".to_string()),
+            requested_model: Some(worker_snap.requested_model.clone()),
+            requested_effort: Some(worker_snap.requested_effort.clone()),
+            observed_model: worker_snap.observed_model.clone(),
+            observed_effort: worker_snap.observed_effort.clone(),
+            file_permissions: threadlane_workers::WorkerFilePermissions::TaskFiles,
+            require_effort_evidence: true,
+            require_passing_tests: true,
+        };
+        let test_evidence = TestEvidenceSummary {
+            formatting_passed: true,
+            clippy_passed: true,
+            tests_passed: true,
+            passed_test_count: 4,
+            failed_test_count: 0,
+            evidence_summary: "cargo fmt --check && cargo clippy && cargo test".to_string(),
+        };
+
+        let subject = inspect_review_subject(&InspectReviewSubjectRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            policy,
+            test_evidence,
+            worker_status: Some(WorkerRunStatus::Succeeded),
+        })
+        .expect("inspect review subject");
+
+        let review_receipt = accept_review_subject(&ReviewAcceptanceRequest {
+            expected_subject_digest: subject.subject_digest.clone(),
+            subject: subject.clone(),
+            receipt_id: None,
+            reviewer_id: "primary-codex".to_string(),
+            review_note: "Reviewed and accepted task-root-agy".to_string(),
+            approved_at_ms: 1_700_000_600_000,
+        })
+        .expect("accept review subject");
+
+        let job_lock_path = host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join(format!("{task_worktree_id}.lock"));
+        fs::remove_file(&job_lock_path).expect("remove inactive lock before read-only polling");
+        let index_path_text = threadlane_workers::run_sanitized_git(
+            &checkout,
+            &["rev-parse", "--git-path", "index"],
+            threadlane_workers::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("resolve actual Git index path");
+        let index_path = PathBuf::from(index_path_text.trim());
+        let index_path = if index_path.is_absolute() {
+            index_path
+        } else {
+            checkout.join(index_path)
+        };
+        let index_before = fs::read(&index_path).expect("read Git index before polling");
+        let index_mtime_before = fs::metadata(&index_path)
+            .expect("stat Git index")
+            .modified()
+            .expect("index mtime");
+
+        // Poll twice without creating a missing job lock or refreshing the Git index.
+        for _ in 0..2 {
+            let reviewed = client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect("get_task after review");
+            // Legacy execution invariant preserved:
+            assert_eq!(reviewed.status, TaskExecutionStatus::ReadyForReview);
+            assert!(!reviewed.accepted);
+
+            let rev_lc = reviewed.lifecycle.as_ref().expect("lifecycle present");
+            assert_eq!(rev_lc.review_status, TaskReviewLifecycleStatus::Accepted);
+            assert_eq!(
+                rev_lc.integration_status,
+                TaskIntegrationLifecycleStatus::ReadyToIntegrate
+            );
+            assert_eq!(
+                rev_lc.evidence_status,
+                TaskEvidenceVerificationStatus::VerifiedLive
+            );
+            assert!(rev_lc.task_checkout_present);
+            assert!(rev_lc.integration_checkout_present);
+            let rev_sum = rev_lc
+                .review_receipt
+                .as_ref()
+                .expect("verified review receipt summary");
+            assert_eq!(rev_sum.receipt_id, review_receipt.receipt_id);
+            assert_eq!(rev_sum.subject_digest, review_receipt.subject_digest);
+            assert_eq!(rev_sum.receipt_digest, review_receipt.receipt_digest);
+            assert_eq!(rev_sum.task_head_commit, review_receipt.task_head_commit);
+            assert_eq!(rev_sum.reviewer_id, "primary-codex");
+            assert!(rev_lc.integration_receipt.is_none());
+            assert!(
+                !job_lock_path.exists(),
+                "polling must not recreate an inactive job lock"
+            );
+            assert_eq!(
+                fs::read(&index_path).expect("read index after polling"),
+                index_before
+            );
+            assert_eq!(
+                fs::metadata(&index_path)
+                    .expect("stat index after polling")
+                    .modified()
+                    .expect("index mtime"),
+                index_mtime_before
+            );
+        }
+
+        // 4. Propose and execute branch integration.
+        let proposal = propose_integration(&IntegrationProposalRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            integration_worktree_id: int_worktree_id.to_string(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject: subject.clone(),
+            review_receipt: review_receipt.clone(),
+            strategy: IntegrationStrategy::MergeNoFf,
+        })
+        .expect("propose integration");
+
+        let integration_receipt = execute_integration(&ExecuteIntegrationRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            integration_worktree_id: int_worktree_id.to_string(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject: subject.clone(),
+            review_receipt: review_receipt.clone(),
+            strategy: IntegrationStrategy::MergeNoFf,
+            expected_integration_head_commit: proposal.integration_head_commit,
+            expected_task_head_commit: proposal.task_head_commit,
+            expected_source_head_commit: proposal.source_head_commit,
+            receipt_id: None,
+            operator_id: "primary-codex".to_string(),
+            integrated_at_ms: 1_700_000_600_500,
+        })
+        .expect("execute integration");
+
+        for _ in 0..2 {
+            let integrated = client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect("get_task after integration");
+            assert_eq!(integrated.status, TaskExecutionStatus::ReadyForReview);
+            assert!(!integrated.accepted);
+
+            let int_lc = integrated.lifecycle.as_ref().expect("lifecycle present");
+            assert_eq!(int_lc.review_status, TaskReviewLifecycleStatus::Accepted);
+            assert_eq!(
+                int_lc.integration_status,
+                TaskIntegrationLifecycleStatus::Integrated
+            );
+            assert_eq!(
+                int_lc.evidence_status,
+                TaskEvidenceVerificationStatus::VerifiedLive
+            );
+            assert!(int_lc.task_checkout_present);
+            assert!(int_lc.integration_checkout_present);
+            let int_sum = int_lc
+                .integration_receipt
+                .as_ref()
+                .expect("verified integration receipt summary");
+            assert_eq!(int_sum.receipt_id, integration_receipt.receipt_id);
+            assert_eq!(int_sum.review_receipt_id, review_receipt.receipt_id);
+            assert_eq!(
+                int_sum.integrated_target_commit,
+                integration_receipt.integrated_target_commit
+            );
+            assert_eq!(int_sum.strategy, IntegrationStrategy::MergeNoFf);
+        }
+
+        // 5. Clean up the integrated task worktree and verify historical projection with verification limits.
+        let cleanup_report = cleanup_integrated_task_worktree(&VerifiedIntegratedCleanupRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject,
+            review_receipt: review_receipt.clone(),
+            integration_receipt: integration_receipt.clone(),
+            expected_source_head_commit: fixture.base_commit.clone(),
+        })
+        .expect("cleanup integrated task worktree");
+        assert!(cleanup_report.checkout_removed);
+
+        for _ in 0..2 {
+            let historical = client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect("get_task after task worktree cleanup");
+            assert_eq!(historical.status, TaskExecutionStatus::ReadyForReview);
+            assert!(!historical.accepted);
+
+            let hist_lc = historical.lifecycle.as_ref().expect("lifecycle present");
+            assert!(!hist_lc.task_checkout_present);
+            assert!(hist_lc.integration_checkout_present);
+            assert_eq!(
+                hist_lc.review_status,
+                TaskReviewLifecycleStatus::HistoricalAccepted
+            );
+            assert_eq!(
+                hist_lc.integration_status,
+                TaskIntegrationLifecycleStatus::HistoricalIntegrated
+            );
+            assert_eq!(
+                hist_lc.evidence_status,
+                TaskEvidenceVerificationStatus::RecordedHistoricalOnly
+            );
+            assert_eq!(
+                hist_lc
+                    .review_receipt
+                    .as_ref()
+                    .map(|r| r.receipt_id.as_str()),
+                Some(review_receipt.receipt_id.as_str())
+            );
+            assert_eq!(
+                hist_lc
+                    .integration_receipt
+                    .as_ref()
+                    .map(|r| r.receipt_id.as_str()),
+                Some(integration_receipt.receipt_id.as_str())
+            );
+            let detail = hist_lc
+                .verification_detail
+                .as_deref()
+                .expect("historical verification detail present");
+            assert!(detail.contains("cleaned up"));
+            assert!(!detail.contains(&fixture.root.display().to_string()));
+        }
+
+        // Polling never re-invoked the worker provider.
+        assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn task_lifecycle_projection_invalidates_wrong_scope_bad_digest_foreign_receipts_and_later_changes(
+    ) {
+        use threadlane_operations::{
+            accept_review_subject, commit_task_worktree_changes, execute_integration,
+            inspect_review_subject, propose_integration, CommitTaskChangesRequest,
+            ExecuteIntegrationRequest, InspectReviewSubjectRequest, IntegrationProposalRequest,
+            IntegrationStrategy, ReviewAcceptanceRequest, ReviewPolicyBinding, TestEvidenceSummary,
+            RECEIPTS_SUBDIR,
+        };
+        use threadlane_workers::WorkerRunStatus;
+
+        let fixture = setup_fixture();
+        let tasks = vec![PlanTask {
+            id: "task-a".to_string(),
+            title: "Root task A".to_string(),
+            instruction: "CHAIN_TASK_A write src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }];
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-lifecycle-negative",
+            BINDING_A,
+            THREAD_UUID_A,
+            tasks,
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-a")
+            .await
+            .expect("dispatch task-a");
+        let completed = wait_for_task_status(&client, &approval_id, "task-a", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let worker_snap = completed.worker.as_ref().expect("worker snapshot");
+        let task_worktree_id = worker_snap
+            .worktree
+            .task_worktree_id
+            .as_deref()
+            .expect("task_worktree_id");
+        let int_worktree_id = worker_snap
+            .worktree
+            .run_worktree_id
+            .as_deref()
+            .expect("run_worktree_id");
+        let task_checkout = PathBuf::from(
+            worker_snap
+                .worktree
+                .task_worktree_path
+                .as_deref()
+                .expect("task_worktree_path"),
+        );
+        let int_checkout = PathBuf::from(
+            worker_snap
+                .worktree
+                .run_worktree_path
+                .as_deref()
+                .expect("run_worktree_path"),
+        );
+
+        commit_task_worktree_changes(&CommitTaskChangesRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            commit_message: "commit task-a".to_string(),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+            allow_missing_effort_evidence: false,
+        })
+        .expect("commit task-a");
+
+        let policy = ReviewPolicyBinding {
+            policy_id: "policy-task-a".to_string(),
+            requested_provider: Some("antigravity".to_string()),
+            requested_model: Some(worker_snap.requested_model.clone()),
+            requested_effort: Some(worker_snap.requested_effort.clone()),
+            observed_model: worker_snap.observed_model.clone(),
+            observed_effort: worker_snap.observed_effort.clone(),
+            file_permissions: threadlane_workers::WorkerFilePermissions::TaskFiles,
+            require_effort_evidence: true,
+            require_passing_tests: true,
+        };
+        let test_evidence = TestEvidenceSummary {
+            formatting_passed: true,
+            clippy_passed: true,
+            tests_passed: true,
+            passed_test_count: 2,
+            failed_test_count: 0,
+            evidence_summary: "cargo fmt --check && cargo clippy && cargo test".to_string(),
+        };
+
+        let subject = inspect_review_subject(&InspectReviewSubjectRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            policy,
+            test_evidence,
+            worker_status: Some(WorkerRunStatus::Succeeded),
+        })
+        .expect("inspect review subject");
+
+        let review_receipt = accept_review_subject(&ReviewAcceptanceRequest {
+            expected_subject_digest: subject.subject_digest.clone(),
+            subject: subject.clone(),
+            receipt_id: None,
+            reviewer_id: "primary-codex".to_string(),
+            review_note: "Accepted task-a".to_string(),
+            approved_at_ms: 1_700_000_700_000,
+        })
+        .expect("accept review subject");
+
+        let receipts_dir = host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join(RECEIPTS_SUBDIR);
+        let review_path = receipts_dir.join(format!("review-{}.json", review_receipt.receipt_id));
+        let original_review_bytes = fs::read(&review_path).expect("read original review receipt");
+
+        // 1. Wrong write scope on review receipt -> Invalidated.
+        let mut wrong_scope_receipt = review_receipt.clone();
+        wrong_scope_receipt
+            .allowed_write_paths
+            .insert("src/other.rs".to_string());
+        wrong_scope_receipt.receipt_digest = wrong_scope_receipt
+            .compute_digest()
+            .expect("compute digest for wrong-scope receipt");
+        fs::write(
+            &review_path,
+            serde_json::to_vec_pretty(&wrong_scope_receipt).expect("serialize wrong-scope"),
+        )
+        .expect("write wrong-scope receipt");
+        fs::set_permissions(&review_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+        let wrong_scope_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with wrong-scope receipt");
+        let ws_lc = wrong_scope_snap.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(ws_lc.review_status, TaskReviewLifecycleStatus::Invalidated);
+        assert_eq!(
+            ws_lc.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+        assert!(ws_lc.review_receipt.is_none());
+
+        // 2. Tampered receipt digest -> Invalidated.
+        let mut bad_digest_receipt = review_receipt.clone();
+        bad_digest_receipt.receipt_digest = "0".repeat(64);
+        fs::write(
+            &review_path,
+            serde_json::to_vec_pretty(&bad_digest_receipt).expect("serialize bad-digest"),
+        )
+        .expect("write bad-digest receipt");
+        fs::set_permissions(&review_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+        let bad_digest_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with bad digest");
+        let bd_lc = bad_digest_snap.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(bd_lc.review_status, TaskReviewLifecycleStatus::Invalidated);
+        assert_eq!(
+            bd_lc.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+
+        // Restore valid review receipt and confirm recovery.
+        fs::write(&review_path, &original_review_bytes).expect("restore valid review receipt");
+        fs::set_permissions(&review_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+        let recovered = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task after restore");
+        assert_eq!(
+            recovered.lifecycle.as_ref().unwrap().review_status,
+            TaskReviewLifecycleStatus::Accepted
+        );
+
+        // 3. Foreign review receipt in session work-area receipts directory -> Invalidated.
+        let mut foreign_receipt = review_receipt.clone();
+        foreign_receipt.receipt_id = "review-foreign-999".to_string();
+        foreign_receipt.run_id = "r_deadbeefcafe".to_string();
+        foreign_receipt.task_id = "w_deadbeefcafe".to_string();
+        foreign_receipt.receipt_digest = foreign_receipt
+            .compute_digest()
+            .expect("compute foreign receipt digest");
+        let foreign_path = receipts_dir.join("review-foreign-999.json");
+        fs::write(
+            &foreign_path,
+            serde_json::to_vec_pretty(&foreign_receipt).expect("serialize foreign"),
+        )
+        .expect("write foreign receipt");
+        fs::set_permissions(&foreign_path, fs::Permissions::from_mode(0o600)).expect("chmod 0600");
+
+        let foreign_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with foreign receipt");
+        assert_eq!(
+            foreign_snap.lifecycle.as_ref().unwrap().evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+        fs::remove_file(&foreign_path).expect("remove foreign receipt");
+
+        // Symlink inside receipts directory -> Invalidated.
+        let sym_path = receipts_dir.join("review-symlink.json");
+        symlink(&review_path, &sym_path).expect("create symlink receipt");
+        let sym_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with symlink receipt");
+        assert_eq!(
+            sym_snap.lifecycle.as_ref().unwrap().evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+        fs::remove_file(&sym_path).expect("remove symlink receipt");
+
+        // 4. Later task changes after review receipt (dirty checkout, then moved HEAD commit) -> Invalidated.
+        fs::write(
+            task_checkout.join("src/a.rs"),
+            "pub fn task_a() -> u32 { 999 }\n",
+        )
+        .expect("modify src/a.rs after review");
+
+        let dirty_after_review = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with dirty checkout after review");
+        let dar_lc = dirty_after_review.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(dar_lc.review_status, TaskReviewLifecycleStatus::Invalidated);
+        assert_eq!(
+            dar_lc.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+
+        // Commit the later change so the worktree is clean again, but HEAD has moved past the reviewed commit.
+        commit_task_worktree_changes(&CommitTaskChangesRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            commit_message: "unreviewed follow-up commit".to_string(),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+            allow_missing_effort_evidence: false,
+        })
+        .expect("commit follow-up change");
+
+        let moved_head_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with moved HEAD after review");
+        let mh_lc = moved_head_snap.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(mh_lc.review_status, TaskReviewLifecycleStatus::Invalidated);
+        assert_eq!(
+            mh_lc.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+
+        // Reset task worktree back to the accepted review commit and verify recovery.
+        run_sanitized_git(
+            &task_checkout,
+            &["reset", "--hard", &review_receipt.task_head_commit],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("reset task checkout to reviewed commit");
+
+        let restored_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task after resetting to reviewed commit");
+        assert_eq!(
+            restored_snap.lifecycle.as_ref().unwrap().review_status,
+            TaskReviewLifecycleStatus::Accepted
+        );
+
+        // 5. Execute integration, then dirty the integration checkout -> Integration Invalidated while Review stays Accepted.
+        let proposal = propose_integration(&IntegrationProposalRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            integration_worktree_id: int_worktree_id.to_string(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject: subject.clone(),
+            review_receipt: review_receipt.clone(),
+            strategy: IntegrationStrategy::MergeNoFf,
+        })
+        .expect("propose integration");
+
+        execute_integration(&ExecuteIntegrationRequest {
+            work_area_root: host.work_area_dir().to_path_buf(),
+            integration_worktree_id: int_worktree_id.to_string(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject,
+            review_receipt,
+            strategy: IntegrationStrategy::MergeNoFf,
+            expected_integration_head_commit: proposal.integration_head_commit,
+            expected_task_head_commit: proposal.task_head_commit,
+            expected_source_head_commit: proposal.source_head_commit,
+            receipt_id: None,
+            operator_id: "primary-codex".to_string(),
+            integrated_at_ms: 1_700_000_700_500,
+        })
+        .expect("execute integration");
+
+        let dirty_int_file = int_checkout.join("untracked-dirty.txt");
+        fs::write(&dirty_int_file, "dirty integration checkout\n")
+            .expect("write untracked file in integration checkout");
+
+        let dirty_int_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task with dirty integration checkout");
+        let di_lc = dirty_int_snap.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(di_lc.review_status, TaskReviewLifecycleStatus::Accepted);
+        assert_eq!(
+            di_lc.integration_status,
+            TaskIntegrationLifecycleStatus::Invalidated
+        );
+        assert_eq!(
+            di_lc.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+        assert!(di_lc.review_receipt.is_some());
+        assert!(di_lc.integration_receipt.is_none());
+
+        fs::remove_file(&dirty_int_file).expect("clean integration checkout");
+        let clean_int_snap = client
+            .get_task(&approval_id, "task-a")
+            .await
+            .expect("get_task after cleaning integration checkout");
+        let ci_lc = clean_int_snap.lifecycle.as_ref().expect("lifecycle");
+        assert_eq!(
+            ci_lc.integration_status,
+            TaskIntegrationLifecycleStatus::Integrated
+        );
+        assert_eq!(
+            ci_lc.evidence_status,
+            TaskEvidenceVerificationStatus::VerifiedLive
+        );
+
+        host.shutdown().await.expect("shutdown host");
     }
 }

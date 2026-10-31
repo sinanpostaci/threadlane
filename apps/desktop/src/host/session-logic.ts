@@ -7,8 +7,15 @@ import type {
   HostExecutionGates,
   HostPanelContext,
   HostSessionSummary,
+  IntegrationStrategy,
+  TaskEvidenceVerificationStatus,
   TaskExecutionStatus,
+  TaskIntegrationLifecycleStatus,
+  TaskLifecycleProjection,
+  TaskReviewLifecycleStatus,
   TaskStateSnapshot,
+  VerifiedIntegrationReceiptSummary,
+  VerifiedReviewReceiptSummary,
   WorkerSnapshot,
 } from './types.ts';
 
@@ -623,18 +630,440 @@ export function isTerminalTaskStatus(status: TaskExecutionStatus): boolean {
 }
 
 /**
- * Review wording for a task snapshot. The frontend never turns worker
- * completion or a backend `accepted` flag into acceptance, merging, or plan
- * application.
+ * Tasks in `ready_for_review` have finished worker execution (`isTerminalTaskStatus`
+ * remains true for execution controls), but their review, integration, and
+ * evidence verification lifecycle can still advance or be invalidated on disk
+ * during active polling.
  */
-export function taskReviewNote(task: Pick<TaskStateSnapshot, 'status'>): string {
-  if (task.status === 'ready_for_review') {
-    return 'Review pending; not accepted, merged, or applied.';
+export function shouldPollTaskSnapshot(
+  task: Pick<TaskStateSnapshot, 'status' | 'lifecycle'>
+): boolean {
+  return (
+    !isTerminalTaskStatus(task.status) ||
+    task.status === 'ready_for_review' ||
+    Boolean(task.lifecycle && task.lifecycle.review_status !== 'not_ready')
+  );
+}
+
+export type TaskReadMode = 'missing' | 'active' | 'all';
+
+export function selectTaskIdsForRead(
+  approvedTaskIds: readonly string[],
+  visibleTaskCount: number,
+  mode: TaskReadMode,
+  snapshots: ReadonlyMap<
+    string,
+    Pick<TaskStateSnapshot, 'status' | 'lifecycle'>
+  >,
+  pendingTaskIds?: ReadonlySet<string>
+): string[] {
+  const visibleIds = normalizeApprovedTaskIds(approvedTaskIds).slice(
+    0,
+    Math.max(0, visibleTaskCount)
+  );
+  const selected: string[] = [];
+  for (const taskId of visibleIds) {
+    if (pendingTaskIds?.has(taskId)) {
+      continue;
+    }
+    const snapshot = snapshots.get(taskId);
+    const shouldRead =
+      mode === 'all' ||
+      !snapshot ||
+      (mode === 'active' && shouldPollTaskSnapshot(snapshot));
+    if (shouldRead) {
+      selected.push(taskId);
+    }
   }
+  return selected;
+}
+
+export type TaskLifecycleBadgeTone = 'default' | 'active' | 'warn';
+
+export interface TaskLifecycleStageBadge {
+  label: string;
+  tone: TaskLifecycleBadgeTone;
+}
+
+export interface TaskLifecycleDisplay {
+  visible: boolean;
+  execution: TaskLifecycleStageBadge;
+  review: TaskLifecycleStageBadge;
+  integration: TaskLifecycleStageBadge;
+  evidence: TaskLifecycleStageBadge;
+  receiptSummary: string | null;
+  detailNote: string;
+  detailTone: TaskLifecycleBadgeTone;
+}
+
+export function formatTaskReviewLifecycleStatus(
+  status: TaskReviewLifecycleStatus
+): TaskLifecycleStageBadge {
+  switch (status) {
+    case 'not_ready':
+      return { label: 'Not ready', tone: 'default' };
+    case 'pending_review':
+      return { label: 'Review pending', tone: 'default' };
+    case 'accepted':
+      return { label: 'Review accepted', tone: 'active' };
+    case 'historical_accepted':
+      return { label: 'Accepted (history)', tone: 'default' };
+    case 'invalidated':
+      return { label: 'Review invalidated', tone: 'warn' };
+    default:
+      return { label: 'Review pending', tone: 'default' };
+  }
+}
+
+export function formatTaskIntegrationLifecycleStatus(
+  status: TaskIntegrationLifecycleStatus
+): TaskLifecycleStageBadge {
+  switch (status) {
+    case 'not_integrated':
+      return { label: 'Not integrated', tone: 'default' };
+    case 'ready_to_integrate':
+      return { label: 'Ready to integrate', tone: 'default' };
+    case 'integrated':
+      return { label: 'Integrated', tone: 'active' };
+    case 'historical_integrated':
+      return { label: 'Integrated (history)', tone: 'default' };
+    case 'invalidated':
+      return { label: 'Integration invalidated', tone: 'warn' };
+    default:
+      return { label: 'Not integrated', tone: 'default' };
+  }
+}
+
+export function formatTaskEvidenceVerificationStatus(
+  status: TaskEvidenceVerificationStatus
+): TaskLifecycleStageBadge {
+  switch (status) {
+    case 'not_applicable':
+      return { label: 'Evidence N/A', tone: 'default' };
+    case 'pending_review':
+      return { label: 'Awaiting review receipt', tone: 'default' };
+    case 'verified_live':
+      return { label: 'Verified live', tone: 'active' };
+    case 'recorded_historical_only':
+      return {
+        label: 'Recorded history (checkout cleaned up)',
+        tone: 'default',
+      };
+    case 'invalidated':
+      return { label: 'Evidence invalidated', tone: 'warn' };
+    default:
+      return { label: 'Awaiting review receipt', tone: 'default' };
+  }
+}
+
+export function formatIntegrationStrategyLabel(
+  strategy: IntegrationStrategy
+): string {
+  switch (strategy) {
+    case 'fast_forward_only':
+      return 'fast-forward';
+    case 'merge_no_ff':
+      return 'merge --no-ff';
+    default:
+      return 'branch integration';
+  }
+}
+
+export function resolveTaskLifecycleProjection(
+  task: Pick<TaskStateSnapshot, 'status' | 'lifecycle'>
+): TaskLifecycleProjection {
+  if (task.lifecycle) {
+    return {
+      review_status: task.lifecycle.review_status,
+      integration_status: task.lifecycle.integration_status,
+      evidence_status: task.lifecycle.evidence_status,
+      task_checkout_present: Boolean(task.lifecycle.task_checkout_present),
+      integration_checkout_present: Boolean(
+        task.lifecycle.integration_checkout_present
+      ),
+      review_receipt: task.lifecycle.review_receipt ?? null,
+      integration_receipt: task.lifecycle.integration_receipt ?? null,
+      verification_detail: task.lifecycle.verification_detail ?? null,
+    };
+  }
+  if (task.status === 'ready_for_review') {
+    return {
+      review_status: 'pending_review',
+      integration_status: 'not_integrated',
+      evidence_status: 'pending_review',
+      task_checkout_present: false,
+      integration_checkout_present: false,
+      review_receipt: null,
+      integration_receipt: null,
+      verification_detail: null,
+    };
+  }
+  return {
+    review_status: 'not_ready',
+    integration_status: 'not_integrated',
+    evidence_status: 'not_applicable',
+    task_checkout_present: false,
+    integration_checkout_present: false,
+    review_receipt: null,
+    integration_receipt: null,
+    verification_detail: null,
+  };
+}
+
+export function formatTaskLifecycleReceipts(
+  lifecycle: TaskLifecycleProjection | null | undefined
+): string | null {
+  if (
+    !lifecycle ||
+    lifecycle.evidence_status === 'invalidated' ||
+    lifecycle.review_status === 'invalidated' ||
+    lifecycle.integration_status === 'invalidated'
+  ) {
+    return null;
+  }
+  const parts: string[] = [];
+  const review: VerifiedReviewReceiptSummary | null =
+    lifecycle.review_receipt ?? null;
+  if (
+    review &&
+    (lifecycle.review_status === 'accepted' ||
+      lifecycle.review_status === 'historical_accepted')
+  ) {
+    const receiptId = nonEmptyText(review.receipt_id) ?? 'receipt';
+    const commit = abbreviatedDependencySha(review.task_head_commit);
+    const reviewer = nonEmptyText(review.reviewer_id);
+    const meta = [
+      commit ? `commit ${commit}` : null,
+      reviewer ? `reviewer ${reviewer}` : null,
+    ]
+      .filter((item): item is string => item !== null)
+      .join(', ');
+    parts.push(
+      meta ? `Review ${receiptId} (${meta})` : `Review ${receiptId}`
+    );
+  }
+  const integration: VerifiedIntegrationReceiptSummary | null =
+    lifecycle.integration_receipt ?? null;
+  if (
+    integration &&
+    (lifecycle.integration_status === 'integrated' ||
+      lifecycle.integration_status === 'historical_integrated')
+  ) {
+    const receiptId = nonEmptyText(integration.receipt_id) ?? 'receipt';
+    const target = abbreviatedDependencySha(
+      integration.integrated_target_commit
+    );
+    const operator = nonEmptyText(integration.operator_id);
+    const strategy = formatIntegrationStrategyLabel(integration.strategy);
+    const meta = [
+      target ? `target ${target}` : null,
+      strategy,
+      operator ? `operator ${operator}` : null,
+    ]
+      .filter((item): item is string => item !== null)
+      .join(', ');
+    parts.push(
+      meta
+        ? `Integration ${receiptId} (${meta})`
+        : `Integration ${receiptId}`
+    );
+  }
+  return parts.length > 0 ? parts.join(' · ') : null;
+}
+
+/**
+ * Review and lifecycle wording for a task snapshot. The frontend never turns
+ * worker completion, a worker `final_summary`, or a backend `accepted` flag
+ * into acceptance, merging, or plan application; only host-verified lifecycle
+ * projections can report reviewed, integrated, historical, or invalidated state.
+ */
+export function taskReviewNote(
+  task: Pick<TaskStateSnapshot, 'status' | 'lifecycle'>
+): string {
   if (task.status === 'unknown') {
     return 'Unknown (uncertain); not replayed or accepted.';
   }
+  const lifecycle = task.lifecycle ?? null;
+  if (lifecycle) {
+    const detail = nonEmptyText(lifecycle.verification_detail);
+    if (
+      lifecycle.evidence_status === 'invalidated' ||
+      lifecycle.review_status === 'invalidated' ||
+      lifecycle.integration_status === 'invalidated'
+    ) {
+      return detail
+        ? `Lifecycle evidence invalidated; not treated as reviewed or integrated. ${detail}`
+        : 'Lifecycle evidence invalidated; not treated as reviewed or integrated.';
+    }
+    if (
+      lifecycle.evidence_status === 'recorded_historical_only' ||
+      lifecycle.review_status === 'historical_accepted' ||
+      lifecycle.integration_status === 'historical_integrated'
+    ) {
+      return detail
+        ? `Recorded history only (task checkout cleaned up; live checkout diff re-verification unavailable). ${detail}`
+        : 'Recorded history only (task checkout cleaned up; live checkout diff re-verification unavailable).';
+    }
+    if (
+      lifecycle.review_status === 'accepted' &&
+      lifecycle.integration_status === 'integrated' &&
+      lifecycle.evidence_status === 'verified_live'
+    ) {
+      return detail
+        ? `Reviewed and integrated on the run branch (verified live). ${detail}`
+        : 'Reviewed and integrated on the run branch (verified live).';
+    }
+    if (
+      lifecycle.review_status === 'accepted' &&
+      lifecycle.evidence_status === 'verified_live'
+    ) {
+      return detail
+        ? `Review receipt verified live; ready to integrate onto the run branch (not yet integrated). ${detail}`
+        : 'Review receipt verified live; ready to integrate onto the run branch (not yet integrated).';
+    }
+    if (lifecycle.review_status === 'pending_review') {
+      return 'Review pending; not accepted, merged, or applied.';
+    }
+  }
+  if (task.status === 'ready_for_review') {
+    return 'Review pending; not accepted, merged, or applied.';
+  }
   return '';
+}
+
+export function formatTaskLifecycleDisplay(
+  task: Pick<TaskStateSnapshot, 'status' | 'lifecycle'>
+): TaskLifecycleDisplay {
+  const lifecycle = resolveTaskLifecycleProjection(task);
+  const visible =
+    task.status === 'ready_for_review' ||
+    Boolean(
+      task.lifecycle &&
+        (task.lifecycle.review_status !== 'not_ready' ||
+          task.lifecycle.integration_status !== 'not_integrated' ||
+          task.lifecycle.evidence_status !== 'not_applicable')
+    );
+  const execution: TaskLifecycleStageBadge = {
+    label: formatTaskStatusLabel(task.status),
+    tone: formatTaskStatusTone(task.status),
+  };
+  const review = formatTaskReviewLifecycleStatus(lifecycle.review_status);
+  const integration = formatTaskIntegrationLifecycleStatus(
+    lifecycle.integration_status
+  );
+  const evidence = formatTaskEvidenceVerificationStatus(
+    lifecycle.evidence_status
+  );
+  const receiptSummary = formatTaskLifecycleReceipts(lifecycle);
+  const detailNote = taskReviewNote(task);
+  const detailTone: TaskLifecycleBadgeTone =
+    review.tone === 'warn' ||
+    integration.tone === 'warn' ||
+    evidence.tone === 'warn' ||
+    task.status === 'unknown'
+      ? 'warn'
+      : review.tone === 'active' ||
+          integration.tone === 'active' ||
+          evidence.tone === 'active'
+        ? 'active'
+        : 'default';
+
+  return {
+    visible,
+    execution,
+    review,
+    integration,
+    evidence,
+    receiptSummary,
+    detailNote,
+    detailTone,
+  };
+}
+
+export interface TaskLifecycleElementSink {
+  textContent: string | null;
+  hidden: HTMLElement['hidden'];
+  setAttribute(name: string, value: string): void;
+}
+
+export interface TaskLifecycleDomTargets {
+  lifecycleGroup: Pick<TaskLifecycleElementSink, 'hidden'>;
+  executionPill: Pick<TaskLifecycleElementSink, 'textContent' | 'setAttribute'>;
+  reviewPill: Pick<TaskLifecycleElementSink, 'textContent' | 'setAttribute'>;
+  integrationPill: Pick<TaskLifecycleElementSink, 'textContent' | 'setAttribute'>;
+  evidencePill: Pick<TaskLifecycleElementSink, 'textContent' | 'setAttribute'>;
+  lifecycleReceipts: Pick<TaskLifecycleElementSink, 'textContent' | 'hidden'>;
+  lifecycleNote: TaskLifecycleElementSink;
+  reviewDetail: TaskLifecycleElementSink;
+}
+
+function writeSinkText(
+  target: { textContent: string | null },
+  text: string
+): void {
+  if (target.textContent !== text) {
+    target.textContent = text;
+  }
+}
+
+/**
+ * Synchronizes the lifecycle stage pills, receipt summary, and review/verification
+ * notes in place through `textContent` and `data-status` attributes without
+ * replacing DOM nodes or parsing HTML.
+ */
+export function syncTaskLifecycleTargets(
+  targets: TaskLifecycleDomTargets,
+  task: Pick<TaskStateSnapshot, 'status' | 'lifecycle'> | null,
+  receiptDisplayLimit: number = 600
+): TaskLifecycleDisplay | null {
+  if (!task) {
+    targets.lifecycleGroup.hidden = true;
+    writeSinkText(targets.executionPill, 'Waiting');
+    targets.executionPill.setAttribute('data-status', 'default');
+    writeSinkText(targets.reviewPill, 'Not ready');
+    targets.reviewPill.setAttribute('data-status', 'default');
+    writeSinkText(targets.integrationPill, 'Not integrated');
+    targets.integrationPill.setAttribute('data-status', 'default');
+    writeSinkText(targets.evidencePill, 'Evidence N/A');
+    targets.evidencePill.setAttribute('data-status', 'default');
+    writeSinkText(targets.lifecycleReceipts, '');
+    targets.lifecycleReceipts.hidden = true;
+    writeSinkText(targets.lifecycleNote, '');
+    targets.lifecycleNote.setAttribute('data-status', 'default');
+    targets.lifecycleNote.hidden = true;
+    writeSinkText(targets.reviewDetail, '');
+    targets.reviewDetail.setAttribute('data-status', 'default');
+    targets.reviewDetail.hidden = true;
+    return null;
+  }
+
+  const display = formatTaskLifecycleDisplay(task);
+  targets.lifecycleGroup.hidden = !display.visible;
+  writeSinkText(targets.executionPill, display.execution.label);
+  targets.executionPill.setAttribute('data-status', display.execution.tone);
+  writeSinkText(targets.reviewPill, display.review.label);
+  targets.reviewPill.setAttribute('data-status', display.review.tone);
+  writeSinkText(targets.integrationPill, display.integration.label);
+  targets.integrationPill.setAttribute('data-status', display.integration.tone);
+  writeSinkText(targets.evidencePill, display.evidence.label);
+  targets.evidencePill.setAttribute('data-status', display.evidence.tone);
+
+  const receiptText = display.receiptSummary
+    ? compactDisplayText(display.receiptSummary, receiptDisplayLimit)
+    : '';
+  writeSinkText(targets.lifecycleReceipts, receiptText);
+  targets.lifecycleReceipts.hidden = receiptText.length === 0;
+
+  writeSinkText(targets.lifecycleNote, display.detailNote);
+  targets.lifecycleNote.setAttribute('data-status', display.detailTone);
+  targets.lifecycleNote.hidden =
+    !display.visible || display.detailNote.length === 0;
+
+  writeSinkText(targets.reviewDetail, display.detailNote);
+  targets.reviewDetail.setAttribute('data-status', display.detailTone);
+  targets.reviewDetail.hidden = display.detailNote.length === 0;
+
+  return display;
 }
 
 /** Operator guidance for dependent inputs that the host has not verified. */

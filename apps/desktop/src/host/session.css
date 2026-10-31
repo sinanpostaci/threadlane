@@ -337,6 +337,91 @@
   user-select: text;
 }
 
+.aq-host-session-task-lifecycle {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 5px 6px;
+  border: 1px solid var(--aq-line);
+  border-radius: 4px;
+  background: var(--aq-base);
+  min-width: 0;
+}
+
+.aq-host-session-task-lifecycle-stages {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px 6px;
+  min-width: 0;
+}
+
+.aq-host-session-task-lifecycle-stage {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-width: 0;
+}
+
+.aq-host-session-task-lifecycle-label {
+  color: var(--aq-muted);
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.035em;
+}
+
+.aq-host-session-task-lifecycle-pill {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px 5px;
+  border: 1px solid var(--aq-line);
+  border-radius: 3px;
+  color: var(--aq-muted);
+  font-size: 10px;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+
+.aq-host-session-task-lifecycle-pill[data-status='active'] {
+  color: var(--aq-accent);
+  border-color: color-mix(in srgb, var(--aq-accent) 45%, var(--aq-line));
+}
+
+.aq-host-session-task-lifecycle-pill[data-status='warn'] {
+  color: var(--aq-warn);
+  border-color: color-mix(in srgb, var(--aq-warn) 45%, var(--aq-line));
+  background: var(--aq-warn-bg);
+}
+
+.aq-host-session-task-lifecycle-receipts {
+  margin: 0;
+  color: var(--aq-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9.5px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.aq-host-session-task-lifecycle-note {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 10px;
+  line-height: 1.38;
+  overflow-wrap: anywhere;
+}
+
+.aq-host-session-task-lifecycle-note[data-status='active'],
+.aq-host-session-task-review[data-status='active'] {
+  color: var(--aq-accent);
+}
+
+.aq-host-session-task-lifecycle-note[data-status='warn'],
+.aq-host-session-task-review[data-status='warn'] {
+  color: var(--aq-warn);
+}
+
 .aq-host-session-task-details {
   min-width: 0;
 }

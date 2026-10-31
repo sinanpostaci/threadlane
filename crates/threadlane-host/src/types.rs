@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use threadlane::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus, MAX_CODEX_TIMEOUT_MS};
 use threadlane_authority::ApprovalRecord;
 use threadlane_core::WorkerExecutionBinding;
+use threadlane_operations::IntegrationStrategy;
 use threadlane_registry::ToolAdapter;
 use threadlane_workers::{validate_executable_file, DependencyInputSeal, WorkerProvider};
 
@@ -752,6 +753,155 @@ impl TaskExecutionStatus {
     }
 }
 
+/// Maximum directory entries inspected when scanning `<work_area_dir>/manifests/receipts` during
+/// read-only task lifecycle projection.
+pub const MAX_RECEIPT_SCAN_ENTRIES: usize = 256;
+
+/// Maximum UTF-8 byte length for [`TaskLifecycleProjection::verification_detail`].
+pub const MAX_LIFECYCLE_DETAIL_BYTES: usize = 256;
+
+/// Read-only review lifecycle stage projected for an approved task.
+///
+/// Separate from [`TaskExecutionStatus`], which preserves `ReadyForReview` after worker completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskReviewLifecycleStatus {
+    /// Task has not yet reached [`TaskExecutionStatus::ReadyForReview`].
+    NotReady,
+    /// Worker completed at [`TaskExecutionStatus::ReadyForReview`] and the live task checkout is
+    /// awaiting an operator review receipt.
+    PendingReview,
+    /// A valid [`threadlane_operations::ReviewReceipt`] is verified against the live task checkout
+    /// subject and frozen task/run/policy identity.
+    Accepted,
+    /// A valid [`threadlane_operations::ReviewReceipt`] and Git commit/tree ancestry are verified
+    /// in the repository, but the task checkout directory was cleaned up and is no longer present
+    /// for live working-tree inspection.
+    HistoricalAccepted,
+    /// Review receipt or task worktree evidence failed verification (wrong scope/digest/model/policy,
+    /// dirty worktree or moved `HEAD` after review, missing commit, corrupt/symlink/foreign receipt
+    /// file, or missing checkout before review).
+    Invalidated,
+}
+
+/// Read-only branch integration lifecycle stage projected for an approved task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskIntegrationLifecycleStatus {
+    /// Task is not yet reviewed or has only historical review without integration.
+    NotIntegrated,
+    /// Review is [`TaskReviewLifecycleStatus::Accepted`] on a live task checkout and ready for
+    /// operator integration into the run integration branch.
+    ReadyToIntegrate,
+    /// A valid [`threadlane_operations::IntegrationReceipt`] is verified against the accepted
+    /// review receipt, live task checkout, and integration ancestry.
+    Integrated,
+    /// A valid [`threadlane_operations::IntegrationReceipt`] is verified against the accepted
+    /// review receipt and repository/integration ancestry after task checkout cleanup.
+    HistoricalIntegrated,
+    /// Integration receipt, target worktree, or underlying review evidence failed verification.
+    Invalidated,
+}
+
+/// Read-only evidence verification status projected for an approved task's review and integration
+/// lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskEvidenceVerificationStatus {
+    /// Task has not yet reached [`TaskExecutionStatus::ReadyForReview`].
+    NotApplicable,
+    /// Live task worktree checkout is present and passes post-run diff gate checks; awaiting an
+    /// operator review receipt.
+    PendingReview,
+    /// Active receipts and worktree checkouts are present on disk and verified live against Git
+    /// state and frozen task policy.
+    VerifiedLive,
+    /// Task worktree checkout was cleaned up; receipts and Git commit/tree ancestry are verified
+    /// from recorded history in the repository, with explicit historical verification limits.
+    RecordedHistoricalOnly,
+    /// Evidence is stale, mismatched, tampered, dirty, foreign, symlinked, or exceeded scan bounds.
+    Invalidated,
+}
+
+/// Path-free, token-free summary of a verified [`threadlane_operations::ReviewReceipt`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedReviewReceiptSummary {
+    /// Unique software-assigned review receipt identifier (`review-<uuid>`).
+    pub receipt_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the canonical [`threadlane_operations::ReviewSubject`].
+    pub subject_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the [`threadlane_operations::ReviewReceipt`].
+    pub receipt_digest: String,
+    /// Validated task worktree identifier (`wt-task-...`).
+    pub task_worktree_id: String,
+    /// Exact 40-character lowercase hex base commit SHA of the task worktree.
+    pub base_commit: String,
+    /// Exact 40-character lowercase hex `HEAD` commit SHA accepted in the review subject.
+    pub task_head_commit: String,
+    /// Exact 40-character lowercase hex root tree SHA of `task_head_commit`.
+    pub task_tree_sha: String,
+    /// 64-character lowercase hex SHA-256 digest of the task's verified diff.
+    pub diff_digest: String,
+    /// Non-empty identifier of the human reviewer or operator that accepted the subject.
+    pub reviewer_id: String,
+    /// Unix epoch timestamp in milliseconds when the review receipt was issued.
+    pub approved_at_ms: i64,
+}
+
+/// Path-free, token-free summary of a verified [`threadlane_operations::IntegrationReceipt`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedIntegrationReceiptSummary {
+    /// Unique software-assigned integration receipt identifier (`integration-<uuid>`).
+    pub receipt_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the [`threadlane_operations::IntegrationReceipt`].
+    pub receipt_digest: String,
+    /// Exact `receipt_id` of the bound [`threadlane_operations::ReviewReceipt`].
+    pub review_receipt_id: String,
+    /// Validated run-level integration worktree identifier (`wt-run-...`).
+    pub integration_worktree_id: String,
+    /// Deterministic merge strategy used (`fast_forward_only` or `merge_no_ff`).
+    pub strategy: IntegrationStrategy,
+    /// Exact 40-character lowercase hex accepted task `HEAD` commit SHA that was integrated.
+    pub accepted_task_head_commit: String,
+    /// Exact 40-character lowercase hex `HEAD` commit SHA of the integration branch after integration.
+    pub integrated_target_commit: String,
+    /// Exact 40-character lowercase hex root tree SHA of `integrated_target_commit`.
+    pub integrated_tree_sha: String,
+    /// Non-empty identifier of the operator that executed the integration.
+    pub operator_id: String,
+    /// Unix epoch timestamp in milliseconds when the integration completed.
+    pub integrated_at_ms: i64,
+}
+
+/// Truthful, read-only review and integration lifecycle projection joined from software-owned
+/// session, run, worktree, subject, and receipt identities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskLifecycleProjection {
+    /// Current review lifecycle stage for this task.
+    pub review_status: TaskReviewLifecycleStatus,
+    /// Current branch integration lifecycle stage for this task.
+    pub integration_status: TaskIntegrationLifecycleStatus,
+    /// Current evidence verification status for this task.
+    pub evidence_status: TaskEvidenceVerificationStatus,
+    /// Whether the isolated task worktree checkout directory is currently present on disk.
+    pub task_checkout_present: bool,
+    /// Whether the run-level integration worktree checkout directory is currently present on disk.
+    pub integration_checkout_present: bool,
+    /// Verified review receipt summary when a review receipt was verified (live or historical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_receipt: Option<VerifiedReviewReceiptSummary>,
+    /// Verified integration receipt summary when an integration receipt was verified (live or historical).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration_receipt: Option<VerifiedIntegrationReceiptSummary>,
+    /// Sanitized single-line explanation of verification limits (such as post-cleanup historical
+    /// state) or evidence invalidation reasons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_detail: Option<String>,
+}
+
 /// Scoped, token-free snapshot of an approved task's execution state returned by
 /// [`crate::ApprovedHostClient::dispatch_task`], [`crate::ApprovedHostClient::get_task`], and
 /// [`crate::ApprovedHostClient::cancel_task`].
@@ -795,6 +945,10 @@ pub struct TaskStateSnapshot {
     pub worker: Option<WorkerSnapshot>,
     /// Always `false`: worker completion means `ReadyForReview` and is never automatically accepted/merged/applied.
     pub accepted: bool,
+    /// Separate read-only review and integration lifecycle projection joined from verified
+    /// worktree/subject/receipt state (`None` when omitted on legacy payloads).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<TaskLifecycleProjection>,
 }
 
 /// Lifecycle status of a durable per-approval initial host launch intent under
