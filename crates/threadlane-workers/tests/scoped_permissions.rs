@@ -426,21 +426,19 @@ printf '{"event":"result","result":{"conversation_id":"s-scoped-1","status":"SUC
     assert!(settings_arg.contains(canonical_checkout.to_str().expect("utf8 checkout")));
     assert!(!settings_arg.contains(env.repo_dir.to_str().expect("utf8 repo")));
 
-    // Missing observed effort remains MissingEffortEvidence / FinishedNeedsEvidenceAndReview.
+    // The installed AGY schema proves the selected known catalog variant; acceptance still
+    // requires the diff gate and an explicit review.
     assert_eq!(
         task_report.worker_report.evidence.effort_evidence,
-        FieldEvidence::Missing {
-            requested: "high".to_string()
+        FieldEvidence::VerifiedMatch {
+            value: "high".to_string()
         }
     );
-    assert_eq!(
-        task_report.worker_report.status,
-        WorkerRunStatus::MissingEffortEvidence
-    );
+    assert_eq!(task_report.worker_report.status, WorkerRunStatus::Succeeded);
     assert!(task_report.diff_gate.passed);
     assert_eq!(
         task_report.overall_acceptance_state,
-        WorkAcceptanceState::FinishedNeedsEvidenceAndReview
+        WorkAcceptanceState::DiffGatePassedPendingReview
     );
 
     // Verify that if a worker modifies a path outside allowed_write_paths despite TaskFiles hints,

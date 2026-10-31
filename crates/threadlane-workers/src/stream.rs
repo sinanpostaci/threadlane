@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::antigravity_models::antigravity_catalog_effort;
 use crate::fs_safety::sanitize_and_redact;
-use crate::spec::ResolvedModelTarget;
+use crate::spec::{ResolvedModelTarget, WorkerProvider};
 
 /// Maximum byte length of a redacted event summary or diagnostic snippet.
 pub const MAX_DIAGNOSTIC_SUMMARY_BYTES: usize = 256;
@@ -146,6 +147,23 @@ pub struct NormalizedWorkerEvent {
     pub summary: Option<String>,
 }
 
+/// Provenance of observed effort/variant evidence in a provider NDJSON stream.
+///
+/// Both variants represent CLI-reported selection metadata from the worker stream, **not**
+/// independent cloud or reasoning-budget attestation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffortEvidenceSource {
+    /// Effort or variant was explicitly emitted in stream metadata (a dedicated `effort`,
+    /// `variant`, `reasoning_effort`, or `thinking_effort` field, or an inline `#variant` tag).
+    DirectStreamMetadata,
+    /// Effort was derived from an allowlisted concrete model identifier in a structured
+    /// Antigravity `event: "init"` (`init.model`) event under the versioned Antigravity 1.4.12
+    /// catalog contract. This records CLI-reported concrete model variant selection, **not**
+    /// independent reasoning-budget attestation.
+    AntigravityCatalogModelVariant,
+}
+
 /// Aggregated evidence and normalized events parsed from a worker's stdout NDJSON stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamEvidenceSummary {
@@ -165,6 +183,13 @@ pub struct StreamEvidenceSummary {
     pub model_evidence: FieldEvidence,
     /// Verification of requested vs observed effort/variant.
     pub effort_evidence: FieldEvidence,
+    /// Provenance of observed stream effort evidence, when effort was observed without conflict.
+    ///
+    /// Distinguishes direct stream effort/variant metadata from known Antigravity catalog model
+    /// variant selection in structured `event: "init"` (`init.model`). This records CLI-reported
+    /// variant selection, **not** independent reasoning-budget attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_evidence_source: Option<EffortEvidenceSource>,
     /// Verification of requested vs observed session ID.
     pub session_evidence: FieldEvidence,
     /// First observed session ID in the stream, if any.
@@ -184,6 +209,7 @@ pub struct StreamEvidenceSummary {
 
 /// Incremental stateful parser for Antigravity and OpenCode v2 NDJSON streams.
 pub struct NdjsonStreamParser {
+    provider: Option<WorkerProvider>,
     requested_model: ResolvedModelTarget,
     requested_session_id: Option<String>,
     max_events: usize,
@@ -196,6 +222,7 @@ pub struct NdjsonStreamParser {
     observed_model: Option<String>,
     model_conflict: Option<String>,
     observed_effort: Option<String>,
+    observed_effort_source: Option<EffortEvidenceSource>,
     effort_conflict: Option<String>,
     observed_session_id: Option<String>,
     session_conflict: Option<String>,
@@ -207,13 +234,20 @@ pub struct NdjsonStreamParser {
 }
 
 impl NdjsonStreamParser {
-    /// Creates a new incremental NDJSON stream parser for the given expected model, effort, and session.
+    /// Creates a new provider-neutral, strict incremental NDJSON stream parser for the given
+    /// expected model, effort, and session.
+    ///
+    /// This default constructor remains provider-neutral and requires direct stream effort/variant
+    /// metadata (`effort`, `variant`, `reasoning_effort`, `thinking_effort`, or inline `#variant`)
+    /// whenever an effort/variant is requested. Use [`NdjsonStreamParser::new_for_provider`] or
+    /// [`NdjsonStreamParser::with_provider`] to enable provider-specific stream rules.
     pub fn new(
         requested_model: ResolvedModelTarget,
         requested_session_id: Option<String>,
         max_events: usize,
     ) -> Self {
         Self {
+            provider: None,
             requested_model,
             requested_session_id,
             max_events,
@@ -226,6 +260,7 @@ impl NdjsonStreamParser {
             observed_model: None,
             model_conflict: None,
             observed_effort: None,
+            observed_effort_source: None,
             effort_conflict: None,
             observed_session_id: None,
             session_conflict: None,
@@ -235,6 +270,28 @@ impl NdjsonStreamParser {
             retained_events: Vec::new(),
             dropped_events_count: 0,
         }
+    }
+
+    /// Creates a new provider-aware incremental NDJSON stream parser for `provider`.
+    ///
+    /// When `provider` is [`WorkerProvider::Antigravity`], valid structured `event: "init"` events
+    /// carrying a known Antigravity 1.4.12 catalog model identifier in `init.model` can supply
+    /// [`EffortEvidenceSource::AntigravityCatalogModelVariant`] evidence (unless contradicted by
+    /// explicit effort/variant metadata or later stream conflicts).
+    pub fn new_for_provider(
+        provider: WorkerProvider,
+        requested_model: ResolvedModelTarget,
+        requested_session_id: Option<String>,
+        max_events: usize,
+    ) -> Self {
+        Self::new(requested_model, requested_session_id, max_events).with_provider(provider)
+    }
+
+    /// Configures the worker provider context for this stream parser.
+    #[must_use]
+    pub fn with_provider(mut self, provider: WorkerProvider) -> Self {
+        self.provider = Some(provider);
+        self
     }
 
     /// Processes a single complete line from stdout.
@@ -361,7 +418,22 @@ impl NdjsonStreamParser {
             }
         }
 
-        let (event_model, event_effort, inline_effort_conflict) = extract_model_and_effort(obj);
+        let mut tool_name = extract_tool_name(obj);
+        let event_is_tool = is_tool_event(obj, event_type, subtype, tool_name.is_some());
+
+        let (event_model, mut event_effort, inline_model_conflict, inline_effort_conflict) =
+            if event_is_tool {
+                (None, None, None, None)
+            } else {
+                extract_model_and_effort(obj)
+            };
+        let mut event_effort_source = event_effort
+            .as_ref()
+            .map(|_| EffortEvidenceSource::DirectStreamMetadata);
+
+        if self.model_conflict.is_none() {
+            self.model_conflict = inline_model_conflict;
+        }
         if self.effort_conflict.is_none() {
             self.effort_conflict = inline_effort_conflict;
         }
@@ -376,25 +448,34 @@ impl NdjsonStreamParser {
                 _ => {}
             }
         }
-        if let Some(ref effort) = event_effort {
-            match &self.observed_effort {
-                None => self.observed_effort = Some(effort.clone()),
-                Some(prev) if prev != effort && self.effort_conflict.is_none() => {
-                    self.effort_conflict = Some(format!(
-                        "conflicting effort/variant values observed in stream: `{prev}` vs `{effort}`"
-                    ));
+
+        if self.provider == Some(WorkerProvider::Antigravity) {
+            if let (Some(ref model), Some(ref explicit_eff)) = (&event_model, &event_effort) {
+                if let Some(catalog_effort) = antigravity_catalog_effort(model) {
+                    if explicit_eff != catalog_effort && self.effort_conflict.is_none() {
+                        self.effort_conflict = Some(format!(
+                            "explicit stream effort/variant `{explicit_eff}` conflicts with Antigravity catalog model `{model}` encoded effort `{catalog_effort}`"
+                        ));
+                    }
                 }
-                _ => {}
+            }
+            if let (Some(ref model), Some(ref prev_eff)) = (&event_model, &self.observed_effort) {
+                if let Some(catalog_effort) = antigravity_catalog_effort(model) {
+                    if prev_eff != catalog_effort && self.effort_conflict.is_none() {
+                        self.effort_conflict = Some(format!(
+                            "conflicting effort/variant values observed in stream: `{prev_eff}` vs `{catalog_effort}`"
+                        ));
+                    }
+                }
             }
         }
-
-        let mut tool_name = extract_tool_name(obj);
 
         // 1. Check for permission or user-input block first (including `denied_actions`)
         // so blocked states are never misclassified as success.
         if let Some((blocked_kind, blocked_tool, blocked_summary)) =
             detect_blocked_event(obj, event_type, subtype)
         {
+            self.record_observed_event_effort(event_effort.as_deref(), event_effort_source);
             if tool_name.is_none() {
                 tool_name = blocked_tool;
             }
@@ -424,6 +505,7 @@ impl NdjsonStreamParser {
         if is_recoverable_step_error(obj, event_type, subtype) {
             self.recoverable_step_errors_count += 1;
         } else if let Some((err_code, err_msg)) = detect_error_event(obj, event_type, subtype) {
+            self.record_observed_event_effort(event_effort.as_deref(), event_effort_source);
             if self.provider_errors.len() < MAX_PROVIDER_ERROR_RECORDS {
                 self.provider_errors.push(ProviderErrorEvidence {
                     line_number,
@@ -441,7 +523,37 @@ impl NdjsonStreamParser {
                 tool_name,
                 summary: Some(err_msg),
             };
+        } else if self.provider == Some(WorkerProvider::Antigravity)
+            && !event_is_tool
+            && is_structured_antigravity_init_event(obj, subtype)
+            && self.model_conflict.is_none()
+        {
+            if let Some(init_model_raw) = obj
+                .get("init")
+                .and_then(Value::as_object)
+                .and_then(|init_obj| init_obj.get("model"))
+                .and_then(Value::as_str)
+            {
+                if let Some(catalog_effort) = antigravity_catalog_effort(init_model_raw) {
+                    match &event_effort {
+                        Some(explicit_eff) => {
+                            if explicit_eff != catalog_effort && self.effort_conflict.is_none() {
+                                self.effort_conflict = Some(format!(
+                                    "explicit stream effort/variant `{explicit_eff}` conflicts with Antigravity init catalog model `{init_model_raw}` encoded effort `{catalog_effort}`"
+                                ));
+                            }
+                        }
+                        None => {
+                            event_effort = Some(catalog_effort.to_string());
+                            event_effort_source =
+                                Some(EffortEvidenceSource::AntigravityCatalogModelVariant);
+                        }
+                    }
+                }
+            }
         }
+
+        self.record_observed_event_effort(event_effort.as_deref(), event_effort_source);
 
         // 3. Classify Init, Result, Tool, Progress, or Other.
         let is_init = is_init_event(obj, event_type, subtype);
@@ -490,6 +602,34 @@ impl NdjsonStreamParser {
         }
     }
 
+    fn record_observed_event_effort(
+        &mut self,
+        event_effort: Option<&str>,
+        event_effort_source: Option<EffortEvidenceSource>,
+    ) {
+        let Some(effort) = event_effort else {
+            return;
+        };
+        match &self.observed_effort {
+            None => {
+                self.observed_effort = Some(effort.to_string());
+                self.observed_effort_source = event_effort_source;
+            }
+            Some(prev) if prev != effort => {
+                if self.effort_conflict.is_none() {
+                    self.effort_conflict = Some(format!(
+                        "conflicting effort/variant values observed in stream: `{prev}` vs `{effort}`"
+                    ));
+                }
+            }
+            Some(_) => {
+                if event_effort_source == Some(EffortEvidenceSource::DirectStreamMetadata) {
+                    self.observed_effort_source = Some(EffortEvidenceSource::DirectStreamMetadata);
+                }
+            }
+        }
+    }
+
     fn retain_event(
         &mut self,
         event: NormalizedWorkerEvent,
@@ -510,7 +650,17 @@ impl NdjsonStreamParser {
     }
 
     /// Finalizes stream parsing and computes requested-vs-observed evidence verification.
-    pub fn finalize(self) -> StreamEvidenceSummary {
+    pub fn finalize(mut self) -> StreamEvidenceSummary {
+        if self.observed_effort_source == Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
+            && self.model_conflict.is_some()
+            && self.effort_conflict.is_none()
+        {
+            self.effort_conflict = Some(
+                "cannot verify Antigravity catalog model effort when stream reported conflicting models"
+                    .to_string(),
+            );
+        }
+
         let model_evidence = evaluate_model_evidence(
             &self.requested_model,
             self.observed_model.as_deref(),
@@ -521,6 +671,11 @@ impl NdjsonStreamParser {
             self.observed_effort.as_deref(),
             self.effort_conflict.as_deref(),
         );
+        let effort_evidence_source = if self.effort_conflict.is_none() {
+            self.observed_effort_source
+        } else {
+            None
+        };
         let session_evidence = evaluate_session_evidence(
             self.requested_session_id.as_deref(),
             self.observed_session_id.as_deref(),
@@ -536,6 +691,7 @@ impl NdjsonStreamParser {
             saw_result_event: self.saw_result_event,
             model_evidence,
             effort_evidence,
+            effort_evidence_source,
             session_evidence,
             observed_session_id: self.observed_session_id,
             provider_errors: self.provider_errors,
@@ -701,127 +857,179 @@ fn extract_session_id(obj: &Map<String, Value>) -> Option<String> {
     None
 }
 
+fn is_tool_event(
+    obj: &Map<String, Value>,
+    event_type: &str,
+    subtype: Option<&str>,
+    has_tool_name: bool,
+) -> bool {
+    let et = event_type.to_ascii_lowercase();
+    let st = subtype.unwrap_or("").to_ascii_lowercase();
+    if matches!(
+        et.as_str(),
+        "tool" | "tool_use" | "tool_result" | "tool_call"
+    ) || matches!(
+        st.as_str(),
+        "tool" | "tool_use" | "tool_result" | "tool_call"
+    ) || obj.contains_key("tool_use")
+        || obj.contains_key("tool_result")
+    {
+        return true;
+    }
+
+    !matches!(
+        et.as_str(),
+        "init" | "result" | "system" | "step_start" | "step_finish" | "session"
+    ) && (has_tool_name || st.contains("tool"))
+}
+
+fn is_structured_antigravity_init_event(obj: &Map<String, Value>, subtype: Option<&str>) -> bool {
+    if obj.get("event").and_then(Value::as_str) != Some("init") {
+        return false;
+    }
+    if obj
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|t| t != "init")
+    {
+        return false;
+    }
+    if subtype.is_some_and(|s| !s.is_empty() && s != "init") {
+        return false;
+    }
+    let Some(init_obj) = obj.get("init").and_then(Value::as_object) else {
+        return false;
+    };
+    !has_object_error_field(init_obj) && init_obj.get("is_error") != Some(&Value::Bool(true))
+}
+
 fn extract_model_and_effort(
     obj: &Map<String, Value>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let raw_model_str = obj
-        .get("model")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            obj.get("init")
-                .and_then(Value::as_object)
-                .and_then(|i| i.get("model"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            obj.get("result")
-                .and_then(Value::as_object)
-                .and_then(|r| r.get("model"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            obj.get("step_update")
-                .and_then(Value::as_object)
-                .and_then(|s| s.get("model"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            obj.get("message")
-                .and_then(Value::as_object)
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            obj.get("part")
-                .and_then(Value::as_object)
-                .and_then(|p| p.get("model"))
-                .and_then(Value::as_str)
-        })
-        .or_else(|| {
-            obj.get("metadata")
-                .and_then(Value::as_object)
-                .and_then(|m| m.get("model"))
-                .and_then(Value::as_str)
-        })
-        .map(str::to_string)
-        .or_else(|| extract_provider_plus_model_id(obj))
-        .or_else(|| {
-            obj.get("init")
-                .and_then(Value::as_object)
-                .and_then(extract_provider_plus_model_id)
-        })
-        .or_else(|| {
-            obj.get("part")
-                .and_then(Value::as_object)
-                .and_then(extract_provider_plus_model_id)
-        })
-        .or_else(|| {
-            obj.get("model")
-                .and_then(Value::as_object)
-                .and_then(extract_provider_plus_model_id)
-        });
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let model_sources: [Option<String>; 10] = [
+        obj.get("model").and_then(Value::as_str).map(str::to_string),
+        obj.get("init")
+            .and_then(Value::as_object)
+            .and_then(|i| i.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        obj.get("result")
+            .and_then(Value::as_object)
+            .and_then(|r| r.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        obj.get("step_update")
+            .and_then(Value::as_object)
+            .and_then(|s| s.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        obj.get("message")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        obj.get("part")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        obj.get("metadata")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        extract_provider_plus_model_id(obj),
+        obj.get("init")
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
+        obj.get("part")
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id)
+            .or_else(|| {
+                obj.get("model")
+                    .and_then(Value::as_object)
+                    .and_then(extract_provider_plus_model_id)
+            }),
+    ];
 
-    let explicit_effort = extract_explicit_effort(obj)
-        .or_else(|| {
-            obj.get("init")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        })
-        .or_else(|| {
-            obj.get("result")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        })
-        .or_else(|| {
-            obj.get("step_update")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        })
-        .or_else(|| {
-            obj.get("part")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        })
-        .or_else(|| {
-            obj.get("message")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        })
-        .or_else(|| {
-            obj.get("metadata")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        })
-        .or_else(|| {
-            obj.get("model")
-                .and_then(Value::as_object)
-                .and_then(extract_explicit_effort)
-        });
+    let mut base_model: Option<String> = None;
+    let mut inline_effort: Option<String> = None;
+    let mut model_conflict: Option<String> = None;
+    let mut effort_conflict: Option<String> = None;
 
-    let mut base_model = None;
-    let mut inline_effort = None;
-
-    if let Some(raw_m) = raw_model_str {
+    for raw_m in model_sources.into_iter().flatten() {
         let trimmed = raw_m.trim();
-        if !trimmed.is_empty() {
-            if let Some((base, variant)) = trimmed.split_once('#') {
-                if !base.is_empty() {
-                    base_model = Some(sanitize_and_redact(base, 128));
+        if trimmed.is_empty() {
+            continue;
+        }
+        let (cand_base, cand_inline) = match trimmed.split_once('#') {
+            Some((base, variant)) => (
+                (!base.is_empty()).then(|| sanitize_and_redact(base, 128)),
+                (!variant.is_empty()).then(|| sanitize_and_redact(variant, 128)),
+            ),
+            None => (Some(sanitize_and_redact(trimmed, 128)), None),
+        };
+        if let Some(cb) = cand_base {
+            match &base_model {
+                None => base_model = Some(cb),
+                Some(prev) if prev != &cb && model_conflict.is_none() => {
+                    model_conflict = Some(format!(
+                        "conflicting models observed on event: `{prev}` vs `{cb}`"
+                    ));
                 }
-                if !variant.is_empty() {
-                    inline_effort = Some(sanitize_and_redact(variant, 128));
+                _ => {}
+            }
+        }
+        if let Some(ci) = cand_inline {
+            match &inline_effort {
+                None => inline_effort = Some(ci),
+                Some(prev) if prev != &ci && effort_conflict.is_none() => {
+                    effort_conflict = Some(format!(
+                        "conflicting inline model variants observed on event: `{prev}` vs `{ci}`"
+                    ));
                 }
-            } else {
-                base_model = Some(sanitize_and_redact(trimmed, 128));
+                _ => {}
             }
         }
     }
 
-    let mut conflict = None;
+    let explicit_effort_scopes = [
+        Some(obj),
+        obj.get("init").and_then(Value::as_object),
+        obj.get("result").and_then(Value::as_object),
+        obj.get("step_update").and_then(Value::as_object),
+        obj.get("part").and_then(Value::as_object),
+        obj.get("message").and_then(Value::as_object),
+        obj.get("metadata").and_then(Value::as_object),
+        obj.get("model").and_then(Value::as_object),
+    ];
+
+    let mut explicit_effort: Option<String> = None;
+    for exp_cand in explicit_effort_scopes
+        .into_iter()
+        .flatten()
+        .flat_map(extract_explicit_efforts)
+    {
+        match &explicit_effort {
+            None => explicit_effort = Some(exp_cand),
+            Some(prev) if prev != &exp_cand && effort_conflict.is_none() => {
+                effort_conflict = Some(format!(
+                    "conflicting explicit effort/variant values observed on event: `{prev}` vs `{exp_cand}`"
+                ));
+            }
+            _ => {}
+        }
+    }
+
     let resolved_effort = match (inline_effort, explicit_effort) {
         (Some(inl), Some(exp)) => {
-            if inl != exp {
-                conflict = Some(format!(
+            if inl != exp && effort_conflict.is_none() {
+                effort_conflict = Some(format!(
                     "inline model variant `{inl}` conflicts with explicit event effort/variant `{exp}`"
                 ));
             }
@@ -832,7 +1040,7 @@ fn extract_model_and_effort(
         (None, None) => None,
     };
 
-    (base_model, resolved_effort, conflict)
+    (base_model, resolved_effort, model_conflict, effort_conflict)
 }
 
 fn extract_provider_plus_model_id(obj: &Map<String, Value>) -> Option<String> {
@@ -853,16 +1061,13 @@ fn extract_provider_plus_model_id(obj: &Map<String, Value>) -> Option<String> {
     Some(format!("{provider_id}/{model_id}"))
 }
 
-fn extract_explicit_effort(obj: &Map<String, Value>) -> Option<String> {
-    for key in ["effort", "variant", "reasoning_effort", "thinking_effort"] {
-        if let Some(val) = obj.get(key).and_then(Value::as_str) {
-            let trimmed = val.trim();
-            if !trimmed.is_empty() {
-                return Some(sanitize_and_redact(trimmed, 128));
-            }
-        }
-    }
-    None
+fn extract_explicit_efforts(obj: &Map<String, Value>) -> impl Iterator<Item = String> + '_ {
+    ["effort", "variant", "reasoning_effort", "thinking_effort"]
+        .into_iter()
+        .filter_map(|key| obj.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| sanitize_and_redact(value, 128))
 }
 
 fn extract_tool_name(obj: &Map<String, Value>) -> Option<String> {

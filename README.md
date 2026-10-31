@@ -120,6 +120,11 @@ The collector performs no session discovery, does not query IDs from model prose
 and keeps raw export content in memory. The missing-evidence gate remains in force,
 and CLI-reported metadata is not cloud attestation.
 
+Antigravity [catalog-variant evidence](docs/ANTIGRAVITY-EVIDENCE.md) verifies exact
+known concrete model IDs from structured CLI initialization, preserving the
+distinction between catalog selection and direct effort telemetry. Unknown IDs
+and contradictory metadata still fail the evidence gate.
+
 ---
 
 ## Protocol, Security, and Acknowledgement Model

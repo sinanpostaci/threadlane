@@ -1701,6 +1701,7 @@ mod tests {
                 effort_evidence: FieldEvidence::Missing {
                     requested: "max".to_string(),
                 },
+                effort_evidence_source: None,
                 session_evidence: FieldEvidence::VerifiedMatch {
                     value: "ses_owned_001".to_string(),
                 },

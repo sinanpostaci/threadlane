@@ -29,6 +29,8 @@
 //!   diffs (explicitly labeled as post-run evidence, not preventive OS sandboxing), and enforces
 //!   safe ownership-verified cleanup without `--force` or auto-merge/push.
 
+/// Versioned exact-match AGY catalog model variant metadata.
+pub mod antigravity_models;
 /// Narrow diagnostic CLI parser and command runner (`threadlane-worker`).
 pub mod cli;
 /// Sealed dependency input policy, manifest verification, and shared lock lease loader.
@@ -105,8 +107,9 @@ pub use spec::{
     MAX_PATH_ENTRY_LEN, MAX_PROMPT_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
 pub use stream::{
-    BlockedEvidence, BlockedKind, FieldEvidence, MalformedLineDiagnostic, NdjsonStreamParser,
-    NormalizedEventKind, NormalizedWorkerEvent, ProviderErrorEvidence, StreamEvidenceSummary,
+    BlockedEvidence, BlockedKind, EffortEvidenceSource, FieldEvidence, MalformedLineDiagnostic,
+    NdjsonStreamParser, NormalizedEventKind, NormalizedWorkerEvent, ProviderErrorEvidence,
+    StreamEvidenceSummary,
 };
 pub use supervisor::{
     is_process_alive, is_process_group_alive, run_worker, run_worker_with_cancel,

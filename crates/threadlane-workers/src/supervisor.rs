@@ -795,7 +795,8 @@ pub async fn run_worker_with_observer(
                     None
                 };
                 if let Some((abort_status, abort_code)) = pre_spawn_abort {
-                    let empty_parser = NdjsonStreamParser::new(
+                    let empty_parser = NdjsonStreamParser::new_for_provider(
+                        spec.provider,
                         validation.resolved_model.clone(),
                         effective_session_id,
                         spec.budgets.max_events,
@@ -831,7 +832,8 @@ pub async fn run_worker_with_observer(
                 let status = map_collector_error_to_run_status(alloc_err);
                 let cleanup_incomplete =
                     matches!(alloc_err, OpenCodeCollectorError::CleanupIncomplete);
-                let empty_parser = NdjsonStreamParser::new(
+                let empty_parser = NdjsonStreamParser::new_for_provider(
+                    spec.provider,
                     validation.resolved_model.clone(),
                     spec.session_id.clone(),
                     spec.budgets.max_events,
@@ -918,8 +920,12 @@ pub async fn run_worker_with_observer(
 
     let mut stdout_handle = tokio::spawn(drain_stdout_incremental(
         stdout_pipe,
-        validation.resolved_model.clone(),
-        effective_session_id.clone(),
+        NdjsonStreamParser::new_for_provider(
+            spec.provider,
+            validation.resolved_model.clone(),
+            effective_session_id.clone(),
+            spec.budgets.max_events,
+        ),
         spec.budgets.clone(),
         overflow_tx.clone(),
         drain_stop_rx.clone(),
@@ -1003,7 +1009,8 @@ pub async fn run_worker_with_observer(
         Err(_) => {
             stdout_handle.abort();
             cleanup_incomplete = true;
-            let empty_parser = NdjsonStreamParser::new(
+            let empty_parser = NdjsonStreamParser::new_for_provider(
+                spec.provider,
                 validation.resolved_model.clone(),
                 effective_session_id,
                 spec.budgets.max_events,
@@ -1153,8 +1160,7 @@ fn ingest_and_observe_line(
 
 async fn drain_stdout_incremental(
     mut reader: tokio::process::ChildStdout,
-    requested_model: ResolvedModelTarget,
-    requested_session_id: Option<String>,
+    mut parser: NdjsonStreamParser,
     budgets: ExecutionBudgets,
     overflow_tx: mpsc::UnboundedSender<OutputOverflowKind>,
     mut drain_stop_rx: watch::Receiver<bool>,
@@ -1162,8 +1168,6 @@ async fn drain_stdout_incremental(
 ) -> StdoutDrainOutput {
     let max_line_bytes = budgets.max_line_bytes;
     let max_stdout_bytes = budgets.max_stdout_bytes;
-    let mut parser =
-        NdjsonStreamParser::new(requested_model, requested_session_id, budgets.max_events);
     let mut total_bytes: usize = 0;
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096.min(max_line_bytes));
     let mut chunk = [0u8; 4096];

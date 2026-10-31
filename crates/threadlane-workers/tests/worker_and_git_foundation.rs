@@ -1215,18 +1215,21 @@ printf '{"event":"result","result":{"conversation_id":"fixture-session","status"
             value: "gemini-4-argon-high".to_string(),
         }
     );
-    // Effort is not emitted by the real AGY schema; must retain Missing honestly without synthesizing.
+    // AGY reports its known concrete catalog variant, not independent reasoning telemetry.
     assert_eq!(
         report.evidence.effort_evidence,
-        FieldEvidence::Missing {
-            requested: "high".to_string(),
+        FieldEvidence::VerifiedMatch {
+            value: "high".to_string(),
         }
     );
-    assert_eq!(report.status, WorkerRunStatus::MissingEffortEvidence);
-    assert!(report.status.is_completed_pending_effort_evidence());
+    assert_eq!(
+        report.evidence.effort_evidence_source,
+        Some(threadlane_workers::EffortEvidenceSource::AntigravityCatalogModelVariant)
+    );
+    assert_eq!(report.status, WorkerRunStatus::Succeeded);
+    assert!(!report.status.is_completed_pending_effort_evidence());
 
-    // Running via `execute_worker_task` separates `FinishedNeedsEvidenceAndReview` from
-    // `RejectedByWorkerOutcome` and from `DiffGatePassedPendingReview`.
+    // A successful execution and clean scope still require explicit review before acceptance.
     let (_cancel_tx, mut cancel_rx) = watch::channel(false);
     let task_report = execute_worker_task(&spec, "real-agy", "task-1", None, &mut cancel_rx)
         .await
@@ -1234,7 +1237,7 @@ printf '{"event":"result","result":{"conversation_id":"fixture-session","status"
     assert!(task_report.diff_gate.passed);
     assert_eq!(
         task_report.overall_acceptance_state,
-        WorkAcceptanceState::FinishedNeedsEvidenceAndReview
+        WorkAcceptanceState::DiffGatePassedPendingReview
     );
 
     // 2. Real AGY `result` with `denied_actions` even when `status: "SUCCESS"` and `response: ""`
@@ -1303,7 +1306,7 @@ printf '{"event":"result","result":{"conversation_id":"fixture-session","status"
     assert!(rec_report.evidence.provider_errors.is_empty());
     assert!(rec_report.evidence.saw_init_event);
     assert!(rec_report.evidence.saw_result_event);
-    assert_eq!(rec_report.status, WorkerRunStatus::MissingEffortEvidence);
+    assert_eq!(rec_report.status, WorkerRunStatus::Succeeded);
 }
 
 #[test]
@@ -2610,7 +2613,7 @@ sleep 30
 }
 
 #[tokio::test]
-async fn none_observer_preserves_behavior_zero_live_drops_and_argon_missing_effort() {
+async fn none_observer_preserves_behavior_zero_live_drops_and_unknown_agy_missing_effort() {
     let env = TestEnv::new();
     let workdir = env.root_dir.join("none-observer-dir");
     fs::create_dir_all(&workdir).expect("create workdir");
@@ -2651,18 +2654,20 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
         serde_json::from_value(json_val).expect("deserialize legacy report without field");
     assert_eq!(deserialized.dropped_live_events, 0);
 
-    // 3. Existing Argon missing-effort stream schema remains `MissingEffortEvidence` /
+    // 3. Unknown AGY model variants remain `MissingEffortEvidence` /
     // `FinishedNeedsEvidenceAndReview` both with `Some(progress_tx)` and `None`.
     let argon_missing_effort_bin = env.write_fake_executable(
         "argon-missing-effort-obs",
         r#"
 printf 'pub fn argon_obs_check() {}\n' >> crates/threadlane-workers/src/lib.rs
-printf '{"event":"init","conversation_id":"s-argon","init":{"model":"gemini-4-argon-high","cwd":"/canonical/worktree","permission_mode":"accept-edits"}}\n'
+printf '{"event":"init","conversation_id":"s-argon","init":{"model":"future-argon-high","cwd":"/canonical/worktree","permission_mode":"accept-edits"}}\n'
 printf '{"event":"step_update","step_update":{"conversation_id":"s-argon","step_index":1,"state":"DONE","step_type":"agent_response","usage":{}}}\n'
 printf '{"event":"result","result":{"conversation_id":"s-argon","status":"SUCCESS","response":"Completed","num_turns":1}}\n'
 "#,
     );
-    let argon_spec = env.antigravity_spec(argon_missing_effort_bin, "Argon missing effort check");
+    let mut argon_spec = env.antigravity_spec(argon_missing_effort_bin, "Unknown AGY effort check");
+    argon_spec.model = "future-argon-high".to_string();
+    argon_spec.allowed_models = BTreeSet::from([argon_spec.model.clone()]);
     let (argon_tx, mut argon_rx) = mpsc::channel(8);
     let argon_task_report = execute_worker_task_with_observer(
         &argon_spec,

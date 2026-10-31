@@ -631,6 +631,15 @@ pub fn resolve_model_target(
                 )
             })?;
             validate_simple_identifier(effort, "effort")?;
+            if let Some(catalog_effort) =
+                crate::antigravity_models::antigravity_catalog_effort(model)
+            {
+                if effort != catalog_effort {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "Antigravity model `{model}` encodes catalog effort `{catalog_effort}` which conflicts with explicit effort `{effort}`"
+                    )));
+                }
+            }
             Ok(ResolvedModelTarget {
                 base_model: model.to_string(),
                 effort: Some(effort.to_string()),
