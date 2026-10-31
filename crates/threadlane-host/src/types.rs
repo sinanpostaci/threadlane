@@ -57,6 +57,60 @@ pub const APPROVED_EVENT_BATCH_MAX_EVENTS: usize = 20;
 /// Maximum serialized JSON byte budget (`49_152` bytes / `48 KiB`) for [`crate::ApprovedHostClient::pull_events`].
 pub const APPROVED_EVENT_BATCH_MAX_BYTES: usize = 49_152;
 
+/// Route for software-owned approved-session wake-up notification messages.
+///
+/// Controls only the fixed software-owned guidance text passed to the configured Codex
+/// executable (`queue --thread <THREAD_UUID> --message <FIXED_WAKEUP_TEXT>`) when
+/// approved-session notifications are explicitly enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostNotificationRoute {
+    /// Default MCP-oriented wake-up message (`approved_pull_events` / `approved_ack_events`).
+    #[default]
+    Mcp,
+    /// Native operator CLI wake-up message (`threadlane-session pull` / `threadlane-session ack`).
+    OperatorCli,
+}
+
+impl HostNotificationRoute {
+    /// Returns the canonical `snake_case` wire identifier (`"mcp"` or `"operator_cli"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::OperatorCli => "operator_cli",
+        }
+    }
+
+    /// Returns `true` when this route is the default [`HostNotificationRoute::Mcp`] variant.
+    ///
+    /// Used by `#[serde(skip_serializing_if = ...)]` on [`HostNotificationSummary::route`] so
+    /// disabled and default-MCP summaries remain byte-for-byte compatible with legacy manifests.
+    pub const fn is_default_mcp(&self) -> bool {
+        matches!(self, Self::Mcp)
+    }
+}
+
+impl std::fmt::Display for HostNotificationRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for HostNotificationRoute {
+    type Err = HostError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "mcp" => Ok(Self::Mcp),
+            "operator-cli" | "operator_cli" => Ok(Self::OperatorCli),
+            _ => Err(HostError::validation(
+                "notify_route",
+                format!("invalid notification route `{raw}`: expected `mcp` or `operator-cli`"),
+            )),
+        }
+    }
+}
+
 /// Explicit opt-in configuration for approved-session Codex wake-up notifications on [`crate::ApprovedHost`].
 ///
 /// Disabled by default. When configured, the executable path is canonicalized and validated as an
@@ -67,6 +121,8 @@ pub struct ApprovedHostNotificationConfig {
     pub executable: PathBuf,
     /// Bounded timeout in milliseconds (`1..=MAX_CODEX_TIMEOUT_MS`) for each Codex queue invocation.
     pub timeout_ms: u64,
+    /// Fixed software-owned notification message route (defaults to [`HostNotificationRoute::Mcp`]).
+    pub route: HostNotificationRoute,
 }
 
 impl ApprovedHostNotificationConfig {
@@ -131,7 +187,14 @@ impl ApprovedHostNotificationConfig {
         Ok(Self {
             executable: validated,
             timeout_ms,
+            route: HostNotificationRoute::Mcp,
         })
+    }
+
+    /// Sets the [`HostNotificationRoute`] for this notification configuration.
+    pub fn with_route(mut self, route: HostNotificationRoute) -> Self {
+        self.route = route;
+        self
     }
 
     /// Returns a safe, path-free [`HostNotificationSummary`] where `executable_digest` is the
@@ -153,6 +216,7 @@ impl ApprovedHostNotificationConfig {
             enabled: true,
             executable_digest: Some(hex),
             timeout_ms: Some(self.timeout_ms),
+            route: self.route,
         }
     }
 }
@@ -171,28 +235,36 @@ pub struct HostNotificationSummary {
     pub executable_digest: Option<String>,
     /// Bounded timeout in milliseconds (`1..=MAX_CODEX_TIMEOUT_MS`) when `enabled` is `true`; `None` when disabled.
     pub timeout_ms: Option<u64>,
+    /// Notification message route (`mcp` by default; omitted on serialization when `mcp` for legacy wire compatibility).
+    #[serde(default, skip_serializing_if = "HostNotificationRoute::is_default_mcp")]
+    pub route: HostNotificationRoute,
 }
 
 impl HostNotificationSummary {
-    /// Returns the default disabled notification summary (`enabled: false`, no digest or timeout).
+    /// Returns the default disabled notification summary (`enabled: false`, no digest or timeout, `route: Mcp`).
     pub const fn disabled() -> Self {
         Self {
             enabled: false,
             executable_digest: None,
             timeout_ms: None,
+            route: HostNotificationRoute::Mcp,
         }
     }
 
     /// Validates internal field consistency of this [`HostNotificationSummary`]:
-    /// - When `enabled == false`, both `executable_digest` and `timeout_ms` must be `None`.
+    /// - When `enabled == false`, both `executable_digest` and `timeout_ms` must be `None` and
+    ///   `route` must be [`HostNotificationRoute::Mcp`].
     /// - When `enabled == true`, `executable_digest` must be a valid 64-char lowercase hex SHA-256
     ///   digest and `timeout_ms` must be in `1..=MAX_CODEX_TIMEOUT_MS`.
     pub fn validate(&self) -> Result<(), HostError> {
         if !self.enabled {
-            if self.executable_digest.is_some() || self.timeout_ms.is_some() {
+            if self.executable_digest.is_some()
+                || self.timeout_ms.is_some()
+                || self.route != HostNotificationRoute::Mcp
+            {
                 return Err(HostError::validation(
                     "notifications",
-                    "disabled notifications summary must have executable_digest=None and timeout_ms=None",
+                    "disabled notifications summary must have executable_digest=None, timeout_ms=None, and route=mcp",
                 ));
             }
             return Ok(());

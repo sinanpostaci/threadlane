@@ -36,3 +36,13 @@ current milestone contract before editing.
   runs commands if the implementation agent cannot do so in its environment.
 - Test stale revisions, duplicate requests, recovery and isolation, not just happy
   path serialization. Do not weaken a test to accommodate a broken implementation.
+
+## Native conversation workflow
+
+- When the operator supplies a private Threadlane context, use
+  `threadlane-workflow` for plans and `threadlane-session` for approved tasks and
+  events. Read `docs/NATIVE-OPERATOR.md`; preserve the supplied store/binding scope.
+- Existing approval, host startup and review/integration steps stay explicit.
+  A context, CLI flag or worker response is not new human authorization.
+- Do not start a second Codex app-server or install a universal fixed-binding MCP
+  configuration to work around unavailable native routing.

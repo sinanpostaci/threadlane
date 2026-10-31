@@ -22,9 +22,9 @@ use crate::storage::{
     write_host_manifest, HostSessionLock,
 };
 use crate::types::{
-    ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationSummary, HostPhase,
-    HostSessionManifest, HostSessionSummary, HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR,
-    WORK_AREA_SUBDIR,
+    ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationRoute,
+    HostNotificationSummary, HostPhase, HostSessionManifest, HostSessionSummary,
+    HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 
 /// Default supervisor tick interval (`50ms`) used by [`ApprovedHostConfig`].
@@ -249,10 +249,10 @@ impl ApprovedHost {
         validate_approval_id(approval_id)?;
 
         let validated_notifications = match notifications {
-            Some(cfg) => Some(ApprovedHostNotificationConfig::new(
-                cfg.executable,
-                cfg.timeout_ms,
-            )?),
+            Some(cfg) => Some(
+                ApprovedHostNotificationConfig::new(cfg.executable, cfg.timeout_ms)?
+                    .with_route(cfg.route),
+            ),
             None => None,
         };
         let notify_summary = validated_notifications
@@ -438,10 +438,10 @@ impl ApprovedHost {
         validate_host_instance_id("expected_prior_instance_id", expected_prior_instance_id)?;
 
         let validated_notifications = match notifications {
-            Some(cfg) => Some(ApprovedHostNotificationConfig::new(
-                cfg.executable,
-                cfg.timeout_ms,
-            )?),
+            Some(cfg) => Some(
+                ApprovedHostNotificationConfig::new(cfg.executable, cfg.timeout_ms)?
+                    .with_route(cfg.route),
+            ),
             None => None,
         };
         let notify_summary = validated_notifications
@@ -755,7 +755,11 @@ impl ApprovedHost {
 
         let final_codex = match notifications {
             Some(notify_cfg) => {
-                let approved_ctx = ApprovedSessionWakeupContext::new(record.approval_id.clone())?;
+                let mut approved_ctx =
+                    ApprovedSessionWakeupContext::new(record.approval_id.clone())?;
+                if matches!(notify_cfg.route, HostNotificationRoute::OperatorCli) {
+                    approved_ctx = approved_ctx.with_operator_cli_route();
+                }
                 let codex_cfg = CodexWakeupConfig {
                     executable: notify_cfg.executable.clone(),
                     notify_bindings: BTreeSet::from([session_binding.binding_id.clone()]),

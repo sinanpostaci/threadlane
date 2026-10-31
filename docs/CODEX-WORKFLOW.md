@@ -2,13 +2,14 @@
 
 Native Codex is the everyday conversation surface. The user plans, asks
 questions, approves the intended work and changes direction there. The Codex
-follower translates those decisions into explicit, versioned MCP requests.
+follower translates those decisions into explicit, versioned requests through
+the paired MCP interface or the [trusted local operator commands](NATIVE-OPERATOR.md).
 Threadlane supervises validated execution and retains correlated progress and
 results. The desktop window is an optional view for settings, observation and
 intervention; it is not intended to be a per-task form.
 
 Threadlane does not monitor keystrokes or silently interpret the conversation.
-The follower submits the relevant decision through MCP. A question does not
+The follower explicitly submits the relevant decision. A question does not
 change a published plan. A changed scope or model assignment requires a new
 validated revision and its appropriate trusted approval.
 

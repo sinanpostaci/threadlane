@@ -17,6 +17,14 @@ path = "src/bin/threadlane-native-probe.rs"
 name = "threadlane-approve"
 path = "src/bin/threadlane-approve.rs"
 
+[[bin]]
+name = "threadlane-workflow"
+path = "src/bin/threadlane-workflow.rs"
+
+[[bin]]
+name = "threadlane-session"
+path = "src/bin/threadlane-session.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"

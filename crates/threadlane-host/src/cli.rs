@@ -16,7 +16,7 @@ use crate::storage::{
 };
 use crate::types::{
     ApprovedHostNotificationConfig, DependencyInputSummary, DependencyPredecessorSelection,
-    PrepareDependencyInputsRequest,
+    HostNotificationRoute, PrepareDependencyInputsRequest,
 };
 
 const MAX_PREDECESSORS_FILE_BYTES: usize = 65_536;
@@ -116,6 +116,10 @@ pub struct ServeArgs {
     #[arg(long = "notify-timeout-ms")]
     pub notify_timeout_ms: Option<u64>,
 
+    /// Optional fixed notification message route (`mcp` or `operator-cli`, valid only with `--notify-codex`).
+    #[arg(long = "notify-route", value_parser = parse_notify_route)]
+    pub notify_route: Option<HostNotificationRoute>,
+
     /// Optional expected prior stopped host instance identifier (`hst_<32hex>`) to restart cleanly via `ApprovedHost::restart_stopped`.
     #[arg(long = "restart-from-instance-id")]
     pub restart_from_instance_id: Option<String>,
@@ -128,6 +132,11 @@ pub struct ServeArgs {
         conflicts_with = "restart_from_instance_id"
     )]
     pub start_fresh_only: bool,
+}
+
+fn parse_notify_route(raw: &str) -> Result<HostNotificationRoute, String> {
+    raw.parse::<HostNotificationRoute>()
+        .map_err(|err| err.to_string())
 }
 
 impl ServeArgs {
@@ -152,17 +161,26 @@ impl ServeArgs {
             self.approval_id,
         );
 
-        match (self.notify_codex, self.notify_timeout_ms) {
-            (None, None) => {}
-            (None, Some(_)) => {
-                return Err(HostError::validation(
-                    "notify_timeout_ms",
-                    "`--notify-timeout-ms` cannot be used without `--notify-codex <ABS_EXEC>`",
-                ));
+        match self.notify_codex {
+            None => {
+                if self.notify_timeout_ms.is_some() {
+                    return Err(HostError::validation(
+                        "notify_timeout_ms",
+                        "`--notify-timeout-ms` cannot be used without `--notify-codex <ABS_EXEC>`",
+                    ));
+                }
+                if self.notify_route.is_some() {
+                    return Err(HostError::validation(
+                        "notify_route",
+                        "`--notify-route` cannot be used without `--notify-codex <ABS_EXEC>`",
+                    ));
+                }
             }
-            (Some(executable), timeout_opt) => {
-                let timeout_ms = timeout_opt.unwrap_or(DEFAULT_CODEX_TIMEOUT_MS);
-                let notify_cfg = ApprovedHostNotificationConfig::new(executable, timeout_ms)?;
+            Some(executable) => {
+                let timeout_ms = self.notify_timeout_ms.unwrap_or(DEFAULT_CODEX_TIMEOUT_MS);
+                let route = self.notify_route.unwrap_or(HostNotificationRoute::Mcp);
+                let notify_cfg =
+                    ApprovedHostNotificationConfig::new(executable, timeout_ms)?.with_route(route);
                 config = config.with_notifications(notify_cfg);
             }
         }

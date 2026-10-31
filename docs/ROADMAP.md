@@ -44,6 +44,17 @@ cross-platform support remain in scope. Staging work must not erase those goals.
 
 ## Current checkpoint
 
+The [native operator commands](NATIVE-OPERATOR.md) expose existing scoped plan
+and approved-session operations to a trusted local caller. They preserve human
+scope approval, explicit host startup and review acceptance. This route does not
+require a desktop form or native MCP connection and does not establish native
+per-call identity or automatic same-project two-chat routing.
+
+The same operator route provides explicit owner/instance-scoped idle stop and
+truthful stopped-session inspection. An opt-in
+[CLI notification route](NATIVE-OPERATOR-NOTIFICATIONS.md) uses a fixed message
+through the existing Codex queue, with no shell adapter or worker prose.
+
 Milestone 1's deterministic native conversation loop and Milestone 2A's bounded
 history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker
 library and diagnostic CLI provide provider evidence parsing, bounded process

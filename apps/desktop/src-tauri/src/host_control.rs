@@ -775,11 +775,7 @@ fn requested_notification_summary(
 ) -> HostNotificationSummary {
     match selection {
         Some(selection) => selection.config.summary(),
-        None => HostNotificationSummary {
-            enabled: false,
-            executable_digest: None,
-            timeout_ms: None,
-        },
+        None => HostNotificationSummary::disabled(),
     }
 }
 
@@ -3094,11 +3090,7 @@ mod tests {
         )
         .expect("config a");
         let requested = config_a.summary();
-        let disabled = HostNotificationSummary {
-            enabled: false,
-            executable_digest: None,
-            timeout_ms: None,
-        };
+        let disabled = HostNotificationSummary::disabled();
         assert_eq!(
             verify_notification_policy_on_attach(&disabled, &requested)
                 .unwrap_err()
@@ -3111,6 +3103,7 @@ mod tests {
             enabled: true,
             executable_digest: requested.executable_digest.clone(),
             timeout_ms: Some(1),
+            ..requested.clone()
         };
         assert_eq!(
             verify_notification_policy_on_attach(&changed_timeout, &requested)

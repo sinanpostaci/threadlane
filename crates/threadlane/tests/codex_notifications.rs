@@ -88,13 +88,15 @@ async fn test_approved_session_wakeup_exact_argv_coalescing_ack_release_and_time
     fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
 
     // Verify `CodexWakeupConfig::validate()` rejects invalid `approved_session`.
+    let mut invalid_context =
+        ApprovedSessionWakeupContext::new("apr_0123456789abcdef0123456789abcdef")
+            .expect("valid initial context");
+    invalid_context.approval_id = "apr_UPPERCASE".to_string();
     let bad_cfg = CodexWakeupConfig {
         executable: fake_codex.clone(),
         notify_bindings: BTreeSet::from(["bnd_1".to_string()]),
         timeout: Duration::from_millis(1_000),
-        approved_session: Some(ApprovedSessionWakeupContext {
-            approval_id: "apr_UPPERCASE".to_string(),
-        }),
+        approved_session: Some(invalid_context),
     };
     assert!(matches!(bad_cfg.validate(), Err(Error::InvalidConfig(_))));
 

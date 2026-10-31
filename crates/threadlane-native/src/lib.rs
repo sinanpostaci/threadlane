@@ -35,6 +35,8 @@ pub mod fs_safety;
 pub mod host_launcher;
 /// Paired MCP stdio server delegating to [`threadlane::ThreadlaneMcpServer`] after enrollment.
 pub mod mcp_pair;
+/// Common validation, live-binding verification, and bounded I/O helpers for trusted local operator CLIs.
+pub mod operator_cli;
 /// Private operator connection-epoch pairing store and verification gate types.
 pub mod pairing;
 /// Bounded newline-delimited JSON-RPC proxy session and Unix process-group cleanup.
