@@ -743,6 +743,14 @@ fn validate_model_choice(
     Ok(())
 }
 
+/// Validates an opaque registry identifier using the canonical registry bounds.
+///
+/// Provider-qualified identifiers may contain `/`; these values are exact lookup
+/// keys, never filesystem paths or workflow operation identifiers.
+pub fn validate_registry_identifier(value: &str) -> Result<(), RegistryError> {
+    validate_identifier(value)
+}
+
 fn validate_identifier(value: &str) -> Result<(), RegistryError> {
     validate_bounded_text(value, MAX_ID_LEN)
 }

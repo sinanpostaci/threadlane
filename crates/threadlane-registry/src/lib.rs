@@ -19,7 +19,7 @@ mod store;
 mod types;
 
 pub use error::RegistryError;
-pub use store::{resolve_choice, RegistryStore};
+pub use store::{resolve_choice, validate_registry_identifier, RegistryStore};
 pub use types::{
     Difficulty, ModelChoice, ModelDefinition, RegistryChange, RegistrySnapshot, RoleAssignment,
     ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole, MAX_ASSIGNMENTS_PER_PROFILE,

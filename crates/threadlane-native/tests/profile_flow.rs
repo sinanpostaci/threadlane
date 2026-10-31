@@ -1251,3 +1251,37 @@ fn preflight_from_store_does_not_recreate_deleted_registry_lock() {
     assert_eq!(before_bytes, after_bytes);
     assert_eq!(before_registry_entries, after_registry_entries);
 }
+
+#[test]
+fn provider_qualified_registry_ids_remain_exact_policy_keys() {
+    let mut snapshot = worker_target_snapshot(
+        "tool-oc",
+        ToolAdapter::OpencodeV2,
+        "opencode-go/deepseek-v4.1-flash",
+        &["max"],
+        false,
+        Some("max"),
+    );
+    let id = "opencode-go/deepseek-v4.1-flash";
+    snapshot.models[0].id = id.to_string();
+    snapshot.profiles[0].assignments[0].choice.model_id = id.to_string();
+    let mut policy = worker_target_policy("tool-oc", &["max"], false);
+    policy.allow_rules[0].model_id = id.to_string();
+    let report = preflight(&snapshot, &worker_target_request(), &policy)
+        .expect("provider-qualified model IDs use canonical registry validation");
+    assert!(report.ready);
+    assert_eq!(report.roles[0].selected.as_ref().unwrap().model_id, id);
+    policy.allow_rules[0].model_id = "other-provider/deepseek-v4.1-flash".to_string();
+    let blocked = preflight(&snapshot, &worker_target_request(), &policy)
+        .expect("different provider is a valid but unauthorized key");
+    assert!(!blocked.ready);
+    assert_eq!(
+        blocked.roles[0].block_reason,
+        Some(PreflightBlockReason::PolicyBlocked)
+    );
+    policy.allow_rules[0].model_id = "opencode-go/\ninvalid".to_string();
+    assert!(
+        policy.validate().is_err(),
+        "control characters remain forbidden"
+    );
+}

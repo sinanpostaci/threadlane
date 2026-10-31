@@ -45,7 +45,7 @@ pub use threadlane_plans::{
     compile_plan_revision, preview_draft_compilation, DeliveryReceipt, PlanChange, PlanError,
     PlanRevision, PlanStatus, PlanStore, PlanTask,
 };
-pub use threadlane_registry::resolve_choice;
+pub use threadlane_registry::{resolve_choice, validate_registry_identifier};
 pub use threadlane_registry::{
     Difficulty, ModelChoice, ModelDefinition, RegistryChange, RegistryError, RegistrySnapshot,
     RegistryStore, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,

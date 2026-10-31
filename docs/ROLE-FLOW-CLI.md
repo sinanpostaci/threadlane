@@ -21,8 +21,10 @@ scope, and does not grant approval. Scope approval remains the separate explicit
 `threadlane-approve` operation, and host startup remains the separate explicit
 `threadlane-host serve` operation.
 
-The CLI never selects a shell, executable, or child process from `PATH`. It starts
-no host, model, provider, worker, approval, review, merge, or push.
+The CLI never selects a shell, executable, or child process from `PATH`. It never
+automatically starts a host or grants approval, accepts a review, merges, or
+pushes. Only an explicit `handoff` can request dispatch of an already approved
+headless task through its already-running host.
 
 ## Fixed stores and flags
 

@@ -185,8 +185,8 @@ impl ExecutionPolicy {
         let mut canonical = Vec::with_capacity(self.allow_rules.len());
 
         for rule in &self.allow_rules {
-            validate_bounded_identifier(&rule.tool_id, "tool_id", MAX_REGISTRY_ID_LEN)?;
-            validate_bounded_identifier(&rule.model_id, "model_id", MAX_REGISTRY_ID_LEN)?;
+            validate_registry_id(&rule.tool_id, "tool_id")?;
+            validate_registry_id(&rule.model_id, "model_id")?;
 
             if rule.efforts.len() > MAX_REGISTRY_EFFORTS_PER_MODEL {
                 return Err(NativeError::new(
@@ -589,11 +589,7 @@ fn evaluate_role_request(
         ));
     };
 
-    validate_bounded_identifier(
-        &assignment.choice.model_id,
-        "assignment.choice.model_id",
-        MAX_REGISTRY_ID_LEN,
-    )?;
+    validate_registry_id(&assignment.choice.model_id, "assignment.choice.model_id")?;
     if let Some(ref effort) = assignment.choice.effort {
         validate_bounded_identifier(effort, "assignment.choice.effort", MAX_REGISTRY_EFFORT_LEN)?;
     }
@@ -796,7 +792,7 @@ fn blocked_outcome(
 
 fn validate_preflight_request(request: &PreflightRequest) -> Result<(), NativeError> {
     if let Some(ref explicit_profile_id) = request.profile_id {
-        validate_bounded_identifier(explicit_profile_id, "profile_id", MAX_REGISTRY_ID_LEN)?;
+        validate_registry_id(explicit_profile_id, "profile_id")?;
     }
 
     if request.roles.is_empty() {
@@ -852,7 +848,7 @@ fn validate_snapshot_header(snapshot: &RegistrySnapshot) -> Result<(), NativeErr
         ));
     }
     if let Some(ref default_id) = snapshot.default_profile_id {
-        validate_bounded_identifier(default_id, "default_profile_id", MAX_REGISTRY_ID_LEN)?;
+        validate_registry_id(default_id, "default_profile_id")?;
     }
     Ok(())
 }
@@ -860,7 +856,7 @@ fn validate_snapshot_header(snapshot: &RegistrySnapshot) -> Result<(), NativeErr
 fn validate_profile_structure(
     profile: &threadlane_workflow::WorkflowProfile,
 ) -> Result<(), NativeError> {
-    validate_bounded_identifier(&profile.id, "profile.id", MAX_REGISTRY_ID_LEN)?;
+    validate_registry_id(&profile.id, "profile.id")?;
     validate_registry_text_native(&profile.name, "profile.name", MAX_REGISTRY_LABEL_LEN)?;
     if profile.assignments.len() > MAX_PREFLIGHT_ROLES {
         return Err(NativeError::new(
@@ -878,8 +874,8 @@ fn validate_profile_structure(
 }
 
 fn validate_model_definition_structure(model: &ModelDefinition) -> Result<(), NativeError> {
-    validate_bounded_identifier(&model.id, "model.id", MAX_REGISTRY_ID_LEN)?;
-    validate_bounded_identifier(&model.tool_id, "model.tool_id", MAX_REGISTRY_ID_LEN)?;
+    validate_registry_id(&model.id, "model.id")?;
+    validate_registry_id(&model.tool_id, "model.tool_id")?;
     validate_registry_text_native(&model.label, "model.label", MAX_REGISTRY_LABEL_LEN)?;
     validate_registry_text_native(
         &model.model_arg,
@@ -906,7 +902,7 @@ fn validate_model_definition_structure(model: &ModelDefinition) -> Result<(), Na
 }
 
 fn validate_tool_definition_structure(tool: &ToolDefinition) -> Result<(), NativeError> {
-    validate_bounded_identifier(&tool.id, "tool.id", MAX_REGISTRY_ID_LEN)?;
+    validate_registry_id(&tool.id, "tool.id")?;
     validate_registry_text_native(&tool.label, "tool.label", MAX_REGISTRY_LABEL_LEN)?;
     Ok(())
 }
@@ -963,4 +959,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+fn validate_registry_id(value: &str, field: &str) -> Result<(), NativeError> {
+    threadlane_workflow::validate_registry_identifier(value).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("{field} failed canonical registry identifier validation"),
+        )
+    })
 }
