@@ -31,6 +31,7 @@ import {
   formatTaskIntegrationLifecycleStatus,
   formatTaskLifecycleDisplay,
   formatTaskLifecycleReceipts,
+  formatTaskPrimaryStatus,
   formatTaskReviewLifecycleStatus,
   formatTaskStatusLabel,
   formatTaskStatusTone,
@@ -1293,6 +1294,17 @@ function makeLifecycleProjection(
 }
 
 describe('approved task lifecycle projection and polling', () => {
+  it('uses verified review and integration for the headline while preserving execution semantics', () => {
+    const task = makeTask({lifecycle:makeLifecycleProjection({review_status:'accepted', integration_status:'integrated', evidence_status:'verified_live'})});
+    assert.equal(formatTaskPrimaryStatus(task).label, 'Integrated');
+    assert.equal(task.status, 'ready_for_review');
+    assert.equal(task.accepted, false);
+    assert.equal(formatTaskPrimaryStatus({...task,lifecycle:makeLifecycleProjection({review_status:'accepted',integration_status:'ready_to_integrate',evidence_status:'verified_live'})}).label, 'Review accepted');
+    assert.equal(formatTaskPrimaryStatus({...task,lifecycle:makeLifecycleProjection({review_status:'historical_accepted',integration_status:'historical_integrated',evidence_status:'recorded_historical_only'})}).label, 'Integrated (history)');
+    assert.equal(formatTaskPrimaryStatus({...task,lifecycle:makeLifecycleProjection({review_status:'invalidated',evidence_status:'invalidated'})}).label, 'Evidence invalidated');
+    assert.equal(formatTaskPrimaryStatus({...task,lifecycle:undefined}).label, 'Ready for review');
+    assert.equal(formatTaskPrimaryStatus({...task,status:'running'}).label, 'Running');
+  });
   it('projects completion-only tasks as pending review and ignores worker summary claims', () => {
     const workerClaimingAcceptance = makeWorker({
       outcome: {

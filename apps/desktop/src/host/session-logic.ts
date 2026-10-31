@@ -980,6 +980,27 @@ export function formatTaskLifecycleDisplay(
   };
 }
 
+/** The row headline reflects validated progress while execution stays separately visible. */
+export function formatTaskPrimaryStatus(
+  task: Pick<TaskStateSnapshot, 'status' | 'lifecycle'>
+): TaskLifecycleStageBadge {
+  const display = formatTaskLifecycleDisplay(task);
+  if (task.status !== 'ready_for_review' || !task.lifecycle) return display.execution;
+  const lifecycle = task.lifecycle;
+  if (lifecycle.evidence_status === 'invalidated' || lifecycle.review_status === 'invalidated' || lifecycle.integration_status === 'invalidated') {
+    return { label: 'Evidence invalidated', tone: 'warn' };
+  }
+  if (lifecycle.integration_status === 'historical_integrated') return display.integration;
+  if (lifecycle.review_status === 'historical_accepted') return display.review;
+  if (lifecycle.evidence_status === 'recorded_historical_only') {
+    return { label: 'Recorded history', tone: 'warn' };
+  }
+  if (lifecycle.evidence_status === 'verified_live' && lifecycle.review_status === 'accepted') {
+    return lifecycle.integration_status === 'integrated' ? display.integration : display.review;
+  }
+  return display.execution;
+}
+
 export interface TaskLifecycleElementSink {
   textContent: string | null;
   hidden: HTMLElement['hidden'];

@@ -30,8 +30,7 @@ import {
   formatHostStatusTone,
   formatTaskInstruction,
   formatTaskProgress,
-  formatTaskStatusLabel,
-  formatTaskStatusTone,
+  formatTaskPrimaryStatus,
   formatTaskTelemetry,
   hostInstanceChanged,
   hostInstanceId,
@@ -1377,8 +1376,9 @@ export class ApprovedSessionPanel {
     let statusTone: 'default' | 'active' | 'warn' = 'default';
 
     if (snapshot) {
-      statusText = formatTaskStatusLabel(snapshot.status);
-      statusTone = formatTaskStatusTone(snapshot.status);
+      const primaryStatus = formatTaskPrimaryStatus(snapshot);
+      statusText = primaryStatus.label;
+      statusTone = primaryStatus.tone;
     } else if (error) {
       statusText = 'Status unavailable';
       statusTone = 'warn';
@@ -1592,7 +1592,7 @@ export class ApprovedSessionPanel {
     } else {
       setText(
         this.tasksHint,
-        'Read-only task status. Dispatch stays with the approved MCP workflow; the backend revalidates this approval.'
+        'Task status updates here. Continue and manage approved work in your Codex conversation.'
       );
     }
   }
