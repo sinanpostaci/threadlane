@@ -1201,6 +1201,7 @@ fn detect_blocked_event(
     let et = event_type.to_ascii_lowercase();
     let st = subtype.unwrap_or("").to_ascii_lowercase();
     let nested_res = obj.get("result").and_then(Value::as_object);
+
     let nested_step = obj.get("step_update").and_then(Value::as_object);
 
     let status = obj
@@ -1373,6 +1374,19 @@ fn detect_error_event(
     let et = event_type.to_ascii_lowercase();
     let st = subtype.unwrap_or("").to_ascii_lowercase();
     let nested_res = obj.get("result").and_then(Value::as_object);
+
+    // The installed AGY CLI reports this terminal timeout alongside status SUCCESS.
+    // A selected model variant cannot turn an incomplete provider run into completion.
+    if et == "result"
+        && [Some(obj), nested_res].into_iter().flatten().any(|scope| {
+            scope.get("finished_reason").and_then(Value::as_str) == Some("print_timeout")
+        })
+    {
+        return Some((
+            Some("print_timeout".to_string()),
+            "provider print deadline elapsed without confirmed completion".to_string(),
+        ));
+    }
 
     let status = obj
         .get("status")

@@ -162,3 +162,21 @@ fn known_concrete_variant_and_requested_effort_must_agree() {
     .is_ok());
     assert!(resolve_model_target(WorkerProvider::Antigravity, "unknown-high", None).is_err());
 }
+
+#[test]
+fn provider_print_timeout_cannot_be_a_successful_terminal_result() {
+    let evidence = feed(
+        agy("gemini-4-argon-high"),
+        &[
+            INIT,
+            r#"{"event":"result","result":{"status":"SUCCESS","finished_reason":"print_timeout"}}"#,
+        ],
+    );
+    assert!(evidence.effort_evidence.is_satisfied());
+    assert!(!evidence.saw_result_event);
+    assert_eq!(evidence.provider_errors.len(), 1);
+    assert_eq!(
+        evidence.provider_errors[0].code.as_deref(),
+        Some("print_timeout")
+    );
+}

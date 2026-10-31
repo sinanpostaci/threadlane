@@ -25,5 +25,7 @@ perform an explicitly authorized, backed-up registry migration. Do not switch
 models or alter other role assignments during migration.
 
 Completion, verified model/variant, scoped diff checks, review acceptance and
-integration remain separate gates. Missing results, provider errors, cancelled
+integration remain separate gates. A provider `SUCCESS` result with
+`finished_reason: print_timeout` is an incomplete run and fails the result gate.
+Missing results, provider errors, cancelled
 or timed-out runs and stale scope never become successful from the catalog rule.
