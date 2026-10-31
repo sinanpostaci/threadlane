@@ -2,8 +2,9 @@
 
 Date: 2026-10-31. This document describes `threadlane-context`, the packaged
 trusted local operator context command in `threadlane-native`. It routes
-everyday workflow and approved-session CLI invocations through an existing
-private version-1 context JSON file without shells or ad-hoc wrapper scripts.
+everyday workflow, approved-session, and flow CLI invocations through an
+existing private version-1 context JSON file without shells or ad-hoc wrapper
+scripts.
 
 ## Authority boundary
 
@@ -14,8 +15,13 @@ local control plane. It does **not** authenticate per-call native chat identity
 (`native_per_call_identity_verified: false`), establish automatic two-chat
 routing, or grant human scope approval (`human_approval_verified: false`).
 
-- Operational context commands are `check`, `workflow`, and `session`.
-  Context-free `help workflow` and `help session` expose sibling help only.
+- Operational context commands are `check`, `workflow`, `session`, and `flow`.
+  Context-free `help workflow`, `help session`, and `help flow` expose sibling
+  help only.
+- The `flow` family is an additional forwarding surface for the
+  `threadlane-flow` package sibling. It adds no scheduling, automatic routing,
+  native identity, or human approval authority; the sibling owns its own
+  behavior and remains subject to the same explicit operator boundaries.
 - Scope approval (`threadlane-approve`), host startup (`threadlane-host`), and
   review/integration (`threadlane-operator`) remain separate explicit operator
   commands and are not exposed as context pass-through families.
@@ -29,21 +35,22 @@ running supervisor.
 
 ### Context-free family help
 
-The two exact offline family help commands are:
+The three exact offline family help commands are:
 
 ```sh
 threadlane-context help workflow
 threadlane-context help session
+threadlane-context help flow
 ```
 
-Both forms succeed without a context file or a running supervisor. Each command
-resolves only the canonical `threadlane-workflow` or `threadlane-session`
-executable in the current binary's canonical parent directory and passes exactly
-one fixed `--help` argument. The sibling's own help text is written through
-inherited stdio. `PATH` is never consulted, and missing, symlink, non-regular, or
-non-executable package siblings are refused. Any other family, extra argument,
-context-bearing form, protected scope or context override, or general help
-pass-through is rejected before a child is invoked.
+All three forms succeed without a context file or a running supervisor. Each
+command resolves only the canonical `threadlane-workflow`, `threadlane-session`,
+or `threadlane-flow` executable in the current binary's canonical parent
+directory and passes exactly one fixed `--help` argument. The sibling's own help
+text is written through inherited stdio. `PATH` is never consulted, and missing,
+symlink, non-regular, or non-executable package siblings are refused. Any other
+family, extra argument, context-bearing form, protected scope or context
+override, or general help pass-through is rejected before a child is invoked.
 
 These offline forms are not operational context validation: they do not read or
 validate a context file, stores, package pin, or live binding, and they do not
@@ -86,6 +93,14 @@ threadlane-context --context /absolute/private/context.json \
   context-bound `--state-dir`, `--registry-dir`, `--plans-dir`,
   `--authority-dir`, `--sessions-dir`, `--binding`, and `--thread` flags, and
   forwards `<args...>` directly via `argv`.
+- `flow <args...>` resolves only the canonical `threadlane-flow` executable in
+  the current binary's canonical parent directory, prepends exactly the same
+  five context-bound stores as `session` (`--state-dir`, `--registry-dir`,
+  `--plans-dir`, `--authority-dir`, and `--sessions-dir`) plus the `--binding`
+  and `--thread` flags, and forwards `<args...>` directly via `argv`.
+  As with workflow and session, the private context and live binding are
+  validated before child invocation; the router does not interpret or schedule
+  any flow subcommand.
 
 From a Nix checkout, inspect the packaged command without installing it globally:
 
@@ -132,21 +147,23 @@ changes; a stale pin is rejected rather than selecting a different installation.
 All wrapper arguments must be valid UTF-8. Non-UTF-8 Unix file names in argv
 are rejected with a static `invalid_input` error.
 
-- `--context` is valid only before the family name (`check`, `workflow`, or
-  `session`).
+- `--context` is valid only before the family name (`check`, `workflow`,
+  `session`, or `flow`).
 - Forwarded overrides for `--state-dir`, `--registry-dir`, `--plans-dir`,
   `--authority-dir`, `--sessions-dir`, `--binding`, `--thread`, `--context`, and
   `--project-root` (including `=` forms and repeated flags) are rejected before
   child execution.
-- Sibling executables (`threadlane-workflow` and `threadlane-session`) are
-  resolved exclusively from the canonical parent directory of `current_exe()`.
-  Missing (`not_configured`), symlink, non-regular, or non-executable
-  (`security_violation`) children are rejected.
+- Sibling executables (`threadlane-workflow`, `threadlane-session`, and
+  `threadlane-flow`) are resolved exclusively from the canonical parent
+  directory of `current_exe()`. Missing (`not_configured`), symlink,
+  non-regular, or non-executable (`security_violation`) children are rejected.
+  The context's legacy package metadata and `PATH` never select a child
+  executable.
 - Child processes inherit normal `stdin`, `stdout`, and `stderr`, and their exit
   status is preserved.
 - Spawn failure before a child process exists returns a static, sanitized error.
   Wait failure or signal termination after spawn returns `outcome_unknown` and
-  never replays the command; reconcile workflow or session state before
+  never replays the command; reconcile workflow, session, or flow state before
   retrying.
 
 ## Verification
@@ -154,4 +171,5 @@ are rejected with a static `invalid_input` error.
 Focused behavioral fixtures live in
 [`crates/threadlane-native/tests/context_cli.rs`](../crates/threadlane-native/tests/context_cli.rs)
 and exercise real compiled CLI subprocesses against local supervisor, workflow,
-and authority stores without paid provider calls.
+session, and authority stores plus a test-owned argv-recording flow sibling
+without paid provider calls.

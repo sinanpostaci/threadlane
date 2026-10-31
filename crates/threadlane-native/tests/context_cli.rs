@@ -2,12 +2,13 @@
 //! End-to-end behavioral tests for the packaged `threadlane-context` CLI.
 //!
 //! Covers outer help/version without context or runtime, context-free `help workflow` /
-//! `help session` offline sibling help with hostile `PATH`, sanitized syntax errors, existing
-//! private v1 context validation with legacy installation metadata, `check` + `workflow catalog` +
-//! `session` missing-host refusal, foreign/offline bindings, protected scope/context flag override
-//! refusals with zero side effects, bad schema/route/identity/duplicate fields, package-pin and
-//! store guards, symlink/insecure/oversized context files, missing or unsafe sibling binaries, and
-//! child stdio/exit/signal (`outcome_unknown`) handling.
+//! `help session` / `help flow` offline sibling help with hostile `PATH`, sanitized syntax errors,
+//! existing private v1 context validation with legacy installation metadata, `check` + `workflow
+//! catalog` + `session` missing-host refusal, flow forwarding with the same five bound stores as
+//! session, foreign/offline bindings, protected scope/context flag override refusals with zero side
+//! effects, bad schema/route/identity/duplicate fields, package-pin and store guards,
+//! symlink/insecure/oversized context files, missing or unsafe sibling binaries, and child
+//! stdio/exit/signal (`outcome_unknown`) handling.
 
 use std::ffi::OsString;
 use std::fs;
@@ -385,6 +386,96 @@ async fn run_bin_with_path(bin: &Path, args: &[&str], path_value: &str) -> Outpu
         .expect("execute CLI binary with an explicit hostile PATH")
 }
 
+fn write_argv_recording_sibling(dir: &Path, name: &str, marker: &Path) -> PathBuf {
+    let body = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"{}\"\nexit 0\n",
+        marker.display()
+    );
+    write_executable_script(dir, name, &body, 0o755)
+}
+
+fn read_argv_marker(marker: &Path) -> Vec<String> {
+    fs::read_to_string(marker)
+        .expect("read argv marker")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+fn five_store_scope_args(fixture: &ContextFixture) -> Vec<String> {
+    vec![
+        "--state-dir".to_string(),
+        fixture
+            .state_dir
+            .to_str()
+            .expect("utf8 state_dir")
+            .to_string(),
+        "--registry-dir".to_string(),
+        fixture
+            .registry_dir
+            .to_str()
+            .expect("utf8 registry_dir")
+            .to_string(),
+        "--plans-dir".to_string(),
+        fixture
+            .plans_dir
+            .to_str()
+            .expect("utf8 plans_dir")
+            .to_string(),
+        "--authority-dir".to_string(),
+        fixture
+            .authority_dir
+            .to_str()
+            .expect("utf8 authority_dir")
+            .to_string(),
+        "--sessions-dir".to_string(),
+        fixture
+            .sessions_dir
+            .to_str()
+            .expect("utf8 sessions_dir")
+            .to_string(),
+        "--binding".to_string(),
+        fixture.binding_id.clone(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+    ]
+}
+
+fn workflow_scope_args(fixture: &ContextFixture) -> Vec<String> {
+    vec![
+        "--state-dir".to_string(),
+        fixture
+            .state_dir
+            .to_str()
+            .expect("utf8 state_dir")
+            .to_string(),
+        "--registry-dir".to_string(),
+        fixture
+            .registry_dir
+            .to_str()
+            .expect("utf8 registry_dir")
+            .to_string(),
+        "--plans-dir".to_string(),
+        fixture
+            .plans_dir
+            .to_str()
+            .expect("utf8 plans_dir")
+            .to_string(),
+        "--binding".to_string(),
+        fixture.binding_id.clone(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+    ]
+}
+
+fn expected_recorded_argv(scope: &[String], inner: &[&str]) -> Vec<String> {
+    let mut expected = Vec::with_capacity(1 + scope.len() + inner.len());
+    expected.push((scope.len() + inner.len()).to_string());
+    expected.extend(scope.iter().cloned());
+    expected.extend(inner.iter().map(|arg| (*arg).to_string()));
+    expected
+}
+
 fn assert_error_code(output: &Output, expected_code: &str) -> Value {
     assert!(
         !output.status.success(),
@@ -556,6 +647,59 @@ async fn offline_family_help_succeeds_without_context_or_supervisor_and_ignores_
 }
 
 #[tokio::test]
+async fn offline_flow_help_uses_fixed_help_without_context_supervisor_or_path_lookup() {
+    let mut fixture = ContextFixture::start().await;
+    fixture.shutdown().await;
+
+    let hostile_dir = fixture.root.join("hostile-flow-help-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile flow help PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile flow help PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-flow-help-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    write_executable_script(&hostile_dir, "threadlane-flow", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile flow help PATH directory");
+
+    // A missing package flow sibling is refused even while PATH contains a same-named executable.
+    let missing = run_bin_with_path(&fixture.context_bin, &["help", "flow"], hostile_path).await;
+    assert_error_code(&missing, "not_configured");
+    assert!(
+        !hostile_marker.exists(),
+        "missing package flow sibling must not fall back to PATH"
+    );
+
+    // With the supervisor stopped and no context argument, the offline form forwards exactly one
+    // fixed --help argument to the canonical package flow sibling.
+    let help_marker = fixture.root.join("flow-help-argv.marker");
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-flow", &help_marker);
+
+    let out = run_bin_with_path(&fixture.context_bin, &["help", "flow"], hostile_path).await;
+    assert!(
+        out.status.success(),
+        "offline `help flow` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "offline `help flow` must not write stderr"
+    );
+    assert_eq!(
+        read_argv_marker(&help_marker),
+        vec!["1".to_string(), "--help".to_string()],
+        "offline `help flow` must forward exactly one fixed --help argument"
+    );
+    assert!(
+        !hostile_marker.exists(),
+        "offline `help flow` must not resolve a sibling through PATH"
+    );
+}
+
+#[tokio::test]
 async fn family_help_rejects_invalid_forms_before_child_and_preserves_sibling_refusals() {
     let mut fixture = ContextFixture::start().await;
     fixture.shutdown().await;
@@ -658,6 +802,418 @@ async fn family_help_rejects_invalid_forms_before_child_and_preserves_sibling_re
     let missing_session = run_bin(&fixture.context_bin, &["help", "session"]).await;
     assert_error_code(&missing_session, "not_configured");
     assert!(!marker_file.exists());
+}
+
+#[tokio::test]
+async fn flow_forwards_the_same_five_bound_stores_as_session_and_ignores_path_and_metadata() {
+    let mut fixture = ContextFixture::start().await;
+
+    let hostile_dir = fixture.root.join("hostile-flow-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile flow PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile flow PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-flow-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    let hostile_flow =
+        write_executable_script(&hostile_dir, "threadlane-flow", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile flow PATH directory");
+
+    // Non-operational context metadata naming a child executable must never select it.
+    let mut flow_context = fixture.valid_context_json();
+    flow_context["flow_executable"] = json!(hostile_flow);
+    let ctx_path = fixture.write_private_context("flow-forwarding-context.json", &flow_context);
+    let ctx_str = ctx_path.to_str().expect("utf8 flow context path");
+
+    let flow_marker = fixture.root.join("flow-forward-argv.marker");
+    let session_marker = fixture.root.join("session-forward-argv.marker");
+    let workflow_marker = fixture.root.join("workflow-forward-argv.marker");
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-flow", &flow_marker);
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-session", &session_marker);
+    write_argv_recording_sibling(
+        &fixture.pkg_bin_dir,
+        "threadlane-workflow",
+        &workflow_marker,
+    );
+
+    let inner = ["fixture-command", "--limit", "5"];
+
+    let mut flow_args = vec!["--context", ctx_str, "flow"];
+    flow_args.extend(inner);
+    let flow_out = run_bin_with_path(&fixture.context_bin, &flow_args, hostile_path).await;
+    assert!(
+        flow_out.status.success(),
+        "flow forwarding failed: {}",
+        String::from_utf8_lossy(&flow_out.stderr)
+    );
+    assert!(
+        flow_out.stderr.is_empty(),
+        "flow forwarding must not write stderr"
+    );
+    assert!(
+        !hostile_marker.exists(),
+        "flow forwarding must not resolve a sibling through PATH or context metadata"
+    );
+    let flow_argv = read_argv_marker(&flow_marker);
+    assert_eq!(
+        flow_argv,
+        expected_recorded_argv(&five_store_scope_args(&fixture), &inner),
+        "flow must inject the five context-bound stores plus binding/thread before inner args"
+    );
+
+    // Session must receive the identical five-store scope and binding/thread prefix.
+    let mut session_args = vec!["--context", ctx_str, "session"];
+    session_args.extend(inner);
+    let session_out = run_bin(&fixture.context_bin, &session_args).await;
+    assert!(
+        session_out.status.success(),
+        "session forwarding failed: {}",
+        String::from_utf8_lossy(&session_out.stderr)
+    );
+    assert!(
+        session_out.stderr.is_empty(),
+        "session forwarding must not write stderr"
+    );
+    assert_eq!(
+        read_argv_marker(&session_marker),
+        flow_argv,
+        "flow must forward exactly the same five stores and binding/thread as session"
+    );
+
+    // Workflow keeps its existing three-store scope after flow support is added.
+    let mut workflow_args = vec!["--context", ctx_str, "workflow"];
+    workflow_args.extend(inner);
+    let workflow_out = run_bin(&fixture.context_bin, &workflow_args).await;
+    assert!(
+        workflow_out.status.success(),
+        "workflow forwarding failed: {}",
+        String::from_utf8_lossy(&workflow_out.stderr)
+    );
+    assert!(
+        workflow_out.stderr.is_empty(),
+        "workflow forwarding must not write stderr"
+    );
+    assert_eq!(
+        read_argv_marker(&workflow_marker),
+        expected_recorded_argv(&workflow_scope_args(&fixture), &inner),
+        "workflow forwarding must keep its existing three-store scope"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_or_unsafe_flow_sibling_is_refused_before_child_invocation() {
+    let mut fixture = ContextFixture::start().await;
+    let ctx_path =
+        fixture.write_private_context("flow-sibling-context.json", &fixture.valid_context_json());
+    let ctx_str = ctx_path.to_str().unwrap();
+    let flow_sibling = fixture.pkg_bin_dir.join("threadlane-flow");
+
+    let hostile_dir = fixture.root.join("hostile-flow-sibling-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile flow sibling PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile flow sibling PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-flow-sibling.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    write_executable_script(&hostile_dir, "threadlane-flow", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile flow sibling PATH directory");
+
+    // A missing package flow sibling is refused without falling back to PATH.
+    let missing = run_bin_with_path(
+        &fixture.context_bin,
+        &["--context", ctx_str, "flow", "fixture-command"],
+        hostile_path,
+    )
+    .await;
+    assert_error_code(&missing, "not_configured");
+    assert!(
+        !hostile_marker.exists(),
+        "missing package flow sibling must not fall back to PATH"
+    );
+
+    // A symlink flow sibling is refused for operational forwarding and offline help.
+    symlink(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-workflow")),
+        &flow_sibling,
+    )
+    .expect("symlink threadlane-flow sibling");
+    let symlink_out = run_bin(
+        &fixture.context_bin,
+        &["--context", ctx_str, "flow", "fixture-command"],
+    )
+    .await;
+    assert_error_code(&symlink_out, "security_violation");
+    let offline_symlink = run_bin(&fixture.context_bin, &["help", "flow"]).await;
+    assert_error_code(&offline_symlink, "security_violation");
+    fs::remove_file(&flow_sibling).expect("remove symlink flow sibling");
+
+    // A directory in place of the flow sibling is refused.
+    fs::create_dir(&flow_sibling).expect("create directory flow sibling");
+    let dir_out = run_bin(
+        &fixture.context_bin,
+        &["--context", ctx_str, "flow", "fixture-command"],
+    )
+    .await;
+    assert_error_code(&dir_out, "security_violation");
+    fs::remove_dir(&flow_sibling).expect("remove directory flow sibling");
+
+    // A non-executable regular file flow sibling is refused.
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-flow",
+        "#!/bin/sh\nexit 0\n",
+        0o600,
+    );
+    let non_exec_out = run_bin(
+        &fixture.context_bin,
+        &["--context", ctx_str, "flow", "fixture-command"],
+    )
+    .await;
+    assert_error_code(&non_exec_out, "security_violation");
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn flow_rejects_invalid_extra_and_protected_arguments_before_child_invocation() {
+    let mut fixture = ContextFixture::start().await;
+    let ctx_path =
+        fixture.write_private_context("flow-protected-context.json", &fixture.valid_context_json());
+    let ctx_str = ctx_path.to_str().unwrap();
+    let ctx_eq = format!("--context={ctx_str}");
+
+    let marker_file = fixture.root.join("flow-protected-child.marker");
+    let marker_script = format!(
+        "#!/bin/sh\nprintf 'spawned' > \"{}\"\nexit 0\n",
+        marker_file.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-flow",
+        &marker_script,
+        0o755,
+    );
+
+    let invalid_cases: &[&[&str]] = &[
+        // Missing operational inner arguments.
+        &["--context", ctx_str, "flow"],
+        // Offline help accepts no extra argument, context, or protected override.
+        &["help", "flow", "extra"],
+        &["help", "flow", SECRET_SENTINEL],
+        &["help", "flow", "--help"],
+        &["help", "flow", "--state-dir=/tmp/other"],
+        &["help", "flow=ignored"],
+        &["--context", ctx_str, "help", "flow"],
+        &[ctx_eq.as_str(), "help", "flow"],
+        // A protected override cannot occupy the family position.
+        &[
+            "--context",
+            ctx_str,
+            "--state-dir=/tmp/other",
+            "flow",
+            "fixture-command",
+        ],
+        // Protected store, binding, thread, context, and project-root overrides are refused in
+        // separate, equals, and repeated forms.
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--state-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--state-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--registry-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--registry-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--plans-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--plans-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--authority-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--authority-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--sessions-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--sessions-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--binding",
+            "bnd_override",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--binding=bnd_override",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--binding=bnd_override",
+            "--binding=bnd_override",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--thread",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            &format!("--thread={OTHER_THREAD_UUID}"),
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--thread",
+            OTHER_THREAD_UUID,
+            "--thread",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--context",
+            ctx_str,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            ctx_eq.as_str(),
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--project-root",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--project-root=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--project_root=/tmp/other",
+        ],
+    ];
+
+    for case in invalid_cases {
+        let out = run_bin(&fixture.context_bin, case).await;
+        assert_error_code(&out, "invalid_input");
+        assert!(
+            !marker_file.exists(),
+            "invalid flow arguments must never spawn the child executable: {case:?}"
+        );
+    }
+
+    // A valid flow invocation proves the marker sibling is live and the refusals above were
+    // caused by argument validation rather than a broken fixture.
+    let valid_out = run_bin(
+        &fixture.context_bin,
+        &["--context", ctx_str, "flow", "fixture-command"],
+    )
+    .await;
+    assert!(
+        valid_out.status.success(),
+        "valid flow forwarding failed: {}",
+        String::from_utf8_lossy(&valid_out.stderr)
+    );
+    assert!(
+        marker_file.exists(),
+        "valid flow forwarding must invoke the package flow sibling"
+    );
+
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

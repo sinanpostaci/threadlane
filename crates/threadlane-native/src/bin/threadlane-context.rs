@@ -6,7 +6,8 @@
 //! Validates a private (`0600`) version-1 operator context JSON file, verifies the bound
 //! `(binding_id, thread_uuid)` target against the live authenticated local supervisor, and
 //! either emits a bounded `check` verification envelope or invokes the canonical sibling
-//! `threadlane-workflow` / `threadlane-session` binary directly via `argv` (never a shell).
+//! `threadlane-workflow`, `threadlane-session`, or `threadlane-flow` binary directly via `argv`
+//! (never a shell).
 //!
 //! ## Security and Authority Boundaries
 //!
@@ -18,12 +19,13 @@
 //!   and XDG fields) is never granted authority to choose executables or override bound stores.
 //!   When `cli_package` is present, its `bin` directory must match the current executable's
 //!   canonical sibling directory.
-//! - **Canonical sibling execution only**: `workflow` and `session` resolve only the canonical
-//!   `threadlane-workflow` or `threadlane-session` regular executable in the current binary's
-//!   canonical parent directory, rejecting missing, symlink, non-regular, or non-executable targets.
-//! - **Context-free family help**: `help workflow` and `help session` execute only the canonical
-//!   same-package sibling with a single fixed `--help` argument, without reading a context,
-//!   validating stores, or contacting a supervisor.
+//! - **Canonical sibling execution only**: `workflow`, `session`, and `flow` resolve only the
+//!   canonical `threadlane-workflow`, `threadlane-session`, or `threadlane-flow` regular executable
+//!   in the current binary's canonical parent directory, rejecting missing, symlink, non-regular,
+//!   or non-executable targets.
+//! - **Context-free family help**: `help workflow`, `help session`, and `help flow` execute only the
+//!   canonical same-package sibling with a single fixed `--help` argument, without reading a
+//!   context, validating stores, or contacting a supervisor.
 //! - **Locked scope flags**: Bound store directories, `--binding`, `--thread`, and `--context`
 //!   come exclusively from the private context file; forwarded overrides (including `=` forms and
 //!   repeated flags) are rejected before child execution.
@@ -47,6 +49,7 @@ const CONTEXT_SCHEMA_VERSION: u32 = 1;
 const TRUSTED_LOCAL_OPERATOR_ROUTE: &str = "trusted_local_operator";
 const WORKFLOW_BINARY_NAME: &str = "threadlane-workflow";
 const SESSION_BINARY_NAME: &str = "threadlane-session";
+const FLOW_BINARY_NAME: &str = "threadlane-flow";
 
 const OUTER_HELP_TEXT: &str = "\
 threadlane-context — Packaged trusted local operator context CLI for Threadlane
@@ -55,8 +58,10 @@ USAGE:
     threadlane-context --context <ABS_PRIVATE_JSON> check
     threadlane-context --context <ABS_PRIVATE_JSON> workflow <WORKFLOW_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> session <SESSION_ARGS>...
+    threadlane-context --context <ABS_PRIVATE_JSON> flow <FLOW_ARGS>...
     threadlane-context help workflow
     threadlane-context help session
+    threadlane-context help flow
     threadlane-context --help | -h | help
     threadlane-context --version | -V
 
@@ -64,7 +69,8 @@ FAMILIES:
     check       Validate private v1 context schema, project root, private stores, package pin, and live binding
     workflow    Invoke canonical sibling threadlane-workflow with context-bound scope flags
     session     Invoke canonical sibling threadlane-session with context-bound scope flags
-    help        Display outer help, or context-free sibling help for workflow/session
+    flow        Invoke canonical sibling threadlane-flow with the same five stores, binding, and thread as session
+    help        Display outer help, or context-free sibling help for workflow/session/flow
 ";
 
 const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
@@ -93,6 +99,7 @@ const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
 enum ChildFamily {
     Workflow,
     Session,
+    Flow,
 }
 
 impl ChildFamily {
@@ -100,6 +107,7 @@ impl ChildFamily {
         match self {
             Self::Workflow => WORKFLOW_BINARY_NAME,
             Self::Session => SESSION_BINARY_NAME,
+            Self::Flow => FLOW_BINARY_NAME,
         }
     }
 }
@@ -444,7 +452,7 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
     if args[0] == "help" {
         if args.len() != 2 {
             return Err(OperatorCliError::invalid_input(
-                "help command family accepts exactly one of workflow or session",
+                "help command family accepts exactly one of workflow, session, or flow",
             ));
         }
         return match args[1] {
@@ -454,8 +462,11 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
             "session" => Ok(OuterParseAction::DisplaySiblingHelp {
                 family: ChildFamily::Session,
             }),
+            "flow" => Ok(OuterParseAction::DisplaySiblingHelp {
+                family: ChildFamily::Flow,
+            }),
             _ => Err(OperatorCliError::invalid_input(
-                "unsupported help family; only workflow and session are supported",
+                "unsupported help family; only workflow, session, and flow are supported",
             )),
         };
     }
@@ -527,6 +538,18 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
                 inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
             }
         }
+        "flow" => {
+            if rest.is_empty() {
+                return Err(OperatorCliError::invalid_input(
+                    "flow command family requires subcommand arguments",
+                ));
+            }
+            reject_protected_overrides(rest)?;
+            ContextCommand::Forward {
+                family: ChildFamily::Flow,
+                inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
+            }
+        }
         "help" => {
             return Err(OperatorCliError::invalid_input(
                 "help command family is context-free and does not accept --context",
@@ -534,7 +557,7 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
         }
         _ => {
             return Err(OperatorCliError::invalid_input(
-                "unsupported command family; only check, workflow, and session are supported",
+                "unsupported command family; only check, workflow, session, and flow are supported",
             ));
         }
     };
@@ -935,7 +958,7 @@ fn build_child_args(
     args.push(OsString::from("--plans-dir"));
     args.push(validated.stores.plans_dir.as_os_str().to_os_string());
 
-    if family == ChildFamily::Session {
+    if matches!(family, ChildFamily::Session | ChildFamily::Flow) {
         args.push(OsString::from("--authority-dir"));
         args.push(validated.stores.authority_dir.as_os_str().to_os_string());
         args.push(OsString::from("--sessions-dir"));
@@ -1054,6 +1077,30 @@ mod tests {
             }
         );
 
+        let flow = parse_outer_args(&[
+            OsString::from("--context"),
+            OsString::from("/tmp/context.json"),
+            OsString::from("flow"),
+            OsString::from("fixture-command"),
+            OsString::from("--limit"),
+            OsString::from("5"),
+        ])
+        .expect("parse flow");
+        assert_eq!(
+            flow,
+            OuterParseAction::Execute {
+                context_path: PathBuf::from("/tmp/context.json"),
+                command: ContextCommand::Forward {
+                    family: ChildFamily::Flow,
+                    inner_args: vec![
+                        "fixture-command".to_string(),
+                        "--limit".to_string(),
+                        "5".to_string()
+                    ],
+                },
+            }
+        );
+
         // Non-UTF8 is rejected safely with invalid_input.
         let bad_utf8 = parse_outer_args(&[
             OsString::from("--context"),
@@ -1075,33 +1122,66 @@ mod tests {
             assert_eq!(err.code, "invalid_input");
         }
 
-        // Protected flags in inner_args (separate and equals forms) are rejected.
-        for bad_flag in [
-            "--state-dir",
-            "--state-dir=/tmp/other",
-            "--registry-dir",
-            "--registry-dir=/tmp/other",
-            "--plans-dir",
-            "--plans-dir=/tmp/other",
-            "--authority-dir",
-            "--authority-dir=/tmp/other",
-            "--sessions-dir",
-            "--sessions-dir=/tmp/other",
-            "--binding",
-            "--binding=bnd_other",
-            "--thread",
-            "--thread=0196ed00-0000-7000-8000-000000000099",
-            "--context",
-            "--context=/tmp/other.json",
+        // Protected flags in inner_args (separate and equals forms) are rejected for every
+        // forwarding family, including flow.
+        for (family, inner) in [
+            ("workflow", "catalog"),
+            ("session", "session"),
+            ("flow", "fixture-command"),
         ] {
-            let err = parse_outer_args(&[
+            for bad_flag in [
+                "--state-dir",
+                "--state-dir=/tmp/other",
+                "--registry-dir",
+                "--registry-dir=/tmp/other",
+                "--plans-dir",
+                "--plans-dir=/tmp/other",
+                "--authority-dir",
+                "--authority-dir=/tmp/other",
+                "--sessions-dir",
+                "--sessions-dir=/tmp/other",
+                "--binding",
+                "--binding=bnd_other",
+                "--thread",
+                "--thread=0196ed00-0000-7000-8000-000000000099",
+                "--context",
+                "--context=/tmp/other.json",
+                "--project-root=/tmp/other",
+            ] {
+                let err = parse_outer_args(&[
+                    OsString::from("--context"),
+                    OsString::from("/tmp/context.json"),
+                    OsString::from(family),
+                    OsString::from(inner),
+                    OsString::from(bad_flag),
+                ])
+                .expect_err("protected flag must fail");
+                assert_eq!(err.code, "invalid_input");
+            }
+        }
+
+        // A protected flag cannot occupy the family position, and repeated protected flags are
+        // rejected before any child could be resolved.
+        for raw in [
+            vec![
                 OsString::from("--context"),
                 OsString::from("/tmp/context.json"),
-                OsString::from("workflow"),
-                OsString::from("catalog"),
-                OsString::from(bad_flag),
-            ])
-            .expect_err("protected flag must fail");
+                OsString::from("--state-dir=/tmp/other"),
+                OsString::from("flow"),
+                OsString::from("fixture-command"),
+            ],
+            vec![
+                OsString::from("--context"),
+                OsString::from("/tmp/context.json"),
+                OsString::from("flow"),
+                OsString::from("fixture-command"),
+                OsString::from("--thread"),
+                OsString::from("0196ed00-0000-7000-8000-000000000099"),
+                OsString::from("--thread"),
+                OsString::from("0196ed00-0000-7000-8000-000000000099"),
+            ],
+        ] {
+            let err = parse_outer_args(&raw).expect_err("protected family/repeat must fail");
             assert_eq!(err.code, "invalid_input");
         }
     }
@@ -1114,6 +1194,7 @@ mod tests {
         for (family_token, expected_family) in [
             ("workflow", ChildFamily::Workflow),
             ("session", ChildFamily::Session),
+            ("flow", ChildFamily::Flow),
         ] {
             let parsed = parse_outer_args(&[OsString::from("help"), OsString::from(family_token)])
                 .expect("parse context-free family help");
@@ -1132,13 +1213,17 @@ mod tests {
             &["help", "operator"],
             &["help", "unknown"],
             &["help", "workflow=ignored"],
+            &["help", "flow=ignored"],
             &["help", "--help"],
             &["help", "-h"],
             &["help", "--context"],
             &["help", "--context=/tmp/context.json"],
             &["help", "workflow", "extra"],
             &["help", "session", "--help"],
+            &["help", "flow", "extra"],
+            &["help", "flow", "--help"],
             &["help", "workflow", "--state-dir=/tmp/other"],
+            &["help", "flow", "--state-dir=/tmp/other"],
         ];
         for args in invalid_help_forms {
             let raw: Vec<OsString> = args.iter().map(|arg| OsString::from(*arg)).collect();
@@ -1149,6 +1234,7 @@ mod tests {
         let context_bearing_help_forms: &[&[&str]] = &[
             &["--context", "/tmp/context.json", "help", "workflow"],
             &["--context=/tmp/context.json", "help", "session"],
+            &["--context", "/tmp/context.json", "help", "flow"],
             &["--context", "/tmp/context.json", "help"],
         ];
         for args in context_bearing_help_forms {
