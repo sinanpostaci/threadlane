@@ -973,7 +973,11 @@ pub struct WakeupNotice {
     pub status: WakeupStatus,
     /// Active or most recent claim ID for the current unacknowledged notice cycle.
     pub claim_id: Option<String>,
-    /// Fixed wake-up message (`FIXED_WAKEUP_MESSAGE`).
+    /// Route-neutral status guidance (`WAKEUP_NOTICE_STATUS_MESSAGE`).
+    ///
+    /// This is observational status text, not necessarily the exact outbound wake-up body.
+    /// Legacy claims report their own fixed [`WakeupClaim`] `message`, and approved-session
+    /// routes construct separate fixed, route-specific messages.
     pub message: String,
     /// Earliest unacknowledged important event sequence number in the current notice cycle.
     pub pending_since_seq: Option<u64>,

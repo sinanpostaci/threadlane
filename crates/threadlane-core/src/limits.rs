@@ -133,6 +133,15 @@ pub const MAX_DEMO_STEP_DELAY_MS: i64 = 3_600_000;
 pub const FIXED_WAKEUP_MESSAGE: &str =
     "Threadlane has pending events. Pull and process Threadlane events via MCP.";
 
+/// Route-neutral status guidance surfaced in the observational [`crate::WakeupNotice`] `message` field.
+///
+/// This is not an outbound wake-up payload. Legacy binding notifications continue to use
+/// [`FIXED_WAKEUP_MESSAGE`], while approved-session MCP and operator-CLI routes construct their
+/// own fixed, route-specific messages. This value never contains worker prose, task labels,
+/// file paths, or a preferred delivery interface.
+pub const WAKEUP_NOTICE_STATUS_MESSAGE: &str =
+    "Threadlane has pending events. Use the configured event interface to pull and acknowledge them.";
+
 pub(crate) fn validate_thread_uuid(raw: &str) -> Result<String, CoreError> {
     if raw.is_empty() {
         return Err(CoreError::Validation {

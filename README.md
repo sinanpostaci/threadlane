@@ -8,7 +8,7 @@ trusted scope approval remain explicit setup boundaries; ordinary work should
 not require switching to the panel for each task. See
 [session lifecycle and its current limits](docs/SESSION-LIFECYCLE.md).
 
-> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. Immutable operator approvals, detached local hosts, frozen-task MCP dispatch and default-off approved-session notifications have local fixture coverage. Production multi-chat onboarding, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [M4 baseline and its validation limits](docs/M4-CHECKPOINT.md), [approved-session notification extension](docs/APPROVED-NOTIFICATIONS.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
+> **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. One trusted local operator CLI conversation also received a real busy-turn callback and completed a six-event pull/ACK, cancellation of a real OpenCode process, and explicit stop/restart without replay; see [the 2026-10-31 pilot](docs/NATIVE-CLI-PILOT-2026-10-31.md). Immutable operator approvals, detached local hosts, frozen-task MCP dispatch and default-off approved-session notifications have local fixture coverage. Production multi-chat onboarding, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [M4 baseline and its validation limits](docs/M4-CHECKPOINT.md), [approved-session notification extension](docs/APPROVED-NOTIFICATIONS.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
 
 ---
 
@@ -26,14 +26,14 @@ not require switching to the panel for each task. See
 ### Worker Diagnostics (Milestone 2 Foundation)
 - **`threadlane-workers`**: Separate library and trusted `threadlane-worker` diagnostic CLI for exact provider argv, incremental bounded output, requested/observed model and effort evidence, Unix process-group supervision, owned task/integration worktrees and post-run diff checks.
 - **Acceptance stays explicit**: Exit zero and a passing diff are insufficient to accept a patch. Missing provider evidence, blocked work, incomplete cleanup and incomplete diff reports remain visible. Diff checks do not prevent filesystem writes while a worker runs.
-- **Validation scope**: Linux process/Git regressions use isolated fixtures. One live Antigravity transport smoke confirmed the requested model; the provider did not report effort, so it remained unverified. OpenCode uses fixture and installed-CLI checks; live Go execution is still unverified. See [worker usage and limits](docs/WORKERS.md).
+- **Validation scope**: Linux process/Git regressions use isolated fixtures. One live Antigravity transport smoke confirmed the requested model; the provider did not report effort, so it remained unverified. A separate disposable three-task OpenCode Go pipeline completed with CLI-reported per-assistant model/effort evidence, review/integration receipts and eight focused integration checks on `0e94e17`; broader live provider compatibility remains unverified. See the earlier checkpoint note in the [2026-10-31 report](docs/NATIVE-CLI-PILOT-2026-10-31.md). See [worker usage and limits](docs/WORKERS.md).
 
 ### Durable Worker Dispatch (Milestone 2B)
 
 - **Trusted startup profiles**: Optional private `--workers-config` fixes provider, executable, model/effort, exact base commit, repository, work area, write scope and budgets. Callers select an authorized `profile_id`; they cannot override those settings. Dispatch is disabled by default.
 - **Durable lifecycle**: SQLite claims precede external effects. Duplicate requests replay without another spawn; revision/claim checks reject stale callbacks. Uncertain jobs become `Unknown` on restart without automatic replay or unverified PID killing.
 - **Scoped runtime operations**: `start_worker`, `get_worker` and `cancel_worker` support bounded live progress, per-task worktrees, configured concurrency (`1..=8`), private optional report artifacts and the existing event/ACK/wake-up path.
-- **Acceptance stays separate**: A successful execution is only ready for review. Native print-mode worker Answer/Steer, live provider coding acceptance and reviewed merge/cleanup remain separate gates. See [dispatch usage and limits](docs/DISPATCH.md).
+- **Acceptance stays separate**: A successful execution is only ready for review. Native print-mode worker Answer/Steer, live provider coding acceptance, and automatic merge/push remain separate gates. Reviewed commit, acceptance, and same-run integration are explicit operator CLI actions; they do not auto-accept or publish. See [dispatch usage and limits](docs/DISPATCH.md) and the [operator workflow](docs/OPERATOR-WORKFLOW.md).
 
 ### Scoped Provider Permissions and Native Pilot (Milestone 2C)
 
@@ -44,7 +44,7 @@ not require switching to the panel for each task. See
 - **Repeatable operator fixture**: [live_worker_pilot.py](scripts/live_worker_pilot.py) prints a plan by default and invokes a provider only with explicit `--allow-live`, executable, model and effort. It uses a new private disposable repository and preserves evidence; see [usage](docs/WORKERS.md#repeatable-operator-pilot).
 
 ### Remaining Milestones
-- **Milestone 2 remaining integration**: Interactive provider question/Steer delivery, busy-turn and multi-chat acceptance, reconciliation of preserved uncertain artifacts, and reviewed Git integration/cleanup. The durable fixture checkpoint is not the full native workflow.
+- **Milestone 2 remaining integration**: Interactive provider question/Steer delivery, general per-call native identity and authenticated two-chat routing, and broader provider compatibility. Busy-turn callback passed in one trusted local operator CLI conversation; preserved uncertain artifacts still require explicit reconciliation. Receipt-bound dependency inputs and the trusted review/integration CLI are implemented with their own same-run and receipt checks; they do not auto-accept, merge, push, or start a child without a separate explicit dispatch. See [the operator CLI pilot](docs/NATIVE-CLI-PILOT-2026-10-31.md).
 - **Desktop configuration and observation**: [Tauri desktop panel](docs/DESKTOP.md) (`Activity`, `Chats`, `Plans`, `Tools`, `Profiles`, `Settings`), editable global models/efforts and role/difficulty profiles, a separate local demo, read-only history, and configurable theme/accent/transparency.
 - **Milestone 4 execution checkpoint**: Durable draft/publication MCP operations, immutable operator approvals, separate per-approval host processes, and caller-scoped frozen-task dispatch are implemented with local fixture coverage. Jev/OpenAI Decisions adapters provide explicit synthetic tests; live credentials and automatic workflow classification are separate gates. The [configuration guide](docs/CONFIGURATION.md) distinguishes approval, host startup, dispatch, and review.
 - **Milestone 5**: Cross-platform release hardening, macOS/Windows native ACLs and secret storage, optional background service/tray packaging, and measured cost/notification budgets.
@@ -84,10 +84,20 @@ not require switching to the panel for each task. See
   gates. No new lifecycle MCP tools are exposed. See
   [session lifecycle](docs/SESSION-LIFECYCLE.md).
 
-OpenCode v2 [metadata validation](docs/OPENCODE-METADATA.md) is available as a pure library boundary using
-bounded, already-loaded inputs and per-assistant model/effort fields. It performs
-no session discovery or export and is not yet connected to the runtime worker
-collector. The existing missing-evidence gate remains in force.
+- **Native operator CLI pilot (2026-10-31)**: One Linux/NixOS trusted local
+  operator CLI conversation received a real callback after a busy turn, pulled and
+  acknowledged a six-event batch, canceled an OpenCode process, and passed
+  explicit stop/restart without replay. The cancellation's `system_init`
+  step-start is not model-output, effort, or remote-termination proof; no code was
+  accepted. See [pilot evidence](docs/NATIVE-CLI-PILOT-2026-10-31.md).
+
+OpenCode v2 [metadata validation](docs/OPENCODE-METADATA.md) is integrated into the
+runtime worker path. New software-owned OpenCode sessions are allocated through the
+bounded CLI collector, then validated from that exact session's info and sanitized
+export after a clean process exit; existing-session jobs retain stream-only evidence.
+The collector performs no session discovery, does not query IDs from model prose,
+and keeps raw export content in memory. The missing-evidence gate remains in force,
+and CLI-reported metadata is not cloud attestation.
 
 ---
 

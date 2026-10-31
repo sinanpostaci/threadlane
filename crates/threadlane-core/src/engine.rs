@@ -15,6 +15,7 @@ use crate::limits::{
     LEGACY_SCHEMA_VERSION_V2, LEGACY_SCHEMA_VERSION_V3, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
     MAX_COMPACT_RESPONSE_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN,
     MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN, RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
+    WAKEUP_NOTICE_STATUS_MESSAGE,
 };
 use crate::types::{
     AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
@@ -2620,7 +2621,7 @@ impl Core {
             thread_uuid,
             status,
             claim_id,
-            message: FIXED_WAKEUP_MESSAGE.to_string(),
+            message: WAKEUP_NOTICE_STATUS_MESSAGE.to_string(),
             pending_since_seq,
             latest_important_seq: i64_to_u64("latest_important_seq", latest_imp_raw)?,
             covered_up_to_seq: i64_to_u64("covered_up_to_seq", covered_raw)?,

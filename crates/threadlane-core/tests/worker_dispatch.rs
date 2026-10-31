@@ -1152,7 +1152,10 @@ fn worker_reopen_recovery_marks_in_flight_unknown_without_replay_and_migrates_v1
     let wakeup = reopened.get_wakeup(&bid).expect("wakeup after reopen");
     assert_eq!(wakeup.status, WakeupStatus::Pending);
     assert_eq!(wakeup.coalesced_count, 5);
-    assert_eq!(wakeup.message, FIXED_WAKEUP_MESSAGE);
+    assert_eq!(
+        wakeup.message,
+        threadlane_core::WAKEUP_NOTICE_STATUS_MESSAGE
+    );
 }
 
 #[test]

@@ -106,9 +106,16 @@ means ready for review, with `accepted: false`; it does not merge or apply code.
 ## Current acceptance limits
 
 The lifecycle package on 667d975 passed its documented Linux fixture and build
-gates. This startup extension has its own validation gate. Real two-chat routing,
-busy-turn delivery, live interactive provider continuation, receipt-bound DAG
-inputs, API entitlement and macOS/Windows release behavior remain separate.
-Local demos or a submitted CLI call do not establish those outcomes. See
-[validation](VALIDATION.md), [native routing](NATIVE-ROUTING.md) and
-[session lifecycle](SESSION-LIFECYCLE.md).
+gates. This startup extension has its own validation gate. The
+[2026-10-31 operator CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md) records live
+delivery after a busy turn, a six-event pull/ACK, cancellation of a real OpenCode
+process, and explicit stop/restart without replay for one trusted local
+conversation. General two-chat routing, live interactive provider continuation,
+product API entitlement, and macOS/Windows release behavior remain separate.
+Receipt-bound dependency inputs and the trusted review/integration CLI are
+implemented with their documented same-run and receipt checks; they do not
+auto-accept, merge, push, or start a child without a separate explicit dispatch.
+Local demos or a submitted CLI call do not establish the remaining outcomes. See
+[validation](VALIDATION.md),
+[native routing](NATIVE-ROUTING.md), [session lifecycle](SESSION-LIFECYCLE.md),
+and the [operator workflow](OPERATOR-WORKFLOW.md).

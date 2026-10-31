@@ -50,6 +50,12 @@ scope approval, explicit host startup and review acceptance. This route does not
 require a desktop form or native MCP connection and does not establish native
 per-call identity or automatic same-project two-chat routing.
 
+The [2026-10-31 operator CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md) records one
+Linux/NixOS trusted local conversation with a real busy-turn callback, a six-event
+pull/ACK, cancellation of a real OpenCode process, and explicit stop/restart
+without replay. Cancellation did not prove model output, effort telemetry, or
+remote inference termination, and no code was accepted.
+
 The same operator route provides explicit owner/instance-scoped idle stop and
 truthful stopped-session inspection. An opt-in
 [CLI notification route](NATIVE-OPERATOR-NOTIFICATIONS.md) uses a fixed message
@@ -84,14 +90,16 @@ fixture gates and qualified limits.
 
 The [approved-session notification extension](APPROVED-NOTIFICATIONS.md) adds
 default-off startup policy, fixed approval wake-ups and transactional byte-bounded
-event pull/ACK through the original paired native enrollment. Fake-process local
-coverage does not establish delivery to real native chats.
+event pull/ACK through the original paired native enrollment. The
+[2026-10-31 operator CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md) records one live
+delivery and busy-turn callback in its single conversation; fake-process fixtures
+and that pilot still do not establish general multi-chat delivery.
 
 Provider interactive continuation and the [multi-chat routing gate](NATIVE-ROUTING.md)
-remain separate integration work. Live host-to-Codex notifications, busy-turn
-delivery, product API entitlement, and cross-platform release
-hardening are not implied by the local configuration/execution checkpoint. See
-[validation](VALIDATION.md).
+remain separate integration work. General multi-chat notification delivery,
+product API entitlement, and cross-platform release hardening remain open. See
+[validation](VALIDATION.md) and the
+[operator CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md).
 
 The optional [Codex-first startup extension](CODEX-WORKFLOW.md) removes the
 desktop Start step for an existing approved root task. Trusted scope approval
@@ -100,8 +108,10 @@ uses explicit desktop confirmation or the separate operator-only
 not authentication or proof of human conversation provenance. The OpenCode v2
 worker now integrates an [owned-session metadata collector](OPENCODE-METADATA.md)
 without changing requested-versus-observed evidence or automatic-acceptance boundaries.
-A [qualified native single-chat pilot](NATIVE-PILOT-2026-10-30.md) also records the
-simulated loop, deferred busy-turn delivery and remaining identity/onboarding gates.
+A [qualified native single-chat pilot](NATIVE-PILOT-2026-10-30.md) records that
+earlier simulated loop and its remaining identity/onboarding gates. The later
+[2026-10-31 operator CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md) records busy-turn
+delivery without generalizing it to multi-chat routing.
 
 The [trusted operator CLI](OPERATOR-WORKFLOW.md) exposes the existing task
 commit, review acceptance and same-run integration operations to an explicit
@@ -154,7 +164,10 @@ caused completed replies. The CLI was 0.165.0-alpha.1.2 and the desktop was open
 One reply changed the echoed tag: software must own correlation IDs. A later isolated native MCP test completed the deterministic
 question/answer/completion loop with both wake-ups and final acknowledgements;
 see [validation](VALIDATION.md). Busy-turn, real-worker recovery, app-closed and
-cross-platform behaviour remain unverified.
+cross-platform behaviour remained unverified at that checkpoint. The later
+[2026-10-31 operator CLI pilot](NATIVE-CLI-PILOT-2026-10-31.md) records one live
+busy-turn callback and bounded pull/ACK without changing the earlier observations
+or establishing multi-chat routing.
 
 The independent Argon High and Opus 5.5 High design reviews were completed before
 implementation. They motivated the invariants above; their agreement is not

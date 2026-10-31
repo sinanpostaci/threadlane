@@ -11,7 +11,7 @@ checkout; the existing development shells remain the normal development path.
 | --- | --- |
 | Python desktop build wrapper | Ten offline fixture tests pass. |
 | Nix CLI package | Source build passed using the root `Cargo.lock`. Includes `threadlane` and the paired `threadlane-native-mcp` bootstrap. |
-| Nix desktop package | Linux source build passed with the standalone Tauri lockfile, a separately built frontend, and explicit Cargo build subdirectory. The resulting executable's `--help` passed; GUI rendering through this Nix wrapper remains unverified. |
+| Nix desktop package | Linux source build passed with the standalone Tauri lockfile, a separately built frontend, and explicit Cargo build subdirectory. The resulting executable's `--help` passed. The latest native window creation was observed; visual human acceptance of the current window is still pending. |
 | GitHub Actions workflow | Manual `workflow_dispatch` source-build matrix added. It has not been dispatched from this checkout, so all three platform results remain unverified. |
 | Desktop runtime | The standalone M4 Linux binary builds and passes all-target Clippy. The earlier native Wayland preview rendered successfully. Current Tools/Profiles and History browser checks use explicit DEV fixtures; they do not prove native chat pairing. |
 
@@ -181,7 +181,7 @@ compositor, and platform combinations still need their own smoke tests.
 
 | Platform | Nix package | Source/CI build |
 | --- | --- | --- |
-| Linux x86_64 | Locked frontend build passes; complete package validation is in progress. | Standalone desktop build and Clippy pass. Manual workflow not yet run. |
+| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. Manual workflow not yet run. |
 | Linux aarch64 | Defined for CLI and desktop; not built. | No workflow matrix entry yet. |
 | macOS | CLI expression only; desktop Nix package not provided. | Manual workflow entry not yet run. |
 | Windows | No Nix package. | Manual workflow entry not yet run; Windows runtime ACL support remains a separate product concern. |
