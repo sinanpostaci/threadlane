@@ -378,6 +378,7 @@ pub const SANITIZED_GIT_ENV_OVERRIDES: &[(&str, &str)] = &[
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_SYSTEM", "/dev/null"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
+    ("GIT_OPTIONAL_LOCKS", "0"),
 ];
 
 /// Combined report of running a worker inside an owned task worktree and evaluating the post-run diff gate.
@@ -755,6 +756,258 @@ pub fn begin_worktree_job(
         work_area_root: manifest.work_area_root,
         worktree_id: worktree_id.to_string(),
     })
+}
+
+/// Opens an existing private (`0600`) regular lock file without creating or mutating it.
+///
+/// - Returns `Ok(None)` if `path` does not exist (`ErrorKind::NotFound`), leaving the missing file
+///   absent on disk.
+/// - Refuses symlinks (in `path` or any ancestor component), non-regular files (directories, FIFOs,
+///   sockets, device nodes), non-`0600` permissions, foreign UID ownership, or inode/metadata
+///   changes between `lstat` and `open` (`O_RDONLY | O_NOFOLLOW | O_NONBLOCK`).
+pub fn open_existing_private_lock_file(
+    path: &Path,
+    label: &str,
+) -> Result<Option<File>, WorkerError> {
+    ensure_platform_supported()?;
+    #[cfg(unix)]
+    {
+        open_existing_private_lock_file_with_uid(path, label, current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, label);
+        unreachable!()
+    }
+}
+
+/// Verifies in read-only mode that a managed worktree has no active job or held lock without
+/// creating a missing `.lock` file.
+///
+/// - Refuses with [`CleanupRefusalReason::ActiveJob`] if `manifest.job_active` is `true` or
+///   `manifest.active_job_pid` refers to a live process.
+/// - If `<work_area_root>/manifests/<worktree_id>.lock` does not exist, returns `Ok(())` without
+///   creating the lock file.
+/// - If the `.lock` file exists, opens it via [`open_existing_private_lock_file`], probes a
+///   nonblocking exclusive lock via [`fs2::FileExt::try_lock_exclusive`], verifies that the locked
+///   file's device/inode, regular-file type, `0600` permissions, and owner UID still match the
+///   path on disk, and unlocks via [`fs2::FileExt::unlock`] without killing any process.
+pub fn ensure_worktree_job_inactive_readonly(
+    manifest: &WorktreeManifest,
+) -> Result<(), WorkerError> {
+    ensure_platform_supported()?;
+    #[cfg(unix)]
+    {
+        ensure_worktree_job_inactive_readonly_with_uid(manifest, current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = manifest;
+        unreachable!()
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn current_euid() -> u32 {
+    // SAFETY: `geteuid` is a thread-safe POSIX syscall taking no arguments.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn open_existing_private_lock_file_with_uid(
+    path: &Path,
+    label: &str,
+    expected_uid: u32,
+) -> Result<Option<File>, WorkerError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let _ = validate_absolute_no_symlink_components(path, label)?;
+    let parent = path.parent().ok_or_else(|| {
+        WorkerError::InvalidSpec(format!(
+            "{label} path `{}` must have a parent directory",
+            path.display()
+        ))
+    })?;
+    let parent_meta = fs::symlink_metadata(parent)?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.file_type().is_dir() {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} parent `{}` must be a non-symlink directory",
+            parent.display()
+        )));
+    }
+
+    let pre_meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(WorkerError::Io(err)),
+    };
+
+    if pre_meta.file_type().is_symlink() {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` must not be a symlink",
+            path.display()
+        )));
+    }
+    if !pre_meta.file_type().is_file() {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` must be a regular file",
+            path.display()
+        )));
+    }
+    let pre_mode = pre_meta.permissions().mode() & 0o7777;
+    if pre_mode != 0o600 {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` has insecure permissions {:04o} (expected 0600)",
+            path.display(),
+            pre_mode
+        )));
+    }
+    if pre_meta.uid() != expected_uid {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` has foreign owner uid {} (expected {expected_uid})",
+            path.display(),
+            pre_meta.uid()
+        )));
+    }
+
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(false)
+        .create(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(WorkerError::SecurityViolation(format!(
+                "{label} `{}` must not be a symlink",
+                path.display()
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(WorkerError::SecurityViolation(format!(
+                "{label} `{}` was removed or replaced during open",
+                path.display()
+            )));
+        }
+        Err(err) => return Err(WorkerError::Io(err)),
+    };
+
+    verify_locked_private_file_unchanged(&file, path, &pre_meta, label, expected_uid)?;
+    Ok(Some(file))
+}
+
+#[cfg(unix)]
+fn verify_locked_private_file_unchanged(
+    file: &File,
+    path: &Path,
+    expected_meta: &fs::Metadata,
+    label: &str,
+    expected_uid: u32,
+) -> Result<(), WorkerError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let open_meta = file.metadata()?;
+    let post_sym = fs::symlink_metadata(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            WorkerError::SecurityViolation(format!(
+                "{label} `{}` was removed or replaced during inspection",
+                path.display()
+            ))
+        } else {
+            WorkerError::Io(err)
+        }
+    })?;
+
+    if post_sym.file_type().is_symlink()
+        || !post_sym.file_type().is_file()
+        || !open_meta.file_type().is_file()
+    {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    if open_meta.dev() != expected_meta.dev()
+        || open_meta.ino() != expected_meta.ino()
+        || post_sym.dev() != open_meta.dev()
+        || post_sym.ino() != open_meta.ino()
+    {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` inode changed during inspection",
+            path.display()
+        )));
+    }
+    let open_mode = open_meta.permissions().mode() & 0o7777;
+    let post_mode = post_sym.permissions().mode() & 0o7777;
+    if open_mode != 0o600 || post_mode != 0o600 {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` has insecure permissions {:04o} (expected 0600)",
+            path.display(),
+            if open_mode != 0o600 {
+                open_mode
+            } else {
+                post_mode
+            }
+        )));
+    }
+    if open_meta.uid() != expected_uid || post_sym.uid() != expected_uid {
+        return Err(WorkerError::SecurityViolation(format!(
+            "{label} `{}` has foreign owner uid {} (expected {expected_uid})",
+            path.display(),
+            if open_meta.uid() != expected_uid {
+                open_meta.uid()
+            } else {
+                post_sym.uid()
+            }
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_worktree_job_inactive_readonly_with_uid(
+    manifest: &WorktreeManifest,
+    expected_uid: u32,
+) -> Result<(), WorkerError> {
+    if manifest.job_active {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::ActiveJob,
+            detail: "manifest indicates `job_active == true`".to_string(),
+        });
+    }
+    if let Some(pid) = manifest.active_job_pid.filter(|&pid| is_process_alive(pid)) {
+        return Err(WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::ActiveJob,
+            detail: format!("active_job_pid {pid} is still running"),
+        });
+    }
+
+    let manifests_dir = manifest.work_area_root.join(MANIFESTS_SUBDIR);
+    let lock_path = manifests_dir.join(format!("{}.lock", manifest.worktree_id));
+    if let Some(lock_file) =
+        open_existing_private_lock_file_with_uid(&lock_path, "worktree job lock", expected_uid)?
+    {
+        let open_meta = lock_file.metadata()?;
+        fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|_| WorkerError::CleanupRefused {
+            worktree_id: manifest.worktree_id.clone(),
+            reason: CleanupRefusalReason::ActiveJob,
+            detail: "worktree job lock is held by an active process".to_string(),
+        })?;
+        let verify_res = verify_locked_private_file_unchanged(
+            &lock_file,
+            &lock_path,
+            &open_meta,
+            "worktree job lock",
+            expected_uid,
+        );
+        let _ = fs2::FileExt::unlock(&lock_file);
+        verify_res?;
+    }
+    Ok(())
 }
 
 /// Loads and validates a private [`WorktreeManifest`] from `<work_area_root>/manifests/<worktree_id>.json`.
@@ -2663,7 +2916,8 @@ pub fn is_worktree_clean(checkout_path: &Path, timeout_ms: u64) -> Result<bool, 
 
 /// Removes all inherited `GIT_*` environment variables (case-insensitive) from `cmd`
 /// and installs controlled `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`,
-/// `GIT_CONFIG_SYSTEM=/dev/null`, and `GIT_CONFIG_GLOBAL=/dev/null` overrides.
+/// `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_GLOBAL=/dev/null`, and
+/// `GIT_OPTIONAL_LOCKS=0` overrides.
 pub fn sanitize_git_command_env(cmd: &mut std::process::Command) {
     sanitize_git_command_env_from(cmd, std::env::vars_os());
 }
@@ -3869,4 +4123,349 @@ fn scan_symlinks_in_checkout(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+    use tempfile::TempDir;
+
+    fn init_repo_and_manager() -> (TempDir, PathBuf, WorktreeManager) {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        let repo = root.join("repo");
+        let work_area = root.join("work-area");
+        fs::create_dir_all(repo.join("src")).expect("create repo src");
+
+        run_sanitized_git(&repo, &["init", "--quiet"], DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("git init");
+        run_sanitized_git(
+            &repo,
+            &["config", "user.name", "Threadlane Test"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git config user.name");
+        run_sanitized_git(
+            &repo,
+            &["config", "user.email", "test@threadlane.local"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git config user.email");
+
+        fs::write(repo.join("src/lib.rs"), "pub fn v() -> u32 { 1 }\n").expect("write base file");
+        run_sanitized_git(&repo, &["add", "."], DEFAULT_GIT_COMMAND_TIMEOUT_MS).expect("git add");
+        run_sanitized_git(
+            &repo,
+            &["commit", "-m", "initial", "--quiet"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git commit");
+
+        let base_sha = resolve_exact_commit_sha(&repo, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve HEAD");
+        let manager =
+            WorktreeManager::new(&repo, &work_area, &base_sha).expect("create WorktreeManager");
+        (tmp, repo, manager)
+    }
+
+    fn resolve_worktree_index_path(checkout_path: &Path) -> PathBuf {
+        let raw = run_sanitized_git(
+            checkout_path,
+            &["rev-parse", "--git-path", "index"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("resolve git index path");
+        let trimmed = raw.trim();
+        let path = Path::new(trimmed);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            checkout_path.join(path)
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn create_fifo(path: &Path) {
+        let mut bytes = path.as_os_str().as_bytes().to_vec();
+        bytes.push(0);
+        // SAFETY: `bytes` is a NUL-terminated path buffer in an owned temporary directory.
+        let rc = unsafe { libc::mkfifo(bytes.as_ptr().cast::<libc::c_char>(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo failed: {}", std::io::Error::last_os_error());
+    }
+
+    #[test]
+    fn sanitize_git_command_env_sets_optional_locks_zero_and_preserves_index_across_status() {
+        assert!(
+            SANITIZED_GIT_ENV_OVERRIDES.contains(&("GIT_OPTIONAL_LOCKS", "0")),
+            "SANITIZED_GIT_ENV_OVERRIDES must include GIT_OPTIONAL_LOCKS=0"
+        );
+
+        let mut cmd = Command::new("git");
+        cmd.env("GIT_DIR", "/tmp/poison-git-dir");
+        cmd.env("git_index_file", "/tmp/poison-index");
+        cmd.env("GIT_OPTIONAL_LOCKS", "1");
+        cmd.env("KEEP_NON_GIT", "ok");
+        sanitize_git_command_env_from(
+            &mut cmd,
+            vec![
+                (OsStr::new("GIT_DIR"), OsStr::new("/tmp/poison-git-dir")),
+                (
+                    OsStr::new("git_index_file"),
+                    OsStr::new("/tmp/poison-index"),
+                ),
+                (OsStr::new("GIT_OPTIONAL_LOCKS"), OsStr::new("1")),
+                (OsStr::new("KEEP_NON_GIT"), OsStr::new("ok")),
+            ],
+        );
+
+        let envs: BTreeMap<String, Option<String>> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().to_string(),
+                    v.map(|val| val.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        assert_eq!(envs.get("GIT_DIR"), Some(&None));
+        assert_eq!(envs.get("git_index_file"), Some(&None));
+        assert_eq!(envs.get("GIT_OPTIONAL_LOCKS"), Some(&Some("0".to_string())));
+        assert_eq!(envs.get("KEEP_NON_GIT"), Some(&Some("ok".to_string())));
+
+        let (_tmp, _repo, manager) = init_repo_and_manager();
+        let allowed = BTreeSet::from(["src/lib.rs".to_string()]);
+        let task = manager
+            .create_task_worktree_with_token("run-1", "task-1", "tok01", &allowed)
+            .expect("create task worktree");
+
+        // Mandatory write operations (`git add`, `git commit`) must continue to work normally.
+        let lib_file = task.checkout_path.join("src/lib.rs");
+        let updated_content = "pub fn v() -> u32 { 42 }\n";
+        fs::write(&lib_file, updated_content).expect("write updated file");
+        run_sanitized_git(
+            &task.checkout_path,
+            &["add", "-A", "--", "."],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git add");
+        run_sanitized_git(
+            &task.checkout_path,
+            &[
+                "-c",
+                "user.name=Threadlane Test",
+                "-c",
+                "user.email=test@threadlane.local",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-q",
+                "-m",
+                "task commit",
+            ],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git commit");
+
+        // Rewrite the exact same committed bytes to dirty the working tree stat cache relative
+        // to the index without changing file content.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(&lib_file, updated_content).expect("rewrite identical content");
+
+        let index_path = resolve_worktree_index_path(&task.checkout_path);
+        let index_bytes_before = fs::read(&index_path).expect("read index before");
+        let index_meta_before = fs::symlink_metadata(&index_path).expect("stat index before");
+
+        assert!(
+            is_worktree_clean(&task.checkout_path, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("is_worktree_clean")
+        );
+        let diff_report =
+            evaluate_diff_gate(manager.work_area_root(), &task.worktree_id).expect("diff gate");
+        assert!(diff_report.passed);
+
+        let index_bytes_after = fs::read(&index_path).expect("read index after");
+        let index_meta_after = fs::symlink_metadata(&index_path).expect("stat index after");
+        assert_eq!(index_bytes_after, index_bytes_before);
+        assert_eq!(
+            index_meta_after.modified().expect("mtime after"),
+            index_meta_before.modified().expect("mtime before")
+        );
+        assert_eq!(index_meta_after.ino(), index_meta_before.ino());
+    }
+
+    #[test]
+    fn open_existing_private_lock_file_and_readonly_inactive_check_enforce_security_and_keep_missing_lock_absent(
+    ) {
+        let (_tmp, _repo, manager) = init_repo_and_manager();
+        let allowed = BTreeSet::from(["src/lib.rs".to_string()]);
+        let task = manager
+            .create_task_worktree_with_token("run-1", "task-1", "tok02", &allowed)
+            .expect("create task worktree");
+        let manifests_dir = manager.work_area_root().join(MANIFESTS_SUBDIR);
+        let lock_path = manifests_dir.join(format!("{}.lock", task.worktree_id));
+
+        // 1. Missing lock stays missing and passes readonly inactive check when manifest guards pass.
+        assert!(fs::symlink_metadata(&lock_path).is_err());
+        assert!(
+            open_existing_private_lock_file(&lock_path, "worktree job lock")
+                .expect("open missing lock")
+                .is_none()
+        );
+        assert!(fs::symlink_metadata(&lock_path).is_err());
+        ensure_worktree_job_inactive_readonly(&task).expect("inactive when lock missing");
+        assert!(fs::symlink_metadata(&lock_path).is_err());
+
+        // 2. Missing lock still refuses when manifest job_active == true or active_job_pid is alive.
+        let mut active_flag_manifest = task.clone();
+        active_flag_manifest.job_active = true;
+        let err = ensure_worktree_job_inactive_readonly(&active_flag_manifest)
+            .expect_err("must refuse job_active == true");
+        assert!(matches!(
+            err,
+            WorkerError::CleanupRefused {
+                reason: CleanupRefusalReason::ActiveJob,
+                ..
+            }
+        ));
+        assert!(fs::symlink_metadata(&lock_path).is_err());
+
+        let mut live_pid_manifest = task.clone();
+        live_pid_manifest.active_job_pid = Some(std::process::id());
+        let err = ensure_worktree_job_inactive_readonly(&live_pid_manifest)
+            .expect_err("must refuse live active_job_pid");
+        assert!(matches!(
+            err,
+            WorkerError::CleanupRefused {
+                reason: CleanupRefusalReason::ActiveJob,
+                ..
+            }
+        ));
+        assert!(fs::symlink_metadata(&lock_path).is_err());
+
+        // 3. Held job lock via begin_worktree_job or external fs2 lock refuses without killing processes.
+        let guard =
+            begin_worktree_job(manager.work_area_root(), &task.worktree_id).expect("begin job");
+        let err =
+            ensure_worktree_job_inactive_readonly(&task).expect_err("must refuse held job lock");
+        assert!(matches!(
+            err,
+            WorkerError::CleanupRefused {
+                reason: CleanupRefusalReason::ActiveJob,
+                ..
+            }
+        ));
+        let finished_manifest = guard.finish().expect("finish job");
+        ensure_worktree_job_inactive_readonly(&finished_manifest)
+            .expect("inactive after guard finish");
+
+        let external_lock = open_private_lock_file(&lock_path, "worktree job lock")
+            .expect("open existing lock for test");
+        fs2::FileExt::try_lock_exclusive(&external_lock).expect("lock exclusive");
+        let err = ensure_worktree_job_inactive_readonly(&finished_manifest)
+            .expect_err("must refuse externally held lock");
+        assert!(matches!(
+            err,
+            WorkerError::CleanupRefused {
+                reason: CleanupRefusalReason::ActiveJob,
+                ..
+            }
+        ));
+        fs2::FileExt::unlock(&external_lock).expect("unlock external");
+        drop(external_lock);
+
+        // 4. Deleting inactive lock leaves it absent across readonly checks.
+        fs::remove_file(&lock_path).expect("remove lock");
+        ensure_worktree_job_inactive_readonly(&finished_manifest)
+            .expect("inactive after deleting lock");
+        assert!(fs::symlink_metadata(&lock_path).is_err());
+
+        // 5. Insecure lock permissions (0644 and 0700) are refused without chmodding.
+        let _ = open_private_lock_file(&lock_path, "worktree job lock").expect("create lock");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+        assert!(matches!(
+            open_existing_private_lock_file(&lock_path, "worktree job lock"),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        assert!(matches!(
+            ensure_worktree_job_inactive_readonly(&finished_manifest),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        let mode_after = fs::symlink_metadata(&lock_path)
+            .expect("stat 0644 lock")
+            .permissions()
+            .mode()
+            & 0o7777;
+        assert_eq!(mode_after, 0o644);
+
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        assert!(matches!(
+            ensure_worktree_job_inactive_readonly(&finished_manifest),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        fs::remove_file(&lock_path).expect("remove insecure lock");
+
+        // 6. Symlink lock is refused.
+        let symlink_target = manifests_dir.join("target.lock");
+        let _ = open_private_lock_file(&symlink_target, "target lock").expect("create target");
+        symlink(&symlink_target, &lock_path).expect("create symlink lock");
+        assert!(matches!(
+            open_existing_private_lock_file(&lock_path, "worktree job lock"),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        assert!(matches!(
+            ensure_worktree_job_inactive_readonly(&finished_manifest),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        fs::remove_file(&lock_path).expect("remove symlink lock");
+        fs::remove_file(&symlink_target).expect("remove target lock");
+
+        // 7. Non-regular files (directory and FIFO) are refused without blocking.
+        fs::create_dir(&lock_path).expect("create dir at lock path");
+        assert!(matches!(
+            open_existing_private_lock_file(&lock_path, "worktree job lock"),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        fs::remove_dir(&lock_path).expect("remove dir at lock path");
+
+        create_fifo(&lock_path);
+        assert!(matches!(
+            open_existing_private_lock_file(&lock_path, "worktree job lock"),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        assert!(matches!(
+            ensure_worktree_job_inactive_readonly(&finished_manifest),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        fs::remove_file(&lock_path).expect("remove fifo at lock path");
+
+        // 8. Foreign owner UID and inode replacement during inspection are refused.
+        let opened = open_private_lock_file(&lock_path, "worktree job lock").expect("create lock");
+        let open_meta = opened.metadata().expect("opened metadata");
+        let foreign_uid = current_euid().wrapping_add(1);
+        assert!(matches!(
+            open_existing_private_lock_file_with_uid(&lock_path, "worktree job lock", foreign_uid),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+        assert!(matches!(
+            ensure_worktree_job_inactive_readonly_with_uid(&finished_manifest, foreign_uid),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+
+        fs::remove_file(&lock_path).expect("unlink original lock inode");
+        let _replacement =
+            open_private_lock_file(&lock_path, "worktree job lock").expect("create new inode");
+        assert!(matches!(
+            verify_locked_private_file_unchanged(
+                &opened,
+                &lock_path,
+                &open_meta,
+                "worktree job lock",
+                current_euid(),
+            ),
+            Err(WorkerError::SecurityViolation(_))
+        ));
+    }
 }

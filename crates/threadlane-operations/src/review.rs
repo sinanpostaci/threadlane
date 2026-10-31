@@ -1,18 +1,17 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_workers::{
-    begin_worktree_job, evaluate_diff_gate, is_commit_ancestor, is_process_alive,
-    is_worktree_clean, load_and_verify_manifest, open_private_lock_file, read_private_json,
-    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, run_sanitized_git_bytes,
-    sanitize_and_redact, validate_exact_40_hex_sha, validate_existing_canonical_dir,
-    validate_repo_relative_path, validate_sha256_hex_digest, validate_simple_identifier,
-    write_private_json_atomic, ChangedPathEntry, WorkerFilePermissions, WorkerRunStatus,
-    WorktreeKind, WorktreeManifest, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
-    MANIFESTS_SUBDIR,
+    begin_worktree_job, ensure_worktree_job_inactive_readonly, evaluate_diff_gate,
+    is_commit_ancestor, is_process_alive, is_worktree_clean, load_and_verify_manifest,
+    open_private_lock_file, read_private_json, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    run_sanitized_git, run_sanitized_git_bytes, sanitize_and_redact, validate_exact_40_hex_sha,
+    validate_existing_canonical_dir, validate_repo_relative_path, validate_sha256_hex_digest,
+    validate_simple_identifier, write_private_json_atomic, ChangedPathEntry, CleanupRefusalReason,
+    WorkerError, WorkerFilePermissions, WorkerRunStatus, WorktreeKind, WorktreeManifest,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES, MANIFESTS_SUBDIR,
 };
 use uuid::Uuid;
 
@@ -764,7 +763,7 @@ pub fn commit_task_worktree_changes(
     result
 }
 
-/// Read-only inspection of an owned `WorktreeKind::Task` checkout to produce a digest-bound
+/// Inspection of an owned `WorktreeKind::Task` checkout to produce a digest-bound
 /// [`ReviewSubject`].
 ///
 /// Requires the task checkout to have no active job, a clean working tree (all task changes
@@ -773,6 +772,29 @@ pub fn commit_task_worktree_changes(
 pub fn inspect_review_subject(
     request: &InspectReviewSubjectRequest,
 ) -> Result<ReviewSubject, OperationsError> {
+    inspect_review_subject_with_inactive_check(request, ensure_worktree_inactive)
+}
+
+/// Strictly read-only inspection of an owned `WorktreeKind::Task` checkout to produce a
+/// digest-bound [`ReviewSubject`] without creating a missing worktree `.lock` file or
+/// rewriting optional Git index locks.
+///
+/// Preserves all subject, digest, write-scope, ancestry, active-job, and clean-checkout
+/// validations performed by [`inspect_review_subject`], while using
+/// [`ensure_worktree_job_inactive_readonly`] so a missing inactive `.lock` file remains absent.
+pub fn inspect_review_subject_readonly(
+    request: &InspectReviewSubjectRequest,
+) -> Result<ReviewSubject, OperationsError> {
+    inspect_review_subject_with_inactive_check(request, ensure_worktree_inactive_readonly)
+}
+
+fn inspect_review_subject_with_inactive_check<F>(
+    request: &InspectReviewSubjectRequest,
+    inactive_check: F,
+) -> Result<ReviewSubject, OperationsError>
+where
+    F: FnOnce(&WorktreeManifest) -> Result<(), OperationsError>,
+{
     if let Some(status) = request.worker_status {
         validate_worker_status_for_review(status, !request.policy.require_effort_evidence)?;
     }
@@ -781,7 +803,7 @@ pub fn inspect_review_subject(
 
     let manifest =
         load_and_verify_task_manifest(&request.work_area_root, &request.task_worktree_id)?;
-    ensure_worktree_inactive(&manifest)?;
+    inactive_check(&manifest)?;
 
     let canonical_checkout =
         validate_existing_canonical_dir(&manifest.checkout_path, "task checkout_path")?;
@@ -1065,14 +1087,28 @@ pub(crate) fn ensure_worktree_inactive(manifest: &WorktreeManifest) -> Result<()
     let manifests_dir = manifest.work_area_root.join(MANIFESTS_SUBDIR);
     let lock_path = manifests_dir.join(format!("{}.lock", manifest.worktree_id));
     let lock_file = open_private_lock_file(&lock_path, "worktree job lock")?;
-    lock_file
-        .try_lock_exclusive()
-        .map_err(|_| OperationsError::ActiveJob {
-            worktree_id: manifest.worktree_id.clone(),
-            detail: "worktree job lock is held by an active process".to_string(),
-        })?;
-    let _ = lock_file.unlock();
+    fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|_| OperationsError::ActiveJob {
+        worktree_id: manifest.worktree_id.clone(),
+        detail: "worktree job lock is held by an active process".to_string(),
+    })?;
+    let _ = fs2::FileExt::unlock(&lock_file);
     Ok(())
+}
+
+pub(crate) fn ensure_worktree_inactive_readonly(
+    manifest: &WorktreeManifest,
+) -> Result<(), OperationsError> {
+    ensure_worktree_job_inactive_readonly(manifest).map_err(|err| match err {
+        WorkerError::CleanupRefused {
+            worktree_id,
+            reason: CleanupRefusalReason::ActiveJob,
+            detail,
+        } => OperationsError::ActiveJob {
+            worktree_id,
+            detail,
+        },
+        other => OperationsError::from(other),
+    })
 }
 
 pub(crate) fn verify_worktree_branch(

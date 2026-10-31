@@ -67,10 +67,11 @@ pub use fs_safety::{
     write_private_json_atomic,
 };
 pub use git::{
-    begin_worktree_job, cleanup_integrated_worktree, cleanup_worktree, evaluate_diff_gate,
-    evaluate_diff_gate_with_limits, evaluate_diff_gate_with_scan_limits,
-    evaluate_diff_gate_with_timeout, execute_worker_task, execute_worker_task_with_observer,
-    inspect_base_commit_path_kind, is_commit_ancestor, is_worktree_clean, load_and_verify_manifest,
+    begin_worktree_job, cleanup_integrated_worktree, cleanup_worktree,
+    ensure_worktree_job_inactive_readonly, evaluate_diff_gate, evaluate_diff_gate_with_limits,
+    evaluate_diff_gate_with_scan_limits, evaluate_diff_gate_with_timeout, execute_worker_task,
+    execute_worker_task_with_observer, inspect_base_commit_path_kind, is_commit_ancestor,
+    is_worktree_clean, load_and_verify_manifest, open_existing_private_lock_file,
     resolve_allowed_write_scopes_at_base, resolve_exact_commit_sha, resolve_exact_tree_sha,
     run_sanitized_git, run_sanitized_git_allow_nonzero, run_sanitized_git_bytes,
     sanitize_git_command_env, sanitize_git_command_env_from, validate_exact_40_hex_sha,
