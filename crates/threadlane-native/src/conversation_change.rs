@@ -2060,21 +2060,26 @@ async fn evaluate_change_request(
         }
     }
 
-    let clean_profile_id =
-        match request.proposed_profile_id {
-            Some(ref raw) => Some(validate_identifier("proposed_profile_id", raw).map_err(
-                |_| ConversationChangeError::Validation {
-                    reason: "proposed_profile_id failed identifier syntax validation.",
-                },
-            )?),
-            None => None,
-        };
-    let clean_model_id = match request.proposed_model_id {
-        Some(ref raw) => Some(validate_identifier("proposed_model_id", raw).map_err(|_| {
-            ConversationChangeError::Validation {
-                reason: "proposed_model_id failed identifier syntax validation.",
-            }
-        })?),
+    let clean_profile_id = match &request.proposed_profile_id {
+        Some(raw) => {
+            threadlane_workflow::validate_registry_identifier(raw).map_err(|_| {
+                ConversationChangeError::Validation {
+                    reason: "proposed_profile_id failed canonical registry validation.",
+                }
+            })?;
+            Some(raw.clone())
+        }
+        None => None,
+    };
+    let clean_model_id = match &request.proposed_model_id {
+        Some(raw) => {
+            threadlane_workflow::validate_registry_identifier(raw).map_err(|_| {
+                ConversationChangeError::Validation {
+                    reason: "proposed_model_id failed canonical registry validation.",
+                }
+            })?;
+            Some(raw.clone())
+        }
         None => None,
     };
     let clean_effort = match request.proposed_effort {
@@ -2424,9 +2429,8 @@ async fn evaluate_change_request(
     };
 
     let observed_stop_state = observed_task.as_ref().map(|c| c.stop_state);
-    let prior_task_proven_stopped = observed_stop_state
-        .map(ObservedTaskStopState::is_proven_stopped)
-        .unwrap_or(true);
+    let prior_task_proven_stopped =
+        observed_stop_state.is_some_and(ObservedTaskStopState::is_proven_stopped);
 
     let decision = ConversationChangeDecision {
         policy_version: CONVERSATION_CHANGE_POLICY_VERSION.to_string(),

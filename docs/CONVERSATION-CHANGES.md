@@ -265,3 +265,8 @@ cover:
 These commands do not establish live provider in-flight steering, transcript
 monitoring, automatic replacement task dispatch, native per-call caller identity,
 general multi-chat routing, or macOS/Windows support.
+
+Approval-wide requests without a specific observed task report
+`prior_task_proven_stopped: false`: omitting a task is not aggregate stop proof.
+Provider-qualified model proposals use the canonical opaque registry identifier
+rules and still require a new plan and approval; they never change a frozen task.

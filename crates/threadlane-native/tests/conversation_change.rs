@@ -712,6 +712,29 @@ async fn questions_during_active_worker_execution_never_revise_cancel_dispatch_o
         requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
         cancel_action: None,
     };
+    // An approval-wide model proposal has no observed task stop proof. In particular,
+    // omitting task_id while a real worker runs must not fabricate a stopped state.
+    let mut approval_wide = question_req.clone();
+    approval_wide.request_key = "approval-wide-model-preview".to_string();
+    approval_wide.task_id = None;
+    approval_wide.expected_task_revision = None;
+    approval_wide.kind = ConversationChangeKind::ModelOrProfileChange;
+    approval_wide.proposed_model_id = Some("opencode-go/deepseek-v4.1-flash".to_string());
+    let wide_path = fx.write_request_file("approval-wide-model.json", &approval_wide);
+    let wide_out = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &["preview-change", "--request", wide_path.to_str().unwrap()],
+        )
+        .await;
+    let wide: ConversationChangePreview = parse_cli_data(&wide_out, &fx.binding_a);
+    assert!(!wide.decision.prior_task_proven_stopped);
+    assert!(wide.decision.blocks_task_advancement);
+    assert!(wide.decision.new_approval_required);
+    assert!(!wide.decision.live_input_delivered);
+    assert!(!wide.decision.process_paused);
+    assert!(!namespace_dir.exists(), "preview remains read-only");
     let req_path = fx.write_request_file("question-1.json", &question_req);
 
     // 1. Preview via `threadlane-session preview-change` (must remain read-only and not create namespace/lock).
