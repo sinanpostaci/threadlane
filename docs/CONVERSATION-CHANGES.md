@@ -46,6 +46,15 @@ active, or awaiting review/integration.
   state is not proven stopped. Explicit resolution (`resolve-change`) refuses to
   resolve a change while an affected task is still `running`, `cancel_requested`,
   or `unknown`.
+- **Uncertain cancellation effects block advancement**: A durable before-effect
+  marker whose returned snapshot was not recorded makes the typed blocker and
+  change-list inspection return `ambiguous_outcome_pending_reconciliation` for
+  the affected approval. This also blocks its downstream tasks even when no
+  change record was appended. An unrelated approval remains observable. Pending
+  effect reservation is checked again under the exclusive mutation lock before
+  the cancellation RPC. Do not retry or clear uncertain effects from prose;
+  inspect actual task state. Automatic reconciliation of these markers is not
+  provided by this surface.
 
 ## Storage and concurrency model
 

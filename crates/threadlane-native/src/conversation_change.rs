@@ -1132,6 +1132,7 @@ impl ConversationChangeStore {
         }
 
         let ledger = self.read_ledger_readonly(&checked_binding)?;
+        refuse_pending_cancel_observation(&ledger, params.approval_id.as_deref())?;
         let summary = build_unresolved_summary(
             &checked_binding,
             ledger.current_revision,
@@ -1203,6 +1204,7 @@ impl ConversationChangeStore {
             validate_task_id(tsk_id)?;
         }
         let ledger = self.read_ledger_readonly(&checked_binding)?;
+        refuse_pending_cancel_observation(&ledger, approval_id)?;
         Ok(build_unresolved_summary(
             &checked_binding,
             ledger.current_revision,
@@ -1417,6 +1419,14 @@ impl ConversationChangeStore {
                     return Err(ConversationChangeError::StaleRevision {
                         reason: "expected_change_revision does not match current conversation-change store revision.",
                     });
+                }
+                // The earlier precheck precedes an await. Reserve the effect
+                // under this same exclusive ledger lock before any cancel RPC.
+                if ledger.ambiguous_cancels.iter().any(|pending| {
+                    pending.request_key == request.request_key
+                        || (pending.approval_id == approval_id && pending.task_id == task_id)
+                }) {
+                    return Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation);
                 }
                 ledger.ambiguous_cancels.push(PendingCancelEffect {
                     request_key: request.request_key.clone(),
@@ -2728,6 +2738,22 @@ fn record_supersedes_approval(
     record.approval_id.as_deref() == Some(apr_id)
 }
 
+fn refuse_pending_cancel_observation(
+    ledger: &PersistedChangeLedger,
+    approval_filter: Option<&str>,
+) -> Result<(), ConversationChangeError> {
+    if ledger
+        .ambiguous_cancels
+        .iter()
+        .any(|pending| approval_filter.is_none_or(|approval_id| pending.approval_id == approval_id))
+    {
+        // Until a returned snapshot is durably recorded, all tasks in the
+        // affected approval may depend on a change whose outcome is unknown.
+        return Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation);
+    }
+    Ok(())
+}
+
 fn build_unresolved_summary(
     binding_id: &str,
     current_revision: u64,
@@ -3450,6 +3476,55 @@ fn map_host_cancel_error(err: &HostError) -> ConversationChangeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uncertain_cancel_marker_blocks_advancement_without_a_change_record() {
+        let root = tempfile::tempdir().expect("temporary plans root");
+        let store = ConversationChangeStore::open(root.path()).expect("open change store");
+        let binding = "binding-uncertain";
+        let affected = "apr_11111111111111111111111111111111";
+        let unrelated = "apr_22222222222222222222222222222222";
+        let mut ledger = PersistedChangeLedger::new(binding);
+        ledger.ambiguous_cancels.push(PendingCancelEffect {
+            request_key: "cancel-once".into(),
+            request_digest: "a".repeat(64),
+            expected_change_revision: 0,
+            approval_id: affected.into(),
+            task_id: "task-a".into(),
+            expected_task_revision: 1,
+        });
+        store
+            .with_binding_lock(binding, |path| {
+                write_ledger_locked(store.namespace_dir(), path, &ledger)
+            })
+            .expect("persist before-effect marker");
+        assert!(ledger.records.is_empty());
+        assert!(matches!(
+            store.unresolved_blocking_changes(binding, Some(affected), Some("dependent-task")),
+            Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation)
+        ));
+        assert!(
+            inspect_unresolved_blocking_changes(root.path(), binding, Some(affected), None)
+                .is_err()
+        );
+        let unrelated_summary = store
+            .unresolved_blocking_changes(binding, Some(unrelated), None)
+            .expect("unrelated approval can be observed");
+        assert!(!unrelated_summary.blocked);
+        assert!(matches!(
+            store.list_changes(
+                binding,
+                &ListConversationChangesParams {
+                    approval_id: Some(affected.into()),
+                    task_id: None,
+                    unresolved_only: false,
+                    cursor: None,
+                    limit: None,
+                }
+            ),
+            Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation)
+        ));
+    }
 
     #[test]
     fn observed_stop_state_distinguishes_cancel_requested_from_proven_stopped() {
