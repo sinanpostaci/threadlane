@@ -39,6 +39,41 @@ pub const MIN_APPROVAL_MAX_PARALLEL: usize = 1;
 /// Maximum allowed `max_parallel` concurrency limit in an [`OperatorApprovalRequest`].
 pub const MAX_APPROVAL_MAX_PARALLEL: usize = 8;
 
+/// Trusted operator-only intent used to prepare and preview a workflow approval before
+/// digest-confirmed persistence.
+///
+/// Carries the same explicit scope and pin fields as [`OperatorApprovalRequest`] except
+/// `expected_plan_digest`, which [`crate::AuthorityStore::prepare_for_operator`] computes from
+/// the active published plan revision and current registry snapshot without auto-upgrading
+/// revisions. Never infers authority from conversation text or extra boolean flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorApprovalIntent {
+    /// Chat binding identifier owning the target plan revision.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Logical plan identifier in [`threadlane_plans::PlanStore`].
+    pub plan_id: String,
+    /// Published plan revision number (`published`, `received`, or `applied`).
+    pub plan_revision: u64,
+    /// Exact registry revision expected by the operator (`must equal plan.profile_revision and current registry revision`).
+    pub expected_registry_revision: u64,
+    /// Existing canonical Git repository path.
+    pub repository_path: PathBuf,
+    /// Exact 40-character hexadecimal Git commit SHA existing in `repository_path`.
+    pub base_commit: String,
+    /// Non-empty list of selected task identifiers from the plan revision (`1..=64`).
+    pub approved_task_ids: Vec<String>,
+    /// Non-empty list of operator-approved repository-relative write scopes (file-exact or trailing-`/` directory prefix).
+    pub approved_write_paths: Vec<String>,
+    /// Maximum concurrent headless worker executions (`1..=8`).
+    pub max_parallel: usize,
+    /// Explicit execution timeout and stream capture budgets.
+    #[serde(default)]
+    pub budgets: ExecutionBudgets,
+}
+
 /// Trusted operator-only request to freeze an immutable workflow approval artifact.
 ///
 /// Only the trusted operator CLI or Tauri control panel may submit this request; MCP tools must
@@ -127,6 +162,25 @@ pub struct ApprovedTaskRecord {
     pub profile_id: Option<String>,
     /// Deterministic idempotency command key for headless worker tasks (`None` for `codex_cli`).
     pub command_key: Option<String>,
+}
+
+/// Private operator-only preview produced by [`crate::AuthorityStore::prepare_for_operator`]
+/// and [`crate::AuthorityStore::preview_for_operator`].
+///
+/// Includes the complete validated [`OperatorApprovalRequest`] (with compiled
+/// `expected_plan_digest` and execution budgets), the 64-character lowercase hex
+/// `subject_digest`, and the full frozen [`ApprovedTaskRecord`] snapshots (resolved model,
+/// effort, canonical CLI executable paths, write scopes, dependencies, and instructions).
+/// This preview is **not** a persisted approval and never modifies `approvals.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorApprovalPreview {
+    /// Complete validated [`OperatorApprovalRequest`] to submit to [`crate::AuthorityStore::approve_confirmed`].
+    pub request: OperatorApprovalRequest,
+    /// 64-character lowercase hex SHA-256 digest over the complete frozen authority subject.
+    pub subject_digest: String,
+    /// Frozen copies of the selected tasks in deterministic plan order.
+    pub tasks: Vec<ApprovedTaskRecord>,
 }
 
 /// Complete private operator-only approval record persisted in [`crate::AuthorityStore`].

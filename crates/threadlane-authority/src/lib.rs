@@ -6,10 +6,10 @@
 //!
 //! ## Core Invariants
 //!
-//! - **Operator-only approval boundary**: [`AuthorityStore::approve`] may only be called by the
-//!   trusted operator CLI or Tauri control panel after explicit UI display and confirmation of the
-//!   request parameters. MCP tools must never call or expose `approve`, and worker/chat prose never
-//!   grants authority.
+//! - **Operator-only approval boundary**: [`AuthorityStore::approve`] and
+//!   [`AuthorityStore::approve_confirmed`] may only be called by the trusted operator CLI or
+//!   Tauri control panel after explicit display and confirmation of the request parameters. MCP
+//!   tools must never call or expose `approve`, and worker/chat prose never grants authority.
 //! - **Complete frozen subject**: Every [`ApprovalRecord`] freezes a full copy of the resolved
 //!   model, effort, canonical CLI executable path (resolved once at approval time), exact task
 //!   write scope, operator allowlist, task instruction, dependencies, execution budgets,
@@ -41,10 +41,11 @@ pub use error::AuthorityError;
 pub use store::{build_approved_worker_profile_config, AuthorityStore};
 pub use types::{
     ApprovalRecord, ApprovalSummary, ApprovedTaskDispatch, ApprovedTaskRecord, MaterializedPlan,
-    NativeRoute, OperatorApprovalRequest, APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME,
-    AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION, MAX_APPROVALS_IN_STORE,
-    MAX_APPROVAL_MAX_PARALLEL, MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS,
-    MAX_AUTHORITY_STORE_BYTES, MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
+    NativeRoute, OperatorApprovalIntent, OperatorApprovalPreview, OperatorApprovalRequest,
+    APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME, AUTHORITY_POLICY_VERSION,
+    AUTHORITY_SCHEMA_VERSION, MAX_APPROVALS_IN_STORE, MAX_APPROVAL_MAX_PARALLEL,
+    MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS, MAX_AUTHORITY_STORE_BYTES,
+    MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
 };
 pub use validation::{
     compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
@@ -2298,5 +2299,115 @@ mod tests {
                 "static profile_digest must match AuthorityStore::materialize bit-for-bit"
             );
         }
+    }
+
+    #[test]
+    fn prepare_preview_and_approve_confirmed_enforce_digest_and_no_preview_persistence() {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().expect("snap").revision;
+
+        let (plan_rev, plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-confirm",
+            "binding-confirm",
+            reg_rev,
+            vec![PlanTask {
+                id: "task-1".to_string(),
+                title: "Confirm Task".to_string(),
+                instruction: "Implement confirmed feature".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+        );
+
+        let intent = OperatorApprovalIntent {
+            binding_id: "binding-confirm".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-confirm".to_string(),
+            plan_revision: plan_rev,
+            expected_registry_revision: reg_rev,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: vec!["task-1".to_string()],
+            approved_write_paths: vec!["src/lib.rs".to_string()],
+            max_parallel: 2,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        let preview = fixture
+            .authority
+            .prepare_for_operator(intent)
+            .expect("prepare_for_operator");
+        assert_eq!(preview.request.expected_plan_digest, plan_digest);
+        assert_eq!(preview.subject_digest.len(), 64);
+        assert_eq!(preview.tasks.len(), 1);
+        assert_eq!(preview.tasks[0].task_id, "task-1");
+        assert_eq!(preview.tasks[0].base_model, "gemini-4-argon-high");
+        assert_eq!(preview.tasks[0].effort.as_deref(), Some("high"));
+        assert!(
+            !fixture.authority.approvals_path().exists(),
+            "prepare_for_operator must never write approvals.json"
+        );
+
+        let direct_preview = fixture
+            .authority
+            .preview_for_operator(preview.request.clone())
+            .expect("preview_for_operator");
+        assert_eq!(direct_preview, preview);
+        assert!(
+            !fixture.authority.approvals_path().exists(),
+            "preview_for_operator must never write approvals.json"
+        );
+
+        // Malformed expected_subject_digest must fail with validation on expected_subject_digest.
+        let malformed_err = fixture
+            .authority
+            .approve_confirmed(preview.request.clone(), "not-a-sha256")
+            .expect_err("malformed expected_subject_digest must fail");
+        assert_eq!(malformed_err.code(), "validation");
+        assert!(matches!(
+            malformed_err,
+            AuthorityError::Validation { ref field, .. } if field == "expected_subject_digest"
+        ));
+        assert!(!fixture.authority.approvals_path().exists());
+
+        // Mismatched 64-hex expected_subject_digest must fail without writing approvals.json.
+        let wrong_digest = "a".repeat(64);
+        let mismatch_err = fixture
+            .authority
+            .approve_confirmed(preview.request.clone(), &wrong_digest)
+            .expect_err("mismatched expected_subject_digest must fail");
+        assert_eq!(mismatch_err.code(), "validation");
+        assert!(matches!(
+            mismatch_err,
+            AuthorityError::Validation { ref field, .. } if field == "expected_subject_digest"
+        ));
+        assert!(!fixture.authority.approvals_path().exists());
+
+        // Matching expected_subject_digest persists the record and is idempotent on repeat.
+        let summary = fixture
+            .authority
+            .approve_confirmed(preview.request.clone(), &preview.subject_digest)
+            .expect("approve_confirmed succeeds");
+        assert_eq!(summary.subject_digest, preview.subject_digest);
+        assert!(fixture.authority.approvals_path().exists());
+
+        let repeat = fixture
+            .authority
+            .approve_confirmed(preview.request.clone(), &preview.subject_digest)
+            .expect("approve_confirmed idempotent repeat");
+        assert_eq!(repeat, summary);
+
+        // Even when the record already exists in the ledger, a mismatched expected_subject_digest must still fail!
+        let post_persist_mismatch = fixture
+            .authority
+            .approve_confirmed(preview.request, &wrong_digest)
+            .expect_err("mismatched digest must fail even after record exists");
+        assert!(matches!(
+            post_persist_mismatch,
+            AuthorityError::Validation { ref field, .. } if field == "expected_subject_digest"
+        ));
     }
 }

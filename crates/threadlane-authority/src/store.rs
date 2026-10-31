@@ -22,10 +22,11 @@ use uuid::Uuid;
 use crate::error::AuthorityError;
 use crate::types::{
     ApprovalRecord, ApprovalSummary, ApprovedTaskDispatch, ApprovedTaskRecord, MaterializedPlan,
-    NativeRoute, OperatorApprovalRequest, APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME,
-    AUTHORITY_POLICY_VERSION, AUTHORITY_SCHEMA_VERSION, MAX_APPROVALS_IN_STORE,
-    MAX_APPROVAL_MAX_PARALLEL, MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS,
-    MAX_AUTHORITY_STORE_BYTES, MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
+    NativeRoute, OperatorApprovalIntent, OperatorApprovalPreview, OperatorApprovalRequest,
+    APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME, AUTHORITY_POLICY_VERSION,
+    AUTHORITY_SCHEMA_VERSION, MAX_APPROVALS_IN_STORE, MAX_APPROVAL_MAX_PARALLEL,
+    MAX_APPROVED_TASKS, MAX_APPROVED_WRITE_PATHS, MAX_AUTHORITY_STORE_BYTES,
+    MAX_EXECUTABLE_PROFILES_PER_APPROVAL, MIN_APPROVAL_MAX_PARALLEL,
 };
 use crate::validation::{
     compute_authority_core_digest, compute_record_subject_digest, derive_approval_id,
@@ -189,6 +190,143 @@ impl AuthorityStore {
         &self.lock_path
     }
 
+    /// Prepares a read-only [`OperatorApprovalPreview`] from an [`OperatorApprovalIntent`]
+    /// without persisting an approval record or mutating any store state.
+    ///
+    /// Retrieves the exact requested active published plan revision and current registry snapshot,
+    /// computes `expected_plan_digest` via [`compile_plan_revision`] without auto-upgrading
+    /// requested revisions, constructs the full [`OperatorApprovalRequest`], and delegates to
+    /// [`Self::preview_for_operator`]. Any concurrent revision or digest change causes a
+    /// validation mismatch rather than silent refreshing.
+    pub fn prepare_for_operator(
+        &self,
+        intent: OperatorApprovalIntent,
+    ) -> Result<OperatorApprovalPreview, AuthorityError> {
+        let binding_id = validate_identifier("binding_id", &intent.binding_id)?;
+        let thread_uuid = validate_canonical_thread_uuid("thread_uuid", &intent.thread_uuid)?;
+        let plan_id = validate_identifier("plan_id", &intent.plan_id)?;
+        let plan_revision = validate_revision("plan_revision", intent.plan_revision)?;
+        let expected_registry_revision = validate_revision(
+            "expected_registry_revision",
+            intent.expected_registry_revision,
+        )?;
+
+        let plan = self
+            .plans
+            .get_revision(&plan_id, plan_revision)?
+            .ok_or_else(|| AuthorityError::PlanNotFound {
+                plan_id: plan_id.clone(),
+                revision: plan_revision,
+            })?;
+
+        if plan.binding_id != binding_id {
+            return Err(AuthorityError::BindingMismatch {
+                plan_id: plan_id.clone(),
+                expected_binding_id: plan.binding_id,
+                actual_binding_id: binding_id,
+            });
+        }
+
+        if !plan.status.is_active_published() {
+            return Err(AuthorityError::UnpublishedOrSupersededPlan {
+                plan_id: plan_id.clone(),
+                revision: plan_revision,
+                status: plan.status,
+            });
+        }
+
+        let registry_snapshot =
+            self.registry
+                .snapshot()
+                .map_err(|err| AuthorityError::Registry {
+                    reason: err.to_string(),
+                })?;
+
+        if expected_registry_revision != plan.profile_revision
+            || registry_snapshot.revision != expected_registry_revision
+        {
+            return Err(AuthorityError::StaleRegistryRevision {
+                plan_id: plan_id.clone(),
+                plan_revision,
+                expected_registry_revision,
+                plan_profile_revision: plan.profile_revision,
+                actual_registry_revision: registry_snapshot.revision,
+            });
+        }
+
+        let compiled_plan = compile_plan_revision(&plan, &registry_snapshot)?;
+
+        let request = OperatorApprovalRequest {
+            binding_id,
+            thread_uuid,
+            plan_id,
+            plan_revision,
+            expected_registry_revision,
+            expected_plan_digest: compiled_plan.plan_digest,
+            repository_path: intent.repository_path,
+            base_commit: intent.base_commit,
+            approved_task_ids: intent.approved_task_ids,
+            approved_write_paths: intent.approved_write_paths,
+            max_parallel: intent.max_parallel,
+            budgets: intent.budgets,
+        };
+
+        self.preview_for_operator(request)
+    }
+
+    /// Validates an [`OperatorApprovalRequest`] and returns a private [`OperatorApprovalPreview`]
+    /// containing the actual normalized request, `subject_digest`, and frozen task records
+    /// without writing `approvals.json` or starting any worker or host process.
+    ///
+    /// Note that opening [`AuthorityStore`] via [`Self::open`] may initialize the private
+    /// authority directory and lock file (`authority.lock`), but [`Self::preview_for_operator`]
+    /// never persists an approval record.
+    pub fn preview_for_operator(
+        &self,
+        request: OperatorApprovalRequest,
+    ) -> Result<OperatorApprovalPreview, AuthorityError> {
+        let record = self.build_validated_approval_record(request, 0)?;
+        let actual_request = OperatorApprovalRequest {
+            binding_id: record.binding_id,
+            thread_uuid: record.thread_uuid,
+            plan_id: record.plan_id,
+            plan_revision: record.plan_revision,
+            expected_registry_revision: record.registry_revision,
+            expected_plan_digest: record.plan_digest,
+            repository_path: record.repository_path,
+            base_commit: record.base_commit,
+            approved_task_ids: record.approved_task_ids,
+            approved_write_paths: record.approved_write_paths,
+            max_parallel: record.max_parallel,
+            budgets: record.budgets,
+        };
+
+        Ok(OperatorApprovalPreview {
+            request: actual_request,
+            subject_digest: record.subject_digest,
+            tasks: record.tasks,
+        })
+    }
+
+    /// Validates and persists an [`OperatorApprovalRequest`] only when the rebuilt candidate's
+    /// `subject_digest` matches `expected_subject_digest` under the exclusive authority store lock.
+    ///
+    /// Enforces 64-character lowercase hex validation on `expected_subject_digest`, acquires the
+    /// same in-process and cross-process ledger locks used for persistence, rebuilds the complete
+    /// validated [`ApprovalRecord`] candidate against current store state, and verifies
+    /// `record.subject_digest == expected_subject_digest` **before** returning any pre-existing
+    /// idempotent summary or writing `approvals.json`.
+    pub fn approve_confirmed(
+        &self,
+        request: OperatorApprovalRequest,
+        expected_subject_digest: &str,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        let checked_digest =
+            validate_sha256_hex("expected_subject_digest", expected_subject_digest)?;
+        let now_ms = current_unix_epoch_ms()?;
+        self.approve_at_internal(request, now_ms, Some(&checked_digest))
+    }
+
     /// Validates an operator approval request against the pinned plan revision, global registry,
     /// Git repository, base commit, CLI executables, and write scopes, persisting an immutable
     /// frozen [`ApprovalRecord`] and returning its bounded [`ApprovalSummary`].
@@ -221,6 +359,20 @@ impl AuthorityStore {
         request: OperatorApprovalRequest,
         created_at_ms: i64,
     ) -> Result<ApprovalSummary, AuthorityError> {
+        self.approve_at_internal(request, created_at_ms, None)
+    }
+
+    fn approve_at_internal(
+        &self,
+        request: OperatorApprovalRequest,
+        created_at_ms: i64,
+        expected_subject_digest: Option<&str>,
+    ) -> Result<ApprovalSummary, AuthorityError> {
+        let checked_expected_digest = match expected_subject_digest {
+            Some(raw) => Some(validate_sha256_hex("expected_subject_digest", raw)?),
+            None => None,
+        };
+
         let _in_proc = self
             .in_process_lock
             .lock()
@@ -229,6 +381,18 @@ impl AuthorityStore {
         let mut ledger = self.read_ledger_locked()?;
 
         let record = self.build_validated_approval_record(request, created_at_ms)?;
+
+        if let Some(expected_digest) = checked_expected_digest.as_deref() {
+            if record.subject_digest != expected_digest {
+                return Err(AuthorityError::validation(
+                    "expected_subject_digest",
+                    format!(
+                        "compiled approval subject_digest `{}` did not match expected_subject_digest `{expected_digest}`",
+                        record.subject_digest
+                    ),
+                ));
+            }
+        }
 
         if let Some(existing) = ledger.approvals.iter().find(|entry| {
             entry.approval_id == record.approval_id || entry.subject_digest == record.subject_digest

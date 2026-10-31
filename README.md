@@ -67,8 +67,9 @@ not require switching to the panel for each task. See
   `threadlane-native-mcp --auto-start-approved-hosts` and the configured stores.
   An explicit approved root-task dispatch can then launch its first fresh host
   and wait for authenticated readiness. It cannot create approval or restart an
-  uncertain session. New-scope approval currently uses desktop confirmation;
-  a trusted headless approval route remains planned. See the
+  uncertain session. New-scope approval can use desktop confirmation or the
+  trusted local `threadlane-approve` preview/record commands. See
+  [native scope approval](docs/NATIVE-APPROVAL.md) and the
   [native conversation workflow](docs/CODEX-WORKFLOW.md).
 - **Explicit idle stop and stopped-session restart**: Operator controls use
   authenticated owner scope and per-start instance identity. Active jobs prevent

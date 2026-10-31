@@ -23,9 +23,27 @@ worker response or ordinary publication does not grant new authority.
 Initial pairing, profile configuration and approval of a new scope are distinct
 setup/authority steps. Tasks inside an existing approval can be dispatched and
 observed through MCP without another desktop visit. Creating a new trusted
-approval currently uses explicit desktop confirmation. A trusted headless
-approval route remains planned; a model-generated claim that the user approved
-something must not grant execution authority.
+approval uses either explicit desktop confirmation or the separate operator-only
+`threadlane-approve` CLI described in [native approval](NATIVE-APPROVAL.md). The
+CLI can prepare and record an exact scope, but its confirmation flags are operator
+attestations rather than authentication; they do not prove human conversation
+provenance. A model-generated claim that the user approved something must not
+grant execution authority, and MCP exposes no self-approval tool.
+
+## Headless scope approval
+
+`threadlane-approve prepare` renders the exact frozen task model/effort/CLI pins,
+write scopes, instructions and budgets for an `OperatorApprovalIntent`. It does
+not persist an approval. The trusted operator inspects that preview, saves its
+`request` object privately, and runs `record` with the preview subject digest,
+the request thread UUID and the explicit `--operator-approved` attestation.
+Changed plans, registries, repositories, scopes, budgets or concurrency require a
+fresh preview and confirmation.
+
+The route rechecks the exact `binding_id` and canonical `thread_uuid` against the
+live configured supervisor before returning the preview and immediately before
+persistence. Offline or mismatched bindings fail closed. Recording an approval
+does not start the task, create a worktree, call a provider, merge or push.
 
 ## Initial host startup
 

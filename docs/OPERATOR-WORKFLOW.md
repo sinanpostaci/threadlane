@@ -5,10 +5,12 @@ local CLI. Codex can use it as the trusted operator after checking the user's
 authorized scope and the actual worker evidence. The desktop is not required
 for these five operations. The Nix CLI package includes this executable.
 
-This CLI does not create scope approvals, approve itself, expose new MCP tools,
-or start providers. Explicit confirmation arguments prevent accidental subject
-mix-ups; they are not authentication or a replacement for user authorization.
-Worker text and JSON request data cannot grant permission to run the CLI.
+Native execution-scope approval is a separate operator-only command,
+`threadlane-approve`, documented in [native approval](NATIVE-APPROVAL.md). Neither
+CLI approves itself, exposes a new MCP tool, or starts providers. The approval
+confirmation flags are explicit operator attestations, not authentication or
+proof of human conversation provenance. Worker text and JSON request data cannot
+grant permission to run either CLI.
 
 ## Commands
 
@@ -43,6 +45,41 @@ Confirmations must match the request before any library operation runs. Review
 acceptance confirms both the expected digest and the embedded subject digest.
 Integration confirms the subject and expected integration HEAD; the library
 also validates current source/task/target HEADs, ownership and frozen receipts.
+
+## Native scope approval
+
+Execution-scope approval is not part of `threadlane-operator`. Use the separate
+`threadlane-approve` command after the native conversation has presented a
+concrete scope:
+
+```sh
+threadlane-approve prepare \
+  --state-dir /absolute/private/runtime \
+  --registry-dir /absolute/private/registry \
+  --plans-dir /absolute/private/plans \
+  --authority-dir /absolute/private/authority \
+  --request /absolute/private/intent.json > /absolute/private/preview.json
+
+# Inspect the preview, save its `request` object privately, then confirm the
+# preview subject digest and request thread explicitly.
+threadlane-approve record \
+  --state-dir /absolute/private/runtime \
+  --registry-dir /absolute/private/registry \
+  --plans-dir /absolute/private/plans \
+  --authority-dir /absolute/private/authority \
+  --request /absolute/private/request.json \
+  --confirm-subject SUBJECT_SHA256 \
+  --confirm-thread THREAD_UUID \
+  --operator-approved
+```
+
+`prepare` is read-only with respect to approvals and returns the full frozen
+task pins, scopes and budgets. `record` requires all three confirmations and
+rechecks the live configured binding before persisting. Changed scope, budgets,
+concurrency, plan, registry, repository, base commit, binding or thread require
+a fresh preview and confirmation. Recording does not start a worker, create a
+worktree, call a provider, merge or push. See [native approval](NATIVE-APPROVAL.md)
+for the full boundary, file safety and failure behavior.
 
 ## Operator sequence
 

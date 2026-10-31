@@ -13,6 +13,10 @@ path = "src/bin/threadlane-native-mcp.rs"
 name = "threadlane-native-probe"
 path = "src/bin/threadlane-native-probe.rs"
 
+[[bin]]
+name = "threadlane-approve"
+path = "src/bin/threadlane-approve.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"

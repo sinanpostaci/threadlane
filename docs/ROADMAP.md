@@ -84,8 +84,10 @@ hardening are not implied by the local configuration/execution checkpoint. See
 
 The optional [Codex-first startup extension](CODEX-WORKFLOW.md) removes the
 desktop Start step for an existing approved root task. Trusted scope approval
-still uses desktop confirmation; a headless operator route remains a usability
-gap. The OpenCode v2 worker now integrates an [owned-session metadata collector](OPENCODE-METADATA.md)
+uses explicit desktop confirmation or the separate operator-only
+[native approval CLI](NATIVE-APPROVAL.md); its flags are operator attestations,
+not authentication or proof of human conversation provenance. The OpenCode v2
+worker now integrates an [owned-session metadata collector](OPENCODE-METADATA.md)
 without changing requested-versus-observed evidence or automatic-acceptance boundaries.
 A [qualified native single-chat pilot](NATIVE-PILOT-2026-10-30.md) also records the
 simulated loop, deferred busy-turn delivery and remaining identity/onboarding gates.
@@ -98,6 +100,14 @@ input assembly, native enrollment or MCP authority. The subsequent
 fan-in and chained execution using accepted predecessor task heads. It keeps
 preparation, dispatch, review, main publication and cleanup as separate actions;
 no follower-to-orchestrator consultation automation is implied.
+
+The additive [native scope approval CLI](NATIVE-APPROVAL.md) separates a
+read-only `prepare` preview from a digest/thread/operator-confirmed `record`
+that reuses the existing authority validation and ledger format. It requires a
+live configured binding, rejects stale or changed previews, and does not change
+the MCP surface, start execution, merge or push. The flags are local operator
+attestations, not proof of the human source of an approval; automatic
+conversation monitoring and general multi-chat routing remain separate gates.
 
 ## Default workflow example
 
