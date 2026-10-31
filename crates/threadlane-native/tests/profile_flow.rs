@@ -68,7 +68,7 @@ fn base_snapshot() -> RegistrySnapshot {
             sample_model(
                 "model-headless-alpha",
                 "tool-agy",
-                "vendor-a/headless-alpha-v1",
+                "gemini-4-argon-high",
                 &["medium", "high"],
                 false,
             ),
@@ -307,7 +307,7 @@ fn unrelated_unavailable_roles_do_not_block_requested_coder() {
     let sel = report.roles[0].selected.as_ref().expect("selected coder");
     assert_eq!(sel.tool_id, "tool-agy");
     assert_eq!(sel.model_id, "model-headless-alpha");
-    assert_eq!(sel.model_arg, "vendor-a/headless-alpha-v1");
+    assert_eq!(sel.model_arg, "gemini-4-argon-high");
     assert_eq!(sel.effort.as_deref(), Some("high"));
     assert_eq!(sel.route, RoleExecutionRoute::HeadlessWorker);
     assert_eq!(sel.matched_difficulty, Some(Difficulty::Hard));
@@ -765,10 +765,7 @@ fn deterministic_policy_digest_and_malformed_or_duplicate_requests_rejected() {
 
     let mut policy_changed = policy_a.clone();
     policy_changed.allow_rules[0].allow_no_effort = false;
-    assert_ne!(
-        digest_a,
-        policy_changed.digest().expect("digest_changed")
-    );
+    assert_ne!(digest_a, policy_changed.digest().expect("digest_changed"));
 
     // 2. Malformed policies are rejected.
     let bad_schema = ExecutionPolicy {
@@ -916,7 +913,7 @@ fn preflight_and_preflight_from_store_are_pure_and_perform_no_file_writes() {
                 model: sample_model(
                     "model-headless-alpha",
                     "tool-agy",
-                    "vendor-a/headless-alpha-v1",
+                    "gemini-4-argon-high",
                     &["high"],
                     false,
                 ),
@@ -968,4 +965,289 @@ fn preflight_and_preflight_from_store_are_pure_and_perform_no_file_writes() {
         .collect();
     assert_eq!(before_bytes, after_bytes);
     assert_eq!(before_entries, after_entries);
+}
+
+#[test]
+fn workflow_reexports_canonical_resolve_choice_with_native_semantics() {
+    let snapshot = base_snapshot();
+    let native = resolve_choice(
+        &snapshot,
+        "profile-active",
+        WorkflowRole::Coder,
+        Some(Difficulty::Medium),
+    )
+    .expect("native resolve_choice");
+    let workflow = threadlane_workflow::resolve_choice(
+        &snapshot,
+        "profile-active",
+        WorkflowRole::Coder,
+        Some(Difficulty::Medium),
+    )
+    .expect("workflow re-exported resolve_choice");
+    assert_eq!(native, workflow);
+    assert_eq!(native.model_id, "model-headless-beta");
+}
+
+fn worker_target_snapshot(
+    tool_id: &str,
+    adapter: ToolAdapter,
+    model_arg: &str,
+    efforts: &[&str],
+    allow_no_effort: bool,
+    configured_effort: Option<&str>,
+) -> RegistrySnapshot {
+    RegistrySnapshot {
+        schema_version: 1,
+        revision: 11,
+        tools: vec![sample_tool(tool_id, adapter, true)],
+        models: vec![sample_model(
+            "model-worker-target",
+            tool_id,
+            model_arg,
+            efforts,
+            allow_no_effort,
+        )],
+        profiles: vec![WorkflowProfile {
+            id: "profile-worker-target".to_string(),
+            name: "Worker Target Profile".to_string(),
+            assignments: vec![RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "model-worker-target".to_string(),
+                    effort: configured_effort.map(|value| value.to_string()),
+                },
+            }],
+        }],
+        default_profile_id: None,
+    }
+}
+
+fn worker_target_policy(tool_id: &str, efforts: &[&str], allow_no_effort: bool) -> ExecutionPolicy {
+    ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: format!("policy-{tool_id}"),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: tool_id.to_string(),
+            model_id: "model-worker-target".to_string(),
+            efforts: efforts.iter().map(|value| (*value).to_string()).collect(),
+            allow_no_effort,
+            roles: vec![],
+        }],
+    }
+}
+
+fn worker_target_request() -> PreflightRequest {
+    PreflightRequest {
+        profile_id: Some("profile-worker-target".to_string()),
+        roles: vec![RolePreflightRequest::new(WorkflowRole::Coder, None)],
+    }
+}
+
+#[test]
+fn agy_requires_explicit_effort_and_invalid_worker_targets_are_blocked() {
+    let req = worker_target_request();
+    let policy = worker_target_policy("tool-agy", &["high"], true);
+
+    // Registry metadata can admit `effort: None` via `allow_no_effort`, but Antigravity worker
+    // execution requires an explicit effort. Metadata alone must not admit this legacy choice.
+    let missing_effort = worker_target_snapshot(
+        "tool-agy",
+        ToolAdapter::Antigravity,
+        "gemini-4-argon-high",
+        &["high"],
+        true,
+        None,
+    );
+    let report = preflight(&missing_effort, &req, &policy).expect("preflight missing agy effort");
+    assert!(!report.ready);
+    assert_eq!(
+        report.roles[0].block_reason,
+        Some(PreflightBlockReason::UnsupportedEffort)
+    );
+    assert!(report.roles[0].selected.is_none());
+    assert!(report.roles[0].detail.contains("explicit `effort`"));
+
+    // The same model with explicit high is valid under an exact policy that permits high.
+    let explicit_high = worker_target_snapshot(
+        "tool-agy",
+        ToolAdapter::Antigravity,
+        "gemini-4-argon-high",
+        &["high"],
+        true,
+        Some("high"),
+    );
+    let report = preflight(&explicit_high, &req, &policy).expect("preflight explicit agy high");
+    assert!(report.ready);
+    let selected = report.roles[0]
+        .selected
+        .as_ref()
+        .expect("selected agy high");
+    assert_eq!(selected.model_arg, "gemini-4-argon-high");
+    assert_eq!(selected.effort.as_deref(), Some("high"));
+
+    // Invalid AGY model and effort formats are blocked by the canonical worker target resolver
+    // before any model invocation.
+    let invalid_model = worker_target_snapshot(
+        "tool-agy",
+        ToolAdapter::Antigravity,
+        "vendor/model",
+        &["high"],
+        false,
+        Some("high"),
+    );
+    let report = preflight(&invalid_model, &req, &policy).expect("preflight invalid agy model");
+    assert_eq!(
+        report.roles[0].block_reason,
+        Some(PreflightBlockReason::UnsupportedEffort)
+    );
+
+    let invalid_effort = worker_target_snapshot(
+        "tool-agy",
+        ToolAdapter::Antigravity,
+        "gemini-4-argon-high",
+        &["-high"],
+        false,
+        Some("-high"),
+    );
+    let report = preflight(&invalid_effort, &req, &policy).expect("preflight invalid agy effort");
+    assert_eq!(
+        report.roles[0].block_reason,
+        Some(PreflightBlockReason::UnsupportedEffort)
+    );
+
+    // OpenCode requires `provider/model`; a plain model name cannot be admitted as executable.
+    let invalid_oc_model = worker_target_snapshot(
+        "tool-oc",
+        ToolAdapter::OpencodeV2,
+        "plain-model",
+        &["max"],
+        false,
+        Some("max"),
+    );
+    let oc_policy = worker_target_policy("tool-oc", &["max"], false);
+    let report =
+        preflight(&invalid_oc_model, &req, &oc_policy).expect("preflight invalid oc model");
+    assert_eq!(
+        report.roles[0].block_reason,
+        Some(PreflightBlockReason::UnsupportedEffort)
+    );
+}
+
+#[test]
+fn opencode_inline_variant_uses_canonical_effort_for_policy_and_selection() {
+    let req = worker_target_request();
+    let snapshot = worker_target_snapshot(
+        "tool-oc",
+        ToolAdapter::OpencodeV2,
+        "vendor-b/headless-beta-v2#max",
+        &["max"],
+        true,
+        None,
+    );
+
+    // `allow_no_effort` would admit the registry's `None`, but the inline `#max` variant is an
+    // actual effective effort and must not bypass the policy's empty effort list.
+    let no_effort_only_policy = worker_target_policy("tool-oc", &[], true);
+    let report = preflight(&snapshot, &req, &no_effort_only_policy)
+        .expect("preflight inline variant no-effort policy");
+    assert!(!report.ready);
+    assert_eq!(
+        report.roles[0].block_reason,
+        Some(PreflightBlockReason::PolicyBlocked)
+    );
+    assert!(report.roles[0].selected.is_none());
+
+    // Permitting the effective variant makes the role ready. The selected model argument stays
+    // the original registry argument and the selected effort is the canonical resolved variant.
+    let max_policy = worker_target_policy("tool-oc", &["max"], false);
+    let report = preflight(&snapshot, &req, &max_policy).expect("preflight inline variant max");
+    assert!(report.ready);
+    let selected = report.roles[0]
+        .selected
+        .as_ref()
+        .expect("selected inline variant");
+    assert_eq!(selected.model_arg, "vendor-b/headless-beta-v2#max");
+    assert_eq!(selected.effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn preflight_from_store_does_not_recreate_deleted_registry_lock() {
+    let tmp = TempDir::new().expect("tempdir");
+    let reg_dir = tmp.path().join("registry");
+    let store = RegistryStore::open(&reg_dir).expect("open registry store");
+
+    let s1 = store
+        .apply(
+            0,
+            RegistryChange::UpsertTool {
+                tool: sample_tool("tool-agy", ToolAdapter::Antigravity, true),
+            },
+        )
+        .expect("upsert tool");
+    let s2 = store
+        .apply(
+            s1.revision,
+            RegistryChange::UpsertModel {
+                model: sample_model(
+                    "model-headless-alpha",
+                    "tool-agy",
+                    "gemini-4-argon-high",
+                    &["high"],
+                    false,
+                ),
+            },
+        )
+        .expect("upsert model");
+    let s3 = store
+        .apply(
+            s2.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    id: "profile-store".to_string(),
+                    name: "Store Profile".to_string(),
+                    assignments: vec![RoleAssignment {
+                        role: WorkflowRole::Coder,
+                        difficulty: Some(Difficulty::Hard),
+                        choice: ModelChoice {
+                            model_id: "model-headless-alpha".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    }],
+                },
+            },
+        )
+        .expect("upsert profile");
+
+    let before_bytes = fs::read(store.registry_path()).expect("read registry.json before");
+    fs::remove_file(store.lock_path()).expect("remove registry.lock before preflight");
+    assert!(!store.lock_path().exists());
+    let before_registry_entries: Vec<_> = fs::read_dir(&reg_dir)
+        .expect("read registry dir before")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+
+    let policy = allow_all_test_models_policy();
+    let req = PreflightRequest {
+        profile_id: Some("profile-store".to_string()),
+        roles: vec![RolePreflightRequest::new(
+            WorkflowRole::Coder,
+            Some(Difficulty::Hard),
+        )],
+    };
+    let report = preflight_from_store(&store, &req, &policy).expect("preflight_from_store");
+    assert!(report.ready);
+    assert_eq!(report.registry_revision, s3.revision);
+    assert!(
+        !store.lock_path().exists(),
+        "readonly preflight must not recreate a deleted registry.lock"
+    );
+
+    let after_bytes = fs::read(store.registry_path()).expect("read registry.json after");
+    let after_registry_entries: Vec<_> = fs::read_dir(&reg_dir)
+        .expect("read registry dir after")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(before_bytes, after_bytes);
+    assert_eq!(before_registry_entries, after_registry_entries);
 }

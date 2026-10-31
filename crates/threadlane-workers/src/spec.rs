@@ -423,80 +423,7 @@ impl WorkerSpec {
 
     /// Resolves and validates the provider-specific model and effort/variant identifiers.
     pub fn resolve_model_target(&self) -> Result<ResolvedModelTarget, WorkerError> {
-        match self.provider {
-            WorkerProvider::Antigravity => {
-                validate_simple_identifier(&self.model, "model")?;
-                let effort = self.effort.as_deref().ok_or_else(|| {
-                    WorkerError::InvalidSpec(
-                        "provider `antigravity` requires an explicit `effort` identifier"
-                            .to_string(),
-                    )
-                })?;
-                validate_simple_identifier(effort, "effort")?;
-                Ok(ResolvedModelTarget {
-                    base_model: self.model.clone(),
-                    effort: Some(effort.to_string()),
-                    cli_model_arg: self.model.clone(),
-                })
-            }
-            WorkerProvider::OpenCodeV2 => {
-                if self.model.is_empty()
-                    || self.model.len() > MAX_IDENTIFIER_LEN
-                    || self.model.trim() != self.model
-                {
-                    return Err(WorkerError::InvalidSpec(format!(
-                        "invalid OpenCode model identifier `{}`",
-                        self.model
-                    )));
-                }
-
-                let (base_part, inline_variant) = match self.model.split_once('#') {
-                    Some((base, variant)) => {
-                        if variant.contains('#') {
-                            return Err(WorkerError::InvalidSpec(format!(
-                                "OpenCode model `{}` must not contain multiple `#` separators",
-                                self.model
-                            )));
-                        }
-                        validate_simple_identifier(variant, "OpenCode model variant")?;
-                        (base, Some(variant))
-                    }
-                    None => (self.model.as_str(), None),
-                };
-
-                validate_opencode_provider_model(base_part)?;
-
-                let resolved_effort = match (inline_variant, self.effort.as_deref()) {
-                    (Some(inline_v), Some(explicit_v)) => {
-                        validate_simple_identifier(explicit_v, "effort")?;
-                        if inline_v != explicit_v {
-                            return Err(WorkerError::InvalidSpec(format!(
-                                "OpenCode model `{}` inline variant `{inline_v}` conflicts with explicit effort `{explicit_v}`",
-                                self.model
-                            )));
-                        }
-                        Some(inline_v.to_string())
-                    }
-                    (Some(inline_v), None) => Some(inline_v.to_string()),
-                    (None, Some(explicit_v)) => {
-                        validate_simple_identifier(explicit_v, "effort")?;
-                        Some(explicit_v.to_string())
-                    }
-                    (None, None) => None,
-                };
-
-                let cli_model_arg = match resolved_effort {
-                    Some(ref v) => format!("{base_part}#{v}"),
-                    None => base_part.to_string(),
-                };
-
-                Ok(ResolvedModelTarget {
-                    base_model: base_part.to_string(),
-                    effort: resolved_effort,
-                    cli_model_arg,
-                })
-            }
-        }
+        resolve_model_target(self.provider, &self.model, self.effort.as_deref())
     }
 
     /// Validates the spec and constructs the static CLI argument array (excluding `argv[0]`)
@@ -680,6 +607,86 @@ impl WorkerSpec {
                 argv.push(self.prompt.clone());
                 argv
             }
+        }
+    }
+}
+
+/// Resolves and validates a provider-specific model and effort/variant target from the three
+/// explicit inputs used by [`WorkerSpec`]: provider, model argument, and optional effort/variant.
+///
+/// This is the canonical pure target resolver for worker execution. It performs no filesystem,
+/// process, provider, or network I/O and applies the same Antigravity explicit-effort and
+/// OpenCode inline-variant rules as [`WorkerSpec::resolve_model_target`].
+pub fn resolve_model_target(
+    provider: WorkerProvider,
+    model: &str,
+    effort: Option<&str>,
+) -> Result<ResolvedModelTarget, WorkerError> {
+    match provider {
+        WorkerProvider::Antigravity => {
+            validate_simple_identifier(model, "model")?;
+            let effort = effort.ok_or_else(|| {
+                WorkerError::InvalidSpec(
+                    "provider `antigravity` requires an explicit `effort` identifier".to_string(),
+                )
+            })?;
+            validate_simple_identifier(effort, "effort")?;
+            Ok(ResolvedModelTarget {
+                base_model: model.to_string(),
+                effort: Some(effort.to_string()),
+                cli_model_arg: model.to_string(),
+            })
+        }
+        WorkerProvider::OpenCodeV2 => {
+            if model.is_empty() || model.len() > MAX_IDENTIFIER_LEN || model.trim() != model {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "invalid OpenCode model identifier `{model}`"
+                )));
+            }
+
+            let (base_part, inline_variant) = match model.split_once('#') {
+                Some((base, variant)) => {
+                    if variant.contains('#') {
+                        return Err(WorkerError::InvalidSpec(format!(
+                            "OpenCode model `{model}` must not contain multiple `#` separators"
+                        )));
+                    }
+                    validate_simple_identifier(variant, "OpenCode model variant")?;
+                    (base, Some(variant))
+                }
+                None => (model, None),
+            };
+
+            validate_opencode_provider_model(base_part)?;
+
+            let resolved_effort = match (inline_variant, effort) {
+                (Some(inline_v), Some(explicit_v)) => {
+                    validate_simple_identifier(explicit_v, "effort")?;
+                    if inline_v != explicit_v {
+                        return Err(WorkerError::InvalidSpec(format!(
+                            "OpenCode model `{model}` inline variant `{inline_v}` conflicts with explicit effort `{explicit_v}`"
+                        )));
+                    }
+                    Some(inline_v.to_string())
+                }
+                (Some(inline_v), None) => Some(inline_v.to_string()),
+                (None, Some(explicit_v)) => {
+                    validate_simple_identifier(explicit_v, "effort")?;
+                    Some(explicit_v.to_string())
+                }
+                (None, None) => None,
+            };
+
+            let cli_model_arg = match resolved_effort {
+                Some(ref v) => format!("{base_part}#{v}"),
+                None => base_part.to_string(),
+            };
+
+            Ok(ResolvedModelTarget {
+                base_model: base_part.to_string(),
+                effort: resolved_effort,
+                cli_model_arg,
+            })
         }
     }
 }

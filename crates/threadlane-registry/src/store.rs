@@ -18,11 +18,14 @@ use crate::types::{
 
 /// Persistent, cross-process locked store for the global [`RegistrySnapshot`].
 ///
-/// All reads and compare-and-swap mutations are serialized across threads and processes
-/// via a stable `fs2` lock file (`registry.lock`) inside the private configuration directory
-/// (`0700` directory mode, `0600` file mode on Unix). Mutations reread the latest on-disk
-/// snapshot under the exclusive lock, validate all reference and effort invariants, and
-/// atomically replace `registry.json` via a same-directory temporary file with `fsync`.
+/// Compare-and-swap mutations and the standard [`RegistryStore::snapshot`] read are serialized
+/// across threads and processes via a stable `fs2` lock file (`registry.lock`) inside the private
+/// configuration directory (`0700` directory mode, `0600` file mode on Unix). Mutations reread the
+/// latest on-disk snapshot under the exclusive lock, validate all reference and effort invariants,
+/// and atomically replace `registry.json` via a same-directory temporary file with `fsync`.
+/// [`RegistryStore::snapshot_readonly`] and
+/// [`RegistryStore::read_snapshot_readonly_at`] reuse the same validated parser without opening
+/// or creating the lock file.
 #[derive(Debug, Clone)]
 pub struct RegistryStore {
     config_dir: PathBuf,
@@ -71,6 +74,37 @@ impl RegistryStore {
     pub fn snapshot(&self) -> Result<RegistrySnapshot, RegistryError> {
         let _guard = self.acquire_lock(false)?;
         self.read_snapshot_locked()
+    }
+
+    /// Reads and validates the current [`RegistrySnapshot`] without acquiring or creating
+    /// `registry.lock`.
+    ///
+    /// Uses the same parser and existing private-directory validation as [`Self::snapshot`].
+    /// This read-only route never calls `prepare_config_dir` or `open_lock_file`, never creates
+    /// a missing configuration directory, lock file, or registry file, and requires the
+    /// configuration directory to already exist. Atomic `registry.json` replacement yields
+    /// either the previous or the next complete snapshot.
+    pub fn snapshot_readonly(&self) -> Result<RegistrySnapshot, RegistryError> {
+        self.read_snapshot_locked()
+    }
+
+    /// Reads and validates the [`RegistrySnapshot`] in `config_dir` without acquiring or creating
+    /// `registry.lock`.
+    ///
+    /// The configuration directory must already exist. This static read-only route never calls
+    /// `prepare_config_dir` or `open_lock_file`, never creates a missing directory, lock file, or
+    /// registry file, and uses the same JSON/schema/integrity parser and private-directory
+    /// validation as [`Self::snapshot`].
+    pub fn read_snapshot_readonly_at(
+        config_dir: impl AsRef<Path>,
+    ) -> Result<RegistrySnapshot, RegistryError> {
+        ensure_platform_supported()?;
+        let resolved_dir = validate_no_symlink_components(config_dir.as_ref())?;
+        let store = Self {
+            config_dir: resolved_dir,
+            process_lock: Arc::new(Mutex::new(())),
+        };
+        store.read_snapshot_locked()
     }
 
     /// Applies `change` atomically if the on-disk revision equals `expected_revision`.

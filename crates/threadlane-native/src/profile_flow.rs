@@ -3,10 +3,13 @@ use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use threadlane_workers::{resolve_model_target, WorkerProvider};
 use threadlane_workflow::{
-    Difficulty, ModelChoice, ModelDefinition, RegistryError, RegistrySnapshot, RegistryStore,
-    RoleAssignment, ToolAdapter, ToolDefinition, WorkflowRole,
+    Difficulty, ModelDefinition, RegistryError, RegistrySnapshot, RegistryStore, RoleAssignment,
+    ToolAdapter, ToolDefinition, WorkflowRole,
 };
+
+pub use threadlane_workflow::resolve_choice;
 
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::validate_bounded_identifier;
@@ -447,73 +450,17 @@ pub struct PreflightReport {
     pub roles: Vec<RolePreflightOutcome>,
 }
 
-/// Resolves the [`ModelChoice`] for a given `profile_id`, `role`, and optional `difficulty`.
-///
-/// Checks for an exact `(role, Some(difficulty))` match first when `difficulty` is `Some`,
-/// then falls back to the explicit role default `(role, None)`. Never substitutes another
-/// difficulty tier, another role, or an unapproved fallback model.
-pub fn resolve_choice(
-    snapshot: &RegistrySnapshot,
-    profile_id: &str,
-    role: WorkflowRole,
-    difficulty: Option<Difficulty>,
-) -> Result<ModelChoice, RegistryError> {
-    validate_registry_text(profile_id, MAX_REGISTRY_ID_LEN)?;
-
-    let profile = snapshot
-        .profiles
-        .iter()
-        .find(|candidate| candidate.id == profile_id)
-        .ok_or(RegistryError::NotFound(
-            "Workflow profile not found in registry snapshot.",
-        ))?;
-
-    validate_unique_assignments(&profile.assignments)?;
-
-    let assignment = find_role_assignment(&profile.assignments, role, difficulty).ok_or(
-        RegistryError::MissingAssignment(
-            "No model assignment is configured for the requested role and difficulty.",
-        ),
-    )?;
-
-    validate_registry_text(&assignment.choice.model_id, MAX_REGISTRY_ID_LEN)?;
-    if let Some(ref effort) = assignment.choice.effort {
-        validate_registry_text(effort, MAX_REGISTRY_EFFORT_LEN)?;
-    }
-
-    let model = snapshot
-        .models
-        .iter()
-        .find(|candidate| candidate.id == assignment.choice.model_id)
-        .ok_or(RegistryError::InvalidReference(
-            "Assigned model does not exist in the registry.",
-        ))?;
-
-    if !snapshot.tools.iter().any(|tool| tool.id == model.tool_id) {
-        return Err(RegistryError::InvalidReference(
-            "Assigned model references a tool that does not exist in the registry.",
-        ));
-    }
-
-    if !model.supports_effort(assignment.choice.effort.as_deref()) {
-        return Err(RegistryError::UnsupportedEffort(
-            "Assigned effort is not supported by the selected model.",
-        ));
-    }
-
-    Ok(assignment.choice.clone())
-}
-
 /// Evaluates a pure, read-only profile and role preflight check against an existing [`RegistryStore`].
 ///
-/// Reads a point-in-time [`RegistrySnapshot`] via [`RegistryStore::snapshot`] and delegates to
-/// [`preflight`] without mutating the registry or creating any workflow cycle, host, or worktree.
+/// Reads a point-in-time [`RegistrySnapshot`] via [`RegistryStore::snapshot_readonly`] and
+/// delegates to [`preflight`] without acquiring or creating `registry.lock` and without mutating
+/// the registry or creating any workflow cycle, host, or worktree.
 pub fn preflight_from_store(
     registry: &RegistryStore,
     request: &PreflightRequest,
     policy: &ExecutionPolicy,
 ) -> Result<PreflightReport, NativeError> {
-    let snapshot = registry.snapshot().map_err(|err| {
+    let snapshot = registry.snapshot_readonly().map_err(|err| {
         NativeError::new(
             NativeErrorCode::ValidationFailed,
             format!("failed to read registry snapshot for preflight: {err}"),
@@ -728,6 +675,38 @@ fn evaluate_role_request(
         ));
     }
 
+    let worker_provider = match tool.adapter {
+        ToolAdapter::Antigravity => Some(WorkerProvider::Antigravity),
+        ToolAdapter::OpencodeV2 => Some(WorkerProvider::OpenCodeV2),
+        _ => None,
+    };
+
+    // Registry `supports_effort` metadata is necessary but not sufficient for an executable
+    // worker route. Use the canonical pure worker target resolver so the same model, effort, and
+    // OpenCode inline-variant rules that gate actual execution also gate admission. Native Codex
+    // handoff remains an explicit route and does not resolve a worker model target here.
+    let effective_effort = if let Some(provider) = worker_provider {
+        match resolve_model_target(
+            provider,
+            &model.model_arg,
+            resolved_choice.effort.as_deref(),
+        ) {
+            Ok(target) => target.effort,
+            Err(err) => {
+                return Ok(blocked_outcome(
+                    role_req,
+                    PreflightBlockReason::UnsupportedEffort,
+                    format!(
+                        "model `{}` has an invalid {} worker target `{}`: {err}",
+                        model.id, tool.adapter, model.model_arg
+                    ),
+                ));
+            }
+        }
+    } else {
+        resolved_choice.effort.clone()
+    };
+
     let Some(rule) = policy.find_matching_rule(role_req.role, &tool.id, &model.id) else {
         let reason = if policy.allow_rules.is_empty() {
             format!(
@@ -747,8 +726,8 @@ fn evaluate_role_request(
         ));
     };
 
-    if !rule.allows_effort(resolved_choice.effort.as_deref()) {
-        let eff_desc = resolved_choice.effort.as_deref().unwrap_or("none");
+    if !rule.allows_effort(effective_effort.as_deref()) {
+        let eff_desc = effective_effort.as_deref().unwrap_or("none");
         return Ok(blocked_outcome(
             role_req,
             PreflightBlockReason::PolicyBlocked,
@@ -774,7 +753,7 @@ fn evaluate_role_request(
             route,
             model_id: model.id.clone(),
             model_arg: model.model_arg.clone(),
-            effort: resolved_choice.effort,
+            effort: effective_effort,
             matched_difficulty: assignment.difficulty,
         }),
     })

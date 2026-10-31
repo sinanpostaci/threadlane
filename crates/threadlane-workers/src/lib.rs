@@ -94,6 +94,7 @@ pub use permissions::{
     validate_permission_pattern_path, validate_permission_pattern_str, WorkerFilePermissions,
     AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
 };
+pub use spec::resolve_model_target;
 pub use spec::{
     is_control_config_path, is_path_allowed, is_path_allowed_by_scopes, is_path_allowed_syntactic,
     validate_commit_ref, validate_repo_relative_path, validate_simple_identifier, ExecutionBudgets,

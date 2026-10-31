@@ -17,7 +17,8 @@ deny-by-default execution policy admission core for Threadlane Milestone 4.
     to an explicit role default `(role, None)` without substituting another
     role, difficulty, or unapproved fallback model.
   - Pure, read-only preflight over a [`RegistrySnapshot`] ([`preflight`]) or an
-    existing [`RegistryStore`] ([`preflight_from_store`]).
+    existing [`RegistryStore`] ([`preflight_from_store`]) using the store's
+    lock-free readonly snapshot API.
 - **Deferred to Phase A2 (not implemented yet)**:
   - Durable workflow cycle state, idempotent persisted role handoff records,
     and single-use package closure reservation.
@@ -46,6 +47,17 @@ deny-by-default execution policy admission core for Threadlane Milestone 4.
      [`RoleAssignment`]. `RolePreflightRequest` accepts only `role` and optional
      `difficulty` (`#[serde(deny_unknown_fields)]`), preventing caller model,
      effort, tool, or executable overrides.
+   - For Antigravity and OpenCode v2 executable worker routes, admission also
+     runs the canonical pure `threadlane_workers::resolve_model_target` helper
+     over the resolved registry model argument and effort. Antigravity therefore
+     requires an explicit effort even when registry metadata sets
+     `allow_no_effort`, and an OpenCode inline `#variant` becomes the effective
+     effort used for policy evaluation. `SelectedRoleChoice::model_arg` remains
+     the original registry model argument; `SelectedRoleChoice::effort` is the
+     canonical effective effort. A missing or malformed executable worker target
+     is blocked with `PreflightBlockReason::UnsupportedEffort` before policy
+     evaluation and before any model invocation. Native Codex handoff does not
+     resolve a worker model target and invokes no model during preflight.
 4. **Truthful route classification**:
    - `ToolAdapter::CodexCli` maps to `RoleExecutionRoute::NativeHandoff` (never
      a headless worker).
@@ -66,6 +78,13 @@ deny-by-default execution policy admission core for Threadlane Milestone 4.
    - `preflight` performs zero filesystem writes, creates no cycle/lock/store
      files, queries no providers, and starts no model, host, approval, or Git
      worktree.
+   - `preflight_from_store` reads through `RegistryStore::snapshot_readonly`
+     (the same parser is available statically as
+     `RegistryStore::read_snapshot_readonly_at`), reusing the existing validated
+     registry parser and private-directory checks without acquiring or creating
+     `registry.lock`. A deleted lock stays absent and a missing directory stays
+     absent. Atomic `registry.json` replacement yields a consistent complete
+     snapshot.
 
 ## Public Rust API (`threadlane_native::profile_flow`)
 
@@ -84,6 +103,9 @@ deny-by-default execution policy admission core for Threadlane Milestone 4.
   - `RolePreflightOutcome` (`role`, `requested_difficulty`, `ready`, `block_reason`, `detail`, `selected`)
   - `PreflightReport` (`registry_revision`, `profile_id`, `used_default_profile`, `policy_id`, `policy_digest`, `ready`, `roles`)
 - Functions:
-  - `resolve_choice(&RegistrySnapshot, profile_id, WorkflowRole, Option<Difficulty>) -> Result<ModelChoice, RegistryError>`
+  - `resolve_choice(&RegistrySnapshot, profile_id, WorkflowRole, Option<Difficulty>) -> Result<ModelChoice, RegistryError>` (canonical resolver re-exported by `threadlane_workflow` and `threadlane_native`)
   - `preflight(&RegistrySnapshot, &PreflightRequest, &ExecutionPolicy) -> Result<PreflightReport, NativeError>`
   - `preflight_from_store(&RegistryStore, &PreflightRequest, &ExecutionPolicy) -> Result<PreflightReport, NativeError>`
+- Registry readonly snapshot APIs:
+  - `RegistryStore::snapshot_readonly()`
+  - `RegistryStore::read_snapshot_readonly_at(config_dir)`
