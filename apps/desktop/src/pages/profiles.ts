@@ -1,6 +1,13 @@
 import './profiles.css';
 
 import { desktop_registry_apply, desktop_registry_snapshot } from '../registry/ipc.ts';
+import {
+  findModelFamily,
+  groupModelFamilies,
+  modelChoiceForFamilyEffort,
+  selectedFamilyEffort,
+  type ModelFamily,
+} from '../registry/model-families.ts';
 
 import type {
   Difficulty,
@@ -48,6 +55,7 @@ const SLOTS: readonly Slot[] = ['default', ...DIFFICULTIES];
 export interface Choice {
   model_id: string;
   effort: string | null;
+  pending_family?: string | null;
 }
 
 export type AssignmentTable = Record<WorkflowRole, Record<Slot, Choice>>;
@@ -95,11 +103,15 @@ export interface ProfileDraft {
 interface ModelGroup {
   tool: ToolDefinition;
   models: ModelDefinition[];
+  families: ModelFamily[];
 }
 
 interface RegistryIndex {
   tools: Map<string, ToolDefinition>;
   models: Map<string, ModelDefinition>;
+  allFamilies: ModelFamily[];
+  familiesByKey: Map<string, ModelFamily>;
+  enabledFamiliesByKey: Map<string, ModelFamily>;
   groups: ModelGroup[];
 }
 
@@ -142,7 +154,7 @@ function createEmptyTable(): AssignmentTable {
   for (const role of ROLES) {
     const slots = {} as Record<Slot, Choice>;
     for (const slot of SLOTS) {
-      slots[slot] = { model_id: '', effort: null };
+      slots[slot] = { model_id: '', effort: null, pending_family: null };
     }
     table[role] = slots;
   }
@@ -172,6 +184,7 @@ function tableFromProfile(profile: WorkflowProfile): AssignmentTable {
     table[assignment.role][slot] = {
       model_id: assignment.choice.model_id,
       effort: assignment.choice.effort ?? null,
+      pending_family: null,
     };
   }
   return table;
@@ -182,7 +195,7 @@ function assignmentsFromTable(table: AssignmentTable): RoleAssignment[] {
   for (const role of ROLES) {
     for (const slot of SLOTS) {
       const cell = table[role][slot];
-      if (!cell.model_id) {
+      if (!cell.model_id || cell.pending_family) {
         continue;
       }
       assignments.push({
@@ -206,19 +219,141 @@ function profileFromDraft(draft: ProfileDraft): WorkflowProfile {
 function buildIndex(snapshot: RegistrySnapshot): RegistryIndex {
   const tools = new Map(snapshot.tools.map((tool) => [tool.id, tool]));
   const models = new Map(snapshot.models.map((model) => [model.id, model]));
+  const allFamilies = groupModelFamilies(snapshot.models, snapshot.tools);
+  const familiesByKey = new Map(allFamilies.map((family) => [family.key, family]));
+  const enabledFamiliesByKey = new Map<string, ModelFamily>();
   const groups: ModelGroup[] = [];
 
   for (const tool of snapshot.tools) {
     if (!tool.enabled) {
       continue;
     }
+    const toolModels = snapshot.models.filter((model) => model.tool_id === tool.id);
+    const toolFamilies = allFamilies.filter((family) => family.tool_id === tool.id);
+    for (const family of toolFamilies) {
+      enabledFamiliesByKey.set(family.key, family);
+    }
     groups.push({
       tool,
-      models: snapshot.models.filter((model) => model.tool_id === tool.id),
+      models: toolModels,
+      families: toolFamilies,
     });
   }
 
-  return { tools, models, groups };
+  return {
+    tools,
+    models,
+    allFamilies,
+    familiesByKey,
+    enabledFamiliesByKey,
+    groups,
+  };
+}
+
+function resolveFamilyForCell(
+  index: RegistryIndex,
+  cell: Choice
+): ModelFamily | undefined {
+  if (cell.pending_family) {
+    return (
+      index.enabledFamiliesByKey.get(cell.pending_family) ??
+      index.familiesByKey.get(cell.pending_family)
+    );
+  }
+  if (!cell.model_id) {
+    return undefined;
+  }
+  return findModelFamily(index.allFamilies, cell.model_id);
+}
+
+function applyModelSelectValue(
+  index: RegistryIndex,
+  cell: Choice,
+  selectedValue: string
+): void {
+  if (!selectedValue) {
+    cell.model_id = '';
+    cell.effort = null;
+    cell.pending_family = null;
+    return;
+  }
+
+  const family =
+    index.enabledFamiliesByKey.get(selectedValue) ??
+    index.familiesByKey.get(selectedValue) ??
+    findModelFamily(index.allFamilies, selectedValue);
+
+  if (family && family.encodedEfforts) {
+    if (cell.pending_family === family.key) {
+      return;
+    }
+    const alreadyInFamily =
+      !cell.pending_family &&
+      Boolean(cell.model_id) &&
+      family.members.some((member) => member.id === cell.model_id);
+    if (alreadyInFamily) {
+      return;
+    }
+    cell.model_id = '';
+    cell.effort = null;
+    cell.pending_family = family.key;
+    return;
+  }
+
+  const nextModelId = family?.members[0]?.id ?? selectedValue;
+  cell.model_id = nextModelId;
+  cell.pending_family = null;
+  if (!cell.model_id) {
+    cell.effort = null;
+  }
+}
+
+function applyEffortSelectValue(
+  index: RegistryIndex,
+  cell: Choice,
+  rawEffortValue: string
+): boolean {
+  const family = resolveFamilyForCell(index, cell);
+  const nextEffort = rawEffortValue === '' ? null : rawEffortValue;
+
+  if (family && family.encodedEfforts) {
+    const mapped = modelChoiceForFamilyEffort(family, nextEffort);
+    if (!mapped) {
+      return false;
+    }
+    cell.model_id = mapped.model_id;
+    cell.effort = mapped.effort;
+    cell.pending_family = null;
+    return true;
+  }
+
+  if (!cell.model_id) {
+    return false;
+  }
+  if (family) {
+    const mapped = modelChoiceForFamilyEffort(family, nextEffort);
+    if (!mapped) {
+      return false;
+    }
+    cell.model_id = mapped.model_id;
+    cell.effort = mapped.effort;
+    cell.pending_family = null;
+    return true;
+  }
+
+  const currentModel = index.models.get(cell.model_id);
+  if (!currentModel) {
+    return false;
+  }
+  if (nextEffort === null && !currentModel.allow_no_effort) {
+    return false;
+  }
+  if (nextEffort !== null && !currentModel.efforts.includes(nextEffort)) {
+    return false;
+  }
+  cell.effort = nextEffort;
+  cell.pending_family = null;
+  return true;
 }
 
 function validateTable(index: RegistryIndex, table: AssignmentTable): AssignmentIssue[] {
@@ -227,6 +362,39 @@ function validateTable(index: RegistryIndex, table: AssignmentTable): Assignment
   for (const role of ROLES) {
     for (const slot of SLOTS) {
       const cell = table[role][slot];
+      if (cell.pending_family) {
+        const pendingFamily = index.familiesByKey.get(cell.pending_family);
+        const familyLabel = pendingFamily?.label || cell.pending_family;
+        if (!pendingFamily) {
+          issues.push({
+            role,
+            slot,
+            message: `Model family "${familyLabel}" is not in the registry.`,
+          });
+          continue;
+        }
+        const tool = index.tools.get(pendingFamily.tool_id);
+        if (!tool) {
+          issues.push({
+            role,
+            slot,
+            message: `Model family "${familyLabel}" refers to a missing tool.`,
+          });
+        } else if (!tool.enabled) {
+          issues.push({
+            role,
+            slot,
+            message: `Model family "${familyLabel}" belongs to disabled tool "${tool.label}".`,
+          });
+        }
+        issues.push({
+          role,
+          slot,
+          message: `Model family "${familyLabel}" requires an explicit effort.`,
+        });
+        continue;
+      }
+
       if (!cell.model_id) {
         if (cell.effort !== null) {
           issues.push({ role, slot, message: 'An effort is set without a model.' });
@@ -305,7 +473,11 @@ function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnaly
 
   const missingDefaults = ROLES.filter((role) => !draft.assignments[role].default.model_id);
   const unassignedRoles = ROLES.filter((role) =>
-    SLOTS.every((slot) => !draft.assignments[role][slot].model_id)
+    SLOTS.every(
+      (slot) =>
+        !draft.assignments[role][slot].model_id &&
+        !draft.assignments[role][slot].pending_family
+    )
   );
   let assignmentCount = 0;
   let overrideCount = 0;
@@ -1115,8 +1287,9 @@ export class ProfilesPage {
     });
 
     const hasAssignableModels =
-      this.index?.groups.some((group) => group.models.length > 0) ?? false;
-    const showRoleEditors = hasAssignableModels || analysis.assignmentCount > 0;
+      this.index?.groups.some((group) => group.families.length > 0) ?? false;
+    const showRoleEditors =
+      hasAssignableModels || analysis.assignmentCount > 0 || analysis.issues.length > 0;
 
     return h(
       'section',
@@ -1353,7 +1526,7 @@ export class ProfilesPage {
   ): HTMLSelectElement {
     const index = this.index;
     const key = `${role}:${slot}`;
-    const hasAssignableModels = index?.groups.some((group) => group.models.length > 0) ?? false;
+    const hasAssignableModels = index?.groups.some((group) => group.families.length > 0) ?? false;
     const select = h('select', {
       class: 'aq-profiles-select',
       'aria-label': `${ROLE_LABELS[role]} ${slotLabel(slot)} model`,
@@ -1368,25 +1541,48 @@ export class ProfilesPage {
       )
     );
 
+    let selectedOptionValue = '';
+
     if (index) {
       let selected = false;
       for (const group of index.groups) {
         const optgroup = h('optgroup', { label: group.tool.label });
-        for (const model of group.models) {
-          const option = h('option', { value: model.id }, model.label || model.id);
-          option.title = model.id;
-          if (model.id === cell.model_id) {
+        for (const family of group.families) {
+          const optionValue = family.encodedEfforts
+            ? family.key
+            : (family.members[0]?.id ?? family.key);
+          const option = h('option', { value: optionValue }, family.label);
+          option.title = family.encodedEfforts
+            ? family.members.map((member) => member.id).join(', ')
+            : (family.members[0]?.id ?? family.key);
+          const isCurrentFamily = cell.pending_family
+            ? cell.pending_family === family.key
+            : Boolean(cell.model_id) &&
+              family.members.some((member) => member.id === cell.model_id);
+          if (isCurrentFamily) {
             option.selected = true;
             selected = true;
+            selectedOptionValue = optionValue;
           }
           optgroup.append(option);
         }
-        if (group.models.length > 0) {
+        if (group.families.length > 0) {
           select.append(optgroup);
         }
       }
 
-      if (cell.model_id && !selected) {
+      if (cell.pending_family && !selected) {
+        const unavailableFamily = index.familiesByKey.get(cell.pending_family);
+        const unavailable = h(
+          'option',
+          { value: cell.pending_family },
+          `${unavailableFamily?.label || cell.pending_family} (unavailable)`
+        );
+        unavailable.disabled = true;
+        unavailable.selected = true;
+        select.append(unavailable);
+        selectedOptionValue = cell.pending_family;
+      } else if (cell.model_id && !selected) {
         const model = index.models.get(cell.model_id);
         const unavailable = h(
           'option',
@@ -1396,20 +1592,18 @@ export class ProfilesPage {
         unavailable.disabled = true;
         unavailable.selected = true;
         select.append(unavailable);
+        selectedOptionValue = cell.model_id;
       }
     }
 
-    select.value = cell.model_id;
+    select.value = selectedOptionValue;
     select.disabled = busy;
     select.addEventListener('change', () => {
-      if (!this.draft) {
+      if (!this.draft || !this.index) {
         return;
       }
       const current = this.draft.assignments[role][slot];
-      current.model_id = select.value;
-      if (!current.model_id) {
-        current.effort = null;
-      }
+      applyModelSelectValue(this.index, current, select.value);
       this.syncEffort(role, slot);
       this.refreshDraftStatus();
     });
@@ -1422,6 +1616,7 @@ export class ProfilesPage {
     cell: Choice,
     busy: boolean
   ): HTMLSelectElement {
+    const family = this.index ? resolveFamilyForCell(this.index, cell) : undefined;
     const model = cell.model_id && this.index
       ? this.index.models.get(cell.model_id)
       : null;
@@ -1431,6 +1626,55 @@ export class ProfilesPage {
       'data-effort-key': `${role}:${slot}`,
       'data-focus-key': `effort-${role}-${slot}`,
     });
+
+    if (family && family.encodedEfforts) {
+      const derivedEffort = cell.pending_family ? null : selectedFamilyEffort(family, cell);
+      const hasInvalidRawEffort =
+        !cell.pending_family && Boolean(cell.model_id) && cell.effort !== null;
+      let selected = false;
+
+      if (derivedEffort === null && !hasInvalidRawEffort) {
+        const placeholder = h('option', { value: '' }, 'Select an effort');
+        placeholder.disabled = true;
+        placeholder.selected = true;
+        select.append(placeholder);
+        selected = true;
+      }
+
+      for (const variant of family.variants) {
+        const option = h('option', { value: variant.effort }, variant.effort);
+        if (variant.effort === derivedEffort) {
+          option.selected = true;
+          selected = true;
+        }
+        select.append(option);
+      }
+
+      if (hasInvalidRawEffort && cell.effort !== null && !selected) {
+        const unsupported = h(
+          'option',
+          { value: cell.effort },
+          `${cell.effort} (unsupported)`
+        );
+        unsupported.disabled = true;
+        unsupported.selected = true;
+        select.append(unsupported);
+      }
+
+      select.value =
+        derivedEffort ?? (hasInvalidRawEffort && cell.effort !== null ? cell.effort : '');
+      select.disabled = busy;
+      select.addEventListener('change', () => {
+        if (!this.draft || !this.index) {
+          return;
+        }
+        const current = this.draft.assignments[role][slot];
+        if (applyEffortSelectValue(this.index, current, select.value)) {
+          this.refreshDraftStatus();
+        }
+      });
+      return select;
+    }
 
     if (!model) {
       const option = h('option', { value: '' }, 'Select a model first');
@@ -1479,23 +1723,13 @@ export class ProfilesPage {
     select.value = cell.effort ?? '';
     select.disabled = busy;
     select.addEventListener('change', () => {
-      if (!this.draft) {
+      if (!this.draft || !this.index) {
         return;
       }
       const current = this.draft.assignments[role][slot];
-      const currentModel = this.index?.models.get(current.model_id);
-      const next = select.value === '' ? null : select.value;
-      if (!currentModel) {
-        return;
+      if (applyEffortSelectValue(this.index, current, select.value)) {
+        this.refreshDraftStatus();
       }
-      if (next === null && !currentModel.allow_no_effort) {
-        return;
-      }
-      if (next !== null && !currentModel.efforts.includes(next)) {
-        return;
-      }
-      current.effort = next;
-      this.refreshDraftStatus();
     });
     return select;
   }
@@ -1577,6 +1811,7 @@ export class ProfilesPage {
     const cell = this.draft.assignments[role][slot];
     cell.model_id = '';
     cell.effort = null;
+    cell.pending_family = null;
     const select = this.root.querySelector<HTMLSelectElement>(
       `[data-model-key="${role}:${slot}"]`
     );

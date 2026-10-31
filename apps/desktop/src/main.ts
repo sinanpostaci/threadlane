@@ -97,6 +97,7 @@ import {
   type DecisionProvider,
   type ModelDefinition,
 } from './registry/ipc.ts';
+import { visibleModelCount } from './registry/model-families.ts';
 import { createBrandIconElement, createUiIcon, type UiIconName } from './icons.ts';
 import { createButton, h } from './ui/dom.ts';
 import { ToolsPage } from './pages/tools.ts';
@@ -1915,13 +1916,17 @@ class ThreadlaneDesktopApp {
   }
 
   private buildRegistryHeaderBar(): HTMLElement {
+    const modelCount = visibleModelCount(
+      this.state.registrySnapshot.models,
+      this.state.registrySnapshot.tools
+    );
     return h(
       'div',
       { className: 'aq-scope-bar' },
       h(
         'span',
         undefined,
-        `Registry revision r${this.state.registrySnapshot.revision} · ${this.state.registrySnapshot.tools.length} tools · ${this.state.registrySnapshot.models.length} models · ${this.state.registrySnapshot.profiles.length} profiles`
+        `Registry revision r${this.state.registrySnapshot.revision} · ${this.state.registrySnapshot.tools.length} tools · ${modelCount} models · ${this.state.registrySnapshot.profiles.length} profiles`
       ),
       h(
         'button',

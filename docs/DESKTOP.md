@@ -17,6 +17,12 @@ Milestone 3A introduces the first usable Threadlane desktop control panel (`apps
 
 ---
 
+## Model families and concrete CLI variants
+
+Tools groups Antigravity's separate effort-suffixed CLI records (for example, low, medium, and high) into one model family only when both the display label and model argument identify the same base model and effort. The saved records remain separate concrete CLI pins: their exact IDs, labels, model arguments, and effort metadata are unchanged, and each one stays available under **CLI variants** on the family card. Profiles can offer one family choice whose effort resolves to those existing records. Other tools continue to show one card per model, and unrecognized or ambiguous records stay ordinary. This grouping is UI-only: it adds no migration, rewrites no saved records, and never probes or executes a CLI.
+
+---
+
 ## Runtime, Security, and UI Invariants
 
 1. **Sole Live Data Boundary (`SupervisorClient::from_state_dir_lazy`)**:

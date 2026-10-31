@@ -9,6 +9,11 @@ import type {
   RegistrySnapshot,
   ToolDefinition,
 } from '../registry/types.ts';
+import {
+  groupModelFamilies,
+  visibleModelCount,
+  type ModelFamily,
+} from '../registry/model-families.ts';
 import { createButton, h } from '../ui/dom.ts';
 import { planDetectedEffortUpdates } from './effort-setup.ts';
 import { catalogProvider, catalogProviderOptions, matchesCatalogProvider, type CatalogProvider } from './catalog-providers.ts';
@@ -101,6 +106,15 @@ interface ModelDraft extends DraftMeta {
   modelArg: string;
   efforts: string;
   allowNoEffort: boolean;
+}
+
+interface CatalogFamilyState {
+  savedCount: number;
+  full: boolean;
+  partial: boolean;
+  selectable: ModelDefinition[];
+  unimportable: ModelDefinition[];
+  collisions: ModelDefinition[];
 }
 
 interface ProbeState {
@@ -1022,7 +1036,10 @@ export class ToolsPage {
   private buildHeader(snapshot: RegistrySnapshot): HTMLElement {
     const enabledTools = snapshot.tools.filter((tool) => tool.enabled);
     const enabledToolIds = new Set(enabledTools.map((tool) => tool.id));
-    const readyModels = snapshot.models.filter((model) => enabledToolIds.has(model.tool_id));
+    const readyModelCount = visibleModelCount(
+      snapshot.models.filter((model) => enabledToolIds.has(model.tool_id)),
+      snapshot.tools
+    );
 
     return h(
       'div',
@@ -1049,12 +1066,12 @@ export class ToolsPage {
         ),
         h(
           'span',
-          { className: 'aq-badge', 'data-status': readyModels.length > 0 ? 'active' : 'warn' },
-          readyModels.length > 0
-            ? `${readyModels.length} model${readyModels.length === 1 ? '' : 's'} ready`
+          { className: 'aq-badge', 'data-status': readyModelCount > 0 ? 'active' : 'warn' },
+          readyModelCount > 0
+            ? `${readyModelCount} model${readyModelCount === 1 ? '' : 's'} ready`
             : 'No models added'
         ),
-        readyModels.length > 0 && this.onOpenProfiles
+        readyModelCount > 0 && this.onOpenProfiles
           ? this.button(
               'Open Profiles',
               () => this.onOpenProfiles?.(),
@@ -1598,6 +1615,11 @@ export class ToolsPage {
     const probe = this.probes.get(tool.id);
     const api = provider ? this.apiState(tool.id) : null;
     const using = snapshot.models.filter((model) => model.tool_id === tool.id);
+    const usingModelCount = visibleModelCount(using, snapshot.tools);
+    const usingCountText =
+      using.length === usingModelCount
+        ? `${usingModelCount} model${usingModelCount === 1 ? '' : 's'}`
+        : `${usingModelCount} model${usingModelCount === 1 ? '' : 's'} (${using.length} CLI variants)`;
     const deleting = this.pending.has(`tool-delete:${tool.id}`);
     const confirming = this.deleteConfirm?.kind === 'tool' && this.deleteConfirm?.id === tool.id;
     const cardKey = `tool:${tool.id}`;
@@ -1700,7 +1722,7 @@ export class ToolsPage {
             { className: 'aq-tools-hint' },
             using.length === 0
               ? 'Registered · No models added yet'
-              : `${using.length} model${using.length === 1 ? '' : 's'} added for Profiles`
+              : `${usingCountText} added for Profiles`
           )
         ),
         h(
@@ -1720,9 +1742,7 @@ export class ToolsPage {
             h(
               'span',
               { className: 'aq-badge', 'data-status': using.length > 0 ? 'active' : 'warn' },
-              using.length > 0
-                ? `${using.length} model${using.length === 1 ? '' : 's'}`
-                : 'No models added'
+              using.length > 0 ? usingCountText : 'No models added'
             ),
             h('span', { className: 'aq-badge' }, ADAPTER_LABELS[tool.adapter]),
             changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null
@@ -1739,7 +1759,7 @@ export class ToolsPage {
         ? h(
             'p',
             { className: 'aq-tools-hint' },
-            'Registration alone does not add models. Click Choose models to read the catalog and select models for Profiles.'
+            'Registration alone does not add models. Click Choose models to read the catalog and select model families for Profiles.'
           )
         : null,
       pickerOpen
@@ -1784,7 +1804,7 @@ export class ToolsPage {
                   ? h(
                       'span',
                       { className: 'aq-tools-hint aq-tools-delete-note' },
-                      `Remove ${using.length} model${using.length === 1 ? '' : 's'} before deleting this tool.`
+                      `Remove ${usingCountText} before deleting this tool.`
                     )
                   : confirming
                     ? h(
@@ -1958,7 +1978,7 @@ export class ToolsPage {
         h(
           'p',
           { className: 'aq-tools-hint' },
-          'Select new models to use in Profiles, then click Add selected models. Imported models keep any detected effort options. Already-added models stay saved with their existing settings.'
+          'Select model families to use in Profiles, then click Add selected models. A family adds only its missing concrete CLI variants, and imported models keep any detected effort options. Already-added models stay saved with their existing settings.'
         )
       ),
       this.button('Close', closePicker, `close-picker-${tool.id}`)
@@ -2017,6 +2037,7 @@ export class ToolsPage {
     }
 
     const importableModels = catalogModels.filter((model) => this.importable(model));
+    const families = groupModelFamilies(catalogModels, [tool]);
     const currentQuery = this.catalogSearch.get(key) ?? '';
     const searchInput = this.input(
       `${key}-search`,
@@ -2076,42 +2097,84 @@ export class ToolsPage {
           )
         : null;
 
-    const matchesSearch = (model: ModelDefinition, rawQuery: string): boolean => {
+    const familyCountText = (count: number): string =>
+      `${count} famil${count === 1 ? 'y' : 'ies'}`;
+
+    const matchesFamilySearch = (family: ModelFamily, rawQuery: string): boolean => {
       const q = rawQuery.trim().toLowerCase();
       if (!q) return true;
-      const haystack = `${model.label} ${model.id} ${model.model_arg} ${(model.efforts ?? []).join(' ')}`.toLowerCase();
-      return haystack.includes(q);
+      const haystack: string[] = [family.label, family.tool_id];
+      for (const model of family.members) {
+        haystack.push(
+          model.label,
+          model.id,
+          model.model_arg,
+          ...(Array.isArray(model.efforts) ? model.efforts : [])
+        );
+      }
+      for (const variant of family.variants) {
+        haystack.push(variant.effort);
+      }
+      return haystack.join(' ').toLowerCase().includes(q);
     };
+
+    const matchesFamilyProvider = (
+      family: ModelFamily,
+      provider: CatalogProvider
+    ): boolean =>
+      provider === 'all' ||
+      family.members.some((model) => matchesCatalogProvider(model.model_arg, provider));
 
     const renderPickerBody = (renderRows = true): void => {
       const currentSelection = this.selection(key, importableModels);
       const query = this.catalogSearch.get(key) ?? '';
       const provider = hasProviderFilter ? this.catalogProviders.get(key) ?? 'all' : 'all';
-      const filtered = catalogModels.filter((model) =>
-        matchesCatalogProvider(model.model_arg, provider) && matchesSearch(model, query)
+      const filteredFamilies = families.filter(
+        (family) =>
+          matchesFamilyProvider(family, provider) && matchesFamilySearch(family, query)
       );
-      const visibleIds = new Set(filtered.map(model => model.id));
-      const hiddenSelected = Array.from(currentSelection).filter(id => !visibleIds.has(id)).length;
-      const addedForToolCount = catalogModels.filter((model) =>
-        this.snapshot?.models.some(
-          (saved) => saved.id.trim() === model.id.trim() && saved.tool_id === tool.id
+      const visibleFamilyKeys = new Set(filteredFamilies.map((family) => family.key));
+      const selectedFamilies = families.filter((family) =>
+        this.catalogFamilyState(tool, family).selectable.some((model) =>
+          currentSelection.has(model.id)
         )
+      );
+      const hiddenSelectedFamilyCount = selectedFamilies.filter(
+        (family) => !visibleFamilyKeys.has(family.key)
+      ).length;
+      const fullAddedFamilyCount = families.filter(
+        (family) => this.catalogFamilyState(tool, family).full
+      ).length;
+      const partialAddedFamilyCount = families.filter(
+        (family) => this.catalogFamilyState(tool, family).partial
       ).length;
 
       const stateNodes: HTMLElement[] = [
         h(
           'span',
           undefined,
-          currentSelection.size > 0
-            ? `${currentSelection.size} selected to add`
-            : '0 selected'
+          selectedFamilies.length > 0
+            ? `${familyCountText(selectedFamilies.length)} selected to add`
+            : '0 families selected'
         ),
-        h('span', undefined, `${addedForToolCount} already added for ${tool.label}`),
-        h('span', undefined, `Showing ${filtered.length} of ${catalogModels.length}`),
+        h(
+          'span',
+          undefined,
+          `${familyCountText(fullAddedFamilyCount)} fully added${
+            partialAddedFamilyCount > 0
+              ? ` · ${familyCountText(partialAddedFamilyCount)} partially added`
+              : ''
+          } for ${tool.label}`
+        ),
+        h(
+          'span',
+          undefined,
+          `Showing ${familyCountText(filteredFamilies.length)} of ${familyCountText(families.length)}`
+        ),
       ];
-      if (hiddenSelected > 0) {
+      if (hiddenSelectedFamilyCount > 0) {
         stateNodes.push(h('span', { className: 'aq-tools-hint' },
-          `${hiddenSelected} selected outside the current view. Clear selection to remove them.`));
+          `${familyCountText(hiddenSelectedFamilyCount)} selected outside the current view. Clear selection to remove them.`));
       }
       if (currentSelection.size > 0) {
         stateNodes.push(
@@ -2127,11 +2190,11 @@ export class ToolsPage {
       }
       stateEl.replaceChildren(...stateNodes);
 
-      if (renderRows && catalogModels.length === 0) {
+      if (renderRows && families.length === 0) {
         listEl.replaceChildren(
           h('p', { className: 'aq-note' }, 'The catalog reported no models.')
         );
-      } else if (renderRows && filtered.length === 0) {
+      } else if (renderRows && filteredFamilies.length === 0) {
         listEl.replaceChildren(
           h('p', { className: 'aq-note' },
             provider === 'opencode-go' && query.trim() === ''
@@ -2140,8 +2203,8 @@ export class ToolsPage {
         );
       } else if (renderRows) {
         listEl.replaceChildren(
-          ...filtered.map((model, index) =>
-            this.catalogRow(tool, key, model, currentSelection, index, () =>
+          ...filteredFamilies.map((family, index) =>
+            this.catalogFamilyRow(tool, key, family, currentSelection, index, () =>
               renderPickerBody(false)
             )
           )
@@ -2155,13 +2218,17 @@ export class ToolsPage {
       const importBtn = this.button(
         importing
           ? 'Adding models…'
-          : `Add selected models${currentSelection.size > 0 ? ` (${currentSelection.size})` : ''}`,
+          : `Add selected models${
+              selectedFamilies.length > 0
+                ? ` (${familyCountText(selectedFamilies.length)})`
+                : ''
+            }`,
         () => void this.importModels(tool, key, importableModels),
         `${key}-import`,
-        currentSelection.size > 0 ? 'primary' : undefined,
-        currentSelection.size === 0 || importing
+        selectedFamilies.length > 0 ? 'primary' : undefined,
+        selectedFamilies.length === 0 || importing
       );
-      if (currentSelection.size > 0) {
+      if (selectedFamilies.length > 0) {
         importBtn.classList.add('aq-tools-primary');
       }
 
@@ -2432,11 +2499,18 @@ export class ToolsPage {
 
   private buildModels(snapshot: RegistrySnapshot): HTMLElement {
     const toolById = new Map(snapshot.tools.map((tool) => [tool.id, tool]));
-    const models = [...snapshot.models].sort((left, right) => {
-      const leftTool = toolById.get(left.tool_id)?.label ?? left.tool_id;
-      const rightTool = toolById.get(right.tool_id)?.label ?? right.tool_id;
-      return leftTool.localeCompare(rightTool) || left.label.localeCompare(right.label);
-    });
+    const families = [...groupModelFamilies(snapshot.models, snapshot.tools)].sort(
+      (left, right) => {
+        const leftTool = toolById.get(left.tool_id)?.label ?? left.tool_id;
+        const rightTool = toolById.get(right.tool_id)?.label ?? right.tool_id;
+        return (
+          leftTool.localeCompare(rightTool) ||
+          left.label.localeCompare(right.label) ||
+          left.key.localeCompare(right.key)
+        );
+      }
+    );
+    const visibleCount = visibleModelCount(snapshot.models, snapshot.tools);
     const manualOpen = this.expanded.has('create-model');
     return h(
       'section',
@@ -2455,7 +2529,7 @@ export class ToolsPage {
           h(
             'p',
             { className: 'aq-note' },
-            'Models added from tool catalogs or manual setup appear here. Catalog imports keep any detected effort options; you can review or edit them on any saved model. Detected options are metadata, not runtime verification.'
+            'Models added from tool catalogs or manual setup appear here. Antigravity effort variants are grouped into one family card while every concrete CLI record stays editable under CLI variants. Detected options are metadata, not runtime verification.'
           )
         ),
         h(
@@ -2463,10 +2537,10 @@ export class ToolsPage {
           { className: 'aq-tools-actions aq-tools-progress' },
           h(
             'span',
-            { className: 'aq-badge', 'data-status': models.length > 0 ? 'active' : 'warn' },
-            `${models.length} model${models.length === 1 ? '' : 's'}`
+            { className: 'aq-badge', 'data-status': visibleCount > 0 ? 'active' : 'warn' },
+            `${visibleCount} model${visibleCount === 1 ? '' : 's'}`
           ),
-          models.length > 0 && this.onOpenProfiles
+          visibleCount > 0 && this.onOpenProfiles
             ? this.button(
                 'Open Profiles',
                 () => this.onOpenProfiles?.(),
@@ -2476,7 +2550,7 @@ export class ToolsPage {
             : null
         )
       ),
-      models.length === 0
+      families.length === 0
         ? h(
             'p',
             { className: 'aq-note aq-tools-empty' },
@@ -2485,7 +2559,13 @@ export class ToolsPage {
         : h(
             'div',
             { className: 'aq-tools-list' },
-            ...models.map((model) => this.buildModel(snapshot, model))
+            ...families.map((family) => {
+              if (family.encodedEfforts && family.members.length > 0) {
+                return this.buildModelFamily(snapshot, family);
+              }
+              const model = family.members[0];
+              return model ? this.buildModel(snapshot, model) : null;
+            })
           ),
       h(
         'details',
@@ -2493,6 +2573,78 @@ export class ToolsPage {
         h('summary', undefined, 'Advanced: Add manual model'),
         this.buildCreateModel(snapshot)
       )
+    );
+  }
+
+  private buildModelFamily(snapshot: RegistrySnapshot, family: ModelFamily): HTMLElement {
+    const tool = snapshot.tools.find((entry) => entry.id === family.tool_id) ?? null;
+    const variantsKey = `model-family:${family.key}`;
+    const variantsOpen = this.expanded.has(variantsKey);
+    const effortList = family.variants.map((variant) => variant.effort).join(', ');
+    const variants = h(
+      'details',
+      {
+        className: 'aq-tools-advanced aq-tools-family-variants',
+        open: variantsOpen ? true : undefined,
+      },
+      h(
+        'summary',
+        undefined,
+        `CLI variants (${family.members.length} concrete record${family.members.length === 1 ? '' : 's'})`
+      ),
+      h(
+        'p',
+        { className: 'aq-tools-hint' },
+        'Each CLI variant keeps its exact model ID and provider model argument. Expand a variant to review, edit, or delete that concrete saved record.'
+      ),
+      h(
+        'div',
+        { className: 'aq-tools-list' },
+        ...family.members.map((member) => this.buildModel(snapshot, member))
+      )
+    );
+    variants.addEventListener('toggle', () => {
+      if (variants.open) this.expanded.add(variantsKey);
+      else this.expanded.delete(variantsKey);
+    });
+    return h(
+      'article',
+      { className: 'aq-tools-card aq-tools-model-family' },
+      h(
+        'div',
+        { className: 'aq-tools-model-head' },
+        createBrandIconElement(tool ? brandFor(tool.adapter) : 'generic'),
+        h(
+          'div',
+          { className: 'aq-tools-tool-title' },
+          h('h4', undefined, family.label),
+          h(
+            'span',
+            { className: 'aq-tools-hint' },
+            `${tool?.label ?? 'Missing tool'} · Efforts: ${effortList || 'Not detected'}`
+          )
+        ),
+        h(
+          'div',
+          { className: 'aq-tools-card-controls' },
+          h(
+            'div',
+            { className: 'aq-tools-badges' },
+            h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Model family'),
+            h(
+              'span',
+              { className: 'aq-badge' },
+              `${family.members.length} CLI variant${family.members.length === 1 ? '' : 's'}`
+            )
+          )
+        )
+      ),
+      h(
+        'p',
+        { className: 'aq-tools-hint' },
+        'Select this model and its effort in Profiles. Advanced CLI settings are available below.'
+      ),
+      variants
     );
   }
 
@@ -2860,46 +3012,110 @@ export class ToolsPage {
     );
   }
 
-  private catalogRow(
+  private catalogFamilyState(tool: ToolDefinition, family: ModelFamily): CatalogFamilyState {
+    const savedById = new Map<string, ModelDefinition>();
+    for (const saved of this.snapshot?.models ?? []) {
+      savedById.set(saved.id.trim(), saved);
+    }
+    const state: CatalogFamilyState = {
+      savedCount: 0,
+      full: false,
+      partial: false,
+      selectable: [],
+      unimportable: [],
+      collisions: [],
+    };
+    for (const member of family.members) {
+      const saved = savedById.get(member.id.trim());
+      if (saved) {
+        if (saved.tool_id === tool.id) state.savedCount += 1;
+        else state.collisions.push(saved);
+        continue;
+      }
+      if (this.importable(member)) state.selectable.push(member);
+      else state.unimportable.push(member);
+    }
+    state.full = family.members.length > 0 && state.savedCount === family.members.length;
+    state.partial = state.savedCount > 0 && !state.full;
+    return state;
+  }
+
+  private catalogFamilyRow(
     tool: ToolDefinition,
     key: string,
-    model: ModelDefinition,
+    family: ModelFamily,
     selection: Set<string>,
     index: number,
     onSelectionChanged?: () => void
   ): HTMLElement {
-    const importable = this.importable(model);
-    const modelId = model.id?.trim() ?? '';
-    const saved = this.snapshot?.models.find((entry) => entry.id.trim() === modelId) ?? null;
-    const alreadyOnThisTool = saved !== null && saved.tool_id === tool.id;
-    const usedByOtherTool = saved !== null && saved.tool_id !== tool.id;
-    const otherToolLabel = usedByOtherTool
-      ? this.snapshot?.tools.find((entry) => entry.id === saved.tool_id)?.label ?? saved.tool_id
-      : null;
-    const canSelect = importable && saved === null;
-
+    const state = this.catalogFamilyState(tool, family);
+    const primaryModel = family.members[0] ?? null;
+    const selectableIds = state.selectable.map((model) => model.id);
+    const selectedCount = selectableIds.filter((id) => selection.has(id)).length;
+    const allSelected = selectableIds.length > 0 && selectedCount === selectableIds.length;
+    const someSelected = selectedCount > 0;
     const check = this.checkbox(
-      `${key}-model-${index}-${model.id || 'missing'}`,
-      alreadyOnThisTool || (canSelect && selection.has(model.id))
+      `${key}-family-${index}-${family.key}`,
+      allSelected || state.full
     );
-    check.disabled = !canSelect;
+    check.indeterminate = someSelected && !allSelected && !state.full;
+    check.disabled = selectableIds.length === 0;
+    check.setAttribute('aria-label', `Select ${family.label} for import`);
     check.addEventListener('change', () => {
-      if (!canSelect) {
-        check.checked = alreadyOnThisTool;
+      if (selectableIds.length === 0) {
+        check.checked = false;
+        check.indeterminate = false;
         return;
       }
-      if (check.checked) selection.add(model.id);
-      else selection.delete(model.id);
+      if (check.checked) {
+        for (const id of selectableIds) selection.add(id);
+      } else {
+        for (const id of selectableIds) selection.delete(id);
+      }
+      check.indeterminate = false;
       if (onSelectionChanged) {
         onSelectionChanged();
       } else {
         this.refresh();
       }
     });
+
+    const collisionLabels = Array.from(
+      new Set(
+        state.collisions.map(
+          (saved) =>
+            this.snapshot?.tools.find((entry) => entry.id === saved.tool_id)?.label ??
+            saved.tool_id
+        )
+      )
+    );
+    const exactIds = family.members.map((model) => model.id || 'missing-id');
+    const effortList = family.variants.map((variant) => variant.effort).join(', ');
+    const detailText = family.encodedEfforts
+      ? `Efforts: ${effortList || 'None detected'} · ${family.members.length} concrete CLI variant${
+          family.members.length === 1 ? '' : 's'
+        }`
+      : primaryModel
+        ? `Model arg: ${safeText(primaryModel.model_arg, 'missing')} · ${effortText(primaryModel)}`
+        : 'No catalog metadata';
+    const statusHint = state.full
+      ? 'All concrete variants for this family are already saved. Existing settings are preserved.'
+      : state.partial
+        ? 'Some concrete variants for this family are already saved. Selecting this family adds only missing importable variants and never removes or overwrites saved ones.'
+        : state.collisions.length > 0
+          ? `Concrete model IDs already belong to ${collisionLabels.join(', ')} and cannot be overwritten from ${tool.label}.`
+          : state.unimportable.length > 0
+            ? 'Some variants are missing required catalog metadata and will not be imported.'
+            : 'Detected effort options are catalog metadata, not runtime verification.';
+
     return h(
       'div',
       {
-        className: `aq-tools-catalog-row${!importable || usedByOtherTool ? ' aq-tools-catalog-row-invalid' : ''}`,
+        className: `aq-tools-catalog-row${
+          state.collisions.length > 0 || state.unimportable.length > 0
+            ? ' aq-tools-catalog-row-invalid'
+            : ''
+        }`,
       },
       h(
         'label',
@@ -2911,45 +3127,49 @@ export class ToolsPage {
           h(
             'span',
             { className: 'aq-tools-badges' },
-            h('strong', undefined, safeText(model.label, model.id || 'Unnamed model')),
-            alreadyOnThisTool
+            h(
+              'strong',
+              undefined,
+              safeText(family.label, primaryModel?.id || 'Unnamed model family')
+            ),
+            state.full
               ? h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Added')
               : null,
-            usedByOtherTool
+            state.partial
+              ? h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Partially added')
+              : null,
+            collisionLabels.length > 0
               ? h(
                   'span',
                   { className: 'aq-badge', 'data-status': 'warn' },
-                  `ID used by ${otherToolLabel}`
+                  `ID used by ${collisionLabels.join(', ')}`
                 )
               : null
           ),
-          h('code', { className: 'aq-tools-code' }, model.id || 'missing-id'),
-          h(
-            'span',
-            { className: 'aq-tools-hint' },
-            `Model arg: ${safeText(model.model_arg, 'missing')} · ${effortText(model)}`
-          ),
-          alreadyOnThisTool
-            ? h(
-                'span',
-                { className: 'aq-tools-hint' },
-                'Already added for this tool. Existing label, model argument, effort options, and profile assignments are preserved.'
-              )
-            : usedByOtherTool
-              ? h(
-                  'span',
-                  { className: 'aq-tools-hint' },
-                  `Model ID "${model.id}" already belongs to ${otherToolLabel} and cannot be overwritten from ${tool.label}.`
-                )
-              : h(
-                  'span',
-                  { className: 'aq-tools-hint' },
-                  'Detected effort options are catalog metadata, not runtime verification.'
-                )
+          family.encodedEfforts
+            ? h('code', { className: 'aq-tools-code' }, exactIds.join(' · '))
+            : h('code', { className: 'aq-tools-code' }, primaryModel?.id || 'missing-id'),
+          h('span', { className: 'aq-tools-hint' }, detailText),
+          h('span', { className: 'aq-tools-hint' }, statusHint)
         )
       ),
-      !importable
-        ? h('span', { className: 'aq-tools-inline-error' }, 'Missing required catalog metadata.')
+      state.unimportable.length > 0
+        ? h(
+            'span',
+            { className: 'aq-tools-inline-error' },
+            `Missing required catalog metadata for ${state.unimportable.length} variant${
+              state.unimportable.length === 1 ? '' : 's'
+            }.`
+          )
+        : null,
+      state.collisions.length > 0
+        ? h(
+            'span',
+            { className: 'aq-tools-inline-error' },
+            `Concrete model IDs already belong to ${collisionLabels.join(
+              ', '
+            )} and cannot be overwritten from ${tool.label}.`
+          )
         : null
     );
   }
@@ -3496,6 +3716,7 @@ export class ToolsPage {
       efforts: [...model.efforts],
       allow_no_effort: Boolean(model.allow_no_effort) || model.efforts.length === 0,
     }));
+    const addedFamilyCount = groupModelFamilies(models, [tool]).length;
     await this.apply(`import:${key}`, { op: 'upsert_models', models }, (next) => {
       this.selections.delete(key);
       this.catalogSearch.delete(key);
@@ -3503,7 +3724,7 @@ export class ToolsPage {
       this.notice = {
         tone: 'success',
         title: 'Models added',
-        text: `Added ${models.length} model${models.length === 1 ? '' : 's'} for ${tool.label} at revision ${next.revision}. Catalog metadata, including any detected effort options, was kept. You can now assign ${models.length === 1 ? 'it' : 'them'} in Profiles.`,
+        text: `Added ${addedFamilyCount} model famil${addedFamilyCount === 1 ? 'y' : 'ies'} (${models.length} concrete model${models.length === 1 ? '' : 's'}) for ${tool.label} at revision ${next.revision}. Catalog metadata, including any detected effort options, was kept. The added records are available in Profiles.`,
         showOpenProfiles: true,
       };
     });
