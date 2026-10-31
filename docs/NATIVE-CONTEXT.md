@@ -14,7 +14,8 @@ local control plane. It does **not** authenticate per-call native chat identity
 (`native_per_call_identity_verified: false`), establish automatic two-chat
 routing, or grant human scope approval (`human_approval_verified: false`).
 
-- `threadlane-context` supports only `check`, `workflow`, and `session`.
+- Operational context commands are `check`, `workflow`, and `session`.
+  Context-free `help workflow` and `help session` expose sibling help only.
 - Scope approval (`threadlane-approve`), host startup (`threadlane-host`), and
   review/integration (`threadlane-operator`) remain separate explicit operator
   commands and are not exposed as context pass-through families.
