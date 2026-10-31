@@ -21,6 +21,9 @@
 //! - **Canonical sibling execution only**: `workflow` and `session` resolve only the canonical
 //!   `threadlane-workflow` or `threadlane-session` regular executable in the current binary's
 //!   canonical parent directory, rejecting missing, symlink, non-regular, or non-executable targets.
+//! - **Context-free family help**: `help workflow` and `help session` execute only the canonical
+//!   same-package sibling with a single fixed `--help` argument, without reading a context,
+//!   validating stores, or contacting a supervisor.
 //! - **Locked scope flags**: Bound store directories, `--binding`, `--thread`, and `--context`
 //!   come exclusively from the private context file; forwarded overrides (including `=` forms and
 //!   repeated flags) are rejected before child execution.
@@ -52,13 +55,16 @@ USAGE:
     threadlane-context --context <ABS_PRIVATE_JSON> check
     threadlane-context --context <ABS_PRIVATE_JSON> workflow <WORKFLOW_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> session <SESSION_ARGS>...
-    threadlane-context --help | -h
+    threadlane-context help workflow
+    threadlane-context help session
+    threadlane-context --help | -h | help
     threadlane-context --version | -V
 
 FAMILIES:
     check       Validate private v1 context schema, project root, private stores, package pin, and live binding
     workflow    Invoke canonical sibling threadlane-workflow with context-bound scope flags
     session     Invoke canonical sibling threadlane-session with context-bound scope flags
+    help        Display outer help, or context-free sibling help for workflow/session
 ";
 
 const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
@@ -111,6 +117,9 @@ enum ContextCommand {
 enum OuterParseAction {
     DisplayHelp,
     DisplayVersion,
+    DisplaySiblingHelp {
+        family: ChildFamily,
+    },
     Execute {
         context_path: PathBuf,
         command: ContextCommand,
@@ -383,6 +392,13 @@ async fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        OuterParseAction::DisplaySiblingHelp { family } => match run_sibling_help(family) {
+            Ok(code) => code,
+            Err(err) => {
+                emit_error(&err);
+                ExitCode::from(1)
+            }
+        },
         OuterParseAction::Execute {
             context_path,
             command,
@@ -423,6 +439,25 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
                 ));
             }
         }
+    }
+
+    if args[0] == "help" {
+        if args.len() != 2 {
+            return Err(OperatorCliError::invalid_input(
+                "help command family accepts exactly one of workflow or session",
+            ));
+        }
+        return match args[1] {
+            "workflow" => Ok(OuterParseAction::DisplaySiblingHelp {
+                family: ChildFamily::Workflow,
+            }),
+            "session" => Ok(OuterParseAction::DisplaySiblingHelp {
+                family: ChildFamily::Session,
+            }),
+            _ => Err(OperatorCliError::invalid_input(
+                "unsupported help family; only workflow and session are supported",
+            )),
+        };
     }
 
     let (context_raw, family_idx) = if args[0] == "--context" {
@@ -492,6 +527,11 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
                 inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
             }
         }
+        "help" => {
+            return Err(OperatorCliError::invalid_input(
+                "help command family is context-free and does not accept --context",
+            ));
+        }
         _ => {
             return Err(OperatorCliError::invalid_input(
                 "unsupported command family; only check, workflow, and session are supported",
@@ -526,13 +566,26 @@ fn reject_protected_overrides(inner_args: &[&str]) -> Result<(), OperatorCliErro
     Ok(())
 }
 
-async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, OperatorCliError> {
+fn ensure_operator_platform_supported() -> Result<(), OperatorCliError> {
     ensure_platform_supported().map_err(|_| {
         OperatorCliError::new(
             "unsupported_platform",
             "trusted local operator CLI is only supported on Unix platforms",
         )
-    })?;
+    })
+}
+
+fn run_sibling_help(family: ChildFamily) -> Result<ExitCode, OperatorCliError> {
+    // Context-free family help never reads a context or contacts the supervisor. It resolves
+    // only the canonical same-package sibling and forwards no user arguments.
+    ensure_operator_platform_supported()?;
+    let current_bin_dir = resolve_current_bin_dir()?;
+    let sibling_exe = resolve_sibling_executable(&current_bin_dir, family)?;
+    execute_sibling_command(&sibling_exe, &[OsString::from("--help")])
+}
+
+async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, OperatorCliError> {
+    ensure_operator_platform_supported()?;
 
     let raw: RawPrivateContext = read_request(context_path)?;
     let current_bin_dir = resolve_current_bin_dir()?;
@@ -1049,6 +1102,58 @@ mod tests {
                 OsString::from(bad_flag),
             ])
             .expect_err("protected flag must fail");
+            assert_eq!(err.code, "invalid_input");
+        }
+    }
+
+    #[test]
+    fn outer_parser_accepts_only_exact_context_free_family_help_forms() {
+        let bare_help = parse_outer_args(&[OsString::from("help")]).expect("parse bare help");
+        assert_eq!(bare_help, OuterParseAction::DisplayHelp);
+
+        for (family_token, expected_family) in [
+            ("workflow", ChildFamily::Workflow),
+            ("session", ChildFamily::Session),
+        ] {
+            let parsed = parse_outer_args(&[OsString::from("help"), OsString::from(family_token)])
+                .expect("parse context-free family help");
+            assert_eq!(
+                parsed,
+                OuterParseAction::DisplaySiblingHelp {
+                    family: expected_family,
+                }
+            );
+        }
+
+        let invalid_help_forms: &[&[&str]] = &[
+            &["help", "check"],
+            &["help", "approve"],
+            &["help", "host"],
+            &["help", "operator"],
+            &["help", "unknown"],
+            &["help", "workflow=ignored"],
+            &["help", "--help"],
+            &["help", "-h"],
+            &["help", "--context"],
+            &["help", "--context=/tmp/context.json"],
+            &["help", "workflow", "extra"],
+            &["help", "session", "--help"],
+            &["help", "workflow", "--state-dir=/tmp/other"],
+        ];
+        for args in invalid_help_forms {
+            let raw: Vec<OsString> = args.iter().map(|arg| OsString::from(*arg)).collect();
+            let err = parse_outer_args(&raw).expect_err("non-exact help form must fail");
+            assert_eq!(err.code, "invalid_input");
+        }
+
+        let context_bearing_help_forms: &[&[&str]] = &[
+            &["--context", "/tmp/context.json", "help", "workflow"],
+            &["--context=/tmp/context.json", "help", "session"],
+            &["--context", "/tmp/context.json", "help"],
+        ];
+        for args in context_bearing_help_forms {
+            let raw: Vec<OsString> = args.iter().map(|arg| OsString::from(*arg)).collect();
+            let err = parse_outer_args(&raw).expect_err("context-bearing help must fail");
             assert_eq!(err.code, "invalid_input");
         }
     }
