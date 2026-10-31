@@ -1,8 +1,9 @@
 #![cfg(unix)]
 //! End-to-end behavioral tests for the packaged `threadlane-context` CLI.
 //!
-//! Covers outer help/version without context or runtime, sanitized syntax errors, existing private
-//! v1 context validation with legacy installation metadata, `check` + `workflow catalog` +
+//! Covers outer help/version without context or runtime, context-free `help workflow` /
+//! `help session` offline sibling help with hostile `PATH`, sanitized syntax errors, existing
+//! private v1 context validation with legacy installation metadata, `check` + `workflow catalog` +
 //! `session` missing-host refusal, foreign/offline bindings, protected scope/context flag override
 //! refusals with zero side effects, bad schema/route/identity/duplicate fields, package-pin and
 //! store guards, symlink/insecure/oversized context files, missing or unsafe sibling binaries, and
@@ -372,6 +373,18 @@ async fn run_bin_os(bin: &Path, args: &[OsString]) -> Output {
         .expect("execute CLI binary with OsString args")
 }
 
+async fn run_bin_with_path(bin: &Path, args: &[&str], path_value: &str) -> Output {
+    Command::new(bin)
+        .args(args)
+        .env("PATH", path_value)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .expect("execute CLI binary with an explicit hostile PATH")
+}
+
 fn assert_error_code(output: &Output, expected_code: &str) -> Value {
     assert!(
         !output.status.success(),
@@ -470,6 +483,181 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
     )
     .await;
     assert_error_code(&non_utf8, "invalid_input");
+}
+
+#[tokio::test]
+async fn offline_family_help_succeeds_without_context_or_supervisor_and_ignores_hostile_path() {
+    let mut fixture = ContextFixture::start().await;
+
+    // Context-free family help must succeed after the fixture supervisor is stopped and without
+    // any --context argument.
+    fixture.shutdown().await;
+
+    let hostile_dir = fixture.root.join("hostile-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-path-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    for name in ["threadlane-workflow", "threadlane-session"] {
+        write_executable_script(&hostile_dir, name, &hostile_script, 0o755);
+    }
+
+    // Package siblings record their exact argv so the test can prove only fixed --help is passed.
+    let workflow_marker = fixture.root.join("workflow-help-argv.marker");
+    let workflow_script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"{}\"\nexit 0\n",
+        workflow_marker.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-workflow",
+        &workflow_script,
+        0o755,
+    );
+
+    let session_marker = fixture.root.join("session-help-argv.marker");
+    let session_script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > \"{}\"\nexit 0\n",
+        session_marker.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-session",
+        &session_script,
+        0o755,
+    );
+
+    let hostile_path = hostile_dir.to_str().expect("utf8 hostile PATH directory");
+    for (family, marker) in [("workflow", &workflow_marker), ("session", &session_marker)] {
+        let out = run_bin_with_path(&fixture.context_bin, &["help", family], hostile_path).await;
+        assert!(
+            out.status.success(),
+            "offline `help {family}` failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "offline `help {family}` must not write stderr"
+        );
+        assert_eq!(
+            fs::read_to_string(marker).expect("read package sibling argv marker"),
+            "1\n--help\n",
+            "offline `help {family}` must forward only fixed --help to the package sibling"
+        );
+        assert!(
+            !hostile_marker.exists(),
+            "offline `help {family}` must not resolve a sibling through PATH"
+        );
+    }
+}
+
+#[tokio::test]
+async fn family_help_rejects_invalid_forms_before_child_and_preserves_sibling_refusals() {
+    let mut fixture = ContextFixture::start().await;
+    fixture.shutdown().await;
+
+    // A fully valid context path proves these forms are rejected by argument parsing, not by a
+    // context-read failure.
+    let ctx_path =
+        fixture.write_private_context("help-refusal-context.json", &fixture.valid_context_json());
+    let ctx_str = ctx_path.to_str().expect("utf8 context path");
+    let ctx_eq = format!("--context={ctx_str}");
+
+    let marker_file = fixture.root.join("help-refusal-child.marker");
+    let marker_script = format!(
+        "#!/bin/sh\nprintf 'spawned' > \"{}\"\nexit 0\n",
+        marker_file.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-workflow",
+        &marker_script,
+        0o755,
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-session",
+        &marker_script,
+        0o755,
+    );
+
+    let invalid_help_forms: &[&[&str]] = &[
+        &["help", "check"],
+        &["help", "approve"],
+        &["help", "host"],
+        &["help", "operator"],
+        &["help", "unknown-family"],
+        &["help", "workflow=ignored"],
+        &["help", "--help"],
+        &["help", "-h"],
+        &["help", "workflow", "extra"],
+        &["help", "workflow", SECRET_SENTINEL],
+        &["help", "session", "--help"],
+        &["help", "workflow", "--help"],
+        &["help", "workflow", "--state-dir=/tmp/other"],
+        &["help", "session", "--thread", OTHER_THREAD_UUID],
+        &["help", "--context", ctx_str],
+        &["help", ctx_eq.as_str()],
+        &["--context", ctx_str, "help", "workflow"],
+        &[ctx_eq.as_str(), "help", "session"],
+    ];
+    for args in invalid_help_forms {
+        let out = run_bin(&fixture.context_bin, args).await;
+        assert_error_code(&out, "invalid_input");
+        assert!(
+            !marker_file.exists(),
+            "invalid help form must be rejected before child invocation: {args:?}"
+        );
+    }
+
+    // A missing package sibling is refused for offline help even when PATH contains a hostile
+    // executable with the same name.
+    let hostile_dir = fixture.root.join("hostile-help-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile help PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile help PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-help-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    write_executable_script(&hostile_dir, "threadlane-workflow", &hostile_script, 0o755);
+
+    let workflow_sibling = fixture.pkg_bin_dir.join("threadlane-workflow");
+    fs::remove_file(&workflow_sibling).expect("remove threadlane-workflow sibling");
+    let missing_out = run_bin_with_path(
+        &fixture.context_bin,
+        &["help", "workflow"],
+        hostile_dir.to_str().expect("utf8 hostile PATH directory"),
+    )
+    .await;
+    assert_error_code(&missing_out, "not_configured");
+    assert!(
+        !hostile_marker.exists(),
+        "missing package sibling must not fall back to PATH"
+    );
+
+    // Unsafe symlink siblings are still refused for offline help.
+    symlink(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-workflow")),
+        &workflow_sibling,
+    )
+    .expect("symlink threadlane-workflow sibling");
+    let symlink_out = run_bin(&fixture.context_bin, &["help", "workflow"]).await;
+    assert_error_code(&symlink_out, "security_violation");
+    assert!(!marker_file.exists());
+    fs::remove_file(&workflow_sibling).expect("remove symlink workflow sibling");
+
+    // The session help form has the same missing-sibling refusal.
+    fs::remove_file(fixture.pkg_bin_dir.join("threadlane-session"))
+        .expect("remove threadlane-session sibling");
+    let missing_session = run_bin(&fixture.context_bin, &["help", "session"]).await;
+    assert_error_code(&missing_session, "not_configured");
+    assert!(!marker_file.exists());
 }
 
 #[tokio::test]

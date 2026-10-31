@@ -24,8 +24,35 @@ routing, or grant human scope approval (`human_approval_verified: false`).
 ## Commands
 
 Outer `--help` / `-h` and `--version` / `-V` succeed without a context file or
-running supervisor. All operational invocations require `--context` before the
-command family:
+running supervisor.
+
+### Context-free family help
+
+The two exact offline family help commands are:
+
+```sh
+threadlane-context help workflow
+threadlane-context help session
+```
+
+Both forms succeed without a context file or a running supervisor. Each command
+resolves only the canonical `threadlane-workflow` or `threadlane-session`
+executable in the current binary's canonical parent directory and passes exactly
+one fixed `--help` argument. The sibling's own help text is written through
+inherited stdio. `PATH` is never consulted, and missing, symlink, non-regular, or
+non-executable package siblings are refused. Any other family, extra argument,
+context-bearing form, protected scope or context override, or general help
+pass-through is rejected before a child is invoked.
+
+These offline forms are not operational context validation: they do not read or
+validate a context file, stores, package pin, or live binding, and they do not
+contact the supervisor. They are also not approval, do not start a supervisor
+or host, and make no native identity or authorization claim; scope approval
+remains a separate `threadlane-approve` operation.
+
+### Operational invocations
+
+All operational invocations require `--context` before the command family:
 
 ```sh
 threadlane-context --context /absolute/private/context.json check
