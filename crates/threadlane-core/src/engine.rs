@@ -12,9 +12,9 @@ use crate::limits::{
     validate_bounded_text, validate_command_key, validate_identifier, validate_label,
     validate_optional_text, validate_page_limit, validate_step_delay_ms, validate_thread_uuid,
     validate_timestamp_ms, CursorKind, FIXED_WAKEUP_MESSAGE, LEGACY_SCHEMA_VERSION_V1,
-    LEGACY_SCHEMA_VERSION_V2, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN, MAX_COMPACT_RESPONSE_BYTES,
-    MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN, MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN,
-    RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
+    LEGACY_SCHEMA_VERSION_V2, LEGACY_SCHEMA_VERSION_V3, MAX_ANSWER_LEN, MAX_CANCEL_REASON_LEN,
+    MAX_COMPACT_RESPONSE_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_INSTRUCTION_LEN,
+    MAX_PAGE_RESPONSE_BYTES, MAX_WAKEUP_ERROR_LEN, RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION,
 };
 use crate::types::{
     AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
@@ -492,6 +492,7 @@ impl Core {
                 requested_model,
                 requested_effort,
                 base_commit,
+                execution_binding,
                 instruction,
                 now_ms,
             } => self.execute_start_worker(
@@ -503,6 +504,7 @@ impl Core {
                 requested_model,
                 requested_effort,
                 base_commit,
+                execution_binding,
                 instruction,
                 now_ms,
             ),
@@ -1343,6 +1345,7 @@ impl Core {
                 instruction TEXT NOT NULL,
                 claim_id TEXT,
                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                execution_binding_json TEXT,
                 worktree_json TEXT NOT NULL,
                 progress_json TEXT NOT NULL,
                 outcome_json TEXT,
@@ -1373,13 +1376,17 @@ impl Core {
                 )?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
-            Some(version) if version == LEGACY_SCHEMA_VERSION_V2 => {
+            Some(version)
+                if version == LEGACY_SCHEMA_VERSION_V3 || version == LEGACY_SCHEMA_VERSION_V2 =>
+            {
+                Self::ensure_workers_execution_binding_column_tx(tx)?;
                 tx.execute(
                     "UPDATE schema_meta SET version = ?1 WHERE id = 1",
                     params![SCHEMA_VERSION],
                 )?;
             }
             Some(version) if version == LEGACY_SCHEMA_VERSION_V1 => {
+                Self::ensure_workers_execution_binding_column_tx(tx)?;
                 Self::migrate_legacy_command_dedup_tx(tx)?;
                 tx.execute(
                     "UPDATE schema_meta SET version = ?1 WHERE id = 1",
@@ -1434,6 +1441,29 @@ impl Core {
             Self::reconcile_wakeup_on_ack_tx(tx, &binding_id, acked_seq)?;
         }
 
+        Ok(())
+    }
+
+    fn ensure_workers_execution_binding_column_tx(tx: &Transaction<'_>) -> Result<(), CoreError> {
+        let has_column = {
+            let mut stmt = tx.prepare("PRAGMA table_info(workers)")?;
+            let mut rows = stmt.query([])?;
+            let mut found = false;
+            while let Some(row) = rows.next()? {
+                let col_name: String = row.get(1)?;
+                if col_name == "execution_binding_json" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_column {
+            tx.execute(
+                "ALTER TABLE workers ADD COLUMN execution_binding_json TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -3919,6 +3949,7 @@ mod tests {
                     requested_model: "gpt-5.4".to_string(),
                     requested_effort: "high".to_string(),
                     base_commit: BASE_COMMIT.to_string(),
+                    execution_binding: None,
                     instruction: "verify package".to_string(),
                     now_ms: 2_000,
                 },

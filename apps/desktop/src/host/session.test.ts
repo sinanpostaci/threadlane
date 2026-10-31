@@ -22,9 +22,13 @@ import {
   codexToolChoicesFromRegistry,
   emptyHostNotificationState,
   enabledHostCodexTools,
+  formatDependencyInputsGate,
+  formatDependentTasksGate,
   formatHostLifecycleActionLabel,
   formatHostStatusLabel,
+  formatTaskDependencyDetail,
   formatTaskStatusLabel,
+  formatTaskStatusTone,
   formatTaskTelemetry,
   hostInstanceChanged,
   hostInstanceId,
@@ -34,6 +38,7 @@ import {
   hostTaskMatchesContext,
   isCurrentHostRequest,
   isHostSummaryReady,
+  isTerminalTaskStatus,
   isUncertainHostErrorKind,
   isValidHostInstanceId,
   MAX_VISIBLE_APPROVED_TASKS,
@@ -42,7 +47,9 @@ import {
   notificationToolIdForStart,
   resolveHostNotificationState,
   taskReviewNote,
+  TASK_DEPENDENCY_UNVERIFIED_NOTE,
   workerTelemetry,
+  writeTaskDependencyText,
 } from './session-logic.ts';
 import type {
   HostExecutionGates,
@@ -822,6 +829,121 @@ describe('approved task completion semantics', () => {
     );
     assert.equal(nextVisibleApprovedTaskCount(40, 45), 45);
     assert.equal(nextVisibleApprovedTaskCount(45, 45), 45);
+  });
+});
+
+describe('approved task prepared dependency inputs', () => {
+  it('labels verified inputs as ready without started or terminal meaning', () => {
+    const label = formatTaskStatusLabel('dependency_inputs_ready');
+    assert.equal(label, 'Ready: dependencies verified');
+    assert.equal(formatTaskStatusTone('dependency_inputs_ready'), 'default');
+    assert.equal(isTerminalTaskStatus('dependency_inputs_ready'), false);
+    assert.equal(/started|running|accepted|merged|applied/i.test(label), false);
+
+    assert.equal(
+      formatTaskStatusLabel('dependency_inputs_unverified'),
+      'Blocked: dependencies unverified'
+    );
+    assert.equal(formatTaskStatusTone('dependency_inputs_unverified'), 'warn');
+    assert.equal(isTerminalTaskStatus('dependency_inputs_unverified'), false);
+
+    const unverified = formatTaskDependencyDetail(
+      makeTask({ status: 'dependency_inputs_unverified' })
+    );
+    assert.equal(unverified?.tone, 'warn');
+    assert.equal(unverified?.text, TASK_DEPENDENCY_UNVERIFIED_NOTE);
+    assert.ok(unverified?.text.includes('reviewed prerequisite code'));
+    assert.ok(unverified?.text.includes('before starting this task'));
+  });
+
+  it('shows only a host-reported prepared base and predecessors, even after start', () => {
+    const base = '0123456789abcdef0123456789abcdef01234567';
+    const dependency_input = {
+      input_digest: 'f'.repeat(64),
+      base_commit: base,
+      tree_sha: 'e'.repeat(40),
+      predecessor_task_ids: ['task-root', 'task-native'],
+    };
+    const prepared = makeTask({
+      status: 'dependency_inputs_ready',
+      dependency_input,
+    });
+    const detail = formatTaskDependencyDetail(prepared);
+    assert.ok(detail);
+    assert.equal(detail.tone, 'default');
+    assert.ok(detail.text.includes(`Base ${base.slice(0, 12)}…`));
+    assert.equal(detail.text.includes(base), false);
+    assert.ok(detail.text.includes('Prerequisites: task-root, task-native'));
+    assert.ok(detail.text.includes('Base '));
+    assert.ok(detail.text.includes('Ready to start.'));
+    assert.equal(taskReviewNote(prepared), '');
+    assert.deepEqual(Object.keys(detail).sort(), ['text', 'tone']);
+
+    const started = formatTaskDependencyDetail(
+      makeTask({ status: 'running', dependency_input })
+    );
+    assert.ok(started?.text.includes(`Base ${base.slice(0, 12)}…`));
+    assert.equal(started?.text.includes('Ready to start.'), false);
+
+    const readyWithoutSummary = formatTaskDependencyDetail(
+      makeTask({ status: 'dependency_inputs_ready', dependency_input: null })
+    );
+    assert.ok(readyWithoutSummary?.text.includes('Prepared input details are unavailable'));
+    assert.equal(readyWithoutSummary?.text.includes(base.slice(0, 12)), false);
+
+    const parentsOnly = makeTask({
+      status: 'not_started',
+      depends_on: ['task-root'],
+      dependency_input: null,
+    });
+    assert.equal(formatTaskDependencyDetail(parentsOnly), null);
+    const clearedSink: { textContent: string | null } = {
+      textContent: 'stale prepared base',
+    };
+    assert.equal(writeTaskDependencyText(clearedSink, parentsOnly), null);
+    assert.equal(clearedSink.textContent, '');
+  });
+
+  it('writes unsafe prepared text as text and reports legacy gate support honestly', () => {
+    const unsafe = '<img src=x onerror=alert(1)>';
+    const task = makeTask({
+      status: 'running',
+      dependency_input: {
+        input_digest: 'a'.repeat(64),
+        base_commit: 'b'.repeat(40),
+        tree_sha: 'c'.repeat(40),
+        predecessor_task_ids: [unsafe, ' task-ok '],
+      },
+    });
+    const sink: { textContent: string | null } = { textContent: '' };
+    const detail = writeTaskDependencyText(sink, task);
+    const rendered = sink.textContent ?? '';
+    assert.equal(rendered, detail?.text ?? '');
+    assert.ok(rendered.includes(unsafe));
+    assert.ok(rendered.includes('task-ok'));
+    assert.equal(rendered.includes('&lt;img'), false);
+    assert.deepEqual(Object.keys(detail!).sort(), ['text', 'tone']);
+
+    assert.ok(formatDependencyInputsGate(READY_GATES).includes('Legacy host'));
+    assert.ok(formatDependentTasksGate(READY_GATES).includes('legacy'));
+
+    const fresh = {
+      ...READY_GATES,
+      root_tasks_only: false,
+      dependent_tasks_blocked: false,
+      dependency_inputs_required: true,
+    };
+    assert.ok(
+      formatDependencyInputsGate(fresh).includes('required before starting dependent tasks')
+    );
+    assert.ok(formatDependentTasksGate(fresh).includes('prerequisite code is reviewed and prepared'));
+    assert.equal(formatDependentTasksGate(fresh).includes('Blocked'), false);
+    assert.ok(
+      formatDependentTasksGate({
+        ...fresh,
+        dependent_tasks_blocked: true,
+      }).includes('Waiting for reviewed prerequisite code')
+    );
   });
 });
 

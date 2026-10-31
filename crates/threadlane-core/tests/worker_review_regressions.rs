@@ -27,6 +27,7 @@ fn terminal_worker_evidence_stays_readable_with_admitted_escaped_instruction_and
                 requested_effort: "high".into(),
                 base_commit: "a".repeat(40),
                 instruction: instruction.clone(),
+                execution_binding: None,
                 now_ms: 1_000,
             },
         )

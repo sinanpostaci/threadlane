@@ -1606,7 +1606,7 @@ impl PairedMcpServer {
     /// Dispatches an approved root worker task using its frozen instruction, profile, write scope, and deterministic command key (requires verified operator enrollment).
     #[tool(
         name = "start_approved_task",
-        description = "Dispatch an operator-approved root worker task (approval_id, task_id) in the separate approved host session for the enrolled (control_binding_id, native_thread_uuid). Loads frozen instructions, model profile, write scope, and deterministic idempotency key from the authority store; dependent tasks and manual codex_cli native routes are blocked.",
+        description = "Dispatch an operator-approved worker task (approval_id, task_id) in the separate approved host session for the enrolled (control_binding_id, native_thread_uuid). Loads frozen instructions, model profile, write scope, and deterministic idempotency key from authority; dependent tasks require explicitly prepared receipt-bound inputs. Manual codex_cli native routes remain blocked.",
         annotations(
             title = "Start Approved Root Worker Task",
             read_only_hint = false,

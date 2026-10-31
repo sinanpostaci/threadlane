@@ -36,8 +36,8 @@ use crate::protocol::{
 };
 use crate::workers::{
     build_completion_record, build_pre_spawn_cancelled_completion, execute_claimed_worker,
-    map_live_event_to_progress, prepare_claim_worktrees, ValidatedWorkerProfile,
-    ValidatedWorkersConfig, WorkersConfig, LIVE_OBSERVER_CHANNEL_CAPACITY,
+    map_live_event_to_progress, prepare_claim_worktrees, resolve_worker_execution,
+    ResolvedWorkerExecution, ValidatedWorkersConfig, WorkersConfig, LIVE_OBSERVER_CHANNEL_CAPACITY,
 };
 
 /// Default background tick interval (ms) for advancing due demo runs and checking wake-up claims.
@@ -984,6 +984,25 @@ async fn handle_scoped_command(
                     ));
                 }
 
+                let resolved = resolve_worker_execution(profile, &command_key, instruction.clone())
+                    .map_err(|err| {
+                        let safe_msg = threadlane_workers::sanitize_and_redact(
+                            &err.to_string(),
+                            threadlane_core::MAX_WORKER_SUMMARY_TEXT_BYTES,
+                        );
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(ApiError::with_details(
+                                ErrorCode::ValidationFailed,
+                                safe_msg,
+                                serde_json::json!({
+                                    "field": "profile_id",
+                                    "profile_id": profile.profile_id,
+                                }),
+                            )),
+                        )
+                    })?;
+
                 let cmd = Command::StartWorker {
                     command_key,
                     profile_id: profile.profile_id.clone(),
@@ -991,8 +1010,9 @@ async fn handle_scoped_command(
                     provider: profile.provider_str().to_string(),
                     requested_model: profile.requested_model_str().to_string(),
                     requested_effort: profile.requested_effort.clone(),
-                    base_commit: profile.template.base_commit.clone(),
+                    base_commit: resolved.spec.base_commit.clone(),
                     instruction,
+                    execution_binding: resolved.execution_binding.clone(),
                     now_ms: now,
                 };
                 let output = access
@@ -1302,6 +1322,7 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                         break;
                     }
 
+                    let mut rejected_any = false;
                     let claimed_batch = {
                         let Some(mut access) = state.acquire_for_worker(false).await else {
                             break;
@@ -1334,11 +1355,102 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                                 continue;
                             }
 
-                            match access.core_mut().claim_worker(
+                            let claim_command_key = profile
+                                .dependency_input
+                                .as_ref()
+                                .map(|policy| policy.command_key.as_str())
+                                .unwrap_or("root-claim");
+
+                            let resolved_res = if profile.dependency_input.is_some()
+                                != snap.execution_binding.is_some()
+                            {
+                                Err(format!(
+                                    "queued worker `{}` dependency policy presence does not match recorded execution_binding",
+                                    snap.worker_id
+                                ))
+                            } else {
+                                match resolve_worker_execution(
+                                    profile,
+                                    claim_command_key,
+                                    snap.instruction.clone(),
+                                ) {
+                                    Ok(resolved) => {
+                                        if resolved.execution_binding != snap.execution_binding {
+                                            Err(format!(
+                                                "queued worker `{}` execution_binding no longer matches current dependency input seal",
+                                                snap.worker_id
+                                            ))
+                                        } else if resolved.spec.base_commit
+                                            != snap.worktree.base_commit
+                                        {
+                                            Err(format!(
+                                                "queued worker `{}` base_commit `{}` does not match resolved execution base `{}`",
+                                                snap.worker_id,
+                                                snap.worktree.base_commit,
+                                                resolved.spec.base_commit
+                                            ))
+                                        } else {
+                                            Ok(resolved)
+                                        }
+                                    }
+                                    Err(err) => Err(format!(
+                                        "queued worker `{}` dependency input validation failed at claim: {err}",
+                                        snap.worker_id
+                                    )),
+                                }
+                            };
+
+                            let resolved = match resolved_res {
+                                Ok(resolved) => resolved,
+                                Err(raw_reason) => {
+                                    let safe_reason = threadlane_workers::sanitize_and_redact(
+                                        &raw_reason,
+                                        threadlane_core::MAX_WORKER_SUMMARY_TEXT_BYTES,
+                                    );
+                                    let reason = if safe_reason.trim().is_empty() {
+                                        "queued worker dependency input rejected before claim"
+                                            .to_string()
+                                    } else {
+                                        safe_reason
+                                    };
+                                    match access.core_mut().reject_queued_worker(
+                                        &snap.binding_id,
+                                        &snap.run_id,
+                                        snap.revision,
+                                        &profile.profile_digest,
+                                        &reason,
+                                        current_time_ms(),
+                                    ) {
+                                        Ok(_) => {
+                                            rejected_any = true;
+                                            continue;
+                                        }
+                                        Err(
+                                            CoreError::StaleRevision { .. }
+                                            | CoreError::InvalidRunState { .. }
+                                            | CoreError::RunNotFound { .. }
+                                            | CoreError::BindingNotFound { .. },
+                                        ) => {
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            let _ = state.record_core_fatal_error(
+                                                "reject_queued_worker failed",
+                                                &err,
+                                            );
+                                            fatal_occurred = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            };
+
+                            match access.core_mut().claim_worker_with_execution_binding(
                                 &snap.binding_id,
                                 &snap.run_id,
                                 snap.revision,
                                 &profile.profile_digest,
+                                snap.execution_binding.as_ref(),
                                 current_time_ms(),
                             ) {
                                 Ok(claim) => {
@@ -1350,7 +1462,7 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                                         Arc::clone(&user_cancel_requested),
                                     );
                                     newly_claimed.push((
-                                        profile.clone(),
+                                        resolved,
                                         claim,
                                         cancel_tx,
                                         cancel_rx,
@@ -1376,11 +1488,17 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                         newly_claimed
                     };
 
-                    if fatal_occurred || claimed_batch.is_empty() {
+                    if fatal_occurred {
+                        break;
+                    }
+                    if claimed_batch.is_empty() {
+                        if rejected_any {
+                            continue;
+                        }
                         break;
                     }
 
-                    for (profile, claim, cancel_tx, cancel_rx, user_cancel_requested) in
+                    for (resolved, claim, cancel_tx, cancel_rx, user_cancel_requested) in
                         claimed_batch
                     {
                         let task_state = Arc::clone(&state);
@@ -1388,7 +1506,7 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
                         worker_tasks.spawn(async move {
                             run_single_claimed_worker(
                                 task_state,
-                                profile,
+                                resolved,
                                 claim,
                                 cancel_tx,
                                 cancel_rx,
@@ -1526,7 +1644,7 @@ async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::
 
 async fn run_single_claimed_worker(
     state: Arc<SharedState>,
-    profile: ValidatedWorkerProfile,
+    resolved: ResolvedWorkerExecution,
     claim: WorkerClaim,
     cancel_tx: watch::Sender<bool>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -1539,12 +1657,12 @@ async fn run_single_claimed_worker(
         run_id: run_id.clone(),
     };
 
-    // 1. Prepare owned per-run and per-task worktrees without holding the Core mutex.
-    let prep_profile = profile.clone();
+    // 1. Prepare owned per-run and per-task worktrees without holding the Core mutex, while
+    // retaining `resolved` (and its dependency seal shared lock lease) in scope.
+    let prep_spec = resolved.spec.clone();
     let prep_claim = claim.clone();
     let worktree_res =
-        tokio::task::spawn_blocking(move || prepare_claim_worktrees(&prep_profile, &prep_claim))
-            .await;
+        tokio::task::spawn_blocking(move || prepare_claim_worktrees(&prep_spec, &prep_claim)).await;
 
     let worktree_update = match worktree_res {
         Ok(Ok(update)) => update,
@@ -1705,7 +1823,7 @@ async fn run_single_claimed_worker(
     };
 
     let exec_fut = execute_claimed_worker(
-        &profile,
+        &resolved,
         &claim,
         &worktree_update.task_worktree_id,
         &mut cancel_rx,
@@ -2404,6 +2522,7 @@ mod tests {
                         base_commit,
                         instruction: "verify non-terminal worker states block idle stop"
                             .to_string(),
+                        execution_binding: None,
                         now_ms: current_time_ms(),
                     },
                 )

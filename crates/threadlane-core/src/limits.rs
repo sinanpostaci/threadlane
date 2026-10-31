@@ -7,16 +7,21 @@ use crate::types::EventKind;
 ///
 /// Version 2 introduced keyset pagination indexes (`idx_runs_binding_order`,
 /// `idx_questions_binding_run_order`) and in-place compaction of legacy v1
-/// full-run `command_dedup` responses. Version 3 adds the durable `workers`
-/// ledger and reopen uncertainty recovery. Databases at version 1 or 2 are
-/// migrated automatically and transactionally on open.
-pub const SCHEMA_VERSION: u32 = 3;
+/// full-run `command_dedup` responses. Version 3 added the durable `workers`
+/// ledger and reopen uncertainty recovery. Version 4 adds the nullable
+/// `execution_binding_json` column on `workers` for sealed dependency input
+/// bindings. Databases at versions 1, 2, or 3 are migrated automatically and
+/// transactionally on open.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Legacy Milestone 1 SQLite schema version supported for in-place upgrade on open.
 pub(crate) const LEGACY_SCHEMA_VERSION_V1: u32 = 1;
 
 /// Legacy Milestone 2A SQLite schema version supported for in-place upgrade on open.
 pub(crate) const LEGACY_SCHEMA_VERSION_V2: u32 = 2;
+
+/// Legacy Milestone 2B SQLite schema version supported for in-place upgrade on open.
+pub(crate) const LEGACY_SCHEMA_VERSION_V3: u32 = 3;
 
 /// Maximum number of named worker execution profiles permitted in startup configuration.
 pub const MAX_WORKER_PROFILES: usize = 32;

@@ -27,8 +27,8 @@
 //!   both `binding_id` and `thread_uuid` before accessing the session directory.
 //!   [`ApprovedHostClient::dispatch_task`] accepts only `(approval_id, task_id)`—no caller
 //!   instruction, model, effort, executable, write scope, or idempotency key override is
-//!   permitted. Dependent tasks (`!depends_on.is_empty()`) are rejected with
-//!   [`HostError::DependencyInputsUnverified`], and manual `codex_cli` routes are rejected with
+//!   permitted. Dependent tasks require explicitly prepared, receipt-bound inputs or return
+//!   [`HostError::DependencyInputsUnverified`]; manual `codex_cli` routes return
 //!   [`HostError::NativeRouteRequired`].
 //! - **ReadyForReview completion boundary**: Completed worker runs map to
 //!   [`TaskExecutionStatus::ReadyForReview`] (`accepted: false`) and never automatically accept,
@@ -47,13 +47,17 @@ pub mod storage;
 /// Serializable manifest, summary, receipt, and task state snapshot types.
 pub mod types;
 
-pub use cli::{run_cli, run_serve, HostCli, HostCommand, ServeArgs};
+pub use cli::{
+    run_cli, run_prepare_dependencies, run_serve, HostCli, HostCommand, PrepareDependenciesArgs,
+    ServeArgs,
+};
 pub use client::ApprovedHostClient;
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
 pub use storage::{
     derive_ack_command_key, derive_cancel_command_key, ensure_fresh_session_dir_locked,
-    ensure_no_symlink_components, ensure_private_dir, is_host_lock_held, paths_overlap,
+    ensure_no_symlink_components, ensure_private_dir,
+    has_prepared_dependency_input_or_ledger_entry, is_host_lock_held, paths_overlap,
     prepare_session_dir, read_and_verify_host_manifest, read_host_launch_intent_optional,
     read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
     record_task_dispatch_intent, record_task_receipt, validate_approval_id,
@@ -69,8 +73,9 @@ pub use threadlane::{
 };
 pub use threadlane_core::{AckResult, EventBatch};
 pub use types::{
-    ApprovedHostNotificationConfig, HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus,
-    HostNotificationSummary, HostPhase, HostSessionManifest, HostSessionSummary,
+    ApprovedHostNotificationConfig, DependencyInputSummary, DependencyPredecessorSelection,
+    HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus, HostNotificationSummary,
+    HostPhase, HostSessionManifest, HostSessionSummary, PrepareDependencyInputsRequest,
     TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot,
     APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
     HOST_LAUNCH_INTENT_SCHEMA_VERSION, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
@@ -187,7 +192,37 @@ case "$PROMPT" in
 esac
 
 if [ -d "src" ]; then
-    printf "// updated by fake-agy\npub fn alpha() -> u32 {{ 42 }}\n" > "src/lib.rs"
+    case "$PROMPT" in
+        *CHAIN_TASK_A*)
+            printf "pub fn task_a() -> u32 {{ 10 }}\n" > "src/a.rs"
+            ;;
+        *CHAIN_TASK_B*)
+            printf "pub fn task_b() -> u32 {{ 20 }}\n" > "src/b.rs"
+            ;;
+        *CHAIN_TASK_C*)
+            if [ ! -f "src/a.rs" ] || [ ! -f "src/b.rs" ]; then
+                echo "missing parent files src/a.rs or src/b.rs in task C worktree" >&2
+                exit 3
+            fi
+            printf "pub fn task_c() -> u32 {{ 30 }}\n" > "src/c.rs"
+            ;;
+        *CHAIN_TASK_D*)
+            if [ ! -f "src/a.rs" ] || [ ! -f "src/b.rs" ] || [ ! -f "src/c.rs" ]; then
+                echo "missing ancestor/parent files in task D worktree" >&2
+                exit 3
+            fi
+            printf "pub fn task_d() -> u32 {{ 40 }}\n" > "src/d.rs"
+            ;;
+        *CONFLICT_TASK_LEFT*)
+            printf "pub fn conflict() -> u32 {{ 111 }}\n" > "src/lib.rs"
+            ;;
+        *CONFLICT_TASK_RIGHT*)
+            printf "pub fn conflict() -> u32 {{ 222 }}\n" > "src/lib.rs"
+            ;;
+        *)
+            printf "// updated by fake-agy\npub fn alpha() -> u32 {{ 42 }}\n" > "src/lib.rs"
+            ;;
+    esac
 fi
 
 printf '{{"type":"result","subtype":"success","session_id":"sess-agy-1","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
@@ -751,6 +786,7 @@ exit 0
                 assert_eq!(args.sessions_dir, PathBuf::from("/tmp/sess"));
                 assert_eq!(args.approval_id, "apr_0123456789abcdef0123456789abcdef");
             }
+            HostCommand::PrepareDependencies(_) => panic!("expected Serve subcommand"),
         }
 
         // Missing required flag (--approval-id) must be rejected.
@@ -2052,6 +2088,7 @@ exit 0
                 task_digest: agy_dispatch.task_digest.clone(),
                 profile_id: agy_dispatch.profile_id.clone(),
                 command_key: agy_dispatch.command_key.clone(),
+                execution_binding: None,
                 recorded_at_ms: 1_700_000_010_000,
             },
         )
@@ -2667,6 +2704,7 @@ exit 0
                     .expect_err("--notify-timeout-ms without --notify-codex must fail");
                 assert_eq!(err.code(), "validation");
             }
+            HostCommand::PrepareDependencies(_) => panic!("expected Serve subcommand"),
         }
 
         // CLI flag parsing: --notify-codex without --notify-timeout-ms uses DEFAULT_CODEX_TIMEOUT_MS.
@@ -2697,6 +2735,7 @@ exit 0
                     fs::canonicalize(&fake_codex).expect("canonical fake_codex")
                 );
             }
+            HostCommand::PrepareDependencies(_) => panic!("expected Serve subcommand"),
         }
 
         // Legacy manifest JSON without `notifications` deserializes with disabled defaults.
@@ -4295,6 +4334,7 @@ exit 0
                     Some(clean_inst1.as_str())
                 );
             }
+            HostCommand::PrepareDependencies(_) => panic!("expected Serve subcommand"),
         }
 
         let clean_host2 = ApprovedHost::restart_stopped(
@@ -4448,6 +4488,7 @@ exit 0
                 assert!(!args.start_fresh_only);
                 assert!(args.restart_from_instance_id.is_none());
             }
+            HostCommand::PrepareDependencies(_) => panic!("expected Serve subcommand"),
         }
 
         let fresh_cli = HostCli::try_parse_from([
@@ -4474,6 +4515,7 @@ exit 0
                 assert_eq!(cfg.approval_id, approval_id);
                 assert!(cfg.notifications.is_none());
             }
+            HostCommand::PrepareDependencies(_) => panic!("expected Serve subcommand"),
         }
 
         assert!(
@@ -4743,5 +4785,1595 @@ exit 0
                 .code(),
             "corrupt_session_state"
         );
+    }
+
+    fn commit_review_and_integrate_task(
+        _fixture: &HostTestFixture,
+        work_area_dir: &Path,
+        task_snap: &TaskStateSnapshot,
+        operator_id: &str,
+    ) -> DependencyPredecessorSelection {
+        use threadlane_operations::{
+            accept_review_subject, commit_task_worktree_changes, execute_integration,
+            inspect_review_subject, propose_integration, CommitTaskChangesRequest,
+            ExecuteIntegrationRequest, InspectReviewSubjectRequest, IntegrationProposalRequest,
+            IntegrationStrategy, ReviewAcceptanceRequest, ReviewPolicyBinding, TestEvidenceSummary,
+        };
+        use threadlane_workers::WorkerRunStatus;
+
+        let worker_snap = task_snap
+            .worker
+            .as_ref()
+            .expect("completed task must have worker snapshot");
+        let task_worktree_id = worker_snap
+            .worktree
+            .task_worktree_id
+            .as_deref()
+            .expect("completed task must have task_worktree_id");
+        let int_worktree_id = worker_snap
+            .worktree
+            .run_worktree_id
+            .as_deref()
+            .expect("completed task must have run_worktree_id");
+        let provider = task_snap
+            .provider
+            .expect("completed worker task must have provider");
+
+        let _commit_report = commit_task_worktree_changes(&CommitTaskChangesRequest {
+            work_area_root: work_area_dir.to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            commit_message: format!("commit changes for {}", task_snap.task_id),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+            allow_missing_effort_evidence: false,
+        })
+        .expect("commit task worktree changes");
+
+        let policy = ReviewPolicyBinding {
+            policy_id: format!("policy-{}", task_snap.task_id),
+            requested_provider: Some(provider.as_str().to_string()),
+            requested_model: Some(worker_snap.requested_model.clone()),
+            requested_effort: Some(worker_snap.requested_effort.clone()),
+            observed_model: worker_snap.observed_model.clone(),
+            observed_effort: worker_snap.observed_effort.clone(),
+            file_permissions: threadlane_workers::WorkerFilePermissions::TaskFiles,
+            require_effort_evidence: true,
+            require_passing_tests: true,
+        };
+        let test_evidence = TestEvidenceSummary {
+            formatting_passed: true,
+            clippy_passed: true,
+            tests_passed: true,
+            passed_test_count: 3,
+            failed_test_count: 0,
+            evidence_summary: "cargo fmt --check && cargo clippy && cargo test".to_string(),
+        };
+
+        let subject = inspect_review_subject(&InspectReviewSubjectRequest {
+            work_area_root: work_area_dir.to_path_buf(),
+            task_worktree_id: task_worktree_id.to_string(),
+            policy,
+            test_evidence,
+            worker_status: Some(WorkerRunStatus::Succeeded),
+        })
+        .expect("inspect review subject");
+
+        let review_receipt = accept_review_subject(&ReviewAcceptanceRequest {
+            expected_subject_digest: subject.subject_digest.clone(),
+            subject: subject.clone(),
+            receipt_id: None,
+            reviewer_id: operator_id.to_string(),
+            review_note: format!("Reviewed and accepted {}", task_snap.task_id),
+            approved_at_ms: 1_700_000_500_000,
+        })
+        .expect("accept review subject");
+
+        let proposal = propose_integration(&IntegrationProposalRequest {
+            work_area_root: work_area_dir.to_path_buf(),
+            integration_worktree_id: int_worktree_id.to_string(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject: subject.clone(),
+            review_receipt: review_receipt.clone(),
+            strategy: IntegrationStrategy::MergeNoFf,
+        })
+        .expect("propose integration");
+
+        let integration_receipt = execute_integration(&ExecuteIntegrationRequest {
+            work_area_root: work_area_dir.to_path_buf(),
+            integration_worktree_id: int_worktree_id.to_string(),
+            task_worktree_id: task_worktree_id.to_string(),
+            subject,
+            review_receipt: review_receipt.clone(),
+            strategy: IntegrationStrategy::MergeNoFf,
+            expected_integration_head_commit: proposal.integration_head_commit,
+            expected_task_head_commit: proposal.task_head_commit,
+            expected_source_head_commit: proposal.source_head_commit,
+            receipt_id: None,
+            operator_id: operator_id.to_string(),
+            integrated_at_ms: 1_700_000_500_500,
+        })
+        .expect("execute integration");
+
+        DependencyPredecessorSelection {
+            task_id: task_snap.task_id.clone(),
+            review_receipt_id: review_receipt.receipt_id,
+            integration_receipt_id: integration_receipt.receipt_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_prepare_dependencies_parses_flags_and_enforces_private_predecessors_file() {
+        let fixture = setup_fixture();
+        let preds_path = fixture.root.join("predecessors.json");
+        let preds_json = serde_json::json!([
+            {
+                "task_id": "task-root-agy",
+                "review_receipt_id": "rvw_1111",
+                "integration_receipt_id": "int_1111"
+            }
+        ]);
+        fs::write(
+            &preds_path,
+            serde_json::to_vec_pretty(&preds_json).expect("serialize preds"),
+        )
+        .expect("write preds");
+        fs::set_permissions(&preds_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 preds");
+
+        let expected_digest = "a".repeat(64);
+        let parsed = HostCli::try_parse_from([
+            "threadlane-host",
+            "prepare-dependencies",
+            "--registry-dir",
+            fixture.registry_dir.to_str().unwrap(),
+            "--plans-dir",
+            fixture.plans_dir.to_str().unwrap(),
+            "--authority-dir",
+            fixture.authority_dir.to_str().unwrap(),
+            "--sessions-dir",
+            fixture.sessions_dir.to_str().unwrap(),
+            "--approval-id",
+            "apr_0123456789abcdef0123456789abcdef",
+            "--task-id",
+            "task-dep-agy",
+            "--predecessors",
+            preds_path.to_str().unwrap(),
+            "--confirm-approval",
+            &expected_digest,
+        ])
+        .expect("parse prepare-dependencies CLI");
+
+        match parsed.command {
+            HostCommand::PrepareDependencies(args) => {
+                assert_eq!(args.approval_id, "apr_0123456789abcdef0123456789abcdef");
+                assert_eq!(args.task_id, "task-dep-agy");
+                assert_eq!(args.confirm_approval, expected_digest);
+            }
+            HostCommand::Serve(_) => panic!("expected PrepareDependencies subcommand"),
+        }
+
+        // Permissive 0644 predecessors file must fail closed before opening session state.
+        let permissive_preds = fixture.root.join("permissive-preds.json");
+        fs::write(&permissive_preds, b"[]").expect("write permissive preds");
+        fs::set_permissions(&permissive_preds, fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        let perm_err = run_prepare_dependencies(PrepareDependenciesArgs {
+            registry_dir: fixture.registry_dir.clone(),
+            plans_dir: fixture.plans_dir.clone(),
+            authority_dir: fixture.authority_dir.clone(),
+            sessions_dir: fixture.sessions_dir.clone(),
+            approval_id: "apr_0123456789abcdef0123456789abcdef".to_string(),
+            task_id: "task-dep-agy".to_string(),
+            predecessors: permissive_preds,
+            confirm_approval: expected_digest,
+        })
+        .await
+        .expect_err("0644 predecessors file must be rejected");
+        assert_eq!(perm_err.code(), "security_violation");
+    }
+
+    #[tokio::test]
+    async fn dependency_fan_in_and_chain_execution_composes_parent_code_and_preserves_source_head()
+    {
+        let fixture = setup_fixture();
+        let chain_tasks = vec![
+            PlanTask {
+                id: "task-a".to_string(),
+                title: "Root task A".to_string(),
+                instruction: "CHAIN_TASK_A write src/a.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-b".to_string(),
+                title: "Root task B".to_string(),
+                instruction: "CHAIN_TASK_B write src/b.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-c".to_string(),
+                title: "Fan-in child task C".to_string(),
+                instruction: "CHAIN_TASK_C verify src/a.rs + src/b.rs and write src/c.rs"
+                    .to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-a".to_string(), "task-b".to_string()],
+                allowed_write_paths: vec!["src/c.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-d".to_string(),
+                title: "Chained child task D".to_string(),
+                instruction:
+                    "CHAIN_TASK_D verify src/a.rs + src/b.rs + src/c.rs and write src/d.rs"
+                        .to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-c".to_string()],
+                allowed_write_paths: vec!["src/d.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-cancel".to_string(),
+                title: "Dependent cancel regression".to_string(),
+                instruction: "SLOW_WAIT_FOR_CANCEL dependent cancel".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-c".to_string()],
+                allowed_write_paths: vec!["src/cancel.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-recover".to_string(),
+                title: "Dependent recover regression".to_string(),
+                instruction: "SLOW_WAIT_FOR_CANCEL dependent recover".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-c".to_string()],
+                allowed_write_paths: vec!["src/recover.rs".to_string()],
+            },
+        ];
+
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-m5b-chain",
+            BINDING_A,
+            THREAD_UUID_A,
+            chain_tasks,
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host for M5B chain");
+
+        let subject_digest = host.approval().subject_digest.clone();
+        let gates = host.summary().gates;
+        assert!(!gates.root_tasks_only);
+        assert!(!gates.dependent_tasks_blocked);
+        assert!(gates.dependency_inputs_required);
+        assert!(gates.supervisor_authenticated_ready);
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // Read-only get_task before preparation reports DependencyInputsUnverified and creates no dependency manifests.
+        let unprep_c = client
+            .get_task(&approval_id, "task-c")
+            .await
+            .expect("get_task task-c before preparation");
+        assert_eq!(
+            unprep_c.status,
+            TaskExecutionStatus::DependencyInputsUnverified
+        );
+        assert!(unprep_c.dependency_input.is_none());
+        assert!(!host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join("dependencies")
+            .exists());
+
+        // 1. Dispatch root tasks A and B, wait for ReadyForReview, commit, review, and integrate each.
+        client
+            .dispatch_task(&approval_id, "task-a")
+            .await
+            .expect("dispatch task-a");
+        client
+            .dispatch_task(&approval_id, "task-b")
+            .await
+            .expect("dispatch task-b");
+
+        let done_a = wait_for_task_status(&client, &approval_id, "task-a", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        let done_b = wait_for_task_status(&client, &approval_id, "task-b", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let pred_a =
+            commit_review_and_integrate_task(&fixture, host.work_area_dir(), &done_a, "op_chain");
+        let pred_b =
+            commit_review_and_integrate_task(&fixture, host.work_area_dir(), &done_b, "op_chain");
+
+        // 2. Prepare dependency inputs for fan-in task C (depends on A and B).
+        let prep_req_c = PrepareDependencyInputsRequest {
+            approval_id: approval_id.clone(),
+            task_id: "task-c".to_string(),
+            expected_approval_digest: subject_digest.clone(),
+            predecessors: vec![pred_b.clone(), pred_a.clone()],
+        };
+        let summary_c = client
+            .prepare_dependency_inputs(prep_req_c.clone())
+            .await
+            .expect("prepare_dependency_inputs for task-c");
+        assert_eq!(
+            summary_c.predecessor_task_ids,
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
+
+        // Calling prepare_dependency_inputs again with identical predecessors is idempotent.
+        let summary_c_again = client
+            .prepare_dependency_inputs(prep_req_c)
+            .await
+            .expect("idempotent prepare_dependency_inputs for task-c");
+        assert_eq!(summary_c_again, summary_c);
+
+        // Read-only get_task after preparation reports DependencyInputsReady and includes the summary.
+        let ready_c = client
+            .get_task(&approval_id, "task-c")
+            .await
+            .expect("get_task task-c after preparation");
+        assert_eq!(ready_c.status, TaskExecutionStatus::DependencyInputsReady);
+        assert_eq!(ready_c.dependency_input, Some(summary_c.clone()));
+
+        // 2b. Pending dispatch intent regression: persist an exact valid pending TaskDispatchIntent
+        //     for task-c before first dispatch, mutate only seal whitespace, and verify dispatch_task
+        //     rejects BEFORE runtime admission, provider invocation, or worktree creation while
+        //     retaining the original pending intent and recording no receipt; restoring exact bytes
+        //     allows the same intent to dispatch once.
+        let task_c_record = host
+            .approval()
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-c")
+            .expect("task-c in approval")
+            .clone();
+        let task_c_profile = storage::build_validated_task_profile(
+            host.approval(),
+            host.session_binding_id(),
+            host.work_area_dir(),
+            &task_c_record,
+        )
+        .expect("build validated profile for task-c");
+        let orig_resolved_c = threadlane::resolve_worker_execution(
+            &task_c_profile,
+            task_c_record.command_key.as_deref().unwrap(),
+            task_c_record.instruction.clone(),
+        )
+        .expect("resolve original execution for task-c");
+        let orig_binding_c = orig_resolved_c
+            .execution_binding
+            .clone()
+            .expect("task-c execution_binding");
+        drop(orig_resolved_c);
+
+        let pending_intent_c = record_task_dispatch_intent(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            TaskDispatchIntent {
+                task_id: task_c_record.task_id.clone(),
+                task_digest: task_c_record.task_digest.clone(),
+                profile_id: task_c_record.profile_id.clone().unwrap(),
+                command_key: task_c_record.command_key.clone().unwrap(),
+                execution_binding: Some(orig_binding_c.clone()),
+                recorded_at_ms: 1_700_000_550_000,
+            },
+        )
+        .expect("persist pending dispatch intent for task-c");
+
+        let agy_count_before_c = read_invocation_count(&fixture.agy_count_file);
+        let activity_before_c = client
+            .list_activity(&approval_id, None, None, Some(20), None)
+            .await
+            .expect("list_activity before task-c dispatch");
+        let task_checkouts_dir = host.work_area_dir().join(CHECKOUTS_SUBDIR).join("tasks");
+        let task_checkouts_before_c = fs::read_dir(&task_checkouts_dir)
+            .expect("read task checkouts dir")
+            .count();
+
+        let seal_c_path = host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join("dependencies")
+            .join("task-c.json");
+        let orig_seal_c_bytes = fs::read(&seal_c_path).expect("read original task-c seal bytes");
+        let mut whitespace_seal_c_bytes = orig_seal_c_bytes.clone();
+        whitespace_seal_c_bytes.extend_from_slice(b"   \n");
+        fs::write(&seal_c_path, &whitespace_seal_c_bytes)
+            .expect("write whitespace-mutated task-c seal");
+        fs::set_permissions(&seal_c_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 task-c seal");
+
+        let ws_reject = client
+            .dispatch_task(&approval_id, "task-c")
+            .await
+            .expect_err(
+                "pending intent with mutated seal whitespace must fail before start_worker",
+            );
+        assert_eq!(ws_reject.code(), "dependency_inputs_unverified");
+
+        let (intent_after_ws_reject, receipt_after_ws_reject) = storage::read_task_ledger_entry(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            "task-c",
+        )
+        .expect("read task-c ledger after whitespace rejection");
+        assert_eq!(intent_after_ws_reject, Some(pending_intent_c.clone()));
+        assert!(
+            receipt_after_ws_reject.is_none(),
+            "rejected pending intent retry must not record a task receipt"
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            agy_count_before_c,
+            "provider must not be invoked when pending intent seal bytes changed"
+        );
+        let activity_after_ws_reject = client
+            .list_activity(&approval_id, None, None, Some(20), None)
+            .await
+            .expect("list_activity after whitespace rejection");
+        assert_eq!(
+            activity_after_ws_reject.events.len(),
+            activity_before_c.events.len(),
+            "runtime must not admit or queue a worker when pending intent binding mismatches"
+        );
+        assert_eq!(
+            fs::read_dir(&task_checkouts_dir)
+                .expect("read task checkouts dir")
+                .count(),
+            task_checkouts_before_c,
+            "no task worktree may be created when pending intent binding mismatches"
+        );
+
+        // Restore exact seal bytes and also verify legacy root-only gate rejects pending dependent intent
+        // before any runtime effect.
+        fs::write(&seal_c_path, &orig_seal_c_bytes).expect("restore original task-c seal bytes");
+        fs::set_permissions(&seal_c_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 restored task-c seal");
+
+        let manifest_path = host.session_dir().join(HOST_MANIFEST_FILENAME);
+        let orig_host_manifest =
+            read_and_verify_host_manifest(&manifest_path, host.approval()).expect("read manifest");
+        let mut legacy_host_manifest = orig_host_manifest.clone();
+        legacy_host_manifest.gates = HostExecutionGates::legacy_for_ready_state(true);
+        write_host_manifest(host.session_dir(), &legacy_host_manifest)
+            .expect("write legacy manifest");
+
+        let legacy_pending_reject = client
+            .dispatch_task(&approval_id, "task-c")
+            .await
+            .expect_err("legacy root-only gate must reject dependent pending intent");
+        assert_eq!(legacy_pending_reject.code(), "dependency_inputs_unverified");
+        let (intent_after_legacy_reject, receipt_after_legacy_reject) =
+            storage::read_task_ledger_entry(
+                host.session_dir(),
+                host.approval(),
+                host.session_binding_id(),
+                "task-c",
+            )
+            .expect("read task-c ledger after legacy rejection");
+        assert_eq!(intent_after_legacy_reject, Some(pending_intent_c.clone()));
+        assert!(receipt_after_legacy_reject.is_none());
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            agy_count_before_c
+        );
+
+        write_host_manifest(host.session_dir(), &orig_host_manifest)
+            .expect("restore Ready manifest gates");
+
+        // 3. Dispatch task C with restored exact seal bytes: the same pending intent dispatches once.
+        let dispatched_c = client
+            .dispatch_task(&approval_id, "task-c")
+            .await
+            .expect("dispatch dependent task-c");
+        assert_eq!(dispatched_c.dependency_input, Some(summary_c.clone()));
+        let done_c = wait_for_task_status(&client, &approval_id, "task-c", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(done_c.status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(done_c.dependency_input, Some(summary_c));
+        assert_eq!(
+            done_c.worker.as_ref().unwrap().execution_binding,
+            Some(orig_binding_c.clone())
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            agy_count_before_c + 1
+        );
+
+        // Verify that once task-c has a durable ledger entry, get_task, list_task_activity, and
+        // idempotent dispatch_task replay succeed even if parent task-a's worktree is temporarily dirtied.
+        let wt_a_checkout = PathBuf::from(
+            done_a
+                .worker
+                .as_ref()
+                .unwrap()
+                .worktree
+                .task_worktree_path
+                .as_ref()
+                .unwrap(),
+        );
+        let temp_dirty_file = wt_a_checkout.join("src/post_child_dirty.tmp");
+        fs::write(&temp_dirty_file, "dirty after child start").expect("write temp dirty file");
+
+        let snap_c_while_parent_dirty = client
+            .get_task(&approval_id, "task-c")
+            .await
+            .expect("get_task on started child must not re-require live parent cleanliness");
+        assert_eq!(
+            snap_c_while_parent_dirty.status,
+            TaskExecutionStatus::ReadyForReview
+        );
+        let replay_c_while_parent_dirty = client
+            .dispatch_task(&approval_id, "task-c")
+            .await
+            .expect("idempotent dispatch_task on started child must use ledger entry");
+        assert_eq!(replay_c_while_parent_dirty.run_id, done_c.run_id);
+        let activity_c = client
+            .list_task_activity(&approval_id, "task-c", None, None, Some(10), None)
+            .await
+            .expect("list_task_activity on started child");
+        assert!(!activity_c.events.is_empty());
+
+        fs::remove_file(&temp_dirty_file).expect("remove temp dirty file from parent A");
+
+        // 4. Commit, review, and integrate task C, then prepare and dispatch chained task D (depends on C).
+        let pred_c =
+            commit_review_and_integrate_task(&fixture, host.work_area_dir(), &done_c, "op_chain");
+
+        let preds_d_path = fixture.root.join("preds-d.json");
+        fs::write(
+            &preds_d_path,
+            serde_json::to_vec_pretty(&vec![pred_c.clone()]).expect("serialize preds-d"),
+        )
+        .expect("write preds-d.json");
+        fs::set_permissions(&preds_d_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 preds-d.json");
+
+        let summary_d = run_prepare_dependencies(PrepareDependenciesArgs {
+            registry_dir: fixture.registry_dir.clone(),
+            plans_dir: fixture.plans_dir.clone(),
+            authority_dir: fixture.authority_dir.clone(),
+            sessions_dir: fixture.sessions_dir.clone(),
+            approval_id: approval_id.clone(),
+            task_id: "task-d".to_string(),
+            predecessors: preds_d_path,
+            confirm_approval: subject_digest.clone(),
+        })
+        .await
+        .expect("run_prepare_dependencies for chained task-d");
+        assert_eq!(summary_d.predecessor_task_ids, vec!["task-c".to_string()]);
+
+        client
+            .dispatch_task(&approval_id, "task-d")
+            .await
+            .expect("dispatch chained task-d");
+        let done_d = wait_for_task_status(&client, &approval_id, "task-d", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(done_d.status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(done_d.dependency_input, Some(summary_d));
+
+        // An internally valid replacement seal/journal/ref must not relabel an existing run.
+        let intent_c_path = seal_c_path.with_extension("intent.json");
+        let original_intent_bytes =
+            fs::read(&intent_c_path).expect("read original C preparation intent");
+        let mut replacement_seal: threadlane_workers::DependencyInputSeal =
+            serde_json::from_slice(&orig_seal_c_bytes).expect("parse original C seal");
+        let replacement_base = done_d.worker.as_ref().unwrap().worktree.base_commit.clone();
+        assert_ne!(replacement_base, orig_binding_c.execution_base_commit);
+        replacement_seal.execution_base_commit = replacement_base.clone();
+        replacement_seal.execution_tree_sha = threadlane_workers::resolve_exact_tree_sha(
+            &fixture.repo_dir,
+            &replacement_base,
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("replacement execution tree");
+        replacement_seal.seal_digest = replacement_seal
+            .compute_digest()
+            .expect("replacement digest");
+        replacement_seal
+            .verify_integrity()
+            .expect("replacement structure is valid");
+        let mut replacement_intent: serde_json::Value =
+            serde_json::from_slice(&original_intent_bytes).expect("parse original intent");
+        replacement_intent["seal"] =
+            serde_json::to_value(&replacement_seal).expect("replacement seal value");
+        threadlane_workers::run_sanitized_git(
+            &fixture.repo_dir,
+            &[
+                "update-ref",
+                "--no-deref",
+                "--",
+                &replacement_seal.snapshot_ref,
+                &replacement_base,
+                &orig_binding_c.execution_base_commit,
+            ],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("replace owned fixture ref");
+        fs::write(
+            &seal_c_path,
+            serde_json::to_vec_pretty(&replacement_seal).unwrap(),
+        )
+        .expect("replace C fixture seal");
+        fs::write(
+            &intent_c_path,
+            serde_json::to_vec_pretty(&replacement_intent).unwrap(),
+        )
+        .expect("replace C fixture intent");
+        for observed in [
+            client
+                .get_task(&approval_id, "task-c")
+                .await
+                .expect("observe C with replacement seal"),
+            client
+                .dispatch_task(&approval_id, "task-c")
+                .await
+                .expect("duplicate C stays observational"),
+        ] {
+            assert_eq!(observed.run_id, done_c.run_id);
+            assert_eq!(observed.status, TaskExecutionStatus::ReadyForReview);
+            assert!(
+                observed.dependency_input.is_none(),
+                "replacement input must not be displayed as original"
+            );
+            assert_eq!(
+                observed.worker.as_ref().unwrap().execution_binding.as_ref(),
+                Some(&orig_binding_c)
+            );
+            assert_eq!(
+                observed.worker.as_ref().unwrap().worktree.base_commit,
+                orig_binding_c.execution_base_commit
+            );
+        }
+        threadlane_workers::run_sanitized_git(
+            &fixture.repo_dir,
+            &[
+                "update-ref",
+                "--no-deref",
+                "--",
+                &replacement_seal.snapshot_ref,
+                &orig_binding_c.execution_base_commit,
+                &replacement_base,
+            ],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("restore owned C fixture ref");
+        fs::write(&seal_c_path, &orig_seal_c_bytes).expect("restore C fixture seal");
+        fs::write(&intent_c_path, original_intent_bytes).expect("restore C fixture intent");
+        assert!(client
+            .get_task(&approval_id, "task-c")
+            .await
+            .expect("restored C observation")
+            .dependency_input
+            .is_some());
+
+        // Started children keep their pinned identity for cancellation even if a parent changes.
+        for child in ["task-cancel", "task-recover"] {
+            client
+                .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                    approval_id: approval_id.clone(),
+                    task_id: child.to_string(),
+                    expected_approval_digest: subject_digest.clone(),
+                    predecessors: vec![pred_c.clone()],
+                })
+                .await
+                .expect("prepare lifecycle child");
+        }
+        client
+            .dispatch_task(&approval_id, "task-cancel")
+            .await
+            .expect("dispatch cancellation child");
+        let running = wait_for_task_status(&client, &approval_id, "task-cancel", |st| {
+            st == TaskExecutionStatus::Running
+        })
+        .await;
+        let parent_c_path = PathBuf::from(
+            done_c
+                .worker
+                .as_ref()
+                .unwrap()
+                .worktree
+                .task_worktree_path
+                .as_ref()
+                .unwrap(),
+        );
+        let dirty_c = parent_c_path.join("src/later-parent.tmp");
+        fs::write(&dirty_c, "changed after child admission").expect("dirty parent C");
+        let revision = running.worker.as_ref().unwrap().revision;
+        assert_eq!(
+            client
+                .cancel_task(&approval_id, "task-cancel", revision + 1, None)
+                .await
+                .expect_err("stale child cancellation must fail")
+                .code(),
+            "stale_revision"
+        );
+        client
+            .list_task_activity(&approval_id, "task-cancel", None, None, Some(10), None)
+            .await
+            .expect("activity remains readable with dirty parent");
+        client
+            .cancel_task(&approval_id, "task-cancel", revision, None)
+            .await
+            .expect("cancel exact child revision despite dirty parent");
+        let cancelled = wait_for_task_status(&client, &approval_id, "task-cancel", |st| {
+            st == TaskExecutionStatus::Cancelled
+        })
+        .await;
+        assert_eq!(cancelled.run_id, running.run_id);
+        fs::remove_file(dirty_c).expect("restore parent C fixture");
+
+        let invocation_count_before = read_invocation_count(&fixture.agy_count_file);
+        let recover = client
+            .dispatch_task(&approval_id, "task-recover")
+            .await
+            .expect("dispatch recovery child");
+        wait_for_task_status(&client, &approval_id, "task-recover", |st| {
+            st == TaskExecutionStatus::Running
+        })
+        .await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read_invocation_count(&fixture.agy_count_file) == invocation_count_before {
+            assert!(Instant::now() < deadline, "recovery provider never started");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let invocation_count = read_invocation_count(&fixture.agy_count_file);
+        let original_binding = host.session_binding_id().to_string();
+
+        // Primary repository checkout HEAD and tracked files remain untouched at base_commit.
+        let current_repo_head =
+            resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("resolve primary repo HEAD");
+        assert_eq!(current_repo_head, fixture.base_commit);
+        assert!(!fixture.repo_dir.join("src/a.rs").exists());
+        assert!(!fixture.repo_dir.join("src/b.rs").exists());
+        assert!(!fixture.repo_dir.join("src/c.rs").exists());
+        assert!(!fixture.repo_dir.join("src/d.rs").exists());
+
+        host.shutdown()
+            .await
+            .expect("shutdown host with in-flight dependent");
+        let restarted = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("restart dependency session");
+        assert_eq!(restarted.session_binding_id(), original_binding);
+        let recovered = client
+            .dispatch_task(&approval_id, "task-recover")
+            .await
+            .expect("duplicate dispatch observes original uncertain child");
+        assert_eq!(recovered.run_id, recover.run_id);
+        assert_eq!(recovered.status, TaskExecutionStatus::Unknown);
+        assert_eq!(
+            recovered.worker.as_ref().unwrap().execution_binding,
+            recover.worker.as_ref().unwrap().execution_binding
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            invocation_count
+        );
+        restarted.shutdown().await.expect("shutdown restarted host");
+    }
+
+    #[tokio::test]
+    async fn dependency_preparation_and_dispatch_reject_negative_and_tampered_cases() {
+        let fixture = setup_fixture();
+        let tasks = vec![
+            PlanTask {
+                id: "task-left".to_string(),
+                title: "Left conflicting root task".to_string(),
+                instruction: "CONFLICT_TASK_LEFT write src/lib.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-right".to_string(),
+                title: "Right conflicting root task".to_string(),
+                instruction: "CONFLICT_TASK_RIGHT write src/lib.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-child".to_string(),
+                title: "Dependent child on conflicting roots".to_string(),
+                instruction: "Follow up on src/lib.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-left".to_string(), "task-right".to_string()],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            },
+        ];
+
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-m5b-negative",
+            BINDING_A,
+            THREAD_UUID_A,
+            tasks,
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let subject_digest = host.approval().subject_digest.clone();
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // 1. Unprepared dependent dispatch fails closed with dependency_inputs_unverified.
+        assert_eq!(
+            client
+                .dispatch_task(&approval_id, "task-child")
+                .await
+                .expect_err("unprepared dependent dispatch must fail")
+                .code(),
+            "dependency_inputs_unverified"
+        );
+
+        // 2. Mismatched expected_approval_digest is rejected with scope_mismatch.
+        assert_eq!(
+            client
+                .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                    approval_id: approval_id.clone(),
+                    task_id: "task-child".to_string(),
+                    expected_approval_digest: "f".repeat(64),
+                    predecessors: vec![],
+                })
+                .await
+                .expect_err("mismatched expected_approval_digest must fail")
+                .code(),
+            "scope_mismatch"
+        );
+
+        // 3. Root task passed to prepare_dependency_inputs is rejected.
+        assert_eq!(
+            client
+                .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                    approval_id: approval_id.clone(),
+                    task_id: "task-left".to_string(),
+                    expected_approval_digest: subject_digest.clone(),
+                    predecessors: vec![],
+                })
+                .await
+                .expect_err("root task in prepare_dependency_inputs must fail")
+                .code(),
+            "validation"
+        );
+
+        // 4a. Missing second predecessor in request selection is rejected with validation.
+        assert_eq!(
+            client
+                .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                    approval_id: approval_id.clone(),
+                    task_id: "task-child".to_string(),
+                    expected_approval_digest: subject_digest.clone(),
+                    predecessors: vec![DependencyPredecessorSelection {
+                        task_id: "task-left".to_string(),
+                        review_receipt_id: "rvw_missing".to_string(),
+                        integration_receipt_id: "int_missing".to_string(),
+                    }],
+                })
+                .await
+                .expect_err("missing second predecessor in request must fail")
+                .code(),
+            "validation"
+        );
+
+        // 4b. Unstarted predecessors fail closed with dependency_inputs_unverified.
+        assert_eq!(
+            client
+                .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                    approval_id: approval_id.clone(),
+                    task_id: "task-child".to_string(),
+                    expected_approval_digest: subject_digest.clone(),
+                    predecessors: vec![
+                        DependencyPredecessorSelection {
+                            task_id: "task-left".to_string(),
+                            review_receipt_id: "rvw_missing".to_string(),
+                            integration_receipt_id: "int_missing".to_string(),
+                        },
+                        DependencyPredecessorSelection {
+                            task_id: "task-right".to_string(),
+                            review_receipt_id: "rvw_missing".to_string(),
+                            integration_receipt_id: "int_missing".to_string(),
+                        },
+                    ],
+                })
+                .await
+                .expect_err("unstarted predecessors must fail")
+                .code(),
+            "dependency_inputs_unverified"
+        );
+
+        // 5. Run both conflicting root tasks, commit, review, and integrate each into its own run worktree.
+        client
+            .dispatch_task(&approval_id, "task-left")
+            .await
+            .expect("dispatch task-left");
+        client
+            .dispatch_task(&approval_id, "task-right")
+            .await
+            .expect("dispatch task-right");
+        let done_left = wait_for_task_status(&client, &approval_id, "task-left", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        let done_right = wait_for_task_status(&client, &approval_id, "task-right", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let pred_left =
+            commit_review_and_integrate_task(&fixture, host.work_area_dir(), &done_left, "op_neg");
+        let pred_right =
+            commit_review_and_integrate_task(&fixture, host.work_area_dir(), &done_right, "op_neg");
+
+        // 6. Tampered/mismatched review_receipt_id or integration_receipt_id is rejected.
+        let mut bad_review_pred = pred_left.clone();
+        bad_review_pred.review_receipt_id = pred_right.review_receipt_id.clone();
+        let error = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "task-child".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![bad_review_pred, pred_right.clone()],
+            })
+            .await
+            .expect_err("swapped review_receipt_id must fail");
+        assert!(matches!(error, HostError::Runtime { code, .. } if code == "receipt_invalidated"));
+
+        // 7. Conflicting predecessor trees fail closed with merge_conflict and leave no seal.
+        let error = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "task-child".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![pred_left.clone(), pred_right.clone()],
+            })
+            .await
+            .expect_err("conflicting predecessor trees must fail closed");
+        assert!(matches!(error, HostError::Runtime { code, .. } if code == "merge_conflict"));
+        assert!(!host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join("dependencies")
+            .join("task-child.json")
+            .exists());
+        assert!(!host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join("dependencies")
+            .join("task-child.intent.json")
+            .exists());
+
+        // 8. Legacy Ready manifest (`root_tasks_only: true`) rejects prepare_dependency_inputs.
+        let manifest_path = host.session_dir().join(HOST_MANIFEST_FILENAME);
+        let record = host.approval().clone();
+        let mut legacy_manifest =
+            read_and_verify_host_manifest(&manifest_path, &record).expect("read manifest");
+        legacy_manifest.gates = HostExecutionGates::legacy_for_ready_state(true);
+        write_host_manifest(host.session_dir(), &legacy_manifest)
+            .expect("write legacy gates manifest");
+
+        assert_eq!(
+            client
+                .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                    approval_id: approval_id.clone(),
+                    task_id: "task-child".to_string(),
+                    expected_approval_digest: subject_digest,
+                    predecessors: vec![pred_left, pred_right],
+                })
+                .await
+                .expect_err("legacy root-only manifest must reject prepare_dependency_inputs")
+                .code(),
+            "dependency_inputs_unverified"
+        );
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn dependency_predecessor_frozen_identity_tag_join_and_memo_direct_selection_regressions()
+    {
+        let fixture = setup_fixture();
+        let dag_tasks = vec![
+            PlanTask {
+                id: "z-root".to_string(),
+                title: "Root task Z".to_string(),
+                instruction: "CHAIN_TASK_A write src/a.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".to_string()],
+            },
+            PlanTask {
+                id: "a-middle".to_string(),
+                title: "Middle task A depending on z-root".to_string(),
+                instruction: "CHAIN_TASK_B write src/b.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["z-root".to_string()],
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+            PlanTask {
+                id: "leaf".to_string(),
+                title: "Leaf task depending on a-middle and z-root".to_string(),
+                instruction: "CHAIN_TASK_C verify src/a.rs + src/b.rs and write src/c.rs"
+                    .to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["a-middle".to_string(), "z-root".to_string()],
+                allowed_write_paths: vec!["src/c.rs".to_string()],
+            },
+        ];
+
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-m5b-dag-regressions",
+            BINDING_A,
+            THREAD_UUID_A,
+            dag_tasks,
+        );
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        let subject_digest = host.approval().subject_digest.clone();
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        let z_root_record = host
+            .approval()
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "z-root")
+            .expect("z-root in approval")
+            .clone();
+
+        // 1. Launch the same allowed profile for z-root with a WRONG instruction directly through
+        //    ScopedClient, commit/review/integrate its task worktree, and substitute a valid-shape
+        //    TaskRunReceipt into task-receipts.json. Dependency preparation must reject the wrong
+        //    frozen execution identity.
+        let scoped = threadlane::ScopedClient::from_state_dir(
+            host.session_dir().join(RUNTIME_STATE_SUBDIR),
+            host.session_binding_id(),
+        )
+        .expect("open scoped client");
+        let rogue_started = scoped
+            .start_worker(
+                "rogue-wrong-instruction-key".to_string(),
+                z_root_record.profile_id.clone().unwrap(),
+                "CHAIN_TASK_A WRONG_INSTRUCTION write src/a.rs".to_string(),
+            )
+            .await
+            .expect("start rogue worker with wrong instruction");
+
+        let rogue_deadline = Instant::now() + Duration::from_secs(8);
+        let rogue_done = loop {
+            let snap = scoped
+                .get_worker(rogue_started.run_id.clone())
+                .await
+                .expect("get rogue worker");
+            if snap.status == threadlane::WorkerStatus::Completed {
+                break snap;
+            }
+            assert!(
+                Instant::now() < rogue_deadline,
+                "timed out waiting for rogue worker completion: {snap:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        let rogue_task_snap = TaskStateSnapshot {
+            approval_id: approval_id.clone(),
+            subject_digest: subject_digest.clone(),
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            session_binding_id: host.session_binding_id().to_string(),
+            task_id: "z-root".to_string(),
+            task_digest: z_root_record.task_digest.clone(),
+            adapter: z_root_record.adapter,
+            provider: z_root_record.provider,
+            depends_on: Vec::new(),
+            dependency_input: None,
+            profile_id: z_root_record.profile_id.clone(),
+            command_key: z_root_record.command_key.clone(),
+            status: TaskExecutionStatus::ReadyForReview,
+            run_id: Some(rogue_done.run_id.clone()),
+            worker_id: Some(rogue_done.worker_id.clone()),
+            worker: Some(rogue_done.clone()),
+            accepted: false,
+        };
+        let rogue_pred_z = commit_review_and_integrate_task(
+            &fixture,
+            host.work_area_dir(),
+            &rogue_task_snap,
+            "op_rogue",
+        );
+
+        record_task_receipt(
+            host.session_dir(),
+            host.approval(),
+            host.session_binding_id(),
+            TaskRunReceipt {
+                task_id: z_root_record.task_id.clone(),
+                task_digest: z_root_record.task_digest.clone(),
+                profile_id: z_root_record.profile_id.clone().unwrap(),
+                command_key: z_root_record.command_key.clone().unwrap(),
+                run_id: rogue_done.run_id.clone(),
+                worker_id: rogue_done.worker_id.clone(),
+                execution_binding: None,
+                recorded_at_ms: 1_700_000_600_000,
+            },
+        )
+        .expect("record valid-shape receipt pointing to wrong-instruction worker");
+
+        let wrong_instr_err = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "a-middle".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![rogue_pred_z],
+            })
+            .await
+            .expect_err("wrong frozen instruction on predecessor must be rejected");
+        assert_eq!(wrong_instr_err.code(), "dependency_inputs_unverified");
+        assert!(!host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join("dependencies")
+            .join("a-middle.json")
+            .exists());
+
+        // Remove the substituted receipt so the genuine z-root task can be dispatched.
+        fs::remove_file(host.session_dir().join(TASK_RECEIPTS_FILENAME))
+            .expect("remove substituted task-receipts.json");
+
+        // 2. Dispatch the genuine z-root task, wait for ReadyForReview, commit, review, and integrate.
+        client
+            .dispatch_task(&approval_id, "z-root")
+            .await
+            .expect("dispatch genuine z-root");
+        let done_z = wait_for_task_status(&client, &approval_id, "z-root", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        let pred_z_root =
+            commit_review_and_integrate_task(&fixture, host.work_area_dir(), &done_z, "op_dag");
+
+        // 2b. Compact run/task tag join mismatch: temporarily mutate the task worktree manifest's
+        //     compact `task_id` tag (`w_...`) so it no longer matches SHA256(receipt.worker_id).
+        let z_task_wt_id = done_z
+            .worker
+            .as_ref()
+            .unwrap()
+            .worktree
+            .task_worktree_id
+            .as_ref()
+            .unwrap()
+            .clone();
+        let z_manifest_path = host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join(format!("{z_task_wt_id}.json"));
+        let orig_z_manifest_bytes = fs::read(&z_manifest_path).expect("read z-root task manifest");
+        let mut mutated_z_manifest: serde_json::Value =
+            serde_json::from_slice(&orig_z_manifest_bytes).expect("parse z-root task manifest");
+        mutated_z_manifest["task_id"] = serde_json::json!("w_000000000000");
+        fs::write(
+            &z_manifest_path,
+            serde_json::to_vec_pretty(&mutated_z_manifest).expect("serialize mutated manifest"),
+        )
+        .expect("write mutated z-root task manifest");
+        fs::set_permissions(&z_manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 mutated z-root task manifest");
+
+        let tag_mismatch_err = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "a-middle".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![pred_z_root.clone()],
+            })
+            .await
+            .expect_err("compact task tag mismatch between receipt worker_id and worktree manifest must fail");
+        assert_eq!(tag_mismatch_err.code(), "dependency_inputs_unverified");
+
+        fs::write(&z_manifest_path, &orig_z_manifest_bytes)
+            .expect("restore original z-root task manifest");
+        fs::set_permissions(&z_manifest_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 restored z-root task manifest");
+
+        // 3. Prepare, dispatch, and integrate `a-middle` (depends on `z-root`).
+        client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "a-middle".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![pred_z_root.clone()],
+            })
+            .await
+            .expect("prepare a-middle with restored z-root manifest");
+        client
+            .dispatch_task(&approval_id, "a-middle")
+            .await
+            .expect("dispatch a-middle");
+        let done_a_middle = wait_for_task_status(&client, &approval_id, "a-middle", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        let pred_a_middle = commit_review_and_integrate_task(
+            &fixture,
+            host.work_area_dir(),
+            &done_a_middle,
+            "op_dag",
+        );
+
+        // 4. Memo hit regression on DAG `z-root -> a-middle` and `leaf` depending on `["a-middle", "z-root"]`:
+        //    Because `"a-middle"` sorts before `"z-root"`, verifying `"a-middle"` caches `"z-root"` in `memo`
+        //    before `"z-root"` is checked as a direct predecessor of `leaf`. Foreign or nonexistent direct
+        //    receipt IDs for `"z-root"` must be rejected rather than silently reusing the cached proof.
+        let foreign_direct_z = DependencyPredecessorSelection {
+            task_id: "z-root".to_string(),
+            review_receipt_id: pred_a_middle.review_receipt_id.clone(),
+            integration_receipt_id: pred_z_root.integration_receipt_id.clone(),
+        };
+        let foreign_memo_err = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "leaf".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![pred_a_middle.clone(), foreign_direct_z],
+            })
+            .await
+            .expect_err("foreign direct review_receipt_id on memo-cached ancestor must fail");
+        assert!(
+            matches!(foreign_memo_err, HostError::Runtime { code, .. } if code == "receipt_invalidated")
+        );
+
+        let nonexistent_direct_z = DependencyPredecessorSelection {
+            task_id: "z-root".to_string(),
+            review_receipt_id: "rvw_nonexistent".to_string(),
+            integration_receipt_id: pred_z_root.integration_receipt_id.clone(),
+        };
+        let nonexistent_memo_err = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "leaf".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![pred_a_middle.clone(), nonexistent_direct_z],
+            })
+            .await
+            .expect_err("nonexistent direct review_receipt_id on memo-cached ancestor must fail");
+        assert!(
+            matches!(nonexistent_memo_err, HostError::Runtime { code, .. } if code == "receipt_invalidated")
+        );
+
+        let nonexistent_int_direct_z = DependencyPredecessorSelection {
+            task_id: "z-root".to_string(),
+            review_receipt_id: pred_z_root.review_receipt_id.clone(),
+            integration_receipt_id: "int_nonexistent".to_string(),
+        };
+        let nonexistent_int_memo_err = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "leaf".to_string(),
+                expected_approval_digest: subject_digest.clone(),
+                predecessors: vec![pred_a_middle.clone(), nonexistent_int_direct_z],
+            })
+            .await
+            .expect_err(
+                "nonexistent direct integration_receipt_id on memo-cached ancestor must fail",
+            );
+        assert!(
+            matches!(nonexistent_int_memo_err, HostError::Runtime { code, .. } if code == "receipt_invalidated")
+        );
+        assert!(!host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join("dependencies")
+            .join("leaf.json")
+            .exists());
+
+        // Valid direct selection matching cached ancestor proof succeeds and dispatches cleanly.
+        let summary_leaf = client
+            .prepare_dependency_inputs(PrepareDependencyInputsRequest {
+                approval_id: approval_id.clone(),
+                task_id: "leaf".to_string(),
+                expected_approval_digest: subject_digest,
+                predecessors: vec![pred_a_middle, pred_z_root],
+            })
+            .await
+            .expect("prepare leaf with valid direct selection matching cached z-root");
+        assert_eq!(
+            summary_leaf.predecessor_task_ids,
+            vec!["a-middle".to_string(), "z-root".to_string()]
+        );
+
+        client
+            .dispatch_task(&approval_id, "leaf")
+            .await
+            .expect("dispatch leaf");
+        let done_leaf = wait_for_task_status(&client, &approval_id, "leaf", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(done_leaf.status, TaskExecutionStatus::ReadyForReview);
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn readonly_get_task_and_shared_profile_constructor_preserve_nondefault_budgets_and_no_file_effects(
+    ) {
+        let fixture = setup_fixture();
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+        let tasks = default_tasks("Non-default budget instruction");
+        let plan_rev = fixture
+            .plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: "plan-readonly-budgets".to_string(),
+                    binding_id: BINDING_A.to_string(),
+                    profile_id: "profile-main".to_string(),
+                    profile_revision: reg_snap.revision,
+                    summary: "Non-default budgets + AGY/Go + read-only status".to_string(),
+                    tasks: tasks.clone(),
+                },
+                1_700_000_100_000,
+            )
+            .expect("save draft");
+        let published = fixture
+            .plans
+            .change(
+                plan_rev.revision,
+                PlanChange::Publish {
+                    plan_id: "plan-readonly-budgets".to_string(),
+                    revision: plan_rev.revision,
+                },
+            )
+            .expect("publish plan");
+        let compiled =
+            compile_plan_revision(&published, &reg_snap).expect("compile published plan");
+
+        let custom_budgets = ExecutionBudgets {
+            timeout_ms: 42_000,
+            max_stdout_bytes: 262_144,
+            max_stderr_bytes: 131_072,
+            max_line_bytes: 32_768,
+            max_events: 512,
+        };
+        let approved_task_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+        let summary = fixture
+            .authority
+            .approve_at(
+                OperatorApprovalRequest {
+                    binding_id: BINDING_A.to_string(),
+                    thread_uuid: THREAD_UUID_A.to_string(),
+                    plan_id: "plan-readonly-budgets".to_string(),
+                    plan_revision: published.revision,
+                    expected_registry_revision: reg_snap.revision,
+                    expected_plan_digest: compiled.plan_digest,
+                    repository_path: fixture.repo_dir.clone(),
+                    base_commit: fixture.base_commit.clone(),
+                    approved_task_ids,
+                    approved_write_paths: vec!["src/".to_string()],
+                    max_parallel: 2,
+                    budgets: custom_budgets.clone(),
+                },
+                1_700_000_123_000,
+            )
+            .expect("approve with custom budgets");
+        let approval_id = summary.approval_id.clone();
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("get_for_operator");
+
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(20)),
+        )
+        .await
+        .expect("start host");
+
+        // 1. Verify build_validated_task_profile matches AuthorityStore::materialize for both AGY (standalone=false)
+        //    and OpenCode Go (standalone=true) with non-default budgets and effort.
+        let live_binding = threadlane_core::Binding {
+            binding_id: host.session_binding_id().to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            label: "test".to_string(),
+            delivered_seq: 0,
+            acked_seq: 0,
+        };
+        let materialized = fixture
+            .authority
+            .materialize(&approval_id, &live_binding, host.work_area_dir())
+            .expect("materialize plan")
+            .workers
+            .expect("materialized workers")
+            .validate()
+            .expect("validate materialized workers");
+
+        for task in &record.tasks {
+            if task.provider.is_none() {
+                continue;
+            }
+            let host_profile = storage::build_validated_task_profile(
+                &record,
+                host.session_binding_id(),
+                host.work_area_dir(),
+                task,
+            )
+            .expect("build_validated_task_profile");
+            let mat_profile = materialized
+                .profiles
+                .get(task.profile_id.as_ref().unwrap())
+                .expect("materialized profile exists");
+            assert_eq!(host_profile.profile_id, mat_profile.profile_id);
+            assert_eq!(host_profile.profile_digest, mat_profile.profile_digest);
+            assert_eq!(
+                host_profile.allowed_binding_ids,
+                mat_profile.allowed_binding_ids
+            );
+            assert_eq!(host_profile.template, mat_profile.template);
+            assert_eq!(host_profile.requested_effort, mat_profile.requested_effort);
+            assert_eq!(host_profile.dependency_input, mat_profile.dependency_input);
+            assert_eq!(host_profile.template.budgets, custom_budgets);
+        }
+
+        // 2. Remove task-receipts.json and task-receipts.lock to simulate a session where the ledger
+        //    file and lockfile are absent, then verify get_task and has_prepared_dependency_input_or_ledger_entry
+        //    do not create any files or lockfiles on disk.
+        let receipts_path = host.session_dir().join(TASK_RECEIPTS_FILENAME);
+        let receipts_lock_path = host.session_dir().join(TASK_RECEIPTS_LOCK_FILENAME);
+        if receipts_path.exists() {
+            fs::remove_file(&receipts_path).expect("remove task-receipts.json");
+        }
+        if receipts_lock_path.exists() {
+            fs::remove_file(&receipts_lock_path).expect("remove task-receipts.lock");
+        }
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        let root_snap = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("read-only get_task on root task without ledger file");
+        assert_eq!(root_snap.status, TaskExecutionStatus::NotStarted);
+
+        let dep_snap = client
+            .get_task(&approval_id, "task-dep-agy")
+            .await
+            .expect("read-only get_task on dependent task without ledger file");
+        assert_eq!(
+            dep_snap.status,
+            TaskExecutionStatus::DependencyInputsUnverified
+        );
+
+        assert!(
+            !has_prepared_dependency_input_or_ledger_entry(
+                &fixture.sessions_dir,
+                &record,
+                "task-dep-agy"
+            )
+            .expect("has_prepared_dependency_input_or_ledger_entry"),
+            "unprepared dependent task with missing ledger must return false"
+        );
+
+        assert!(
+            !receipts_path.exists(),
+            "read-only get_task must never recreate missing task-receipts.json"
+        );
+        assert!(
+            !receipts_lock_path.exists(),
+            "read-only get_task must never create missing task-receipts.lock"
+        );
+        assert!(
+            !host
+                .work_area_dir()
+                .join(MANIFESTS_SUBDIR)
+                .join("dependencies")
+                .exists(),
+            "read-only get_task must never create manifests/dependencies directory"
+        );
+
+        host.shutdown().await.expect("shutdown host");
     }
 }

@@ -78,7 +78,7 @@ coverage does not establish delivery to real native chats.
 
 Provider interactive continuation and the [multi-chat routing gate](NATIVE-ROUTING.md)
 remain separate integration work. Live host-to-Codex notifications, busy-turn
-delivery, verified DAG inputs, product API entitlement, and cross-platform release
+delivery, product API entitlement, and cross-platform release
 hardening are not implied by the local configuration/execution checkpoint. See
 [validation](VALIDATION.md).
 
@@ -93,7 +93,11 @@ simulated loop, deferred busy-turn delivery and remaining identity/onboarding ga
 The [trusted operator CLI](OPERATOR-WORKFLOW.md) exposes the existing task
 commit, review acceptance and same-run integration operations to an explicit
 local caller. It adds no automatic acceptance, primary merge/push, dependency
-input assembly, native enrollment or MCP authority.
+input assembly, native enrollment or MCP authority. The subsequent
+[dependency-input extension](DEPENDENCIES.md) adds explicit receipt-bound
+fan-in and chained execution using accepted predecessor task heads. It keeps
+preparation, dispatch, review, main publication and cleanup as separate actions;
+no follower-to-orchestrator consultation automation is implied.
 
 ## Default workflow example
 

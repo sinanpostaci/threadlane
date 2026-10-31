@@ -14,10 +14,11 @@ use rmcp::model::CallToolResult;
 use threadlane_authority::{ApprovalRecord, AuthorityStore};
 use threadlane_core::Binding;
 use threadlane_host::{
-    is_host_lock_held, read_host_launch_intent_optional, read_host_manifest_optional,
-    validate_approval_id, validate_canonical_thread_uuid, validate_identifier,
-    validate_sessions_root, verify_existing_session_dir, write_host_launch_intent,
-    ApprovedHostClient, HostControlRuntimeState, HostError, HostLaunchIntent, HostLaunchIntentLock,
+    has_prepared_dependency_input_or_ledger_entry, is_host_lock_held,
+    read_host_launch_intent_optional, read_host_manifest_optional, validate_approval_id,
+    validate_canonical_thread_uuid, validate_identifier, validate_sessions_root,
+    verify_existing_session_dir, write_host_launch_intent, ApprovedHostClient,
+    HostControlRuntimeState, HostError, HostLaunchIntent, HostLaunchIntentLock,
     HostLaunchIntentStatus, HostPhase, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
     WORK_AREA_SUBDIR,
 };
@@ -1011,14 +1012,6 @@ fn validate_task_and_scope_before_launch(
             task_id: task_id.to_string(),
         })?;
 
-    if !task.depends_on.is_empty() {
-        return Err(HostError::DependencyInputsUnverified {
-            approval_id: record.approval_id.clone(),
-            task_id: task.task_id.clone(),
-            depends_on: task.depends_on.clone(),
-        });
-    }
-
     if task.provider.is_none()
         || task.adapter == ToolAdapter::CodexCli
         || task.profile_id.is_none()
@@ -1028,6 +1021,20 @@ fn validate_task_and_scope_before_launch(
             approval_id: record.approval_id.clone(),
             task_id: task.task_id.clone(),
             adapter: task.adapter,
+        });
+    }
+
+    if !task.depends_on.is_empty()
+        && !has_prepared_dependency_input_or_ledger_entry(
+            &canonical_sessions_root,
+            &record,
+            &task.task_id,
+        )?
+    {
+        return Err(HostError::DependencyInputsUnverified {
+            approval_id: record.approval_id.clone(),
+            task_id: task.task_id.clone(),
+            depends_on: task.depends_on.clone(),
         });
     }
 

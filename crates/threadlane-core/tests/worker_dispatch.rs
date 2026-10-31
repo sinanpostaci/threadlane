@@ -2,10 +2,11 @@ use tempfile::TempDir;
 use threadlane_core::{
     estimate_wire_response_bytes, Command, CommandOutput, Core, CoreError, EventKind, RunStatus,
     WakeupOutcome, WakeupStatus, WorkerAcceptanceState, WorkerCompletionRecord,
-    WorkerOutcomeSummary, WorkerProgressUpdate, WorkerStatus, WorkerWorktreeUpdate,
-    FIXED_WAKEUP_MESSAGE, MAX_COMPACT_RESPONSE_BYTES, MAX_INSTRUCTION_LEN,
+    WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressUpdate, WorkerStatus,
+    WorkerWorktreeUpdate, FIXED_WAKEUP_MESSAGE, MAX_COMPACT_RESPONSE_BYTES, MAX_INSTRUCTION_LEN,
     MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_PROGRESS_EVENTS_PER_ATTEMPT,
     MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES, SCHEMA_VERSION,
+    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 
 const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
@@ -74,6 +75,7 @@ fn worker_lifecycle_start_claim_progress_complete_and_wake_ack() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Implement worker dispatch ledger".to_string(),
                 now_ms: 1_000,
             },
@@ -294,7 +296,8 @@ fn worker_demo_isolation_and_refusal_of_answer_steer_and_generic_cancel() {
                 provider: "claude_code".to_string(),
                 requested_model: "claude-sonnet-4-6".to_string(),
                 requested_effort: "high".to_string(),
-                base_commit: "HEAD".to_string(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Worker task".to_string(),
                 now_ms: 1_000,
             },
@@ -436,6 +439,7 @@ fn worker_idempotency_changed_profile_conflict_and_binding_isolation() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Original worker instruction".to_string(),
                 now_ms: 1_000,
             },
@@ -476,6 +480,7 @@ fn worker_idempotency_changed_profile_conflict_and_binding_isolation() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Original worker instruction".to_string(),
                 now_ms: 9_999,
             },
@@ -502,6 +507,7 @@ fn worker_idempotency_changed_profile_conflict_and_binding_isolation() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Original worker instruction".to_string(),
                 now_ms: 10_000,
             },
@@ -521,6 +527,7 @@ fn worker_idempotency_changed_profile_conflict_and_binding_isolation() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Modified instruction".to_string(),
                 now_ms: 10_001,
             },
@@ -558,6 +565,7 @@ fn worker_idempotency_changed_profile_conflict_and_binding_isolation() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "medium".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Binding B instruction".to_string(),
                 now_ms: 10_003,
             },
@@ -587,7 +595,8 @@ fn worker_atomic_claim_correlation_and_stale_callback_rejection() {
                 provider: "codex_cli".to_string(),
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
-                base_commit: "HEAD".to_string(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Check claim correlation".to_string(),
                 now_ms: 1_000,
             },
@@ -744,7 +753,8 @@ fn worker_cancel_semantics_queued_vs_running_and_natural_completion_race() {
                 provider: "codex_cli".to_string(),
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
-                base_commit: "HEAD".to_string(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Cancel while queued".to_string(),
                 now_ms: 1_000,
             },
@@ -811,7 +821,8 @@ fn worker_cancel_semantics_queued_vs_running_and_natural_completion_race() {
                 provider: "codex_cli".to_string(),
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
-                base_commit: "HEAD".to_string(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Cancel while running".to_string(),
                 now_ms: 2_000,
             },
@@ -924,7 +935,8 @@ fn worker_cancel_semantics_queued_vs_running_and_natural_completion_race() {
                 provider: "codex_cli".to_string(),
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
-                base_commit: "HEAD".to_string(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Finish just as cancel arrives".to_string(),
                 now_ms: 3_000,
             },
@@ -1009,7 +1021,8 @@ fn worker_reopen_recovery_marks_in_flight_unknown_without_replay_and_migrates_v1
                     provider: "codex_cli".to_string(),
                     requested_model: "gpt-5.4".to_string(),
                     requested_effort: "high".to_string(),
-                    base_commit: "HEAD".to_string(),
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    execution_binding: None,
                     instruction: format!("Task for {key}"),
                     now_ms: ts,
                 },
@@ -1163,6 +1176,7 @@ fn worker_bounded_progress_cap_secret_redaction_and_wire_budget_enforcement() {
                 requested_model: "openai/gpt-5".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: max_instruction,
                 now_ms: 1_000,
             },
@@ -1351,6 +1365,7 @@ fn worker_shutdown_mark_active_unknown_and_timeout_outcome() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Slow worker task".to_string(),
                 now_ms: 1_000,
             },
@@ -1401,6 +1416,7 @@ fn worker_shutdown_mark_active_unknown_and_timeout_outcome() {
                 requested_model: "gpt-5.4".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "HEAD".to_string(),
+                execution_binding: None,
                 instruction: "Interrupted by shutdown".to_string(),
                 now_ms: 32_000,
             },
@@ -1446,4 +1462,334 @@ fn worker_shutdown_mark_active_unknown_and_timeout_outcome() {
         ),
         Err(CoreError::StaleWorkerClaim { .. })
     ));
+}
+
+#[test]
+fn worker_execution_binding_reject_queued_worker_and_schema_v3_migration() {
+    let dir = TempDir::new().expect("tempdir");
+    let db_path = dir.path().join("worker_exec_binding.db");
+    let mut core = Core::open(&db_path).expect("open core");
+
+    let binding = core
+        .create_binding(UUID_A, "Execution Binding & Rejection")
+        .expect("create binding");
+    let bid = &binding.binding_id;
+
+    let exec_base = "1111111111111111111111111111111111111111";
+    let input_digest = "22".repeat(32);
+    let seal_file_digest = "33".repeat(32);
+    let instruction = "Implement dependent task B";
+
+    let exec_binding = WorkerExecutionBinding::new(
+        DIGEST_A,
+        instruction,
+        &input_digest,
+        &seal_file_digest,
+        exec_base,
+    )
+    .expect("construct execution binding");
+    assert_eq!(
+        exec_binding.schema_version,
+        WORKER_EXECUTION_BINDING_SCHEMA_VERSION
+    );
+    exec_binding
+        .verify_against(DIGEST_A, instruction, exec_base)
+        .expect("verify against matching inputs");
+    assert!(exec_binding
+        .verify_against(DIGEST_B, instruction, exec_base)
+        .is_err());
+    assert!(exec_binding
+        .verify_against(DIGEST_A, "wrong instruction", exec_base)
+        .is_err());
+    assert!(exec_binding
+        .verify_against(
+            DIGEST_A,
+            instruction,
+            "4444444444444444444444444444444444444444"
+        )
+        .is_err());
+
+    // StartWorker rejects a mismatched execution_binding before mutating state.
+    assert!(matches!(
+        core.execute(
+            bid,
+            Command::StartWorker {
+                command_key: "dep-bad-base".to_string(),
+                profile_id: "dep-prof".to_string(),
+                profile_digest: DIGEST_A.to_string(),
+                provider: "antigravity".to_string(),
+                requested_model: "gemini-4-argon-high".to_string(),
+                requested_effort: "high".to_string(),
+                base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: Some(exec_binding.clone()),
+                instruction: instruction.to_string(),
+                now_ms: 1_000,
+            },
+        ),
+        Err(CoreError::Validation {
+            field: "execution_binding",
+            ..
+        })
+    ));
+
+    // Admit dependent worker with valid execution_binding.
+    let dep_worker = core
+        .execute(
+            bid,
+            Command::StartWorker {
+                command_key: "dep-start-1".to_string(),
+                profile_id: "dep-prof".to_string(),
+                profile_digest: DIGEST_A.to_string(),
+                provider: "antigravity".to_string(),
+                requested_model: "gemini-4-argon-high".to_string(),
+                requested_effort: "high".to_string(),
+                base_commit: exec_base.to_string(),
+                execution_binding: Some(exec_binding.clone()),
+                instruction: instruction.to_string(),
+                now_ms: 1_010,
+            },
+        )
+        .expect("start dependent worker")
+        .into_worker()
+        .expect("worker");
+    assert_eq!(dep_worker.execution_binding, Some(exec_binding.clone()));
+    assert_eq!(dep_worker.worktree.base_commit, exec_base);
+
+    // Reusing the same command_key with a different seal_file_digest must conflict.
+    let alt_binding = WorkerExecutionBinding::new(
+        DIGEST_A,
+        instruction,
+        &input_digest,
+        &"55".repeat(32),
+        exec_base,
+    )
+    .expect("alt binding");
+    assert!(matches!(
+        core.execute(
+            bid,
+            Command::StartWorker {
+                command_key: "dep-start-1".to_string(),
+                profile_id: "dep-prof".to_string(),
+                profile_digest: DIGEST_A.to_string(),
+                provider: "antigravity".to_string(),
+                requested_model: "gemini-4-argon-high".to_string(),
+                requested_effort: "high".to_string(),
+                base_commit: exec_base.to_string(),
+                execution_binding: Some(alt_binding.clone()),
+                instruction: instruction.to_string(),
+                now_ms: 1_015,
+            },
+        ),
+        Err(CoreError::IdempotencyConflict { .. })
+    ));
+
+    // Claiming without execution_binding or with a mismatched execution_binding must fail with StaleWorkerClaim.
+    assert!(matches!(
+        core.claim_worker(bid, &dep_worker.run_id, 1, DIGEST_A, 1_020),
+        Err(CoreError::StaleWorkerClaim { .. })
+    ));
+    assert!(matches!(
+        core.claim_worker_with_execution_binding(
+            bid,
+            &dep_worker.run_id,
+            1,
+            DIGEST_A,
+            Some(&alt_binding),
+            1_021
+        ),
+        Err(CoreError::StaleWorkerClaim { .. })
+    ));
+
+    let claim = core
+        .claim_worker_with_execution_binding(
+            bid,
+            &dep_worker.run_id,
+            1,
+            DIGEST_A,
+            Some(&exec_binding),
+            1_025,
+        )
+        .expect("claim dependent worker");
+    assert_eq!(claim.execution_binding, Some(exec_binding));
+    assert_eq!(claim.base_commit, exec_base);
+
+    // record_worker_running must reject a worktree_update with a mismatched base_commit.
+    assert!(matches!(
+        core.record_worker_running(
+            &claim,
+            sample_worktree_update(&dep_worker.run_id, &dep_worker.worker_id),
+            1_030,
+        ),
+        Err(CoreError::StaleWorkerClaim { .. })
+    ));
+
+    // reject_queued_worker refuses already-claimed workers.
+    assert!(matches!(
+        core.reject_queued_worker(
+            bid,
+            &dep_worker.run_id,
+            1,
+            DIGEST_A,
+            "cannot reject claimed worker",
+            1_031,
+        ),
+        Err(CoreError::InvalidRunState {
+            action: "reject_queued_worker",
+            ..
+        })
+    ));
+
+    // Admit a second dependent worker and reject it while still Queued.
+    let dep_worker_2 = core
+        .execute(
+            bid,
+            Command::StartWorker {
+                command_key: "dep-start-2".to_string(),
+                profile_id: "dep-prof".to_string(),
+                profile_digest: DIGEST_A.to_string(),
+                provider: "antigravity".to_string(),
+                requested_model: "gemini-4-argon-high".to_string(),
+                requested_effort: "high".to_string(),
+                base_commit: exec_base.to_string(),
+                execution_binding: Some(alt_binding),
+                instruction: instruction.to_string(),
+                now_ms: 1_040,
+            },
+        )
+        .expect("start dep_worker_2")
+        .into_worker()
+        .expect("worker 2");
+
+    let rejected = core
+        .reject_queued_worker(
+            bid,
+            &dep_worker_2.run_id,
+            1,
+            DIGEST_A,
+            "dependency seal changed before claim with sk-secret-token-999999",
+            1_050,
+        )
+        .expect("reject queued worker");
+    assert_eq!(rejected.status, WorkerStatus::Failed);
+    assert_eq!(rejected.attempt_count, 0);
+    assert!(rejected.claim_id.is_none());
+    let rej_out = rejected.outcome.as_ref().expect("rejected outcome");
+    assert_eq!(
+        rej_out.acceptance_state,
+        WorkerAcceptanceState::ExecutionFailed
+    );
+    assert!(!rej_out
+        .failure_reason
+        .as_deref()
+        .unwrap_or_default()
+        .contains("sk-secret-token-999999"));
+    assert_eq!(
+        core.get_run(bid, &dep_worker_2.run_id).expect("run").status,
+        RunStatus::Failed
+    );
+    assert_eq!(
+        core.get_wakeup(bid).expect("wakeup").status,
+        WakeupStatus::Pending
+    );
+
+    // Verify v3 schema migration when `execution_binding_json` is absent.
+    let v3_db_path = dir.path().join("legacy_v3.db");
+    {
+        let conn = rusqlite::Connection::open(&v3_db_path).expect("open v3 sqlite");
+        conn.execute_batch(
+            "CREATE TABLE schema_meta (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL);
+             INSERT INTO schema_meta (id, version) VALUES (1, 3);
+             CREATE TABLE bindings (
+                 binding_id TEXT PRIMARY KEY,
+                 thread_uuid TEXT NOT NULL,
+                 label TEXT NOT NULL,
+                 delivered_seq INTEGER NOT NULL DEFAULT 0,
+                 acked_seq INTEGER NOT NULL DEFAULT 0,
+                 next_event_seq INTEGER NOT NULL DEFAULT 1
+             );
+             INSERT INTO bindings (binding_id, thread_uuid, label, delivered_seq, acked_seq, next_event_seq)
+             VALUES ('bnd_v3', '11111111-1111-4111-8111-111111111111', 'v3', 0, 0, 2);
+             CREATE TABLE wakeups (
+                 binding_id TEXT PRIMARY KEY REFERENCES bindings(binding_id),
+                 thread_uuid TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 claim_id TEXT,
+                 pending_since_seq INTEGER,
+                 latest_important_seq INTEGER NOT NULL DEFAULT 0,
+                 covered_up_to_seq INTEGER NOT NULL DEFAULT 0,
+                 coalesced_count INTEGER NOT NULL DEFAULT 0,
+                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                 last_error TEXT,
+                 claimed_at_ms INTEGER,
+                 resolved_at_ms INTEGER
+             );
+             INSERT INTO wakeups (binding_id, thread_uuid, status)
+             VALUES ('bnd_v3', '11111111-1111-4111-8111-111111111111', 'idle');
+             CREATE TABLE runs (
+                 run_id TEXT PRIMARY KEY,
+                 binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                 revision INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 instruction TEXT NOT NULL,
+                 step_seq INTEGER NOT NULL,
+                 step_delay_ms INTEGER NOT NULL,
+                 next_step_at_ms INTEGER,
+                 active_question_id TEXT,
+                 started_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 completed_at_ms INTEGER,
+                 cancelled_at_ms INTEGER,
+                 cancel_reason TEXT
+             );
+             INSERT INTO runs (run_id, binding_id, revision, status, instruction, step_seq, step_delay_ms, started_at_ms, updated_at_ms, completed_at_ms)
+             VALUES ('run_v3', 'bnd_v3', 1, 'completed', 'legacy v3 task', 2, 0, 100, 200, 200);
+             CREATE TABLE workers (
+                 worker_id TEXT PRIMARY KEY,
+                 run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id),
+                 binding_id TEXT NOT NULL REFERENCES bindings(binding_id),
+                 revision INTEGER NOT NULL,
+                 status TEXT NOT NULL,
+                 profile_id TEXT NOT NULL,
+                 profile_digest TEXT NOT NULL,
+                 provider TEXT NOT NULL,
+                 requested_model TEXT NOT NULL,
+                 requested_effort TEXT NOT NULL,
+                 observed_model TEXT,
+                 observed_effort TEXT,
+                 instruction TEXT NOT NULL,
+                 claim_id TEXT,
+                 attempt_count INTEGER NOT NULL DEFAULT 0,
+                 worktree_json TEXT NOT NULL,
+                 progress_json TEXT NOT NULL,
+                 outcome_json TEXT,
+                 created_at_ms INTEGER NOT NULL,
+                 updated_at_ms INTEGER NOT NULL,
+                 started_at_ms INTEGER,
+                 completed_at_ms INTEGER,
+                 cancel_requested_at_ms INTEGER,
+                 cancel_reason TEXT
+             );
+             INSERT INTO workers (
+                 worker_id, run_id, binding_id, revision, status, profile_id,
+                 profile_digest, provider, requested_model, requested_effort,
+                 instruction, attempt_count, worktree_json, progress_json,
+                 created_at_ms, updated_at_ms, completed_at_ms
+             ) VALUES (
+                 'wrk_v3', 'run_v3', 'bnd_v3', 1, 'completed', 'prof-v3',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                 'codex_cli', 'gpt-5.4', 'high', 'legacy v3 task', 1,
+                 '{\"base_commit\":\"0123456789abcdef0123456789abcdef01234567\"}',
+                 '{\"durable_progress_events\":0,\"coalesced_progress_events\":0,\"dropped_live_events\":0}',
+                 100, 200, 200
+             );",
+        )
+        .expect("create v3 schema");
+    }
+
+    let migrated = Core::open(&v3_db_path).expect("migrate v3 to v4");
+    let v3_worker = migrated
+        .get_worker("bnd_v3", "run_v3")
+        .expect("load migrated v3 worker");
+    assert_eq!(v3_worker.status, WorkerStatus::Completed);
+    assert!(v3_worker.execution_binding.is_none());
 }

@@ -38,7 +38,7 @@ pub mod types;
 pub mod validation;
 
 pub use error::AuthorityError;
-pub use store::AuthorityStore;
+pub use store::{build_approved_worker_profile_config, AuthorityStore};
 pub use types::{
     ApprovalRecord, ApprovalSummary, ApprovedTaskDispatch, ApprovedTaskRecord, MaterializedPlan,
     NativeRoute, OperatorApprovalRequest, APPROVALS_FILE_NAME, APPROVALS_LOCK_FILE_NAME,
@@ -1582,6 +1582,10 @@ mod tests {
             agy_prof.spec.allowed_write_paths,
             BTreeSet::from(["src/lib.rs".to_string()])
         );
+        assert!(
+            agy_prof.dependency_input.is_none(),
+            "root worker profile must not carry dependency_input policy"
+        );
 
         let oc_prof = &mixed_workers.profiles[1];
         assert!(oc_prof.profile_id.len() <= 64);
@@ -1596,6 +1600,31 @@ mod tests {
         assert_eq!(
             oc_prof.spec.allowed_models,
             BTreeSet::from(["opencode-go/deepseek-v4.1-flash".to_string()])
+        );
+        let oc_dep_policy = oc_prof
+            .dependency_input
+            .as_ref()
+            .expect("dependent worker profile must carry dependency_input policy");
+        assert_eq!(
+            oc_dep_policy.seal_path,
+            non_existent_work_area
+                .join("manifests")
+                .join("dependencies")
+                .join("task-oc.json")
+        );
+        assert_eq!(oc_dep_policy.approval_id, mixed_summary.approval_id);
+        assert_eq!(
+            oc_dep_policy.approval_subject_digest,
+            mixed_mat.subject_digest
+        );
+        assert_eq!(oc_dep_policy.task_id, "task-oc");
+        assert_eq!(
+            oc_dep_policy.command_key,
+            mixed_mat.task_dispatch[1].command_key
+        );
+        assert_eq!(
+            oc_dep_policy.task_digest,
+            mixed_mat.task_dispatch[1].task_digest
         );
         assert_eq!(
             oc_prof.spec.allowed_write_paths,
@@ -2040,5 +2069,234 @@ mod tests {
             ledger_bytes_after, ledger_bytes_before,
             "ledger bytes on disk must remain unchanged"
         );
+    }
+
+    #[test]
+    fn approve_rejects_missing_direct_or_transitive_predecessors_without_expanding_selection() {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().expect("reg snap").revision;
+
+        let (chain_rev, chain_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-transitive-selection",
+            "binding-1",
+            reg_rev,
+            vec![
+                PlanTask {
+                    id: "task-a".to_string(),
+                    title: "Root A".to_string(),
+                    instruction: "Implement root A".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-b".to_string(),
+                    title: "Middle B".to_string(),
+                    instruction: "Implement middle B".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: vec!["task-a".to_string()],
+                    allowed_write_paths: vec!["src/extra.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-c".to_string(),
+                    title: "Leaf C".to_string(),
+                    instruction: "Implement leaf C".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: vec!["task-b".to_string()],
+                    allowed_write_paths: vec!["src/sub/mod.rs".to_string()],
+                },
+            ],
+        );
+
+        let approve_selection = |ids: Vec<&str>| {
+            fixture.authority.approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-transitive-selection".to_string(),
+                plan_revision: chain_rev,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: chain_digest.clone(),
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: ids.into_iter().map(str::to_string).collect(),
+                approved_write_paths: vec!["src/".to_string()],
+                max_parallel: 2,
+                budgets: ExecutionBudgets::default(),
+            })
+        };
+
+        // 1. Selecting dependent task-b without direct predecessor task-a is rejected.
+        let direct_err =
+            approve_selection(vec!["task-b"]).expect_err("missing direct predecessor rejected");
+        assert_eq!(direct_err.code(), "validation");
+        assert!(direct_err.to_string().contains("task-a"));
+
+        // 2. Selecting task-b and task-c without transitive predecessor task-a is rejected.
+        let transitive_err = approve_selection(vec!["task-b", "task-c"])
+            .expect_err("missing transitive root predecessor rejected");
+        assert_eq!(transitive_err.code(), "validation");
+        assert!(transitive_err.to_string().contains("task-a"));
+
+        // 3. Selecting task-a and task-c without intermediate predecessor task-b is rejected.
+        let middle_err = approve_selection(vec!["task-a", "task-c"])
+            .expect_err("missing intermediate predecessor rejected");
+        assert_eq!(middle_err.code(), "validation");
+        assert!(middle_err.to_string().contains("task-b"));
+
+        // Store remains empty after rejected partial approvals (never silently expanded).
+        assert!(fixture
+            .authority
+            .list_for_binding("binding-1")
+            .expect("list approvals")
+            .is_empty());
+
+        // 4. Selecting the complete prefix [task-a, task-b] or full chain [task-a, task-b, task-c] succeeds.
+        let prefix_summary =
+            approve_selection(vec!["task-a", "task-b"]).expect("complete prefix selection valid");
+        assert_eq!(
+            prefix_summary.approved_task_ids,
+            vec!["task-a".to_string(), "task-b".to_string()]
+        );
+    }
+
+    #[test]
+    fn shared_worker_profile_constructor_preserves_nondefault_budgets_effort_and_provider_standalone(
+    ) {
+        let fixture = setup_fixture();
+        let reg_rev = fixture.registry.snapshot().expect("reg snap").revision;
+
+        let (plan_rev, plan_digest) = save_and_publish_plan(
+            &fixture,
+            "plan-shared-profile-constructor",
+            "binding-1",
+            reg_rev,
+            vec![
+                PlanTask {
+                    id: "task-agy".to_string(),
+                    title: "AGY Hard Root".to_string(),
+                    instruction: "Implement AGY root".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-go".to_string(),
+                    title: "Go Dependent".to_string(),
+                    instruction: "Implement Go dependent".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: vec!["task-agy".to_string()],
+                    allowed_write_paths: vec!["src/extra.rs".to_string()],
+                },
+            ],
+        );
+
+        let custom_budgets = ExecutionBudgets {
+            timeout_ms: 123_456,
+            max_stdout_bytes: 204_800,
+            max_stderr_bytes: 102_400,
+            max_line_bytes: 32_768,
+            max_events: 512,
+        };
+
+        let summary = fixture
+            .authority
+            .approve(OperatorApprovalRequest {
+                binding_id: "binding-1".to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-shared-profile-constructor".to_string(),
+                plan_revision: plan_rev,
+                expected_registry_revision: reg_rev,
+                expected_plan_digest: plan_digest,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-agy".to_string(), "task-go".to_string()],
+                approved_write_paths: vec!["src/".to_string()],
+                max_parallel: 2,
+                budgets: custom_budgets.clone(),
+            })
+            .expect("approve with custom budgets");
+
+        let record = fixture
+            .authority
+            .get_for_operator(&summary.approval_id)
+            .expect("get_for_operator");
+        assert_eq!(record.budgets, custom_budgets);
+
+        let session_binding = sample_binding("bnd_session_shared", THREAD_UUID_A);
+        let work_area = fixture.root.join("work-area-shared");
+        let materialized = fixture
+            .authority
+            .materialize(&summary.approval_id, &session_binding, &work_area)
+            .expect("materialize");
+        let mat_validated = materialized
+            .workers
+            .as_ref()
+            .expect("workers present")
+            .validate()
+            .expect("validate materialized workers");
+
+        for task in &record.tasks {
+            let shared_cfg = build_approved_worker_profile_config(
+                &record,
+                task,
+                &session_binding.binding_id,
+                &work_area,
+                fixture.authority.approvals_path(),
+            )
+            .expect("build_approved_worker_profile_config");
+
+            assert_eq!(shared_cfg.spec.budgets, custom_budgets);
+            assert_eq!(shared_cfg.spec.model, task.base_model);
+            assert_eq!(shared_cfg.spec.effort, task.effort);
+            assert_eq!(
+                shared_cfg.spec.file_permissions,
+                WorkerFilePermissions::TaskFiles
+            );
+
+            match task.provider {
+                Some(WorkerProvider::Antigravity) => {
+                    assert!(
+                        !shared_cfg.spec.standalone,
+                        "Antigravity profile must have standalone == false"
+                    );
+                    assert_eq!(shared_cfg.spec.effort.as_deref(), Some("high"));
+                    assert!(shared_cfg.dependency_input.is_none());
+                }
+                Some(WorkerProvider::OpenCodeV2) => {
+                    assert!(
+                        shared_cfg.spec.standalone,
+                        "OpenCode Go profile must have standalone == true"
+                    );
+                    assert_eq!(shared_cfg.spec.effort.as_deref(), Some("max"));
+                    assert!(shared_cfg.dependency_input.is_some());
+                }
+                None => panic!("expected worker provider"),
+            }
+
+            let single_validated = threadlane::WorkersConfig {
+                max_parallel: 1,
+                profiles: vec![shared_cfg.clone()],
+            }
+            .validate()
+            .expect("validate single profile");
+            let single_prof = single_validated
+                .profiles
+                .get(&shared_cfg.profile_id)
+                .expect("single validated profile");
+            let mat_prof = mat_validated
+                .profiles
+                .get(&shared_cfg.profile_id)
+                .expect("materialized validated profile");
+            assert_eq!(
+                single_prof.profile_digest, mat_prof.profile_digest,
+                "static profile_digest must match AuthorityStore::materialize bit-for-bit"
+            );
+        }
     }
 }

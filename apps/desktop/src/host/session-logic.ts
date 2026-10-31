@@ -2,7 +2,9 @@ import type { ApprovalSummary } from '../approval/types.ts';
 import type { RegistrySnapshot } from '../registry/types.ts';
 import type { BrandKey } from '../types.ts';
 import type {
+  DependencyInputSummary,
   HostCodexToolChoice,
+  HostExecutionGates,
   HostPanelContext,
   HostSessionSummary,
   TaskExecutionStatus,
@@ -571,6 +573,7 @@ export function nextVisibleApprovedTaskCount(current: number, total: number): nu
 const TASK_STATUS_LABELS: Readonly<Record<TaskExecutionStatus, string>> = {
   not_started: 'Not started',
   dependency_inputs_unverified: 'Blocked: dependencies unverified',
+  dependency_inputs_ready: 'Ready: dependencies verified',
   native_route_required: 'Native route required',
   queued: 'Queued',
   claimed: 'Claimed',
@@ -602,6 +605,8 @@ export function formatTaskStatusTone(
     case 'timed_out':
     case 'unknown':
       return 'warn';
+    case 'dependency_inputs_ready':
+      return 'default';
     default:
       return 'default';
   }
@@ -630,6 +635,115 @@ export function taskReviewNote(task: Pick<TaskStateSnapshot, 'status'>): string 
     return 'Unknown (uncertain); not replayed or accepted.';
   }
   return '';
+}
+
+/** Operator guidance for dependent inputs that the host has not verified. */
+export const TASK_DEPENDENCY_UNVERIFIED_NOTE =
+  'Waiting for reviewed prerequisite code. Prepare dependency inputs before starting this task.';
+
+export interface TaskDependencyDetail {
+  text: string;
+  tone: 'default' | 'warn';
+}
+
+function abbreviatedDependencySha(raw: string): string | null {
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value) {
+    return null;
+  }
+  return value.length <= 12 ? value : `${value.slice(0, 12)}…`;
+}
+
+/**
+ * Read-only dependency text. It never turns a status or parent list into a
+ * prepared summary: the host must report `dependency_input` explicitly.
+ */
+export function formatTaskDependencyDetail(
+  task: Pick<TaskStateSnapshot, 'status' | 'dependency_input'>
+): TaskDependencyDetail | null {
+  const input: DependencyInputSummary | null = task.dependency_input ?? null;
+  const parts: string[] = [];
+  if (input) {
+    const base = abbreviatedDependencySha(input.base_commit);
+    const predecessors = Array.isArray(input.predecessor_task_ids)
+      ? input.predecessor_task_ids
+          .map((id) => (typeof id === 'string' ? id.trim() : ''))
+          .filter((id) => id.length > 0)
+      : [];
+    const predecessorText =
+      predecessors.length > 0
+        ? `Prerequisites: ${predecessors.join(', ')}`
+        : 'Prerequisites not reported';
+    parts.push(
+      `${
+        base ? `Base ${base}` : 'Base not reported'
+      } · ${predecessorText}.`
+    );
+  }
+  if (task.status === 'dependency_inputs_unverified') {
+    parts.push(TASK_DEPENDENCY_UNVERIFIED_NOTE);
+  } else if (task.status === 'dependency_inputs_ready' && !input) {
+    parts.push(
+      'Prepared input details are unavailable.'
+    );
+  } else if (task.status === 'dependency_inputs_ready') {
+    parts.push('Ready to start.');
+  }
+  if (parts.length === 0) {
+    return null;
+  }
+  return {
+    text: parts.join(' '),
+    tone: task.status === 'dependency_inputs_unverified' ? 'warn' : 'default',
+  };
+}
+
+/** Writes dependency details through `textContent`, never HTML parsing. */
+export function writeTaskDependencyText(
+  target: { textContent: string | null },
+  task: Pick<TaskStateSnapshot, 'status' | 'dependency_input'>
+): TaskDependencyDetail | null {
+  const detail = formatTaskDependencyDetail(task);
+  const text = detail?.text ?? '';
+  if (target.textContent !== text) {
+    target.textContent = text;
+  }
+  return detail;
+}
+
+/** Honest gate wording for legacy hosts that never report input support. */
+export function formatDependencyInputsGate(
+  gates: Pick<HostExecutionGates, 'dependency_inputs_required'> | null | undefined
+): string {
+  if (gates?.dependency_inputs_required === true) {
+    return 'Reviewed prerequisite code is required before starting dependent tasks.';
+  }
+  if (gates?.dependency_inputs_required === false) {
+    return 'Not supported by this host.';
+  }
+  return 'Legacy host: dependency preparation is unavailable.';
+}
+
+/** Dependent tasks are not described as unconditionally blocked. */
+export function formatDependentTasksGate(
+  gates: Pick<
+    HostExecutionGates,
+    'dependent_tasks_blocked' | 'dependency_inputs_required'
+  >
+): string {
+  if (gates.dependency_inputs_required === true) {
+    return gates.dependent_tasks_blocked
+      ? 'Waiting for reviewed prerequisite code.'
+      : 'Available after prerequisite code is reviewed and prepared.';
+  }
+  if (gates.dependent_tasks_blocked) {
+    return gates.dependency_inputs_required === false
+      ? 'Blocked by host policy; no verified-input requirement reported.'
+      : 'Blocked; verified-input support not reported (legacy).';
+  }
+  return gates.dependency_inputs_required === false
+    ? 'No global block reported.'
+    : 'No global block reported; verified-input support not reported (legacy).';
 }
 
 export function workerTelemetry(worker: WorkerSnapshot | null | undefined): HostWorkerTelemetry {

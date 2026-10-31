@@ -64,8 +64,10 @@ also validates current source/task/target HEADs, ownership and frozen receipts.
 
 A moved HEAD, changed evidence, stale subject, active job, dirty worktree or
 invalid receipt can block the existing library operations. A confirmation flag
-does not override any of those checks. Combining independent root runs and
-automatic dependent-task dispatch remain unsupported by this checkpoint.
+does not override any of those checks. The
+[dependency-input extension](DEPENDENCIES.md) separately composes reviewed
+predecessor heads for explicit child dispatch; automatic child dispatch remains
+unsupported. The same-run integration guard is unchanged.
 
 ## Files and failures
 

@@ -14,6 +14,11 @@ export interface HostExecutionGates {
   workers_auto_started_on_boot: boolean;
   root_tasks_only: boolean;
   dependent_tasks_blocked: boolean;
+  /**
+   * Whether dependent dispatch requires verified prepared inputs. Optional for
+   * compatibility with legacy hosts; an absent value means unsupported.
+   */
+  dependency_inputs_required?: boolean;
   native_routes_manual_only: boolean;
   worker_completed_means_ready_for_review: boolean;
   auto_accept_or_merge_enabled: boolean;
@@ -166,6 +171,8 @@ export interface WorkerSnapshot {
 export type TaskExecutionStatus =
   | 'not_started'
   | 'dependency_inputs_unverified'
+  /** Verified prepared dependent with no dispatch intent; not started. */
+  | 'dependency_inputs_ready'
   | 'native_route_required'
   | 'queued'
   | 'claimed'
@@ -176,6 +183,14 @@ export type TaskExecutionStatus =
   | 'cancelled'
   | 'timed_out'
   | 'unknown';
+
+/** Read-only prepared dependency identity reported by the host. */
+export interface DependencyInputSummary {
+  input_digest: string;
+  base_commit: string;
+  tree_sha: string;
+  predecessor_task_ids: string[];
+}
 
 /** Safe `threadlane_host::TaskStateSnapshot` DTO. */
 export interface TaskStateSnapshot {
@@ -194,6 +209,8 @@ export interface TaskStateSnapshot {
   profile_id: string | null;
   command_key: string | null;
   status: TaskExecutionStatus;
+  /** Present only when the backend reports the exact prepared input summary. */
+  dependency_input?: DependencyInputSummary | null;
   run_id: string | null;
   worker_id: string | null;
   worker: WorkerSnapshot | null;

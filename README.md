@@ -15,7 +15,7 @@ not require switching to the panel for each task. See
 ## Working Now and Remaining Milestones
 
 ### Conversation Runtime and Bounded History (Milestones 1 and 2A)
-- **`threadlane-core` (`crates/threadlane-core`)**: Transactional SQLite state engine (`SCHEMA_VERSION = 3`, with transactional v1/v2 upgrades) with validated non-nil Codex thread UUID bindings, deterministic simulated demo runs, revision-checked `answer` / `steer` / `cancel` transitions, per-binding compact idempotent command replay, bounded keyset-paginated run/revision/question history, bounded event batches, high-water-mark event acknowledgements, and persistent wake-up notice coalescing and crash/reopen recovery.
+- **`threadlane-core` (`crates/threadlane-core`)**: Transactional SQLite state engine (`SCHEMA_VERSION = 4`, with transactional v1/v2/v3 upgrades) with validated non-nil Codex thread UUID bindings, deterministic simulated demo runs, revision-checked `answer` / `steer` / `cancel` transitions, per-binding compact idempotent command replay, bounded keyset-paginated run/revision/question history, bounded event batches, high-water-mark event acknowledgements, and persistent wake-up notice coalescing and crash/reopen recovery.
 - **`threadlane` runtime (`crates/threadlane`)**:
   - **Single-owner supervisor (`threadlane serve`)**: Holds an exclusive process-lifetime file lock (`supervisor.lock`) tied to the active state engine, owns the SQLite database (`state.db`) and timed demo progression ticks, binds only `127.0.0.1:0`, and writes an atomic private runtime descriptor (`supervisor.json`) containing a fresh 64-hex-character bearer token (244 random bits from two v4 UUIDs).
   - **Trusted CLI (`threadlane bind`, `list-bindings`, `status`, `call`, `retry-wakeup`)**: Configures chat bindings and executes binding-scoped operations over authenticated loopback HTTP with streamed response size enforcement.
@@ -56,6 +56,12 @@ not require switching to the panel for each task. See
   commands. It preserves the existing digest/receipt and same-run checks; no
   main merge, push or dependent-task dispatch follows automatically. See the
   [operator workflow](docs/OPERATOR-WORKFLOW.md).
+
+- **Reviewed dependent tasks**: An explicit local
+  `threadlane-host prepare-dependencies` call combines accepted predecessor heads into a frozen
+  input commit. Approved child dispatch uses the same task-ID interface, with
+  bound input proofs and no automatic release when a parent exits. See
+  [dependency inputs](docs/DEPENDENCIES.md).
 
 - **Codex-first initial startup**: An operator may opt in with
   `threadlane-native-mcp --auto-start-approved-hosts` and the configured stores.

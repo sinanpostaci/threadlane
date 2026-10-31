@@ -517,3 +517,49 @@ because completed rows were collapsed. The follow-up presentation fix routes dem
 actions to Activity and opens Finished; a regression and browser UI check confirm
 the completed row remains visible. The updated standalone window was reopened on
 native Wayland. This is GUI-to-local-runtime evidence, not native Codex orchestration.
+
+## M5B reviewed dependency inputs (2026-10-31)
+
+The receipt-bound dependency-input extension adds explicit fan-in and chained
+headless task execution without changing public dispatch arguments. Its operator
+sequence is documented in [dependency inputs](DEPENDENCIES.md).
+
+Accepted frozen-source gates:
+
+- Rust workspace: **307 tests passed**, no failures.
+- Standalone desktop Rust workspace: **23 tests passed**, no failures.
+- Frontend: **140 tests passed**; TypeScript and production Vite build passed.
+- Workspace and standalone desktop formatting and all-target Clippy passed with
+  warnings denied. Both Cargo lockfiles retain their package versions; changes
+  add only the local operations dependency edges.
+
+Behavioral evidence uses real disposable Git repositories and deterministic fake
+providers. It covers A+B -> C -> D, exact reviewed parent code in the child,
+unchanged primary checkout, immutable/idempotent preparation, merge conflicts,
+interrupted preparation, missing/replaced proofs, raw-byte seal changes after
+queue and before admission, exact frozen instruction/profile/worktree identity,
+and overlapping direct/transitive predecessor selection. An internally valid
+replacement seal, journal and ref cannot relabel a recorded run. Started children
+retain cancellation/activity access after parent changes; stale cancellation is
+rejected and restart leaves in-flight work Unknown without replay.
+
+The single Astra Max package-closing review found five required corrections:
+pending-intent binding before effects, complete predecessor identity, exact
+selection on memo hits, no-dereference symbolic-ref protection, and static private
+JSON errors. The targeted source recheck cleared these corrections and historical
+summary pinning. Raw review/generation/runtime logs remain private, outside the
+repository. Review does not substitute for actual test and package evidence.
+
+Parallel harness runs on this host intermittently returned ETXTBSY while starting
+freshly written fake-provider scripts in the unchanged worker foundation suite.
+The isolated pipe-holder test and all 24 foundation tests passed with a serial
+harness. No assertions or runtime launch policy were weakened. The final full
+Rust gate uses `--test-threads=1`; tests still exercise their own concurrent tasks,
+queueing, cancellation and race scenarios. Default-parallel harness stability is
+not claimed by that result; the precise environmental cause remains unproven.
+
+These are Linux/NixOS fixture gates, not native macOS/Windows acceptance. Live
+native onboarding, production multi-chat delivery, interactive provider steering,
+and real provider model/effort telemetry remain separate gates. The earlier Go UI
+generation attempt timed out; its draft was manually reviewed and tested, not
+promoted to a successful provider run or automatically retried.

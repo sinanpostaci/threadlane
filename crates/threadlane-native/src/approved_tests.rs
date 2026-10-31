@@ -1504,8 +1504,9 @@ async fn approved_mcp_session_live_auth_verification_task_dispatch_retry_cancel_
     assert_eq!(session_summary.phase, HostPhase::Ready);
     assert!(session_summary.gates.supervisor_authenticated_ready);
     assert!(!session_summary.gates.workers_auto_started_on_boot);
-    assert!(session_summary.gates.root_tasks_only);
-    assert!(session_summary.gates.dependent_tasks_blocked);
+    assert!(!session_summary.gates.root_tasks_only);
+    assert!(!session_summary.gates.dependent_tasks_blocked);
+    assert!(session_summary.gates.dependency_inputs_required);
     assert!(session_summary.gates.native_routes_manual_only);
     assert!(
         session_summary
@@ -3823,6 +3824,9 @@ async fn codex_first_live_subprocess_auto_start_exact_argv_readiness_and_dispatc
                                     .expect("start_fresh_only from spawned argv");
                                 let _ = host_handle_tx.send(handle);
                                 return;
+                            }
+                            HostCommand::PrepareDependencies(_) => {
+                                panic!("host startup must not prepare dependencies");
                             }
                         }
                     }

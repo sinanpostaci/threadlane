@@ -2596,6 +2596,7 @@ mod tests {
                 assert_eq!(serve.sessions_dir, sess);
                 assert_eq!(serve.approval_id, valid_approval);
             }
+            HostCommand::PrepareDependencies(_) => panic!("startup must not prepare dependencies"),
         }
 
         // Reject malformed, whitespace-padded, or flag-injected approval_id inputs.
@@ -2716,6 +2717,7 @@ mod tests {
                 assert!(serve.notify_codex.is_none());
                 assert!(serve.notify_timeout_ms.is_none());
             }
+            HostCommand::PrepareDependencies(_) => panic!("startup must not prepare dependencies"),
         }
 
         for bad_instance in [
@@ -4395,7 +4397,9 @@ exit 0
                 let mut cli_args = vec![HOST_BINARY_NAME.to_string()];
                 cli_args.extend(raw_lines.lines().map(str::to_string));
                 let parsed = HostCli::try_parse_from(&cli_args).expect("parse captured argv");
-                let HostCommand::Serve(serve_args) = parsed.command;
+                let HostCommand::Serve(serve_args) = parsed.command else {
+                    panic!("startup must not prepare dependencies");
+                };
                 ApprovedHost::start(
                     ApprovedHostConfig::new(
                         serve_args.registry_dir,
@@ -4537,7 +4541,9 @@ exit 0
                 let mut cli_args = vec![HOST_BINARY_NAME.to_string()];
                 cli_args.extend(raw_lines.lines().map(str::to_string));
                 let parsed = HostCli::try_parse_from(&cli_args).expect("parse restart argv");
-                let HostCommand::Serve(serve_args) = parsed.command;
+                let HostCommand::Serve(serve_args) = parsed.command else {
+                    panic!("startup must not prepare dependencies");
+                };
                 let expected_prior_instance = serve_args
                     .restart_from_instance_id
                     .expect("explicit restart flag is required");

@@ -5,6 +5,7 @@ use thiserror::Error;
 use threadlane::ErrorCode as RuntimeErrorCode;
 use threadlane_authority::AuthorityError;
 use threadlane_core::CoreError;
+use threadlane_operations::OperationsError;
 use threadlane_plans::{PlanError, PlanStatus};
 use threadlane_registry::{RegistryError, ToolAdapter};
 
@@ -557,6 +558,29 @@ fn map_core_err(err: CoreError) -> HostError {
             code: "core_error".to_string(),
             message: other.to_string(),
         },
+    }
+}
+
+impl From<OperationsError> for HostError {
+    fn from(err: OperationsError) -> Self {
+        match err {
+            OperationsError::InvalidInput(reason) => Self::Validation {
+                field: "dependency_input".to_string(),
+                reason,
+            },
+            OperationsError::SecurityViolation(reason) => Self::SecurityViolation {
+                path: "work-area".to_string(),
+                reason,
+            },
+            OperationsError::Io(io_err) => Self::Io {
+                operation: "operations".to_string(),
+                reason: io_err.to_string(),
+            },
+            other => Self::Runtime {
+                code: other.code().to_string(),
+                message: other.to_string(),
+            },
+        }
     }
 }
 

@@ -6,13 +6,21 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_core::{
-    WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerOutcomeSummary,
-    WorkerProgressUpdate, WorkerStatus, WorkerWorktreeUpdate, MAX_ID_LEN,
+    WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord, WorkerExecutionBinding,
+    WorkerOutcomeSummary, WorkerProgressUpdate, WorkerStatus, WorkerWorktreeUpdate, MAX_ID_LEN,
     MAX_WORKER_CHANGED_PATHS_PREVIEW, MAX_WORKER_DIGEST_LEN, MAX_WORKER_PATH_BYTES,
     MAX_WORKER_PROFILE_ID_LEN, MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
 };
-use threadlane_workers::git::WORK_AREA_LOCK_FILENAME;
-pub use threadlane_workers::WorkerFilePermissions;
+use threadlane_workers::git::{
+    resolve_allowed_write_scopes_at_base, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
+    WORK_AREA_LOCK_FILENAME,
+};
+pub use threadlane_workers::{
+    dependency_input_lock_path, read_dependency_input, validate_dependency_input_policy,
+    DependencyInputPolicy, DependencyInputSeal, DependencyPredecessorInput,
+    VerifiedDependencyInput, WorkerFilePermissions, DEPENDENCIES_MANIFEST_SUBDIR,
+    DEPENDENCY_INPUT_SCHEMA_VERSION, MAX_DEPENDENCY_INPUT_BYTES, MAX_DEPENDENCY_PREDECESSORS,
+};
 use threadlane_workers::{
     execute_worker_task_with_observer, sanitize_and_redact,
     validate_absolute_no_symlink_components, validate_simple_identifier, ExecutionBudgets,
@@ -126,6 +134,9 @@ pub struct WorkerProfileConfig {
     pub allowed_binding_ids: BTreeSet<String>,
     /// Trusted worker specification template fixed by this profile.
     pub spec: WorkerSpecTemplate,
+    /// Optional startup dependency input policy for dependent tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_input: Option<DependencyInputPolicy>,
 }
 
 impl<'de> Deserialize<'de> for WorkerProfileConfig {
@@ -159,6 +170,11 @@ impl<'de> Deserialize<'de> for WorkerProfileConfig {
         let allowed_binding_ids: BTreeSet<String> =
             serde_json::from_value(allowed_val).map_err(serde::de::Error::custom)?;
 
+        let dependency_input: Option<DependencyInputPolicy> = match map.remove("dependency_input") {
+            Some(v) => serde_json::from_value(v).map_err(serde::de::Error::custom)?,
+            None => None,
+        };
+
         let spec: WorkerSpecTemplate = match (map.remove("spec"), map.remove("template")) {
             (Some(_), Some(_)) => {
                 return Err(serde::de::Error::custom(
@@ -169,7 +185,12 @@ impl<'de> Deserialize<'de> for WorkerProfileConfig {
                 if let Some(unexpected_key) = map.keys().next() {
                     return Err(serde::de::Error::unknown_field(
                         unexpected_key,
-                        &["profile_id", "allowed_binding_ids", "spec"],
+                        &[
+                            "profile_id",
+                            "allowed_binding_ids",
+                            "spec",
+                            "dependency_input",
+                        ],
                     ));
                 }
                 serde_json::from_value(spec_val).map_err(serde::de::Error::custom)?
@@ -182,6 +203,7 @@ impl<'de> Deserialize<'de> for WorkerProfileConfig {
             profile_id,
             allowed_binding_ids,
             spec,
+            dependency_input,
         })
     }
 }
@@ -384,6 +406,8 @@ pub struct ValidatedWorkerProfile {
     pub resolved_model: ResolvedModelTarget,
     /// Non-empty requested effort label recorded in `threadlane-core`.
     pub requested_effort: String,
+    /// Optional validated dependency input policy for dependent tasks.
+    pub dependency_input: Option<DependencyInputPolicy>,
 }
 
 impl ValidatedWorkerProfile {
@@ -680,6 +704,21 @@ fn validate_profile_side_effect_free(
     let normalized_base_commit = validate_exact_commit_sha(&profile.spec.base_commit)?;
     let checked_work_area = validate_work_area_side_effect_free(&profile.spec.work_area_root)?;
 
+    let canonical_dependency_input = match &profile.dependency_input {
+        Some(policy) => {
+            validate_dependency_input_policy(policy, &checked_work_area).map_err(|err| {
+                Error::InvalidConfig(format!("profile `{}`: {err}", profile.profile_id))
+            })?;
+            let mut normalized = policy.clone();
+            normalized.seal_path = checked_work_area
+                .join(MANIFESTS_SUBDIR)
+                .join(DEPENDENCIES_MANIFEST_SUBDIR)
+                .join(format!("{}.json", policy.task_id));
+            Some(normalized)
+        }
+        None => None,
+    };
+
     let placeholder_spec = profile
         .spec
         .to_worker_spec("validation-placeholder".to_string());
@@ -725,6 +764,7 @@ fn validate_profile_side_effect_free(
         &canonical_template,
         &validation.resolved_model,
         &requested_effort,
+        canonical_dependency_input.as_ref(),
     )?;
 
     Ok(ValidatedWorkerProfile {
@@ -734,6 +774,7 @@ fn validate_profile_side_effect_free(
         template: canonical_template,
         resolved_model: validation.resolved_model,
         requested_effort,
+        dependency_input: canonical_dependency_input,
     })
 }
 
@@ -743,6 +784,7 @@ fn compute_profile_digest(
     template: &WorkerSpecTemplate,
     resolved_model: &ResolvedModelTarget,
     requested_effort: &str,
+    dependency_input: Option<&DependencyInputPolicy>,
 ) -> Result<String, Error> {
     let mut canonical = serde_json::json!({
         "profile_id": profile_id,
@@ -770,6 +812,9 @@ fn compute_profile_digest(
     if template.file_permissions == WorkerFilePermissions::TaskFiles {
         canonical["file_permissions"] = serde_json::json!("task_files");
     }
+    if let Some(policy) = dependency_input {
+        canonical["dependency_input"] = serde_json::to_value(policy)?;
+    }
     let bytes = serde_json::to_vec(&canonical)?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -780,6 +825,143 @@ fn compute_profile_digest(
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+/// Resolved worker execution specification and optional dependency execution binding.
+///
+/// When resolved for a dependent profile, this value privately retains the shared `fs2` lock
+/// lease on the verified dependency seal until dropped.
+#[derive(Debug)]
+pub struct ResolvedWorkerExecution {
+    /// Materialized worker specification with `base_commit` set to the verified execution base.
+    pub spec: WorkerSpec,
+    /// Durable dependency execution binding (`Some` for dependent profiles, `None` for root profiles).
+    pub execution_binding: Option<WorkerExecutionBinding>,
+    profile_id: String,
+    profile_digest: String,
+    policy: Option<DependencyInputPolicy>,
+    _lease: Option<VerifiedDependencyInput>,
+}
+
+/// Resolves and verifies the execution specification and optional [`WorkerExecutionBinding`] for
+/// a worker profile before admission or claim execution.
+///
+/// For root profiles (`profile.dependency_input.is_none()`), returns the unmodified template
+/// specification with `execution_binding: None`.
+///
+/// For dependent profiles (`profile.dependency_input.is_some()`), acquires the shared dependency
+/// seal lock lease, verifies the seal and Git object/ancestry invariants, verifies persisted
+/// predecessor review/integration receipts, verifies that allowed write scope kinds at
+/// `execution_base_commit` do not widen relative to the approved template `base_commit`, updates
+/// `spec.base_commit` to `execution_base_commit`, and computes the [`WorkerExecutionBinding`]
+/// bound to `profile.profile_digest`.
+pub fn resolve_worker_execution(
+    profile: &ValidatedWorkerProfile,
+    command_key: &str,
+    instruction: String,
+) -> Result<ResolvedWorkerExecution, Error> {
+    let Some(ref policy) = profile.dependency_input else {
+        return Ok(ResolvedWorkerExecution {
+            spec: profile.build_spec(instruction),
+            execution_binding: None,
+            profile_id: profile.profile_id.clone(),
+            profile_digest: profile.profile_digest.clone(),
+            policy: None,
+            _lease: None,
+        });
+    };
+
+    let verified = read_dependency_input(
+        policy,
+        &profile.template.repository_path,
+        &profile.template.work_area_root,
+        &profile.template.base_commit,
+        &instruction,
+        command_key,
+    )
+    .map_err(|err| {
+        Error::InvalidConfig(format!(
+            "profile `{}` dependency input verification failed: {err}",
+            profile.profile_id
+        ))
+    })?;
+
+    threadlane_operations::dependency::verify_dependency_predecessor_receipts(&verified.seal)
+        .map_err(|err| {
+            Error::InvalidConfig(format!(
+                "profile `{}` dependency predecessor receipt verification failed: {err}",
+                profile.profile_id
+            ))
+        })?;
+
+    let approved_scopes = resolve_allowed_write_scopes_at_base(
+        &profile.template.repository_path,
+        &profile.template.base_commit,
+        &profile.template.allowed_write_paths,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .map_err(|err| {
+        Error::InvalidConfig(format!(
+            "profile `{}` failed to resolve allowed write scopes at approved base_commit `{}`: {err}",
+            profile.profile_id, profile.template.base_commit
+        ))
+    })?;
+
+    let execution_scopes = resolve_allowed_write_scopes_at_base(
+        &profile.template.repository_path,
+        &verified.seal.execution_base_commit,
+        &profile.template.allowed_write_paths,
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .map_err(|err| {
+        Error::InvalidConfig(format!(
+            "profile `{}` failed to resolve allowed write scopes at execution_base_commit `{}`: {err}",
+            profile.profile_id, verified.seal.execution_base_commit
+        ))
+    })?;
+
+    for (path_entry, approved_kind) in &approved_scopes {
+        let Some(execution_kind) = execution_scopes.get(path_entry) else {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{}` allowed_write_paths entry `{path_entry}` missing in execution base scope resolution",
+                profile.profile_id
+            )));
+        };
+        if approved_kind != execution_kind {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{}` allowed_write_paths entry `{path_entry}` changed write scope kind between approved base `{}` ({approved_kind:?}) and execution base `{}` ({execution_kind:?})",
+                profile.profile_id,
+                profile.template.base_commit,
+                verified.seal.execution_base_commit
+            )));
+        }
+    }
+    if approved_scopes.len() != execution_scopes.len() {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{}` allowed_write_paths scope count changed between approved base and execution base",
+            profile.profile_id
+        )));
+    }
+
+    let mut spec = profile.build_spec(instruction);
+    spec.base_commit = verified.seal.execution_base_commit.clone();
+
+    let binding = WorkerExecutionBinding::new(
+        &profile.profile_digest,
+        &spec.prompt,
+        &verified.seal.seal_digest,
+        &verified.seal_file_digest,
+        &verified.seal.execution_base_commit,
+    )?;
+
+    Ok(ResolvedWorkerExecution {
+        spec,
+        execution_binding: Some(binding),
+        profile_id: profile.profile_id.clone(),
+        profile_digest: profile.profile_digest.clone(),
+        policy: Some(policy.clone()),
+        _lease: Some(verified),
+    })
 }
 
 /// Derives a compact, deterministic worktree identifier tag (`14` chars, `<prefix>_<12hex>`)
@@ -798,25 +980,28 @@ pub(crate) fn compact_worktree_tag(id: &str, prefix: &str) -> String {
 }
 
 /// Creates the owned per-run integration worktree and per-task execution worktree for a
-/// claimed worker attempt.
+/// claimed worker attempt using the resolved execution [`WorkerSpec`].
 pub(crate) fn prepare_claim_worktrees(
-    profile: &ValidatedWorkerProfile,
+    spec: &WorkerSpec,
     claim: &WorkerClaim,
 ) -> Result<WorkerWorktreeUpdate, WorkerError> {
+    if spec.base_commit != claim.base_commit {
+        return Err(WorkerError::SecurityViolation(format!(
+            "resolved worker spec base_commit `{}` does not match claim base_commit `{}`",
+            spec.base_commit, claim.base_commit
+        )));
+    }
     let manager = WorktreeManager::new(
-        &profile.template.repository_path,
-        &profile.template.work_area_root,
-        &claim.base_commit,
+        &spec.repository_path,
+        &spec.work_area_root,
+        &spec.base_commit,
     )?;
     let wt_run_tag = compact_worktree_tag(&claim.run_id, "r");
     let wt_task_tag = compact_worktree_tag(&claim.worker_id, "w");
 
     let run_manifest = manager.create_run_worktree(&wt_run_tag)?;
-    let task_manifest = manager.create_task_worktree(
-        &wt_run_tag,
-        &wt_task_tag,
-        &profile.template.allowed_write_paths,
-    )?;
+    let task_manifest =
+        manager.create_task_worktree(&wt_run_tag, &wt_task_tag, &spec.allowed_write_paths)?;
 
     Ok(WorkerWorktreeUpdate {
         run_worktree_id: run_manifest.worktree_id,
@@ -831,18 +1016,96 @@ pub(crate) fn prepare_claim_worktrees(
 
 /// Executes the worker task inside its pre-created task worktree while streaming live normalized
 /// events over a bounded channel.
+///
+/// Immediately before first provider allocation/spawn (including OpenCode session allocation),
+/// re-verifies the pinned [`WorkerExecutionBinding`], pinned [`DependencyInputSeal`], and
+/// persisted predecessor receipts while retaining the original shared seal lock lease.
 pub(crate) async fn execute_claimed_worker(
-    profile: &ValidatedWorkerProfile,
+    resolved: &ResolvedWorkerExecution,
     claim: &WorkerClaim,
     task_worktree_id: &str,
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: mpsc::Sender<NormalizedWorkerEvent>,
 ) -> Result<TaskExecutionReport, WorkerError> {
-    let spec = profile.build_spec(claim.instruction.clone());
+    if resolved.spec.base_commit != claim.base_commit
+        || resolved.spec.prompt != claim.instruction
+        || resolved.execution_binding != claim.execution_binding
+    {
+        return Err(WorkerError::SecurityViolation(format!(
+            "resolved worker execution spec/binding does not match claim `{}`",
+            claim.claim_id
+        )));
+    }
+
+    match (&resolved.policy, &resolved._lease, &claim.execution_binding) {
+        (None, None, None) => {}
+        (Some(policy), Some(pinned_verified), Some(pinned_binding)) => {
+            pinned_binding
+                .verify_against(&resolved.profile_digest, &claim.instruction, &claim.base_commit)
+                .map_err(|err| {
+                    WorkerError::SecurityViolation(format!(
+                        "profile `{}` claim execution_binding failed pre-provider verification: {err}",
+                        resolved.profile_id
+                    ))
+                })?;
+            if pinned_binding.input_digest != pinned_verified.seal.seal_digest
+                || pinned_binding.seal_file_digest != pinned_verified.seal_file_digest
+                || pinned_binding.execution_base_commit
+                    != pinned_verified.seal.execution_base_commit
+            {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "profile `{}` pinned execution_binding does not match retained dependency seal lease",
+                    resolved.profile_id
+                )));
+            }
+
+            let rechecked = read_dependency_input(
+                policy,
+                &resolved.spec.repository_path,
+                &resolved.spec.work_area_root,
+                &pinned_verified.seal.approved_base_commit,
+                &claim.instruction,
+                &policy.command_key,
+            )
+            .map_err(|err| {
+                WorkerError::SecurityViolation(format!(
+                    "profile `{}` dependency input revalidation failed before provider execution: {err}",
+                    resolved.profile_id
+                ))
+            })?;
+            if rechecked.seal != pinned_verified.seal
+                || rechecked.seal.seal_digest != pinned_binding.input_digest
+                || rechecked.seal_file_digest != pinned_binding.seal_file_digest
+                || rechecked.seal.execution_base_commit != pinned_binding.execution_base_commit
+            {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "profile `{}` dependency input seal changed before provider execution",
+                    resolved.profile_id
+                )));
+            }
+
+            threadlane_operations::dependency::verify_dependency_predecessor_receipts(
+                &pinned_verified.seal,
+            )
+            .map_err(|err| {
+                WorkerError::SecurityViolation(format!(
+                    "profile `{}` dependency predecessor receipt verification failed before provider execution: {err}",
+                    resolved.profile_id
+                ))
+            })?;
+        }
+        _ => {
+            return Err(WorkerError::SecurityViolation(format!(
+                "profile `{}` dependency execution binding state is inconsistent for claim `{}`",
+                resolved.profile_id, claim.claim_id
+            )));
+        }
+    }
+
     let wt_run_tag = compact_worktree_tag(&claim.run_id, "r");
     let wt_task_tag = compact_worktree_tag(&claim.worker_id, "w");
     execute_worker_task_with_observer(
-        &spec,
+        &resolved.spec,
         &wt_run_tag,
         &wt_task_tag,
         Some(task_worktree_id),
@@ -1511,6 +1774,7 @@ mod tests {
                     requested_effort: "max".to_string(),
                     base_commit: base_commit.clone(),
                     instruction: "implement bounded change".to_string(),
+                    execution_binding: None,
                     now_ms: 1_000,
                 },
             )
@@ -1586,6 +1850,7 @@ mod tests {
                     requested_effort: "max".to_string(),
                     base_commit,
                     instruction: "attempt with conflicting stream".to_string(),
+                    execution_binding: None,
                     now_ms: 2_000,
                 },
             )
@@ -1691,6 +1956,7 @@ mod tests {
                         requested_effort: "max".to_string(),
                         base_commit: base_commit.clone(),
                         instruction: "verify stream preservation on metadata failure".to_string(),
+                        execution_binding: None,
                         now_ms: now_base,
                     },
                 )
@@ -1820,6 +2086,7 @@ mod tests {
                         requested_effort: "max".to_string(),
                         base_commit: base_commit.clone(),
                         instruction: "verify metadata field error provenance".to_string(),
+                        execution_binding: None,
                         now_ms: now_base,
                     },
                 )

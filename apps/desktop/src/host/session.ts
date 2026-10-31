@@ -23,6 +23,8 @@ import {
   emptyHostNotificationState,
   enabledHostCodexTools,
   formatAdapterLabel,
+  formatDependencyInputsGate,
+  formatDependentTasksGate,
   formatHostLifecycleActionLabel,
   formatHostStatusLabel,
   formatHostStatusTone,
@@ -51,6 +53,7 @@ import {
   resolveHostNotificationState,
   resolveHostTaskBrand,
   taskReviewNote,
+  writeTaskDependencyText,
 } from './session-logic.ts';
 import type { HostErrorKind, HostLifecycleAction, HostNotificationUiState } from './session-logic.ts';
 import type {
@@ -80,6 +83,7 @@ interface TaskRowView {
   brand: BrandKey | null;
   badge: HTMLElement;
   meta: HTMLElement;
+  dependency: HTMLElement;
   requested: HTMLElement;
   observed: HTMLElement;
   progress: HTMLElement;
@@ -1220,6 +1224,10 @@ export class ApprovedSessionPanel {
       'Waiting'
     );
     const meta = h('p', { className: 'aq-host-session-task-meta' });
+    const dependency = h('p', {
+      className: 'aq-host-session-task-text',
+      hidden: true,
+    });
     const requested = h('p', { className: 'aq-host-session-task-text' });
     const observed = h('p', { className: 'aq-host-session-task-text' });
     const progress = h('p', { className: 'aq-host-session-task-text' });
@@ -1250,6 +1258,7 @@ export class ApprovedSessionPanel {
         badge
       ),
       meta,
+      dependency,
       h(
         'details',
         { className: 'aq-host-session-task-details' },
@@ -1273,6 +1282,7 @@ export class ApprovedSessionPanel {
       brand: null,
       badge,
       meta,
+      dependency,
       requested,
       observed,
       progress,
@@ -1344,6 +1354,17 @@ export class ApprovedSessionPanel {
     if (view.brand !== brand) {
       view.brandHost.replaceChildren(createBrandIconElement(brand));
       view.brand = brand;
+    }
+
+    const dependencyDetail = snapshot
+      ? writeTaskDependencyText(view.dependency, snapshot)
+      : null;
+    if (!snapshot) {
+      setText(view.dependency, '');
+    }
+    view.dependency.hidden = dependencyDetail === null;
+    if (dependencyDetail) {
+      view.dependency.setAttribute('data-status', dependencyDetail.tone);
     }
 
     if (snapshot) {
@@ -1655,10 +1676,8 @@ export class ApprovedSessionPanel {
         gates.workers_auto_started_on_boot ? 'Yes' : 'No'
       ),
       kvRow('Root tasks only', gates.root_tasks_only ? 'Yes' : 'No'),
-      kvRow(
-        'Dependent tasks blocked',
-        gates.dependent_tasks_blocked ? 'Yes' : 'No'
-      ),
+      kvRow('Dependent tasks', formatDependentTasksGate(gates)),
+      kvRow('Dependency inputs', formatDependencyInputsGate(gates)),
       kvRow(
         'Native routes manual only',
         gates.native_routes_manual_only ? 'Yes' : 'No'

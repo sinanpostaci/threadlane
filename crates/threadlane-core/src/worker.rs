@@ -1,5 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::engine::{
     enforce_compact_response_budget, generate_id, hash_dedup_payload, i64_to_u64, u64_to_i64, Core,
@@ -13,6 +14,110 @@ use crate::limits::{
     MAX_WORKER_SUMMARY_TEXT_BYTES, MAX_WORKER_VIOLATION_SUMMARIES,
 };
 use crate::types::{CommandOutput, EventKind, EventPayload, RunStatus};
+
+/// Schema version for [`WorkerExecutionBinding`] records.
+pub const WORKER_EXECUTION_BINDING_SCHEMA_VERSION: u32 = 1;
+
+const WORKER_EXECUTION_BINDING_DOMAIN: &str = "threadlane.worker_execution_binding.v1";
+
+/// Durable execution binding persisted on dependent worker runs to bind the static
+/// `profile_digest`, exact instruction, sealed dependency input digest, on-disk seal file digest,
+/// and synthesized `execution_base_commit`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerExecutionBinding {
+    /// Execution binding schema version (`1`).
+    pub schema_version: u32,
+    /// Lowercase 64-character SHA-256 hex `seal_digest` from the verified [`DependencyInputSeal`].
+    pub input_digest: String,
+    /// Lowercase 64-character SHA-256 hex digest of the raw on-disk dependency seal file bytes.
+    pub seal_file_digest: String,
+    /// Exact lowercase 40-character hexadecimal Git commit SHA used as the execution base.
+    pub execution_base_commit: String,
+    /// Canonical lowercase 64-character SHA-256 hex digest binding all execution inputs.
+    pub execution_digest: String,
+}
+
+impl WorkerExecutionBinding {
+    /// Validates all execution binding inputs and computes the canonical `execution_digest`.
+    pub fn new(
+        profile_digest: &str,
+        instruction: &str,
+        input_digest: &str,
+        seal_file_digest: &str,
+        execution_base_commit: &str,
+    ) -> Result<Self, CoreError> {
+        let clean_profile_digest = validate_profile_digest(profile_digest)?;
+        let clean_instruction =
+            validate_bounded_text("instruction", instruction, MAX_INSTRUCTION_LEN)?;
+        let clean_input_digest = validate_sha256_digest("input_digest", input_digest)?;
+        let clean_seal_file_digest = validate_sha256_digest("seal_file_digest", seal_file_digest)?;
+        let clean_base_commit =
+            validate_exact_40_hex_commit("execution_base_commit", execution_base_commit)?;
+
+        let instruction_hash = sha256_hex_str(&clean_instruction);
+        let execution_digest = hash_dedup_payload(&(
+            WORKER_EXECUTION_BINDING_DOMAIN,
+            WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
+            &clean_profile_digest,
+            &instruction_hash,
+            &clean_input_digest,
+            &clean_seal_file_digest,
+            &clean_base_commit,
+        ))?;
+
+        Ok(Self {
+            schema_version: WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
+            input_digest: clean_input_digest,
+            seal_file_digest: clean_seal_file_digest,
+            execution_base_commit: clean_base_commit,
+            execution_digest,
+        })
+    }
+
+    /// Verifies that this execution binding is structurally valid and matches `profile_digest`,
+    /// `instruction`, and `base_commit`.
+    pub fn verify_against(
+        &self,
+        profile_digest: &str,
+        instruction: &str,
+        base_commit: &str,
+    ) -> Result<(), CoreError> {
+        if self.schema_version != WORKER_EXECUTION_BINDING_SCHEMA_VERSION {
+            return Err(CoreError::Validation {
+                field: "execution_binding",
+                reason: format!(
+                    "unsupported execution_binding schema_version {} (expected {WORKER_EXECUTION_BINDING_SCHEMA_VERSION})",
+                    self.schema_version
+                ),
+            });
+        }
+        if self.execution_base_commit != base_commit {
+            return Err(CoreError::Validation {
+                field: "execution_binding",
+                reason: format!(
+                    "execution_binding.execution_base_commit `{}` does not match base_commit `{base_commit}`",
+                    self.execution_base_commit
+                ),
+            });
+        }
+        let expected = Self::new(
+            profile_digest,
+            instruction,
+            &self.input_digest,
+            &self.seal_file_digest,
+            base_commit,
+        )?;
+        if self != &expected {
+            return Err(CoreError::Validation {
+                field: "execution_binding",
+                reason: "execution_binding.execution_digest does not match expected binding digest"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
 
 const fn default_untrusted_data() -> bool {
     true
@@ -238,6 +343,9 @@ pub struct WorkerSnapshot {
     pub claim_id: Option<String>,
     /// Number of dispatch claims attempted (at most `1`; never automatically retried).
     pub attempt_count: u32,
+    /// Optional durable execution binding when started with a verified dependency input seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<WorkerExecutionBinding>,
     /// Owned per-run and per-task worktree references.
     pub worktree: WorkerWorktreeSummary,
     /// Bounded live progress counters and latest summary.
@@ -283,8 +391,11 @@ pub struct WorkerClaim {
     pub requested_model: String,
     /// Requested effort fixed by the profile.
     pub requested_effort: String,
-    /// Base commit fixed by the profile.
+    /// Base commit fixed by the profile or pinned dependency seal.
     pub base_commit: String,
+    /// Optional durable execution binding when started with a verified dependency input seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<WorkerExecutionBinding>,
     /// Bounded task instruction.
     pub instruction: String,
     /// Timestamp (ms) when the claim was persisted.
@@ -367,19 +478,49 @@ pub(crate) fn validate_profile_id(raw: &str) -> Result<String, CoreError> {
 }
 
 pub(crate) fn validate_profile_digest(raw: &str) -> Result<String, CoreError> {
+    validate_sha256_digest("profile_digest", raw)
+}
+
+fn validate_sha256_digest(field: &'static str, raw: &str) -> Result<String, CoreError> {
     if raw.len() != MAX_WORKER_DIGEST_LEN
         || !raw
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
         return Err(CoreError::Validation {
-            field: "profile_digest",
+            field,
             reason: format!(
-                "profile_digest must be a {MAX_WORKER_DIGEST_LEN}-character lowercase hex SHA-256 digest"
+                "{field} must be a {MAX_WORKER_DIGEST_LEN}-character lowercase hex SHA-256 digest"
             ),
         });
     }
     Ok(raw.to_string())
+}
+
+fn validate_exact_40_hex_commit(field: &'static str, raw: &str) -> Result<String, CoreError> {
+    if raw.len() != 40
+        || !raw
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(CoreError::Validation {
+            field,
+            reason: format!("{field} must be an exact 40-character lowercase hexadecimal SHA"),
+        });
+    }
+    Ok(raw.to_string())
+}
+
+fn sha256_hex_str(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 /// Sanitizes and bounds a compact diagnostic or progress string for durable storage and MCP output.
@@ -539,7 +680,8 @@ impl Core {
         Ok(snapshots)
     }
 
-    /// Atomically claims a `Queued` worker for dispatch after verifying `(binding_id, run_id, expected_revision, expected_profile_digest)`.
+    /// Atomically claims a `Queued` worker for dispatch after verifying `(binding_id, run_id, expected_revision, expected_profile_digest)`
+    /// and that `execution_binding` is `None`.
     ///
     /// Persists `WorkerStatus::Claimed`, increments `attempt_count`, and records a fresh `claim_id`
     /// before the caller performs any worktree or process side effects.
@@ -549,6 +691,30 @@ impl Core {
         run_id: &str,
         expected_revision: u64,
         expected_profile_digest: &str,
+        now_ms: i64,
+    ) -> Result<WorkerClaim, CoreError> {
+        self.claim_worker_with_execution_binding(
+            binding_id,
+            run_id,
+            expected_revision,
+            expected_profile_digest,
+            None,
+            now_ms,
+        )
+    }
+
+    /// Atomically claims a `Queued` worker for dispatch after verifying `(binding_id, run_id, expected_revision, expected_profile_digest)`
+    /// and `expected_execution_binding`.
+    ///
+    /// Persists `WorkerStatus::Claimed`, increments `attempt_count`, and records a fresh `claim_id`
+    /// before the caller performs any worktree or process side effects.
+    pub fn claim_worker_with_execution_binding(
+        &mut self,
+        binding_id: &str,
+        run_id: &str,
+        expected_revision: u64,
+        expected_profile_digest: &str,
+        expected_execution_binding: Option<&WorkerExecutionBinding>,
         now_ms: i64,
     ) -> Result<WorkerClaim, CoreError> {
         let clean_binding_id = validate_identifier("binding_id", binding_id)?;
@@ -579,6 +745,36 @@ impl Core {
                     worker.profile_digest
                 ),
             });
+        }
+
+        if worker.execution_binding.as_ref() != expected_execution_binding {
+            return Err(CoreError::StaleWorkerClaim {
+                binding_id: clean_binding_id,
+                run_id: worker.run_id,
+                worker_id: worker.worker_id,
+                claim_id: worker.claim_id.unwrap_or_else(|| "unclaimed".to_string()),
+                reason: "execution_binding mismatch between queued worker and claim request"
+                    .to_string(),
+            });
+        }
+
+        if let Some(ref binding) = worker.execution_binding {
+            binding
+                .verify_against(
+                    &worker.profile_digest,
+                    &worker.instruction,
+                    &worker.worktree.base_commit,
+                )
+                .map_err(|err| CoreError::StaleWorkerClaim {
+                    binding_id: clean_binding_id.clone(),
+                    run_id: worker.run_id.clone(),
+                    worker_id: worker.worker_id.clone(),
+                    claim_id: worker
+                        .claim_id
+                        .clone()
+                        .unwrap_or_else(|| "unclaimed".to_string()),
+                    reason: format!("stored execution_binding verification failed: {err}"),
+                })?;
         }
 
         if worker.status != WorkerStatus::Queued {
@@ -637,9 +833,152 @@ impl Core {
             requested_model: worker.requested_model,
             requested_effort: worker.requested_effort,
             base_commit: worker.worktree.base_commit,
+            execution_binding: worker.execution_binding,
             instruction: worker.instruction,
             claimed_at_ms: valid_now,
         })
+    }
+
+    /// Rejects an unclaimed `Queued` worker (`attempt_count == 0`, `claim_id == None`) before dispatch,
+    /// transitioning both `workers` and `runs` to `Failed` (`WorkerAcceptanceState::ExecutionFailed`),
+    /// emitting an important `EventKind::WorkerFailed` event, and coalescing a binding wake-up notice.
+    pub fn reject_queued_worker(
+        &mut self,
+        binding_id: &str,
+        run_id: &str,
+        expected_revision: u64,
+        expected_profile_digest: &str,
+        failure_reason: &str,
+        now_ms: i64,
+    ) -> Result<WorkerSnapshot, CoreError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_run_id = validate_identifier("run_id", run_id)?;
+        let clean_digest = validate_profile_digest(expected_profile_digest)?;
+        if failure_reason.trim().is_empty() {
+            return Err(CoreError::Validation {
+                field: "failure_reason",
+                reason: "failure_reason must not be empty".to_string(),
+            });
+        }
+        let clean_reason = sanitize_worker_text(failure_reason, MAX_WORKER_SUMMARY_TEXT_BYTES);
+        let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
+
+        let tx = self.conn.transaction()?;
+        Self::ensure_binding_exists(&tx, &clean_binding_id)?;
+        let worker = Self::load_worker_tx(&tx, &clean_binding_id, &clean_run_id)?;
+
+        if worker.revision != expected_revision {
+            return Err(CoreError::StaleRevision {
+                run_id: worker.run_id,
+                expected_revision,
+                actual_revision: worker.revision,
+            });
+        }
+
+        if worker.profile_digest != clean_digest {
+            return Err(CoreError::StaleWorkerClaim {
+                binding_id: clean_binding_id,
+                run_id: worker.run_id,
+                worker_id: worker.worker_id,
+                claim_id: worker.claim_id.unwrap_or_else(|| "unclaimed".to_string()),
+                reason: format!(
+                    "profile_digest mismatch: queued with `{}`, attempted rejection with `{clean_digest}`",
+                    worker.profile_digest
+                ),
+            });
+        }
+
+        if worker.status != WorkerStatus::Queued
+            || worker.attempt_count != 0
+            || worker.claim_id.is_some()
+        {
+            return Err(CoreError::InvalidRunState {
+                run_id: worker.run_id,
+                status: worker.status.to_run_status(),
+                action: "reject_queued_worker",
+            });
+        }
+
+        let outcome = WorkerOutcomeSummary {
+            exit_code: None,
+            signal: None,
+            duration_ms: Some(0),
+            timed_out: false,
+            cancelled: false,
+            cancel_requested_before_completion: false,
+            missing_model_evidence: false,
+            missing_effort_evidence: false,
+            provider_error: false,
+            incomplete_cleanup: false,
+            rejected_by_diff_gate: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            acceptance_state: WorkerAcceptanceState::ExecutionFailed,
+            changed_paths_count: 0,
+            changed_paths_preview: Vec::new(),
+            violation_count: 0,
+            violation_summaries: Vec::new(),
+            final_summary: None,
+            failure_reason: Some(clean_reason.clone()),
+            report_artifact_id: None,
+        };
+        let outcome_json = serde_json::to_string(&outcome)?;
+
+        tx.execute(
+            "UPDATE workers
+             SET status = ?1,
+                 outcome_json = ?2,
+                 completed_at_ms = ?3,
+                 updated_at_ms = ?3
+             WHERE worker_id = ?4 AND binding_id = ?5",
+            params![
+                WorkerStatus::Failed.as_str(),
+                outcome_json,
+                valid_now,
+                worker.worker_id,
+                clean_binding_id
+            ],
+        )?;
+
+        let next_step_seq = Self::increment_run_step_tx(
+            &tx,
+            &clean_binding_id,
+            &worker.run_id,
+            RunStatus::Failed,
+            valid_now,
+        )?;
+
+        let summary = sanitize_worker_text(
+            &format!(
+                "Worker {} on run {} rejected before dispatch: {}",
+                worker.worker_id, worker.run_id, clean_reason
+            ),
+            MAX_WORKER_SUMMARY_TEXT_BYTES,
+        );
+
+        Self::emit_event_tx(
+            &tx,
+            &clean_binding_id,
+            &worker.run_id,
+            worker.revision,
+            next_step_seq,
+            EventKind::WorkerFailed,
+            EventPayload {
+                untrusted_data: true,
+                summary,
+                question_id: None,
+                question_prompt: None,
+                answer: None,
+                instruction: None,
+                cancel_reason: None,
+            },
+            valid_now,
+        )?;
+
+        let snapshot = Self::load_worker_tx(&tx, &clean_binding_id, &worker.run_id)?;
+        enforce_compact_response_budget(&CommandOutput::Worker(Box::new(snapshot.clone())))?;
+        tx.commit()?;
+        Ok(snapshot)
     }
 
     /// Records that a claimed worker has created its owned worktrees and started execution.
@@ -656,6 +995,22 @@ impl Core {
         let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
         let tx = self.conn.transaction()?;
         let worker = Self::verify_active_claim_tx(&tx, claim)?;
+
+        let clean_update_base = sanitize_worker_text(&worktree_update.base_commit, MAX_ID_LEN * 2);
+        if clean_update_base != claim.base_commit
+            || clean_update_base != worker.worktree.base_commit
+        {
+            return Err(CoreError::StaleWorkerClaim {
+                binding_id: claim.binding_id.clone(),
+                run_id: claim.run_id.clone(),
+                worker_id: claim.worker_id.clone(),
+                claim_id: claim.claim_id.clone(),
+                reason: format!(
+                    "worktree base_commit `{clean_update_base}` does not match claimed base_commit `{}`",
+                    claim.base_commit
+                ),
+            });
+        }
 
         let worktree = WorkerWorktreeSummary {
             run_worktree_id: Some(sanitize_worker_text(
@@ -682,7 +1037,7 @@ impl Core {
                 &worktree_update.task_branch_name,
                 MAX_WORKER_PATH_BYTES,
             )),
-            base_commit: sanitize_worker_text(&worktree_update.base_commit, MAX_ID_LEN * 2),
+            base_commit: clean_update_base,
             head_commit: worker.worktree.head_commit,
         };
         let worktree_json = serde_json::to_string(&worktree)?;
@@ -1210,6 +1565,7 @@ impl Core {
         requested_model: String,
         requested_effort: String,
         base_commit: String,
+        execution_binding: Option<WorkerExecutionBinding>,
         instruction: String,
         now_ms: i64,
     ) -> Result<CommandOutput, CoreError> {
@@ -1226,15 +1582,29 @@ impl Core {
             validate_bounded_text("instruction", &instruction, MAX_INSTRUCTION_LEN)?;
         let valid_now = validate_timestamp_ms("now_ms", now_ms)?;
 
-        // Include `clean_profile_id`, `clean_digest`, and `clean_instruction` in the dedup hash so:
-        // - Identical retries with the same profile digest return the original snapshot regardless of queue load.
-        // - Reusing the same `command_key` after a profile's configuration digest changed is rejected with `IdempotencyConflict`.
-        let payload_hash = hash_dedup_payload(&(
-            "start_worker",
-            &clean_profile_id,
-            &clean_digest,
-            &clean_instruction,
-        ))?;
+        if let Some(ref binding) = execution_binding {
+            binding.verify_against(&clean_digest, &clean_instruction, &clean_base)?;
+        }
+
+        // Include `clean_profile_id`, `clean_digest`, `clean_instruction` (and `execution_binding` when present)
+        // in the dedup hash so:
+        // - Identical retries with the same profile digest and execution binding return the original snapshot regardless of queue load.
+        // - Reusing the same `command_key` after a profile's configuration digest or sealed execution binding changed is rejected with `IdempotencyConflict`.
+        let payload_hash = match execution_binding {
+            Some(ref binding) => hash_dedup_payload(&(
+                "start_worker",
+                &clean_profile_id,
+                &clean_digest,
+                &clean_instruction,
+                binding,
+            ))?,
+            None => hash_dedup_payload(&(
+                "start_worker",
+                &clean_profile_id,
+                &clean_digest,
+                &clean_instruction,
+            ))?,
+        };
 
         let tx = self.conn.transaction()?;
         Self::ensure_binding_exists(&tx, binding_id)?;
@@ -1290,20 +1660,26 @@ impl Core {
         let progress = WorkerProgressSummary::default();
         let worktree_json = serde_json::to_string(&worktree)?;
         let progress_json = serde_json::to_string(&progress)?;
+        let execution_binding_json = match execution_binding {
+            Some(ref binding) => Some(serde_json::to_string(binding)?),
+            None => None,
+        };
 
         tx.execute(
             "INSERT INTO workers (
                 worker_id, run_id, binding_id, revision, status, profile_id,
                 profile_digest, provider, requested_model, requested_effort,
                 observed_model, observed_effort, instruction, claim_id, attempt_count,
-                worktree_json, progress_json, outcome_json, created_at_ms, updated_at_ms,
-                started_at_ms, completed_at_ms, cancel_requested_at_ms, cancel_reason
+                execution_binding_json, worktree_json, progress_json, outcome_json,
+                created_at_ms, updated_at_ms, started_at_ms, completed_at_ms,
+                cancel_requested_at_ms, cancel_reason
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6,
                 ?7, ?8, ?9, ?10,
                 NULL, NULL, ?11, NULL, 0,
-                ?12, ?13, NULL, ?14, ?14,
-                NULL, NULL, NULL, NULL
+                ?12, ?13, ?14, NULL,
+                ?15, ?15, NULL, NULL,
+                NULL, NULL
              )",
             params![
                 worker_id,
@@ -1317,6 +1693,7 @@ impl Core {
                 clean_model,
                 clean_effort,
                 clean_instruction,
+                execution_binding_json,
                 worktree_json,
                 progress_json,
                 valid_now
@@ -1665,6 +2042,39 @@ impl Core {
             });
         }
 
+        if worker.execution_binding != claim.execution_binding {
+            return Err(CoreError::StaleWorkerClaim {
+                binding_id: claim.binding_id.clone(),
+                run_id: claim.run_id.clone(),
+                worker_id: claim.worker_id.clone(),
+                claim_id: claim.claim_id.clone(),
+                reason: "execution_binding mismatch".to_string(),
+            });
+        }
+
+        if worker.worktree.base_commit != claim.base_commit {
+            return Err(CoreError::StaleWorkerClaim {
+                binding_id: claim.binding_id.clone(),
+                run_id: claim.run_id.clone(),
+                worker_id: claim.worker_id.clone(),
+                claim_id: claim.claim_id.clone(),
+                reason: format!(
+                    "base_commit mismatch: claim `{}`, actual `{}`",
+                    claim.base_commit, worker.worktree.base_commit
+                ),
+            });
+        }
+
+        if worker.instruction != claim.instruction {
+            return Err(CoreError::StaleWorkerClaim {
+                binding_id: claim.binding_id.clone(),
+                run_id: claim.run_id.clone(),
+                worker_id: claim.worker_id.clone(),
+                claim_id: claim.claim_id.clone(),
+                reason: "instruction mismatch".to_string(),
+            });
+        }
+
         if worker.status.is_terminal() || worker.status == WorkerStatus::Queued {
             return Err(CoreError::StaleWorkerClaim {
                 binding_id: claim.binding_id.clone(),
@@ -1767,6 +2177,7 @@ impl Core {
             String,
             Option<String>,
             i64,
+            Option<String>,
             String,
             String,
             Option<String>,
@@ -1781,8 +2192,9 @@ impl Core {
                 "SELECT worker_id, run_id, binding_id, revision, status, profile_id,
                         profile_digest, provider, requested_model, requested_effort,
                         observed_model, observed_effort, instruction, claim_id, attempt_count,
-                        worktree_json, progress_json, outcome_json, created_at_ms, updated_at_ms,
-                        started_at_ms, completed_at_ms, cancel_requested_at_ms, cancel_reason
+                        execution_binding_json, worktree_json, progress_json, outcome_json,
+                        created_at_ms, updated_at_ms, started_at_ms, completed_at_ms,
+                        cancel_requested_at_ms, cancel_reason
                  FROM workers
                  WHERE binding_id = ?1 AND (run_id = ?2 OR worker_id = ?2)",
                 params![binding_id, target_id],
@@ -1812,6 +2224,7 @@ impl Core {
                         r.get(21)?,
                         r.get(22)?,
                         r.get(23)?,
+                        r.get(24)?,
                     ))
                 },
             )
@@ -1833,6 +2246,7 @@ impl Core {
             instruction,
             claim_id,
             attempt_raw,
+            execution_binding_json,
             worktree_json,
             progress_json,
             outcome_json,
@@ -1857,6 +2271,10 @@ impl Core {
             u32::try_from(i64_to_u64("attempt_count", attempt_raw)?).map_err(|_| {
                 CoreError::CorruptState(format!("attempt_count overflow: {attempt_raw}"))
             })?;
+        let execution_binding: Option<WorkerExecutionBinding> = match execution_binding_json {
+            Some(json) => Some(serde_json::from_str(&json)?),
+            None => None,
+        };
         let worktree: WorkerWorktreeSummary = serde_json::from_str(&worktree_json)?;
         let progress: WorkerProgressSummary = serde_json::from_str(&progress_json)?;
         let outcome: Option<WorkerOutcomeSummary> = match outcome_json {
@@ -1881,6 +2299,7 @@ impl Core {
             instruction,
             claim_id,
             attempt_count,
+            execution_binding,
             worktree,
             progress,
             outcome,

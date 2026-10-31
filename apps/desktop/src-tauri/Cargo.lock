@@ -4607,6 +4607,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "threadlane-core",
+ "threadlane-operations",
  "threadlane-workers",
  "tokio",
  "uuid",
@@ -4714,6 +4715,7 @@ dependencies = [
  "threadlane",
  "threadlane-authority",
  "threadlane-core",
+ "threadlane-operations",
  "threadlane-plans",
  "threadlane-registry",
  "threadlane-workers",
@@ -4742,6 +4744,22 @@ dependencies = [
  "threadlane-workers",
  "threadlane-workflow",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "threadlane-operations"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fs2",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "threadlane-workers",
  "uuid",
 ]
 

@@ -31,6 +31,8 @@
 
 /// Narrow diagnostic CLI parser and command runner (`threadlane-worker`).
 pub mod cli;
+/// Sealed dependency input policy, manifest verification, and shared lock lease loader.
+pub mod dependency;
 /// Structured error types, refusal reasons, and wire error envelopes.
 pub mod error;
 /// Path canonicalization, symlink rejection, private `0700`/`0600` file helpers, and secret redaction.
@@ -51,6 +53,12 @@ pub mod stream;
 pub mod supervisor;
 
 pub use cli::{load_worker_spec_file, run_cli, CreatedWorktreesReport, WorkerCli, WorkerCommand};
+pub use dependency::{
+    dependency_input_lock_path, read_dependency_input, validate_dependency_input_policy,
+    DependencyInputPolicy, DependencyInputSeal, DependencyPredecessorInput,
+    VerifiedDependencyInput, DEPENDENCIES_MANIFEST_SUBDIR, DEPENDENCY_INPUT_SCHEMA_VERSION,
+    MAX_DEPENDENCY_INPUT_BYTES, MAX_DEPENDENCY_PREDECESSORS,
+};
 pub use error::{CleanupRefusalReason, WorkerApiError, WorkerError, WorkerErrorCode};
 pub use fs_safety::{
     ensure_platform_supported, ensure_private_dir, open_private_lock_file, read_private_json,

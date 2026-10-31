@@ -10,6 +10,7 @@ name = "threadlane"
 path = "src/main.rs"
 
 [dependencies]
+threadlane-operations = { path = "../threadlane-operations", version = "0.1.0" }
 axum.workspace = true
 clap.workspace = true
 fs2.workspace = true

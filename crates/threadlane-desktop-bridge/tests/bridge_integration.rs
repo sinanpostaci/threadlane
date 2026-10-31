@@ -569,6 +569,7 @@ fn sample_worker_snapshot(
         status,
         profile_id: "coding_hard".to_string(),
         profile_digest: "a".repeat(64),
+        execution_binding: None,
         provider: "antigravity".to_string(),
         requested_model: "gemini-4-argon-high".to_string(),
         requested_effort: "high".to_string(),

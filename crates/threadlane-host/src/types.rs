@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus, MAX_CODEX_TIMEOUT_MS};
 use threadlane_authority::ApprovalRecord;
+use threadlane_core::WorkerExecutionBinding;
 use threadlane_registry::ToolAdapter;
-use threadlane_workers::{validate_executable_file, WorkerProvider};
+use threadlane_workers::{validate_executable_file, DependencyInputSeal, WorkerProvider};
 
 use crate::error::HostError;
 use crate::storage::{ensure_no_symlink_components, validate_hex_digest};
@@ -265,10 +266,13 @@ pub struct HostExecutionGates {
     pub supervisor_authenticated_ready: bool,
     /// Always `false`: no provider or worker is ever started automatically on host startup or restart.
     pub workers_auto_started_on_boot: bool,
-    /// Always `true`: only root tasks (`depends_on.is_empty()`) can be dispatched on static `base_commit`.
+    /// `false` on M5B sessions supporting receipt-sealed dependent tasks; `true` on legacy root-only sessions.
     pub root_tasks_only: bool,
-    /// Always `true`: tasks with non-empty `depends_on` are rejected with `dependency_inputs_unverified`.
+    /// `false` on M5B sessions supporting receipt-sealed dependent tasks; `true` on legacy root-only sessions.
     pub dependent_tasks_blocked: bool,
+    /// `true` on M5B sessions: dependent tasks require a verified receipt-proven `DependencyInputSeal` before dispatch.
+    #[serde(default)]
+    pub dependency_inputs_required: bool,
     /// Always `true`: `codex_cli` native routes are manual-only and rejected for worker dispatch with `native_route_required`.
     pub native_routes_manual_only: bool,
     /// Always `true`: worker `Completed` maps at most to `ReadyForReview`.
@@ -278,16 +282,93 @@ pub struct HostExecutionGates {
 }
 
 impl HostExecutionGates {
-    /// Constructs the invariant execution gates for the given readiness state.
+    /// Constructs the M5B execution gates for the given readiness state.
     pub const fn for_ready_state(supervisor_authenticated_ready: bool) -> Self {
+        Self {
+            supervisor_authenticated_ready,
+            workers_auto_started_on_boot: false,
+            root_tasks_only: false,
+            dependent_tasks_blocked: false,
+            dependency_inputs_required: true,
+            native_routes_manual_only: true,
+            worker_completed_means_ready_for_review: true,
+            auto_accept_or_merge_enabled: false,
+        }
+    }
+
+    /// Constructs the legacy root-only execution gates for backward compatibility with older manifests.
+    pub const fn legacy_for_ready_state(supervisor_authenticated_ready: bool) -> Self {
         Self {
             supervisor_authenticated_ready,
             workers_auto_started_on_boot: false,
             root_tasks_only: true,
             dependent_tasks_blocked: true,
+            dependency_inputs_required: false,
             native_routes_manual_only: true,
             worker_completed_means_ready_for_review: true,
             auto_accept_or_merge_enabled: false,
+        }
+    }
+
+    /// Returns `true` if this gate tuple represents a legacy root-only session that does not support
+    /// prepared dependency inputs.
+    pub const fn is_legacy_root_only(&self) -> bool {
+        !self.dependency_inputs_required || self.root_tasks_only || self.dependent_tasks_blocked
+    }
+}
+
+/// Operator selection of an integrated predecessor task and its review/integration receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyPredecessorSelection {
+    /// Approved predecessor task identifier (`depends_on` entry).
+    pub task_id: String,
+    /// Review receipt ID (`rev_<16hex>` or validated identifier) under `manifests/receipts/review-<id>.json`.
+    pub review_receipt_id: String,
+    /// Integration receipt ID (`int_<16hex>` or validated identifier) under `manifests/receipts/integration-<id>.json`.
+    pub integration_receipt_id: String,
+}
+
+/// Explicit trusted-local request to verify predecessor proof and seal a dependent task's input commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareDependencyInputsRequest {
+    /// Approval identifier (`apr_<32hex>`).
+    pub approval_id: String,
+    /// Dependent task identifier (`!depends_on.is_empty()`).
+    pub task_id: String,
+    /// Expected 64-character lowercase hex SHA-256 subject digest of the frozen approval.
+    pub expected_approval_digest: String,
+    /// Exact set of direct predecessor selections matching `task.depends_on`.
+    pub predecessors: Vec<DependencyPredecessorSelection>,
+}
+
+/// Path-free, token-free summary of a sealed [`DependencyInputSeal`] for operator and task snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DependencyInputSummary {
+    /// 64-character lowercase hex SHA-256 digest of the sealed dependency input (`seal_digest`).
+    pub input_digest: String,
+    /// Canonical 40-char lowercase hex SHA-1 of the composed dependency input commit (`execution_base_commit`).
+    pub base_commit: String,
+    /// Canonical 40-char lowercase hex SHA-1 of the root tree of `base_commit` (`execution_tree_sha`).
+    pub tree_sha: String,
+    /// Sorted direct predecessor task IDs included in this dependency input.
+    pub predecessor_task_ids: Vec<String>,
+}
+
+impl DependencyInputSummary {
+    /// Projects a verified [`DependencyInputSeal`] into a safe, path-free [`DependencyInputSummary`].
+    pub fn from_seal(seal: &DependencyInputSeal) -> Self {
+        Self {
+            input_digest: seal.seal_digest.clone(),
+            base_commit: seal.execution_base_commit.clone(),
+            tree_sha: seal.execution_tree_sha.clone(),
+            predecessor_task_ids: seal
+                .predecessors
+                .iter()
+                .map(|p| p.task_id.clone())
+                .collect(),
         }
     }
 }
@@ -505,6 +586,9 @@ pub struct TaskDispatchIntent {
     pub profile_id: String,
     /// Deterministic idempotency command key used with `ScopedClient::start_worker`.
     pub command_key: String,
+    /// Sealed execution binding (`Some` for dependent worker tasks, `None` for root worker tasks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<WorkerExecutionBinding>,
     /// Timestamp (ms since Unix epoch) when the dispatch intent was recorded.
     pub recorded_at_ms: i64,
 }
@@ -526,6 +610,9 @@ pub struct TaskRunReceipt {
     pub run_id: String,
     /// Actual software-generated `worker_id` (`wrk_<uuid>`) returned by `ScopedClient::start_worker`.
     pub worker_id: String,
+    /// Sealed execution binding (`Some` for dependent worker tasks, `None` for root worker tasks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<WorkerExecutionBinding>,
     /// Timestamp (ms since Unix epoch) when the receipt was recorded.
     pub recorded_at_ms: i64,
 }
@@ -539,8 +626,10 @@ pub struct TaskRunReceipt {
 pub enum TaskExecutionStatus {
     /// Root worker task has not been dispatched yet (no durable dispatch intent or sealed task-to-run receipt exists).
     NotStarted,
-    /// Task has non-empty `depends_on` and is blocked because predecessor code is not verified in static `base_commit`.
+    /// Task has non-empty `depends_on` and is blocked because predecessor code is not verified in a sealed dependency input.
     DependencyInputsUnverified,
+    /// Dependent worker task has a verified `DependencyInputSeal` on disk and is ready for dispatch.
+    DependencyInputsReady,
     /// Task targets `codex_cli` and requires manual native conversation routing rather than headless worker dispatch.
     NativeRouteRequired,
     /// Worker run is queued in the session supervisor.
@@ -617,6 +706,9 @@ pub struct TaskStateSnapshot {
     pub provider: Option<WorkerProvider>,
     /// Upstream dependency task IDs frozen in the approval record.
     pub depends_on: Vec<String>,
+    /// Path-free summary of the verified dependency input seal for dependent tasks, if prepared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependency_input: Option<DependencyInputSummary>,
     /// Deterministic worker profile identifier (`Some` for worker tasks, `None` for `codex_cli`).
     pub profile_id: Option<String>,
     /// Deterministic idempotency command key (`Some` for worker tasks, `None` for `codex_cli`).

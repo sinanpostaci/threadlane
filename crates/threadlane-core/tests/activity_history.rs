@@ -57,6 +57,7 @@ fn empty_binding_and_read_only_invariants_across_reopen() {
                 requested_model: "gemini-4-argon-high".to_string(),
                 requested_effort: "high".to_string(),
                 base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                execution_binding: None,
                 instruction: "Worker task instruction".to_string(),
                 now_ms: 1_030,
             },

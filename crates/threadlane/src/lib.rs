@@ -40,15 +40,20 @@ pub use protocol::{
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
     HostControlRuntimeState, HostControlStatusResponse, RetryWakeupRequest, RunSummary,
     ScopedRequest, ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerAcceptanceState,
-    WorkerClaim, WorkerCompletionRecord, WorkerOutcomeSummary, WorkerProgressSummary,
-    WorkerProgressUpdate, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
-    WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
+    WorkerClaim, WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary,
+    WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot, WorkerStatus,
+    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
+    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 pub use supervisor::{
     Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,
 };
 pub use workers::{
-    ValidatedWorkerProfile, ValidatedWorkersConfig, WorkerProfileConfig, WorkerSpecTemplate,
-    WorkersConfig, DEFAULT_MAX_PARALLEL, MAX_MAX_PARALLEL, MAX_WORKERS_CONFIG_FILE_BYTES,
-    MAX_WORKER_PROFILES, MIN_MAX_PARALLEL,
+    dependency_input_lock_path, read_dependency_input, resolve_worker_execution,
+    validate_dependency_input_policy, DependencyInputPolicy, DependencyInputSeal,
+    DependencyPredecessorInput, ResolvedWorkerExecution, ValidatedWorkerProfile,
+    ValidatedWorkersConfig, VerifiedDependencyInput, WorkerProfileConfig, WorkerSpecTemplate,
+    WorkersConfig, DEFAULT_MAX_PARALLEL, DEPENDENCIES_MANIFEST_SUBDIR,
+    DEPENDENCY_INPUT_SCHEMA_VERSION, MAX_DEPENDENCY_INPUT_BYTES, MAX_DEPENDENCY_PREDECESSORS,
+    MAX_MAX_PARALLEL, MAX_WORKERS_CONFIG_FILE_BYTES, MAX_WORKER_PROFILES, MIN_MAX_PARALLEL,
 };

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::worker::WorkerSnapshot;
+use crate::worker::{WorkerExecutionBinding, WorkerSnapshot};
 
 /// Trusted binding between a Threadlane scope and a native Codex thread UUID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,8 +690,11 @@ pub enum Command {
         requested_model: String,
         /// Requested reasoning effort fixed by the trusted profile.
         requested_effort: String,
-        /// Base commit/ref fixed by the trusted profile.
+        /// Base commit/ref fixed by the trusted profile or pinned dependency seal.
         base_commit: String,
+        /// Optional durable execution binding when started with a verified dependency input seal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        execution_binding: Option<WorkerExecutionBinding>,
         /// Bounded task instruction supplied by the caller.
         instruction: String,
         /// Injected current timestamp in milliseconds.

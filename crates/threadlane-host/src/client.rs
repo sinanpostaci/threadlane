@@ -1,29 +1,42 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use threadlane::{
-    ActivityPage, ErrorCode as RuntimeErrorCode, EventKind, HostControlInfoRequest,
-    HostControlRuntimeState, HostControlStatusResponse, ScopedClient, StopIdleHostRequest,
-    SupervisorClient, WorkerSnapshot,
+    resolve_worker_execution, ActivityPage, ErrorCode as RuntimeErrorCode, EventKind,
+    HostControlInfoRequest, HostControlRuntimeState, HostControlStatusResponse, ScopedClient,
+    StopIdleHostRequest, SupervisorClient, ValidatedWorkersConfig, WorkerAcceptanceState,
+    WorkerSnapshot, WorkerStatus,
 };
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
-use threadlane_core::{AckResult, Binding, EventBatch};
+use threadlane_core::{AckResult, Binding, EventBatch, WorkerExecutionBinding};
+use threadlane_operations::{
+    inspect_dependency_input_seal_readonly, prepare_and_seal_dependency_input,
+    verify_dependency_predecessor_proof, DependencyPredecessorCandidate, OperationsError,
+};
 use threadlane_plans::PlanStore;
 use threadlane_registry::{RegistryStore, ToolAdapter};
+use threadlane_workers::{
+    is_commit_ancestor, load_and_verify_manifest, read_dependency_input, DependencyInputSeal,
+    DependencyPredecessorInput, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+};
 
 use crate::error::HostError;
 use crate::storage::{
-    derive_ack_command_key, derive_cancel_command_key, is_host_lock_held, now_epoch_ms,
-    read_host_manifest_optional, read_task_ledger_entry, record_task_dispatch_intent,
-    record_task_receipt, validate_approval_id, validate_canonical_thread_uuid,
-    validate_host_instance_id, validate_identifier, validate_sessions_root,
+    build_validated_task_profile, derive_ack_command_key, derive_cancel_command_key,
+    is_host_lock_held, now_epoch_ms, read_host_manifest_optional, read_task_ledger_entry,
+    record_task_dispatch_intent, record_task_receipt, validate_approval_id,
+    validate_canonical_thread_uuid, validate_hex_digest, validate_host_instance_id,
+    validate_identifier, validate_sessions_root, verify_all_transitive_predecessors_in_approval,
     verify_existing_private_dir, verify_existing_session_dir,
 };
 use crate::types::{
-    HostPhase, HostSessionSummary, TaskDispatchIntent, TaskExecutionStatus, TaskRunReceipt,
-    TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
-    RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    DependencyInputSummary, DependencyPredecessorSelection, HostPhase, HostSessionManifest,
+    HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent, TaskExecutionStatus,
+    TaskRunReceipt, TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES,
+    APPROVED_EVENT_BATCH_MAX_EVENTS, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 
 const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,6 +44,7 @@ const STOP_CONFIRM_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 struct VerifiedSession {
     record: ApprovalRecord,
+    manifest: HostSessionManifest,
     session_dir: PathBuf,
     work_area_dir: PathBuf,
     live_binding: Binding,
@@ -446,18 +460,192 @@ impl ApprovedHostClient {
         }
     }
 
-    /// Dispatches an approved root headless worker task (`antigravity` or `opencode_v2`) using
-    /// only `(approval_id, task_id)`.
-    ///
-    /// - Verifies caller `control_binding_id` and `native_thread_uuid` before accessing session state.
-    /// - Rejects tasks with non-empty `depends_on` with [`HostError::DependencyInputsUnverified`].
-    /// - Rejects manual `codex_cli` tasks with [`HostError::NativeRouteRequired`].
-    /// - Materializes the frozen approval against the active host's single `session_binding`,
-    ///   commits a validated [`TaskDispatchIntent`] to `task-receipts.json` **before** invoking
-    ///   `ScopedClient::start_worker`, and calls `ScopedClient::start_worker` with the frozen
-    ///   deterministic `command_key`, `profile_id`, and `instruction`.
-    /// - Persists the actual returned `WorkerSnapshot::run_id` and `worker_id` in private
-    ///   `task-receipts.json` and never mutates plan status to `Received` or `Applied`.
+    /// Verifies receipt-proven predecessor outputs and seals a dependent task's deterministic
+    /// dependency input commit and [`DependencyInputSeal`].
+    pub async fn prepare_dependency_inputs(
+        &self,
+        request: PrepareDependencyInputsRequest,
+    ) -> Result<DependencyInputSummary, HostError> {
+        validate_identifier("task_id", &request.task_id)?;
+        validate_hex_digest(
+            "expected_approval_digest",
+            &request.expected_approval_digest,
+        )?;
+        let session = self
+            .verify_active_ready_session(&request.approval_id)
+            .await?;
+
+        if request.expected_approval_digest != session.record.subject_digest {
+            return Err(HostError::ScopeMismatch {
+                field: "expected_approval_digest".to_string(),
+                expected: session.record.subject_digest.clone(),
+                actual: request.expected_approval_digest,
+                reason: format!(
+                    "expected_approval_digest does not match frozen subject_digest for approval `{}`",
+                    session.record.approval_id
+                ),
+            });
+        }
+
+        let task = session
+            .record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == request.task_id)
+            .ok_or_else(|| HostError::UnknownTask {
+                approval_id: session.record.approval_id.clone(),
+                task_id: request.task_id.clone(),
+            })?;
+
+        if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+                adapter: task.adapter,
+            });
+        }
+
+        if task.depends_on.is_empty() {
+            return Err(HostError::validation(
+                "task_id",
+                format!(
+                    "task `{}` is a root task (depends_on is empty) and does not use dependency inputs",
+                    task.task_id
+                ),
+            ));
+        }
+
+        if session.manifest.gates.is_legacy_root_only() {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+                depends_on: task.depends_on.clone(),
+            });
+        }
+
+        // Verify that the frozen ApprovalRecord includes all direct AND transitive predecessors
+        // as headless worker tasks. Legacy partial approvals fail closed with missing predecessor IDs.
+        if verify_all_transitive_predecessors_in_approval(&session.record, &task.task_id).is_err() {
+            let missing_ids =
+                collect_missing_predecessors_in_approval(&session.record, &task.task_id);
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: task.task_id.clone(),
+                depends_on: if missing_ids.is_empty() {
+                    task.depends_on.clone()
+                } else {
+                    missing_ids
+                },
+            });
+        }
+
+        // Verify that the active source plan is still Published and materialize the frozen profiles.
+        let materialized = self.authority.materialize(
+            &session.record.approval_id,
+            &session.live_binding,
+            &session.work_area_dir,
+        )?;
+        let workers_cfg = materialized
+            .workers
+            .ok_or_else(|| HostError::CorruptSessionState {
+                reason: format!(
+                    "materialized plan for approval `{}` has no headless worker profiles",
+                    session.record.approval_id
+                ),
+            })?;
+        let validated_workers = workers_cfg.validate()?;
+
+        // Require `request.predecessors` to match `task.depends_on` as an exact duplicate-free set.
+        let mut selection_by_task: BTreeMap<String, DependencyPredecessorSelection> =
+            BTreeMap::new();
+        for sel in &request.predecessors {
+            validate_identifier("task_id", &sel.task_id)?;
+            validate_identifier("review_receipt_id", &sel.review_receipt_id)?;
+            validate_identifier("integration_receipt_id", &sel.integration_receipt_id)?;
+            if selection_by_task
+                .insert(sel.task_id.clone(), sel.clone())
+                .is_some()
+            {
+                return Err(HostError::validation(
+                    "predecessors",
+                    format!(
+                        "duplicate predecessor task_id `{}` in prepare_dependency_inputs request",
+                        sel.task_id
+                    ),
+                ));
+            }
+        }
+
+        let expected_preds: BTreeSet<String> = task.depends_on.iter().cloned().collect();
+        let actual_preds: BTreeSet<String> = selection_by_task.keys().cloned().collect();
+        if expected_preds != actual_preds || selection_by_task.len() != task.depends_on.len() {
+            return Err(HostError::validation(
+                "predecessors",
+                format!(
+                    "predecessors selection {:?} does not match task `{}` depends_on {:?}",
+                    actual_preds, task.task_id, task.depends_on
+                ),
+            ));
+        }
+
+        let mut visiting = BTreeSet::new();
+        let mut memo = BTreeMap::new();
+        let mut predecessor_inputs = Vec::with_capacity(selection_by_task.len());
+
+        for (pred_task_id, sel) in &selection_by_task {
+            let proof = self
+                .verify_predecessor_closure_member(
+                    &session,
+                    &validated_workers,
+                    pred_task_id,
+                    Some(sel),
+                    &mut visiting,
+                    &mut memo,
+                )
+                .await?;
+            predecessor_inputs.push(proof);
+        }
+
+        let profile_id =
+            task.profile_id
+                .as_deref()
+                .ok_or_else(|| HostError::CorruptSessionState {
+                    reason: format!(
+                        "dependent worker task `{}` is missing profile_id",
+                        task.task_id
+                    ),
+                })?;
+        let validated_profile = validated_workers.profiles.get(profile_id).ok_or_else(|| {
+            HostError::CorruptSessionState {
+                reason: format!(
+                    "validated profile `{profile_id}` is missing from materialized config"
+                ),
+            }
+        })?;
+        let policy = validated_profile
+            .dependency_input
+            .as_ref()
+            .ok_or_else(|| HostError::CorruptSessionState {
+                reason: format!(
+                    "validated profile `{profile_id}` for dependent task `{}` is missing dependency_input policy",
+                    task.task_id
+                ),
+            })?;
+
+        let seal = prepare_and_seal_dependency_input(
+            policy,
+            &session.record.repository_path,
+            &session.work_area_dir,
+            &session.record.base_commit,
+            &task.instruction,
+            predecessor_inputs,
+        )?;
+
+        Ok(DependencyInputSummary::from_seal(&seal))
+    }
+
+    /// Dispatches an approved root or prepared dependent headless worker task (`antigravity` or
+    /// `opencode_v2`) using only `(approval_id, task_id)`.
     pub async fn dispatch_task(
         &self,
         approval_id: &str,
@@ -476,13 +664,6 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if !task.depends_on.is_empty() {
-            return Err(HostError::DependencyInputsUnverified {
-                approval_id: session.record.approval_id.clone(),
-                task_id: task.task_id.clone(),
-                depends_on: task.depends_on.clone(),
-            });
-        }
         if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
@@ -491,11 +672,28 @@ impl ApprovedHostClient {
             });
         }
 
+        // 1. Read `read_task_ledger_entry` FIRST (after task lookup and native-route check).
+        let (existing_intent, existing_receipt) = read_task_ledger_entry(
+            &session.session_dir,
+            &session.record,
+            &session.live_binding.binding_id,
+            task_id,
+        )?;
+
         let materialized = self.authority.materialize(
             &session.record.approval_id,
             &session.live_binding,
             &session.work_area_dir,
         )?;
+        let workers_cfg = materialized
+            .workers
+            .ok_or_else(|| HostError::CorruptSessionState {
+                reason: format!(
+                    "materialized plan for approval `{}` has no headless worker profiles",
+                    session.record.approval_id
+                ),
+            })?;
+        let validated_workers = workers_cfg.validate()?;
 
         let dispatch = materialized
             .task_dispatch
@@ -503,7 +701,7 @@ impl ApprovedHostClient {
             .find(|d| d.task_id == task_id)
             .ok_or_else(|| HostError::CorruptSessionState {
                 reason: format!(
-                    "materialized plan is missing dispatch entry for root worker task `{task_id}`"
+                    "materialized plan is missing dispatch entry for worker task `{task_id}`"
                 ),
             })?;
 
@@ -519,13 +717,196 @@ impl ApprovedHostClient {
             });
         }
 
-        let intent = TaskDispatchIntent {
-            task_id: task.task_id.clone(),
-            task_digest: dispatch.task_digest.clone(),
-            profile_id: dispatch.profile_id.clone(),
-            command_key: dispatch.command_key.clone(),
-            recorded_at_ms: now_epoch_ms(),
+        let validated_profile = validated_workers
+            .profiles
+            .get(&dispatch.profile_id)
+            .ok_or_else(|| HostError::CorruptSessionState {
+                reason: format!(
+                    "materialized validated_workers is missing profile `{}`",
+                    dispatch.profile_id
+                ),
+            })?;
+
+        // A sealed receipt proves that admission already happened. Observe that exact run
+        // instead of asking the runtime to admit it again against mutable predecessor state.
+        if existing_receipt.is_some() {
+            return self.get_task(approval_id, task_id).await;
+        }
+
+        // 2. Determine the dispatch intent to commit/replay:
+        //    - For root tasks (`task.depends_on.is_empty()`), reuse an existing pending intent if
+        //      present, or create a new root intent with `execution_binding: None`.
+        //    - For dependent tasks without a sealed receipt (including retries of a pending
+        //      intent), always enforce non-legacy gates, full predecessor closure in the approval
+        //      record, `resolve_worker_execution` (retaining the shared seal lease through the
+        //      dispatch response), full `execution_binding` equality against any existing pending
+        //      intent (including raw seal byte digest), and live predecessor receipts/worktrees
+        //      before invoking runtime `start_worker`.
+        let mut _resolved_execution_lease = None;
+        let intent = if task.depends_on.is_empty() {
+            if let Some(existing) = existing_intent {
+                existing
+            } else {
+                TaskDispatchIntent {
+                    task_id: task.task_id.clone(),
+                    task_digest: dispatch.task_digest.clone(),
+                    profile_id: dispatch.profile_id.clone(),
+                    command_key: dispatch.command_key.clone(),
+                    execution_binding: None,
+                    recorded_at_ms: now_epoch_ms(),
+                }
+            }
+        } else {
+            if session.manifest.gates.is_legacy_root_only()
+                || verify_all_transitive_predecessors_in_approval(&session.record, &task.task_id)
+                    .is_err()
+            {
+                let missing_ids =
+                    collect_missing_predecessors_in_approval(&session.record, &task.task_id);
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: task.task_id.clone(),
+                    depends_on: if missing_ids.is_empty() {
+                        task.depends_on.clone()
+                    } else {
+                        missing_ids
+                    },
+                });
+            }
+
+            let resolved = match resolve_worker_execution(
+                validated_profile,
+                &dispatch.command_key,
+                dispatch.instruction.clone(),
+            ) {
+                Ok(res) => res,
+                Err(threadlane::Error::SecurityViolation(reason)) => {
+                    return Err(HostError::SecurityViolation {
+                        path: session.work_area_dir.display().to_string(),
+                        reason,
+                    });
+                }
+                Err(_) => {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: task.task_id.clone(),
+                        depends_on: task.depends_on.clone(),
+                    });
+                }
+            };
+
+            let Some(exec_binding) = resolved.execution_binding.clone() else {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: task.task_id.clone(),
+                    depends_on: task.depends_on.clone(),
+                });
+            };
+            _resolved_execution_lease = Some(resolved);
+
+            if let Some(ref existing) = existing_intent {
+                if existing.execution_binding.as_ref() != Some(&exec_binding) {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: task.task_id.clone(),
+                        depends_on: task.depends_on.clone(),
+                    });
+                }
+            }
+
+            let seal = match self.inspect_readonly_verified_dependency_seal(&session, task)? {
+                Some(s) => s,
+                None => {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: task.task_id.clone(),
+                        depends_on: task.depends_on.clone(),
+                    });
+                }
+            };
+
+            if exec_binding.input_digest != seal.seal_digest
+                || exec_binding.execution_base_commit != seal.execution_base_commit
+            {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: task.task_id.clone(),
+                    depends_on: task.depends_on.clone(),
+                });
+            }
+
+            let expected_preds: BTreeSet<&str> =
+                task.depends_on.iter().map(String::as_str).collect();
+            let actual_preds: BTreeSet<&str> = seal
+                .predecessors
+                .iter()
+                .map(|p| p.task_id.as_str())
+                .collect();
+            if expected_preds != actual_preds || seal.predecessors.len() != task.depends_on.len() {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: task.task_id.clone(),
+                    depends_on: task.depends_on.clone(),
+                });
+            }
+
+            let mut visiting = BTreeSet::new();
+            let mut memo = BTreeMap::new();
+            for pred_proof in &seal.predecessors {
+                let sel = DependencyPredecessorSelection {
+                    task_id: pred_proof.task_id.clone(),
+                    review_receipt_id: pred_proof.review_receipt_id.clone(),
+                    integration_receipt_id: pred_proof.integration_receipt_id.clone(),
+                };
+                let live_proof = match self
+                    .verify_predecessor_closure_member(
+                        &session,
+                        &validated_workers,
+                        &pred_proof.task_id,
+                        Some(&sel),
+                        &mut visiting,
+                        &mut memo,
+                    )
+                    .await
+                {
+                    Ok(proof) => proof,
+                    Err(HostError::SecurityViolation { path, reason }) => {
+                        return Err(HostError::SecurityViolation { path, reason });
+                    }
+                    Err(HostError::Io { operation, reason }) => {
+                        return Err(HostError::Io { operation, reason });
+                    }
+                    Err(_) => {
+                        return Err(HostError::DependencyInputsUnverified {
+                            approval_id: session.record.approval_id.clone(),
+                            task_id: task.task_id.clone(),
+                            depends_on: task.depends_on.clone(),
+                        });
+                    }
+                };
+                if live_proof != *pred_proof {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: task.task_id.clone(),
+                        depends_on: task.depends_on.clone(),
+                    });
+                }
+            }
+
+            if let Some(existing) = existing_intent {
+                existing
+            } else {
+                TaskDispatchIntent {
+                    task_id: task.task_id.clone(),
+                    task_digest: dispatch.task_digest.clone(),
+                    profile_id: dispatch.profile_id.clone(),
+                    command_key: dispatch.command_key.clone(),
+                    execution_binding: Some(exec_binding),
+                    recorded_at_ms: now_epoch_ms(),
+                }
+            }
         };
+
         let recorded_intent = record_task_dispatch_intent(
             &session.session_dir,
             &session.record,
@@ -551,6 +932,15 @@ impl ApprovedHostClient {
             });
         }
 
+        if started.execution_binding != recorded_intent.execution_binding {
+            return Err(HostError::CorruptSessionState {
+                reason: format!(
+                    "worker snapshot execution_binding {:?} does not match recorded dispatch intent {:?}",
+                    started.execution_binding, recorded_intent.execution_binding
+                ),
+            });
+        }
+
         let receipt = TaskRunReceipt {
             task_id: task.task_id.clone(),
             task_digest: recorded_intent.task_digest.clone(),
@@ -558,6 +948,7 @@ impl ApprovedHostClient {
             command_key: recorded_intent.command_key.clone(),
             run_id: started.run_id.clone(),
             worker_id: started.worker_id.clone(),
+            execution_binding: recorded_intent.execution_binding.clone(),
             recorded_at_ms: now_epoch_ms(),
         };
         let sealed = record_task_receipt(
@@ -576,6 +967,9 @@ impl ApprovedHostClient {
             Err(_) => started,
         };
 
+        let dependency_input =
+            self.historical_dependency_summary(&session, task, sealed.execution_binding.as_ref());
+
         Ok(build_task_snapshot(
             &session.record,
             &session.live_binding.binding_id,
@@ -583,6 +977,7 @@ impl ApprovedHostClient {
             Some(&recorded_intent),
             Some(&sealed),
             Some(live_worker),
+            dependency_input,
         ))
     }
 
@@ -590,13 +985,6 @@ impl ApprovedHostClient {
     ///
     /// - Strictly read-only: never dispatches a worker or writes to session storage.
     /// - Never invents a `run_id` from a `command_key`.
-    /// - If a root worker task has neither a durable dispatch intent nor a sealed receipt, returns
-    ///   [`TaskExecutionStatus::NotStarted`].
-    /// - If a root worker task has a durable dispatch intent without a sealed receipt, returns
-    ///   [`TaskExecutionStatus::Unknown`].
-    /// - If a task has non-empty `depends_on`, returns [`TaskExecutionStatus::DependencyInputsUnverified`].
-    /// - If a task uses `codex_cli`, returns [`TaskExecutionStatus::NativeRouteRequired`].
-    /// - If a worker completed, reports [`TaskExecutionStatus::ReadyForReview`] (`accepted: false`).
     pub async fn get_task(
         &self,
         approval_id: &str,
@@ -615,28 +1003,6 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if !task.depends_on.is_empty() {
-            return Ok(TaskStateSnapshot {
-                approval_id: session.record.approval_id.clone(),
-                subject_digest: session.record.subject_digest.clone(),
-                binding_id: session.record.binding_id.clone(),
-                thread_uuid: session.record.thread_uuid.clone(),
-                session_binding_id: session.live_binding.binding_id.clone(),
-                task_id: task.task_id.clone(),
-                task_digest: task.task_digest.clone(),
-                adapter: task.adapter,
-                provider: task.provider,
-                depends_on: task.depends_on.clone(),
-                profile_id: task.profile_id.clone(),
-                command_key: task.command_key.clone(),
-                status: TaskExecutionStatus::DependencyInputsUnverified,
-                run_id: None,
-                worker_id: None,
-                worker: None,
-                accepted: false,
-            });
-        }
-
         if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
             return Ok(TaskStateSnapshot {
                 approval_id: session.record.approval_id.clone(),
@@ -649,6 +1015,7 @@ impl ApprovedHostClient {
                 adapter: task.adapter,
                 provider: task.provider,
                 depends_on: task.depends_on.clone(),
+                dependency_input: None,
                 profile_id: task.profile_id.clone(),
                 command_key: task.command_key.clone(),
                 status: TaskExecutionStatus::NativeRouteRequired,
@@ -666,6 +1033,52 @@ impl ApprovedHostClient {
             task_id,
         )?;
 
+        if intent.is_none() && receipt.is_none() && !task.depends_on.is_empty() {
+            let dep_seal = if session.manifest.gates.is_legacy_root_only()
+                || verify_all_transitive_predecessors_in_approval(&session.record, &task.task_id)
+                    .is_err()
+            {
+                None
+            } else {
+                self.inspect_readonly_verified_dependency_seal(&session, task)?
+            };
+
+            let (status, dependency_input) = match dep_seal {
+                Some(seal) => (
+                    TaskExecutionStatus::DependencyInputsReady,
+                    Some(DependencyInputSummary::from_seal(&seal)),
+                ),
+                None => (TaskExecutionStatus::DependencyInputsUnverified, None),
+            };
+
+            return Ok(TaskStateSnapshot {
+                approval_id: session.record.approval_id.clone(),
+                subject_digest: session.record.subject_digest.clone(),
+                binding_id: session.record.binding_id.clone(),
+                thread_uuid: session.record.thread_uuid.clone(),
+                session_binding_id: session.live_binding.binding_id.clone(),
+                task_id: task.task_id.clone(),
+                task_digest: task.task_digest.clone(),
+                adapter: task.adapter,
+                provider: task.provider,
+                depends_on: task.depends_on.clone(),
+                dependency_input,
+                profile_id: task.profile_id.clone(),
+                command_key: task.command_key.clone(),
+                status,
+                run_id: None,
+                worker_id: None,
+                worker: None,
+                accepted: false,
+            });
+        }
+
+        let pinned_binding = receipt
+            .as_ref()
+            .and_then(|r| r.execution_binding.as_ref())
+            .or_else(|| intent.as_ref().and_then(|i| i.execution_binding.as_ref()));
+        let dependency_input = self.historical_dependency_summary(&session, task, pinned_binding);
+
         let Some(receipt) = receipt else {
             return Ok(build_task_snapshot(
                 &session.record,
@@ -674,6 +1087,7 @@ impl ApprovedHostClient {
                 intent.as_ref(),
                 None,
                 None,
+                dependency_input,
             ));
         };
 
@@ -698,6 +1112,7 @@ impl ApprovedHostClient {
                     intent.as_ref(),
                     Some(&receipt),
                     Some(worker),
+                    dependency_input,
                 ))
             }
             Err(threadlane::Error::Remote(api_err))
@@ -710,13 +1125,14 @@ impl ApprovedHostClient {
                     intent.as_ref(),
                     Some(&receipt),
                     None,
+                    dependency_input,
                 ))
             }
             Err(err) => Err(err.into()),
         }
     }
 
-    /// Requests revision-checked cancellation of an in-flight root worker task using the sealed
+    /// Requests revision-checked cancellation of an in-flight worker task using the sealed
     /// `task_id -> run_id` receipt and a deterministic cancellation command key.
     pub async fn cancel_task(
         &self,
@@ -745,13 +1161,6 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if !task.depends_on.is_empty() {
-            return Err(HostError::DependencyInputsUnverified {
-                approval_id: session.record.approval_id.clone(),
-                task_id: task.task_id.clone(),
-                depends_on: task.depends_on.clone(),
-            });
-        }
         if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
@@ -777,6 +1186,24 @@ impl ApprovedHostClient {
                         task.task_id, session.record.approval_id, intent.command_key
                     ),
                 });
+            }
+            if !task.depends_on.is_empty() {
+                let prepared = !session.manifest.gates.is_legacy_root_only()
+                    && verify_all_transitive_predecessors_in_approval(
+                        &session.record,
+                        &task.task_id,
+                    )
+                    .is_ok()
+                    && self
+                        .inspect_readonly_verified_dependency_seal(&session, task)?
+                        .is_some();
+                if !prepared {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: task.task_id.clone(),
+                        depends_on: task.depends_on.clone(),
+                    });
+                }
             }
             return Err(HostError::TaskNotStarted {
                 approval_id: session.record.approval_id.clone(),
@@ -810,6 +1237,9 @@ impl ApprovedHostClient {
             Err(_) => cancelled,
         };
 
+        let dependency_input =
+            self.historical_dependency_summary(&session, task, receipt.execution_binding.as_ref());
+
         Ok(build_task_snapshot(
             &session.record,
             &session.live_binding.binding_id,
@@ -817,6 +1247,7 @@ impl ApprovedHostClient {
             intent.as_ref(),
             Some(&receipt),
             Some(live_worker),
+            dependency_input,
         ))
     }
 
@@ -860,13 +1291,6 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if !task.depends_on.is_empty() {
-            return Err(HostError::DependencyInputsUnverified {
-                approval_id: session.record.approval_id.clone(),
-                task_id: task.task_id.clone(),
-                depends_on: task.depends_on.clone(),
-            });
-        }
         if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
@@ -893,6 +1317,24 @@ impl ApprovedHostClient {
                     ),
                 });
             }
+            if !task.depends_on.is_empty() {
+                let prepared = !session.manifest.gates.is_legacy_root_only()
+                    && verify_all_transitive_predecessors_in_approval(
+                        &session.record,
+                        &task.task_id,
+                    )
+                    .is_ok()
+                    && self
+                        .inspect_readonly_verified_dependency_seal(&session, task)?
+                        .is_some();
+                if !prepared {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: task.task_id.clone(),
+                        depends_on: task.depends_on.clone(),
+                    });
+                }
+            }
             return Err(HostError::TaskNotStarted {
                 approval_id: session.record.approval_id.clone(),
                 task_id: task.task_id.clone(),
@@ -904,6 +1346,575 @@ impl ApprovedHostClient {
             .list_activity(after_seq, cursor, limit, Some(receipt.run_id), kind)
             .await?;
         Ok(page)
+    }
+
+    // Historical reads remain useful after parents move; only show input details that still
+    // match the run's exact persisted binding. Never relabel a started run from a replacement seal.
+    fn historical_dependency_summary(
+        &self,
+        session: &VerifiedSession,
+        task: &ApprovedTaskRecord,
+        binding: Option<&WorkerExecutionBinding>,
+    ) -> Option<DependencyInputSummary> {
+        let binding = binding?;
+        let profile = build_validated_task_profile(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            task,
+        )
+        .ok()?;
+        let policy = profile.dependency_input.as_ref()?;
+        let verified = read_dependency_input(
+            policy,
+            &session.record.repository_path,
+            &session.work_area_dir,
+            &session.record.base_commit,
+            &task.instruction,
+            &policy.command_key,
+        )
+        .ok()?;
+        let expected = WorkerExecutionBinding::new(
+            &profile.profile_digest,
+            &task.instruction,
+            &verified.seal.seal_digest,
+            &verified.seal_file_digest,
+            &verified.seal.execution_base_commit,
+        )
+        .ok()?;
+        if &expected != binding {
+            return None;
+        }
+        Some(DependencyInputSummary::from_seal(&verified.seal))
+    }
+
+    fn inspect_readonly_verified_dependency_seal(
+        &self,
+        session: &VerifiedSession,
+        task: &ApprovedTaskRecord,
+    ) -> Result<Option<DependencyInputSeal>, HostError> {
+        let Ok(profile) = build_validated_task_profile(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            task,
+        ) else {
+            return Ok(None);
+        };
+        let Some(ref policy) = profile.dependency_input else {
+            return Ok(None);
+        };
+
+        match inspect_dependency_input_seal_readonly(
+            policy,
+            &session.record.repository_path,
+            &session.work_area_dir,
+            &session.record.base_commit,
+            &task.instruction,
+            &policy.command_key,
+        ) {
+            Ok(Some(seal)) => {
+                let expected_preds: BTreeSet<&str> =
+                    task.depends_on.iter().map(String::as_str).collect();
+                let actual_preds: BTreeSet<&str> = seal
+                    .predecessors
+                    .iter()
+                    .map(|p| p.task_id.as_str())
+                    .collect();
+                if expected_preds != actual_preds
+                    || seal.predecessors.len() != task.depends_on.len()
+                {
+                    return Ok(None);
+                }
+                Ok(Some(seal))
+            }
+            Ok(None) => Ok(None),
+            Err(OperationsError::SecurityViolation(reason)) => Err(HostError::SecurityViolation {
+                path: session.work_area_dir.display().to_string(),
+                reason,
+            }),
+            Err(_) => Ok(None),
+        }
+    }
+
+    async fn verify_predecessor_closure_member(
+        &self,
+        session: &VerifiedSession,
+        validated_workers: &ValidatedWorkersConfig,
+        pred_task_id: &str,
+        direct_selection: Option<&DependencyPredecessorSelection>,
+        visiting: &mut BTreeSet<String>,
+        memo: &mut BTreeMap<String, DependencyPredecessorInput>,
+    ) -> Result<DependencyPredecessorInput, HostError> {
+        if let Some(cached) = memo.get(pred_task_id) {
+            return verify_cached_predecessor_selection(cached, direct_selection);
+        }
+        if memo.len() + visiting.len() > session.record.tasks.len()
+            || !visiting.insert(pred_task_id.to_string())
+        {
+            return Err(HostError::CorruptSessionState {
+                reason: format!(
+                    "dependency cycle or bound exceeded while verifying predecessor `{pred_task_id}`"
+                ),
+            });
+        }
+
+        let pred_task = session
+            .record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == pred_task_id)
+            .ok_or_else(|| HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task_id.to_string(),
+                depends_on: Vec::new(),
+            })?;
+
+        let Some(pred_provider) = pred_task.provider else {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                adapter: pred_task.adapter,
+            });
+        };
+        if pred_task.adapter == ToolAdapter::CodexCli {
+            return Err(HostError::NativeRouteRequired {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                adapter: pred_task.adapter,
+            });
+        }
+
+        let p_profile_id = pred_task.profile_id.as_deref().ok_or_else(|| {
+            HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            }
+        })?;
+        let p_command_key = pred_task.command_key.as_deref().ok_or_else(|| {
+            HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            }
+        })?;
+        let p_profile = validated_workers
+            .profiles
+            .get(p_profile_id)
+            .ok_or_else(|| HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            })?;
+        let host_p_profile = build_validated_task_profile(
+            &session.record,
+            &session.live_binding.binding_id,
+            &session.work_area_dir,
+            pred_task,
+        )
+        .map_err(|_| HostError::DependencyInputsUnverified {
+            approval_id: session.record.approval_id.clone(),
+            task_id: pred_task.task_id.clone(),
+            depends_on: pred_task.depends_on.clone(),
+        })?;
+        if p_profile.profile_id != host_p_profile.profile_id
+            || p_profile.profile_digest != host_p_profile.profile_digest
+        {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        }
+
+        let (p_intent, p_receipt) = read_task_ledger_entry(
+            &session.session_dir,
+            &session.record,
+            &session.live_binding.binding_id,
+            pred_task_id,
+        )?;
+        let Some(p_receipt) = p_receipt else {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        };
+        if let Some(ref intent) = p_intent {
+            if intent.execution_binding != p_receipt.execution_binding {
+                return Err(HostError::CorruptReceipts {
+                    path: session.session_dir.display().to_string(),
+                    reason: format!(
+                        "predecessor task `{pred_task_id}` intent and receipt execution_binding mismatch"
+                    ),
+                });
+            }
+        }
+
+        let worker = session
+            .scoped_client
+            .get_worker(p_receipt.run_id.clone())
+            .await
+            .map_err(|_| HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            })?;
+
+        if worker.binding_id != session.live_binding.binding_id {
+            return Err(HostError::ScopeMismatch {
+                field: "session_binding_id".to_string(),
+                expected: session.live_binding.binding_id.clone(),
+                actual: worker.binding_id,
+                reason: "predecessor worker snapshot binding_id mismatch".to_string(),
+            });
+        }
+
+        if p_receipt.task_id != pred_task.task_id
+            || p_receipt.task_digest != pred_task.task_digest
+            || p_receipt.profile_id != p_profile_id
+            || p_receipt.command_key != p_command_key
+            || worker.run_id != p_receipt.run_id
+            || worker.worker_id != p_receipt.worker_id
+            || worker.profile_id != p_receipt.profile_id
+            || worker.profile_id != p_profile.profile_id
+            || worker.profile_digest != p_profile.profile_digest
+            || worker.provider != pred_provider.as_str()
+            || worker.provider != p_profile.provider_str()
+            || worker.requested_model != pred_task.base_model
+            || worker.requested_model != p_profile.requested_model_str()
+            || worker.requested_effort != p_profile.requested_effort
+            || worker.instruction != pred_task.instruction
+            || worker.status != WorkerStatus::Completed
+        {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        }
+        if let Some(ref expected_effort) = pred_task.effort {
+            if worker.requested_effort != *expected_effort {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            }
+        }
+
+        let Some(ref outcome) = worker.outcome else {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        };
+        if outcome.acceptance_state != WorkerAcceptanceState::ReadyForReview
+            || outcome.missing_model_evidence
+            || outcome.missing_effort_evidence
+            || outcome.provider_error
+            || outcome.incomplete_cleanup
+            || outcome.rejected_by_diff_gate
+            || outcome.timed_out
+            || outcome.cancelled
+            || outcome.exit_code != Some(0)
+            || worker.observed_model.as_deref() != Some(pred_task.base_model.as_str())
+        {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        }
+        if let Some(ref expected_effort) = pred_task.effort {
+            if worker.observed_effort.as_deref() != Some(expected_effort.as_str()) {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            }
+        }
+
+        let (Some(ref task_worktree_id), Some(ref integration_worktree_id)) = (
+            &worker.worktree.task_worktree_id,
+            &worker.worktree.run_worktree_id,
+        ) else {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        };
+
+        let mut upstream_accepted_heads = Vec::new();
+        let expected_execution_base_commit = if pred_task.depends_on.is_empty() {
+            if p_profile.dependency_input.is_some() {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            }
+            if p_receipt.execution_binding.is_some() || worker.execution_binding.is_some() {
+                return Err(HostError::CorruptReceipts {
+                    path: session.session_dir.display().to_string(),
+                    reason: format!(
+                        "root predecessor task `{pred_task_id}` must not have an execution_binding"
+                    ),
+                });
+            }
+            session.record.base_commit.clone()
+        } else {
+            let Some(ref p_binding) = p_receipt.execution_binding else {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            };
+            if worker.execution_binding.as_ref() != Some(p_binding) {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            }
+
+            let p_policy = p_profile.dependency_input.as_ref().ok_or_else(|| {
+                HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                }
+            })?;
+
+            p_binding
+                .verify_against(
+                    &p_profile.profile_digest,
+                    &pred_task.instruction,
+                    &p_binding.execution_base_commit,
+                )
+                .map_err(|_| HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                })?;
+
+            let p_verified = read_dependency_input(
+                p_policy,
+                &session.record.repository_path,
+                &session.work_area_dir,
+                &session.record.base_commit,
+                &pred_task.instruction,
+                p_command_key,
+            )
+            .map_err(|err| match err {
+                threadlane_workers::WorkerError::SecurityViolation(reason) => {
+                    HostError::SecurityViolation {
+                        path: session.work_area_dir.display().to_string(),
+                        reason,
+                    }
+                }
+                _ => HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                },
+            })?;
+            let p_seal = &p_verified.seal;
+
+            let expected_p_binding = WorkerExecutionBinding::new(
+                &p_profile.profile_digest,
+                &pred_task.instruction,
+                &p_seal.seal_digest,
+                &p_verified.seal_file_digest,
+                &p_seal.execution_base_commit,
+            )
+            .map_err(|_| HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            })?;
+
+            if p_binding != &expected_p_binding {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            }
+
+            let expected_up: BTreeSet<&str> =
+                pred_task.depends_on.iter().map(String::as_str).collect();
+            let actual_up: BTreeSet<&str> = p_seal
+                .predecessors
+                .iter()
+                .map(|p| p.task_id.as_str())
+                .collect();
+            if expected_up != actual_up || p_seal.predecessors.len() != pred_task.depends_on.len() {
+                return Err(HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                });
+            }
+
+            for up_proof in &p_seal.predecessors {
+                let up_sel = DependencyPredecessorSelection {
+                    task_id: up_proof.task_id.clone(),
+                    review_receipt_id: up_proof.review_receipt_id.clone(),
+                    integration_receipt_id: up_proof.integration_receipt_id.clone(),
+                };
+                let live_up = Box::pin(self.verify_predecessor_closure_member(
+                    session,
+                    validated_workers,
+                    &up_proof.task_id,
+                    Some(&up_sel),
+                    visiting,
+                    memo,
+                ))
+                .await?;
+                if live_up != *up_proof {
+                    return Err(HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: pred_task.task_id.clone(),
+                        depends_on: pred_task.depends_on.clone(),
+                    });
+                }
+                upstream_accepted_heads.push(up_proof.accepted_task_head_commit.clone());
+            }
+
+            p_binding.execution_base_commit.clone()
+        };
+
+        if worker.worktree.base_commit != expected_execution_base_commit {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        }
+
+        let task_manifest = load_and_verify_manifest(&session.work_area_dir, task_worktree_id)
+            .map_err(|err| match err {
+                threadlane_workers::WorkerError::SecurityViolation(reason) => {
+                    HostError::SecurityViolation {
+                        path: session.work_area_dir.display().to_string(),
+                        reason,
+                    }
+                }
+                _ => HostError::DependencyInputsUnverified {
+                    approval_id: session.record.approval_id.clone(),
+                    task_id: pred_task.task_id.clone(),
+                    depends_on: pred_task.depends_on.clone(),
+                },
+            })?;
+        let integration_manifest =
+            load_and_verify_manifest(&session.work_area_dir, integration_worktree_id).map_err(
+                |err| match err {
+                    threadlane_workers::WorkerError::SecurityViolation(reason) => {
+                        HostError::SecurityViolation {
+                            path: session.work_area_dir.display().to_string(),
+                            reason,
+                        }
+                    }
+                    _ => HostError::DependencyInputsUnverified {
+                        approval_id: session.record.approval_id.clone(),
+                        task_id: pred_task.task_id.clone(),
+                        depends_on: pred_task.depends_on.clone(),
+                    },
+                },
+            )?;
+
+        let expected_run_tag = compact_worktree_tag(&p_receipt.run_id, "r");
+        let expected_task_tag = compact_worktree_tag(&p_receipt.worker_id, "w");
+
+        if task_manifest.kind != WorktreeKind::Task
+            || integration_manifest.kind != WorktreeKind::RunIntegration
+            || task_manifest.worktree_id != *task_worktree_id
+            || integration_manifest.worktree_id != *integration_worktree_id
+            || task_manifest.run_id != expected_run_tag
+            || integration_manifest.run_id != expected_run_tag
+            || task_manifest.task_id.as_deref() != Some(expected_task_tag.as_str())
+            || integration_manifest.task_id.is_some()
+            || task_manifest.base_commit != expected_execution_base_commit
+            || integration_manifest.base_commit != expected_execution_base_commit
+            || worker.worktree.task_worktree_path.as_deref()
+                != Some(task_manifest.checkout_path.to_string_lossy().as_ref())
+            || worker.worktree.run_worktree_path.as_deref()
+                != Some(
+                    integration_manifest
+                        .checkout_path
+                        .to_string_lossy()
+                        .as_ref(),
+                )
+            || worker.worktree.task_branch_name.as_deref()
+                != Some(task_manifest.branch_name.as_str())
+            || worker.worktree.run_branch_name.as_deref()
+                != Some(integration_manifest.branch_name.as_str())
+        {
+            return Err(HostError::DependencyInputsUnverified {
+                approval_id: session.record.approval_id.clone(),
+                task_id: pred_task.task_id.clone(),
+                depends_on: pred_task.depends_on.clone(),
+            });
+        }
+
+        let sel = direct_selection.ok_or_else(|| HostError::DependencyInputsUnverified {
+            approval_id: session.record.approval_id.clone(),
+            task_id: pred_task.task_id.clone(),
+            depends_on: pred_task.depends_on.clone(),
+        })?;
+
+        let candidate = DependencyPredecessorCandidate {
+            logical_task_id: pred_task.task_id.clone(),
+            logical_task_digest: pred_task.task_digest.clone(),
+            runtime_run_id: p_receipt.run_id.clone(),
+            worker_id: p_receipt.worker_id.clone(),
+            integration_worktree_id: integration_worktree_id.clone(),
+            task_worktree_id: task_worktree_id.clone(),
+            repository_path: session.record.repository_path.clone(),
+            work_area_root: session.work_area_dir.clone(),
+            approved_base_commit: session.record.base_commit.clone(),
+            expected_execution_base_commit,
+            allowed_write_paths: pred_task.allowed_write_paths.iter().cloned().collect(),
+            expected_provider: pred_provider.as_str().to_string(),
+            expected_model: pred_task.base_model.clone(),
+            expected_effort: pred_task.effort.clone(),
+            review_receipt_id: sel.review_receipt_id.clone(),
+            integration_receipt_id: sel.integration_receipt_id.clone(),
+        };
+
+        let proof = verify_dependency_predecessor_proof(&candidate)?;
+
+        for ancestor_head in &upstream_accepted_heads {
+            let is_anc = is_commit_ancestor(
+                &session.record.repository_path,
+                ancestor_head,
+                &proof.accepted_task_head_commit,
+                DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+            )
+            .map_err(|err| HostError::Runtime {
+                code: "ancestry_mismatch".to_string(),
+                message: err.to_string(),
+            })?;
+            if !is_anc {
+                return Err(HostError::Runtime {
+                    code: "ancestry_mismatch".to_string(),
+                    message: format!(
+                        "ancestor accepted_task_head_commit `{ancestor_head}` is not a Git ancestor of `{}`",
+                        proof.accepted_task_head_commit
+                    ),
+                });
+            }
+        }
+
+        visiting.remove(pred_task_id);
+        memo.insert(pred_task_id.to_string(), proof.clone());
+        Ok(proof)
     }
 
     /// Pulls a bounded batch of events from the approved session's full runtime event stream
@@ -1122,6 +2133,7 @@ impl ApprovedHostClient {
 
         Ok(VerifiedSession {
             record,
+            manifest,
             session_dir,
             work_area_dir,
             live_binding,
@@ -1137,6 +2149,7 @@ fn build_task_snapshot(
     intent: Option<&TaskDispatchIntent>,
     receipt: Option<&TaskRunReceipt>,
     worker: Option<WorkerSnapshot>,
+    dependency_input: Option<DependencyInputSummary>,
 ) -> TaskStateSnapshot {
     let status = match (intent, receipt, &worker) {
         (_, _, Some(w)) => TaskExecutionStatus::from_worker_snapshot(w),
@@ -1155,6 +2168,7 @@ fn build_task_snapshot(
         adapter: task.adapter,
         provider: task.provider,
         depends_on: task.depends_on.clone(),
+        dependency_input,
         profile_id: task.profile_id.clone(),
         command_key: task.command_key.clone(),
         status,
@@ -1163,4 +2177,66 @@ fn build_task_snapshot(
         worker,
         accepted: false,
     }
+}
+
+fn collect_missing_predecessors_in_approval(record: &ApprovalRecord, task_id: &str) -> Vec<String> {
+    let tasks_by_id: BTreeMap<&str, &ApprovedTaskRecord> = record
+        .tasks
+        .iter()
+        .map(|t| (t.task_id.as_str(), t))
+        .collect();
+    let mut visited = BTreeSet::new();
+    let mut missing = BTreeSet::new();
+    let mut stack = vec![task_id];
+
+    while let Some(current_id) = stack.pop() {
+        if !visited.insert(current_id) {
+            continue;
+        }
+        if let Some(t) = tasks_by_id.get(current_id) {
+            for dep_id in &t.depends_on {
+                if tasks_by_id.contains_key(dep_id.as_str()) {
+                    stack.push(dep_id.as_str());
+                } else {
+                    missing.insert(dep_id.clone());
+                }
+            }
+        }
+    }
+
+    missing.into_iter().collect()
+}
+
+pub(crate) fn compact_worktree_tag(id: &str, prefix: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(id.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(12);
+    for byte in &digest[..6] {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("{prefix}_{hex}")
+}
+
+pub(crate) fn verify_cached_predecessor_selection(
+    cached: &DependencyPredecessorInput,
+    direct_selection: Option<&DependencyPredecessorSelection>,
+) -> Result<DependencyPredecessorInput, HostError> {
+    if let Some(sel) = direct_selection {
+        if sel.task_id != cached.task_id
+            || sel.review_receipt_id != cached.review_receipt_id
+            || sel.integration_receipt_id != cached.integration_receipt_id
+        {
+            return Err(HostError::from(OperationsError::ReceiptInvalidated(format!(
+                "predecessor `{}` selection (review `{}`, integration `{}`) does not match verified predecessor proof (review `{}`, integration `{}`)",
+                cached.task_id,
+                sel.review_receipt_id,
+                sel.integration_receipt_id,
+                cached.review_receipt_id,
+                cached.integration_receipt_id
+            ))));
+        }
+    }
+    Ok(cached.clone())
 }

@@ -35,6 +35,9 @@
 /// Auxiliary `git`, `tmux`, and `codegraph` capability reporting, read-only `tmux` attachment
 /// descriptors, and owned-worktree CodeGraph project/freshness checks.
 pub mod capabilities;
+/// Predecessor proof verification, deterministic Git tree/commit composition, compare-and-swap
+/// snapshot ref updates, durable preparation intent journaling, and write-once dependency input seals.
+pub mod dependency;
 /// Structured error codes, error types, and API error envelopes.
 pub mod error;
 /// Read-only integration/push/remote-delete proposals, owned integration checkout execution,
@@ -50,6 +53,13 @@ pub use capabilities::{
     CodeGraphSurfaceDistinction, CodeGraphWorktreeStatus, TmuxAttachmentDescriptor,
     TmuxDescriptorRequest, ToolCapabilities, ToolCapabilityReport, ToolPathsConfig,
     ToolSupportStatus, CODEGRAPH_INDEX_RECEIPT_SCHEMA_VERSION, MAX_TOOL_PROBE_OUTPUT_BYTES,
+};
+pub use dependency::{
+    dependency_input_intent_path, dependency_input_snapshot_ref,
+    inspect_dependency_input_seal_readonly, prepare_and_seal_dependency_input,
+    verify_dependency_predecessor_proof, verify_dependency_predecessor_receipts,
+    DependencyPredecessorCandidate, DependencyPreparationIntent, DEPENDENCIES_SUBDIR,
+    DEPENDENCY_INPUT_REF_PREFIX, MAX_DEPENDENCY_CLOSURE_TASKS, MAX_DEPENDENCY_PREDECESSORS,
 };
 pub use error::{OperationsApiError, OperationsError, OperationsErrorCode};
 pub use integration::{

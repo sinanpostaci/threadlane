@@ -41,6 +41,7 @@ pub use types::{
 };
 pub use worker::{
     sanitize_worker_text, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord,
-    WorkerOutcomeSummary, WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot,
-    WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate,
+    WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressSummary, WorkerProgressUpdate,
+    WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate,
+    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
 };

@@ -128,6 +128,7 @@ fn make_profile_config(
             file_permissions: WorkerFilePermissions::Inherit,
             budgets: default_test_budgets(timeout_ms),
         },
+        dependency_input: None,
     }
 }
 
@@ -1789,6 +1790,7 @@ async fn test_stale_callbacks_crash_recovery_unknown_and_shutdown_drop() {
                     requested_effort: vprof.requested_effort.clone(),
                     base_commit: vprof.template.base_commit.clone(),
                     instruction: "Interrupted before completion".to_string(),
+                    execution_binding: None,
                     now_ms: 1_000,
                 },
             )
@@ -3158,6 +3160,718 @@ exit 0
             .iter()
             .any(|a| a == "--auto" || a == "--dangerously-skip-permissions"),
         "task_files must never pass --auto or --dangerously-skip-permissions"
+    );
+
+    handle.shutdown().await;
+}
+
+fn sha256_hex_str(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let mut hex = String::with_capacity(64);
+    for b in hasher.finalize() {
+        let _ = write!(&mut hex, "{b:02x}");
+    }
+    hex
+}
+
+fn git_stdout_trimmed(repo_dir: &Path, args: &[&str]) -> String {
+    let out = StdCommand::new("git")
+        .args(args)
+        .current_dir(repo_dir)
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("utf8 stdout")
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+async fn test_dependent_worker_profile_execution_seal_tamper_staleness_and_scope_widening() {
+    use threadlane::workers::{
+        dependency_input_lock_path, resolve_worker_execution, DependencyInputPolicy,
+        DependencyInputSeal, DependencyPredecessorInput, DEPENDENCIES_MANIFEST_SUBDIR,
+        DEPENDENCY_INPUT_SCHEMA_VERSION,
+    };
+    use threadlane_operations::{
+        accept_review_subject, commit_task_worktree_changes, execute_integration,
+        inspect_review_subject, CommitTaskChangesRequest, ExecuteIntegrationRequest,
+        InspectReviewSubjectRequest, IntegrationStrategy, ReviewAcceptanceRequest,
+        ReviewPolicyBinding, TestEvidenceSummary, RECEIPTS_SUBDIR,
+    };
+    use threadlane_workers::{WorkerFilePermissions, WorkerRunStatus, WorktreeManager};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let state_dir = temp.path().join("state_dep");
+    let work_area = temp.path().join("work_area_dep");
+    let repo = init_git_repo(temp.path());
+    let canonical_repo = fs::canonicalize(&repo.repo_dir).expect("canonicalize repo");
+
+    let binding = {
+        let db_path = threadlane::descriptor::prepare_database_path(&state_dir).expect("prep db");
+        let mut core = Core::open(&db_path).expect("open core");
+        let b = core
+            .create_binding(THREAD_UUID_A, "Dependent Worker Dispatch Chat")
+            .expect("create binding");
+        threadlane::descriptor::enforce_database_permissions(&state_dir).expect("enforce perms");
+        b
+    };
+
+    let spawn_count_file = temp.path().join("dep_spawn_count.txt");
+    let hold_root_file = temp.path().join("hold_root.flag");
+    let fake_dep_worker = temp.path().join("fake_agy_dep.sh");
+    write_executable_script(
+        &fake_dep_worker,
+        &format!(
+            r#"#!/bin/sh
+echo spawned >> "{spawn_count}"
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s-dep","model":"gemini-4-argon-high","effort":"high"}}'
+while [ -f "{hold_root}" ]; do
+  sleep 0.02
+done
+if [ -f "src/pred_out.rs" ]; then
+  cat src/pred_out.rs >> src/lib.rs
+fi
+printf '%s\n' '{{"type":"result","subtype":"success","status":"completed","summary":"Completed task"}}'
+exit 0
+"#,
+            spawn_count = spawn_count_file.display(),
+            hold_root = hold_root_file.display(),
+        ),
+    );
+
+    let approval_id = "apr_11111111111111111111111111111111".to_string();
+    let approval_subject_digest = "2".repeat(64);
+
+    let child_task_id = "task_child_1".to_string();
+    let child_instruction = "Build on predecessor output in src/lib.rs".to_string();
+    let child_command_key = "dep-cmd-child-1".to_string();
+    let child_seal_path = work_area
+        .join("manifests")
+        .join(DEPENDENCIES_MANIFEST_SUBDIR)
+        .join(format!("{child_task_id}.json"));
+    let child_policy = DependencyInputPolicy {
+        seal_path: child_seal_path.clone(),
+        approval_id: approval_id.clone(),
+        approval_subject_digest: approval_subject_digest.clone(),
+        task_id: child_task_id.clone(),
+        task_digest: "3".repeat(64),
+        instruction_digest: sha256_hex_str(child_instruction.as_bytes()),
+        command_key: child_command_key.clone(),
+    };
+
+    let widen_task_id = "task_widen_1".to_string();
+    let widen_instruction = "Attempt widened scope task".to_string();
+    let widen_command_key = "dep-cmd-widen-1".to_string();
+    let widen_seal_path = work_area
+        .join("manifests")
+        .join(DEPENDENCIES_MANIFEST_SUBDIR)
+        .join(format!("{widen_task_id}.json"));
+    let widen_policy = DependencyInputPolicy {
+        seal_path: widen_seal_path.clone(),
+        approval_id: approval_id.clone(),
+        approval_subject_digest: approval_subject_digest.clone(),
+        task_id: widen_task_id.clone(),
+        task_digest: "4".repeat(64),
+        instruction_digest: sha256_hex_str(widen_instruction.as_bytes()),
+        command_key: widen_command_key.clone(),
+    };
+
+    let missing_proof_task_id = "task_missing_proof_1".to_string();
+    let missing_proof_instruction =
+        "Queued dependent task whose persisted predecessor receipt is removed after queue"
+            .to_string();
+    let missing_proof_command_key = "dep-cmd-missing-proof-1".to_string();
+    let missing_proof_seal_path = work_area
+        .join("manifests")
+        .join(DEPENDENCIES_MANIFEST_SUBDIR)
+        .join(format!("{missing_proof_task_id}.json"));
+    let missing_proof_policy = DependencyInputPolicy {
+        seal_path: missing_proof_seal_path.clone(),
+        approval_id: approval_id.clone(),
+        approval_subject_digest: approval_subject_digest.clone(),
+        task_id: missing_proof_task_id.clone(),
+        task_digest: "5".repeat(64),
+        instruction_digest: sha256_hex_str(missing_proof_instruction.as_bytes()),
+        command_key: missing_proof_command_key.clone(),
+    };
+
+    let stale_task_id = "task_stale_1".to_string();
+    let stale_instruction = "Queued dependent task whose seal mutates before claim".to_string();
+    let stale_command_key = "dep-cmd-stale-1".to_string();
+    let stale_seal_path = work_area
+        .join("manifests")
+        .join(DEPENDENCIES_MANIFEST_SUBDIR)
+        .join(format!("{stale_task_id}.json"));
+    let stale_policy = DependencyInputPolicy {
+        seal_path: stale_seal_path.clone(),
+        approval_id: approval_id.clone(),
+        approval_subject_digest: approval_subject_digest.clone(),
+        task_id: stale_task_id.clone(),
+        task_digest: "6".repeat(64),
+        instruction_digest: sha256_hex_str(stale_instruction.as_bytes()),
+        command_key: stale_command_key.clone(),
+    };
+
+    let root_profile = make_profile_config(
+        "prof_root",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_dep_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    let mut child_profile = make_profile_config(
+        "prof_child",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_dep_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    child_profile.dependency_input = Some(child_policy.clone());
+
+    let mut widen_profile = make_profile_config(
+        "prof_widen",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_dep_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    widen_profile.spec.allowed_write_paths = BTreeSet::from(["src/scope_entry".to_string()]);
+    widen_profile.dependency_input = Some(widen_policy.clone());
+
+    let mut missing_proof_profile = make_profile_config(
+        "prof_missing_proof",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_dep_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    missing_proof_profile.dependency_input = Some(missing_proof_policy.clone());
+
+    let mut stale_profile = make_profile_config(
+        "prof_stale",
+        std::slice::from_ref(&binding.binding_id),
+        &fake_dep_worker,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    stale_profile.dependency_input = Some(stale_policy.clone());
+
+    let workers_cfg = WorkersConfig {
+        max_parallel: 1,
+        profiles: vec![
+            root_profile,
+            child_profile,
+            widen_profile,
+            missing_proof_profile,
+            stale_profile,
+        ],
+    };
+
+    // 1. Startup validation succeeds before `work_area` or any seal files exist, without creating files.
+    let validated_cfg = workers_cfg
+        .validate()
+        .expect("validate workers_cfg with dependent profiles");
+    assert!(
+        !work_area.exists(),
+        "startup validation of dependent profiles must not create work_area"
+    );
+    let v_root = validated_cfg.profiles.get("prof_root").unwrap();
+    let v_child = validated_cfg.profiles.get("prof_child").unwrap();
+    let v_widen = validated_cfg.profiles.get("prof_widen").unwrap();
+    assert!(v_root.dependency_input.is_none());
+    assert!(v_child.dependency_input.is_some());
+
+    let handle = Supervisor::start(SupervisorConfig {
+        state_dir: state_dir.clone(),
+        tick_interval: Duration::from_millis(15),
+        codex: None,
+        workers: Some(workers_cfg),
+    })
+    .await
+    .expect("start supervisor");
+
+    let scoped = SupervisorClient::from_state_dir(&state_dir)
+        .expect("client")
+        .scoped(&binding.binding_id)
+        .expect("scoped");
+
+    // 2. Starting `prof_child` before its dependency seal exists is rejected before admission
+    // with zero runs, zero events, and zero provider executions.
+    let missing_seal_err = scoped
+        .start_worker(
+            child_command_key.clone(),
+            "prof_child".to_string(),
+            child_instruction.clone(),
+        )
+        .await
+        .expect_err("start_worker must fail when dependency seal is missing");
+    assert_eq!(
+        missing_seal_err.to_api_error().code,
+        ErrorCode::ValidationFailed
+    );
+    assert_eq!(scoped.status().await.expect("status").total_runs, 0);
+    assert!(!spawn_count_file.exists());
+
+    // Initialize owned work area, execute a genuine predecessor task commit + review acceptance
+    // + integration so persisted ReviewReceipt and IntegrationReceipt files exist on disk,
+    // and stage private `manifests/dependencies` directory.
+    let wm = WorktreeManager::new(&canonical_repo, &work_area, &repo.base_commit)
+        .expect("init work area");
+    let canonical_work_area = fs::canonicalize(&work_area).expect("canonicalize work_area");
+    let pred_run_manifest = wm
+        .create_run_worktree("run_pred_0")
+        .expect("create predecessor run worktree");
+    let pred_task_manifest = wm
+        .create_task_worktree(
+            "run_pred_0",
+            "wrk_pred_0",
+            &BTreeSet::from(["src".to_string()]),
+        )
+        .expect("create predecessor task worktree");
+    fs::write(
+        pred_task_manifest.checkout_path.join("src/pred_out.rs"),
+        "pub fn from_pred() -> u32 {\n    7\n}\n",
+    )
+    .expect("write pred_out.rs in predecessor task worktree");
+
+    let _pred_commit_report = commit_task_worktree_changes(&CommitTaskChangesRequest {
+        work_area_root: canonical_work_area.clone(),
+        task_worktree_id: pred_task_manifest.worktree_id.clone(),
+        commit_message: "Predecessor task output".to_string(),
+        worker_status: Some(WorkerRunStatus::Succeeded),
+        allow_missing_effort_evidence: false,
+    })
+    .expect("commit predecessor task changes");
+
+    let pred_subject = inspect_review_subject(&InspectReviewSubjectRequest {
+        work_area_root: canonical_work_area.clone(),
+        task_worktree_id: pred_task_manifest.worktree_id.clone(),
+        policy: ReviewPolicyBinding {
+            policy_id: "prof_root".to_string(),
+            requested_provider: Some("antigravity".to_string()),
+            requested_model: Some("gemini-4-argon-high".to_string()),
+            requested_effort: Some("high".to_string()),
+            observed_model: Some("gemini-4-argon-high".to_string()),
+            observed_effort: Some("high".to_string()),
+            file_permissions: WorkerFilePermissions::Inherit,
+            require_effort_evidence: true,
+            require_passing_tests: true,
+        },
+        test_evidence: TestEvidenceSummary {
+            formatting_passed: true,
+            clippy_passed: true,
+            tests_passed: true,
+            passed_test_count: 1,
+            failed_test_count: 0,
+            evidence_summary: "All predecessor checks passed".to_string(),
+        },
+        worker_status: Some(WorkerRunStatus::Succeeded),
+    })
+    .expect("inspect predecessor review subject");
+
+    let pred_review_receipt = accept_review_subject(&ReviewAcceptanceRequest {
+        expected_subject_digest: pred_subject.subject_digest.clone(),
+        subject: pred_subject.clone(),
+        receipt_id: Some("rev_pred_0".to_string()),
+        reviewer_id: "primary-codex".to_string(),
+        review_note: "Approved predecessor output".to_string(),
+        approved_at_ms: 1_000,
+    })
+    .expect("accept predecessor review subject");
+
+    let pred_integration_receipt = execute_integration(&ExecuteIntegrationRequest {
+        work_area_root: canonical_work_area.clone(),
+        integration_worktree_id: pred_run_manifest.worktree_id.clone(),
+        task_worktree_id: pred_task_manifest.worktree_id.clone(),
+        subject: pred_subject.clone(),
+        review_receipt: pred_review_receipt.clone(),
+        expected_integration_head_commit: repo.base_commit.clone(),
+        expected_task_head_commit: pred_subject.task_head_commit.clone(),
+        expected_source_head_commit: repo.base_commit.clone(),
+        strategy: IntegrationStrategy::FastForwardOnly,
+        receipt_id: Some("int_pred_0".to_string()),
+        operator_id: "primary-codex".to_string(),
+        integrated_at_ms: 1_001,
+    })
+    .expect("execute predecessor integration");
+
+    let pred_head_commit = pred_integration_receipt.accepted_task_head_commit.clone();
+    let execution_base_commit = pred_integration_receipt.integrated_target_commit.clone();
+    let execution_tree_sha = pred_integration_receipt.integrated_tree_sha.clone();
+
+    let pred_integration_receipt_path = canonical_work_area
+        .join("manifests")
+        .join(RECEIPTS_SUBDIR)
+        .join(format!(
+            "integration-{}.json",
+            pred_integration_receipt.receipt_id
+        ));
+    let saved_integration_receipt_bytes =
+        fs::read(&pred_integration_receipt_path).expect("read persisted integration receipt");
+
+    let original_branch = git_stdout_trimmed(&canonical_repo, &["symbolic-ref", "--short", "HEAD"]);
+    // Also create a commit descending from `execution_base_commit` where bare path `src/scope_entry`
+    // (missing at `approved_base_commit`) becomes a directory `src/scope_entry/nested.rs` to test
+    // scope widening rejection!
+    run_git(
+        &canonical_repo,
+        &["checkout", "--detach", &execution_base_commit],
+    );
+    fs::create_dir_all(canonical_repo.join("src/scope_entry")).expect("create scope_entry dir");
+    fs::write(
+        canonical_repo.join("src/scope_entry/nested.rs"),
+        "pub const WIDENED: bool = true;\n",
+    )
+    .expect("write nested.rs");
+    run_git(&canonical_repo, &["add", "src/scope_entry/nested.rs"]);
+    run_git(
+        &canonical_repo,
+        &["commit", "-m", "Widen scope_entry to dir"],
+    );
+    let widened_commit = git_stdout_trimmed(&canonical_repo, &["rev-parse", "HEAD"]);
+    let widened_tree_sha = git_stdout_trimmed(&canonical_repo, &["rev-parse", "HEAD^{tree}"]);
+
+    // Restore primary repository checkout to `approved_base_commit`.
+    run_git(&canonical_repo, &["checkout", "-f", &original_branch]);
+    assert_eq!(
+        git_stdout_trimmed(&canonical_repo, &["rev-parse", "HEAD"]),
+        repo.base_commit
+    );
+    assert!(!canonical_repo.join("src/pred_out.rs").exists());
+
+    let deps_dir = canonical_work_area
+        .join("manifests")
+        .join(DEPENDENCIES_MANIFEST_SUBDIR);
+    fs::create_dir_all(&deps_dir).expect("create deps_dir");
+    fs::set_permissions(&deps_dir, fs::Permissions::from_mode(0o700)).expect("chmod deps_dir");
+
+    let make_seal_for = |policy: &DependencyInputPolicy,
+                         exec_commit: &str,
+                         exec_tree: &str|
+     -> DependencyInputSeal {
+        let snapshot_ref = format!(
+            "refs/threadlane/dependency-inputs/{}/{}",
+            policy.approval_id, policy.task_id
+        );
+        run_git(&canonical_repo, &["update-ref", &snapshot_ref, exec_commit]);
+        let mut seal = DependencyInputSeal {
+            schema_version: DEPENDENCY_INPUT_SCHEMA_VERSION,
+            approval_id: policy.approval_id.clone(),
+            approval_subject_digest: policy.approval_subject_digest.clone(),
+            task_id: policy.task_id.clone(),
+            task_digest: policy.task_digest.clone(),
+            instruction_digest: policy.instruction_digest.clone(),
+            repository_path: canonical_repo.clone(),
+            work_area_root: canonical_work_area.clone(),
+            approved_base_commit: repo.base_commit.clone(),
+            execution_base_commit: exec_commit.to_string(),
+            execution_tree_sha: exec_tree.to_string(),
+            snapshot_ref,
+            predecessors: vec![DependencyPredecessorInput {
+                task_id: pred_integration_receipt.task_id.clone(),
+                task_digest: "6".repeat(64),
+                runtime_run_id: pred_integration_receipt.run_id.clone(),
+                worker_id: pred_integration_receipt.task_id.clone(),
+                task_worktree_id: pred_integration_receipt.task_worktree_id.clone(),
+                review_subject_digest: pred_review_receipt.subject_digest.clone(),
+                review_receipt_id: pred_review_receipt.receipt_id.clone(),
+                review_receipt_digest: pred_review_receipt.receipt_digest.clone(),
+                integration_receipt_id: pred_integration_receipt.receipt_id.clone(),
+                integration_receipt_digest: pred_integration_receipt.receipt_digest.clone(),
+                accepted_task_head_commit: pred_head_commit.clone(),
+            }],
+            seal_digest: String::new(),
+        };
+        seal.seal_digest = seal.compute_digest().expect("compute seal digest");
+        let lock_path = dependency_input_lock_path(policy);
+        fs::write(&lock_path, b"").expect("write lock file");
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600)).expect("chmod lock");
+        let raw_bytes = serde_json::to_vec_pretty(&seal).expect("serialize seal");
+        fs::write(&policy.seal_path, &raw_bytes).expect("write seal");
+        fs::set_permissions(&policy.seal_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod seal");
+        seal
+    };
+
+    // 3. Scope widening check: `src/scope_entry` is `ExactFile` (missing) at `approved_base_commit`
+    // and becomes `DirectorySubtree` at `widened_commit` -> rejected before admission!
+    let _widen_seal = make_seal_for(&widen_policy, &widened_commit, &widened_tree_sha);
+    assert!(
+        resolve_worker_execution(v_widen, &widen_command_key, widen_instruction.clone()).is_err(),
+        "resolve_worker_execution must reject ExactFile -> DirectorySubtree scope widening"
+    );
+    let widen_err = scoped
+        .start_worker(
+            widen_command_key.clone(),
+            "prof_widen".to_string(),
+            widen_instruction.clone(),
+        )
+        .await
+        .expect_err("start_worker must reject scope widening before admission");
+    assert_eq!(widen_err.to_api_error().code, ErrorCode::ValidationFailed);
+    assert_eq!(scoped.status().await.expect("status").total_runs, 0);
+
+    // 4. Stage valid seal for `prof_child` and verify wrong command_key or wrong instruction
+    // is rejected before admission without mutating Core.
+    let child_seal = make_seal_for(&child_policy, &execution_base_commit, &execution_tree_sha);
+    let wrong_key_err = scoped
+        .start_worker(
+            "wrong-command-key".to_string(),
+            "prof_child".to_string(),
+            child_instruction.clone(),
+        )
+        .await
+        .expect_err("wrong command_key must be rejected");
+    assert_eq!(
+        wrong_key_err.to_api_error().code,
+        ErrorCode::ValidationFailed
+    );
+    let wrong_instr_err = scoped
+        .start_worker(
+            child_command_key.clone(),
+            "prof_child".to_string(),
+            "Tampered instruction".to_string(),
+        )
+        .await
+        .expect_err("wrong instruction must be rejected");
+    assert_eq!(
+        wrong_instr_err.to_api_error().code,
+        ErrorCode::ValidationFailed
+    );
+    assert_eq!(scoped.status().await.expect("status").total_runs, 0);
+
+    // 5. Valid dependent `start_worker` admits with `execution_base_commit` and `execution_binding`,
+    // and executes in a task checkout containing `src/pred_out.rs`!
+    let child_started = scoped
+        .start_worker(
+            child_command_key.clone(),
+            "prof_child".to_string(),
+            child_instruction.clone(),
+        )
+        .await
+        .expect("start valid dependent worker");
+    assert_eq!(
+        child_started.worktree.base_commit, execution_base_commit,
+        "admitted dependent worker must record execution_base_commit"
+    );
+    let child_binding = child_started
+        .execution_binding
+        .as_ref()
+        .expect("dependent worker must record execution_binding");
+    assert_eq!(child_binding.input_digest, child_seal.seal_digest);
+    assert_eq!(child_binding.execution_base_commit, execution_base_commit);
+    child_binding
+        .verify_against(
+            &v_child.profile_digest,
+            &child_instruction,
+            &execution_base_commit,
+        )
+        .expect("verify execution_binding");
+
+    let child_done =
+        wait_for_worker_status(&scoped, &child_started.run_id, |s| s.status.is_terminal()).await;
+    assert_eq!(child_done.status, WorkerStatus::Completed);
+    assert_eq!(
+        child_done.outcome.as_ref().map(|o| o.acceptance_state),
+        Some(WorkerAcceptanceState::ReadyForReview)
+    );
+    assert_eq!(
+        child_done.execution_binding.as_ref(),
+        Some(child_binding),
+        "completed snapshot must preserve execution_binding"
+    );
+    let child_wt_path = PathBuf::from(
+        child_done
+            .worktree
+            .task_worktree_path
+            .as_deref()
+            .expect("child task_worktree_path"),
+    );
+    let child_lib_contents =
+        fs::read_to_string(child_wt_path.join("src/lib.rs")).expect("read child lib.rs");
+    assert!(
+        child_lib_contents.contains("pub fn from_pred() -> u32"),
+        "child task checkout must see predecessor file content from execution_base_commit: {child_lib_contents}"
+    );
+    assert!(
+        !canonical_repo.join("src/pred_out.rs").exists(),
+        "primary source repository checkout must remain unchanged"
+    );
+
+    // 6a. Post-queue missing/replaced persisted predecessor receipt proof rejection at claim time
+    // without worktree/provider effects or FIFO starvation:
+    let _missing_proof_seal = make_seal_for(
+        &missing_proof_policy,
+        &execution_base_commit,
+        &execution_tree_sha,
+    );
+    fs::write(&hold_root_file, b"hold").expect("write hold_root_file");
+
+    let blocker_1 = scoped
+        .start_worker(
+            "root-blocker-proof-1".to_string(),
+            "prof_root".to_string(),
+            "Hold execution slot for persisted proof removal test".to_string(),
+        )
+        .await
+        .expect("start root blocker 1");
+    let _ = wait_for_worker_status(&scoped, &blocker_1.run_id, |s| {
+        s.status == WorkerStatus::Running
+    })
+    .await;
+
+    let missing_proof_queued = scoped
+        .start_worker(
+            missing_proof_command_key.clone(),
+            "prof_missing_proof".to_string(),
+            missing_proof_instruction.clone(),
+        )
+        .await
+        .expect("queue dependent worker while slot busy");
+    assert_eq!(missing_proof_queued.status, WorkerStatus::Queued);
+    assert!(missing_proof_queued.execution_binding.is_some());
+
+    // Remove the persisted predecessor integration receipt file on disk AFTER `missing_proof_queued`
+    // has been admitted into the queue, while leaving `missing_proof_policy.seal_path` untouched.
+    fs::remove_file(&pred_integration_receipt_path)
+        .expect("remove persisted integration receipt after queue");
+    fs::remove_file(&hold_root_file).expect("release hold_root_file 1");
+
+    let _ = wait_for_worker_status(&scoped, &blocker_1.run_id, |s| {
+        s.status == WorkerStatus::Completed
+    })
+    .await;
+    let missing_proof_failed = wait_for_worker_status(&scoped, &missing_proof_queued.run_id, |s| {
+        s.status.is_terminal()
+    })
+    .await;
+    assert_eq!(missing_proof_failed.status, WorkerStatus::Failed);
+    assert_eq!(missing_proof_failed.attempt_count, 0);
+    assert!(missing_proof_failed.claim_id.is_none());
+    assert!(missing_proof_failed.worktree.task_worktree_id.is_none());
+    assert_eq!(
+        missing_proof_failed
+            .outcome
+            .as_ref()
+            .map(|o| o.acceptance_state),
+        Some(WorkerAcceptanceState::ExecutionFailed)
+    );
+
+    // Restore the persisted integration receipt for the subsequent seal-mutation test.
+    fs::write(
+        &pred_integration_receipt_path,
+        &saved_integration_receipt_bytes,
+    )
+    .expect("restore persisted integration receipt");
+    fs::set_permissions(
+        &pred_integration_receipt_path,
+        fs::Permissions::from_mode(0o600),
+    )
+    .expect("chmod restored integration receipt");
+
+    // 6b. Post-queue seal mutation rejection at claim time without provider effects or FIFO starvation:
+    // Hold `prof_root` running in the single `max_parallel = 1` slot while we queue `prof_stale`
+    // and then another `prof_root` worker behind it.
+    let _stale_seal = make_seal_for(&stale_policy, &execution_base_commit, &execution_tree_sha);
+    fs::write(&hold_root_file, b"hold").expect("write hold_root_file 2");
+
+    let blocker = scoped
+        .start_worker(
+            "root-blocker-1".to_string(),
+            "prof_root".to_string(),
+            "Hold execution slot".to_string(),
+        )
+        .await
+        .expect("start root blocker");
+    let _ = wait_for_worker_status(&scoped, &blocker.run_id, |s| {
+        s.status == WorkerStatus::Running
+    })
+    .await;
+
+    let stale_queued = scoped
+        .start_worker(
+            stale_command_key.clone(),
+            "prof_stale".to_string(),
+            stale_instruction.clone(),
+        )
+        .await
+        .expect("queue dependent stale worker while slot busy");
+    assert_eq!(stale_queued.status, WorkerStatus::Queued);
+    assert!(stale_queued.execution_binding.is_some());
+
+    let follower_root = scoped
+        .start_worker(
+            "root-follower-1".to_string(),
+            "prof_root".to_string(),
+            "Run after rejected queued dependent worker".to_string(),
+        )
+        .await
+        .expect("queue follower root worker");
+    assert_eq!(follower_root.status, WorkerStatus::Queued);
+    assert!(follower_root.execution_binding.is_none());
+
+    // Mutate `stale_policy.seal_path` on disk while `stale_queued` is still `Queued`
+    // (appending trailing whitespace changes `seal_file_digest` even though JSON semantics match).
+    let mut mutated_bytes = fs::read(&stale_policy.seal_path).expect("read stale seal");
+    mutated_bytes.push(b'\n');
+    fs::write(&stale_policy.seal_path, &mutated_bytes).expect("write mutated stale seal");
+    fs::set_permissions(&stale_policy.seal_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod mutated stale seal");
+
+    // Release the blocker and verify:
+    // - `blocker` completes
+    // - `stale_queued` transitions directly from `Queued` -> `Failed` with `attempt_count == 0`,
+    //   `claim_id == None`, and no task worktree created
+    // - `follower_root` is NOT starved and completes cleanly!
+    fs::remove_file(&hold_root_file).expect("release hold_root_file");
+
+    let _ = wait_for_worker_status(&scoped, &blocker.run_id, |s| {
+        s.status == WorkerStatus::Completed
+    })
+    .await;
+    let stale_failed =
+        wait_for_worker_status(&scoped, &stale_queued.run_id, |s| s.status.is_terminal()).await;
+    assert_eq!(stale_failed.status, WorkerStatus::Failed);
+    assert_eq!(stale_failed.attempt_count, 0);
+    assert!(stale_failed.claim_id.is_none());
+    assert!(stale_failed.worktree.task_worktree_id.is_none());
+    assert_eq!(
+        stale_failed.outcome.as_ref().map(|o| o.acceptance_state),
+        Some(WorkerAcceptanceState::ExecutionFailed)
+    );
+
+    let follower_done =
+        wait_for_worker_status(&scoped, &follower_root.run_id, |s| s.status.is_terminal()).await;
+    assert_eq!(
+        follower_done.status,
+        WorkerStatus::Completed,
+        "rejected queued dependent worker must not starve subsequent queued workers"
+    );
+
+    // Exactly 4 provider executions should have occurred (`child_started`, `blocker_1`, `blocker`, `follower_root`);
+    // neither `missing_proof_queued` nor `stale_queued` may ever spawn the provider executable.
+    let spawn_lines = fs::read_to_string(&spawn_count_file)
+        .expect("read spawn_count_file")
+        .lines()
+        .count();
+    assert_eq!(
+        spawn_lines, 4,
+        "rejected queued workers must never spawn a provider process"
     );
 
     handle.shutdown().await;

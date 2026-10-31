@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -8,7 +8,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use threadlane_authority::ApprovalRecord;
+use threadlane::{ValidatedWorkerProfile, WorkersConfig};
+use threadlane_authority::{
+    build_approved_worker_profile_config, ApprovalRecord, ApprovedTaskRecord,
+};
+use threadlane_core::WorkerExecutionBinding;
 use threadlane_registry::ToolAdapter;
 use uuid::Uuid;
 
@@ -974,6 +978,44 @@ fn open_private_lock_file(lock_path: &Path) -> Result<File, HostError> {
     Ok(file)
 }
 
+fn open_existing_private_lock_file(lock_path: &Path) -> Result<Option<File>, HostError> {
+    let checked = ensure_no_symlink_components(lock_path)?;
+    match fs::symlink_metadata(&checked) {
+        Ok(meta) => validate_private_regular_metadata(&checked, &meta)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: format!("symlink_metadata({})", checked.display()),
+                reason: err.to_string(),
+            })
+        }
+    }
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc_o_nofollow());
+    }
+    let file = match opts.open(&checked) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: format!("open_existing_lock({})", checked.display()),
+                reason: err.to_string(),
+            })
+        }
+    };
+    let meta = file.metadata().map_err(|err| HostError::Io {
+        operation: "fstat(lock)".to_string(),
+        reason: err.to_string(),
+    })?;
+    validate_private_regular_metadata(&checked, &meta)?;
+    Ok(Some(file))
+}
+
 #[cfg(unix)]
 const fn libc_o_nofollow() -> i32 {
     0o400000
@@ -1201,8 +1243,10 @@ fn validate_host_manifest_structure(manifest: &HostSessionManifest) -> Result<()
             "Ready or Stopping manifest must record session_binding_id",
         ));
     }
-    let expected_gates = HostExecutionGates::for_ready_state(manifest.phase == HostPhase::Ready);
-    if manifest.gates != expected_gates {
+    let ready = manifest.phase == HostPhase::Ready;
+    let expected_gates = HostExecutionGates::for_ready_state(ready);
+    let legacy_gates = HostExecutionGates::legacy_for_ready_state(ready);
+    if manifest.gates != expected_gates && manifest.gates != legacy_gates {
         return Err(HostError::validation(
             "gates",
             "manifest gates do not match phase invariants",
@@ -1305,7 +1349,9 @@ fn verify_manifest_against_approval(
                 .to_string(),
         ));
     }
-    if manifest.gates != expected_reference.gates {
+    let ready = manifest.phase == HostPhase::Ready;
+    let legacy_gates = HostExecutionGates::legacy_for_ready_state(ready);
+    if manifest.gates != expected_reference.gates && manifest.gates != legacy_gates {
         return Err(corrupt(
             "manifest execution gates do not match required phase invariants".to_string(),
         ));
@@ -1347,7 +1393,7 @@ pub fn read_task_receipt(
 }
 
 /// Verifies `<session_dir>/task-receipts.json` (if present) against `record` and `session_binding_id`
-/// under `task-receipts.lock`.
+/// without creating a missing lock file on disk.
 pub(crate) fn verify_existing_task_receipts(
     session_dir: &Path,
     record: &ApprovalRecord,
@@ -1356,8 +1402,15 @@ pub(crate) fn verify_existing_task_receipts(
     let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
     let checked = ensure_no_symlink_components(&receipts_path)?;
     match fs::symlink_metadata(&checked) {
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(meta) => validate_private_regular_metadata(&checked, &meta)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let lock_path = session_dir.join(TASK_RECEIPTS_LOCK_FILENAME);
+            let checked_lock = ensure_no_symlink_components(&lock_path)?;
+            if let Ok(lock_meta) = fs::symlink_metadata(&checked_lock) {
+                validate_private_regular_metadata(&checked_lock, &lock_meta)?;
+            }
+            return Ok(None);
+        }
         Err(err) => {
             return Err(HostError::Io {
                 operation: "symlink_metadata(task-receipts.json)".to_string(),
@@ -1366,14 +1419,19 @@ pub(crate) fn verify_existing_task_receipts(
         }
     }
 
-    let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
-    lock_file.lock_exclusive().map_err(|err| HostError::Io {
-        operation: "lock_exclusive(task-receipts.lock)".to_string(),
-        reason: err.to_string(),
-    })?;
-    let res = read_task_receipts_locked(session_dir, record, session_binding_id);
-    let _ = lock_file.unlock();
-    res
+    if let Some(lock_file) =
+        open_existing_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?
+    {
+        lock_file.lock_exclusive().map_err(|err| HostError::Io {
+            operation: "lock_exclusive(task-receipts.lock)".to_string(),
+            reason: err.to_string(),
+        })?;
+        let res = read_task_receipts_locked(session_dir, record, session_binding_id);
+        let _ = lock_file.unlock();
+        res
+    } else {
+        read_task_receipts_locked(session_dir, record, session_binding_id)
+    }
 }
 
 pub(crate) fn read_task_ledger_entry(
@@ -1382,11 +1440,33 @@ pub(crate) fn read_task_ledger_entry(
     session_binding_id: &str,
     task_id: &str,
 ) -> Result<(Option<TaskDispatchIntent>, Option<TaskRunReceipt>), HostError> {
-    let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
-    lock_file.lock_exclusive().map_err(|err| HostError::Io {
-        operation: "lock_exclusive(task-receipts.lock)".to_string(),
-        reason: err.to_string(),
-    })?;
+    let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+    let checked_receipts = ensure_no_symlink_components(&receipts_path)?;
+    let lock_path = session_dir.join(TASK_RECEIPTS_LOCK_FILENAME);
+    let checked_lock = ensure_no_symlink_components(&lock_path)?;
+    match fs::symlink_metadata(&checked_receipts) {
+        Ok(meta) => validate_private_regular_metadata(&checked_receipts, &meta)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if let Ok(lock_meta) = fs::symlink_metadata(&checked_lock) {
+                validate_private_regular_metadata(&checked_lock, &lock_meta)?;
+            }
+            return Ok((None, None));
+        }
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(task-receipts.json)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    }
+
+    let lock_guard = open_existing_private_lock_file(&checked_lock)?;
+    if let Some(ref lock_file) = lock_guard {
+        lock_file.lock_exclusive().map_err(|err| HostError::Io {
+            operation: "lock_exclusive(task-receipts.lock)".to_string(),
+            reason: err.to_string(),
+        })?;
+    }
     let res =
         read_task_receipts_locked(session_dir, record, session_binding_id).map(|opt| match opt {
             Some(ledger) => {
@@ -1402,8 +1482,95 @@ pub(crate) fn read_task_ledger_entry(
             }
             None => (None, None),
         });
-    let _ = lock_file.unlock();
+    if let Some(lock_file) = lock_guard {
+        let _ = lock_file.unlock();
+    }
     res
+}
+
+/// Read-only preflight check for whether an existing Ready host session has a validated
+/// prepared dependency input seal or existing ledger entry for `task_id`.
+pub fn has_prepared_dependency_input_or_ledger_entry(
+    sessions_root: &Path,
+    record: &ApprovalRecord,
+    task_id: &str,
+) -> Result<bool, HostError> {
+    let candidate = sessions_root.join(&record.approval_id);
+    match fs::symlink_metadata(&candidate) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(session_dir)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    let session_dir = verify_existing_session_dir(sessions_root, &record.approval_id)?;
+    let Some(manifest) = read_host_manifest_optional(&session_dir, record)? else {
+        return Ok(false);
+    };
+    if manifest.phase != HostPhase::Ready
+        || !manifest.gates.supervisor_authenticated_ready
+        || manifest.gates.is_legacy_root_only()
+        || !is_host_lock_held(&session_dir)?
+    {
+        return Ok(false);
+    }
+    let Some(ref session_binding_id) = manifest.session_binding_id else {
+        return Ok(false);
+    };
+
+    let (intent, receipt) =
+        read_task_ledger_entry(&session_dir, record, session_binding_id, task_id)?;
+    if intent.is_some() || receipt.is_some() {
+        return Ok(true);
+    }
+
+    if verify_all_transitive_predecessors_in_approval(record, task_id).is_err() {
+        return Ok(false);
+    }
+    let Some(task) = record.tasks.iter().find(|t| t.task_id == task_id) else {
+        return Ok(false);
+    };
+    let work_area_dir = session_dir.join(WORK_AREA_SUBDIR);
+    let Ok(profile) =
+        build_validated_task_profile(record, session_binding_id, &work_area_dir, task)
+    else {
+        return Ok(false);
+    };
+    let Some(ref policy) = profile.dependency_input else {
+        return Ok(false);
+    };
+
+    match threadlane_operations::inspect_dependency_input_seal_readonly(
+        policy,
+        &record.repository_path,
+        &work_area_dir,
+        &record.base_commit,
+        &task.instruction,
+        &policy.command_key,
+    ) {
+        Ok(Some(seal)) => {
+            let expected_preds: BTreeSet<&str> =
+                task.depends_on.iter().map(String::as_str).collect();
+            let actual_preds: BTreeSet<&str> = seal
+                .predecessors
+                .iter()
+                .map(|p| p.task_id.as_str())
+                .collect();
+            Ok(expected_preds == actual_preds && seal.predecessors.len() == task.depends_on.len())
+        }
+        Ok(None) => Ok(false),
+        Err(threadlane_operations::OperationsError::SecurityViolation(reason)) => {
+            Err(HostError::SecurityViolation {
+                path: work_area_dir.display().to_string(),
+                reason,
+            })
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 /// Atomically persists a validated [`TaskDispatchIntent`] inside `<session_dir>/task-receipts.json`
@@ -1425,7 +1592,7 @@ pub fn record_task_dispatch_intent(
             reason: format!("invalid session_binding_id `{session_binding_id}`"),
         });
     }
-    validate_single_intent(&intent, record, &receipts_path)?;
+    validate_single_intent(&intent, record, session_binding_id, &receipts_path)?;
 
     let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
     lock_file.lock_exclusive().map_err(|err| HostError::Io {
@@ -1451,6 +1618,7 @@ pub fn record_task_dispatch_intent(
             if existing_receipt.task_digest != intent.task_digest
                 || existing_receipt.profile_id != intent.profile_id
                 || existing_receipt.command_key != intent.command_key
+                || existing_receipt.execution_binding != intent.execution_binding
             {
                 return Err(HostError::CorruptReceipts {
                     path: receipts_path.display().to_string(),
@@ -1470,6 +1638,7 @@ pub fn record_task_dispatch_intent(
             if existing.task_digest != intent.task_digest
                 || existing.profile_id != intent.profile_id
                 || existing.command_key != intent.command_key
+                || existing.execution_binding != intent.execution_binding
             {
                 return Err(HostError::CorruptReceipts {
                     path: receipts_path.display().to_string(),
@@ -1510,7 +1679,7 @@ pub fn record_task_receipt(
             reason: format!("invalid session_binding_id `{session_binding_id}`"),
         });
     }
-    validate_single_receipt(&receipt, record, &receipts_path)?;
+    validate_single_receipt(&receipt, record, session_binding_id, &receipts_path)?;
 
     let lock_file = open_private_lock_file(&session_dir.join(TASK_RECEIPTS_LOCK_FILENAME))?;
     lock_file.lock_exclusive().map_err(|err| HostError::Io {
@@ -1540,6 +1709,7 @@ pub fn record_task_receipt(
             if existing_intent.task_digest != receipt.task_digest
                 || existing_intent.profile_id != receipt.profile_id
                 || existing_intent.command_key != receipt.command_key
+                || existing_intent.execution_binding != receipt.execution_binding
             {
                 return Err(HostError::CorruptReceipts {
                     path: receipts_path.display().to_string(),
@@ -1555,6 +1725,7 @@ pub fn record_task_receipt(
                 task_digest: receipt.task_digest.clone(),
                 profile_id: receipt.profile_id.clone(),
                 command_key: receipt.command_key.clone(),
+                execution_binding: receipt.execution_binding.clone(),
                 recorded_at_ms: receipt.recorded_at_ms,
             });
             ledger
@@ -1573,6 +1744,7 @@ pub fn record_task_receipt(
                 || existing.command_key != receipt.command_key
                 || existing.run_id != receipt.run_id
                 || existing.worker_id != receipt.worker_id
+                || existing.execution_binding != receipt.execution_binding
             {
                 return Err(HostError::CorruptReceipts {
                     path: receipts_path.display().to_string(),
@@ -1732,7 +1904,7 @@ fn verify_task_receipts_ledger(
                 intent.task_id
             )));
         }
-        validate_single_intent(intent, record, receipts_path)?;
+        validate_single_intent(intent, record, session_binding_id, receipts_path)?;
     }
 
     let mut seen_tasks = BTreeSet::new();
@@ -1757,7 +1929,7 @@ fn verify_task_receipts_ledger(
                 receipt.worker_id
             )));
         }
-        validate_single_receipt(receipt, record, receipts_path)?;
+        validate_single_receipt(receipt, record, session_binding_id, receipts_path)?;
         if let Some(intent) = ledger
             .pending_intents
             .iter()
@@ -1766,6 +1938,7 @@ fn verify_task_receipts_ledger(
             if intent.task_digest != receipt.task_digest
                 || intent.profile_id != receipt.profile_id
                 || intent.command_key != receipt.command_key
+                || intent.execution_binding != receipt.execution_binding
             {
                 return Err(corrupt(format!(
                     "dispatch intent and receipt for task `{}` do not match",
@@ -1778,9 +1951,188 @@ fn verify_task_receipts_ledger(
     Ok(())
 }
 
+/// Verifies that every direct and transitive predecessor of `task_id` is included in `record.tasks`
+/// and is a headless worker task (`provider.is_some()` and `adapter != ToolAdapter::CodexCli`),
+/// returning the sorted list of all transitive predecessor task IDs.
+pub(crate) fn verify_all_transitive_predecessors_in_approval(
+    record: &ApprovalRecord,
+    task_id: &str,
+) -> Result<Vec<String>, String> {
+    let tasks_by_id: BTreeMap<&str, &ApprovedTaskRecord> = record
+        .tasks
+        .iter()
+        .map(|t| (t.task_id.as_str(), t))
+        .collect();
+    let Some(root_task) = tasks_by_id.get(task_id) else {
+        return Err(format!("unknown task `{task_id}`"));
+    };
+
+    let mut visited = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    fn visit<'a>(
+        current_id: &'a str,
+        tasks_by_id: &BTreeMap<&'a str, &'a ApprovedTaskRecord>,
+        visiting: &mut BTreeSet<&'a str>,
+        visited: &mut BTreeSet<String>,
+    ) -> Result<(), String> {
+        if !visiting.insert(current_id) {
+            return Err(format!(
+                "dependency cycle detected involving task `{current_id}`"
+            ));
+        }
+        let Some(task) = tasks_by_id.get(current_id) else {
+            return Err(format!(
+                "predecessor task `{current_id}` is missing from frozen approval record"
+            ));
+        };
+        for dep_id in &task.depends_on {
+            let Some(dep_task) = tasks_by_id.get(dep_id.as_str()) else {
+                return Err(format!(
+                    "task `{current_id}` depends on task `{dep_id}` which is missing from frozen approval record"
+                ));
+            };
+            if dep_task.provider.is_none() || dep_task.adapter == ToolAdapter::CodexCli {
+                return Err(format!(
+                    "predecessor task `{dep_id}` uses manual native route `{}` and cannot produce worker dependency receipts",
+                    dep_task.adapter
+                ));
+            }
+            if !visited.contains(dep_id.as_str()) {
+                visit(dep_id.as_str(), tasks_by_id, visiting, visited)?;
+                visited.insert(dep_id.clone());
+            }
+        }
+        visiting.remove(current_id);
+        Ok(())
+    }
+
+    visit(
+        root_task.task_id.as_str(),
+        &tasks_by_id,
+        &mut visiting,
+        &mut visited,
+    )?;
+    Ok(visited.into_iter().collect())
+}
+
+pub(crate) fn build_validated_task_profile(
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    work_area_root: &Path,
+    task: &ApprovedTaskRecord,
+) -> Result<ValidatedWorkerProfile, String> {
+    let profile_cfg = build_approved_worker_profile_config(
+        record,
+        task,
+        session_binding_id,
+        work_area_root,
+        work_area_root,
+    )
+    .map_err(|err| err.to_string())?;
+    let profile_id = profile_cfg.profile_id.clone();
+
+    let cfg = WorkersConfig {
+        max_parallel: 1,
+        profiles: vec![profile_cfg],
+    };
+    let mut validated = cfg.validate().map_err(|err| err.to_string())?;
+    validated
+        .profiles
+        .remove(&profile_id)
+        .ok_or_else(|| format!("validated profile `{profile_id}` not found"))
+}
+
+fn validate_task_execution_binding(
+    task: &ApprovedTaskRecord,
+    execution_binding: &Option<WorkerExecutionBinding>,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    receipts_path: &Path,
+) -> Result<(), HostError> {
+    let corrupt = |reason: String| HostError::CorruptReceipts {
+        path: receipts_path.display().to_string(),
+        reason,
+    };
+
+    if task.depends_on.is_empty() {
+        if execution_binding.is_some() {
+            return Err(corrupt(format!(
+                "root task `{}` must not carry an execution_binding",
+                task.task_id
+            )));
+        }
+        return Ok(());
+    }
+
+    verify_all_transitive_predecessors_in_approval(record, &task.task_id).map_err(|reason| {
+        corrupt(format!(
+            "dependent task `{}` fails approval predecessor closure check: {reason}",
+            task.task_id
+        ))
+    })?;
+
+    let Some(ref binding) = execution_binding else {
+        return Err(corrupt(format!(
+            "dependent task `{}` is missing required execution_binding",
+            task.task_id
+        )));
+    };
+
+    let session_dir = receipts_path
+        .parent()
+        .ok_or_else(|| corrupt("task-receipts.json path has no session_dir parent".to_string()))?;
+    let work_area_root = session_dir.join(WORK_AREA_SUBDIR);
+    let validated_profile =
+        build_validated_task_profile(record, session_binding_id, &work_area_root, task).map_err(
+            |reason| {
+                corrupt(format!(
+                    "failed to validate frozen profile for dependent task `{}`: {reason}",
+                    task.task_id
+                ))
+            },
+        )?;
+
+    let expected_binding = WorkerExecutionBinding::new(
+        &validated_profile.profile_digest,
+        &task.instruction,
+        &binding.input_digest,
+        &binding.seal_file_digest,
+        &binding.execution_base_commit,
+    )
+    .map_err(|err| {
+        corrupt(format!(
+            "dependent task `{}` has structurally invalid execution_binding: {err}",
+            task.task_id
+        ))
+    })?;
+
+    if &expected_binding != binding {
+        return Err(corrupt(format!(
+            "dependent task `{}` execution_binding digest `{}` does not match recomputed `{}`",
+            task.task_id, binding.execution_digest, expected_binding.execution_digest
+        )));
+    }
+
+    binding
+        .verify_against(
+            &validated_profile.profile_digest,
+            &task.instruction,
+            &binding.execution_base_commit,
+        )
+        .map_err(|err| {
+            corrupt(format!(
+                "dependent task `{}` execution_binding does not match frozen profile or instruction digest: {err}",
+                task.task_id
+            ))
+        })?;
+
+    Ok(())
+}
+
 fn validate_single_intent(
     intent: &TaskDispatchIntent,
     record: &ApprovalRecord,
+    session_binding_id: &str,
     receipts_path: &Path,
 ) -> Result<(), HostError> {
     let corrupt = |reason: String| HostError::CorruptReceipts {
@@ -1794,12 +2146,6 @@ fn validate_single_intent(
             intent.task_id
         )));
     };
-    if !task.depends_on.is_empty() {
-        return Err(corrupt(format!(
-            "dispatch intent references dependent task `{}` which cannot be started",
-            intent.task_id
-        )));
-    }
     if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
         return Err(corrupt(format!(
             "dispatch intent references manual native route task `{}`",
@@ -1835,6 +2181,13 @@ fn validate_single_intent(
             intent.command_key, intent.task_id
         )));
     }
+    validate_task_execution_binding(
+        task,
+        &intent.execution_binding,
+        record,
+        session_binding_id,
+        receipts_path,
+    )?;
 
     Ok(())
 }
@@ -1842,6 +2195,7 @@ fn validate_single_intent(
 fn validate_single_receipt(
     receipt: &TaskRunReceipt,
     record: &ApprovalRecord,
+    session_binding_id: &str,
     receipts_path: &Path,
 ) -> Result<(), HostError> {
     let corrupt = |reason: String| HostError::CorruptReceipts {
@@ -1855,12 +2209,6 @@ fn validate_single_receipt(
             receipt.task_id
         )));
     };
-    if !task.depends_on.is_empty() {
-        return Err(corrupt(format!(
-            "receipt references dependent task `{}` which cannot be started",
-            receipt.task_id
-        )));
-    }
     if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
         return Err(corrupt(format!(
             "receipt references manual native route task `{}`",
@@ -1912,6 +2260,13 @@ fn validate_single_receipt(
             receipt.task_id, receipt.worker_id
         )));
     }
+    validate_task_execution_binding(
+        task,
+        &receipt.execution_binding,
+        record,
+        session_binding_id,
+        receipts_path,
+    )?;
 
     Ok(())
 }

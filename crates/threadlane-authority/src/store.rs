@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +14,8 @@ use threadlane_registry::{RegistryStore, ToolAdapter};
 use threadlane_workers::{
     ensure_platform_supported, ensure_private_dir, open_private_lock_file,
     validate_absolute_no_symlink_components, validate_preexisting_private_file,
-    WorkerFilePermissions, WorkerProvider,
+    DependencyInputPolicy, WorkerFilePermissions, WorkerProvider, DEPENDENCIES_MANIFEST_SUBDIR,
+    MANIFESTS_SUBDIR,
 };
 use uuid::Uuid;
 
@@ -399,7 +400,6 @@ impl AuthorityStore {
             self.plans.dir(),
         )?;
 
-        let allowed_binding_ids = BTreeSet::from([session_binding.binding_id.clone()]);
         let mut profiles = Vec::new();
         let mut task_dispatch = Vec::new();
         let mut native_routes = Vec::new();
@@ -423,23 +423,15 @@ impl AuthorityStore {
                     });
                 }
             }
-            if let Some(provider) = task.provider {
-                let executable = task.canonical_executable.clone().ok_or_else(|| {
-                    AuthorityError::CorruptStore {
-                        path: self.approvals_path.display().to_string(),
-                        reason: format!(
-                            "worker task `{}` is missing canonical_executable",
-                            task.task_id
-                        ),
-                    }
-                })?;
-                let profile_id =
-                    task.profile_id
-                        .clone()
-                        .ok_or_else(|| AuthorityError::CorruptStore {
-                            path: self.approvals_path.display().to_string(),
-                            reason: format!("worker task `{}` is missing profile_id", task.task_id),
-                        })?;
+            if task.provider.is_some() {
+                let profile_config = build_approved_worker_profile_config(
+                    &record,
+                    task,
+                    &session_binding.binding_id,
+                    &checked_work_area,
+                    &self.approvals_path,
+                )?;
+                let profile_id = profile_config.profile_id.clone();
                 let command_key =
                     task.command_key
                         .clone()
@@ -451,40 +443,7 @@ impl AuthorityStore {
                             ),
                         })?;
 
-                let standalone = provider == WorkerProvider::OpenCodeV2;
-                let allowed_models = BTreeSet::from([task.base_model.clone()]);
-                let allowed_write_paths: BTreeSet<String> =
-                    task.allowed_write_paths.iter().cloned().collect();
-
-                let spec_template = WorkerSpecTemplate {
-                    provider,
-                    executable,
-                    model: task.base_model.clone(),
-                    effort: task.effort.clone(),
-                    allowed_models,
-                    standalone,
-                    session_id: None,
-                    repository_path: record.repository_path.clone(),
-                    base_commit: record.base_commit.clone(),
-                    work_area_root: checked_work_area.clone(),
-                    allowed_write_paths,
-                    file_permissions: WorkerFilePermissions::TaskFiles,
-                    budgets: record.budgets.clone(),
-                };
-
-                // Validate full WorkerSpec (including TaskFiles permission rules for both AGY and OC).
-                let full_spec = spec_template.to_worker_spec(task.instruction.clone());
-                full_spec
-                    .validate()
-                    .map_err(|err| AuthorityError::WorkersConfigInvalid {
-                        reason: format!("profile `{profile_id}` spec validation failed: {err}"),
-                    })?;
-
-                profiles.push(WorkerProfileConfig {
-                    profile_id: profile_id.clone(),
-                    allowed_binding_ids: allowed_binding_ids.clone(),
-                    spec: spec_template,
-                });
+                profiles.push(profile_config);
 
                 task_dispatch.push(ApprovedTaskDispatch {
                     task_id: task.task_id.clone(),
@@ -701,6 +660,56 @@ impl AuthorityStore {
                     plan_revision,
                     task_id: requested_id.clone(),
                 });
+            }
+        }
+
+        // Enforce transitive predecessor selection closure: new approvals must reject any
+        // selection missing any direct or transitive predecessor, and must never silently
+        // expand the approved task set.
+        for compiled_task in &compiled_plan.tasks {
+            if !selected_task_set.contains(&compiled_task.id) {
+                continue;
+            }
+            let mut visited = BTreeSet::new();
+            let mut missing_predecessors = BTreeSet::new();
+            let mut queue: VecDeque<&str> = compiled_task
+                .depends_on
+                .iter()
+                .map(String::as_str)
+                .collect();
+
+            while let Some(pred_id) = queue.pop_front() {
+                if !visited.insert(pred_id.to_string()) {
+                    continue;
+                }
+                let pred_task =
+                    compiled_plan
+                        .task(pred_id)
+                        .ok_or_else(|| AuthorityError::UnknownTask {
+                            plan_id: plan_id.clone(),
+                            plan_revision,
+                            task_id: pred_id.to_string(),
+                        })?;
+                if !selected_task_set.contains(pred_id) {
+                    missing_predecessors.insert(pred_id.to_string());
+                }
+                for upstream in &pred_task.depends_on {
+                    queue.push_back(upstream.as_str());
+                }
+            }
+
+            if !missing_predecessors.is_empty() {
+                let missing_list = missing_predecessors
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(AuthorityError::validation(
+                    "approved_task_ids",
+                    format!(
+                        "selected task `{}` is missing required transitive predecessor(s) in approved_task_ids: {missing_list}",
+                        compiled_task.id
+                    ),
+                ));
             }
         }
 
@@ -1120,6 +1129,102 @@ impl AuthorityStore {
 
         write_result
     }
+}
+
+/// Synthesizes and validates the exact frozen [`WorkerProfileConfig`] for an approved headless
+/// worker task (`antigravity` or `opencode_v2`) against `session_binding_id` and `work_area_root`.
+///
+/// Reused by both [`AuthorityStore::materialize`] and host execution-binding/profile validation
+/// so static profile digests (`ValidatedWorkerProfile::profile_digest`) can never drift across
+/// non-default budgets, efforts, or providers (`standalone == false` for Antigravity,
+/// `standalone == true` for OpenCode Go).
+pub fn build_approved_worker_profile_config(
+    record: &ApprovalRecord,
+    task: &ApprovedTaskRecord,
+    session_binding_id: &str,
+    work_area_root: &Path,
+    store_path_label: &Path,
+) -> Result<WorkerProfileConfig, AuthorityError> {
+    let provider = task.provider.ok_or_else(|| AuthorityError::CorruptStore {
+        path: store_path_label.display().to_string(),
+        reason: format!("worker task `{}` is missing provider", task.task_id),
+    })?;
+    let executable =
+        task.canonical_executable
+            .clone()
+            .ok_or_else(|| AuthorityError::CorruptStore {
+                path: store_path_label.display().to_string(),
+                reason: format!(
+                    "worker task `{}` is missing canonical_executable",
+                    task.task_id
+                ),
+            })?;
+    let profile_id = task
+        .profile_id
+        .clone()
+        .ok_or_else(|| AuthorityError::CorruptStore {
+            path: store_path_label.display().to_string(),
+            reason: format!("worker task `{}` is missing profile_id", task.task_id),
+        })?;
+    let command_key = task
+        .command_key
+        .clone()
+        .ok_or_else(|| AuthorityError::CorruptStore {
+            path: store_path_label.display().to_string(),
+            reason: format!("worker task `{}` is missing command_key", task.task_id),
+        })?;
+
+    let standalone = provider == WorkerProvider::OpenCodeV2;
+    let allowed_models = BTreeSet::from([task.base_model.clone()]);
+    let allowed_write_paths: BTreeSet<String> = task.allowed_write_paths.iter().cloned().collect();
+
+    let spec_template = WorkerSpecTemplate {
+        provider,
+        executable,
+        model: task.base_model.clone(),
+        effort: task.effort.clone(),
+        allowed_models,
+        standalone,
+        session_id: None,
+        repository_path: record.repository_path.clone(),
+        base_commit: record.base_commit.clone(),
+        work_area_root: work_area_root.to_path_buf(),
+        allowed_write_paths,
+        file_permissions: WorkerFilePermissions::TaskFiles,
+        budgets: record.budgets.clone(),
+    };
+
+    // Validate full WorkerSpec (including TaskFiles permission rules for both AGY and OC).
+    let full_spec = spec_template.to_worker_spec(task.instruction.clone());
+    full_spec
+        .validate()
+        .map_err(|err| AuthorityError::WorkersConfigInvalid {
+            reason: format!("profile `{profile_id}` spec validation failed: {err}"),
+        })?;
+
+    let dependency_input = if task.depends_on.is_empty() {
+        None
+    } else {
+        Some(DependencyInputPolicy {
+            seal_path: work_area_root
+                .join(MANIFESTS_SUBDIR)
+                .join(DEPENDENCIES_MANIFEST_SUBDIR)
+                .join(format!("{}.json", task.task_id)),
+            approval_id: record.approval_id.clone(),
+            approval_subject_digest: record.subject_digest.clone(),
+            task_id: task.task_id.clone(),
+            task_digest: task.task_digest.clone(),
+            instruction_digest: task.instruction_digest.clone(),
+            command_key,
+        })
+    };
+
+    Ok(WorkerProfileConfig {
+        profile_id,
+        allowed_binding_ids: BTreeSet::from([session_binding_id.to_string()]),
+        spec: spec_template,
+        dependency_input,
+    })
 }
 
 fn validate_workers_config_side_effect_free(

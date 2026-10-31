@@ -6,9 +6,10 @@ use threadlane_core::{
 };
 pub use threadlane_core::{
     ActivityPage, Event, EventKind, EventPayload, RunSummary, WorkerAcceptanceState, WorkerClaim,
-    WorkerCompletionRecord, WorkerOutcomeSummary, WorkerProgressSummary, WorkerProgressUpdate,
-    WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary, WorkerWorktreeUpdate,
-    MAX_STATUS_RECENT_RUNS, MAX_SUMMARY_TEXT_PREVIEW_CHARS,
+    WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressSummary,
+    WorkerProgressUpdate, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
+    WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS, MAX_SUMMARY_TEXT_PREVIEW_CHARS,
+    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 
 /// Trusted CLI request to bind a validated native Codex thread UUID and display label.
