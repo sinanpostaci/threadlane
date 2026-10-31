@@ -23,6 +23,22 @@ function freezeModel(model: ModelDefinition): ModelDefinition {
   return Object.freeze({ ...model });
 }
 
+function makeAgySingletonModel(
+  id: string,
+  label: string,
+  effort: string,
+  allowNoEffort: boolean
+): ModelDefinition {
+  return freezeModel({
+    id,
+    tool_id: 'agy-main',
+    label,
+    model_arg: id,
+    efforts: [effort],
+    allow_no_effort: allowNoEffort,
+  });
+}
+
 const REAL_EIGHT_AGY_MODELS: readonly ModelDefinition[] = Object.freeze([
   freezeModel({
     id: 'gemini-4-argon-low',
@@ -88,6 +104,12 @@ const REAL_EIGHT_AGY_MODELS: readonly ModelDefinition[] = Object.freeze([
     efforts: [],
     allow_no_effort: true,
   }),
+]);
+
+const REAL_CONNECTOR_AGY_MODELS: readonly ModelDefinition[] = Object.freeze([
+  makeAgySingletonModel('gemini-4-argon-low', 'Gemini4Argon(Low)', 'low', true),
+  makeAgySingletonModel('gemini-4-argon-medium', 'Gemini4Argon(Medium)', 'medium', true),
+  makeAgySingletonModel('gemini-4-argon-high', 'Gemini4Argon(High)', 'high', true),
 ]);
 
 describe('model-families helper', () => {
@@ -252,6 +274,231 @@ describe('model-families helper', () => {
     );
   });
 
+  it('groups the real connector singleton AGY catalog into one family and saves the exact explicit high choice', () => {
+    const families = groupModelFamilies(REAL_CONNECTOR_AGY_MODELS, [AGY_TOOL]);
+    assert.equal(families.length, 1);
+    assert.equal(visibleModelCount(REAL_CONNECTOR_AGY_MODELS, [AGY_TOOL]), 1);
+
+    const family = families[0]!;
+    assert.equal(family.key, 'family:agy-main:gemini-4-argon');
+    assert.equal(family.label, 'Gemini4Argon');
+    assert.equal(family.tool_id, 'agy-main');
+    assert.equal(family.encodedEfforts, true);
+    assert.deepEqual(
+      family.variants.map((variant) => [variant.effort, variant.model.id]),
+      [
+        ['low', 'gemini-4-argon-low'],
+        ['medium', 'gemini-4-argon-medium'],
+        ['high', 'gemini-4-argon-high'],
+      ]
+    );
+
+    assert.deepEqual(modelChoiceForFamilyEffort(family, 'high'), {
+      model_id: 'gemini-4-argon-high',
+      effort: 'high',
+    });
+    assert.deepEqual(modelChoiceForFamilyEffort(family, 'HIGH'), {
+      model_id: 'gemini-4-argon-high',
+      effort: 'high',
+    });
+    assert.equal(
+      selectedFamilyEffort(family, {
+        model_id: 'gemini-4-argon-high',
+        effort: 'high',
+      }),
+      'high'
+    );
+    assert.equal(
+      selectedFamilyEffort(family, {
+        model_id: 'gemini-4-argon-high',
+        effort: null,
+      }),
+      'high'
+    );
+    assert.equal(
+      selectedFamilyEffort(family, {
+        model_id: 'gemini-4-argon-high',
+        effort: 'low',
+      }),
+      null
+    );
+  });
+
+  it('groups mixed legacy and explicitly declared variants without duplicate effort collisions', () => {
+    const models: ModelDefinition[] = [
+      {
+        id: 'gemini-4-argon-low',
+        tool_id: 'agy-main',
+        label: 'Gemini4Argon(Low)',
+        model_arg: 'gemini-4-argon-low',
+        efforts: [],
+        allow_no_effort: true,
+      },
+      makeAgySingletonModel('gemini-4-argon-medium', 'Gemini4Argon(Medium)', 'medium', false),
+      makeAgySingletonModel('gemini-4-argon-high', 'Gemini4Argon(High)', 'high', true),
+    ];
+
+    const families = groupModelFamilies(models, [AGY_TOOL]);
+    assert.equal(families.length, 1);
+
+    const family = families[0]!;
+    assert.equal(family.encodedEfforts, true);
+    assert.deepEqual(
+      family.variants.map((variant) => variant.effort),
+      ['low', 'medium', 'high']
+    );
+
+    assert.deepEqual(modelChoiceForFamilyEffort(family, 'low'), {
+      model_id: 'gemini-4-argon-low',
+      effort: null,
+    });
+    assert.deepEqual(modelChoiceForFamilyEffort(family, 'medium'), {
+      model_id: 'gemini-4-argon-medium',
+      effort: 'medium',
+    });
+    assert.deepEqual(modelChoiceForFamilyEffort(family, 'high'), {
+      model_id: 'gemini-4-argon-high',
+      effort: 'high',
+    });
+
+    assert.equal(
+      selectedFamilyEffort(family, {
+        model_id: 'gemini-4-argon-low',
+        effort: null,
+      }),
+      'low'
+    );
+    assert.equal(
+      selectedFamilyEffort(family, {
+        model_id: 'gemini-4-argon-low',
+        effort: 'low',
+      }),
+      null
+    );
+    assert.equal(
+      selectedFamilyEffort(family, {
+        model_id: 'gemini-4-argon-medium',
+        effort: 'medium',
+      }),
+      'medium'
+    );
+  });
+
+  it('keeps mismatched, multi-effort, and non-AGY singleton records ordinary without losing identity or selection', () => {
+    const tools: ToolDefinition[] = [
+      AGY_TOOL,
+      {
+        id: 'codex-main',
+        label: 'Codex CLI',
+        adapter: 'codex_cli',
+        executable_path: '/usr/bin/codex',
+        enabled: true,
+      },
+    ];
+    const models: ModelDefinition[] = [
+      {
+        id: 'agy-mismatched-metadata',
+        tool_id: 'agy-main',
+        label: 'Gemini4Argon(High)',
+        model_arg: 'gemini-4-argon-high',
+        efforts: ['low'],
+        allow_no_effort: true,
+      },
+      {
+        id: 'agy-multi-effort',
+        tool_id: 'agy-main',
+        label: 'Gemini4Argon(Medium)',
+        model_arg: 'gemini-4-argon-medium',
+        efforts: ['low', 'medium'],
+        allow_no_effort: true,
+      },
+      {
+        id: 'agy-legacy-not-allowed',
+        tool_id: 'agy-main',
+        label: 'Gemini4Argon(Max)',
+        model_arg: 'gemini-4-argon-max',
+        efforts: [],
+        allow_no_effort: false,
+      },
+      {
+        id: 'codex-singleton',
+        tool_id: 'codex-main',
+        label: 'Gemini4Argon(High)',
+        model_arg: 'gemini-4-argon-high',
+        efforts: ['high'],
+        allow_no_effort: false,
+      },
+    ];
+
+    const families = groupModelFamilies(models, tools);
+    assert.equal(families.length, models.length);
+
+    for (const model of models) {
+      const family = findModelFamily(families, model.id);
+      assert.ok(family);
+      assert.equal(family.encodedEfforts, false);
+      assert.deepEqual(
+        family.members.map((member) => member.id),
+        [model.id]
+      );
+      assert.deepEqual(family.variants, []);
+    }
+
+    const mismatched = findModelFamily(families, 'agy-mismatched-metadata');
+    assert.ok(mismatched);
+    assert.equal(
+      selectedFamilyEffort(mismatched, {
+        model_id: 'agy-mismatched-metadata',
+        effort: 'low',
+      }),
+      'low'
+    );
+    assert.equal(modelChoiceForFamilyEffort(mismatched, 'high'), null);
+    assert.deepEqual(modelChoiceForFamilyEffort(mismatched, 'low'), {
+      model_id: 'agy-mismatched-metadata',
+      effort: 'low',
+    });
+
+    const multi = findModelFamily(families, 'agy-multi-effort');
+    assert.ok(multi);
+    assert.equal(
+      selectedFamilyEffort(multi, {
+        model_id: 'agy-multi-effort',
+        effort: 'medium',
+      }),
+      'medium'
+    );
+    assert.deepEqual(modelChoiceForFamilyEffort(multi, 'medium'), {
+      model_id: 'agy-multi-effort',
+      effort: 'medium',
+    });
+
+    const codex = findModelFamily(families, 'codex-singleton');
+    assert.ok(codex);
+    assert.equal(
+      selectedFamilyEffort(codex, {
+        model_id: 'codex-singleton',
+        effort: 'high',
+      }),
+      'high'
+    );
+    assert.deepEqual(modelChoiceForFamilyEffort(codex, 'high'), {
+      model_id: 'codex-singleton',
+      effort: 'high',
+    });
+
+    const legacy = findModelFamily(families, 'agy-legacy-not-allowed');
+    assert.ok(legacy);
+    assert.equal(
+      selectedFamilyEffort(legacy, {
+        model_id: 'agy-legacy-not-allowed',
+        effort: null,
+      }),
+      null
+    );
+    assert.equal(modelChoiceForFamilyEffort(legacy, null), null);
+  });
+
   it('does not merge across distinct tools, non-Antigravity adapters, versions, or nonmatching label/arg/metadata', () => {
     const tools: ToolDefinition[] = [
       AGY_TOOL,
@@ -358,13 +605,13 @@ describe('model-families helper', () => {
         efforts: [],
         allow_no_effort: true,
       },
-      // Custom non-empty efforts metadata
+      // Multi-effort metadata is never treated as a singleton encoded variant
       {
-        id: 'custom-efforts',
+        id: 'multi-efforts',
         tool_id: 'agy-main',
         label: 'Gemini 4 Argon (Medium)',
         model_arg: 'gemini-4-argon-medium',
-        efforts: ['medium'],
+        efforts: ['low', 'medium'],
         allow_no_effort: true,
       },
       // allow_no_effort: false

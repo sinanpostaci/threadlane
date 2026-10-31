@@ -48,11 +48,7 @@ function parseParenthesizedLabelEffort(
   if (openIndex <= 0) {
     return null;
   }
-  const beforeParen = trimmed.slice(0, openIndex);
-  if (!/\s$/.test(beforeParen)) {
-    return null;
-  }
-  const baseLabel = beforeParen.trim();
+  const baseLabel = trimmed.slice(0, openIndex).trim();
   if (!baseLabel) {
     return null;
   }
@@ -60,7 +56,7 @@ function parseParenthesizedLabelEffort(
   if (!inner || inner.includes('(') || inner.includes(')')) {
     return null;
   }
-  // Require TitleCase or uppercase/lowercase recognized token; reject arbitrary casing or extra words.
+  // Accept any casing for a recognized token, but reject extra words or nested parentheses.
   const lower = inner.toLowerCase();
   if (!isRecognizedEncodedEffort(lower)) {
     return null;
@@ -92,6 +88,18 @@ function parseModelArgEffort(
   return { baseModelArg, effort: suffix };
 }
 
+function hasLegacyEmptyEfforts(model: ModelDefinition): boolean {
+  return Array.isArray(model.efforts) && model.efforts.every((entry) => entry.trim() === '');
+}
+
+function explicitDeclaredEffort(model: ModelDefinition): EncodedEffort | null {
+  if (!Array.isArray(model.efforts) || model.efforts.length !== 1) {
+    return null;
+  }
+  const declared = model.efforts[0]?.trim() ?? '';
+  return isRecognizedEncodedEffort(declared) ? declared : null;
+}
+
 function parseEncodedCandidate(
   model: ModelDefinition,
   antigravityToolIds: ReadonlySet<string>
@@ -99,12 +107,6 @@ function parseEncodedCandidate(
   const toolId = model.tool_id?.trim() ?? '';
   const modelId = model.id?.trim() ?? '';
   if (!toolId || !modelId || !antigravityToolIds.has(toolId)) {
-    return null;
-  }
-  if (model.allow_no_effort !== true) {
-    return null;
-  }
-  if (!Array.isArray(model.efforts) || model.efforts.some((entry) => entry.trim() !== '')) {
     return null;
   }
 
@@ -117,6 +119,19 @@ function parseEncodedCandidate(
     return null;
   }
   if (labelParts.effort !== argParts.effort) {
+    return null;
+  }
+
+  const declaredEffort = explicitDeclaredEffort(model);
+  if (declaredEffort !== null) {
+    if (declaredEffort !== argParts.effort) {
+      return null;
+    }
+  } else if (hasLegacyEmptyEfforts(model)) {
+    if (model.allow_no_effort !== true) {
+      return null;
+    }
+  } else {
     return null;
   }
 
@@ -338,8 +353,16 @@ export function selectedFamilyEffort(
     return null;
   }
 
-  const rawEffort = choice.effort?.trim() || null;
-  if (rawEffort !== null) {
+  const rawEffort = choice.effort?.trim().toLowerCase() || null;
+  if (rawEffort === null) {
+    return variant.effort;
+  }
+  if (rawEffort !== variant.effort) {
+    return null;
+  }
+
+  const declaredEffort = explicitDeclaredEffort(variant.model);
+  if (declaredEffort === null || declaredEffort !== variant.effort) {
     return null;
   }
 
@@ -375,6 +398,20 @@ export function modelChoiceForFamilyEffort(
   const lowerEffort = normalizedEffort.toLowerCase();
   const variant = family.variants.find((entry) => entry.effort === lowerEffort);
   if (!variant) {
+    return null;
+  }
+
+  const declaredEffort = explicitDeclaredEffort(variant.model);
+  if (declaredEffort !== null) {
+    if (declaredEffort !== variant.effort || declaredEffort !== lowerEffort) {
+      return null;
+    }
+    return {
+      model_id: variant.model.id,
+      effort: declaredEffort,
+    };
+  }
+  if (!hasLegacyEmptyEfforts(variant.model)) {
     return null;
   }
   return {
