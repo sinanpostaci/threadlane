@@ -34,8 +34,13 @@ actual catalog. Save an existing `SavePlanDraft` as private `0600` JSON and call
 `save-draft --request /private/draft.json` with the same global flags. Inspect with
 `list-plans` or `get-plan --plan-id ...`; publish with `publish --plan-id ...
 --revision ...`. Global flags work before or after the subcommand. Existing
-binding, revision, duplicate-key and disabled-tool checks still apply.
-Saving/publishing starts no approval, host or worker.
+binding, revision, duplicate-key and disabled-tool checks still apply. Because core
+workflow errors lack stage provenance and a `PlanStore` revision may persist before
+a completion-journal or response failure, opaque I/O, serialization, or response
+errors during `save-draft` or `publish` conservatively report `outcome_unknown`
+(not a claim that an effect certainly occurred); reconcile with `list-plans` or
+`get-plan` before retrying. Read-only commands and known pre-effect refusals keep
+their original error codes. Saving/publishing starts no approval, host or worker.
 
 Present the concrete scope in Codex. After human authorization, use
 [the approval CLI](NATIVE-APPROVAL.md) to prepare the frozen preview and record
@@ -73,8 +78,14 @@ at `data.events`; paired MCP has its own nested shape. Never invent a batch ID.
 
 `cancel` requires approval/task IDs, `--expected-revision`, the exact
 `--confirm-approval` digest and `--operator-approved`. Cancellation, process exit,
-review and integration remain distinct. Timeout or `outcome_unknown` requires
-checking stored state/receipts before retrying. Failed stdout does not prove
+review and integration remain distinct. On mutating session commands (`dispatch`,
+`cancel`, `stop`, `pull`, `ack`), ambiguous runtime/transport, I/O, post-effect
+scope/integrity failures, and uncertain stop outcomes conservatively report
+`outcome_unknown` while preserving known pre-effect refusal codes (`unknown_task`,
+`stale_revision`, `host_not_ready`, `invalid_input`,
+`dependency_inputs_unverified`, `host_not_idle`, `host_instance_mismatch`, etc.).
+Timeout or `outcome_unknown` requires reconciling current `session`, `task`, or
+`activity` state before retrying; never blindly replay. Failed stdout does not prove
 that nothing happened.
 
 `stop` uses `--approval-id`, the exact `--expected-instance`, the approval digest

@@ -786,6 +786,7 @@ fn verify_notification_policy_on_attach(
     if actual.enabled == requested.enabled
         && actual.executable_digest == requested.executable_digest
         && actual.timeout_ms == requested.timeout_ms
+        && actual.route == requested.route
     {
         return Ok(());
     }
@@ -2076,8 +2077,8 @@ mod tests {
     use threadlane_desktop_bridge::{AttachmentMode, ConnectionState};
     use threadlane_host::{
         prepare_session_dir, write_host_manifest, ApprovedHost, ApprovedHostConfig, HostCli,
-        HostCommand, HostSessionLock, HostSessionManifest, TaskExecutionStatus,
-        HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR,
+        HostCommand, HostNotificationRoute, HostSessionLock, HostSessionManifest,
+        TaskExecutionStatus, HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR,
     };
     use threadlane_plans::{
         compile_plan_revision, Difficulty, PlanChange, PlanStatus, PlanTask, WorkflowRole,
@@ -3110,6 +3111,38 @@ mod tests {
                 .unwrap_err()
                 .code,
             "notification_policy_change_requires_restart"
+        );
+
+        let operator_cli_summary = config_a
+            .clone()
+            .with_route(HostNotificationRoute::OperatorCli)
+            .summary();
+        assert_eq!(requested.route, HostNotificationRoute::Mcp);
+        assert_eq!(
+            operator_cli_summary.route,
+            HostNotificationRoute::OperatorCli
+        );
+        assert_eq!(operator_cli_summary.enabled, requested.enabled);
+        assert_eq!(
+            operator_cli_summary.executable_digest,
+            requested.executable_digest
+        );
+        assert_eq!(operator_cli_summary.timeout_ms, requested.timeout_ms);
+        assert_eq!(
+            verify_notification_policy_on_attach(&requested, &operator_cli_summary)
+                .unwrap_err()
+                .code,
+            "notification_policy_change_requires_restart"
+        );
+        assert_eq!(
+            verify_notification_policy_on_attach(&operator_cli_summary, &requested)
+                .unwrap_err()
+                .code,
+            "notification_policy_change_requires_restart"
+        );
+        assert!(
+            verify_notification_policy_on_attach(&operator_cli_summary, &operator_cli_summary)
+                .is_ok()
         );
 
         let fixture = setup_desktop_host_fixture("notify-tool-identity");
@@ -4625,7 +4658,7 @@ exit 0
                             id: "tool-codex".to_string(),
                             label: "Native Codex".to_string(),
                             adapter: ToolAdapter::CodexCli,
-                            executable_path: Some(fake_codex),
+                            executable_path: Some(fake_codex.clone()),
                             enabled: true,
                         },
                     },
@@ -4739,6 +4772,77 @@ exit 0
                 .shutdown()
                 .await
                 .expect("shutdown running_host");
+
+            let record_route = seed_published_plan_and_approval(
+                &fixture,
+                "plan-notify-route-attach",
+                &control_binding_id,
+                THREAD_UUID_A,
+            );
+            let operator_cli_notify = ApprovedHostNotificationConfig::new(
+                fake_codex,
+                DEFAULT_APPROVED_NOTIFICATION_TIMEOUT_MS,
+            )
+            .expect("operator cli notification config")
+            .with_route(HostNotificationRoute::OperatorCli);
+            let operator_cli_host = ApprovedHost::start(
+                ApprovedHostConfig::new(
+                    fixture.control.registry.config_dir(),
+                    fixture.control.plans.dir(),
+                    fixture.control.authority.dir(),
+                    &fixture.control.sessions_dir,
+                    &record_route.approval_id,
+                )
+                .with_notifications(operator_cli_notify)
+                .with_tick_interval(Duration::from_millis(20)),
+            )
+            .await
+            .expect("start operator_cli notification host");
+            assert!(operator_cli_host.summary().notifications.enabled);
+            assert_eq!(
+                operator_cli_host.summary().notifications.route,
+                HostNotificationRoute::OperatorCli
+            );
+
+            let route_mismatch = start_approved_session_with_notifications(
+                &connected_bridge,
+                &fixture.control,
+                record_route.approval_id.clone(),
+                Some("tool-codex".to_string()),
+            )
+            .await
+            .expect_err("attach requesting Mcp route against OperatorCli host must fail");
+            assert_eq!(
+                route_mismatch.code,
+                "notification_policy_change_requires_restart"
+            );
+            assert_eq!(
+                read_count_file(&codex_count_file),
+                0,
+                "route-mismatched attach must not invoke codex notification binary"
+            );
+            assert_eq!(
+                read_count_file(&host_spawn_count_file),
+                0,
+                "route-mismatched attach must not spawn or restart the live host"
+            );
+            let observed_route = approved_session(
+                &connected_bridge,
+                &fixture.control,
+                record_route.approval_id.clone(),
+            )
+            .await
+            .expect("observe live operator_cli host");
+            assert!(observed_route.notifications.enabled);
+            assert_eq!(
+                observed_route.notifications.route,
+                HostNotificationRoute::OperatorCli
+            );
+
+            operator_cli_host
+                .shutdown()
+                .await
+                .expect("shutdown operator_cli_host");
             control_host
                 .shutdown()
                 .await

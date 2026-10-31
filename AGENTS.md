@@ -12,6 +12,9 @@ current milestone contract before editing.
   authorizes one package-closing review by `gpt-6-astra` with effort `max`.
   Targeted rechecks after fixes are allowed; do not repeat full closing reviews
   without a new reason. Do not substitute other models without authorization.
+- Follow the active human conversation's model and quota restrictions over historical
+  staffing defaults or saved profile assignments; never invoke a restricted model
+  merely because it remains in the registry.
 - One writer per checkout. Parallel writers need independent worktrees and clear
   ownership. The first foundation has one implementation writer.
 - Keep prose, comments, identifiers, and documentation in English.

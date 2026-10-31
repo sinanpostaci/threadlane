@@ -214,14 +214,14 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             verify_binding(clean_state_dir, workflow.binding_id(), &thread_uuid).await?;
             let summary = workflow
                 .save_draft(draft)
-                .map_err(|err| map_workflow_error(&err))?;
+                .map_err(|err| map_workflow_mutation_error(&err))?;
             write_result(workflow.binding_id(), &summary, true)
         }
         WorkflowCommand::Publish { plan_id, revision } => {
             verify_binding(clean_state_dir, workflow.binding_id(), &thread_uuid).await?;
             let published = workflow
                 .publish(&plan_id, revision)
-                .map_err(|err| map_workflow_error(&err))?;
+                .map_err(|err| map_workflow_mutation_error(&err))?;
             write_result(workflow.binding_id(), &published, true)
         }
     }
@@ -229,6 +229,42 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
 
 const fn map_workflow_error(err: &WorkflowError) -> OperatorCliError {
     OperatorCliError::new(err.code(), err.safe_message())
+}
+
+/// Maps [`WorkflowError`] returned after entering a mutating workflow command (`save-draft`
+/// or `publish`).
+///
+/// Because [`ScopedWorkflow::save_draft`] and [`ScopedWorkflow::publish`] can persist a
+/// [`threadlane_native::PlanStore`] revision before failing while encoding the response or writing the
+/// completion journal—and [`WorkflowError`] does not carry stage provenance—opaque I/O,
+/// serialization, and response-size failures inside a mutating call are conservatively
+/// reported as `outcome_unknown` so operators reconcile with `list-plans` or `get-plan`
+/// instead of blindly replaying. Deterministic pre-effect validation, not-found, stale
+/// revision, idempotency, and security refusals retain their original error codes.
+const fn map_workflow_mutation_error(err: &WorkflowError) -> OperatorCliError {
+    match err {
+        WorkflowError::Io(_)
+        | WorkflowError::Serialization(_)
+        | WorkflowError::ResponseTooLarge(_) => OperatorCliError::new(
+            "outcome_unknown",
+            "workflow mutation outcome is uncertain after an I/O, serialization, or response error; reconcile with list-plans or get-plan before retrying",
+        ),
+        WorkflowError::InvalidInput(_)
+        | WorkflowError::InvalidCursor(_)
+        | WorkflowError::NotFound(_)
+        | WorkflowError::StaleRevision(_)
+        | WorkflowError::ProfileRevisionMismatch(_)
+        | WorkflowError::RegistryResolution(_)
+        | WorkflowError::DuplicateTaskId(_)
+        | WorkflowError::UnknownDependency(_)
+        | WorkflowError::DependencyCycle(_)
+        | WorkflowError::InvalidWriteScope(_)
+        | WorkflowError::InvalidStateTransition(_)
+        | WorkflowError::IdempotencyConflict(_)
+        | WorkflowError::CorruptStore(_)
+        | WorkflowError::SecurityViolation(_)
+        | WorkflowError::UnsupportedPlatform(_) => map_workflow_error(err),
+    }
 }
 
 fn map_native_error(err: &NativeError) -> OperatorCliError {
@@ -456,5 +492,93 @@ mod tests {
         assert_eq!(pub_rev.status, PlanStatus::Published);
 
         sup.shutdown().await;
+    }
+
+    #[test]
+    fn workflow_read_vs_mutation_error_contracts_preserve_refusals_and_mark_ambiguous_mutations_outcome_unknown(
+    ) {
+        let ambiguous_cases = [
+            (
+                WorkflowError::from_plan_error(&threadlane_workflow::PlanError::Io(
+                    "/secret/workflow/journal write failure".to_string(),
+                )),
+                "io_error",
+            ),
+            (
+                WorkflowError::from_plan_error(&threadlane_workflow::PlanError::Serialization(
+                    "/secret/workflow/serialization failure".to_string(),
+                )),
+                "serialization_error",
+            ),
+            (
+                WorkflowError::ResponseTooLarge("workflow response exceeded cap"),
+                "response_too_large",
+            ),
+        ];
+
+        for (err, expected_read_code) in &ambiguous_cases {
+            let read_mapped = map_workflow_error(err);
+            assert_eq!(read_mapped.code, *expected_read_code);
+            assert!(!read_mapped.message.contains("/secret/workflow"));
+
+            let mutation_mapped = map_workflow_mutation_error(err);
+            assert_eq!(mutation_mapped.code, "outcome_unknown");
+            assert!(
+                mutation_mapped.message.contains("reconcile"),
+                "mutation outcome_unknown message must instruct reconciliation: {}",
+                mutation_mapped.message
+            );
+            assert!(!mutation_mapped.message.contains("/secret/workflow"));
+        }
+
+        let refusal_cases = [
+            (WorkflowError::InvalidInput("invalid"), "invalid_input"),
+            (WorkflowError::InvalidCursor("cursor"), "invalid_cursor"),
+            (WorkflowError::NotFound("not found"), "not_found"),
+            (WorkflowError::StaleRevision("stale"), "stale_revision"),
+            (
+                WorkflowError::ProfileRevisionMismatch("profile mismatch"),
+                "profile_revision_mismatch",
+            ),
+            (
+                WorkflowError::RegistryResolution("registry"),
+                "registry_resolution_failed",
+            ),
+            (WorkflowError::DuplicateTaskId("dup"), "duplicate_task_id"),
+            (
+                WorkflowError::UnknownDependency("dep"),
+                "unknown_dependency",
+            ),
+            (WorkflowError::DependencyCycle("cycle"), "dependency_cycle"),
+            (
+                WorkflowError::InvalidWriteScope("scope"),
+                "invalid_write_scope",
+            ),
+            (
+                WorkflowError::InvalidStateTransition("transition"),
+                "invalid_state_transition",
+            ),
+            (
+                WorkflowError::IdempotencyConflict("conflict"),
+                "idempotency_conflict",
+            ),
+            (WorkflowError::CorruptStore("corrupt"), "corrupt_store"),
+            (
+                WorkflowError::SecurityViolation("security"),
+                "security_violation",
+            ),
+            (
+                WorkflowError::UnsupportedPlatform("platform"),
+                "unsupported_platform",
+            ),
+        ];
+
+        for (err, expected_code) in &refusal_cases {
+            let read_mapped = map_workflow_error(err);
+            let mutation_mapped = map_workflow_mutation_error(err);
+            assert_eq!(read_mapped.code, *expected_code);
+            assert_eq!(mutation_mapped.code, *expected_code);
+            assert_eq!(read_mapped.message, mutation_mapped.message);
+        }
     }
 }

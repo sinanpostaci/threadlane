@@ -2153,3 +2153,161 @@ async fn session_cli_reports_ready_stopped_and_restarted_host_lifecycle_truthful
         "fixture control shutdown must not invoke a worker"
     );
 }
+
+fn assert_help_or_version_success(output: &Output, context: &str, expected_fragments: &[&str]) {
+    assert!(
+        output.status.success(),
+        "{context} failed with status {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{context}: help/version output must not write to stderr\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for fragment in expected_fragments {
+        assert!(
+            stdout.contains(fragment),
+            "{context}: stdout did not contain expected fragment `{fragment}`\nstdout: {stdout}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_and_session_help_and_version_exit_zero_for_top_level_and_subcommands() {
+    let workflow_top = run_workflow(&["--help".to_string()]).await;
+    assert_help_or_version_success(
+        &workflow_top,
+        "threadlane-workflow --help",
+        &[
+            "threadlane-workflow",
+            "catalog",
+            "list-plans",
+            "get-plan",
+            "save-draft",
+            "publish",
+        ],
+    );
+
+    let workflow_version = run_workflow(&["--version".to_string()]).await;
+    assert_help_or_version_success(
+        &workflow_version,
+        "threadlane-workflow --version",
+        &["threadlane-workflow"],
+    );
+
+    let workflow_subcommands: &[(&str, &[&str])] = &[
+        ("catalog", &["--cursor", "--limit"]),
+        ("list-plans", &["--cursor", "--limit"]),
+        (
+            "get-plan",
+            &["--plan-id", "--revision", "--cursor", "--limit"],
+        ),
+        ("save-draft", &["--request"]),
+        ("publish", &["--plan-id", "--revision"]),
+    ];
+    for (subcommand, fragments) in workflow_subcommands {
+        let output = run_workflow(&[(*subcommand).to_string(), "--help".to_string()]).await;
+        assert_help_or_version_success(
+            &output,
+            &format!("threadlane-workflow {subcommand} --help"),
+            fragments,
+        );
+    }
+
+    let session_top = run_session(&["--help".to_string()]).await;
+    assert_help_or_version_success(
+        &session_top,
+        "threadlane-session --help",
+        &[
+            "threadlane-session",
+            "session",
+            "task",
+            "dispatch",
+            "cancel",
+            "stop",
+            "activity",
+            "pull",
+            "ack",
+            "canonical lowercase hyphenated non-nil",
+        ],
+    );
+    let session_top_stdout = String::from_utf8_lossy(&session_top.stdout);
+    assert!(
+        !session_top_stdout.contains("UUIDv7"),
+        "threadlane-session --help must not claim only UUIDv7 is accepted:\n{session_top_stdout}"
+    );
+
+    let session_version = run_session(&["--version".to_string()]).await;
+    assert_help_or_version_success(
+        &session_version,
+        "threadlane-session --version",
+        &["threadlane-session"],
+    );
+
+    let session_subcommands: &[(&str, &[&str])] = &[
+        ("session", &["--approval-id"]),
+        ("task", &["--approval-id", "--task-id"]),
+        (
+            "dispatch",
+            &[
+                "--approval-id",
+                "--task-id",
+                "--confirm-approval",
+                "--operator-approved",
+            ],
+        ),
+        (
+            "cancel",
+            &[
+                "--approval-id",
+                "--task-id",
+                "--expected-revision",
+                "--reason",
+                "--confirm-approval",
+                "--operator-approved",
+            ],
+        ),
+        (
+            "stop",
+            &[
+                "--approval-id",
+                "--expected-instance",
+                "--confirm-approval",
+                "--operator-approved",
+            ],
+        ),
+        (
+            "activity",
+            &[
+                "--approval-id",
+                "--task-id",
+                "--after-seq",
+                "--cursor",
+                "--limit",
+            ],
+        ),
+        ("pull", &["--approval-id", "--after-seq", "--limit"]),
+        ("ack", &["--approval-id", "--batch-id"]),
+    ];
+    for (subcommand, fragments) in session_subcommands {
+        let output = run_session(&[(*subcommand).to_string(), "--help".to_string()]).await;
+        assert_help_or_version_success(
+            &output,
+            &format!("threadlane-session {subcommand} --help"),
+            fragments,
+        );
+    }
+
+    let invalid_stop = run_session(&[
+        "stop".to_string(),
+        "--unknown".to_string(),
+        SECRET_SENTINEL.to_string(),
+    ])
+    .await;
+    expect_failure_code(&invalid_stop, "stop with unknown flag", "invalid_input");
+    assert_no_secret_echo(&invalid_stop, "stop with unknown flag");
+}

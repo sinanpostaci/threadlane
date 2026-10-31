@@ -24,6 +24,7 @@ use threadlane_native::{
 #[derive(Debug, Parser)]
 #[command(
     name = "threadlane-session",
+    version,
     about = "Trusted local operator CLI for Threadlane approved session operations"
 )]
 struct Cli {
@@ -51,7 +52,7 @@ struct Cli {
     #[arg(long = "binding", global = true, value_name = "ID")]
     binding: Option<String>,
 
-    /// Authoritative canonical lowercase UUIDv7 (`thread.id`).
+    /// Target canonical lowercase hyphenated non-nil native Codex thread UUID.
     #[arg(long = "thread", global = true, value_name = "UUID")]
     thread: Option<String>,
 
@@ -239,7 +240,14 @@ impl GlobalArgs {
 async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(_) => {
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                let _ = err.print();
+                return ExitCode::SUCCESS;
+            }
             emit_error(&OperatorCliError::invalid_input(
                 "Invalid CLI arguments for `threadlane-session`.",
             ));
@@ -395,7 +403,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             let snapshot = client
                 .dispatch_task(&approval_id, &task_id)
                 .await
-                .map_err(|err| map_host_error(&err))?;
+                .map_err(|err| map_host_mutation_error(&err))?;
             if snapshot.binding_id != globals.binding || snapshot.thread_uuid != globals.thread {
                 return Err(OperatorCliError::new(
                     "outcome_unknown",
@@ -432,7 +440,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             let snapshot = client
                 .cancel_task(&approval_id, &task_id, expected_revision, clean_reason)
                 .await
-                .map_err(|err| map_host_error(&err))?;
+                .map_err(|err| map_host_mutation_error(&err))?;
             if snapshot.binding_id != globals.binding || snapshot.thread_uuid != globals.thread {
                 return Err(OperatorCliError::new(
                     "outcome_unknown",
@@ -461,7 +469,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             let mut summary = client
                 .stop_idle_session(&approval_id, &expected_instance)
                 .await
-                .map_err(|err| map_host_error(&err))?;
+                .map_err(|err| map_host_mutation_error(&err))?;
             if summary.last_error.is_some() {
                 summary.last_error = Some(
                     "Approved session recorded an error; inspect host diagnostics.".to_string(),
@@ -543,7 +551,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             let mut batch = client
                 .pull_events(&approval_id, after_seq, Some(effective_limit))
                 .await
-                .map_err(|err| map_host_error(&err))?;
+                .map_err(|err| map_host_mutation_error(&err))?;
             if batch.binding_id.trim().is_empty() || batch.binding_id == globals.binding {
                 return Err(OperatorCliError::new(
                     "outcome_unknown",
@@ -573,7 +581,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             let ack = client
                 .ack_events(&approval_id, batch_id)
                 .await
-                .map_err(|err| map_host_error(&err))?;
+                .map_err(|err| map_host_mutation_error(&err))?;
             if ack.binding_id.trim().is_empty() || ack.binding_id == globals.binding {
                 return Err(OperatorCliError::new(
                     "outcome_unknown",
@@ -843,6 +851,48 @@ fn map_host_error(error: &HostError) -> OperatorCliError {
     OperatorCliError::new(error.code(), message)
 }
 
+/// Maps [`HostError`] returned after entering a mutating session command (`dispatch`,
+/// `cancel`, `stop`, `pull`, or `ack`).
+///
+/// Mutating session operations can persist an intent/receipt, start or cancel a worker,
+/// request an idle host stop, or advance delivered/acknowledged notification state before
+/// encountering an I/O, transport/runtime, post-effect scope, or ledger/manifest integrity
+/// failure. Ambiguous runtime, I/O, post-effect scope/integrity failures, and uncertain stop
+/// outcomes are conservatively reported as `outcome_unknown` so operators inspect current
+/// `session`, `task`, or `activity` state instead of blindly retrying, while deterministic
+/// pre-effect refusals preserve their original error codes.
+fn map_host_mutation_error(error: &HostError) -> OperatorCliError {
+    match error {
+        HostError::StopOutcomeUncertain { .. }
+        | HostError::ScopeMismatch { .. }
+        | HostError::CorruptManifest { .. }
+        | HostError::CorruptReceipts { .. }
+        | HostError::CorruptSessionState { .. }
+        | HostError::Runtime { .. }
+        | HostError::Io { .. } => OperatorCliError::new(
+            "outcome_unknown",
+            "Session mutation outcome is uncertain after a runtime, I/O, scope, or integrity error; inspect session, task, or activity state before retrying.",
+        ),
+        HostError::Validation { .. }
+        | HostError::ApprovalNotFound { .. }
+        | HostError::UnknownTask { .. }
+        | HostError::DependencyInputsUnverified { .. }
+        | HostError::NativeRouteRequired { .. }
+        | HostError::TaskNotStarted { .. }
+        | HostError::UnpublishedOrSupersededPlan { .. }
+        | HostError::LockBusy { .. }
+        | HostError::HostNotReady { .. }
+        | HostError::HostNotIdle { .. }
+        | HostError::InstanceMismatch { .. }
+        | HostError::RestartNotAllowed { .. }
+        | HostError::StaleRevision { .. }
+        | HostError::IdempotencyConflict { .. }
+        | HostError::InvalidRunState { .. }
+        | HostError::SecurityViolation { .. }
+        | HostError::Authority { .. } => map_host_error(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -855,8 +905,9 @@ mod tests {
         DEFAULT_GIT_COMMAND_TIMEOUT_MS,
     };
     use threadlane_workflow::{
-        compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanTask,
-        RegistryChange, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+        compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStatus,
+        PlanTask, RegistryChange, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
+        WorkflowRole,
     };
 
     use super::*;
@@ -1368,5 +1419,255 @@ mod tests {
         let mapped_native = map_native_error(&native_err);
         assert_eq!(mapped_native.code, "security_violation");
         assert!(!mapped_native.message.contains("/secret/native/path"));
+    }
+
+    #[test]
+    fn session_read_vs_mutation_error_contracts_preserve_pre_effect_refusals_and_mark_ambiguous_mutations_outcome_unknown(
+    ) {
+        let secret = "/secret/provider/or/internal/raw/detail";
+        let ambiguous_cases = [
+            (
+                HostError::StopOutcomeUncertain {
+                    approval_id: "apr_1".to_string(),
+                    detail: secret.to_string(),
+                },
+                "host_stop_outcome_uncertain",
+            ),
+            (
+                HostError::ScopeMismatch {
+                    field: "session_binding_id".to_string(),
+                    expected: "bnd_expected".to_string(),
+                    actual: secret.to_string(),
+                    reason: secret.to_string(),
+                },
+                "scope_mismatch",
+            ),
+            (
+                HostError::CorruptManifest {
+                    path: secret.to_string(),
+                    reason: secret.to_string(),
+                },
+                "corrupt_manifest",
+            ),
+            (
+                HostError::CorruptReceipts {
+                    path: secret.to_string(),
+                    reason: secret.to_string(),
+                },
+                "corrupt_receipts",
+            ),
+            (
+                HostError::CorruptSessionState {
+                    reason: secret.to_string(),
+                },
+                "corrupt_session_state",
+            ),
+            (
+                HostError::Runtime {
+                    code: "transport_error".to_string(),
+                    message: secret.to_string(),
+                },
+                "runtime_error",
+            ),
+            (
+                HostError::Io {
+                    operation: "record_task_receipt".to_string(),
+                    reason: secret.to_string(),
+                },
+                "io",
+            ),
+        ];
+
+        for (err, expected_read_code) in &ambiguous_cases {
+            let read_mapped = map_host_error(err);
+            assert_eq!(read_mapped.code, *expected_read_code);
+            assert!(!read_mapped.message.contains(secret));
+
+            let mutation_mapped = map_host_mutation_error(err);
+            assert_eq!(mutation_mapped.code, "outcome_unknown");
+            assert!(
+                mutation_mapped
+                    .message
+                    .contains("inspect session, task, or activity state"),
+                "mutation outcome_unknown message must instruct inspection before retrying: {}",
+                mutation_mapped.message
+            );
+            assert!(!mutation_mapped.message.contains(secret));
+        }
+
+        let refusal_cases = [
+            (
+                HostError::Validation {
+                    field: "task_id".to_string(),
+                    reason: secret.to_string(),
+                },
+                "validation",
+            ),
+            (
+                HostError::ApprovalNotFound {
+                    approval_id: secret.to_string(),
+                },
+                "approval_not_found",
+            ),
+            (
+                HostError::UnknownTask {
+                    approval_id: "apr_1".to_string(),
+                    task_id: secret.to_string(),
+                },
+                "unknown_task",
+            ),
+            (
+                HostError::DependencyInputsUnverified {
+                    approval_id: "apr_1".to_string(),
+                    task_id: "task_2".to_string(),
+                    depends_on: vec![secret.to_string()],
+                },
+                "dependency_inputs_unverified",
+            ),
+            (
+                HostError::NativeRouteRequired {
+                    approval_id: "apr_1".to_string(),
+                    task_id: "task_native".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                },
+                "native_route_required",
+            ),
+            (
+                HostError::TaskNotStarted {
+                    approval_id: "apr_1".to_string(),
+                    task_id: secret.to_string(),
+                },
+                "not_started",
+            ),
+            (
+                HostError::UnpublishedOrSupersededPlan {
+                    plan_id: secret.to_string(),
+                    revision: 1,
+                    status: PlanStatus::Draft,
+                },
+                "unpublished_or_superseded_plan",
+            ),
+            (
+                HostError::LockBusy {
+                    approval_id: "apr_1".to_string(),
+                    session_dir: PathBuf::from(secret),
+                },
+                "lock_busy",
+            ),
+            (
+                HostError::HostNotReady {
+                    approval_id: "apr_1".to_string(),
+                    phase: Some(HostPhase::Stopped),
+                    reason: secret.to_string(),
+                },
+                "host_not_ready",
+            ),
+            (
+                HostError::HostNotIdle {
+                    approval_id: "apr_1".to_string(),
+                    detail: secret.to_string(),
+                },
+                "host_not_idle",
+            ),
+            (
+                HostError::InstanceMismatch {
+                    approval_id: "apr_1".to_string(),
+                    expected_instance_id: "hst_0123456789abcdef0123456789abcdef".to_string(),
+                    actual_instance_id: Some(secret.to_string()),
+                },
+                "host_instance_mismatch",
+            ),
+            (
+                HostError::RestartNotAllowed {
+                    approval_id: "apr_1".to_string(),
+                    phase: Some(HostPhase::Ready),
+                    detail: secret.to_string(),
+                },
+                "host_restart_not_allowed",
+            ),
+            (
+                HostError::StaleRevision {
+                    run_id: secret.to_string(),
+                    expected_revision: 1,
+                    actual_revision: 2,
+                },
+                "stale_revision",
+            ),
+            (
+                HostError::IdempotencyConflict {
+                    binding_id: "bnd_1".to_string(),
+                    command_key: secret.to_string(),
+                },
+                "idempotency_conflict",
+            ),
+            (
+                HostError::InvalidRunState {
+                    run_id: "run_1".to_string(),
+                    action: "cancel".to_string(),
+                    reason: secret.to_string(),
+                },
+                "invalid_run_state",
+            ),
+            (
+                HostError::SecurityViolation {
+                    path: secret.to_string(),
+                    reason: secret.to_string(),
+                },
+                "security_violation",
+            ),
+            (
+                HostError::Authority {
+                    code: "plan_digest_mismatch".to_string(),
+                    message: secret.to_string(),
+                },
+                "authority_error",
+            ),
+        ];
+
+        for (err, expected_code) in &refusal_cases {
+            let read_mapped = map_host_error(err);
+            let mutation_mapped = map_host_mutation_error(err);
+            assert_eq!(read_mapped.code, *expected_code);
+            assert_eq!(mutation_mapped.code, *expected_code);
+            assert_eq!(read_mapped.message, mutation_mapped.message);
+            assert!(!read_mapped.message.contains(secret));
+        }
+    }
+
+    #[test]
+    fn cli_help_and_version_requests_classify_as_display_help_or_version() {
+        for help_args in [
+            vec!["threadlane-session", "--help"],
+            vec!["threadlane-session", "-h"],
+            vec!["threadlane-session", "session", "--help"],
+            vec!["threadlane-session", "task", "--help"],
+            vec!["threadlane-session", "dispatch", "--help"],
+            vec!["threadlane-session", "cancel", "--help"],
+            vec!["threadlane-session", "stop", "--help"],
+            vec!["threadlane-session", "activity", "--help"],
+            vec!["threadlane-session", "pull", "--help"],
+            vec!["threadlane-session", "ack", "--help"],
+        ] {
+            let err = Cli::try_parse_from(&help_args)
+                .expect_err("help invocation should return clap DisplayHelp");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "expected DisplayHelp for {help_args:?}"
+            );
+        }
+
+        for version_args in [
+            vec!["threadlane-session", "--version"],
+            vec!["threadlane-session", "-V"],
+        ] {
+            let err = Cli::try_parse_from(&version_args)
+                .expect_err("version invocation should return clap DisplayVersion");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayVersion,
+                "expected DisplayVersion for {version_args:?}"
+            );
+        }
     }
 }
