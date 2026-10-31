@@ -61,6 +61,14 @@ truthful stopped-session inspection. An opt-in
 [CLI notification route](NATIVE-OPERATOR-NOTIFICATIONS.md) uses a fixed message
 through the existing Codex queue, with no shell adapter or worker prose.
 
+The additive [native tool-output transport](NATIVE-TOOL-OUTPUT.md) is a separately
+selected operator route over a private Unix WebSocket. Controlled Linux desktop
+experiments verified idle wake-up and delivery into an existing busy turn in one
+authorized disposable chat without converting the machine event into user text.
+The temporary desktop launcher, product host end-to-end delivery, restart
+recovery, general multi-chat identity and other operating systems have separate
+acceptance boundaries. Legacy queue notifications are not an automatic fallback.
+
 Milestone 1's deterministic native conversation loop and Milestone 2A's bounded
 history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker
 library and diagnostic CLI provide provider evidence parsing, bounded process

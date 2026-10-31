@@ -14,8 +14,10 @@ threadlane-operations = { path = "../threadlane-operations", version = "0.1.0" }
 axum.workspace = true
 clap.workspace = true
 fs2.workspace = true
+futures-util = { version = "0.3", features = ["sink"] }
 reqwest.workspace = true
 rmcp.workspace = true
+rustix = { version = "1", features = ["process"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,6 +27,7 @@ thiserror.workspace = true
 threadlane-core.workspace = true
 threadlane-workers.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 uuid.workspace = true
 
 [dev-dependencies]

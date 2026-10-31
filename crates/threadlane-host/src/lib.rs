@@ -69,17 +69,17 @@ pub use storage::{
 };
 pub use threadlane::{
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
-    HostControlRuntimeState, HostControlStatusResponse, StopIdleHostRequest,
-    DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,
+    HostControlRuntimeState, HostControlStatusResponse, NativeToolOutputConfig,
+    StopIdleHostRequest, DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,
 };
 pub use threadlane_core::{AckResult, EventBatch};
 pub use types::{
     ApprovedHostNotificationConfig, DependencyInputSummary, DependencyPredecessorSelection,
     HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus, HostNotificationRoute,
-    HostNotificationSummary, HostPhase, HostSessionManifest, HostSessionSummary,
-    PrepareDependencyInputsRequest, TaskDispatchIntent, TaskEvidenceVerificationStatus,
-    TaskExecutionStatus, TaskIntegrationLifecycleStatus, TaskLifecycleProjection,
-    TaskReviewLifecycleStatus, TaskRunReceipt, TaskStateSnapshot,
+    HostNotificationSummary, HostNotificationTransport, HostPhase, HostSessionManifest,
+    HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent,
+    TaskEvidenceVerificationStatus, TaskExecutionStatus, TaskIntegrationLifecycleStatus,
+    TaskLifecycleProjection, TaskReviewLifecycleStatus, TaskRunReceipt, TaskStateSnapshot,
     VerifiedIntegrationReceiptSummary, VerifiedReviewReceiptSummary,
     APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
     HOST_LAUNCH_INTENT_SCHEMA_VERSION, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
@@ -3730,6 +3730,7 @@ exit 0
             notify_codex: None,
             notify_timeout_ms: None,
             notify_route: None,
+            notify_tool_output_context: None,
             restart_from_instance_id: None,
             start_fresh_only: false,
         };
@@ -4555,6 +4556,7 @@ exit 0
             notify_codex: None,
             notify_timeout_ms: None,
             notify_route: None,
+            notify_tool_output_context: None,
             restart_from_instance_id: Some("hst_11111111111111111111111111111111".to_string()),
             start_fresh_only: true,
         }
@@ -6466,6 +6468,8 @@ exit 0
             executable_digest: None,
             timeout_ms: None,
             route: HostNotificationRoute::OperatorCli,
+            transport: HostNotificationTransport::Queue,
+            native_context_digest: None,
         };
         let err = invalid_disabled
             .validate()

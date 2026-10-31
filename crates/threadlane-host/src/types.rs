@@ -3,7 +3,10 @@ use std::path::{Component, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use threadlane::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus, MAX_CODEX_TIMEOUT_MS};
+use threadlane::{
+    NativeToolOutputConfig, WorkerAcceptanceState, WorkerSnapshot, WorkerStatus,
+    MAX_CODEX_TIMEOUT_MS,
+};
 use threadlane_authority::ApprovalRecord;
 use threadlane_core::WorkerExecutionBinding;
 use threadlane_operations::IntegrationStrategy;
@@ -112,6 +115,42 @@ impl std::str::FromStr for HostNotificationRoute {
     }
 }
 
+/// Transport mechanism for approved-session wake-up notifications recorded in
+/// [`HostNotificationSummary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HostNotificationTransport {
+    /// Legacy Codex CLI `queue --thread <THREAD_UUID> --message <FIXED_WAKEUP_TEXT>` subprocess transport.
+    #[default]
+    Queue,
+    /// Native Unix WebSocket JSON-RPC `turn/start` `toolOutput` transport.
+    UnixToolOutput,
+}
+
+impl HostNotificationTransport {
+    /// Returns the canonical `snake_case` wire identifier (`"queue"` or `"unix_tool_output"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::UnixToolOutput => "unix_tool_output",
+        }
+    }
+
+    /// Returns `true` when this transport is the default [`HostNotificationTransport::Queue`] variant.
+    ///
+    /// Used by `#[serde(skip_serializing_if = ...)]` on [`HostNotificationSummary::transport`] so
+    /// disabled and default-queue summaries remain byte-for-byte compatible with legacy manifests.
+    pub const fn is_default_queue(&self) -> bool {
+        matches!(self, Self::Queue)
+    }
+}
+
+impl std::fmt::Display for HostNotificationTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Explicit opt-in configuration for approved-session Codex wake-up notifications on [`crate::ApprovedHost`].
 ///
 /// Disabled by default. When configured, the executable path is canonicalized and validated as an
@@ -120,10 +159,12 @@ impl std::str::FromStr for HostNotificationRoute {
 pub struct ApprovedHostNotificationConfig {
     /// Canonical absolute path to the validated Codex executable.
     pub executable: PathBuf,
-    /// Bounded timeout in milliseconds (`1..=MAX_CODEX_TIMEOUT_MS`) for each Codex queue invocation.
+    /// Bounded timeout in milliseconds (`1..=MAX_CODEX_TIMEOUT_MS`) for each Codex wake-up invocation.
     pub timeout_ms: u64,
     /// Fixed software-owned notification message route (defaults to [`HostNotificationRoute::Mcp`]).
     pub route: HostNotificationRoute,
+    /// Optional explicit native Unix WebSocket `turn/start.toolOutput` transport configuration (`None` / queue by default).
+    pub tool_output: Option<NativeToolOutputConfig>,
 }
 
 impl ApprovedHostNotificationConfig {
@@ -189,6 +230,7 @@ impl ApprovedHostNotificationConfig {
             executable: validated,
             timeout_ms,
             route: HostNotificationRoute::Mcp,
+            tool_output: None,
         })
     }
 
@@ -198,8 +240,17 @@ impl ApprovedHostNotificationConfig {
         self
     }
 
+    /// Validates and attaches an explicit [`NativeToolOutputConfig`] so wake-ups use the native
+    /// Unix WebSocket `turn/start.toolOutput` transport instead of spawning the legacy queue CLI.
+    pub fn with_tool_output(mut self, config: NativeToolOutputConfig) -> Result<Self, HostError> {
+        config.validate()?;
+        self.tool_output = Some(config);
+        Ok(self)
+    }
+
     /// Returns a safe, path-free [`HostNotificationSummary`] where `executable_digest` is the
-    /// 64-character lowercase hex SHA-256 of the canonical executable path string.
+    /// 64-character lowercase hex SHA-256 of the canonical executable path string and, when native
+    /// tool-output transport is configured, `native_context_digest` is `config.digest()`.
     pub fn summary(&self) -> HostNotificationSummary {
         let canonical_str = fs::canonicalize(&self.executable)
             .unwrap_or_else(|_| self.executable.clone())
@@ -213,11 +264,20 @@ impl ApprovedHostNotificationConfig {
             use std::fmt::Write as _;
             let _ = write!(&mut hex, "{byte:02x}");
         }
+        let (transport, native_context_digest) = match self.tool_output {
+            Some(ref cfg) => (
+                HostNotificationTransport::UnixToolOutput,
+                Some(cfg.digest()),
+            ),
+            None => (HostNotificationTransport::Queue, None),
+        };
         HostNotificationSummary {
             enabled: true,
             executable_digest: Some(hex),
             timeout_ms: Some(self.timeout_ms),
             route: self.route,
+            transport,
+            native_context_digest,
         }
     }
 }
@@ -226,7 +286,7 @@ impl ApprovedHostNotificationConfig {
 /// [`HostSessionSummary`].
 ///
 /// Reports only whether host notification policy is configured for the session (never delivery
-/// proof) and never contains raw local filesystem paths.
+/// proof) and never contains raw local filesystem paths, model names, effort levels, or thread UUIDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct HostNotificationSummary {
@@ -239,33 +299,50 @@ pub struct HostNotificationSummary {
     /// Notification message route (`mcp` by default; omitted on serialization when `mcp` for legacy wire compatibility).
     #[serde(default, skip_serializing_if = "HostNotificationRoute::is_default_mcp")]
     pub route: HostNotificationRoute,
+    /// Notification transport (`queue` by default; omitted on serialization when `queue` for legacy wire compatibility).
+    #[serde(
+        default,
+        skip_serializing_if = "HostNotificationTransport::is_default_queue"
+    )]
+    pub transport: HostNotificationTransport,
+    /// 64-character lowercase hex SHA-256 digest of the canonical native tool-output context when `transport == UnixToolOutput`; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_context_digest: Option<String>,
 }
 
 impl HostNotificationSummary {
-    /// Returns the default disabled notification summary (`enabled: false`, no digest or timeout, `route: Mcp`).
+    /// Returns the default disabled notification summary (`enabled: false`, no digests or timeout, `route: Mcp`, `transport: Queue`).
     pub const fn disabled() -> Self {
         Self {
             enabled: false,
             executable_digest: None,
             timeout_ms: None,
             route: HostNotificationRoute::Mcp,
+            transport: HostNotificationTransport::Queue,
+            native_context_digest: None,
         }
     }
 
     /// Validates internal field consistency of this [`HostNotificationSummary`]:
-    /// - When `enabled == false`, both `executable_digest` and `timeout_ms` must be `None` and
-    ///   `route` must be [`HostNotificationRoute::Mcp`].
+    /// - When `enabled == false`, `executable_digest`, `timeout_ms`, and `native_context_digest`
+    ///   must be `None`, `route` must be [`HostNotificationRoute::Mcp`], and `transport` must be
+    ///   [`HostNotificationTransport::Queue`].
     /// - When `enabled == true`, `executable_digest` must be a valid 64-char lowercase hex SHA-256
     ///   digest and `timeout_ms` must be in `1..=MAX_CODEX_TIMEOUT_MS`.
+    /// - When `transport == Queue`, `native_context_digest` must be `None`.
+    /// - When `transport == UnixToolOutput`, `native_context_digest` must be a valid 64-char
+    ///   lowercase hex SHA-256 digest.
     pub fn validate(&self) -> Result<(), HostError> {
         if !self.enabled {
             if self.executable_digest.is_some()
                 || self.timeout_ms.is_some()
                 || self.route != HostNotificationRoute::Mcp
+                || self.transport != HostNotificationTransport::Queue
+                || self.native_context_digest.is_some()
             {
                 return Err(HostError::validation(
                     "notifications",
-                    "disabled notifications summary must have executable_digest=None, timeout_ms=None, and route=mcp",
+                    "disabled notifications summary must have executable_digest=None, timeout_ms=None, route=mcp, transport=queue, and native_context_digest=None",
                 ));
             }
             return Ok(());
@@ -290,6 +367,26 @@ impl HostNotificationSummary {
                 "notifications.timeout_ms",
                 format!("notifications timeout_ms must be between 1 and {MAX_CODEX_TIMEOUT_MS} ms"),
             ));
+        }
+
+        match self.transport {
+            HostNotificationTransport::Queue => {
+                if self.native_context_digest.is_some() {
+                    return Err(HostError::validation(
+                        "notifications.native_context_digest",
+                        "queue notifications summary must not include native_context_digest",
+                    ));
+                }
+            }
+            HostNotificationTransport::UnixToolOutput => {
+                let Some(ref native_digest) = self.native_context_digest else {
+                    return Err(HostError::validation(
+                        "notifications.native_context_digest",
+                        "unix_tool_output notifications summary requires native_context_digest",
+                    ));
+                };
+                validate_hex_digest("notifications.native_context_digest", native_digest)?;
+            }
         }
 
         Ok(())

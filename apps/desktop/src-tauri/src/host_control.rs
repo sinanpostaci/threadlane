@@ -787,11 +787,7 @@ fn verify_notification_policy_on_attach(
     actual: &HostNotificationSummary,
     requested: &HostNotificationSummary,
 ) -> Result<(), AppError> {
-    if actual.enabled == requested.enabled
-        && actual.executable_digest == requested.executable_digest
-        && actual.timeout_ms == requested.timeout_ms
-        && actual.route == requested.route
-    {
+    if actual == requested {
         return Ok(());
     }
     Err(AppError::new(
@@ -3103,6 +3099,29 @@ mod tests {
             "notification_policy_change_requires_restart"
         );
         assert!(verify_notification_policy_on_attach(&requested, &requested).is_ok());
+
+        let native_policy = HostNotificationSummary {
+            transport: threadlane_host::HostNotificationTransport::UnixToolOutput,
+            native_context_digest: Some("a".repeat(64)),
+            ..requested.clone()
+        };
+        assert_eq!(
+            verify_notification_policy_on_attach(&native_policy, &requested)
+                .unwrap_err()
+                .code,
+            "notification_policy_change_requires_restart"
+        );
+        let different_native_scope = HostNotificationSummary {
+            native_context_digest: Some("b".repeat(64)),
+            ..native_policy.clone()
+        };
+        assert_eq!(
+            verify_notification_policy_on_attach(&native_policy, &different_native_scope)
+                .unwrap_err()
+                .code,
+            "notification_policy_change_requires_restart"
+        );
+        assert!(verify_notification_policy_on_attach(&native_policy, &native_policy).is_ok());
 
         let changed_timeout = HostNotificationSummary {
             enabled: true,

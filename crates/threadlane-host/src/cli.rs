@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Args, Parser, Subcommand};
-use threadlane::DEFAULT_CODEX_TIMEOUT_MS;
+use threadlane::{NativeToolOutputConfig, DEFAULT_CODEX_TIMEOUT_MS};
 use threadlane_authority::AuthorityStore;
 use threadlane_plans::PlanStore;
 use threadlane_registry::RegistryStore;
@@ -120,6 +120,11 @@ pub struct ServeArgs {
     #[arg(long = "notify-route", value_parser = parse_notify_route)]
     pub notify_route: Option<HostNotificationRoute>,
 
+    /// Optional path to a private (`0600`) non-symlink regular JSON file (`<= 16 KiB`) configuring
+    /// native Unix WebSocket `turn/start.toolOutput` notifications (valid only with `--notify-codex`).
+    #[arg(long = "notify-tool-output-context")]
+    pub notify_tool_output_context: Option<PathBuf>,
+
     /// Optional expected prior stopped host instance identifier (`hst_<32hex>`) to restart cleanly via `ApprovedHost::restart_stopped`.
     #[arg(long = "restart-from-instance-id")]
     pub restart_from_instance_id: Option<String>,
@@ -175,12 +180,22 @@ impl ServeArgs {
                         "`--notify-route` cannot be used without `--notify-codex <ABS_EXEC>`",
                     ));
                 }
+                if self.notify_tool_output_context.is_some() {
+                    return Err(HostError::validation(
+                        "notify_tool_output_context",
+                        "`--notify-tool-output-context` cannot be used without `--notify-codex <ABS_EXEC>`",
+                    ));
+                }
             }
             Some(executable) => {
                 let timeout_ms = self.notify_timeout_ms.unwrap_or(DEFAULT_CODEX_TIMEOUT_MS);
                 let route = self.notify_route.unwrap_or(HostNotificationRoute::Mcp);
-                let notify_cfg =
+                let mut notify_cfg =
                     ApprovedHostNotificationConfig::new(executable, timeout_ms)?.with_route(route);
+                if let Some(ref context_path) = self.notify_tool_output_context {
+                    let tool_output = NativeToolOutputConfig::load(context_path)?;
+                    notify_cfg = notify_cfg.with_tool_output(tool_output)?;
+                }
                 config = config.with_notifications(notify_cfg);
             }
         }

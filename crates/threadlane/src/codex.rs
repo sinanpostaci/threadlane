@@ -12,6 +12,9 @@ use tokio::sync::watch;
 
 use crate::descriptor::{ensure_platform_supported, validate_no_symlink_components};
 use crate::error::Error;
+use crate::native_tool_output::{
+    invoke_native_tool_output_wakeup, validate_canonical_non_nil_uuid, NativeToolOutputConfig,
+};
 
 /// Default bounded timeout (ms) for a single Codex `queue` invocation.
 pub const DEFAULT_CODEX_TIMEOUT_MS: u64 = 10_000;
@@ -36,6 +39,7 @@ pub struct ApprovedSessionWakeupContext {
     /// Validated approval identifier (`apr_<32 lowercase hex>`).
     pub approval_id: String,
     route: ApprovedSessionWakeupRoute,
+    tool_output: Option<NativeToolOutputConfig>,
 }
 
 impl ApprovedSessionWakeupContext {
@@ -44,6 +48,7 @@ impl ApprovedSessionWakeupContext {
         let ctx = Self {
             approval_id: approval_id.into(),
             route: ApprovedSessionWakeupRoute::Mcp,
+            tool_output: None,
         };
         ctx.validate()?;
         Ok(ctx)
@@ -56,9 +61,30 @@ impl ApprovedSessionWakeupContext {
         self
     }
 
-    /// Validates that `approval_id` is `apr_` followed by 32 lowercase ASCII hex characters.
+    /// Attaches and validates an explicit native tool-output wake-up transport configuration.
+    pub fn with_tool_output_transport(
+        mut self,
+        config: NativeToolOutputConfig,
+    ) -> Result<Self, Error> {
+        validate_approved_session_approval_id(&self.approval_id)?;
+        config.validate()?;
+        self.tool_output = Some(config);
+        Ok(self)
+    }
+
+    /// Returns the configured native tool-output transport configuration, if selected.
+    pub fn tool_output_transport(&self) -> Option<&NativeToolOutputConfig> {
+        self.tool_output.as_ref()
+    }
+
+    /// Validates that `approval_id` is `apr_` followed by 32 lowercase ASCII hex characters,
+    /// and validates the optional native tool-output transport configuration if present.
     pub fn validate(&self) -> Result<(), Error> {
-        validate_approved_session_approval_id(&self.approval_id)
+        validate_approved_session_approval_id(&self.approval_id)?;
+        if let Some(ref tool_output) = self.tool_output {
+            tool_output.validate()?;
+        }
+        Ok(())
     }
 
     /// Formats the fixed approved-session wake-up message for this `approval_id` and route.
@@ -216,6 +242,49 @@ pub async fn invoke_codex_wakeup(
     claim: &WakeupClaim,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) -> WakeupOutcome {
+    let timeout_ms = config.timeout.as_millis();
+    if timeout_ms == 0 || timeout_ms > u128::from(MAX_CODEX_TIMEOUT_MS) {
+        return WakeupOutcome::Failed {
+            error: "codex timeout is out of bounds".to_string(),
+        };
+    }
+
+    if validate_binding_id_allowlist_entry(&claim.binding_id).is_err()
+        || !config.notify_bindings.contains(&claim.binding_id)
+    {
+        return WakeupOutcome::Failed {
+            error: "wake-up claim binding_id is not in notify_bindings allowlist".to_string(),
+        };
+    }
+
+    if validate_canonical_non_nil_uuid(&claim.thread_uuid, "claim.thread_uuid").is_err() {
+        return WakeupOutcome::Failed {
+            error: "wake-up claim thread_uuid is not a canonical non-nil UUID".to_string(),
+        };
+    }
+
+    let approved_message = match config.approved_session {
+        Some(ref approved_session) => {
+            if let Err(err) = approved_session.validate() {
+                return WakeupOutcome::Failed {
+                    error: truncate_error(&err.to_string()),
+                };
+            }
+            if let Some(tool_output_cfg) = approved_session.tool_output_transport() {
+                return invoke_native_tool_output_wakeup(
+                    config,
+                    claim,
+                    approved_session,
+                    tool_output_cfg,
+                    shutdown_rx,
+                )
+                .await;
+            }
+            Some(approved_session.wakeup_message())
+        }
+        None => None,
+    };
+
     match fs::symlink_metadata(&config.executable) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -235,18 +304,6 @@ pub async fn invoke_codex_wakeup(
             };
         }
     }
-
-    let approved_message = match config.approved_session {
-        Some(ref approved_session) => {
-            if let Err(err) = approved_session.validate() {
-                return WakeupOutcome::Failed {
-                    error: truncate_error(&err.to_string()),
-                };
-            }
-            Some(approved_session.wakeup_message())
-        }
-        None => None,
-    };
 
     let mut cmd = Command::new(&config.executable);
     if let Some(ref message) = approved_message {

@@ -16,10 +16,10 @@ use threadlane_workers::{WorkerError, WorktreeManager};
 
 use crate::error::HostError;
 use crate::storage::{
-    ensure_fresh_session_dir_locked, ensure_private_dir, generate_host_instance_id, now_epoch_ms,
-    prepare_session_dir, read_host_manifest_optional, validate_approval_id,
-    validate_host_instance_id, validate_sessions_root, verify_existing_task_receipts,
-    write_host_manifest, HostSessionLock,
+    ensure_fresh_session_dir_locked, ensure_no_symlink_components, ensure_private_dir,
+    generate_host_instance_id, now_epoch_ms, prepare_session_dir, read_host_manifest_optional,
+    validate_approval_id, validate_host_instance_id, validate_sessions_root,
+    verify_existing_task_receipts, write_host_manifest, HostSessionLock,
 };
 use crate::types::{
     ApprovedHostNotificationConfig, HostExecutionGates, HostNotificationRoute,
@@ -102,6 +102,7 @@ impl ApprovedHost {
     /// Opens the global stores in `config` and starts the host session for `config.approval_id`.
     pub async fn start(config: ApprovedHostConfig) -> Result<ApprovedHostHandle, HostError> {
         validate_approval_id(&config.approval_id)?;
+        let validated_notifications = validate_host_notifications(config.notifications)?;
         let registry = Arc::new(RegistryStore::open(&config.registry_dir)?);
         let plans = Arc::new(PlanStore::open(&config.plans_dir)?);
         let authority = Arc::new(AuthorityStore::open(
@@ -109,6 +110,8 @@ impl ApprovedHost {
             Arc::clone(&registry),
             Arc::clone(&plans),
         )?);
+        let record = authority.get_for_operator(&config.approval_id)?;
+        validate_notifications_against_approval(validated_notifications.as_ref(), &record)?;
         validate_sessions_root(
             &config.sessions_dir,
             &[
@@ -122,7 +125,7 @@ impl ApprovedHost {
             &config.sessions_dir,
             &config.approval_id,
             config.tick_interval,
-            config.notifications,
+            validated_notifications,
         )
         .await
     }
@@ -172,6 +175,7 @@ impl ApprovedHost {
         config: ApprovedHostConfig,
     ) -> Result<ApprovedHostHandle, HostError> {
         validate_approval_id(&config.approval_id)?;
+        let validated_notifications = validate_host_notifications(config.notifications)?;
         let registry = Arc::new(RegistryStore::open(&config.registry_dir)?);
         let plans = Arc::new(PlanStore::open(&config.plans_dir)?);
         let authority = Arc::new(AuthorityStore::open(
@@ -179,6 +183,8 @@ impl ApprovedHost {
             Arc::clone(&registry),
             Arc::clone(&plans),
         )?);
+        let record = authority.get_for_operator(&config.approval_id)?;
+        validate_notifications_against_approval(validated_notifications.as_ref(), &record)?;
         validate_sessions_root(
             &config.sessions_dir,
             &[
@@ -192,7 +198,7 @@ impl ApprovedHost {
             &config.sessions_dir,
             &config.approval_id,
             config.tick_interval,
-            config.notifications,
+            validated_notifications,
         )
         .await
     }
@@ -248,13 +254,7 @@ impl ApprovedHost {
     ) -> Result<ApprovedHostHandle, HostError> {
         validate_approval_id(approval_id)?;
 
-        let validated_notifications = match notifications {
-            Some(cfg) => Some(
-                ApprovedHostNotificationConfig::new(cfg.executable, cfg.timeout_ms)?
-                    .with_route(cfg.route),
-            ),
-            None => None,
-        };
+        let validated_notifications = validate_host_notifications(notifications)?;
         let notify_summary = validated_notifications
             .as_ref()
             .map(ApprovedHostNotificationConfig::summary)
@@ -263,6 +263,7 @@ impl ApprovedHost {
         // Read and integrity-verify the persisted immutable approval record.
         // Host startup never calls `approve`.
         let record = authority.get_for_operator(approval_id)?;
+        validate_notifications_against_approval(validated_notifications.as_ref(), &record)?;
 
         let canonical_sessions_root = validate_sessions_root(
             sessions_dir,
@@ -395,6 +396,7 @@ impl ApprovedHost {
     ) -> Result<ApprovedHostHandle, HostError> {
         validate_approval_id(&config.approval_id)?;
         validate_host_instance_id("expected_prior_instance_id", expected_prior_instance_id)?;
+        let validated_notifications = validate_host_notifications(config.notifications)?;
         let registry = Arc::new(RegistryStore::open(&config.registry_dir)?);
         let plans = Arc::new(PlanStore::open(&config.plans_dir)?);
         let authority = Arc::new(AuthorityStore::open(
@@ -402,6 +404,8 @@ impl ApprovedHost {
             Arc::clone(&registry),
             Arc::clone(&plans),
         )?);
+        let record = authority.get_for_operator(&config.approval_id)?;
+        validate_notifications_against_approval(validated_notifications.as_ref(), &record)?;
         validate_sessions_root(
             &config.sessions_dir,
             &[
@@ -416,7 +420,7 @@ impl ApprovedHost {
             &config.approval_id,
             expected_prior_instance_id,
             config.tick_interval,
-            config.notifications,
+            validated_notifications,
         )
         .await
     }
@@ -437,19 +441,14 @@ impl ApprovedHost {
         validate_approval_id(approval_id)?;
         validate_host_instance_id("expected_prior_instance_id", expected_prior_instance_id)?;
 
-        let validated_notifications = match notifications {
-            Some(cfg) => Some(
-                ApprovedHostNotificationConfig::new(cfg.executable, cfg.timeout_ms)?
-                    .with_route(cfg.route),
-            ),
-            None => None,
-        };
+        let validated_notifications = validate_host_notifications(notifications)?;
         let notify_summary = validated_notifications
             .as_ref()
             .map(ApprovedHostNotificationConfig::summary)
             .unwrap_or_default();
 
         let record = authority.get_for_operator(approval_id)?;
+        validate_notifications_against_approval(validated_notifications.as_ref(), &record)?;
 
         let canonical_sessions_root = validate_sessions_root(
             sessions_dir.as_ref(),
@@ -759,6 +758,9 @@ impl ApprovedHost {
                     ApprovedSessionWakeupContext::new(record.approval_id.clone())?;
                 if matches!(notify_cfg.route, HostNotificationRoute::OperatorCli) {
                     approved_ctx = approved_ctx.with_operator_cli_route();
+                }
+                if let Some(ref tool_output) = notify_cfg.tool_output {
+                    approved_ctx = approved_ctx.with_tool_output_transport(tool_output.clone())?;
                 }
                 let codex_cfg = CodexWakeupConfig {
                     executable: notify_cfg.executable.clone(),
@@ -1105,6 +1107,77 @@ fn map_work_area_init_error(work_area_dir: &Path, err: WorkerError) -> HostError
             message: other.to_string(),
         },
     }
+}
+
+fn validate_host_notifications(
+    notifications: Option<ApprovedHostNotificationConfig>,
+) -> Result<Option<ApprovedHostNotificationConfig>, HostError> {
+    match notifications {
+        Some(cfg) => {
+            let mut rebuilt = ApprovedHostNotificationConfig::new(cfg.executable, cfg.timeout_ms)?
+                .with_route(cfg.route);
+            if let Some(tool_output) = cfg.tool_output {
+                rebuilt = rebuilt.with_tool_output(tool_output)?;
+            }
+            Ok(Some(rebuilt))
+        }
+        None => Ok(None),
+    }
+}
+
+fn validate_notifications_against_approval(
+    notifications: Option<&ApprovedHostNotificationConfig>,
+    record: &ApprovalRecord,
+) -> Result<(), HostError> {
+    let Some(notify_cfg) = notifications else {
+        return Ok(());
+    };
+    let Some(ref tool_output) = notify_cfg.tool_output else {
+        return Ok(());
+    };
+
+    tool_output.validate()?;
+
+    if tool_output.thread_id != record.thread_uuid {
+        return Err(HostError::ScopeMismatch {
+            field: "thread_id".to_string(),
+            expected: "<redacted>".to_string(),
+            actual: "<redacted>".to_string(),
+            reason: "native tool-output context thread_id does not match approved thread_uuid"
+                .to_string(),
+        });
+    }
+
+    let checked_project_root = ensure_no_symlink_components(&tool_output.project_root)?;
+    let canonical_project_root = std::fs::canonicalize(&checked_project_root).map_err(|err| {
+        HostError::validation(
+            "project_root",
+            format!("native tool-output context project_root could not be canonicalized: {err}"),
+        )
+    })?;
+    let checked_repo_path = ensure_no_symlink_components(&record.repository_path)?;
+    let canonical_repo_path = std::fs::canonicalize(&checked_repo_path).map_err(|err| {
+        HostError::validation(
+            "repository_path",
+            format!("approved repository_path could not be canonicalized: {err}"),
+        )
+    })?;
+
+    if checked_project_root != canonical_project_root
+        || canonical_project_root != canonical_repo_path
+        || tool_output.project_root != canonical_repo_path
+    {
+        return Err(HostError::ScopeMismatch {
+            field: "project_root".to_string(),
+            expected: "<redacted>".to_string(),
+            actual: "<redacted>".to_string(),
+            reason:
+                "native tool-output context project_root does not match approved repository_path"
+                    .to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 fn sanitize_error_diagnostic(err: &HostError) -> String {
