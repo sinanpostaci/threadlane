@@ -195,6 +195,7 @@ exit 0
             2,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
+                    decision_advisor: None,
                     id: "profile-main".to_string(),
                     name: "Main Profile".to_string(),
                     assignments: vec![RoleAssignment {

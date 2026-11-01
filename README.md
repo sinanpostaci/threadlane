@@ -69,6 +69,11 @@ not require switching to the panel for each task. See
   change plans, profiles, difficulty, models, approvals, hosts, workers or Git.
   See [Jev shadow advice](docs/JEV-SHADOW.md).
 
+- **Optional decision advisor**: Profiles may reference a global decision API
+  model separately from the six worker roles. Advisors default to off, have no
+  effort setting, and provide shadow advice only. Saving a choice sends no
+  provider request. See [profile decision advisors](docs/PROFILE-ADVISOR.md).
+
 - **Profile-selected role cycles**: `threadlane-flow` validates only requested
   roles against an explicit model/effort policy, freezes an approved cycle, and
   records idempotent role handoffs. Native Codex handoffs remain manual routing;

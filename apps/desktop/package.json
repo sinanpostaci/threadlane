@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/state.test.ts src/registry/model-families.test.ts"
+    "test": "node --experimental-strip-types --test src/state.test.ts src/registry/model-families.test.ts src/registry/profile-advisor.test.ts src/registry/profile-advisor-ipc.test.ts"
   },
   "dependencies": {
     "@lobehub/icons-static-svg": "1.101.0",

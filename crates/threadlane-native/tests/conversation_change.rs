@@ -170,6 +170,7 @@ impl ChangeRoutingFixture {
                 s3.revision,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: PROFILE_ID.to_string(),
                         name: "Change Routing Profile".to_string(),
                         assignments: vec![RoleAssignment {

@@ -134,6 +134,7 @@ mod tests {
                 },
             ],
             profiles: vec![WorkflowProfile {
+                decision_advisor: None,
                 id: "profile-default".to_string(),
                 name: "Default M4 Profile".to_string(),
                 assignments: vec![

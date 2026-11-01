@@ -17,6 +17,10 @@
 //! - **Public view redaction**: [`CatalogPage`], [`PlanSummaryPage`], [`PlanPage`], [`PlanSummary`],
 //!   and [`PublishedPlanView`] serialize in `snake_case` and never expose CLI `executable_path`
 //!   values or credentials.
+//! - **Read-only advisor metadata**: [`CatalogProfile::decision_advisor`] exposes only the
+//!   configured advisor mode, model/tool identifiers and labels, model argument, and adapter.
+//!   Catalog reads never probe credentials or provider status, never change assignment counts or
+//!   [`CatalogProfile::available`], and never grant execution authority or dispatch advice work.
 //! - **Validated compilation & explicit publish boundary**: `save_draft` validates task DAGs,
 //!   write scopes, and role/difficulty resolution against the pinned `profile_revision` via
 //!   [`preview_draft_compilation`] before mutating [`PlanStore`]. `publish` transitions a draft
@@ -47,13 +51,14 @@ pub use threadlane_plans::{
 };
 pub use threadlane_registry::{resolve_choice, validate_registry_identifier};
 pub use threadlane_registry::{
-    Difficulty, ModelChoice, ModelDefinition, RegistryChange, RegistryError, RegistrySnapshot,
-    RegistryStore, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+    DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition, RegistryChange,
+    RegistryError, RegistrySnapshot, RegistryStore, RoleAssignment, ToolAdapter, ToolDefinition,
+    WorkflowProfile, WorkflowRole,
 };
 pub use types::{
-    CatalogAssignment, CatalogPage, CatalogProfile, CatalogRoleAssignment, PlanHeader, PlanPage,
-    PlanSummary, PlanSummaryPage, PublicTaskRoute, PublishedPlanView, SavePlanDraft,
-    TaskExecutionRoute, TaskRoute, DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT,
+    CatalogAssignment, CatalogDecisionAdvisor, CatalogPage, CatalogProfile, CatalogRoleAssignment,
+    PlanHeader, PlanPage, PlanSummary, PlanSummaryPage, PublicTaskRoute, PublishedPlanView,
+    SavePlanDraft, TaskExecutionRoute, TaskRoute, DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT,
     DEFAULT_PLAN_TASK_LIMIT, MAX_CATALOG_LIMIT, MAX_CURSOR_LEN, MAX_MCP_RESPONSE_BYTES,
     MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
 };
@@ -104,6 +109,57 @@ mod tests {
             model_arg: model_arg.to_string(),
             efforts: efforts.iter().map(|s| (*s).to_string()).collect(),
             allow_no_effort,
+        }
+    }
+
+    fn seed_decision_advisor_tools_and_models(
+        registry: &RegistryStore,
+        mut current_rev: u64,
+    ) -> u64 {
+        for tool in [
+            sample_tool("jev", ToolAdapter::JevApi, true),
+            sample_tool("openai-decisions", ToolAdapter::OpenaiDecisionsApi, true),
+        ] {
+            current_rev = registry
+                .apply(current_rev, RegistryChange::UpsertTool { tool })
+                .expect("upsert decision advisor tool")
+                .revision;
+        }
+
+        registry
+            .apply(
+                current_rev,
+                RegistryChange::UpsertModels {
+                    models: vec![
+                        sample_model("jev-advisor", "jev", "jev-latest", &[], true),
+                        sample_model(
+                            "openai-advisor",
+                            "openai-decisions",
+                            "openai-decisions-v1",
+                            &[],
+                            true,
+                        ),
+                    ],
+                },
+            )
+            .expect("upsert decision advisor models")
+            .revision
+    }
+
+    fn advisor_profile(
+        base: &WorkflowProfile,
+        id: &str,
+        name: &str,
+        model_id: &str,
+    ) -> WorkflowProfile {
+        WorkflowProfile {
+            id: id.to_string(),
+            name: name.to_string(),
+            assignments: base.assignments.clone(),
+            decision_advisor: Some(DecisionAdvisor {
+                model_id: model_id.to_string(),
+                mode: DecisionAdvisorMode::Shadow,
+            }),
         }
     }
 
@@ -237,6 +293,7 @@ mod tests {
                     },
                 },
             ],
+            decision_advisor: None,
         };
 
         let s6 = registry
@@ -278,6 +335,7 @@ mod tests {
                         effort: Some("high".to_string()),
                     },
                 }],
+                decision_advisor: None,
             };
             current_rev = registry
                 .apply(current_rev, RegistryChange::UpsertProfile { profile: p })
@@ -353,6 +411,289 @@ mod tests {
         assert_eq!(easy_coder.tool_id, "opencode");
         assert!(!easy_coder.tool_enabled);
         assert!(!easy_coder.available);
+    }
+
+    #[test]
+    fn catalog_decision_advisor_is_exact_read_only_metadata_and_legacy_wire_safe() {
+        let (_tmp, registry, plans, rev) = setup_stores();
+        let rev = seed_decision_advisor_tools_and_models(&registry, rev);
+
+        let base_profile = registry
+            .snapshot()
+            .expect("registry snapshot")
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == "default-profile")
+            .expect("default profile");
+        assert!(base_profile.decision_advisor.is_none());
+
+        let jev_profile = advisor_profile(
+            &base_profile,
+            "advisor-jev",
+            "Jev Advisor Profile",
+            "jev-advisor",
+        );
+        let openai_profile = advisor_profile(
+            &base_profile,
+            "advisor-openai",
+            "OpenAI Advisor Profile",
+            "openai-advisor",
+        );
+
+        let rev = registry
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: jev_profile,
+                },
+            )
+            .expect("upsert Jev advisor profile")
+            .revision;
+        let rev = registry
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: openai_profile,
+                },
+            )
+            .expect("upsert OpenAI advisor profile")
+            .revision;
+
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("create workflow");
+
+        let page = wf
+            .catalog(None, None)
+            .expect("catalog with decision advisors");
+        assert_eq!(page.registry_revision, rev);
+        assert_eq!(page.profiles.len(), 3);
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.profiles[0].profile_id, "default-profile");
+
+        let legacy_profile = &page.profiles[0];
+        assert!(legacy_profile.decision_advisor.is_none());
+        let legacy_value = serde_json::to_value(legacy_profile).expect("serialize legacy profile");
+        assert!(
+            legacy_value.get("decision_advisor").is_none(),
+            "legacy absent advisor must stay omitted from the wire"
+        );
+        let decoded_legacy: CatalogProfile =
+            serde_json::from_value(legacy_value).expect("decode legacy profile");
+        assert_eq!(&decoded_legacy, legacy_profile);
+
+        let jev_catalog = page
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == "advisor-jev")
+            .expect("Jev advisor profile");
+        let jev_advisor = jev_catalog
+            .decision_advisor
+            .as_ref()
+            .expect("Jev advisor metadata");
+        assert_eq!(jev_advisor.mode, DecisionAdvisorMode::Shadow);
+        assert_eq!(jev_advisor.model_id, "jev-advisor");
+        assert_eq!(jev_advisor.model_label, "Model jev-advisor");
+        assert_eq!(jev_advisor.model_arg, "jev-latest");
+        assert_eq!(jev_advisor.tool_id, "jev");
+        assert_eq!(jev_advisor.tool_label, "Tool jev");
+        assert_eq!(jev_advisor.adapter, ToolAdapter::JevApi);
+
+        let openai_catalog = page
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == "advisor-openai")
+            .expect("OpenAI advisor profile");
+        let openai_advisor = openai_catalog
+            .decision_advisor
+            .as_ref()
+            .expect("OpenAI advisor metadata");
+        assert_eq!(openai_advisor.mode, DecisionAdvisorMode::Shadow);
+        assert_eq!(openai_advisor.model_id, "openai-advisor");
+        assert_eq!(openai_advisor.model_label, "Model openai-advisor");
+        assert_eq!(openai_advisor.model_arg, "openai-decisions-v1");
+        assert_eq!(openai_advisor.tool_id, "openai-decisions");
+        assert_eq!(openai_advisor.tool_label, "Tool openai-decisions");
+        assert_eq!(openai_advisor.adapter, ToolAdapter::OpenaiDecisionsApi);
+
+        for advised_profile in [jev_catalog, openai_catalog] {
+            assert_eq!(advised_profile.assignments, legacy_profile.assignments);
+            assert_eq!(
+                advised_profile.assignments.len(),
+                legacy_profile.assignments.len()
+            );
+            assert!(
+                !advised_profile
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.model_id.ends_with("-advisor")),
+                "the advisor must not become a seventh role assignment"
+            );
+            assert_eq!(advised_profile.available, legacy_profile.available);
+        }
+
+        let advisor_value = serde_json::to_value(jev_advisor).expect("serialize advisor");
+        let advisor_object = advisor_value.as_object().expect("advisor object");
+        let expected_keys = [
+            "mode",
+            "model_id",
+            "model_label",
+            "model_arg",
+            "tool_id",
+            "tool_label",
+            "adapter",
+        ];
+        assert_eq!(advisor_object.len(), expected_keys.len());
+        for key in expected_keys {
+            assert!(
+                advisor_object.contains_key(key),
+                "advisor metadata must include {key}"
+            );
+        }
+        for absent_key in [
+            "effort",
+            "executable_path",
+            "route",
+            "available",
+            "status",
+            "credential",
+            "secret",
+        ] {
+            assert!(
+                !advisor_object.contains_key(absent_key),
+                "advisor metadata must not include {absent_key}"
+            );
+        }
+
+        let envelope =
+            ThreadlaneMcpServer::build_structured_tool_result("binding-1", "catalog", &page);
+        let serialized = serde_json::to_vec(&envelope).expect("serialize catalog envelope");
+        assert!(serialized.len() <= MAX_MCP_RESPONSE_BYTES);
+        let serialized_text = String::from_utf8(serialized).expect("catalog envelope UTF-8");
+        assert!(!serialized_text.contains("/opt/secret-cli-paths"));
+        assert!(!serialized_text.contains("executable_path"));
+        assert!(!serialized_text.contains("\"secret\""));
+        assert!(!serialized_text.contains("\"credential\""));
+    }
+
+    #[test]
+    fn catalog_decision_advisor_preserves_pagination_cas_and_wire_budget() {
+        let (_tmp, registry, plans, rev) = setup_stores();
+        let mut rev = seed_decision_advisor_tools_and_models(&registry, rev);
+
+        let base_profile = registry
+            .snapshot()
+            .expect("registry snapshot")
+            .profiles
+            .into_iter()
+            .find(|profile| profile.id == "default-profile")
+            .expect("default profile");
+
+        for (id, name, model_id) in [
+            ("advisor-jev-01", "Jev Advisor 01", "jev-advisor"),
+            ("advisor-openai-02", "OpenAI Advisor 02", "openai-advisor"),
+        ] {
+            let profile = advisor_profile(&base_profile, id, name, model_id);
+            rev = registry
+                .apply(rev, RegistryChange::UpsertProfile { profile })
+                .expect("upsert advisor profile")
+                .revision;
+        }
+
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("create workflow");
+
+        let page1 = wf
+            .catalog(None, Some(1))
+            .expect("catalog page 1 with limit 1");
+        assert_eq!(page1.registry_revision, rev);
+        assert_eq!(page1.profiles.len(), 1);
+        assert!(page1.has_more);
+        assert!(page1.next_cursor.is_some());
+        assert!(page1.profiles[0].decision_advisor.is_none());
+        assert!(
+            measure_mcp_response_bytes("binding-1", "catalog", &page1)
+                .expect("measure page 1 envelope")
+                <= MAX_MCP_RESPONSE_BYTES
+        );
+
+        let mut cursor = page1.next_cursor.clone();
+        let mut visited = vec![page1.profiles[0].profile_id.clone()];
+        loop {
+            let page = wf
+                .catalog(cursor.clone(), Some(1))
+                .expect("catalog page within budget");
+            assert!(
+                measure_mcp_response_bytes("binding-1", "catalog", &page)
+                    .expect("measure catalog envelope")
+                    <= MAX_MCP_RESPONSE_BYTES
+            );
+            visited.extend(
+                page.profiles
+                    .iter()
+                    .map(|profile| profile.profile_id.clone()),
+            );
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => {
+                    assert!(!page.has_more);
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            visited,
+            vec![
+                "default-profile".to_string(),
+                "advisor-jev-01".to_string(),
+                "advisor-openai-02".to_string(),
+            ]
+        );
+
+        let stale_cursor = cursor.expect("cursor for the last served page");
+        let updated = registry
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: advisor_profile(
+                        &base_profile,
+                        "advisor-jev-01",
+                        "Jev Advisor 01 Updated",
+                        "openai-advisor",
+                    ),
+                },
+            )
+            .expect("update advisor configuration");
+        assert_eq!(updated.revision, rev + 1);
+
+        let stale_err = wf
+            .catalog(Some(stale_cursor), Some(1))
+            .expect_err("cursor from a previous registry revision must be stale");
+        assert_eq!(stale_err.code(), "stale_revision");
+
+        let refreshed = wf.catalog(None, None).expect("refreshed catalog");
+        assert_eq!(refreshed.registry_revision, updated.revision);
+        let refreshed_jev = refreshed
+            .profiles
+            .iter()
+            .find(|profile| profile.profile_id == "advisor-jev-01")
+            .expect("refreshed Jev advisor profile");
+        assert_eq!(
+            refreshed_jev
+                .decision_advisor
+                .as_ref()
+                .expect("refreshed advisor metadata")
+                .model_id,
+            "openai-advisor"
+        );
     }
 
     #[test]

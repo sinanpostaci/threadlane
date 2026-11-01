@@ -426,6 +426,121 @@
   padding-left: 18px;
 }
 
+.aq-profiles-advisor {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--aq-line);
+  border-left: 3px solid var(--aq-line);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--aq-field) 32%, transparent);
+}
+
+.aq-profiles-advisor[data-tone="ready"] {
+  border-left-color: var(--aq-accent);
+}
+
+.aq-profiles-advisor[data-tone="invalid"] {
+  border-left-color: var(--aq-danger);
+}
+
+.aq-profiles-advisor-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 4px 10px;
+}
+
+.aq-profiles-advisor-title {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.aq-profiles-advisor-title h4 {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.3;
+  font-weight: 600;
+}
+
+.aq-profiles-advisor-controls {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.aq-profiles-advisor-controls .aq-profiles-link {
+  justify-self: start;
+}
+
+.aq-profiles-advisor-issue {
+  display: grid;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid var(--aq-danger);
+  border-radius: 5px;
+  background: var(--aq-danger-bg);
+  color: var(--aq-danger);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.aq-profiles-advisor-issue strong {
+  font-size: 12px;
+}
+
+.aq-profiles-advisor-issue p {
+  margin: 0;
+  color: var(--aq-danger);
+  overflow-wrap: anywhere;
+}
+
+.aq-profiles-advisor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.aq-profiles-advisor-empty {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed var(--aq-border);
+  border-radius: 5px;
+}
+
+.aq-profiles-advisor-empty p {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.aq-profiles-advisor .aq-btn {
+  min-height: 28px;
+  padding: 3px 9px;
+  font-size: 12px;
+}
+
+.aq-profiles-advisor-summary {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.aq-profiles-advisor-summary strong {
+  color: var(--aq-text);
+  font-weight: 600;
+}
+
 .aq-profiles-roles {
   display: grid;
   gap: 8px;
@@ -665,6 +780,16 @@
   }
 
   .aq-profiles-setup-actions .aq-btn {
+    flex: 1 1 110px;
+    min-width: 0;
+  }
+
+  .aq-profiles-advisor-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .aq-profiles-advisor-empty .aq-btn,
+  .aq-profiles-advisor-actions .aq-btn {
     flex: 1 1 110px;
     min-width: 0;
   }

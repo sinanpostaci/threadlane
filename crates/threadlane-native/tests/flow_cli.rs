@@ -142,6 +142,7 @@ impl FlowFixture {
                 s2.revision,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: PROFILE_ID.to_string(),
                         name: "Flow CLI fixture profile".to_string(),
                         assignments: vec![RoleAssignment {
@@ -542,6 +543,7 @@ async fn preflight_without_profile_id_uses_only_the_registry_default() {
             snapshot.revision,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
+                    decision_advisor: None,
                     id: "default".to_string(),
                     name: "default".to_string(),
                     assignments: vec![RoleAssignment {

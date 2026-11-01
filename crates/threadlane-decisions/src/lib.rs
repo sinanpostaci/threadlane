@@ -55,13 +55,15 @@ mod tests {
     use fs2::FileExt;
     use threadlane_connectors::{ConnectorError, CredentialStore};
     use threadlane_registry::{
-        Difficulty, ModelChoice, ModelDefinition, RegistryChange, RegistryStore, RoleAssignment,
-        ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+        DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition,
+        RegistryChange, RegistryStore, RoleAssignment, ToolAdapter, ToolDefinition,
+        WorkflowProfile, WorkflowRole,
     };
 
     use super::*;
     use crate::advice::{
-        classify_advice_with_options, preview_advice_with_options, AdviceRuntimeOptions,
+        classify_advice_with_options, compute_cache_key, preview_advice_with_options,
+        AdviceRuntimeOptions,
     };
 
     static TEST_DIR_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -122,6 +124,14 @@ mod tests {
                 project_root: self.project_root.clone(),
                 context_id: context_id.to_string(),
                 cache_ttl_seconds: DEFAULT_CACHE_TTL_SECONDS,
+                profile_id: None,
+            }
+        }
+
+        fn scope_with_profile(&self, context_id: &str, profile_id: &str) -> AdviceScope {
+            AdviceScope {
+                profile_id: Some(profile_id.to_string()),
+                ..self.scope(context_id)
             }
         }
 
@@ -1041,6 +1051,56 @@ mod tests {
         let reg_bytes_after =
             fs::read(ws.registry_dir.join("registry.json")).expect("read registry after");
         assert_eq!(reg_bytes_before, reg_bytes_after);
+    }
+
+    #[tokio::test]
+    async fn legacy_unscoped_advice_preserves_effort_metadata_behavior_and_cache_hits() {
+        let ws = ScopedTestWorkspace::new("legacy-unscoped-effort-metadata");
+        ws.seed_jev_registry();
+        let store = RegistryStore::open(&ws.registry_dir).expect("open fixture registry");
+        let snapshot = store.snapshot().expect("fixture snapshot");
+        let mut model = snapshot.models[0].clone();
+        model.allow_no_effort = false;
+        model.efforts = vec!["high".to_string()];
+        let updated = store
+            .apply(snapshot.revision, RegistryChange::UpsertModel { model })
+            .expect("legacy API model metadata remains a valid registry definition");
+        let request = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "expected_registry_revision": updated.revision,
+            "tool_id": "jev-api",
+            "model_id": "jev-api:jev-latest",
+            "task_id": "legacy-unscoped",
+            "task_revision": 1,
+            "task_summary": "Classify a fixture without an explicit profile."
+        }))
+        .expect("serialize fixture request");
+        let path = ws.write_private_file("legacy-request.json", &request);
+        let scope = ws.scope("ctx-legacy-effort");
+        let vault = FakeVault::with_secret("jev-api", "fixture-key");
+        let transport = FakeTransport::with_responses([valid_jev_four_way_response(
+            "jev-1.14.0",
+            "easy",
+            0.95,
+            (0.95, 0.03, 0.01, 0.01),
+            100,
+            10,
+        )]);
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+        let first = classify_advice(&scope, &path, false, vault.clone(), &client)
+            .await
+            .expect("legacy unscoped route must preserve prerequisite behavior");
+        assert_eq!(first.source, AdviceSource::Provider);
+        assert_eq!(first.profile_id, None);
+        let reads_after_provider = vault.read_count();
+        let cached = classify_advice(&scope, &path, false, vault.clone(), &client)
+            .await
+            .expect("legacy unscoped cache entry remains reusable");
+        assert_eq!(cached.source, AdviceSource::Cache);
+        assert_eq!(cached.cache_key, first.cache_key);
+        assert_eq!(vault.read_count(), reads_after_provider);
+        assert_eq!(transport.recorded_requests().len(), 1);
     }
 
     #[tokio::test]
@@ -2067,6 +2127,7 @@ mod tests {
                                 effort: None,
                             },
                         }],
+                        decision_advisor: None,
                     },
                 },
             )
@@ -3010,5 +3071,971 @@ mod tests {
             .exists());
 
         active_lock_file.unlock().expect("unlock active lock");
+    }
+
+    #[tokio::test]
+    async fn legacy_none_golden_cache_key_and_old_records_without_profile_field_remain_compatible()
+    {
+        const GOLDEN_LEGACY_CACHE_KEY: &str =
+            "8c2e1914792f6d6402f008196d29dd7eb07ab314aa6930f7cfbd2edd8ff46614";
+        let prompt_digest = "1111111111111111111111111111111111111111111111111111111111111111";
+        let project = "/fixtures/project";
+        let context = "ctx-profile";
+        let task = "task1";
+        let task_revision = 1u64;
+        let summary_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        let registry_revision = 17u64;
+        let tool = "jev-api";
+        let model_id = "jev-api:jev-latest";
+        let requested_model = "jev-latest";
+
+        // 1. None profile_id must match the independently calculated legacy v1 golden key byte-for-byte.
+        let none_key = compute_cache_key(
+            prompt_digest,
+            project,
+            context,
+            task,
+            task_revision,
+            summary_sha256,
+            registry_revision,
+            tool,
+            model_id,
+            requested_model,
+            None,
+        );
+        assert_eq!(none_key, GOLDEN_LEGACY_CACHE_KEY);
+
+        // 2. Some(profile_id) domain-separated keys must differ from None and from each other.
+        let profile_a_key = compute_cache_key(
+            prompt_digest,
+            project,
+            context,
+            task,
+            task_revision,
+            summary_sha256,
+            registry_revision,
+            tool,
+            model_id,
+            requested_model,
+            Some("profile-alpha"),
+        );
+        let profile_b_key = compute_cache_key(
+            prompt_digest,
+            project,
+            context,
+            task,
+            task_revision,
+            summary_sha256,
+            registry_revision,
+            tool,
+            model_id,
+            requested_model,
+            Some("profile-beta"),
+        );
+        assert_ne!(profile_a_key, GOLDEN_LEGACY_CACHE_KEY);
+        assert_ne!(profile_b_key, GOLDEN_LEGACY_CACHE_KEY);
+        assert_ne!(profile_a_key, profile_b_key);
+
+        // 3. Old persisted Pending, Uncertain, and Completed records without a `profile_id` field
+        //    must remain readable and protected under `profile_id: None`.
+        let ws = ScopedTestWorkspace::new("legacy-record-compat");
+        let reg_rev = ws.seed_jev_registry();
+        let scope = ws.scope("ctx-profile");
+        fs::create_dir_all(&ws.cache_dir).expect("create cache_dir");
+        fs::set_permissions(&ws.cache_dir, fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 cache_dir");
+
+        let req_json = format!(
+            r#"{{
+                "schema_version": 1,
+                "expected_registry_revision": {reg_rev},
+                "tool_id": "jev-api",
+                "model_id": "jev-api:jev-latest",
+                "task_id": "task1",
+                "task_revision": 1,
+                "task_summary": "Legacy compatibility task summary."
+            }}"#
+        );
+        let req_path = ws.write_private_file("legacy-req.json", req_json.as_bytes());
+        let preview = preview_advice(&scope, &req_path).expect("legacy preview");
+        assert_eq!(preview.profile_id, None);
+        let preview_val = serde_json::to_value(&preview).expect("serialize preview");
+        assert!(
+            preview_val.get("profile_id").is_none(),
+            "preview JSON must omit profile_id when None"
+        );
+
+        let project_root_sha256 = sha256_hex(preview.project_root.as_bytes());
+        let real_prompt_digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            for field in [
+                "threadlane-jev-shadow-v1",
+                "difficulty",
+                "Select implementation difficulty from the supplied task evidence.",
+                "Small isolated behavior-preserving edit.",
+                "Bounded multi-step change within known module boundaries.",
+                "Substantial uncertainty, concurrency, or cross-module integration complexity.",
+                "High-risk architectural, security-critical, or multi-system redesign.",
+            ] {
+                h.update((field.len() as u64).to_le_bytes());
+                h.update(field.as_bytes());
+            }
+            let digest = h.finalize();
+            let mut s = String::with_capacity(64);
+            for b in digest {
+                use std::fmt::Write as _;
+                let _ = write!(&mut s, "{b:02x}");
+            }
+            s
+        };
+
+        let record_path = ws.cache_dir.join(format!("{}.json", preview.cache_key));
+        let failing_vault = FakeVault::failing();
+        let transport = FakeTransport::with_responses([]);
+        let client =
+            DecisionClient::with_transport(failing_vault.clone(), transport.clone()).expect("init");
+
+        // 3a. Old Pending record without `profile_id` field blocks replay without --refresh.
+        let legacy_pending_json = serde_json::json!({
+            "schema_version": ADVICE_CACHE_SCHEMA_VERSION,
+            "prompt_digest": real_prompt_digest,
+            "cache_key": preview.cache_key,
+            "project_root_sha256": project_root_sha256,
+            "context_id": "ctx-profile",
+            "task_id": "task1",
+            "task_revision": 1,
+            "summary_sha256": preview.summary_sha256,
+            "registry_revision": reg_rev,
+            "tool_id": "jev-api",
+            "model_id": "jev-api:jev-latest",
+            "requested_model": "jev-latest",
+            "state": {
+                "status": "pending",
+                "attempt_id": "att-legacy-pending",
+                "started_at_ms": 1_700_000_000_000u64
+            }
+        });
+        fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&legacy_pending_json).expect("serialize legacy pending"),
+        )
+        .expect("write legacy pending");
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 legacy pending");
+
+        let pend_err = classify_advice(&scope, &req_path, false, failing_vault.clone(), &client)
+            .await
+            .expect_err("old pending record without profile_id must block replay");
+        assert_eq!(pend_err.code(), "pending_attempt_requires_refresh");
+        assert_eq!(failing_vault.read_count(), 0);
+        assert!(transport.recorded_requests().is_empty());
+
+        // 3b. Old Uncertain record without `profile_id` field blocks replay without --refresh.
+        let legacy_uncertain_json = serde_json::json!({
+            "schema_version": ADVICE_CACHE_SCHEMA_VERSION,
+            "prompt_digest": real_prompt_digest,
+            "cache_key": preview.cache_key,
+            "project_root_sha256": project_root_sha256,
+            "context_id": "ctx-profile",
+            "task_id": "task1",
+            "task_revision": 1,
+            "summary_sha256": preview.summary_sha256,
+            "registry_revision": reg_rev,
+            "tool_id": "jev-api",
+            "model_id": "jev-api:jev-latest",
+            "requested_model": "jev-latest",
+            "state": {
+                "status": "uncertain",
+                "attempt_id": "att-legacy-uncertain",
+                "failed_at_ms": 1_700_000_000_000u64,
+                "error_code": "timeout"
+            }
+        });
+        fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&legacy_uncertain_json).expect("serialize legacy uncertain"),
+        )
+        .expect("write legacy uncertain");
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 legacy uncertain");
+
+        let unc_err = classify_advice(&scope, &req_path, false, failing_vault.clone(), &client)
+            .await
+            .expect_err("old uncertain record without profile_id must block replay");
+        assert_eq!(unc_err.code(), "uncertain_attempt_requires_refresh");
+        assert_eq!(failing_vault.read_count(), 0);
+        assert!(transport.recorded_requests().is_empty());
+
+        // 3c. Old Completed record without `profile_id` field serves cache hit and omits `profile_id` on output.
+        let t0 = 1_700_000_000_000u64;
+        let legacy_completed_json = serde_json::json!({
+            "schema_version": ADVICE_CACHE_SCHEMA_VERSION,
+            "prompt_digest": real_prompt_digest,
+            "cache_key": preview.cache_key,
+            "project_root_sha256": project_root_sha256,
+            "context_id": "ctx-profile",
+            "task_id": "task1",
+            "task_revision": 1,
+            "summary_sha256": preview.summary_sha256,
+            "registry_revision": reg_rev,
+            "tool_id": "jev-api",
+            "model_id": "jev-api:jev-latest",
+            "requested_model": "jev-latest",
+            "state": {
+                "status": "completed",
+                "attempt_id": "att-legacy-completed",
+                "completed_at_ms": t0,
+                "advice": {
+                    "provider": "jev",
+                    "model": "jev-1.14.0",
+                    "difficulty": "medium",
+                    "confidence": 0.90,
+                    "needs_review": false,
+                    "reason_code": "classified",
+                    "input_tokens": 70,
+                    "output_tokens": 6
+                }
+            }
+        });
+        fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&legacy_completed_json).expect("serialize legacy completed"),
+        )
+        .expect("write legacy completed");
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 legacy completed");
+
+        let hit = classify_advice_with_options(
+            &scope,
+            &req_path,
+            false,
+            failing_vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(t0 + 5_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect("old completed record without profile_id must serve cache hit");
+        assert_eq!(hit.source, AdviceSource::Cache);
+        assert_eq!(hit.profile_id, None);
+        assert!(!hit.provider_call_performed);
+        assert_eq!(failing_vault.read_count(), 0);
+        let hit_val = serde_json::to_value(&hit).expect("serialize classify output");
+        assert!(
+            hit_val.get("profile_id").is_none(),
+            "classify output must omit profile_id when None"
+        );
+
+        // 3d. Tampering with a legacy record to inject a `profile_id` when scope has `profile_id: None`
+        //     must be rejected with `corrupt_cache` before vault/provider access.
+        let mut tampered_json = legacy_completed_json.clone();
+        tampered_json["profile_id"] = serde_json::Value::String("unexpected-profile".to_string());
+        fs::write(
+            &record_path,
+            serde_json::to_vec_pretty(&tampered_json).expect("serialize tampered"),
+        )
+        .expect("write tampered");
+        fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 tampered");
+
+        let corrupt_err = classify_advice_with_options(
+            &scope,
+            &req_path,
+            false,
+            failing_vault.clone(),
+            &client,
+            &AdviceRuntimeOptions {
+                now_ms_override: Some(t0 + 5_000),
+                ..AdviceRuntimeOptions::default()
+            },
+        )
+        .await
+        .expect_err("scope mismatch on persisted profile_id must fail with corrupt_cache");
+        assert_eq!(corrupt_err.code(), "corrupt_cache");
+        assert_eq!(failing_vault.read_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn profile_scoped_advice_validates_exact_match_isolates_distinct_profiles_and_serves_cache_hits_with_zero_io(
+    ) {
+        let ws = ScopedTestWorkspace::new("profile-scoped-advice");
+        let rev1 = ws.seed_jev_registry();
+        let store = RegistryStore::open(ws.registry_dir.clone()).expect("open registry");
+
+        // Configure two distinct profiles that both select the exact same Jev advisor model.
+        let s2 = store
+            .apply(
+                rev1,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-alpha".to_string(),
+                        name: "Alpha Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "jev-api:jev-latest".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-alpha");
+        let s3 = store
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-beta".to_string(),
+                        name: "Beta Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "jev-api:jev-latest".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-beta");
+        let reg_rev = s3.revision;
+
+        let req_json = format!(
+            r#"{{
+                "schema_version": 1,
+                "expected_registry_revision": {reg_rev},
+                "tool_id": "jev-api",
+                "model_id": "jev-api:jev-latest",
+                "task_id": "task-prof",
+                "task_revision": 1,
+                "task_summary": "Classify under explicit profile advisor guard.",
+                "baseline_difficulty": "hard"
+            }}"#
+        );
+        let req_path = ws.write_private_file("req.json", req_json.as_bytes());
+
+        let scope_none = ws.scope("ctx-prof");
+        let scope_alpha = ws.scope_with_profile("ctx-prof", "profile-alpha");
+        let scope_beta = ws.scope_with_profile("ctx-prof", "profile-beta");
+
+        let prev_none = preview_advice(&scope_none, &req_path).expect("preview none");
+        let prev_alpha = preview_advice(&scope_alpha, &req_path).expect("preview alpha");
+        let prev_beta = preview_advice(&scope_beta, &req_path).expect("preview beta");
+
+        assert_eq!(prev_none.profile_id, None);
+        assert_eq!(prev_alpha.profile_id.as_deref(), Some("profile-alpha"));
+        assert_eq!(prev_beta.profile_id.as_deref(), Some("profile-beta"));
+        assert_ne!(prev_none.cache_key, prev_alpha.cache_key);
+        assert_ne!(prev_none.cache_key, prev_beta.cache_key);
+        assert_ne!(prev_alpha.cache_key, prev_beta.cache_key);
+
+        let prev_alpha_val = serde_json::to_value(&prev_alpha).expect("serialize alpha preview");
+        assert_eq!(prev_alpha_val["profile_id"], "profile-alpha");
+        assert!(!ws.cache_dir.exists(), "preview must not create cache_dir");
+
+        let vault = FakeVault::with_secret("jev-api", "jev-secret-key");
+        let transport = FakeTransport::with_responses([
+            valid_jev_four_way_response(
+                "jev-1.14.0",
+                "hard",
+                0.92,
+                (0.02, 0.05, 0.90, 0.03),
+                120,
+                10,
+            ),
+            valid_jev_four_way_response(
+                "jev-1.14.0",
+                "medium",
+                0.88,
+                (0.05, 0.85, 0.08, 0.02),
+                125,
+                11,
+            ),
+        ]);
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+
+        let opts_t0 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_000_000),
+            ..AdviceRuntimeOptions::default()
+        };
+
+        // 1. Classify under profile-alpha -> calls provider and persists profile_id in cache record.
+        let alpha_first = classify_advice_with_options(
+            &scope_alpha,
+            &req_path,
+            false,
+            vault.clone(),
+            &client,
+            &opts_t0,
+        )
+        .await
+        .expect("classify alpha");
+        assert_eq!(alpha_first.source, AdviceSource::Provider);
+        assert_eq!(alpha_first.profile_id.as_deref(), Some("profile-alpha"));
+        assert_eq!(alpha_first.cache_key, prev_alpha.cache_key);
+        assert!(alpha_first.provider_call_performed);
+        assert_eq!(transport.recorded_requests().len(), 1);
+
+        let alpha_out_val = serde_json::to_value(&alpha_first).expect("serialize alpha output");
+        assert_eq!(alpha_out_val["profile_id"], "profile-alpha");
+
+        let alpha_record_path = ws.cache_dir.join(format!("{}.json", prev_alpha.cache_key));
+        let alpha_record_val: serde_json::Value = serde_json::from_slice(
+            &fs::read(&alpha_record_path).expect("read alpha persisted record"),
+        )
+        .expect("parse alpha persisted record");
+        assert_eq!(alpha_record_val["profile_id"], "profile-alpha");
+
+        // 2. Second classify under profile-alpha hits cache with zero vault or provider calls.
+        let failing_vault = FakeVault::failing();
+        let failing_client =
+            DecisionClient::with_transport(failing_vault.clone(), transport.clone()).expect("init");
+        let opts_t1 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_010_000),
+            ..AdviceRuntimeOptions::default()
+        };
+        let alpha_hit = classify_advice_with_options(
+            &scope_alpha,
+            &req_path,
+            false,
+            failing_vault.clone(),
+            &failing_client,
+            &opts_t1,
+        )
+        .await
+        .expect("alpha cache hit");
+        assert_eq!(alpha_hit.source, AdviceSource::Cache);
+        assert_eq!(alpha_hit.profile_id.as_deref(), Some("profile-alpha"));
+        assert!(!alpha_hit.provider_call_performed);
+        assert_eq!(alpha_hit.cache_age_ms, Some(10_000));
+        assert_eq!(failing_vault.read_count(), 0);
+        assert_eq!(transport.recorded_requests().len(), 1);
+
+        // 3. Classify under profile-beta with the same model does NOT share profile-alpha's cache entry.
+        let beta_first = classify_advice_with_options(
+            &scope_beta,
+            &req_path,
+            false,
+            vault.clone(),
+            &client,
+            &opts_t1,
+        )
+        .await
+        .expect("classify beta");
+        assert_eq!(beta_first.source, AdviceSource::Provider);
+        assert_eq!(beta_first.profile_id.as_deref(), Some("profile-beta"));
+        assert_eq!(beta_first.cache_key, prev_beta.cache_key);
+        assert_eq!(beta_first.advice.difficulty, Some(Difficulty::Medium));
+        assert_eq!(transport.recorded_requests().len(), 2);
+
+        // 4. If a profile cache record on disk has its `profile_id` tampered or stripped,
+        //    scope verification rejects it with `corrupt_cache` before vault/provider access.
+        let mut tampered_alpha = alpha_record_val.clone();
+        tampered_alpha["profile_id"] = serde_json::Value::String("profile-beta".to_string());
+        fs::write(
+            &alpha_record_path,
+            serde_json::to_vec_pretty(&tampered_alpha).expect("serialize tampered alpha"),
+        )
+        .expect("write tampered alpha");
+        fs::set_permissions(&alpha_record_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 tampered alpha");
+
+        let tamper_err = classify_advice_with_options(
+            &scope_alpha,
+            &req_path,
+            false,
+            failing_vault.clone(),
+            &failing_client,
+            &opts_t1,
+        )
+        .await
+        .expect_err("mismatched persisted profile_id must fail with corrupt_cache");
+        assert_eq!(tamper_err.code(), "corrupt_cache");
+        assert_eq!(failing_vault.read_count(), 0);
+        assert_eq!(transport.recorded_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn profile_advisor_refusals_and_models_with_profile_id_fail_closed_before_vault_network_or_cache_creation(
+    ) {
+        let ws = ScopedTestWorkspace::new("profile-refusals-pre-io");
+        let store = RegistryStore::open(ws.registry_dir.clone()).expect("open registry");
+
+        store
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "jev-enabled".to_string(),
+                        label: "Enabled Jev".to_string(),
+                        adapter: ToolAdapter::JevApi,
+                        executable_path: None,
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert jev-enabled");
+        store
+            .apply(
+                1,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "jev-alt".to_string(),
+                        label: "Alt Enabled Jev".to_string(),
+                        adapter: ToolAdapter::JevApi,
+                        executable_path: None,
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert jev-alt");
+        store
+            .apply(
+                2,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "jev-disabled".to_string(),
+                        label: "Disabled Jev".to_string(),
+                        adapter: ToolAdapter::JevApi,
+                        executable_path: None,
+                        enabled: false,
+                    },
+                },
+            )
+            .expect("upsert jev-disabled");
+        store
+            .apply(
+                3,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "openai-dec".to_string(),
+                        label: "OpenAI Decisions".to_string(),
+                        adapter: ToolAdapter::OpenaiDecisionsApi,
+                        executable_path: None,
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert openai-dec");
+
+        let s4 = store
+            .apply(
+                4,
+                RegistryChange::UpsertModels {
+                    models: vec![
+                        ModelDefinition {
+                            id: "jev-enabled:jev-latest".to_string(),
+                            tool_id: "jev-enabled".to_string(),
+                            label: "jev-latest".to_string(),
+                            model_arg: "jev-latest".to_string(),
+                            efforts: Vec::new(),
+                            allow_no_effort: true,
+                        },
+                        ModelDefinition {
+                            id: "jev-enabled:jev-1.14.0".to_string(),
+                            tool_id: "jev-enabled".to_string(),
+                            label: "jev-1.14.0".to_string(),
+                            model_arg: "jev-1.14.0".to_string(),
+                            efforts: Vec::new(),
+                            allow_no_effort: true,
+                        },
+                        ModelDefinition {
+                            id: "jev-alt:jev-latest".to_string(),
+                            tool_id: "jev-alt".to_string(),
+                            label: "jev-latest".to_string(),
+                            model_arg: "jev-latest".to_string(),
+                            efforts: Vec::new(),
+                            allow_no_effort: true,
+                        },
+                        ModelDefinition {
+                            id: "jev-disabled:jev-latest".to_string(),
+                            tool_id: "jev-disabled".to_string(),
+                            label: "jev-latest".to_string(),
+                            model_arg: "jev-latest".to_string(),
+                            efforts: Vec::new(),
+                            allow_no_effort: true,
+                        },
+                        ModelDefinition {
+                            id: "openai-dec:gpt-6-luna".to_string(),
+                            tool_id: "openai-dec".to_string(),
+                            label: "gpt-6-luna".to_string(),
+                            model_arg: "gpt-6-luna".to_string(),
+                            efforts: Vec::new(),
+                            allow_no_effort: true,
+                        },
+                    ],
+                },
+            )
+            .expect("upsert models");
+
+        let s5 = store
+            .apply(
+                s4.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-jev".to_string(),
+                        name: "Jev Advisor Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "jev-enabled:jev-latest".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-jev");
+        let s6 = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-off".to_string(),
+                        name: "Advisor Off Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: None,
+                    },
+                },
+            )
+            .expect("upsert profile-off");
+        let s7 = store
+            .apply(
+                s6.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-openai".to_string(),
+                        name: "OpenAI Advisor Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "openai-dec:gpt-6-luna".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-openai");
+        // Set default_profile_id to profile-jev to verify there is no silent fallback/default selection.
+        let snap = store
+            .apply(
+                s7.revision,
+                RegistryChange::SetDefaultProfile {
+                    profile_id: Some("profile-jev".to_string()),
+                },
+            )
+            .expect("set default profile");
+        let rev = snap.revision;
+
+        let make_req = |name: &str, tool_id: &str, model_id: &str| -> PathBuf {
+            let json = format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {rev},
+                    "tool_id": "{tool_id}",
+                    "model_id": "{model_id}",
+                    "task_id": "t-refusal",
+                    "task_revision": 1,
+                    "task_summary": "Verify pre-IO refusal."
+                }}"#
+            );
+            ws.write_private_file(name, json.as_bytes())
+        };
+
+        let req_jev_latest = make_req(
+            "req-jev-latest.json",
+            "jev-enabled",
+            "jev-enabled:jev-latest",
+        );
+        let req_jev_114 = make_req("req-jev-114.json", "jev-enabled", "jev-enabled:jev-1.14.0");
+        let req_jev_alt = make_req("req-jev-alt.json", "jev-alt", "jev-alt:jev-latest");
+        let req_jev_disabled = make_req(
+            "req-jev-disabled.json",
+            "jev-disabled",
+            "jev-disabled:jev-latest",
+        );
+        let req_openai = make_req("req-openai.json", "openai-dec", "openai-dec:gpt-6-luna");
+
+        let vault = FakeVault::failing();
+        let transport = FakeTransport::with_responses([]);
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+
+        // 1. `models` with `profile_id` must fail before credential access.
+        let scope_jev = ws.scope_with_profile("ctx-ref", "profile-jev");
+        let models_err = list_advice_models(&scope_jev, "jev-enabled", &client)
+            .await
+            .expect_err("models with profile_id must be rejected before vault access");
+        assert_eq!(models_err.code(), "invalid_input");
+        assert_eq!(vault.read_count(), 0);
+        assert!(transport.recorded_requests().is_empty());
+
+        // 2. Invalid `profile_id` syntax rejected with `invalid_input`.
+        for bad_profile_id in ["", " profile-jev ", "bad/profile", ".."] {
+            let bad_scope = ws.scope_with_profile("ctx-ref", bad_profile_id);
+            assert_eq!(
+                preview_advice(&bad_scope, &req_jev_latest)
+                    .expect_err("bad profile_id preview")
+                    .code(),
+                "invalid_input"
+            );
+            assert_eq!(
+                classify_advice(&bad_scope, &req_jev_latest, false, vault.clone(), &client)
+                    .await
+                    .expect_err("bad profile_id classify")
+                    .code(),
+                "invalid_input"
+            );
+        }
+
+        // 3. Missing profile rejected with `profile_not_found`.
+        let scope_missing = ws.scope_with_profile("ctx-ref", "nonexistent-profile");
+        assert_eq!(
+            preview_advice(&scope_missing, &req_jev_latest)
+                .expect_err("missing profile preview")
+                .code(),
+            "profile_not_found"
+        );
+        assert_eq!(
+            classify_advice(
+                &scope_missing,
+                &req_jev_latest,
+                false,
+                vault.clone(),
+                &client
+            )
+            .await
+            .expect_err("missing profile classify")
+            .code(),
+            "profile_not_found"
+        );
+
+        // 4. Profile with decision advisor off (`None`) rejected with `decision_advisor_not_configured`
+        //    (never falls back to `default_profile_id`).
+        let scope_off = ws.scope_with_profile("ctx-ref", "profile-off");
+        assert_eq!(
+            preview_advice(&scope_off, &req_jev_latest)
+                .expect_err("advisor off preview")
+                .code(),
+            "decision_advisor_not_configured"
+        );
+        assert_eq!(
+            classify_advice(&scope_off, &req_jev_latest, false, vault.clone(), &client)
+                .await
+                .expect_err("advisor off classify")
+                .code(),
+            "decision_advisor_not_configured"
+        );
+
+        // 5. Wrong model for selected profile rejected with `profile_advisor_mismatch`.
+        assert_eq!(
+            preview_advice(&scope_jev, &req_jev_114)
+                .expect_err("wrong model preview")
+                .code(),
+            "profile_advisor_mismatch"
+        );
+        assert_eq!(
+            classify_advice(&scope_jev, &req_jev_114, false, vault.clone(), &client)
+                .await
+                .expect_err("wrong model classify")
+                .code(),
+            "profile_advisor_mismatch"
+        );
+
+        // 6. Wrong tool for selected profile rejected with `profile_advisor_mismatch`.
+        assert_eq!(
+            preview_advice(&scope_jev, &req_jev_alt)
+                .expect_err("wrong tool preview")
+                .code(),
+            "profile_advisor_mismatch"
+        );
+        assert_eq!(
+            classify_advice(&scope_jev, &req_jev_alt, false, vault.clone(), &client)
+                .await
+                .expect_err("wrong tool classify")
+                .code(),
+            "profile_advisor_mismatch"
+        );
+
+        // 7. Disabled tool rejected with `tool_disabled`.
+        assert_eq!(
+            preview_advice(&scope_jev, &req_jev_disabled)
+                .expect_err("disabled tool preview")
+                .code(),
+            "tool_disabled"
+        );
+        assert_eq!(
+            classify_advice(&scope_jev, &req_jev_disabled, false, vault.clone(), &client)
+                .await
+                .expect_err("disabled tool classify")
+                .code(),
+            "tool_disabled"
+        );
+
+        // 8. Profile configured with OpenAI Decisions advisor rejected with `unsupported_adapter`
+        //    (both when request matches the OpenAI advisor and when request names a Jev tool).
+        let scope_openai = ws.scope_with_profile("ctx-ref", "profile-openai");
+        for req in [&req_openai, &req_jev_latest] {
+            assert_eq!(
+                preview_advice(&scope_openai, req)
+                    .expect_err("openai advisor preview must fail with unsupported_adapter")
+                    .code(),
+                "unsupported_adapter"
+            );
+            assert_eq!(
+                classify_advice(&scope_openai, req, false, vault.clone(), &client)
+                    .await
+                    .expect_err("openai advisor classify must fail with unsupported_adapter")
+                    .code(),
+                "unsupported_adapter"
+            );
+        }
+
+        // 9. When `profile_id` is `None`, `default_profile_id` (`profile-jev`) is NOT auto-selected:
+        //    requesting `jev-enabled:jev-1.14.0` with `profile_id: None` succeeds in preview with `profile_id: None`.
+        let scope_none = ws.scope("ctx-ref");
+        let prev_none_114 = preview_advice(&scope_none, &req_jev_114)
+            .expect("none profile must not enforce default_profile_id");
+        assert_eq!(prev_none_114.profile_id, None);
+        assert_eq!(prev_none_114.model_id, "jev-enabled:jev-1.14.0");
+
+        // Verify zero vault reads, zero network calls, and no cache directory creation across all refusals.
+        assert_eq!(vault.read_count(), 0);
+        assert!(transport.recorded_requests().is_empty());
+        assert!(!ws.cache_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn profile_change_during_provider_await_invalidates_attempt_and_seals_uncertain() {
+        let ws = ScopedTestWorkspace::new("profile-drift-during-await");
+        let rev1 = ws.seed_jev_registry();
+        let store = RegistryStore::open(ws.registry_dir.clone()).expect("open registry");
+        let snap = store
+            .apply(
+                rev1,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "profile-drift".to_string(),
+                        name: "Drift Profile".to_string(),
+                        assignments: Vec::new(),
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "jev-api:jev-latest".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile-drift");
+        let reg_rev = snap.revision;
+
+        let scope = ws.scope_with_profile("ctx-prof-drift", "profile-drift");
+        let req_json = format!(
+            r#"{{
+                "schema_version": 1,
+                "expected_registry_revision": {reg_rev},
+                "tool_id": "jev-api",
+                "model_id": "jev-api:jev-latest",
+                "task_id": "task-prof-drift",
+                "task_revision": 1,
+                "task_summary": "Detect profile advisor change during provider await."
+            }}"#
+        );
+        let req_path = ws.write_private_file("req.json", req_json.as_bytes());
+        let preview = preview_advice(&scope, &req_path).expect("preview before drift");
+
+        let vault = FakeVault::with_secret("jev-api", "secret");
+        let transport = FakeTransport::with_responses([
+            valid_jev_four_way_response(
+                "jev-1.14.0",
+                "easy",
+                0.94,
+                (0.90, 0.05, 0.03, 0.02),
+                100,
+                10,
+            ),
+            valid_jev_four_way_response(
+                "jev-1.14.0",
+                "easy",
+                0.94,
+                (0.90, 0.05, 0.03, 0.02),
+                100,
+                10,
+            ),
+        ]);
+
+        // Part A: Same-revision profile advisor drift on disk while provider awaits is caught by
+        //         post-API `resolve_jev_tool_and_model` and sealed as `Uncertain`.
+        let reg_file_for_hook = ws.registry_dir.join("registry.json");
+        let original_reg_bytes = fs::read(&reg_file_for_hook).expect("read original registry");
+        let mut drifted_same_rev = snap.clone();
+        drifted_same_rev.profiles[0].decision_advisor = Some(DecisionAdvisor {
+            model_id: "jev-api:jev-1.14.0".to_string(),
+            mode: DecisionAdvisorMode::Shadow,
+        });
+        let drifted_bytes =
+            serde_json::to_vec_pretty(&drifted_same_rev).expect("serialize drifted snapshot");
+        let reg_file_clone = reg_file_for_hook.clone();
+        transport.set_on_execute(move || {
+            fs::write(&reg_file_clone, &drifted_bytes).expect("write drifted registry");
+            fs::set_permissions(&reg_file_clone, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 drifted registry");
+        });
+
+        let client =
+            DecisionClient::with_transport(vault.clone(), transport.clone()).expect("client");
+
+        let err = classify_advice(&scope, &req_path, false, vault.clone(), &client)
+            .await
+            .expect_err("profile advisor change during provider await must fail");
+        assert_eq!(err.code(), "profile_advisor_mismatch");
+        assert_eq!(transport.recorded_requests().len(), 1);
+
+        // Restore original registry bytes and verify the record was sealed as `Uncertain` (not `Completed`),
+        // refusing replay without `--refresh`.
+        fs::write(&reg_file_for_hook, &original_reg_bytes).expect("restore original registry");
+        fs::set_permissions(&reg_file_for_hook, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 restored registry");
+
+        let record_path = ws.cache_dir.join(format!("{}.json", preview.cache_key));
+        let persisted_val: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record_path).expect("read uncertain record"))
+                .expect("parse uncertain record");
+        assert_eq!(persisted_val["state"]["status"], "uncertain");
+        assert_eq!(
+            persisted_val["state"]["error_code"],
+            "profile_advisor_mismatch"
+        );
+
+        let replay_err = classify_advice(&scope, &req_path, false, vault.clone(), &client)
+            .await
+            .expect_err(
+                "uncertain record after profile drift must refuse replay without --refresh",
+            );
+        assert_eq!(replay_err.code(), "uncertain_attempt_requires_refresh");
+        assert_eq!(transport.recorded_requests().len(), 1);
+
+        // Part B: Store-applied profile edit (`RegistryStore::apply`) during provider await
+        //         advances revision and fails post-API check with `stale_registry_revision`.
+        let reg_dir_for_hook = ws.registry_dir.clone();
+        transport.set_on_execute(move || {
+            let store = RegistryStore::open(reg_dir_for_hook.clone()).expect("open registry");
+            let _ = store
+                .apply(
+                    reg_rev,
+                    RegistryChange::UpsertProfile {
+                        profile: WorkflowProfile {
+                            id: "profile-drift".to_string(),
+                            name: "Drift Profile".to_string(),
+                            assignments: Vec::new(),
+                            decision_advisor: None,
+                        },
+                    },
+                )
+                .expect("clear profile decision_advisor during provider call");
+        });
+
+        let err2 = classify_advice(&scope, &req_path, true, vault.clone(), &client)
+            .await
+            .expect_err("RegistryStore profile edit during provider call must fail");
+        assert_eq!(err2.code(), "stale_registry_revision");
+        assert_eq!(transport.recorded_requests().len(), 2);
     }
 }

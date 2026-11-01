@@ -1,5 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 import { hasTauriRuntime, isDevPreviewFixtureMode } from '../ipc.ts';
+import {
+  decisionAdvisorFromProfile,
+  profileWithDecisionAdvisor,
+  validateDecisionAdvisor,
+} from './profile-advisor.ts';
 export { hasTauriRuntime, isDevPreviewFixtureMode };
 import {
   createEmptyRegistrySnapshot,
@@ -10,6 +15,7 @@ import {
   WORKFLOW_ROLES,
   type AppError,
   type DecisionAdvice,
+  type DecisionAdvisor,
   type DecisionProvider,
   type DesktopDecisionModelsArgs,
   type DesktopNativeThreadsArgs,
@@ -139,6 +145,74 @@ function validateSafeRevision(revision: number, label: string): void {
   }
 }
 
+function parseDecisionAdvisorInput(value: unknown): DecisionAdvisor | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new AppIpcError(
+      'invalid_advisor',
+      'Decision advisor must be null, missing, or an object with only model_id and mode.'
+    );
+  }
+  const candidate = value as Record<string, unknown>;
+  for (const key of Object.keys(candidate)) {
+    if (key !== 'model_id' && key !== 'mode') {
+      throw new AppIpcError(
+        'invalid_advisor',
+        `Decision advisor does not accept field "${key}".`
+      );
+    }
+  }
+  const modelId = typeof candidate.model_id === 'string' ? candidate.model_id.trim() : '';
+  if (!modelId) {
+    throw new AppIpcError(
+      'invalid_advisor',
+      'Decision advisor model_id must be a non-empty string.'
+    );
+  }
+  if (candidate.mode !== 'shadow') {
+    throw new AppIpcError('invalid_advisor', 'Decision advisor mode must be "shadow".');
+  }
+  return { model_id: modelId, mode: 'shadow' };
+}
+
+function validateDecisionAdvisorReference(
+  value: unknown,
+  tools: RegistrySnapshot['tools'],
+  models: RegistrySnapshot['models'],
+  profileName: string
+): DecisionAdvisor | null {
+  const advisor = parseDecisionAdvisorInput(value);
+  if (!advisor) {
+    return null;
+  }
+  const validation = validateDecisionAdvisor({ tools, models }, advisor);
+  if (validation.state === 'invalid') {
+    throw new AppIpcError(
+      validation.issue.code,
+      `Profile "${profileName}" decision advisor is invalid: ${validation.issue.message}`
+    );
+  }
+  if (validation.state !== 'ready') {
+    throw new AppIpcError(
+      'invalid_advisor',
+      `Profile "${profileName}" decision advisor is invalid.`
+    );
+  }
+  return { ...validation.advisor };
+}
+
+function assertDecisionAdvisorReferences(
+  profiles: RegistrySnapshot['profiles'],
+  tools: RegistrySnapshot['tools'],
+  models: RegistrySnapshot['models']
+): void {
+  for (const profile of profiles) {
+    validateDecisionAdvisorReference(profile.decision_advisor, tools, models, profile.name);
+  }
+}
+
 export function applyRegistryChangeLocally(
   snapshot: RegistrySnapshot,
   expectedRevision: number,
@@ -157,10 +231,15 @@ export function applyRegistryChangeLocally(
 
   const nextTools = snapshot.tools.map((t) => ({ ...t }));
   const nextModels = snapshot.models.map((m) => ({ ...m, efforts: [...m.efforts] }));
-  const nextProfiles = snapshot.profiles.map((p) => ({
-    ...p,
-    assignments: p.assignments.map((a) => ({ ...a, choice: { ...a.choice } })),
-  }));
+  const nextProfiles = snapshot.profiles.map((p) =>
+    profileWithDecisionAdvisor(
+      {
+        ...p,
+        assignments: p.assignments.map((a) => ({ ...a, choice: { ...a.choice } })),
+      },
+      p.decision_advisor
+    )
+  );
   let nextDefaultProfileId = snapshot.default_profile_id;
 
   switch (change.op) {
@@ -242,6 +321,15 @@ export function applyRegistryChangeLocally(
         throw new AppIpcError(
           'model_in_use',
           `Cannot delete model "${modelId}" while profile "${referencedByProfile.name}" references it.`
+        );
+      }
+      const referencedByAdvisor = nextProfiles.find(
+        (p) => decisionAdvisorFromProfile(p)?.model_id === modelId
+      );
+      if (referencedByAdvisor) {
+        throw new AppIpcError(
+          'model_in_use',
+          `Cannot delete model "${modelId}" while profile "${referencedByAdvisor.name}" uses it as a decision advisor.`
         );
       }
       nextModels.splice(idx, 1);
@@ -328,11 +416,20 @@ export function applyRegistryChangeLocally(
       });
 
       const existingIdx = nextProfiles.findIndex((p) => p.id === id);
-      const normalizedProfile = {
-        id,
-        name,
-        assignments: normalizedAssignments,
-      };
+      const decisionAdvisor = validateDecisionAdvisorReference(
+        profile.decision_advisor,
+        nextTools,
+        nextModels,
+        name
+      );
+      const normalizedProfile = profileWithDecisionAdvisor(
+        {
+          id,
+          name,
+          assignments: normalizedAssignments,
+        },
+        decisionAdvisor
+      );
       if (existingIdx >= 0) {
         nextProfiles[existingIdx] = normalizedProfile;
       } else {
@@ -365,6 +462,15 @@ export function applyRegistryChangeLocally(
       nextDefaultProfileId = targetId;
       break;
     }
+  }
+
+  if (
+    change.op === 'upsert_tool' ||
+    change.op === 'upsert_model' ||
+    change.op === 'upsert_models' ||
+    change.op === 'delete_model'
+  ) {
+    assertDecisionAdvisorReferences(nextProfiles, nextTools, nextModels);
   }
 
   return {

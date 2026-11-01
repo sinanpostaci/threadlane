@@ -9,7 +9,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_connectors::CredentialStore;
-use threadlane_registry::{Difficulty, RegistrySnapshot, RegistryStore, ToolAdapter};
+use threadlane_registry::{
+    DecisionAdvisorMode, Difficulty, RegistrySnapshot, RegistryStore, ToolAdapter,
+};
 
 use crate::client::DecisionClient;
 use crate::error::DecisionError;
@@ -174,6 +176,27 @@ impl AdviceError {
         )
     }
 
+    pub(crate) fn profile_not_found() -> Self {
+        Self::new(
+            "profile_not_found",
+            "Requested profile_id was not found in the registry snapshot.",
+        )
+    }
+
+    pub(crate) fn decision_advisor_not_configured() -> Self {
+        Self::new(
+            "decision_advisor_not_configured",
+            "Selected workflow profile does not have a shadow decision advisor configured.",
+        )
+    }
+
+    pub(crate) fn profile_advisor_mismatch() -> Self {
+        Self::new(
+            "profile_advisor_mismatch",
+            "Requested tool_id and model_id do not match the selected profile's decision advisor.",
+        )
+    }
+
     pub(crate) fn cache_busy() -> Self {
         Self::new(
             "cache_busy",
@@ -244,6 +267,8 @@ pub struct AdviceScope {
     pub context_id: String,
     /// Completed-result cache TTL in seconds (`1..=86400`).
     pub cache_ttl_seconds: u64,
+    /// Optional workflow profile identifier whose configured shadow decision advisor must match the request.
+    pub profile_id: Option<String>,
 }
 
 /// Private shadow advice classification/preview request deserialized from `--request`.
@@ -318,6 +343,9 @@ pub struct AdvicePreviewOutput {
     pub project_root: String,
     /// Validated registry snapshot revision.
     pub registry_revision: u64,
+    /// Optional validated workflow profile identifier when `--profile-id` was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     /// Validated registry tool identifier.
     pub tool_id: String,
     /// Validated registry model identifier.
@@ -351,6 +379,7 @@ impl std::fmt::Debug for AdvicePreviewOutput {
             .field("context_id", &self.context_id)
             .field("project_root", &self.project_root)
             .field("registry_revision", &self.registry_revision)
+            .field("profile_id", &self.profile_id)
             .field("tool_id", &self.tool_id)
             .field("model_id", &self.model_id)
             .field("provider", &self.provider)
@@ -408,6 +437,9 @@ pub struct AdviceClassifyOutput {
     pub task_revision: u64,
     /// Validated registry snapshot revision.
     pub registry_revision: u64,
+    /// Optional validated workflow profile identifier when `--profile-id` was supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
     /// Validated registry tool identifier.
     pub tool_id: String,
     /// Validated registry model identifier.
@@ -447,6 +479,8 @@ struct PersistedCacheRecord {
     task_revision: u64,
     summary_sha256: String,
     registry_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
     tool_id: String,
     model_id: String,
     requested_model: String,
@@ -535,7 +569,8 @@ pub(crate) fn preview_advice_with_options(
     let request = read_and_validate_request_file(request_path, options.expected_uid)?;
     let snapshot =
         read_readonly_registry_snapshot(&validated_scope.registry_dir, options.expected_uid)?;
-    let resolved = resolve_jev_tool_and_model(&snapshot, &request)?;
+    let resolved =
+        resolve_jev_tool_and_model(&snapshot, &request, validated_scope.profile_id.as_deref())?;
 
     let summary_sha256 = sha256_hex(request.normalized_summary.as_bytes());
     let prompt_digest = compute_prompt_digest();
@@ -550,6 +585,7 @@ pub(crate) fn preview_advice_with_options(
         &resolved.tool_id,
         &resolved.model_id,
         &resolved.requested_model,
+        resolved.profile_id.as_deref(),
     );
 
     Ok(AdvicePreviewOutput {
@@ -559,6 +595,7 @@ pub(crate) fn preview_advice_with_options(
         context_id: validated_scope.context_id,
         project_root: validated_scope.project_root_str,
         registry_revision: snapshot.revision,
+        profile_id: resolved.profile_id,
         tool_id: resolved.tool_id,
         model_id: resolved.model_id,
         provider: DecisionProvider::Jev,
@@ -589,6 +626,11 @@ pub(crate) async fn list_advice_models_with_options(
     client: &DecisionClient,
     options: &AdviceRuntimeOptions,
 ) -> Result<AdviceModelsOutput, AdviceError> {
+    if scope.profile_id.is_some() {
+        return Err(AdviceError::invalid_input(
+            "--profile-id is not supported for the models command.",
+        ));
+    }
     let validated_scope = validate_scope(scope, false, options.expected_uid)?;
     let validated_tool_id = validate_strict_identifier(tool_id, "tool_id is invalid.")?;
     let snapshot =
@@ -645,7 +687,11 @@ pub(crate) async fn classify_advice_with_options(
     let request = read_and_validate_request_file(request_path, options.expected_uid)?;
     let initial_snapshot =
         read_readonly_registry_snapshot(&preflight_scope.registry_dir, options.expected_uid)?;
-    let resolved = resolve_jev_tool_and_model(&initial_snapshot, &request)?;
+    let resolved = resolve_jev_tool_and_model(
+        &initial_snapshot,
+        &request,
+        preflight_scope.profile_id.as_deref(),
+    )?;
 
     let summary_sha256 = sha256_hex(request.normalized_summary.as_bytes());
     let prompt_digest = compute_prompt_digest();
@@ -661,6 +707,7 @@ pub(crate) async fn classify_advice_with_options(
         &resolved.tool_id,
         &resolved.model_id,
         &resolved.requested_model,
+        resolved.profile_id.as_deref(),
     );
 
     // 2. Ensure private 0700 cache directory exists (only `classify` may create it).
@@ -679,6 +726,7 @@ pub(crate) async fn classify_advice_with_options(
         task_revision: request.raw.task_revision,
         summary_sha256: summary_sha256.clone(),
         registry_revision: request.raw.expected_registry_revision,
+        profile_id: resolved.profile_id.clone(),
         tool_id: resolved.tool_id.clone(),
         model_id: resolved.model_id.clone(),
         requested_model: resolved.requested_model.clone(),
@@ -719,6 +767,7 @@ pub(crate) async fn classify_advice_with_options(
                 request.raw.task_revision,
                 &summary_sha256,
                 request.raw.expected_registry_revision,
+                resolved.profile_id.as_deref(),
                 &resolved.tool_id,
                 &resolved.model_id,
                 &resolved.requested_model,
@@ -762,6 +811,7 @@ pub(crate) async fn classify_advice_with_options(
                             task_id: request.raw.task_id,
                             task_revision: request.raw.task_revision,
                             registry_revision: initial_snapshot.revision,
+                            profile_id: resolved.profile_id,
                             tool_id: resolved.tool_id,
                             model_id: resolved.model_id,
                             requested_model: resolved.requested_model,
@@ -880,8 +930,13 @@ pub(crate) async fn classify_advice_with_options(
     let post_check = (|| -> Result<(), AdviceError> {
         let post_snapshot =
             read_readonly_registry_snapshot(&validated_scope.registry_dir, options.expected_uid)?;
-        let post_resolved = resolve_jev_tool_and_model(&post_snapshot, &request)?;
-        if post_resolved.tool_id != resolved.tool_id
+        let post_resolved = resolve_jev_tool_and_model(
+            &post_snapshot,
+            &request,
+            validated_scope.profile_id.as_deref(),
+        )?;
+        if post_resolved.profile_id != resolved.profile_id
+            || post_resolved.tool_id != resolved.tool_id
             || post_resolved.model_id != resolved.model_id
             || post_resolved.requested_model != resolved.requested_model
         {
@@ -953,6 +1008,7 @@ pub(crate) async fn classify_advice_with_options(
         task_id: request.raw.task_id,
         task_revision: request.raw.task_revision,
         registry_revision: request.raw.expected_registry_revision,
+        profile_id: resolved.profile_id,
         tool_id: resolved.tool_id,
         model_id: resolved.model_id,
         requested_model: resolved.requested_model,
@@ -1144,6 +1200,7 @@ struct ValidatedScope {
     project_root_str: String,
     context_id: String,
     cache_ttl_seconds: u64,
+    profile_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1154,6 +1211,7 @@ struct ValidatedAdviceRequest {
 
 #[derive(Debug, Clone)]
 struct ResolvedJevTarget {
+    profile_id: Option<String>,
     tool_id: String,
     model_id: String,
     requested_model: String,
@@ -1245,6 +1303,14 @@ fn validate_scope(
             "context_id must be a non-empty bounded identifier.",
         )?;
 
+        let profile_id = match scope.profile_id.as_deref() {
+            Some(raw_profile_id) => Some(validate_strict_identifier(
+                raw_profile_id,
+                "profile_id must be a non-empty bounded identifier.",
+            )?),
+            None => None,
+        };
+
         validate_normalized_absolute_path(
             &scope.project_root,
             "project_root must be a normalized absolute path.",
@@ -1288,6 +1354,7 @@ fn validate_scope(
             project_root_str,
             context_id,
             cache_ttl_seconds: scope.cache_ttl_seconds,
+            profile_id,
         })
     }
 }
@@ -1686,12 +1753,66 @@ fn validate_enabled_jev_tool(
 fn resolve_jev_tool_and_model(
     snapshot: &RegistrySnapshot,
     request: &ValidatedAdviceRequest,
+    profile_id: Option<&str>,
 ) -> Result<ResolvedJevTarget, AdviceError> {
     if snapshot.revision != request.raw.expected_registry_revision {
         return Err(AdviceError::stale_registry_revision());
     }
 
-    validate_enabled_jev_tool(snapshot, &request.raw.tool_id)?;
+    let resolved_profile_id = if let Some(expected_profile_id) = profile_id {
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|candidate| candidate.id == expected_profile_id)
+            .ok_or_else(AdviceError::profile_not_found)?;
+
+        let advisor = profile
+            .decision_advisor
+            .as_ref()
+            .ok_or_else(AdviceError::decision_advisor_not_configured)?;
+
+        if advisor.mode != DecisionAdvisorMode::Shadow {
+            return Err(AdviceError::invalid_request(
+                "Selected workflow profile decision advisor must use shadow mode.",
+            ));
+        }
+
+        let advisor_model = snapshot
+            .models
+            .iter()
+            .find(|candidate| candidate.id == advisor.model_id)
+            .ok_or_else(AdviceError::model_not_found)?;
+
+        let advisor_tool = snapshot
+            .tools
+            .iter()
+            .find(|candidate| candidate.id == advisor_model.tool_id)
+            .ok_or_else(AdviceError::tool_not_found)?;
+
+        if advisor_tool.adapter != ToolAdapter::JevApi {
+            return Err(AdviceError::unsupported_adapter());
+        }
+
+        if !advisor_tool.enabled {
+            return Err(AdviceError::tool_disabled());
+        }
+
+        if !advisor_model.allow_no_effort {
+            return Err(AdviceError::invalid_model());
+        }
+
+        validate_enabled_jev_tool(snapshot, &request.raw.tool_id)?;
+
+        if advisor_model.tool_id != request.raw.tool_id || advisor.model_id != request.raw.model_id
+        {
+            return Err(AdviceError::profile_advisor_mismatch());
+        }
+
+        Some(profile.id.clone())
+    } else {
+        validate_enabled_jev_tool(snapshot, &request.raw.tool_id)?;
+        None
+    };
 
     let model = snapshot
         .models
@@ -1707,6 +1828,7 @@ fn resolve_jev_tool_and_model(
     }
 
     Ok(ResolvedJevTarget {
+        profile_id: resolved_profile_id,
         tool_id: request.raw.tool_id.clone(),
         model_id: model.id.clone(),
         requested_model: requested_model.to_string(),
@@ -1749,7 +1871,7 @@ fn compute_prompt_digest() -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_cache_key(
+pub(crate) fn compute_cache_key(
     prompt_digest: &str,
     canonical_project_root: &str,
     context_id: &str,
@@ -1760,6 +1882,7 @@ fn compute_cache_key(
     tool_id: &str,
     model_id: &str,
     requested_model: &str,
+    profile_id: Option<&str>,
 ) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ADVICE_CACHE_SCHEMA_VERSION.to_le_bytes());
@@ -1773,6 +1896,10 @@ fn compute_cache_key(
     hash_len_prefixed(&mut hasher, tool_id.as_bytes());
     hash_len_prefixed(&mut hasher, model_id.as_bytes());
     hash_len_prefixed(&mut hasher, requested_model.as_bytes());
+    if let Some(profile_id) = profile_id {
+        hash_len_prefixed(&mut hasher, b"profile_id");
+        hash_len_prefixed(&mut hasher, profile_id.as_bytes());
+    }
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in digest {
@@ -2308,6 +2435,7 @@ fn read_and_validate_cache_record(
     expected_task_revision: u64,
     expected_summary_sha256: &str,
     expected_registry_revision: u64,
+    expected_profile_id: Option<&str>,
     expected_tool_id: &str,
     expected_model_id: &str,
     expected_requested_model: &str,
@@ -2334,6 +2462,7 @@ fn read_and_validate_cache_record(
         || record.task_revision != expected_task_revision
         || record.summary_sha256 != expected_summary_sha256
         || record.registry_revision != expected_registry_revision
+        || record.profile_id.as_deref() != expected_profile_id
         || record.tool_id != expected_tool_id
         || record.model_id != expected_model_id
         || record.requested_model != expected_requested_model

@@ -134,6 +134,7 @@ impl ApprovalFixture {
                 s2.revision,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: PROFILE_ID.to_string(),
                         name: "Approval CLI fixture profile".to_string(),
                         assignments: vec![RoleAssignment {

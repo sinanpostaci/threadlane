@@ -8,16 +8,27 @@ import {
   selectedFamilyEffort,
   type ModelFamily,
 } from '../registry/model-families.ts';
-
-import type {
-  Difficulty,
-  ModelDefinition,
-  RegistryChange,
-  RegistrySnapshot,
-  RoleAssignment,
-  ToolDefinition,
-  WorkflowProfile,
-  WorkflowRole,
+import {
+  cloneDecisionAdvisor,
+  decisionAdvisorFromProfile,
+  eligibleDecisionAdvisors,
+  profileSignatureWithDecisionAdvisor,
+  profileWithDecisionAdvisor,
+  validateDecisionAdvisor,
+  type DecisionAdvisorChoice,
+  type DecisionAdvisorValidation,
+} from '../registry/profile-advisor.ts';
+import {
+  isApiToolAdapter,
+  type DecisionAdvisor,
+  type Difficulty,
+  type ModelDefinition,
+  type RegistryChange,
+  type RegistrySnapshot,
+  type RoleAssignment,
+  type ToolDefinition,
+  type WorkflowProfile,
+  type WorkflowRole,
 } from '../registry/types.ts';
 import { createButton, h } from '../ui/dom.ts';
 
@@ -69,6 +80,7 @@ export interface AssignmentIssue {
 export interface DraftAnalysis {
   errors: string[];
   issues: AssignmentIssue[];
+  advisor: DecisionAdvisorValidation;
   missingDefaults: WorkflowRole[];
   unassignedRoles: WorkflowRole[];
   assignmentCount: number;
@@ -82,6 +94,7 @@ export interface ProfileSummary {
   overrideCount: number;
   missingDefaults: WorkflowRole[];
   issues: AssignmentIssue[];
+  advisor: DecisionAdvisorValidation;
 }
 
 export interface ProfileDraft {
@@ -94,6 +107,7 @@ export interface ProfileDraft {
   sourceSignature: string | null;
   cloneOfName: string | null;
   assignments: AssignmentTable;
+  decisionAdvisor: DecisionAdvisor | null;
   externalChanged: boolean;
   externalDeleted: boolean;
   overwriteAcknowledged: boolean;
@@ -109,6 +123,8 @@ interface ModelGroup {
 interface RegistryIndex {
   tools: Map<string, ToolDefinition>;
   models: Map<string, ModelDefinition>;
+  toolList: readonly ToolDefinition[];
+  modelList: readonly ModelDefinition[];
   allFamilies: ModelFamily[];
   familiesByKey: Map<string, ModelFamily>;
   enabledFamiliesByKey: Map<string, ModelFamily>;
@@ -209,11 +225,14 @@ function assignmentsFromTable(table: AssignmentTable): RoleAssignment[] {
 }
 
 function profileFromDraft(draft: ProfileDraft): WorkflowProfile {
-  return {
-    id: draft.id,
-    name: draft.name.trim(),
-    assignments: assignmentsFromTable(draft.assignments),
-  };
+  return profileWithDecisionAdvisor(
+    {
+      id: draft.id,
+      name: draft.name.trim(),
+      assignments: assignmentsFromTable(draft.assignments),
+    },
+    draft.decisionAdvisor
+  );
 }
 
 function buildIndex(snapshot: RegistrySnapshot): RegistryIndex {
@@ -225,7 +244,8 @@ function buildIndex(snapshot: RegistrySnapshot): RegistryIndex {
   const groups: ModelGroup[] = [];
 
   for (const tool of snapshot.tools) {
-    if (!tool.enabled) {
+    // Decision APIs are profile advisors, never workflow-role model choices.
+    if (!tool.enabled || isApiToolAdapter(tool.adapter)) {
       continue;
     }
     const toolModels = snapshot.models.filter((model) => model.tool_id === tool.id);
@@ -243,6 +263,8 @@ function buildIndex(snapshot: RegistrySnapshot): RegistryIndex {
   return {
     tools,
     models,
+    toolList: snapshot.tools,
+    modelList: snapshot.models,
     allFamilies,
     familiesByKey,
     enabledFamiliesByKey,
@@ -426,6 +448,15 @@ function validateTable(index: RegistryIndex, table: AssignmentTable): Assignment
           slot,
           message: `Model "${modelLabel}" belongs to disabled tool "${tool.label}".`,
         });
+      } else if (isApiToolAdapter(tool.adapter)) {
+        issues.push({
+          role,
+          slot,
+          message:
+            `Model "${modelLabel}" uses "${tool.label}", a decisions API available only ` +
+            'as a Decision advisor, not a workflow role. Clear this role assignment.',
+        });
+        continue;
       }
 
       if (cell.effort === null) {
@@ -455,9 +486,16 @@ function slotLabel(slot: Slot): string {
 
 function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnalysis {
   const issues = validateTable(index, draft.assignments);
+  const advisor = validateDecisionAdvisor(
+    { tools: index.toolList, models: index.modelList },
+    draft.decisionAdvisor
+  );
   const errors = issues.map(
     (issue) => `${ROLE_LABELS[issue.role]} ${slotLabel(issue.slot)}: ${issue.message}`
   );
+  if (advisor.state === 'invalid') {
+    errors.push(`Decision advisor: ${advisor.issue.message}`);
+  }
   const trimmedName = draft.name.trim();
 
   if (!trimmedName) {
@@ -496,6 +534,7 @@ function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnaly
   return {
     errors,
     issues,
+    advisor,
     missingDefaults,
     unassignedRoles,
     assignmentCount,
@@ -535,6 +574,10 @@ export function summarizeProfile(
     overrideCount,
     missingDefaults,
     issues: validateTable(index, table),
+    advisor: validateDecisionAdvisor(
+      { tools: snapshot.tools, models: snapshot.models },
+      profile.decision_advisor
+    ),
   };
 }
 
@@ -556,7 +599,7 @@ export function profileSignature(profile: WorkflowProfile): string {
       return SLOTS.indexOf(leftSlot) - SLOTS.indexOf(rightSlot);
     });
 
-  return JSON.stringify({ name: profile.name, assignments });
+  return profileSignatureWithDecisionAdvisor(profile, assignments);
 }
 
 export function normalizeError(error: unknown): SafeError {
@@ -628,6 +671,37 @@ function button(
 
 function pill(text: string, tone: 'muted' | 'accent' | 'warn' | 'error'): HTMLElement {
   return h('span', { class: 'aq-profiles-pill', 'data-tone': tone }, text);
+}
+
+function advisorSummaryText(validation: DecisionAdvisorValidation): string {
+  if (validation.state === 'off') {
+    return 'Off';
+  }
+  if (validation.state === 'invalid') {
+    return 'Needs repair';
+  }
+  return `${validation.tool.label} · ${validation.model.label} · Shadow`;
+}
+
+function advisorToolNote(tool: ToolDefinition | null): string | null {
+  return tool?.adapter === 'openai_decisions_api'
+    ? 'OpenAI Decisions is configurable for future use; current advice CLI executes Jev only.'
+    : null;
+}
+
+function groupAdvisorChoices(
+  choices: readonly DecisionAdvisorChoice[]
+): Array<{ tool: ToolDefinition; models: ModelDefinition[] }> {
+  const groups: Array<{ tool: ToolDefinition; models: ModelDefinition[] }> = [];
+  for (const choice of choices) {
+    let group = groups.find((entry) => entry.tool.id === choice.tool.id);
+    if (!group) {
+      group = { tool: choice.tool, models: [] };
+      groups.push(group);
+    }
+    group.models.push(choice.model);
+  }
+  return groups;
 }
 
 function banner(
@@ -1098,6 +1172,8 @@ export class ProfilesPage {
     const isConfirming = this.confirmDeleteId === profile.id;
     const missing = summary.missingDefaults.map((role) => ROLE_LABELS[role]).join(', ');
     const visibleIssues = summary.issues.slice(0, 2);
+    const advisorIssue =
+      summary.advisor.state === 'invalid' ? summary.advisor.issue : null;
 
     const badges: HTMLElement[] = [];
     if (isDefault) {
@@ -1115,6 +1191,9 @@ export class ProfilesPage {
           'error'
         )
       );
+    }
+    if (advisorIssue) {
+      badges.push(pill('Advisor issue', 'error'));
     }
 
     return h(
@@ -1137,6 +1216,20 @@ export class ProfilesPage {
         `${summary.defaultCount}/${ROLES.length} role defaults · ` +
           `${summary.overrideCount} difficulty overrides · ${summary.assignmentCount} assignments`
       ),
+      h(
+        'p',
+        { class: 'aq-profiles-advisor-summary' },
+        h('strong', {}, 'Decision advisor: '),
+        advisorSummaryText(summary.advisor)
+      ),
+      advisorIssue
+        ? h(
+            'p',
+            { class: 'aq-profiles-note', 'data-tone': 'warn' },
+            h('strong', {}, 'Advisor repair: '),
+            advisorIssue.message
+          )
+        : null,
       summary.missingDefaults.length > 0
         ? h(
             'p',
@@ -1328,6 +1421,7 @@ export class ProfilesPage {
         )
       ),
       h('div', { 'data-draft-status': 'true' }, buildDraftStatus(analysis, draft)),
+      this.buildDecisionAdvisorSection(draft, analysis, busy),
       this.buildModelSetupCard(snapshot, true),
       showRoleEditors
         ? h(
@@ -1367,6 +1461,192 @@ export class ProfilesPage {
         { class: 'aq-profiles-footnote' },
         'Profiles are preferences. Running tasks keep their resolved model choices until they finish.'
       )
+    );
+  }
+
+  private buildDecisionAdvisorSection(
+    draft: ProfileDraft,
+    analysis: DraftAnalysis,
+    busy: boolean
+  ): HTMLElement {
+    const validation = analysis.advisor;
+    const advisorIssue = validation.state === 'invalid' ? validation.issue : null;
+    const choices = this.index
+      ? eligibleDecisionAdvisors({
+          tools: this.index.toolList,
+          models: this.index.modelList,
+        })
+      : [];
+    const groups = groupAdvisorChoices(choices);
+    const selectId = `aq-profiles-advisor-${this.instanceId}`;
+    const helpId = `${selectId}-help`;
+    const select = h('select', {
+      id: selectId,
+      class: 'aq-profiles-select',
+      'data-advisor-select': 'true',
+      'data-focus-key': 'advisor-model',
+      'aria-describedby': helpId,
+    }) as HTMLSelectElement;
+    select.append(h('option', { value: '' }, 'Off — no advisor'));
+
+    let selectedValue = '';
+    for (const group of groups) {
+      const groupSuffix =
+        group.tool.adapter === 'openai_decisions_api'
+          ? ' · future; Jev executes today'
+          : '';
+      const optgroup = h('optgroup', { label: `${group.tool.label}${groupSuffix}` });
+      for (const model of group.models) {
+        const modelLabel = model.label || model.id;
+        const option = h('option', { value: model.id }, modelLabel);
+        option.title = `${group.tool.label} · ${model.id}`;
+        if (draft.decisionAdvisor?.model_id === model.id) {
+          option.selected = true;
+          selectedValue = model.id;
+        }
+        optgroup.append(option);
+      }
+      select.append(optgroup);
+    }
+
+    if (draft.decisionAdvisor && !selectedValue) {
+      const model =
+        validation.model ?? this.index?.models.get(draft.decisionAdvisor.model_id) ?? null;
+      const tool =
+        validation.tool ??
+        (model && this.index ? this.index.tools.get(model.tool_id) ?? null : null);
+      const label = model?.label || draft.decisionAdvisor.model_id;
+      const unavailable = h(
+        'option',
+        { value: draft.decisionAdvisor.model_id },
+        `${label} (unavailable${tool ? ` — ${tool.label}` : ''})`
+      );
+      unavailable.disabled = true;
+      unavailable.selected = true;
+      select.append(unavailable);
+      selectedValue = draft.decisionAdvisor.model_id;
+    }
+
+    select.value = selectedValue;
+    select.disabled = busy;
+    select.addEventListener('change', () => {
+      if (!this.draft) {
+        return;
+      }
+      this.draft.decisionAdvisor = select.value
+        ? { model_id: select.value, mode: 'shadow' }
+        : null;
+      this.rebuild('advisor-model');
+    });
+
+    const clearButton = draft.decisionAdvisor
+      ? button(
+          'Clear advisor',
+          () => {
+            if (!this.draft || this.pending !== null) {
+              return;
+            }
+            this.draft.decisionAdvisor = null;
+            this.rebuild('advisor-model');
+          },
+          {
+            className: 'aq-profiles-link',
+            disabled: busy,
+            focusKey: 'clear-advisor',
+            ariaLabel: 'Clear the Decision advisor',
+          }
+        )
+      : null;
+
+    const repairActions = advisorIssue
+      ? [
+          button('Choose in Tools', () => this.onOpenTools(), {
+            className: 'aq-btn',
+            disabled: busy,
+            focusKey: 'advisor-open-tools',
+            ariaLabel: 'Choose decision API models in Tools',
+          }),
+        ]
+      : [];
+
+    const openAiNote = advisorToolNote(
+      validation.state === 'off' ? null : validation.tool
+    );
+
+    return h(
+      'section',
+      {
+        class: 'aq-profiles-advisor',
+        'data-advisor-section': 'true',
+        'data-tone': validation.state,
+        'aria-label': 'Decision advisor',
+      },
+      h(
+        'div',
+        { class: 'aq-profiles-advisor-head' },
+        h(
+          'div',
+          { class: 'aq-profiles-advisor-title' },
+          h('p', { class: 'aq-profiles-kicker' }, 'Optional'),
+          h('h4', {}, 'Decision advisor')
+        ),
+        pill('Shadow', 'accent')
+      ),
+      h(
+        'p',
+        { class: 'aq-profiles-note' },
+        'Suggests task difficulty without changing your plan or starting work.'
+      ),
+      h(
+        'div',
+        { class: 'aq-profiles-advisor-controls' },
+        h(
+          'label',
+          { class: 'aq-profiles-select-field', for: selectId },
+          h('span', {}, 'API model'),
+          select
+        ),
+        clearButton
+      ),
+      advisorIssue
+        ? h(
+            'div',
+            { class: 'aq-profiles-advisor-issue', role: 'alert' },
+            h('strong', {}, 'Advisor needs repair'),
+            h('p', {}, advisorIssue.message),
+            repairActions.length > 0
+              ? h('div', { class: 'aq-profiles-advisor-actions' }, ...repairActions)
+              : null
+          )
+        : null,
+      openAiNote
+        ? h('p', { class: 'aq-profiles-note', 'data-tone': 'warn' }, openAiNote)
+        : null,
+      h(
+        'p',
+        { class: 'aq-profiles-note', id: helpId },
+        'Saving this choice sends no request. Running tasks keep their current settings.'
+      ),
+      choices.length === 0
+        ? h(
+            'div',
+            { class: 'aq-profiles-advisor-empty' },
+            h(
+              'p',
+              {},
+              'No enabled Jev or OpenAI decisions API model is available. Add an enabled ' +
+                'API tool and a model that allows no effort in Tools.'
+            ),
+            advisorIssue
+              ? null
+              : button('Choose in Tools', () => this.onOpenTools(), {
+                  className: 'aq-btn aq-btn-primary',
+                  disabled: busy,
+                  focusKey: 'advisor-empty-open-tools',
+                  ariaLabel: 'Add decision API tools and models in Tools',
+                })
+          )
+        : null
     );
   }
 
@@ -1584,10 +1864,15 @@ export class ProfilesPage {
         selectedOptionValue = cell.pending_family;
       } else if (cell.model_id && !selected) {
         const model = index.models.get(cell.model_id);
+        const modelTool = model ? index.tools.get(model.tool_id) : null;
+        const reason =
+          modelTool && isApiToolAdapter(modelTool.adapter)
+            ? 'decision advisor only'
+            : 'unavailable';
         const unavailable = h(
           'option',
           { value: cell.model_id },
-          `${model?.label || cell.model_id} (unavailable)`
+          `${model?.label || cell.model_id} (${reason})`
         );
         unavailable.disabled = true;
         unavailable.selected = true;
@@ -1844,6 +2129,7 @@ export class ProfilesPage {
         sourceSignature: null,
         cloneOfName: null,
         assignments: createEmptyTable(),
+        decisionAdvisor: null,
         externalChanged: false,
         externalDeleted: false,
         overwriteAcknowledged: false,
@@ -1878,6 +2164,7 @@ export class ProfilesPage {
       sourceSignature: profileSignature(profile),
       cloneOfName: null,
       assignments: tableFromProfile(profile),
+      decisionAdvisor: decisionAdvisorFromProfile(profile),
       externalChanged: false,
       externalDeleted: false,
       overwriteAcknowledged: false,
@@ -1909,6 +2196,7 @@ export class ProfilesPage {
         sourceSignature: null,
         cloneOfName: profile.name,
         assignments: cloneTable(tableFromProfile(profile)),
+        decisionAdvisor: cloneDecisionAdvisor(profile.decision_advisor),
         externalChanged: false,
         externalDeleted: false,
         overwriteAcknowledged: false,
@@ -2142,6 +2430,7 @@ export class ProfilesPage {
 
     this.draft.name = latest.name;
     this.draft.assignments = tableFromProfile(latest);
+    this.draft.decisionAdvisor = decisionAdvisorFromProfile(latest);
     this.draft.sourceRevision = this.snapshot.revision;
     this.draft.sourceSignature = profileSignature(latest);
     this.draft.externalChanged = false;

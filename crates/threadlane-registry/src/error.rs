@@ -12,7 +12,8 @@ pub enum RegistryError {
     #[error("{0}")]
     InvalidInput(&'static str),
 
-    /// A model, profile assignment, or default profile references a nonexistent entity.
+    /// A model, profile assignment, decision advisor, or default profile references a
+    /// nonexistent, disabled, or incompatible entity.
     #[error("{0}")]
     InvalidReference(&'static str),
 
@@ -20,7 +21,8 @@ pub enum RegistryError {
     #[error("{0}")]
     DuplicateAssignment(&'static str),
 
-    /// A workflow assignment specifies an effort level that is not supported by the target model.
+    /// A workflow assignment or decision advisor specifies or requires an effort level that is
+    /// not supported by the target model.
     #[error("{0}")]
     UnsupportedEffort(&'static str),
 

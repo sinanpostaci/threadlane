@@ -120,6 +120,14 @@ advisory lifecycle. One explicit Linux catalog GET with a GUI-entered key
 returned `jev-latest` and `jev-preview`; live classification, paid entitlement
 and cross-platform keychain acceptance remain separate gates.
 
+[Profile decision advisors](PROFILE-ADVISOR.md) add an optional shadow-only API
+model selection independently of the six worker roles. The desktop editor and
+native profile catalog expose the same selection; explicit `advice --profile-id`
+calls require an exact request/profile match. No request is sent by editing or
+saving a profile, legacy off profiles preserve their original wire shape, and
+running approvals stay frozen. OpenAI remains a configuration extension while
+the current advice execution route supports Jev only.
+
 The [approved-session notification extension](APPROVED-NOTIFICATIONS.md) adds
 default-off startup policy, fixed approval wake-ups and transactional byte-bounded
 event pull/ACK through the original paired native enrollment. The

@@ -79,10 +79,18 @@ export interface RoleAssignment {
   choice: ModelChoice;
 }
 
+export type DecisionAdvisorMode = 'shadow';
+
+export interface DecisionAdvisor {
+  model_id: string;
+  mode: DecisionAdvisorMode;
+}
+
 export interface WorkflowProfile {
   id: string;
   name: string;
   assignments: RoleAssignment[];
+  decision_advisor?: DecisionAdvisor | null;
 }
 
 export interface RegistrySnapshot {

@@ -500,6 +500,7 @@ exit 0
                 4,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: "profile-main".to_string(),
                         name: "Main M4 Profile".to_string(),
                         assignments: vec![

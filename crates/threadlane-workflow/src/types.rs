@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use threadlane_plans::{
     CompiledPlan, CompiledTask, DeliveryReceipt, PlanRevision, PlanStatus, PlanTask,
 };
-use threadlane_registry::{Difficulty, ToolAdapter, WorkflowRole};
+use threadlane_registry::{DecisionAdvisorMode, Difficulty, ToolAdapter, WorkflowRole};
 
 /// Default page size limit for [`crate::ScopedWorkflow::catalog`].
 pub const DEFAULT_CATALOG_LIMIT: usize = 20;
@@ -121,6 +121,33 @@ pub struct CatalogRoleAssignment {
 /// Type alias for [`CatalogRoleAssignment`].
 pub type CatalogAssignment = CatalogRoleAssignment;
 
+/// Public, credential-free and executable-path-free view of a profile's optional read-only
+/// decision advisor configuration.
+///
+/// This is static registry metadata resolved from the same pinned snapshot as the profile's
+/// role assignments. It is not proof of credentials, entitlement, provider availability or
+/// model health, and it grants no execution authority. Catalog reads never probe a provider,
+/// request a secret/status check, or dispatch advice work. `adapter` identifies the configured
+/// provider boundary only; OpenAI Decisions entries remain future configuration metadata and
+/// do not imply live advice support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDecisionAdvisor {
+    /// Configured advisory mode.
+    pub mode: DecisionAdvisorMode,
+    /// Identifier of the configured advisor model in the registry.
+    pub model_id: String,
+    /// Human-readable display label of the configured advisor model.
+    pub model_label: String,
+    /// Exact provider/CLI model argument configured for the advisor model.
+    pub model_arg: String,
+    /// Identifier of the tool owning `model_id`.
+    pub tool_id: String,
+    /// Human-readable display label of the owning tool.
+    pub tool_label: String,
+    /// Adapter kind of the owning tool (configuration provenance only).
+    pub adapter: ToolAdapter,
+}
+
 /// Public summary of a workflow profile in a [`CatalogPage`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogProfile {
@@ -136,6 +163,13 @@ pub struct CatalogProfile {
     pub available: bool,
     /// Resolved role/difficulty assignments configured on this profile.
     pub assignments: Vec<CatalogRoleAssignment>,
+    /// Optional read-only decision advisor configuration resolved from the same registry snapshot.
+    ///
+    /// `None` when no advisor is configured, including legacy profiles without the key. This
+    /// metadata is not a seventh worker role, does not affect `available`, and is never
+    /// credential, entitlement or availability proof or execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_advisor: Option<CatalogDecisionAdvisor>,
 }
 
 impl CatalogProfile {

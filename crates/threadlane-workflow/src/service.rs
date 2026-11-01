@@ -25,10 +25,10 @@ use crate::journal::{
     MAX_COMMAND_JOURNAL_ENTRIES,
 };
 use crate::types::{
-    CatalogPage, CatalogProfile, CatalogRoleAssignment, PlanPage, PlanSummary, PlanSummaryPage,
-    PublishedPlanView, SavePlanDraft, TaskExecutionRoute, DEFAULT_CATALOG_LIMIT,
-    DEFAULT_PLAN_LIST_LIMIT, DEFAULT_PLAN_TASK_LIMIT, MAX_CATALOG_LIMIT, MAX_MCP_RESPONSE_BYTES,
-    MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
+    CatalogDecisionAdvisor, CatalogPage, CatalogProfile, CatalogRoleAssignment, PlanPage,
+    PlanSummary, PlanSummaryPage, PublishedPlanView, SavePlanDraft, TaskExecutionRoute,
+    DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT, DEFAULT_PLAN_TASK_LIMIT, MAX_CATALOG_LIMIT,
+    MAX_MCP_RESPONSE_BYTES, MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
 };
 
 /// Derives a deterministic, binding-isolated plan identifier (`plan_<32-hex>`) from
@@ -144,6 +144,9 @@ impl ScopedWorkflow {
     /// - Summaries omit CLI executable paths and credentials.
     /// - Assignments referencing disabled tools are marked `tool_enabled: false` and `available: false`
     ///   without substituting another model or tool.
+    /// - Optional `decision_advisor` metadata is resolved from the same `registry_revision` snapshot;
+    ///   it never probes a provider, changes assignment counts or `available`, or grants execution
+    ///   authority.
     /// - Opaque cursors pin the binding scope and `registry_revision`; if the registry changes between
     ///   pages, the cursor is rejected as stale (`stale_revision`).
     pub fn catalog(
@@ -958,6 +961,39 @@ fn build_catalog_profile(
     let is_default = snapshot.default_profile_id.as_deref() == Some(profile.id.as_str());
     let available = !assignments.is_empty() && assignments.iter().all(|a| a.available);
 
+    // Advisor references are resolved from this same snapshot with no default inference or
+    // substitution. Registry writes already validate the configured model and tool; a missing
+    // reference can only indicate a corrupt/tampered snapshot and uses the same static,
+    // sanitized error convention as role assignments.
+    let decision_advisor = match profile.decision_advisor.as_ref() {
+        Some(advisor) => {
+            let model = snapshot
+                .models
+                .iter()
+                .find(|model| model.id == advisor.model_id)
+                .ok_or(WorkflowError::CorruptStore(
+                    "Registry profile references a missing model definition.",
+                ))?;
+            let tool = snapshot
+                .tools
+                .iter()
+                .find(|tool| tool.id == model.tool_id)
+                .ok_or(WorkflowError::CorruptStore(
+                    "Registry model references a missing tool definition.",
+                ))?;
+            Some(CatalogDecisionAdvisor {
+                mode: advisor.mode,
+                model_id: model.id.clone(),
+                model_label: model.label.clone(),
+                model_arg: model.model_arg.clone(),
+                tool_id: tool.id.clone(),
+                tool_label: tool.label.clone(),
+                adapter: tool.adapter,
+            })
+        }
+        None => None,
+    };
+
     Ok(CatalogProfile {
         profile_id: profile.id.clone(),
         name: profile.name.clone(),
@@ -965,6 +1001,7 @@ fn build_catalog_profile(
         is_default,
         available,
         assignments,
+        decision_advisor,
     })
 }
 

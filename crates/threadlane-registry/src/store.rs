@@ -8,10 +8,10 @@ use fs2::FileExt;
 
 use crate::error::RegistryError;
 use crate::types::{
-    Difficulty, ModelChoice, ModelDefinition, RegistryChange, RegistrySnapshot, RoleAssignment,
-    ToolDefinition, WorkflowProfile, WorkflowRole, MAX_ASSIGNMENTS_PER_PROFILE,
-    MAX_EFFORTS_PER_MODEL, MAX_EFFORT_LEN, MAX_EXECUTABLE_PATH_LEN, MAX_ID_LEN,
-    MAX_JS_SAFE_INTEGER, MAX_LABEL_LEN, MAX_MODELS, MAX_MODEL_ARG_LEN, MAX_PROFILES,
+    DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition, RegistryChange,
+    RegistrySnapshot, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+    MAX_ASSIGNMENTS_PER_PROFILE, MAX_EFFORTS_PER_MODEL, MAX_EFFORT_LEN, MAX_EXECUTABLE_PATH_LEN,
+    MAX_ID_LEN, MAX_JS_SAFE_INTEGER, MAX_LABEL_LEN, MAX_MODELS, MAX_MODEL_ARG_LEN, MAX_PROFILES,
     MAX_REGISTRY_FILE_BYTES, MAX_TOOLS, REGISTRY_FILE_NAME, REGISTRY_LOCK_FILE_NAME,
     REGISTRY_SCHEMA_VERSION,
 };
@@ -454,6 +454,10 @@ fn apply_change_in_memory(
                     .assignments
                     .iter()
                     .any(|assignment| assignment.choice.model_id == model_id)
+                    || profile
+                        .decision_advisor
+                        .as_ref()
+                        .is_some_and(|advisor| advisor.model_id == model_id)
             });
             if referenced_by_profile {
                 return Err(RegistryError::ReferenceConflict(
@@ -683,6 +687,59 @@ fn validate_workflow_profile(
 
     for assignment in &profile.assignments {
         validate_model_choice(&assignment.choice, models, tools)?;
+    }
+
+    if let Some(ref advisor) = profile.decision_advisor {
+        validate_decision_advisor(advisor, models, tools)?;
+    }
+
+    Ok(())
+}
+
+fn validate_decision_advisor(
+    advisor: &DecisionAdvisor,
+    models: &[ModelDefinition],
+    tools: &[ToolDefinition],
+) -> Result<(), RegistryError> {
+    validate_identifier(&advisor.model_id)?;
+
+    match advisor.mode {
+        DecisionAdvisorMode::Shadow => {}
+    }
+
+    let model = models
+        .iter()
+        .find(|candidate| candidate.id == advisor.model_id)
+        .ok_or(RegistryError::InvalidReference(
+            "Decision advisor model does not exist in the registry.",
+        ))?;
+
+    let tool = tools
+        .iter()
+        .find(|candidate| candidate.id == model.tool_id)
+        .ok_or(RegistryError::InvalidReference(
+            "Decision advisor model references a tool that does not exist in the registry.",
+        ))?;
+
+    if !matches!(
+        tool.adapter,
+        ToolAdapter::JevApi | ToolAdapter::OpenaiDecisionsApi
+    ) {
+        return Err(RegistryError::InvalidReference(
+            "Decision advisor model must belong to a Jev API or OpenAI Decisions API tool.",
+        ));
+    }
+
+    if !tool.enabled {
+        return Err(RegistryError::InvalidReference(
+            "Decision advisor model must belong to an enabled decision API tool.",
+        ));
+    }
+
+    if !model.allow_no_effort {
+        return Err(RegistryError::UnsupportedEffort(
+            "Decision advisor model must support selection without an effort level.",
+        ));
     }
 
     Ok(())

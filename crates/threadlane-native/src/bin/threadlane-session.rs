@@ -1464,6 +1464,7 @@ mod tests {
                 s2.revision,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: "profile-main".to_string(),
                         name: "Session CLI Test Profile".to_string(),
                         assignments: vec![RoleAssignment {

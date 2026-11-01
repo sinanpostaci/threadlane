@@ -171,6 +171,7 @@ impl ContextFixture {
                 s2.revision,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: PROFILE_ID.to_string(),
                         name: "Context CLI Fixture Profile".to_string(),
                         assignments: vec![RoleAssignment {

@@ -93,6 +93,7 @@ fn base_snapshot() -> RegistrySnapshot {
         ],
         profiles: vec![
             WorkflowProfile {
+                decision_advisor: None,
                 id: "default".to_string(),
                 name: "default".to_string(),
                 assignments: vec![RoleAssignment {
@@ -105,6 +106,7 @@ fn base_snapshot() -> RegistrySnapshot {
                 }],
             },
             WorkflowProfile {
+                decision_advisor: None,
                 id: "profile-active".to_string(),
                 name: "Active Team Profile".to_string(),
                 assignments: vec![
@@ -399,6 +401,7 @@ fn missing_and_disabled_tool_model_and_unsupported_effort() {
         .enabled = false;
 
     snap.profiles.push(WorkflowProfile {
+        decision_advisor: None,
         id: "profile-broken".to_string(),
         name: "Broken Assignments Profile".to_string(),
         assignments: vec![
@@ -485,6 +488,7 @@ fn missing_and_disabled_tool_model_and_unsupported_effort() {
 fn native_handoff_headless_worker_and_unsupported_routes() {
     let mut snap = base_snapshot();
     snap.profiles.push(WorkflowProfile {
+        decision_advisor: None,
         id: "profile-routes".to_string(),
         name: "Routes Profile".to_string(),
         assignments: vec![
@@ -925,6 +929,7 @@ fn preflight_and_preflight_from_store_are_pure_and_perform_no_file_writes() {
             s2.revision,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
+                    decision_advisor: None,
                     id: "profile-store".to_string(),
                     name: "Store Profile".to_string(),
                     assignments: vec![RoleAssignment {
@@ -1008,6 +1013,7 @@ fn worker_target_snapshot(
             allow_no_effort,
         )],
         profiles: vec![WorkflowProfile {
+            decision_advisor: None,
             id: "profile-worker-target".to_string(),
             name: "Worker Target Profile".to_string(),
             assignments: vec![RoleAssignment {
@@ -1204,6 +1210,7 @@ fn preflight_from_store_does_not_recreate_deleted_registry_lock() {
             s2.revision,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
+                    decision_advisor: None,
                     id: "profile-store".to_string(),
                     name: "Store Profile".to_string(),
                     assignments: vec![RoleAssignment {

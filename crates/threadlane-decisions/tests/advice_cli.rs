@@ -13,7 +13,8 @@ use threadlane_decisions::{
     ADVICE_CACHE_SCHEMA_VERSION,
 };
 use threadlane_registry::{
-    Difficulty, ModelDefinition, RegistryChange, RegistryStore, ToolAdapter, ToolDefinition,
+    DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelDefinition, RegistryChange,
+    RegistryStore, ToolAdapter, ToolDefinition, WorkflowProfile,
 };
 
 static CLI_TEST_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -128,6 +129,7 @@ fn cli_help_and_version_run_offline_without_touching_filesystem() {
     assert!(help_stdout.contains("--cache-dir"));
     assert!(help_stdout.contains("--project-root"));
     assert!(help_stdout.contains("--context-id"));
+    assert!(help_stdout.contains("--profile-id"));
     assert!(help_stdout.contains("preview"));
     assert!(help_stdout.contains("classify"));
     assert!(help_stdout.contains("models"));
@@ -194,11 +196,17 @@ fn cli_preview_and_cached_classify_and_ownership_refusals_work_end_to_end() {
         "preview subprocess must not create cache_dir"
     );
 
+    let preview_stdout = String::from_utf8_lossy(&preview_cmd.stdout);
+    assert!(
+        !preview_stdout.contains("profile_id"),
+        "preview output without --profile-id must omit profile_id"
+    );
     let preview: AdvicePreviewOutput =
         serde_json::from_slice(&preview_cmd.stdout).expect("parse preview json");
     assert!(preview.untrusted_data);
     assert!(preview.advisory_only);
     assert_eq!(preview.mode, "shadow");
+    assert_eq!(preview.profile_id, None);
     assert_eq!(preview.task_summary, raw_summary);
     assert!(!preview.provider_call_performed);
 
@@ -414,8 +422,13 @@ fn cli_preview_and_cached_classify_and_ownership_refusals_work_end_to_end() {
         !classify_stdout.contains(raw_summary),
         "classify output must never contain raw task_summary"
     );
+    assert!(
+        !classify_stdout.contains("profile_id"),
+        "classify output without --profile-id must omit profile_id"
+    );
     let classify_out: AdviceClassifyOutput =
         serde_json::from_slice(&classify_cmd.stdout).expect("parse classify output");
+    assert_eq!(classify_out.profile_id, None);
     assert_eq!(classify_out.source, AdviceSource::Cache);
     assert!(!classify_out.provider_call_performed);
     assert!(classify_out.cache_age_ms.is_some());
@@ -423,4 +436,425 @@ fn cli_preview_and_cached_classify_and_ownership_refusals_work_end_to_end() {
     assert_eq!(classify_out.agrees_with_baseline, Some(true));
     assert_eq!(classify_out.advice.input_tokens, Some(88));
     assert_eq!(classify_out.advice.output_tokens, Some(7));
+}
+
+#[test]
+fn cli_profile_id_flag_validation_cache_scoping_and_refusals_work_end_to_end() {
+    let fixture = CliTestFixture::new("profile-id-subprocess");
+    let mut reg_rev = fixture.seed_jev_registry();
+    let store = RegistryStore::open(fixture.registry_dir.clone()).expect("open registry");
+
+    let snap = store
+        .apply(
+            reg_rev,
+            RegistryChange::UpsertModels {
+                models: vec![
+                    ModelDefinition {
+                        id: "jev-api:jev-latest".to_string(),
+                        tool_id: "jev-api".to_string(),
+                        label: "jev-latest".to_string(),
+                        model_arg: "jev-latest".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                    ModelDefinition {
+                        id: "jev-api:jev-1.14.0".to_string(),
+                        tool_id: "jev-api".to_string(),
+                        label: "jev-1.14.0".to_string(),
+                        model_arg: "jev-1.14.0".to_string(),
+                        efforts: Vec::new(),
+                        allow_no_effort: true,
+                    },
+                ],
+            },
+        )
+        .expect("upsert jev models");
+    reg_rev = snap.revision;
+
+    let snap = store
+        .apply(
+            reg_rev,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "openai-decisions".to_string(),
+                    label: "OpenAI Decisions".to_string(),
+                    adapter: ToolAdapter::OpenaiDecisionsApi,
+                    executable_path: None,
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert openai tool");
+    reg_rev = snap.revision;
+
+    let snap = store
+        .apply(
+            reg_rev,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "openai-decisions:gpt-5-nano".to_string(),
+                    tool_id: "openai-decisions".to_string(),
+                    label: "gpt-5-nano".to_string(),
+                    model_arg: "gpt-5-nano".to_string(),
+                    efforts: Vec::new(),
+                    allow_no_effort: true,
+                }],
+            },
+        )
+        .expect("upsert openai model");
+    reg_rev = snap.revision;
+
+    for (id, advisor_model) in [
+        ("profile-jev", Some("jev-api:jev-latest")),
+        ("profile-jev-b", Some("jev-api:jev-latest")),
+        ("profile-off", None),
+        ("profile-other-model", Some("jev-api:jev-1.14.0")),
+        ("profile-openai", Some("openai-decisions:gpt-5-nano")),
+    ] {
+        let snap = store
+            .apply(
+                reg_rev,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: id.to_string(),
+                        name: format!("Profile {id}"),
+                        assignments: Vec::new(),
+                        decision_advisor: advisor_model.map(|model_id| DecisionAdvisor {
+                            model_id: model_id.to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                    },
+                },
+            )
+            .expect("upsert profile");
+        reg_rev = snap.revision;
+    }
+
+    let context_id = "550e8400-e29b-41d4-a716-446655440000";
+    let raw_summary = "Profile-scoped CLI summary that must remain redacted in classify output.";
+    let req_path = fixture.write_request(
+        "request-jev.json",
+        &format!(
+            r#"{{
+                "schema_version": 1,
+                "expected_registry_revision": {reg_rev},
+                "tool_id": "jev-api",
+                "model_id": "jev-api:jev-latest",
+                "task_id": "cli-prof-task-1",
+                "task_revision": 1,
+                "task_summary": "{raw_summary}",
+                "baseline_difficulty": "easy"
+            }}"#
+        ),
+    );
+    let openai_req_path = fixture.write_request(
+        "request-openai.json",
+        &format!(
+            r#"{{
+                "schema_version": 1,
+                "expected_registry_revision": {reg_rev},
+                "tool_id": "openai-decisions",
+                "model_id": "openai-decisions:gpt-5-nano",
+                "task_id": "cli-prof-task-1",
+                "task_revision": 1,
+                "task_summary": "{raw_summary}",
+                "baseline_difficulty": "easy"
+            }}"#
+        ),
+    );
+
+    // 1. Baseline preview without --profile-id vs with --profile-id (before and after subcommand).
+    let preview_none_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("preview")
+        .arg("--request")
+        .arg(&req_path)
+        .output()
+        .expect("run preview without profile-id");
+    assert!(preview_none_cmd.status.success());
+    let preview_none: AdvicePreviewOutput =
+        serde_json::from_slice(&preview_none_cmd.stdout).expect("parse preview_none");
+    assert_eq!(preview_none.profile_id, None);
+
+    let preview_prof_before_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("--profile-id")
+        .arg("profile-jev")
+        .arg("preview")
+        .arg("--request")
+        .arg(&req_path)
+        .output()
+        .expect("run preview with global --profile-id before subcommand");
+    assert!(
+        preview_prof_before_cmd.status.success(),
+        "preview with --profile-id failed: {}",
+        String::from_utf8_lossy(&preview_prof_before_cmd.stderr)
+    );
+    let preview_prof_stdout = String::from_utf8_lossy(&preview_prof_before_cmd.stdout);
+    assert!(preview_prof_stdout.contains(r#""profile_id": "profile-jev""#));
+    let preview_prof: AdvicePreviewOutput =
+        serde_json::from_slice(&preview_prof_before_cmd.stdout).expect("parse preview_prof");
+    assert_eq!(preview_prof.profile_id.as_deref(), Some("profile-jev"));
+    assert_ne!(preview_prof.cache_key, preview_none.cache_key);
+
+    let preview_prof_after_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("preview")
+        .arg("--profile-id")
+        .arg("profile-jev")
+        .arg("--request")
+        .arg(&req_path)
+        .output()
+        .expect("run preview with --profile-id after subcommand");
+    assert!(preview_prof_after_cmd.status.success());
+    let preview_prof_after: AdvicePreviewOutput =
+        serde_json::from_slice(&preview_prof_after_cmd.stdout).expect("parse preview_prof_after");
+    assert_eq!(preview_prof_after.cache_key, preview_prof.cache_key);
+
+    let preview_prof_b_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("--profile-id")
+        .arg("profile-jev-b")
+        .arg("preview")
+        .arg("--request")
+        .arg(&req_path)
+        .output()
+        .expect("run preview with profile-jev-b");
+    assert!(preview_prof_b_cmd.status.success());
+    let preview_prof_b: AdvicePreviewOutput =
+        serde_json::from_slice(&preview_prof_b_cmd.stdout).expect("parse preview_prof_b");
+    assert_eq!(preview_prof_b.profile_id.as_deref(), Some("profile-jev-b"));
+    assert_ne!(preview_prof_b.cache_key, preview_prof.cache_key);
+    assert_ne!(preview_prof_b.cache_key, preview_none.cache_key);
+    assert!(!fixture.cache_dir.exists());
+
+    // 2. Duplicate --profile-id flag is refused with sanitized invalid_input before IO.
+    let secret_prof = "sk-live-secret-profile-dup-777";
+    let dup_prof_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("--profile-id")
+        .arg("profile-jev")
+        .arg("--profile-id")
+        .arg(secret_prof)
+        .arg("preview")
+        .arg("--request")
+        .arg(&req_path)
+        .output()
+        .expect("run duplicate --profile-id");
+    assert!(!dup_prof_cmd.status.success());
+    let dup_prof_stderr = String::from_utf8_lossy(&dup_prof_cmd.stderr);
+    assert!(!dup_prof_stderr.contains(secret_prof));
+    let dup_prof_err: AdviceError =
+        serde_json::from_slice(&dup_prof_cmd.stderr).expect("parse dup_prof_err");
+    assert_eq!(dup_prof_err.code(), "invalid_input");
+
+    // 3. `models` with --profile-id is refused before credential or network access.
+    let models_prof_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("--profile-id")
+        .arg("profile-jev")
+        .arg("models")
+        .arg("--tool-id")
+        .arg("jev-api")
+        .output()
+        .expect("run models with --profile-id");
+    assert!(!models_prof_cmd.status.success());
+    let models_prof_err: AdviceError =
+        serde_json::from_slice(&models_prof_cmd.stderr).expect("parse models_prof_err");
+    assert_eq!(models_prof_err.code(), "invalid_input");
+    assert!(models_prof_err.message().contains("--profile-id"));
+    assert!(!fixture.cache_dir.exists());
+
+    // 4. Missing profile, off advisor, mismatched model, and OpenAI advisor fail before cache_dir creation.
+    for (profile_id, req, expected_code) in [
+        ("missing-profile", &req_path, "profile_not_found"),
+        ("profile-off", &req_path, "decision_advisor_not_configured"),
+        ("profile-other-model", &req_path, "profile_advisor_mismatch"),
+        ("profile-openai", &req_path, "unsupported_adapter"),
+        ("profile-openai", &openai_req_path, "unsupported_adapter"),
+    ] {
+        for subcmd in ["preview", "classify"] {
+            let out = Command::new(advice_bin())
+                .arg("--registry-dir")
+                .arg(&fixture.registry_dir)
+                .arg("--cache-dir")
+                .arg(&fixture.cache_dir)
+                .arg("--project-root")
+                .arg(&fixture.project_root)
+                .arg("--context-id")
+                .arg(context_id)
+                .arg("--profile-id")
+                .arg(profile_id)
+                .arg(subcmd)
+                .arg("--request")
+                .arg(req)
+                .output()
+                .expect("run refusal subprocess");
+            assert!(
+                !out.status.success(),
+                "{subcmd} for {profile_id} unexpectedly succeeded"
+            );
+            let err: AdviceError = serde_json::from_slice(&out.stderr).expect("parse refusal err");
+            assert_eq!(
+                err.code(),
+                expected_code,
+                "unexpected code for {subcmd} {profile_id}: {}",
+                err.message()
+            );
+            assert!(
+                !fixture.cache_dir.exists(),
+                "cache_dir must not be created when {subcmd} fails for {profile_id}"
+            );
+        }
+    }
+
+    // 5. Seed a Completed cache record for profile-jev and verify classify cache hit + scope check.
+    fs::create_dir_all(&fixture.cache_dir).expect("create cache_dir");
+    fs::set_permissions(&fixture.cache_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 cache_dir");
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("unix epoch")
+        .as_millis() as u64;
+    let project_root_sha256 =
+        threadlane_decisions::sha256_hex(preview_prof.project_root.as_bytes());
+    let prompt_digest_hex = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for field in [
+            "threadlane-jev-shadow-v1",
+            "difficulty",
+            "Select implementation difficulty from the supplied task evidence.",
+            "Small isolated behavior-preserving edit.",
+            "Bounded multi-step change within known module boundaries.",
+            "Substantial uncertainty, concurrency, or cross-module integration complexity.",
+            "High-risk architectural, security-critical, or multi-system redesign.",
+        ] {
+            h.update((field.len() as u64).to_le_bytes());
+            h.update(field.as_bytes());
+        }
+        let digest = h.finalize();
+        let mut s = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(&mut s, "{b:02x}");
+        }
+        s
+    };
+
+    let record_path = fixture
+        .cache_dir
+        .join(format!("{}.json", preview_prof.cache_key));
+    let completed_record_json = serde_json::json!({
+        "schema_version": ADVICE_CACHE_SCHEMA_VERSION,
+        "prompt_digest": prompt_digest_hex,
+        "cache_key": preview_prof.cache_key,
+        "project_root_sha256": project_root_sha256,
+        "context_id": context_id,
+        "profile_id": "profile-jev",
+        "task_id": "cli-prof-task-1",
+        "task_revision": 1,
+        "summary_sha256": preview_prof.summary_sha256,
+        "registry_revision": reg_rev,
+        "tool_id": "jev-api",
+        "model_id": "jev-api:jev-latest",
+        "requested_model": "jev-latest",
+        "state": {
+            "status": "completed",
+            "attempt_id": "att-prof-1",
+            "completed_at_ms": now_ms.saturating_sub(1000),
+            "advice": {
+                "provider": "jev",
+                "model": "jev-1.14.0",
+                "difficulty": "easy",
+                "confidence": 0.96,
+                "needs_review": false,
+                "reason_code": "classified",
+                "input_tokens": 64,
+                "output_tokens": 5
+            }
+        }
+    });
+    fs::write(
+        &record_path,
+        serde_json::to_vec_pretty(&completed_record_json).expect("serialize record"),
+    )
+    .expect("write completed record");
+    fs::set_permissions(&record_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 record");
+
+    let classify_prof_cmd = Command::new(advice_bin())
+        .arg("--registry-dir")
+        .arg(&fixture.registry_dir)
+        .arg("--cache-dir")
+        .arg(&fixture.cache_dir)
+        .arg("--project-root")
+        .arg(&fixture.project_root)
+        .arg("--context-id")
+        .arg(context_id)
+        .arg("--profile-id")
+        .arg("profile-jev")
+        .arg("--cache-ttl-seconds")
+        .arg("3600")
+        .arg("classify")
+        .arg("--request")
+        .arg(&req_path)
+        .output()
+        .expect("run classify cache hit with --profile-id");
+    assert!(
+        classify_prof_cmd.status.success(),
+        "classify cache hit with --profile-id failed: {}",
+        String::from_utf8_lossy(&classify_prof_cmd.stderr)
+    );
+    let classify_prof_stdout = String::from_utf8_lossy(&classify_prof_cmd.stdout);
+    assert!(!classify_prof_stdout.contains(raw_summary));
+    assert!(classify_prof_stdout.contains(r#""profile_id": "profile-jev""#));
+    let classify_prof_out: AdviceClassifyOutput =
+        serde_json::from_slice(&classify_prof_cmd.stdout).expect("parse classify_prof_out");
+    assert_eq!(classify_prof_out.profile_id.as_deref(), Some("profile-jev"));
+    assert_eq!(classify_prof_out.source, AdviceSource::Cache);
+    assert!(!classify_prof_out.provider_call_performed);
 }

@@ -1149,6 +1149,7 @@ fi
             .expect("upsert models");
 
         let profile = WorkflowProfile {
+            decision_advisor: None,
             id: "default-profile".to_string(),
             name: "Default M4 Workflow Profile".to_string(),
             assignments: vec![

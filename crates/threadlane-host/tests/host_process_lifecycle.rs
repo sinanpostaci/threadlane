@@ -257,6 +257,7 @@ fn setup_host_process_fixture() -> HostProcessFixture {
             2,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
+                    decision_advisor: None,
                     id: "profile-process".to_string(),
                     name: "Process Lifecycle Coder".to_string(),
                     assignments: vec![RoleAssignment {

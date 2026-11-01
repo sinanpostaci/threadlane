@@ -350,7 +350,64 @@ pub struct RoleAssignment {
     pub choice: ModelChoice,
 }
 
-/// Named collection of [`RoleAssignment`] rules.
+/// Operating mode for a workflow profile's [`DecisionAdvisor`].
+///
+/// Only [`Self::Shadow`] is supported; advisor evaluations are observational and never
+/// automatically modify plans, models, permissions, or approvals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecisionAdvisorMode {
+    /// Shadow-only advisory mode.
+    #[serde(rename = "shadow")]
+    Shadow,
+}
+
+impl DecisionAdvisorMode {
+    /// All supported [`DecisionAdvisorMode`] variants in canonical order.
+    pub const ALL: [Self; 1] = [Self::Shadow];
+
+    /// Returns the canonical `snake_case` wire identifier for this mode.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+        }
+    }
+}
+
+impl fmt::Display for DecisionAdvisorMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for DecisionAdvisorMode {
+    type Err = RegistryError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "shadow" => Ok(Self::Shadow),
+            _ => Err(RegistryError::InvalidInput(
+                "Unknown decision advisor mode variant.",
+            )),
+        }
+    }
+}
+
+/// Optional decision advisor model selection for a [`WorkflowProfile`], separate from the
+/// six worker [`WorkflowRole`] assignments.
+///
+/// Selecting a decision advisor in the registry is static configuration only; it does not
+/// perform live API inference, verify credentials, or authorize provider execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DecisionAdvisor {
+    /// Identifier of the selected [`ModelDefinition`].
+    pub model_id: String,
+    /// Operating mode for the decision advisor.
+    pub mode: DecisionAdvisorMode,
+}
+
+/// Named collection of [`RoleAssignment`] rules and optional [`DecisionAdvisor`] configuration.
 ///
 /// Partial profiles (profiles that omit one or more roles or difficulties) can be saved;
 /// unassigned roles/difficulties produce an explicit error at resolution time rather than
@@ -364,6 +421,9 @@ pub struct WorkflowProfile {
     pub name: String,
     /// Role and difficulty assignments configured for this profile.
     pub assignments: Vec<RoleAssignment>,
+    /// Optional decision advisor configuration (`None` when disabled/unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_advisor: Option<DecisionAdvisor>,
 }
 
 /// Complete versioned state of the global tool, model, and workflow profile registry.
@@ -432,7 +492,8 @@ pub enum RegistryChange {
         /// Batch of model definitions to insert or update.
         models: Vec<ModelDefinition>,
     },
-    /// Deletes an existing [`ModelDefinition`] if no workflow profile assignments reference `model_id`.
+    /// Deletes an existing [`ModelDefinition`] if no workflow profile role assignments or
+    /// decision advisors reference `model_id`.
     #[serde(rename = "delete_model")]
     DeleteModel {
         /// Identifier of the model to delete.

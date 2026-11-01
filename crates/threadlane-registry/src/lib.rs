@@ -7,8 +7,9 @@
 //! This crate is independent of Tauri, runtime SQLite state, and external provider CLIs.
 //! It provides:
 //! - Canonical `snake_case` wire types ([`ToolAdapter`], [`ToolDefinition`], [`ModelDefinition`],
-//!   [`ModelChoice`], [`WorkflowRole`], [`Difficulty`], [`RoleAssignment`], [`WorkflowProfile`],
-//!   [`RegistrySnapshot`], and [`RegistryChange`]).
+//!   [`ModelChoice`], [`WorkflowRole`], [`Difficulty`], [`RoleAssignment`],
+//!   [`DecisionAdvisorMode`], [`DecisionAdvisor`], [`WorkflowProfile`], [`RegistrySnapshot`], and
+//!   [`RegistryChange`]).
 //! - [`RegistryStore`]: a private (`0700`/`0600`), cross-process locked (`fs2`), atomic
 //!   compare-and-swap JSON store that starts empty at revision `0` with no implicit models.
 //! - [`resolve_choice`]: deterministic role and difficulty resolution (`exact difficulty`
@@ -21,10 +22,10 @@ mod types;
 pub use error::RegistryError;
 pub use store::{resolve_choice, validate_registry_identifier, RegistryStore};
 pub use types::{
-    Difficulty, ModelChoice, ModelDefinition, RegistryChange, RegistrySnapshot, RoleAssignment,
-    ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole, MAX_ASSIGNMENTS_PER_PROFILE,
-    MAX_EFFORTS_PER_MODEL, MAX_EFFORT_LEN, MAX_EXECUTABLE_PATH_LEN, MAX_ID_LEN,
-    MAX_JS_SAFE_INTEGER, MAX_LABEL_LEN, MAX_MODELS, MAX_MODEL_ARG_LEN, MAX_PROFILES,
+    DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition, RegistryChange,
+    RegistrySnapshot, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+    MAX_ASSIGNMENTS_PER_PROFILE, MAX_EFFORTS_PER_MODEL, MAX_EFFORT_LEN, MAX_EXECUTABLE_PATH_LEN,
+    MAX_ID_LEN, MAX_JS_SAFE_INTEGER, MAX_LABEL_LEN, MAX_MODELS, MAX_MODEL_ARG_LEN, MAX_PROFILES,
     MAX_REGISTRY_FILE_BYTES, MAX_TOOLS, REGISTRY_FILE_NAME, REGISTRY_LOCK_FILE_NAME,
     REGISTRY_SCHEMA_VERSION,
 };
@@ -256,6 +257,7 @@ mod tests {
                     },
                 },
             ],
+            decision_advisor: None,
         };
         let s4 = store
             .apply(3, RegistryChange::UpsertProfile { profile })
@@ -434,6 +436,7 @@ mod tests {
                     effort: Some("extreme".to_string()),
                 },
             }],
+            decision_advisor: None,
         };
         let err = store
             .apply(
@@ -457,6 +460,7 @@ mod tests {
                     effort: None,
                 },
             }],
+            decision_advisor: None,
         };
         let err = store
             .apply(
@@ -490,6 +494,7 @@ mod tests {
                     },
                 },
             ],
+            decision_advisor: None,
         };
         let err = store
             .apply(
@@ -513,6 +518,7 @@ mod tests {
                     effort: Some("high".to_string()),
                 },
             }],
+            decision_advisor: None,
         };
         let s3 = store
             .apply(
@@ -612,6 +618,7 @@ mod tests {
                         },
                     },
                 ],
+                decision_advisor: None,
             }],
             default_profile_id: None,
         };
@@ -825,5 +832,668 @@ mod tests {
             )
             .expect_err("65th tool must exceed cap");
         assert_eq!(cap_err.code(), "capacity_exceeded");
+    }
+
+    #[test]
+    fn decision_advisor_wire_format_legacy_roundtrip_and_null_omission() {
+        assert_eq!(DecisionAdvisorMode::ALL, [DecisionAdvisorMode::Shadow]);
+        assert_eq!(DecisionAdvisorMode::Shadow.as_str(), "shadow");
+        assert_eq!(DecisionAdvisorMode::Shadow.to_string(), "shadow");
+        assert_eq!(
+            "shadow".parse::<DecisionAdvisorMode>(),
+            Ok(DecisionAdvisorMode::Shadow)
+        );
+        for unsupported in ["automatic", "assist", "active", "enforce", ""] {
+            let err = unsupported
+                .parse::<DecisionAdvisorMode>()
+                .expect_err("unsupported mode must fail FromStr");
+            assert_eq!(err.code(), "invalid_input");
+            let mode_json = format!("\"{unsupported}\"");
+            assert!(
+                serde_json::from_str::<DecisionAdvisorMode>(&mode_json).is_err(),
+                "serde must reject unsupported mode {unsupported}"
+            );
+        }
+
+        let encoded_mode =
+            serde_json::to_string(&DecisionAdvisorMode::Shadow).expect("serialize shadow mode");
+        assert_eq!(encoded_mode, "\"shadow\"");
+        let decoded_mode: DecisionAdvisorMode =
+            serde_json::from_str(&encoded_mode).expect("deserialize shadow mode");
+        assert_eq!(decoded_mode, DecisionAdvisorMode::Shadow);
+
+        // Legacy JSON without `decision_advisor` must deserialize to `None` and re-serialize
+        // with `decision_advisor` omitted (byte-shape compatible with old profiles).
+        let legacy_profile_json = r#"{"id":"legacy","name":"Legacy Profile","assignments":[{"role":"coder","difficulty":"hard","choice":{"model_id":"argon","effort":"high"}}]}"#;
+        let decoded_legacy: WorkflowProfile =
+            serde_json::from_str(legacy_profile_json).expect("deserialize legacy profile");
+        assert_eq!(decoded_legacy.decision_advisor, None);
+        let reencoded_legacy =
+            serde_json::to_string(&decoded_legacy).expect("reserialize legacy profile");
+        assert_eq!(reencoded_legacy, legacy_profile_json);
+        let legacy_val = serde_json::to_value(&decoded_legacy).expect("to_value legacy");
+        assert!(legacy_val.get("decision_advisor").is_none());
+
+        // Explicit `"decision_advisor": null` must deserialize to `None` and be omitted on
+        // serialization.
+        let explicit_null_json = r#"{"id":"legacy","name":"Legacy Profile","assignments":[{"role":"coder","difficulty":"hard","choice":{"model_id":"argon","effort":"high"}}],"decision_advisor":null}"#;
+        let decoded_null: WorkflowProfile =
+            serde_json::from_str(explicit_null_json).expect("deserialize explicit null advisor");
+        assert_eq!(decoded_null, decoded_legacy);
+        assert_eq!(decoded_null.decision_advisor, None);
+        let reencoded_null =
+            serde_json::to_string(&decoded_null).expect("reserialize explicit null advisor");
+        assert_eq!(reencoded_null, legacy_profile_json);
+
+        // Configured `Some(DecisionAdvisor)` roundtrips cleanly in shadow mode.
+        let with_advisor = WorkflowProfile {
+            id: "with-jev".to_string(),
+            name: "With Jev".to_string(),
+            assignments: Vec::new(),
+            decision_advisor: Some(DecisionAdvisor {
+                model_id: "jev-system-one".to_string(),
+                mode: DecisionAdvisorMode::Shadow,
+            }),
+        };
+        let advisor_val = serde_json::to_value(&with_advisor).expect("serialize with_advisor");
+        assert_eq!(
+            advisor_val["decision_advisor"],
+            serde_json::json!({
+                "model_id": "jev-system-one",
+                "mode": "shadow"
+            })
+        );
+        let roundtrip: WorkflowProfile =
+            serde_json::from_value(advisor_val).expect("deserialize with_advisor");
+        assert_eq!(roundtrip, with_advisor);
+
+        // Unknown and duplicate fields on `DecisionAdvisor` and `WorkflowProfile` must be rejected.
+        for bad_json in [
+            r#"{"model_id":"jev-system-one","mode":"shadow","effort":null}"#,
+            r#"{"model_id":"jev-system-one","mode":"shadow","effort":"high"}"#,
+            r#"{"model_id":"jev-system-one","mode":"shadow","extra":true}"#,
+            r#"{"model_id":"jev-system-one","mode":"automatic"}"#,
+            r#"{"model_id":"jev-system-one","mode":"assist"}"#,
+            r#"{"model_id":"a","model_id":"b","mode":"shadow"}"#,
+            r#"{"model_id":"a","mode":"shadow","mode":"shadow"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<DecisionAdvisor>(bad_json).is_err(),
+                "DecisionAdvisor must reject malformed JSON: {bad_json}"
+            );
+        }
+
+        for bad_profile_json in [
+            r#"{"id":"p1","name":"P1","assignments":[],"decision_advisor":null,"decision_advisor":null}"#,
+            r#"{"id":"p1","name":"P1","assignments":[],"unknown_field":123}"#,
+            r#"{"id":"p1","name":"P1","assignments":[],"decision_advisor":{"model_id":"m1","mode":"assist"}}"#,
+            r#"{"id":"p1","name":"P1","assignments":[],"decision_advisor":{"model_id":"m1","mode":"shadow","effort":"low"}}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<WorkflowProfile>(bad_profile_json).is_err(),
+                "WorkflowProfile must reject malformed JSON: {bad_profile_json}"
+            );
+        }
+
+        // On-disk legacy snapshot without `decision_advisor` loads and re-saves without adding the key.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("registry");
+        let store = RegistryStore::open(&config_dir).expect("open store");
+        let legacy_snapshot_json = r#"{
+  "schema_version": 1,
+  "revision": 1,
+  "tools": [
+    {
+      "id": "agy",
+      "label": "Tool agy",
+      "adapter": "antigravity",
+      "executable_path": "/usr/local/bin/agy",
+      "enabled": true
+    }
+  ],
+  "models": [
+    {
+      "id": "argon",
+      "tool_id": "agy",
+      "label": "Model argon",
+      "model_arg": "argon",
+      "efforts": [
+        "high"
+      ],
+      "allow_no_effort": false
+    }
+  ],
+  "profiles": [
+    {
+      "id": "legacy",
+      "name": "Legacy Profile",
+      "assignments": [
+        {
+          "role": "coder",
+          "difficulty": "hard",
+          "choice": {
+            "model_id": "argon",
+            "effort": "high"
+          }
+        }
+      ]
+    }
+  ],
+  "default_profile_id": "legacy"
+}
+"#;
+        fs::write(store.registry_path(), legacy_snapshot_json).expect("write legacy registry.json");
+        let loaded = store.snapshot().expect("load legacy snapshot");
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].decision_advisor, None);
+        assert_eq!(
+            store.snapshot_readonly().expect("readonly snapshot"),
+            loaded
+        );
+        let readonly_at =
+            RegistryStore::read_snapshot_readonly_at(&config_dir).expect("readonly_at snapshot");
+        assert_eq!(readonly_at, loaded);
+
+        let updated = store
+            .apply(
+                1,
+                RegistryChange::UpsertProfile {
+                    profile: loaded.profiles[0].clone(),
+                },
+            )
+            .expect("resave legacy profile with None advisor");
+        assert_eq!(updated.revision, 2);
+        let saved_text =
+            fs::read_to_string(store.registry_path()).expect("read saved registry.json");
+        assert!(
+            !saved_text.contains("decision_advisor"),
+            "None decision_advisor must stay omitted on disk"
+        );
+    }
+
+    #[test]
+    fn decision_advisor_validation_valid_jev_and_openai_and_invalid_selections_refused() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path().join("registry")).expect("open store");
+
+        let mut disabled_jev = sample_tool("jev-disabled", ToolAdapter::JevApi);
+        disabled_jev.enabled = false;
+        let mut disabled_openai = sample_tool("openai-disabled", ToolAdapter::OpenaiDecisionsApi);
+        disabled_openai.enabled = false;
+
+        let mut rev = 0;
+        for tool in [
+            sample_tool("jev", ToolAdapter::JevApi),
+            sample_tool("openai-decisions", ToolAdapter::OpenaiDecisionsApi),
+            disabled_jev,
+            disabled_openai,
+            sample_tool("codex", ToolAdapter::CodexCli),
+            sample_tool("agy", ToolAdapter::Antigravity),
+            sample_tool("opencode", ToolAdapter::OpencodeV2),
+            sample_tool("git", ToolAdapter::Git),
+        ] {
+            rev = store
+                .apply(rev, RegistryChange::UpsertTool { tool })
+                .expect("upsert tool")
+                .revision;
+        }
+
+        let s_models = store
+            .apply(
+                rev,
+                RegistryChange::UpsertModels {
+                    models: vec![
+                        sample_model("jev-system-one", "jev", &[], true),
+                        sample_model("jev-optional-effort", "jev", &["low"], true),
+                        sample_model("jev-effort-required", "jev", &["high"], false),
+                        sample_model("openai-decision-v1", "openai-decisions", &[], true),
+                        sample_model(
+                            "openai-effort-required",
+                            "openai-decisions",
+                            &["high"],
+                            false,
+                        ),
+                        sample_model("jev-disabled-model", "jev-disabled", &[], true),
+                        sample_model("openai-disabled-model", "openai-disabled", &[], true),
+                        sample_model("codex-luna", "codex", &["max"], true),
+                        sample_model("agy-argon", "agy", &["high"], true),
+                        sample_model("opencode-deepseek", "opencode", &["max"], true),
+                        sample_model("git-dummy", "git", &[], true),
+                    ],
+                },
+            )
+            .expect("upsert models");
+        rev = s_models.revision;
+
+        // Valid Jev advisor on a partial profile (empty assignments) succeeds.
+        let jev_profile = WorkflowProfile {
+            id: "jev-profile".to_string(),
+            name: "Jev Profile".to_string(),
+            assignments: Vec::new(),
+            decision_advisor: Some(DecisionAdvisor {
+                model_id: "jev-system-one".to_string(),
+                mode: DecisionAdvisorMode::Shadow,
+            }),
+        };
+        let s_jev = store
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: jev_profile.clone(),
+                },
+            )
+            .expect("upsert valid Jev advisor profile");
+        assert_eq!(s_jev.profiles[0], jev_profile);
+        rev = s_jev.revision;
+
+        // Valid Jev advisor with optional efforts but allow_no_effort: true also succeeds.
+        let s_jev_opt = store
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: Some(DecisionAdvisor {
+                            model_id: "jev-optional-effort".to_string(),
+                            mode: DecisionAdvisorMode::Shadow,
+                        }),
+                        ..jev_profile.clone()
+                    },
+                },
+            )
+            .expect("upsert Jev advisor with allow_no_effort: true and optional efforts");
+        rev = s_jev_opt.revision;
+
+        // Valid OpenAI Decisions advisor succeeds as documented extension configuration.
+        let openai_profile = WorkflowProfile {
+            id: "openai-profile".to_string(),
+            name: "OpenAI Decisions Profile".to_string(),
+            assignments: vec![RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "agy-argon".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            }],
+            decision_advisor: Some(DecisionAdvisor {
+                model_id: "openai-decision-v1".to_string(),
+                mode: DecisionAdvisorMode::Shadow,
+            }),
+        };
+        let s_openai = store
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: openai_profile.clone(),
+                },
+            )
+            .expect("upsert valid OpenAI Decisions advisor profile");
+        assert_eq!(s_openai.profiles.len(), 2);
+        rev = s_openai.revision;
+
+        // Empty or untrimmed advisor model_id must fail with invalid_input.
+        for bad_id in ["", " jev-system-one ", "jev\n"] {
+            let err = store
+                .apply(
+                    rev,
+                    RegistryChange::UpsertProfile {
+                        profile: WorkflowProfile {
+                            id: "bad-advisor".to_string(),
+                            name: "Bad Advisor".to_string(),
+                            assignments: Vec::new(),
+                            decision_advisor: Some(DecisionAdvisor {
+                                model_id: bad_id.to_string(),
+                                mode: DecisionAdvisorMode::Shadow,
+                            }),
+                        },
+                    },
+                )
+                .expect_err("malformed advisor model_id must fail");
+            assert_eq!(err.code(), "invalid_input");
+        }
+
+        // Missing model, CLI/wrong-tool models, and disabled-tool models must fail with invalid_reference.
+        for rejected_model_id in [
+            "missing-model",
+            "codex-luna",
+            "agy-argon",
+            "opencode-deepseek",
+            "git-dummy",
+            "jev-disabled-model",
+            "openai-disabled-model",
+        ] {
+            let err = store
+                .apply(
+                    rev,
+                    RegistryChange::UpsertProfile {
+                        profile: WorkflowProfile {
+                            id: "bad-advisor".to_string(),
+                            name: "Bad Advisor".to_string(),
+                            assignments: Vec::new(),
+                            decision_advisor: Some(DecisionAdvisor {
+                                model_id: rejected_model_id.to_string(),
+                                mode: DecisionAdvisorMode::Shadow,
+                            }),
+                        },
+                    },
+                )
+                .expect_err("invalid advisor reference must be refused");
+            assert_eq!(
+                err.code(),
+                "invalid_reference",
+                "expected invalid_reference for {rejected_model_id}"
+            );
+        }
+
+        // Effort-required models (allow_no_effort: false) must fail with unsupported_effort.
+        for effort_required_id in ["jev-effort-required", "openai-effort-required"] {
+            let err = store
+                .apply(
+                    rev,
+                    RegistryChange::UpsertProfile {
+                        profile: WorkflowProfile {
+                            id: "bad-advisor".to_string(),
+                            name: "Bad Advisor".to_string(),
+                            assignments: Vec::new(),
+                            decision_advisor: Some(DecisionAdvisor {
+                                model_id: effort_required_id.to_string(),
+                                mode: DecisionAdvisorMode::Shadow,
+                            }),
+                        },
+                    },
+                )
+                .expect_err("effort-required advisor model must be refused");
+            assert_eq!(
+                err.code(),
+                "unsupported_effort",
+                "expected unsupported_effort for {effort_required_id}"
+            );
+        }
+
+        // Revision and stored profiles must remain unchanged after all rejected mutations.
+        let snap = store.snapshot().expect("snapshot after refusals");
+        assert_eq!(snap.revision, rev);
+        assert_eq!(snap.profiles.len(), 2);
+    }
+
+    #[test]
+    fn decision_advisor_reference_protection_cas_and_readonly_snapshot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_dir = temp.path().join("registry");
+        let store = RegistryStore::open(&config_dir).expect("open store");
+
+        let mut disabled_jev = sample_tool("jev-disabled", ToolAdapter::JevApi);
+        disabled_jev.enabled = false;
+
+        let s1 = store
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("jev", ToolAdapter::JevApi),
+                },
+            )
+            .expect("upsert jev");
+        let s2 = store
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("codex", ToolAdapter::CodexCli),
+                },
+            )
+            .expect("upsert codex");
+        let s3 = store
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertTool { tool: disabled_jev },
+            )
+            .expect("upsert jev-disabled");
+        let s4 = store
+            .apply(
+                s3.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("jev-system-one", "jev", &[], true),
+                },
+            )
+            .expect("upsert jev model");
+
+        let profile = WorkflowProfile {
+            id: "p1".to_string(),
+            name: "Advisor Profile".to_string(),
+            assignments: Vec::new(),
+            decision_advisor: Some(DecisionAdvisor {
+                model_id: "jev-system-one".to_string(),
+                mode: DecisionAdvisorMode::Shadow,
+            }),
+        };
+        let s5 = store
+            .apply(
+                s4.revision,
+                RegistryChange::UpsertProfile {
+                    profile: profile.clone(),
+                },
+            )
+            .expect("upsert profile with advisor");
+
+        // Stale CAS revision when updating advisor profile must be rejected.
+        let stale_err = store
+            .apply(
+                s4.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: None,
+                        ..profile.clone()
+                    },
+                },
+            )
+            .expect_err("stale revision must fail");
+        assert_eq!(
+            stale_err,
+            RegistryError::StaleRevision {
+                expected: s4.revision,
+                actual: s5.revision,
+            }
+        );
+        assert_eq!(stale_err.code(), "stale_revision");
+
+        // Deleting model referenced only by decision_advisor must fail with reference_conflict.
+        let del_model_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::DeleteModel {
+                    model_id: "jev-system-one".to_string(),
+                },
+            )
+            .expect_err("deleting advisor model must conflict");
+        assert_eq!(del_model_err.code(), "reference_conflict");
+
+        // Deleting tool owning that model must also fail with reference_conflict.
+        let del_tool_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::DeleteTool {
+                    tool_id: "jev".to_string(),
+                },
+            )
+            .expect_err("deleting advisor tool must conflict");
+        assert_eq!(del_tool_err.code(), "reference_conflict");
+
+        // Disabling the referenced decision API tool or changing its adapter to a CLI adapter
+        // must be refused without silently clearing or substituting the profile's advisor.
+        let mut disabled_tool_edit = sample_tool("jev", ToolAdapter::JevApi);
+        disabled_tool_edit.enabled = false;
+        let disable_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertTool {
+                    tool: disabled_tool_edit,
+                },
+            )
+            .expect_err("disabling tool referenced by decision_advisor must fail");
+        assert_eq!(disable_err.code(), "invalid_reference");
+
+        let adapter_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("jev", ToolAdapter::CodexCli),
+                },
+            )
+            .expect_err("changing referenced advisor tool adapter to CLI must fail");
+        assert_eq!(adapter_err.code(), "invalid_reference");
+
+        // Editing the referenced model to require effort or move to a CLI/disabled tool must fail.
+        let effort_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("jev-system-one", "jev", &["high"], false),
+                },
+            )
+            .expect_err("making referenced advisor model require effort must fail");
+        assert_eq!(effort_err.code(), "unsupported_effort");
+
+        let batch_effort_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertModels {
+                    models: vec![sample_model("jev-system-one", "jev", &["high"], false)],
+                },
+            )
+            .expect_err("batch making referenced advisor model require effort must fail");
+        assert_eq!(batch_effort_err.code(), "unsupported_effort");
+
+        let move_cli_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("jev-system-one", "codex", &[], true),
+                },
+            )
+            .expect_err("moving referenced advisor model to CLI tool must fail");
+        assert_eq!(move_cli_err.code(), "invalid_reference");
+
+        let move_disabled_err = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("jev-system-one", "jev-disabled", &[], true),
+                },
+            )
+            .expect_err("moving referenced advisor model to disabled tool must fail");
+        assert_eq!(move_disabled_err.code(), "invalid_reference");
+
+        // Benign edits to the enabled tool and referenced model (retaining enabled API adapter
+        // and allow_no_effort: true) must succeed and preserve the profile's decision_advisor.
+        let mut renamed_tool = sample_tool("jev", ToolAdapter::JevApi);
+        renamed_tool.label = "Jev System One API".to_string();
+        let s6 = store
+            .apply(
+                s5.revision,
+                RegistryChange::UpsertTool { tool: renamed_tool },
+            )
+            .expect("rename enabled advisor tool");
+
+        let mut updated_model = sample_model("jev-system-one", "jev", &["low"], true);
+        updated_model.label = "Jev System One v2".to_string();
+        updated_model.model_arg = "jev-system-one-v2".to_string();
+        let s7 = store
+            .apply(
+                s6.revision,
+                RegistryChange::UpsertModel {
+                    model: updated_model.clone(),
+                },
+            )
+            .expect("update enabled advisor model while preserving invariants");
+        assert_eq!(
+            s7.profiles[0].decision_advisor,
+            Some(DecisionAdvisor {
+                model_id: "jev-system-one".to_string(),
+                mode: DecisionAdvisorMode::Shadow,
+            })
+        );
+
+        // Read-only snapshot routes must work without creating or touching `registry.lock`
+        // and no extra credential files are written.
+        fs::remove_file(store.lock_path()).expect("remove registry.lock");
+        assert!(!store.lock_path().exists());
+        let ro_snap = store.snapshot_readonly().expect("snapshot_readonly");
+        assert_eq!(ro_snap, s7);
+        assert!(!store.lock_path().exists());
+        let ro_at_snap = RegistryStore::read_snapshot_readonly_at(&config_dir)
+            .expect("read_snapshot_readonly_at");
+        assert_eq!(ro_at_snap, s7);
+        assert!(!store.lock_path().exists());
+
+        let entries: Vec<_> = fs::read_dir(&config_dir)
+            .expect("read_dir")
+            .map(|entry| entry.expect("dir entry").file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from(REGISTRY_FILE_NAME)]);
+
+        // Clearing `decision_advisor` to `None` permits deleting the advisor model and tool.
+        let s8 = store
+            .apply(
+                s7.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: None,
+                        ..profile
+                    },
+                },
+            )
+            .expect("clear decision_advisor");
+        assert_eq!(s8.profiles[0].decision_advisor, None);
+        let saved_json = fs::read_to_string(store.registry_path()).expect("read registry.json");
+        assert!(!saved_json.contains("decision_advisor"));
+
+        let s9 = store
+            .apply(
+                s8.revision,
+                RegistryChange::DeleteModel {
+                    model_id: "jev-system-one".to_string(),
+                },
+            )
+            .expect("delete advisor model after clearing profile advisor");
+        assert!(s9.models.is_empty());
+
+        let s10 = store
+            .apply(
+                s9.revision,
+                RegistryChange::DeleteTool {
+                    tool_id: "jev".to_string(),
+                },
+            )
+            .expect("delete jev tool after deleting model");
+        assert!(!s10.tools.iter().any(|tool| tool.id == "jev"));
+
+        // Corrupt on-disk snapshot with invalid advisor reference must fail closed as corrupt_store.
+        let mut tampered_value = serde_json::to_value(&s10).expect("serialize s10");
+        tampered_value["profiles"][0]["decision_advisor"] = serde_json::json!({
+            "model_id": "missing-advisor-model",
+            "mode": "shadow"
+        });
+        fs::write(
+            store.registry_path(),
+            serde_json::to_vec_pretty(&tampered_value).expect("encode tampered"),
+        )
+        .expect("write tampered registry.json");
+
+        assert_eq!(
+            store.snapshot().expect_err("tampered snapshot").code(),
+            "corrupt_store"
+        );
+        assert_eq!(
+            store
+                .snapshot_readonly()
+                .expect_err("tampered snapshot_readonly")
+                .code(),
+            "corrupt_store"
+        );
+        assert_eq!(
+            RegistryStore::read_snapshot_readonly_at(&config_dir)
+                .expect_err("tampered read_snapshot_readonly_at")
+                .code(),
+            "corrupt_store"
+        );
     }
 }

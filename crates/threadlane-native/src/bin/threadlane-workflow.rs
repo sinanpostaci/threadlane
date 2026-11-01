@@ -417,6 +417,7 @@ mod tests {
                 s2.revision,
                 RegistryChange::UpsertProfile {
                     profile: WorkflowProfile {
+                        decision_advisor: None,
                         id: "default-profile".to_string(),
                         name: "Default Profile".to_string(),
                         assignments: vec![RoleAssignment {

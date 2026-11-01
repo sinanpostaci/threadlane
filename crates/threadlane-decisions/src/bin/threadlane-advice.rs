@@ -42,6 +42,10 @@ struct AdviceCli {
     #[arg(long = "cache-ttl-seconds", value_name = "SECONDS", global = true)]
     cache_ttl_seconds: Option<u64>,
 
+    /// Optional workflow profile identifier whose configured shadow decision advisor must match the request.
+    #[arg(long = "profile-id", value_name = "ID", global = true)]
+    profile_id: Option<String>,
+
     #[command(subcommand)]
     command: AdviceCommand,
 }
@@ -113,6 +117,7 @@ fn build_scope(cli: &AdviceCli) -> Result<AdviceScope, AdviceError> {
         project_root,
         context_id,
         cache_ttl_seconds: cli.cache_ttl_seconds.unwrap_or(DEFAULT_CACHE_TTL_SECONDS),
+        profile_id: cli.profile_id.clone(),
     })
 }
 
@@ -123,6 +128,7 @@ fn has_duplicate_cli_flags() -> bool {
         "--project-root",
         "--context-id",
         "--cache-ttl-seconds",
+        "--profile-id",
         "--request",
         "--tool-id",
         "--refresh",
@@ -185,6 +191,12 @@ fn main() -> ExitCode {
             Err(err) => emit_error_and_exit(&err),
         },
         AdviceCommand::Models { tool_id } => {
+            if scope.profile_id.is_some() {
+                return emit_error_and_exit(&AdviceError::new(
+                    "invalid_input",
+                    "--profile-id is not supported for the models command.",
+                ));
+            }
             let runtime = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()

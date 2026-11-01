@@ -101,6 +101,13 @@ An optional global `--cache-ttl-seconds N` before the subcommand configures the
 completed-result cache lifetime. The default is 3600 seconds; the accepted
 maximum is 86400 seconds. Values outside the accepted bound are rejected.
 
+An optional `--profile-id ID` binds `preview` or `classify` to that profile's
+configured shadow advisor. The request's explicit tool/model IDs must match;
+an off, missing, mismatched or unsupported selection is refused before vault or
+provider access. `models` does not accept a profile selection. See
+[profile decision advisors](PROFILE-ADVISOR.md). Without this option, existing
+version-1 cache keys and pending-attempt protections remain unchanged.
+
 - `--registry-dir` selects the read-only registry snapshot.
 - `--cache-dir` selects the private completed-result cache. Only `classify` may
   create a missing cache directory.
