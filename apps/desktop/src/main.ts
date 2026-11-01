@@ -1,4 +1,6 @@
 import './styles.css';
+import './pages/readiness.css';
+import './pages/recovery-overview.css';
 
 import {
   ACCENT_PALETTES,
@@ -118,6 +120,8 @@ import { ProfilesPage } from './pages/profiles.ts';
 import { PlansPage } from './pages/plans.ts';
 import { NativeLinkingPanel } from './pages/native.ts';
 import { renderActivityHistorySection } from './pages/history.ts';
+import { renderReadinessChecklist } from './pages/readiness.ts';
+import { renderRecoveryOverview } from './pages/recovery-overview.ts';
 
 const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
 const EXECUTION_PREFS_STORAGE_KEY = 'threadlane.desktop.execution_prefs.v1';
@@ -223,6 +227,7 @@ class ThreadlaneDesktopApp {
     error: null,
   };
   private returnFocusKey: string | null = null;
+  private readonly overviewExpansion = new Map<string, boolean>();
   private pollTimerId: number | null = null;
   private sharedRefreshInFlight = false;
   private toolVersionState: ToolVersionScanState = createToolVersionScanState();
@@ -787,7 +792,7 @@ class ThreadlaneDesktopApp {
   }
 
   private renderToolVersionsIfVisible(): void {
-    if (this.state.page === 'tools' && this.state.detailTarget === null) {
+    if ((this.state.page === 'tools' || this.state.page === 'chats') && this.state.detailTarget === null) {
       this.renderPreserveActiveInput();
     }
   }
@@ -1323,6 +1328,21 @@ class ThreadlaneDesktopApp {
     if (this.state.snapshotLoading) {
       frag.appendChild(h('p', { className: 'aq-note' }, 'Loading activity…'));
       return frag;
+    }
+
+    const recovery = renderRecoveryOverview({
+      snapshot: this.state.snapshot,
+      loading: this.state.snapshotLoading,
+      stale: attachment.connection !== 'connected',
+      onOpenRun: (task) => {
+        if (this.state.pendingMutation !== null) return;
+        void this.handleOpenRunDetail(task.binding_id, task.run_id, `recovery-${task.run_id}`);
+      },
+    });
+    if (recovery) {
+      frag.appendChild(this.preserveOverviewExpansion(
+        recovery, `recovery-${this.state.snapshot.selected_binding_id ?? 'none'}`
+      ));
     }
 
     const filteredTasks = tasks.filter((t) => matchesProviderFilter(t, providerFilter));
@@ -1946,8 +1966,37 @@ class ThreadlaneDesktopApp {
     return frag;
   }
 
+  /** Preserve an explicitly toggled overview across polling and navigation. */
+  private preserveOverviewExpansion(element: HTMLElement, key: string): HTMLElement {
+    const details = element instanceof HTMLDetailsElement
+      ? element
+      : element.querySelector('details');
+    if (details) {
+      const expanded = this.overviewExpansion.get(key);
+      if (expanded !== undefined) details.open = expanded;
+      details.querySelector('summary')?.addEventListener('click', () => {
+        this.overviewExpansion.set(key, !details.open);
+      });
+    }
+    return element;
+  }
+
   private buildChatsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    frag.appendChild(this.preserveOverviewExpansion(renderReadinessChecklist({
+      registry: this.state.registrySnapshot,
+      toolVersions: this.toolVersionState,
+      snapshot: this.state.snapshot,
+      registryLoading: this.state.registryLoading,
+      registryError: this.state.registryError,
+      onNavigate: (page) => {
+        this.returnFocusKey = null;
+        this.state = navigateToPage(this.state, page);
+        this.render(`nav-${page}`);
+        this.mainEl.scrollTop = 0;
+      },
+    }), 'readiness'));
+
     const { bindings, selected_binding_id, active_runs, total_runs } = this.state.snapshot;
     const currentSelected = this.state.selectedBindingId ?? selected_binding_id;
 

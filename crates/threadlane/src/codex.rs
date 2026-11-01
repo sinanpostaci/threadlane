@@ -12,6 +12,7 @@ use tokio::sync::watch;
 
 use crate::descriptor::{ensure_platform_supported, validate_no_symlink_components};
 use crate::error::Error;
+pub use crate::native_tool_output::NativeNotificationDelivery;
 use crate::native_tool_output::{
     invoke_native_tool_output_wakeup, validate_canonical_non_nil_uuid, NativeToolOutputConfig,
 };

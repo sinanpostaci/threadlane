@@ -1,0 +1,410 @@
+.aq-readiness {
+  width: 100%;
+  max-width: 720px;
+  margin: 0 auto 8px;
+  min-width: 0;
+}
+
+.aq-readiness-panel {
+  overflow: hidden;
+  border: 1px solid var(--aq-line);
+  border-radius: 12px;
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--aq-field) 42%, transparent),
+      color-mix(in srgb, var(--aq-base) 30%, transparent)
+    );
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--aq-text) 4%, transparent);
+}
+
+.aq-readiness-panel[data-state="ready"] {
+  border-color: color-mix(in srgb, var(--aq-accent) 34%, var(--aq-line));
+}
+
+.aq-readiness-panel[data-state="attention"] {
+  border-color: color-mix(in srgb, var(--aq-warn) 36%, var(--aq-line));
+}
+
+.aq-readiness-summary {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 11px 13px;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.aq-readiness-summary::-webkit-details-marker {
+  display: none;
+}
+
+.aq-readiness-summary:hover {
+  background: color-mix(in srgb, var(--aq-hover) 70%, transparent);
+}
+
+.aq-readiness-summary:focus-visible {
+  outline: 2px solid var(--aq-accent);
+  outline-offset: -2px;
+}
+
+.aq-readiness-panel[open] .aq-readiness-summary {
+  border-bottom: 1px solid var(--aq-line);
+}
+
+.aq-readiness-mark {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--aq-muted);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--aq-muted) 12%, transparent);
+}
+
+.aq-readiness-mark[data-state="ready"] {
+  background: var(--aq-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--aq-accent) 14%, transparent);
+}
+
+.aq-readiness-mark[data-state="attention"] {
+  background: var(--aq-warn);
+  box-shadow: 0 0 0 3px var(--aq-warn-bg);
+}
+
+.aq-readiness-mark[data-state="blocked"] {
+  background: var(--aq-danger);
+  box-shadow: 0 0 0 3px var(--aq-danger-bg);
+}
+
+.aq-readiness-mark[data-state="loading"] {
+  animation: aq-readiness-pulse 1.4s ease-in-out infinite;
+}
+
+.aq-readiness-summary-copy {
+  display: grid;
+  flex: 1;
+  gap: 1px;
+  min-width: 0;
+}
+
+.aq-readiness-kicker {
+  color: var(--aq-muted);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  line-height: 1.4;
+  text-transform: uppercase;
+}
+
+.aq-readiness-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.aq-readiness-caption {
+  color: var(--aq-muted);
+  font-size: 10.75px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.aq-readiness-progress {
+  flex: none;
+  padding: 2px 7px;
+  border: 1px solid var(--aq-line);
+  border-radius: 999px;
+  color: var(--aq-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.aq-readiness-body {
+  display: grid;
+  gap: 12px;
+  padding: 12px 13px 13px;
+}
+
+.aq-readiness-lede {
+  max-width: 64ch;
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 11.5px;
+  line-height: 1.55;
+}
+
+.aq-readiness-alert {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--aq-danger) 40%, var(--aq-line));
+  border-radius: 7px;
+  background: var(--aq-danger-bg);
+}
+
+.aq-readiness-alert strong {
+  font-size: 11.5px;
+  font-weight: 600;
+}
+
+.aq-readiness-alert p {
+  margin: 3px 0 0;
+  color: var(--aq-text);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.aq-readiness-list {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.aq-readiness-item {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr);
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid color-mix(in srgb, var(--aq-line) 74%, transparent);
+}
+
+.aq-readiness-item:first-child {
+  padding-top: 2px;
+  border-top: 0;
+}
+
+.aq-readiness-item:last-child {
+  padding-bottom: 2px;
+}
+
+.aq-readiness-dot {
+  width: 6px;
+  height: 6px;
+  margin-top: 5px;
+  border-radius: 50%;
+  background: var(--aq-muted);
+}
+
+.aq-readiness-dot[data-state="ready"] {
+  background: var(--aq-accent);
+}
+
+.aq-readiness-dot[data-state="attention"] {
+  background: var(--aq-warn);
+}
+
+.aq-readiness-dot[data-state="blocked"] {
+  background: var(--aq-danger);
+}
+
+.aq-readiness-dot[data-state="loading"] {
+  animation: aq-readiness-pulse 1.4s ease-in-out infinite;
+}
+
+.aq-readiness-item-main {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.aq-readiness-item-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.aq-readiness-item-label {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.005em;
+}
+
+.aq-readiness-state {
+  color: var(--aq-muted);
+  font-size: 9.25px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.aq-readiness-state[data-state="ready"] {
+  color: var(--aq-accent);
+}
+
+.aq-readiness-state[data-state="attention"] {
+  color: var(--aq-warn);
+}
+
+.aq-readiness-state[data-state="blocked"] {
+  color: var(--aq-danger);
+}
+
+.aq-readiness-item-summary {
+  margin: 0;
+  color: var(--aq-text);
+  font-size: 11.5px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.aq-readiness-item-detail {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 10.75px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.aq-readiness-action {
+  justify-self: start;
+  min-height: 28px;
+  margin-top: 4px;
+  padding: 3px 8px;
+  border: 1px solid var(--aq-line);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--aq-field) 70%, transparent);
+  color: var(--aq-text);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
+.aq-readiness-action:not(:disabled):hover {
+  border-color: color-mix(in srgb, var(--aq-accent) 42%, var(--aq-line));
+  background: color-mix(in srgb, var(--aq-accent) 12%, var(--aq-field));
+}
+
+.aq-readiness-diagnostics {
+  display: grid;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.aq-readiness-diagnostics-title {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 9.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.aq-readiness-profiles {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.aq-readiness-profile {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 3px 10px;
+  flex-wrap: wrap;
+  padding: 5px 7px;
+  border: 1px solid color-mix(in srgb, var(--aq-line) 82%, transparent);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--aq-field) 36%, transparent);
+}
+
+.aq-readiness-profile-name {
+  min-width: 0;
+  font-size: 11px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.aq-readiness-profile-default {
+  margin-left: 6px;
+  color: var(--aq-accent);
+  font-size: 8.75px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.aq-readiness-profile-meta {
+  color: var(--aq-muted);
+  font-size: 10.25px;
+  line-height: 1.4;
+}
+
+.aq-readiness-profile[data-state="partial"] .aq-readiness-profile-meta {
+  color: var(--aq-warn);
+}
+
+.aq-readiness-profile[data-state="invalid"] .aq-readiness-profile-meta {
+  color: var(--aq-danger);
+}
+
+.aq-readiness-boundaries {
+  display: grid;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--aq-line);
+}
+
+.aq-readiness-boundaries > strong {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.aq-readiness-boundaries ul {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding-left: 15px;
+  color: var(--aq-muted);
+  font-size: 10.75px;
+  line-height: 1.5;
+}
+
+.aq-readiness-boundary-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+
+.aq-readiness-boundary-actions .aq-readiness-action {
+  margin-top: 0;
+}
+
+.aq-readiness-boundary-note {
+  color: var(--aq-muted);
+  font-size: 10px;
+}
+
+@keyframes aq-readiness-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aq-readiness-mark[data-state="loading"],
+  .aq-readiness-dot[data-state="loading"] {
+    animation: none;
+  }
+}
+
+@media (max-width: 520px) {
+  .aq-readiness-summary {
+    align-items: flex-start;
+  }
+
+  .aq-readiness-progress {
+    margin-top: 1px;
+  }
+}

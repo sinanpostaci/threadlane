@@ -771,6 +771,7 @@ async fn native_reconnect_recovers_across_real_child_backend_restart_under_wrapp
         project_root: project_root.clone(),
         model: FAKE_MODEL_ID.to_string(),
         effort: FAKE_EFFORT.to_string(),
+        delivery: Default::default(),
         reconnect: Some(NativeReconnectConfig {
             descriptor_root: descriptor_root.clone(),
             backend_executable: current_exe.clone(),

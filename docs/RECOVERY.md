@@ -40,9 +40,15 @@ the host/session lifecycle and [profile flow](PROFILE-FLOW.md) for role receipts
 ## Current limits
 
 This restores durable workflow state; it does not resume an interrupted LLM
-call at the exact token where it stopped. A unified startup recovery overview
-and guided continuation are not yet complete. There is no implicitly installed
-OS service that restarts all approved hosts after reboot.
+call at the exact token where it stopped.
+
+Activity now provides a read-only **Needs attention** overview of the selected
+snapshot's recent runs, with links to existing run details. It distinguishes
+uncertain outcomes, terminal execution and evidence review, marks stale
+snapshots and reports bounded coverage. It does not enumerate every approval
+or restore interrupted hosts. Guided continuation remains explicit operator work.
+
+There is no implicitly installed OS service that restarts all approved hosts after reboot.
 
 Reopen/restart fixtures verify preserved completed state, unknown in-flight
 state and absence of automatic retries. They do not simulate physical power

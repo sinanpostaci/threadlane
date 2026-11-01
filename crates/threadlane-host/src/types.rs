@@ -125,14 +125,17 @@ pub enum HostNotificationTransport {
     Queue,
     /// Native Unix WebSocket JSON-RPC `turn/start` `toolOutput` transport.
     UnixToolOutput,
+    /// Native Unix WebSocket JSON-RPC direct user-message (`turn/start` when idle, `turn/steer` when active) transport.
+    UnixUserMessageSteer,
 }
 
 impl HostNotificationTransport {
-    /// Returns the canonical `snake_case` wire identifier (`"queue"` or `"unix_tool_output"`).
+    /// Returns the canonical `snake_case` wire identifier (`"queue"`, `"unix_tool_output"`, or `"unix_user_message_steer"`).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queue => "queue",
             Self::UnixToolOutput => "unix_tool_output",
+            Self::UnixUserMessageSteer => "unix_user_message_steer",
         }
     }
 
@@ -241,16 +244,27 @@ impl ApprovedHostNotificationConfig {
     }
 
     /// Validates and attaches an explicit [`NativeToolOutputConfig`] so wake-ups use the native
-    /// Unix WebSocket `turn/start.toolOutput` transport instead of spawning the legacy queue CLI.
+    /// Unix WebSocket transport instead of spawning the legacy queue CLI.
     pub fn with_tool_output(mut self, config: NativeToolOutputConfig) -> Result<Self, HostError> {
         config.validate()?;
         self.tool_output = Some(config);
         Ok(self)
     }
 
+    /// Validates and attaches a [`NativeToolOutputConfig`] with its delivery mode explicitly set to
+    /// [`threadlane::native_tool_output::NativeNotificationDelivery::UserMessageSteer`].
+    pub fn with_steer_context(mut self, config: NativeToolOutputConfig) -> Result<Self, HostError> {
+        let steer_cfg = config.with_delivery(
+            threadlane::native_tool_output::NativeNotificationDelivery::UserMessageSteer,
+        );
+        steer_cfg.validate()?;
+        self.tool_output = Some(steer_cfg);
+        Ok(self)
+    }
+
     /// Returns a safe, path-free [`HostNotificationSummary`] where `executable_digest` is the
     /// 64-character lowercase hex SHA-256 of the canonical executable path string and, when native
-    /// tool-output transport is configured, `native_context_digest` is `config.digest()`.
+    /// Unix WebSocket transport is configured, `native_context_digest` is `config.digest()`.
     pub fn summary(&self) -> HostNotificationSummary {
         let canonical_str = fs::canonicalize(&self.executable)
             .unwrap_or_else(|_| self.executable.clone())
@@ -265,10 +279,17 @@ impl ApprovedHostNotificationConfig {
             let _ = write!(&mut hex, "{byte:02x}");
         }
         let (transport, native_context_digest) = match self.tool_output {
-            Some(ref cfg) => (
-                HostNotificationTransport::UnixToolOutput,
-                Some(cfg.digest()),
-            ),
+            Some(ref cfg) => {
+                let transport = match cfg.delivery {
+                    threadlane::native_tool_output::NativeNotificationDelivery::ToolOutput => {
+                        HostNotificationTransport::UnixToolOutput
+                    }
+                    threadlane::native_tool_output::NativeNotificationDelivery::UserMessageSteer => {
+                        HostNotificationTransport::UnixUserMessageSteer
+                    }
+                };
+                (transport, Some(cfg.digest()))
+            }
             None => (HostNotificationTransport::Queue, None),
         };
         HostNotificationSummary {
@@ -305,7 +326,7 @@ pub struct HostNotificationSummary {
         skip_serializing_if = "HostNotificationTransport::is_default_queue"
     )]
     pub transport: HostNotificationTransport,
-    /// 64-character lowercase hex SHA-256 digest of the canonical native tool-output context when `transport == UnixToolOutput`; `None` otherwise.
+    /// 64-character lowercase hex SHA-256 digest of the canonical native context when `transport` is a native Unix WebSocket transport; `None` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_context_digest: Option<String>,
 }
@@ -330,8 +351,8 @@ impl HostNotificationSummary {
     /// - When `enabled == true`, `executable_digest` must be a valid 64-char lowercase hex SHA-256
     ///   digest and `timeout_ms` must be in `1..=MAX_CODEX_TIMEOUT_MS`.
     /// - When `transport == Queue`, `native_context_digest` must be `None`.
-    /// - When `transport == UnixToolOutput`, `native_context_digest` must be a valid 64-char
-    ///   lowercase hex SHA-256 digest.
+    /// - When `transport == UnixToolOutput | UnixUserMessageSteer`, `native_context_digest` must be
+    ///   a valid 64-char lowercase hex SHA-256 digest.
     pub fn validate(&self) -> Result<(), HostError> {
         if !self.enabled {
             if self.executable_digest.is_some()
@@ -378,11 +399,12 @@ impl HostNotificationSummary {
                     ));
                 }
             }
-            HostNotificationTransport::UnixToolOutput => {
+            HostNotificationTransport::UnixToolOutput
+            | HostNotificationTransport::UnixUserMessageSteer => {
                 let Some(ref native_digest) = self.native_context_digest else {
                     return Err(HostError::validation(
                         "notifications.native_context_digest",
-                        "unix_tool_output notifications summary requires native_context_digest",
+                        "native Unix notifications summary requires native_context_digest",
                     ));
                 };
                 validate_hex_digest("notifications.native_context_digest", native_digest)?;

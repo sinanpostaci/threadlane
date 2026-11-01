@@ -58,6 +58,12 @@ not require switching to the panel for each task. See
   Current Nix profile discovery avoids stale desktop-bundled Codex paths. See
   [tool installations](docs/TOOL-INSTALLATIONS.md).
 
+- **First-use checks and recovery overview**: Chats shows a read-only local
+  setup checklist for installed tools, model/effort assignments, saved profiles
+  and the selected real runtime binding. Activity highlights uncertain or
+  unsuccessful recent runs and evidence review, without replaying work.
+  See [first everyday use](docs/FIRST-USE.md).
+
 - **Crash recovery**: Task state and events are persisted; interrupted workers
   become unknown and are reconciled before continuation. Provider requests are
   never blindly replayed. See [recovery and current limits](docs/RECOVERY.md).

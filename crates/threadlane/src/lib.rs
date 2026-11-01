@@ -40,7 +40,7 @@ pub use descriptor::{
 pub use error::{ApiError, Error, ErrorCode};
 pub use mcp::ThreadlaneMcpServer;
 pub use native_endpoint::NativeReconnectConfig;
-pub use native_tool_output::NativeToolOutputConfig;
+pub use native_tool_output::{NativeNotificationDelivery, NativeToolOutputConfig};
 pub use protocol::{
     ActivityPage, BindingListResponse, CreateBindingRequest, Event, EventKind, EventPayload,
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,

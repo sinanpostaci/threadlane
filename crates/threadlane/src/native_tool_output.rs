@@ -57,6 +57,35 @@ const MAX_RECONNECT_BACKOFF_MS: u64 = 50;
 
 /// Explicit operator-selected native tool-output wake-up transport configuration.
 ///
+/// Explicit operator-selected native notification delivery mode over the private Unix WebSocket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeNotificationDelivery {
+    /// Default mode: submits `turn/start` with empty `input` and `toolOutput` (`functionCallOutput`).
+    #[default]
+    ToolOutput,
+    /// Opt-in direct user-message mode: submits `turn/start` with the fixed operator notice when
+    /// `idle`, or `turn/steer` targeting the verified `inProgress` active turn when `active`.
+    UserMessageSteer,
+}
+
+impl NativeNotificationDelivery {
+    /// Returns `true` when `self` is the default [`Self::ToolOutput`] delivery mode.
+    pub const fn is_default(&self) -> bool {
+        matches!(self, Self::ToolOutput)
+    }
+
+    /// Returns the wire `snake_case` identifier (`"tool_output"` or `"user_message_steer"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolOutput => "tool_output",
+            Self::UserMessageSteer => "user_message_steer",
+        }
+    }
+}
+
+/// Explicit operator-configured native Unix WebSocket notification target context.
+///
 /// This configuration is an operator-selected target scope only and is not a per-call
 /// native identity proof. Every wake-up attempt revalidates the physical socket path
 /// (or resolves and validates the live native endpoint when `reconnect` is configured),
@@ -76,6 +105,12 @@ pub struct NativeToolOutputConfig {
     pub model: String,
     /// Bounded non-empty expected reasoning effort identifier.
     pub effort: String,
+    /// Optional explicit native notification delivery mode (`tool_output` by default; omitted on legacy wire payloads when default).
+    #[serde(
+        default,
+        skip_serializing_if = "NativeNotificationDelivery::is_default"
+    )]
+    pub delivery: NativeNotificationDelivery,
     /// Optional opt-in Linux native endpoint auto-reconnect selector configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reconnect: Option<NativeReconnectConfig>,
@@ -90,12 +125,18 @@ impl fmt::Debug for NativeToolOutputConfig {
             .field("project_root", &"[REDACTED]")
             .field("model", &"[REDACTED]")
             .field("effort", &"[REDACTED]")
+            .field("delivery", &self.delivery)
             .field("reconnect", &self.reconnect)
             .finish()
     }
 }
 
 impl NativeToolOutputConfig {
+    /// Returns a copy of this configuration with the specified [`NativeNotificationDelivery`] mode.
+    pub const fn with_delivery(mut self, delivery: NativeNotificationDelivery) -> Self {
+        self.delivery = delivery;
+        self
+    }
     /// Validates all structural, identifier, canonical project root, and Unix socket or reconnect invariants.
     pub fn validate(&self) -> Result<(), Error> {
         ensure_platform_supported()?;
@@ -295,6 +336,8 @@ impl NativeToolOutputConfig {
             project_root: &'a [u8],
             model: &'a str,
             effort: &'a str,
+            #[serde(skip_serializing_if = "NativeNotificationDelivery::is_default")]
+            delivery: NativeNotificationDelivery,
             #[serde(skip_serializing_if = "Option::is_none")]
             reconnect: Option<CanonicalReconnectConfig<'a>>,
         }
@@ -306,6 +349,7 @@ impl NativeToolOutputConfig {
             project_root: path_as_canonical_bytes(&self.project_root),
             model: &self.model,
             effort: &self.effort,
+            delivery: self.delivery,
             reconnect: self
                 .reconnect
                 .as_ref()
@@ -602,12 +646,41 @@ struct FixedToolOutputPayload<'a> {
 }
 
 #[cfg(unix)]
+enum PreparedDeliveryMessages {
+    ToolOutput {
+        turn_start_req: String,
+    },
+    UserMessageSteer {
+        idle_turn_start_req: String,
+        turns_list_req: String,
+        notice_text: String,
+    },
+}
+
+#[cfg(unix)]
 struct PreparedExchangeMessages {
     init_req: String,
     initialized_notif: String,
     read_req: String,
     resume_req: String,
-    turn_start_req: String,
+    delivery: PreparedDeliveryMessages,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadReadStatus {
+    Idle,
+    Active,
+}
+
+#[cfg(unix)]
+impl ThreadReadStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Active => "active",
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -676,16 +749,29 @@ fn prepare_exchange_messages(
     approved_ctx: &ApprovedSessionWakeupContext,
     tool_output_cfg: &NativeToolOutputConfig,
 ) -> Result<PreparedExchangeMessages, &'static str> {
-    let init_req = serde_json::to_string(&json!({
-        "id": 1u64,
-        "method": "initialize",
-        "params": {
+    let init_params = match tool_output_cfg.delivery {
+        NativeNotificationDelivery::ToolOutput => json!({
             "clientInfo": {
                 "name": "threadlane",
                 "title": "Threadlane",
                 "version": env!("CARGO_PKG_VERSION"),
             }
-        }
+        }),
+        NativeNotificationDelivery::UserMessageSteer => json!({
+            "clientInfo": {
+                "name": "threadlane",
+                "title": "Threadlane",
+                "version": env!("CARGO_PKG_VERSION"),
+            },
+            "capabilities": {
+                "experimentalApi": true,
+            }
+        }),
+    };
+    let init_req = serde_json::to_string(&json!({
+        "id": 1u64,
+        "method": "initialize",
+        "params": init_params,
     }))
     .map_err(|_| "native tool-output request serialization failed")?;
     if init_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
@@ -726,41 +812,85 @@ fn prepare_exchange_messages(
         return Err("native tool-output request exceeded maximum frame size");
     }
 
-    let output_payload = FixedToolOutputPayload {
-        untrusted_data: true,
-        approval_id: &approved_ctx.approval_id,
-        claim_id: &claim.claim_id,
-        pending_since_seq: claim.pending_since_seq,
-        covered_up_to_seq: claim.covered_up_to_seq,
-        coalesced_count: claim.coalesced_count,
-        notice: approved_ctx.wakeup_message(),
-    };
-    let serialized_output = serde_json::to_string(&output_payload)
-        .map_err(|_| "native tool-output payload serialization failed")?;
-    let turn_start_req = serde_json::to_string(&json!({
-        "id": 4u64,
-        "method": "turn/start",
-        "params": {
-            "threadId": tool_output_cfg.thread_id,
-            "input": [],
-            "toolOutput": {
-                "name": NATIVE_TOOL_OUTPUT_NAME,
-                "namespace": NATIVE_TOOL_OUTPUT_NAMESPACE,
-                "output": serialized_output,
+    let delivery = match tool_output_cfg.delivery {
+        NativeNotificationDelivery::ToolOutput => {
+            let output_payload = FixedToolOutputPayload {
+                untrusted_data: true,
+                approval_id: &approved_ctx.approval_id,
+                claim_id: &claim.claim_id,
+                pending_since_seq: claim.pending_since_seq,
+                covered_up_to_seq: claim.covered_up_to_seq,
+                coalesced_count: claim.coalesced_count,
+                notice: approved_ctx.wakeup_message(),
+            };
+            let serialized_output = serde_json::to_string(&output_payload)
+                .map_err(|_| "native tool-output payload serialization failed")?;
+            let turn_start_req = serde_json::to_string(&json!({
+                "id": 4u64,
+                "method": "turn/start",
+                "params": {
+                    "threadId": tool_output_cfg.thread_id,
+                    "input": [],
+                    "toolOutput": {
+                        "name": NATIVE_TOOL_OUTPUT_NAME,
+                        "namespace": NATIVE_TOOL_OUTPUT_NAMESPACE,
+                        "output": serialized_output,
+                    }
+                }
+            }))
+            .map_err(|_| "native tool-output request serialization failed")?;
+            if turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+                return Err("native tool-output request exceeded maximum frame size");
+            }
+            PreparedDeliveryMessages::ToolOutput { turn_start_req }
+        }
+        NativeNotificationDelivery::UserMessageSteer => {
+            let notice_text = approved_ctx.wakeup_message();
+            let idle_turn_start_req = serde_json::to_string(&json!({
+                "id": 4u64,
+                "method": "turn/start",
+                "params": {
+                    "threadId": tool_output_cfg.thread_id,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": notice_text,
+                        }
+                    ]
+                }
+            }))
+            .map_err(|_| "native tool-output request serialization failed")?;
+            if idle_turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+                return Err("native tool-output request exceeded maximum frame size");
+            }
+            let turns_list_req = serde_json::to_string(&json!({
+                "id": 4u64,
+                "method": "thread/turns/list",
+                "params": {
+                    "threadId": tool_output_cfg.thread_id,
+                    "limit": 1u32,
+                    "sortDirection": "desc",
+                    "itemsView": "summary",
+                }
+            }))
+            .map_err(|_| "native tool-output request serialization failed")?;
+            if turns_list_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+                return Err("native tool-output request exceeded maximum frame size");
+            }
+            PreparedDeliveryMessages::UserMessageSteer {
+                idle_turn_start_req,
+                turns_list_req,
+                notice_text,
             }
         }
-    }))
-    .map_err(|_| "native tool-output request serialization failed")?;
-    if turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
-        return Err("native tool-output request exceeded maximum frame size");
-    }
+    };
 
     Ok(PreparedExchangeMessages {
         init_req,
         initialized_notif,
         read_req,
         resume_req,
-        turn_start_req,
+        delivery,
     })
 }
 
@@ -1007,7 +1137,7 @@ async fn run_single_ws_attempt(
         "native tool-output thread/read request rejected",
     )
     .await?;
-    validate_thread_read_result(&read_result, cfg)?;
+    let thread_status = validate_thread_read_result(&read_result, cfg)?;
 
     // 4. thread/resume (threadId, excludeTurns: true, no overrides)
     send_prevalidated_text(&mut ws, &messages.resume_req).await?;
@@ -1019,19 +1149,139 @@ async fn run_single_ws_attempt(
         "native tool-output thread/resume request rejected",
     )
     .await?;
-    validate_thread_resume_result(&resume_result, cfg)?;
+    validate_thread_resume_result(&resume_result, cfg, thread_status)?;
 
+    match &messages.delivery {
+        PreparedDeliveryMessages::ToolOutput { turn_start_req } => {
+            validate_pre_effect_ready(resolved.as_ref(), ws.get_ref(), shutdown_rx)?;
+
+            // 5. Set uncertainty marker immediately BEFORE attempting turn/start write.
+            *may_have_written = true;
+
+            ws.send(Message::Text(turn_start_req.clone().into()))
+                .await
+                .map_err(|_| {
+                    ExchangeError::Terminal("native tool-output turn/start send failed")
+                })?;
+
+            // 6. Receive and validate turn/start response.
+            let turn_result = recv_rpc_response(
+                &mut ws,
+                4,
+                frame_count,
+                cumulative_bytes,
+                "native tool-output turn/start request rejected",
+            )
+            .await?;
+            validate_turn_start_result(&turn_result)?;
+        }
+        PreparedDeliveryMessages::UserMessageSteer {
+            idle_turn_start_req,
+            turns_list_req,
+            notice_text,
+        } => match thread_status {
+            ThreadReadStatus::Idle => {
+                validate_pre_effect_ready(resolved.as_ref(), ws.get_ref(), shutdown_rx)?;
+
+                // 5. Set uncertainty marker immediately BEFORE attempting idle turn/start write.
+                *may_have_written = true;
+
+                ws.send(Message::Text(idle_turn_start_req.clone().into()))
+                    .await
+                    .map_err(|_| {
+                        ExchangeError::Terminal("native tool-output turn/start send failed")
+                    })?;
+
+                // 6. Receive and validate turn/start response.
+                let turn_result = recv_rpc_response(
+                    &mut ws,
+                    4,
+                    frame_count,
+                    cumulative_bytes,
+                    "native tool-output turn/start request rejected",
+                )
+                .await?;
+                validate_turn_start_result(&turn_result)?;
+            }
+            ThreadReadStatus::Active => {
+                // 5. Bounded read-only active turn summary lookup (limit: 1, sortDirection: desc, itemsView: summary).
+                send_prevalidated_text(&mut ws, turns_list_req).await?;
+                let turns_list_result = recv_rpc_response(
+                    &mut ws,
+                    4,
+                    frame_count,
+                    cumulative_bytes,
+                    "native user-message thread/turns/list request rejected",
+                )
+                .await?;
+                let expected_turn_id = extract_in_progress_turn_id(&turns_list_result)?;
+
+                let turn_steer_req = serde_json::to_string(&json!({
+                    "id": 5u64,
+                    "method": "turn/steer",
+                    "params": {
+                        "threadId": cfg.thread_id,
+                        "expectedTurnId": expected_turn_id,
+                        "input": [
+                            {
+                                "type": "text",
+                                "text": notice_text,
+                            }
+                        ]
+                    }
+                }))
+                .map_err(|_| {
+                    ExchangeError::Terminal("native user-message turn/steer serialization failed")
+                })?;
+                if turn_steer_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+                    return Err(ExchangeError::Terminal(
+                        "native user-message turn/steer request exceeded maximum frame size",
+                    ));
+                }
+
+                validate_pre_effect_ready(resolved.as_ref(), ws.get_ref(), shutdown_rx)?;
+
+                // 6. Set uncertainty marker immediately BEFORE attempting turn/steer write.
+                *may_have_written = true;
+
+                ws.send(Message::Text(turn_steer_req.into()))
+                    .await
+                    .map_err(|_| {
+                        ExchangeError::Terminal("native user-message turn/steer send failed")
+                    })?;
+
+                // 7. Receive and validate turn/steer response against exact expectedTurnId.
+                let steer_result = recv_rpc_response(
+                    &mut ws,
+                    5,
+                    frame_count,
+                    cumulative_bytes,
+                    "native user-message turn/steer request rejected",
+                )
+                .await?;
+                validate_turn_steer_result(&steer_result, &expected_turn_id)?;
+            }
+        },
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_pre_effect_ready(
+    resolved: Option<&ResolvedNativeEndpoint>,
+    stream: &tokio::net::UnixStream,
+    shutdown_rx: &watch::Receiver<bool>,
+) -> Result<(), ExchangeError> {
     if *shutdown_rx.borrow() {
         return Err(ExchangeError::Terminal(
             "supervisor shutdown before native tool-output turn/start send",
         ));
     }
 
-    if let Some(ref endpoint) = resolved {
+    if let Some(endpoint) = resolved {
         endpoint.validate_processes().map_err(map_endpoint_error)?;
-        endpoint
-            .validate_peer(ws.get_ref())
-            .map_err(map_endpoint_error)?;
+        endpoint.validate_peer(stream).map_err(map_endpoint_error)?;
     }
 
     if *shutdown_rx.borrow() {
@@ -1039,24 +1289,6 @@ async fn run_single_ws_attempt(
             "supervisor shutdown before native tool-output turn/start send",
         ));
     }
-
-    // 5. Set uncertainty marker immediately BEFORE attempting turn/start write.
-    *may_have_written = true;
-
-    ws.send(Message::Text(messages.turn_start_req.clone().into()))
-        .await
-        .map_err(|_| ExchangeError::Terminal("native tool-output turn/start send failed"))?;
-
-    // 6. Receive and validate turn/start response.
-    let turn_result = recv_rpc_response(
-        &mut ws,
-        4,
-        frame_count,
-        cumulative_bytes,
-        "native tool-output turn/start request rejected",
-    )
-    .await?;
-    validate_turn_start_result(&turn_result)?;
 
     Ok(())
 }
@@ -1223,7 +1455,7 @@ async fn recv_rpc_response(
 fn validate_thread_read_result(
     result: &Value,
     cfg: &NativeToolOutputConfig,
-) -> Result<(), ExchangeError> {
+) -> Result<ThreadReadStatus, ExchangeError> {
     let Some(thread) = result.get("thread").and_then(Value::as_object) else {
         return Err(ExchangeError::Terminal(
             "native tool-output thread/read response missing thread object",
@@ -1288,7 +1520,8 @@ fn validate_thread_read_result(
         _ => None,
     };
     match status_type {
-        Some("idle" | "active") => Ok(()),
+        Some("idle") => Ok(ThreadReadStatus::Idle),
+        Some("active") => Ok(ThreadReadStatus::Active),
         Some("notLoaded") => Err(ExchangeError::Retryable(
             "native tool-output target thread is not loaded in idle or active status",
         )),
@@ -1345,6 +1578,7 @@ fn extract_consistent_string_field<'a>(
 fn validate_thread_resume_result(
     result: &Value,
     cfg: &NativeToolOutputConfig,
+    expected_status: ThreadReadStatus,
 ) -> Result<(), ExchangeError> {
     let Some(result_obj) = result.as_object() else {
         return Err(ExchangeError::Terminal(
@@ -1386,6 +1620,190 @@ fn validate_thread_resume_result(
     if effort != cfg.effort {
         return Err(ExchangeError::Terminal(
             "native tool-output thread/resume reasoningEffort mismatch",
+        ));
+    }
+
+    if cfg.delivery == NativeNotificationDelivery::UserMessageSteer {
+        let status_val = thread_obj.and_then(|thread| thread.get("status"));
+        let status = match status_val {
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(Value::Object(value)) => value.get("type").and_then(Value::as_str),
+            _ => None,
+        };
+        if status != Some(expected_status.as_str()) {
+            return Err(ExchangeError::Terminal(
+                "native user-message current thread status missing or changed before send",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn extract_in_progress_turn_id(result: &Value) -> Result<String, ExchangeError> {
+    let Some(result_obj) = result.as_object() else {
+        return Err(ExchangeError::Terminal(
+            "native user-message thread/turns/list result must be an object",
+        ));
+    };
+
+    if let Some(err_val) = result_obj.get("error") {
+        if !err_val.is_null() {
+            return Err(ExchangeError::Terminal(
+                "native user-message thread/turns/list reported an error",
+            ));
+        }
+    }
+
+    let Some(data) = result_obj.get("data").and_then(Value::as_array) else {
+        return Err(ExchangeError::Terminal(
+            "native user-message thread/turns/list response missing data array",
+        ));
+    };
+    if data.len() != 1 {
+        return Err(ExchangeError::Terminal(
+            "native user-message thread/turns/list did not return exactly one turn summary",
+        ));
+    }
+
+    let Some(turn_obj) = data[0].as_object() else {
+        return Err(ExchangeError::Terminal(
+            "native user-message thread/turns/list summary entry must be an object",
+        ));
+    };
+
+    if let Some(turn_err) = turn_obj.get("error") {
+        if !turn_err.is_null() {
+            return Err(ExchangeError::Terminal(
+                "native user-message latest turn summary reported an error",
+            ));
+        }
+    }
+
+    let status_str = match turn_obj.get("status") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Object(map)) => map.get("type").and_then(Value::as_str),
+        _ => None,
+    };
+    if status_str != Some("inProgress") {
+        return Err(ExchangeError::Terminal(
+            "native user-message latest turn summary is not inProgress",
+        ));
+    }
+
+    let Some(turn_id) = turn_obj.get("id").and_then(Value::as_str) else {
+        return Err(ExchangeError::Terminal(
+            "native user-message latest turn summary missing id",
+        ));
+    };
+    validate_canonical_non_nil_uuid(turn_id, "turn.id").map_err(|_| {
+        ExchangeError::Terminal("native user-message latest turn summary has invalid turn.id")
+    })?;
+
+    Ok(turn_id.to_string())
+}
+
+#[cfg(unix)]
+fn validate_turn_steer_result(result: &Value, expected_turn_id: &str) -> Result<(), ExchangeError> {
+    let Some(result_obj) = result.as_object() else {
+        return Err(ExchangeError::Terminal(
+            "native user-message turn/steer result must be an object",
+        ));
+    };
+
+    if let Some(err_val) = result_obj.get("error") {
+        if !err_val.is_null() {
+            return Err(ExchangeError::Terminal(
+                "native user-message turn/steer reported an error",
+            ));
+        }
+    }
+
+    let outer_turn_id = match result_obj.get("turnId") {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(ExchangeError::Terminal(
+                "native user-message turn/steer turnId field must be a string",
+            ))
+        }
+    };
+
+    let inner_turn_id = match result_obj.get("turn") {
+        Some(Value::Object(turn_obj)) => {
+            if let Some(turn_err) = turn_obj.get("error") {
+                if !turn_err.is_null() {
+                    return Err(ExchangeError::Terminal(
+                        "native user-message turn/steer turn reported an error",
+                    ));
+                }
+            }
+            if let Some(status_val) = turn_obj.get("status") {
+                let status_str = match status_val {
+                    Value::String(s) => Some(s.as_str()),
+                    Value::Object(map) => map.get("type").and_then(Value::as_str),
+                    Value::Null => None,
+                    _ => {
+                        return Err(ExchangeError::Terminal(
+                            "native user-message turn/steer turn.status has invalid format",
+                        ))
+                    }
+                };
+                if let Some(status) = status_str {
+                    if matches!(
+                        status,
+                        "failed" | "error" | "errored" | "cancelled" | "canceled" | "rejected"
+                    ) {
+                        return Err(ExchangeError::Terminal(
+                            "native user-message turn/steer returned a rejected turn status",
+                        ));
+                    }
+                }
+            }
+            match turn_obj.get("id") {
+                Some(Value::String(s)) => Some(s.as_str()),
+                Some(Value::Null) | None => None,
+                Some(_) => {
+                    return Err(ExchangeError::Terminal(
+                        "native user-message turn/steer turn.id field must be a string",
+                    ))
+                }
+            }
+        }
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(ExchangeError::Terminal(
+                "native user-message turn/steer turn field must be an object",
+            ))
+        }
+    };
+
+    let acked_turn_id = match (outer_turn_id, inner_turn_id) {
+        (Some(a), Some(b)) => {
+            if a != b {
+                return Err(ExchangeError::Terminal(
+                    "native user-message turn/steer turnId and turn.id disagreed",
+                ));
+            }
+            a
+        }
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => {
+            return Err(ExchangeError::Terminal(
+                "native user-message turn/steer response missing turnId",
+            ))
+        }
+    };
+
+    validate_canonical_non_nil_uuid(acked_turn_id, "turnId").map_err(|_| {
+        ExchangeError::Terminal("native user-message turn/steer returned invalid turnId")
+    })?;
+
+    if acked_turn_id != expected_turn_id {
+        return Err(ExchangeError::Terminal(
+            "native user-message turn/steer turnId did not match expectedTurnId",
         ));
     }
 
@@ -1472,6 +1890,7 @@ mod tests {
             project_root: PathBuf::from("/tmp/secret-project-root"),
             model: "secret-model-id".to_string(),
             effort: "high".to_string(),
+            delivery: NativeNotificationDelivery::ToolOutput,
             reconnect: None,
         };
 
@@ -1483,6 +1902,10 @@ mod tests {
         assert!(dbg.contains("[REDACTED]"));
 
         let digest = cfg.digest();
+        assert_eq!(
+            digest, "5869029fab09b993d9ccb2f1422ebbc5bf4a1c95406647dd8d87ce8bd961d518",
+            "legacy context digest changed"
+        );
         assert_eq!(digest.len(), 64);
         assert!(digest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
         assert!(!digest.contains("secret"));
@@ -1490,10 +1913,21 @@ mod tests {
 
         let legacy_json = serde_json::to_string(&cfg).expect("serialize legacy config");
         assert!(!legacy_json.contains("reconnect"));
+        assert!(!legacy_json.contains("delivery"));
         let round_trip: NativeToolOutputConfig =
             serde_json::from_str(&legacy_json).expect("deserialize legacy config");
         assert_eq!(round_trip, cfg);
         assert_eq!(round_trip.digest(), digest);
+
+        let steer_cfg = cfg
+            .clone()
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+        let steer_json = serde_json::to_string(&steer_cfg).expect("serialize steer config");
+        assert!(steer_json.contains(r#""delivery":"user_message_steer""#));
+        let steer_round_trip: NativeToolOutputConfig =
+            serde_json::from_str(&steer_json).expect("deserialize steer config");
+        assert_eq!(steer_round_trip, steer_cfg);
+        assert_ne!(steer_cfg.digest(), digest);
 
         let mut with_reconnect = cfg.clone();
         with_reconnect.reconnect = Some(NativeReconnectConfig {
@@ -1528,6 +1962,7 @@ mod tests {
             project_root,
             model: "gpt-5".to_string(),
             effort: "high".to_string(),
+            delivery: NativeNotificationDelivery::ToolOutput,
             reconnect: None,
         };
 

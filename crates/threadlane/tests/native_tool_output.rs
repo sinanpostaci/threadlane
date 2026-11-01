@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use threadlane::native_tool_output::NativeNotificationDelivery;
 use threadlane::{
     invoke_codex_wakeup, ApprovedSessionWakeupContext, CodexWakeupConfig, NativeToolOutputConfig,
 };
@@ -100,6 +101,7 @@ impl TestEnv {
             project_root: self.project_root.clone(),
             model: "gpt-5-codex".to_string(),
             effort: "high".to_string(),
+            delivery: NativeNotificationDelivery::ToolOutput,
             reconnect: None,
         }
     }
@@ -727,5 +729,487 @@ async fn read_json(ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixS
             Message::Pong(_) | Message::Ping(_) => continue,
             other => panic!("unexpected frame: {other:?}"),
         }
+    }
+}
+
+#[tokio::test]
+async fn user_message_steer_mode_routes_idle_to_turn_start_and_active_to_turn_steer() {
+    // 1. Idle thread -> turn/start with fixed user text notice and no toolOutput or overrides.
+    {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env
+            .base_native_config()
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+
+            let msg1 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg1);
+            ws.send(Message::Text(
+                json!({ "id": 1, "result": { "serverInfo": { "name": "fake" } } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("init");
+
+            let msg2 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg2);
+
+            let msg3 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg3);
+            ws.send(Message::Text(
+                json!({
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "idle" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("read");
+
+            let msg4 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg4);
+            ws.send(Message::Text(
+                json!({
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "idle" }
+                        },
+                        "model": "gpt-5-codex",
+                        "reasoningEffort": "high"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("resume");
+
+            let msg5 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg5);
+            ws.send(Message::Text(
+                json!({
+                    "id": 4,
+                    "result": {
+                        "turn": {
+                            "id": TEST_TURN_ID,
+                            "status": { "type": "inProgress" },
+                            "error": null
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("turn/start");
+        });
+
+        let base_ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID)
+            .expect("ctx")
+            .with_operator_cli_route();
+        let expected_notice = base_ctx.wakeup_message();
+        let ctx = base_ctx
+            .with_tool_output_transport(cfg)
+            .expect("attach steer transport");
+        let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+        let claim = env.sample_claim();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+        assert_eq!(outcome, WakeupOutcome::Submitted);
+        assert!(!env.queue_marker.exists());
+
+        server.await.expect("server");
+        let calls = recorded.lock().await;
+        assert_eq!(calls.len(), 5);
+        assert_eq!(
+            calls[0]["params"]["capabilities"],
+            json!({ "experimentalApi": true })
+        );
+        assert_eq!(calls[4]["method"], "turn/start");
+        let params = &calls[4]["params"];
+        assert_eq!(params["threadId"], TEST_THREAD_ID);
+        assert_eq!(
+            params["input"],
+            json!([{ "type": "text", "text": expected_notice }])
+        );
+        assert!(params.get("toolOutput").is_none());
+        assert!(params.get("model").is_none());
+        assert!(params.get("effort").is_none());
+    }
+
+    // 2. Active thread -> thread/turns/list (summary, limit 1, desc) + turn/steer with exact expectedTurnId.
+    {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env
+            .base_native_config()
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+
+            let msg1 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg1);
+            ws.send(Message::Text(
+                json!({ "id": 1, "result": { "serverInfo": { "name": "fake" } } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("init");
+
+            let msg2 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg2);
+
+            let msg3 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg3);
+            ws.send(Message::Text(
+                json!({
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "active", "activeFlags": ["turnRunning"] }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("read");
+
+            let msg4 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg4);
+            ws.send(Message::Text(
+                json!({
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "active" }
+                        },
+                        "model": "gpt-5-codex",
+                        "reasoningEffort": "high"
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("resume");
+
+            let msg5 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg5);
+            ws.send(Message::Text(
+                json!({
+                    "id": 4,
+                    "result": {
+                        "data": [
+                            {
+                                "id": TEST_TURN_ID,
+                                "status": "inProgress",
+                                "items": []
+                            }
+                        ],
+                        "nextCursor": null
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("turns/list");
+
+            let msg6 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg6);
+            ws.send(Message::Text(
+                json!({
+                    "id": 5,
+                    "result": {
+                        "turnId": TEST_TURN_ID
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("turn/steer");
+        });
+
+        let base_ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID).expect("ctx");
+        let expected_notice = base_ctx.wakeup_message();
+        let ctx = base_ctx
+            .with_tool_output_transport(cfg)
+            .expect("attach steer transport");
+        let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+        let claim = env.sample_claim();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+        assert_eq!(outcome, WakeupOutcome::Submitted);
+        assert!(!env.queue_marker.exists());
+
+        server.await.expect("server");
+        let calls = recorded.lock().await;
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[4]["method"], "thread/turns/list");
+        assert_eq!(
+            calls[4]["params"],
+            json!({
+                "threadId": TEST_THREAD_ID,
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "summary"
+            })
+        );
+        assert_eq!(calls[5]["method"], "turn/steer");
+        assert_eq!(
+            calls[5]["params"],
+            json!({
+                "threadId": TEST_THREAD_ID,
+                "expectedTurnId": TEST_TURN_ID,
+                "input": [{ "type": "text", "text": expected_notice }]
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn user_message_steer_refuses_missing_or_completed_active_turn_and_marks_mismatched_steer_ack_unknown(
+) {
+    // 1. Pre-effect refusal when active thread has no inProgress turn summary -> Failed, no turn/start or turn/steer fallback.
+    for list_response in [
+        json!({ "id": 4, "result": { "data": [], "nextCursor": null } }),
+        json!({
+            "id": 4,
+            "result": {
+                "data": [{ "id": TEST_TURN_ID, "status": "completed", "items": [] }],
+                "nextCursor": null
+            }
+        }),
+        json!({ "id": 4, "error": { "code": -32601, "message": "method not found" } }),
+    ] {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env
+            .base_native_config()
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let saw_effect_write = Arc::new(Mutex::new(false));
+        let saw_effect_write_clone = Arc::clone(&saw_effect_write);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream).await.expect("ws");
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({ "id": 1, "result": {} }).to_string().into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": TEST_THREAD_ID,
+                                "cwd": expected_cwd,
+                                "status": { "type": "active" }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 3,
+                        "result": {
+                            "thread": {
+                                "id": TEST_THREAD_ID,
+                                "cwd": expected_cwd,
+                                "status": { "type": "active" }
+                            },
+                            "model": "gpt-5-codex",
+                            "reasoningEffort": "high"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+
+            let list_req = read_json(&mut ws).await;
+            assert_eq!(list_req["method"], "thread/turns/list");
+            let _ = ws
+                .send(Message::Text(list_response.to_string().into()))
+                .await;
+
+            if let Some(Ok(Message::Text(next_text))) = ws.next().await {
+                let next_val: Value = serde_json::from_str(&next_text).expect("json");
+                if matches!(
+                    next_val["method"].as_str(),
+                    Some("turn/start" | "turn/steer")
+                ) {
+                    *saw_effect_write_clone.lock().await = true;
+                }
+            }
+        });
+
+        let ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID)
+            .expect("ctx")
+            .with_tool_output_transport(cfg)
+            .expect("transport");
+        let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+        let claim = env.sample_claim();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+        assert!(
+            matches!(outcome, WakeupOutcome::Failed { .. }),
+            "expected Failed before effect write, got {outcome:?}"
+        );
+        server.await.expect("server");
+        assert!(!*saw_effect_write.lock().await);
+        assert!(!env.queue_marker.exists());
+    }
+
+    // 2. Post-write mismatched turnId or RPC error on turn/steer -> Unknown and no retry.
+    for steer_reply in [
+        json!({
+            "id": 5,
+            "result": { "turnId": "01968f52-1111-7d51-9914-79d2bc48eb5c" }
+        }),
+        json!({
+            "id": 5,
+            "error": { "code": -32000, "message": "secret-active-turn-finished" }
+        }),
+    ] {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env
+            .base_native_config()
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream).await.expect("ws");
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({ "id": 1, "result": {} }).to_string().into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": TEST_THREAD_ID,
+                                "cwd": expected_cwd,
+                                "status": { "type": "active" }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 3,
+                        "result": {
+                            "thread": {
+                                "id": TEST_THREAD_ID,
+                                "cwd": expected_cwd,
+                                "status": { "type": "active" }
+                            },
+                            "model": "gpt-5-codex",
+                            "reasoningEffort": "high"
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 4,
+                        "result": {
+                            "data": [{ "id": TEST_TURN_ID, "status": { "type": "inProgress" } }],
+                            "nextCursor": null
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let steer_req = read_json(&mut ws).await;
+            assert_eq!(steer_req["method"], "turn/steer");
+            let _ = ws.send(Message::Text(steer_reply.to_string().into())).await;
+        });
+
+        let ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID)
+            .expect("ctx")
+            .with_tool_output_transport(cfg)
+            .expect("transport");
+        let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+        let claim = env.sample_claim();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+        match outcome {
+            WakeupOutcome::Unknown { reason } => {
+                assert!(!reason.contains("secret-active-turn-finished"));
+                assert!(!reason.contains(TEST_TURN_ID));
+            }
+            other => panic!("expected Unknown after turn/steer write, got {other:?}"),
+        }
+        server.await.expect("server");
+        assert!(!env.queue_marker.exists());
     }
 }

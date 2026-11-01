@@ -20,9 +20,9 @@ use threadlane_host::{
     prepare_session_dir, read_and_verify_host_manifest, write_host_manifest, ApprovedHost,
     ApprovedHostClient, ApprovedHostConfig, ApprovedHostNotificationConfig, HostCli, HostCommand,
     HostError, HostNotificationRoute, HostNotificationSummary, HostNotificationTransport,
-    HostPhase, HostSessionManifest, NativeToolOutputConfig, ServeArgs, TaskExecutionStatus,
-    APPROVED_EVENT_BATCH_MAX_EVENTS, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
-    RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    HostPhase, HostSessionManifest, NativeNotificationDelivery, NativeToolOutputConfig, ServeArgs,
+    TaskExecutionStatus, APPROVED_EVENT_BATCH_MAX_EVENTS, HOST_LOCK_FILENAME,
+    HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 use threadlane_plans::{
     compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStore,
@@ -328,6 +328,7 @@ fn sample_native_config(
     NativeToolOutputConfig {
         schema_version: 1,
         socket_path: socket_path.to_path_buf(),
+        delivery: NativeNotificationDelivery::ToolOutput,
         reconnect: None,
         thread_id: thread_id.to_string(),
         project_root: project_root.to_path_buf(),
@@ -415,6 +416,33 @@ fn notification_summary_wire_compatibility_validation_and_redaction() {
     assert_eq!(
         serde_json::from_str::<HostNotificationSummary>(&serialized_native).expect("roundtrip"),
         native_summary
+    );
+
+    // 2b. Direct user-message steer mode reports `unix_user_message_steer` and a distinct digest.
+    let steer_native_cfg = native_cfg
+        .clone()
+        .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+    assert_ne!(steer_native_cfg.digest(), native_cfg.digest());
+    let host_steer_cfg = queue_cfg
+        .clone()
+        .with_route(HostNotificationRoute::OperatorCli)
+        .with_steer_context(native_cfg.clone())
+        .expect("with_steer_context");
+    let steer_summary = host_steer_cfg.summary();
+    assert_eq!(
+        steer_summary.transport,
+        HostNotificationTransport::UnixUserMessageSteer
+    );
+    assert_eq!(
+        steer_summary.native_context_digest.as_deref(),
+        Some(steer_native_cfg.digest().as_str())
+    );
+    steer_summary.validate().expect("valid steer summary");
+    let serialized_steer = serde_json::to_string(&steer_summary).expect("serialize steer");
+    assert!(serialized_steer.contains(r#""transport":"unix_user_message_steer""#));
+    assert_eq!(
+        serde_json::from_str::<HostNotificationSummary>(&serialized_steer).expect("roundtrip"),
+        steer_summary
     );
 
     // 3. Invalid summary combinations fail validation and manifest verification.

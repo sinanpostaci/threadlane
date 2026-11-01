@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use threadlane::native_tool_output::NativeNotificationDelivery;
 use threadlane::{
     invoke_codex_wakeup, ApprovedSessionWakeupContext, CodexWakeupConfig, NativeReconnectConfig,
     NativeToolOutputConfig,
@@ -131,6 +132,7 @@ impl ReconnectTestEnv {
             project_root: self.project_root.clone(),
             model: "gpt-5-codex".to_string(),
             effort: "high".to_string(),
+            delivery: NativeNotificationDelivery::ToolOutput,
             reconnect: Some(self.reconnect_config()),
         }
     }

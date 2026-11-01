@@ -144,6 +144,7 @@ fn config(root: &Path, socket: &Path, binding_id: &str) -> CodexWakeupConfig {
     let native = NativeToolOutputConfig {
         schema_version: 1,
         socket_path: socket.to_path_buf(),
+        delivery: Default::default(),
         reconnect: None,
         thread_id: THREAD.to_string(),
         project_root: root.to_path_buf(),

@@ -67,6 +67,7 @@ pub use storage::{
     verify_existing_session_dir, write_host_launch_intent, write_host_manifest,
     HostLaunchIntentLock, HostSessionLock,
 };
+pub use threadlane::native_tool_output::NativeNotificationDelivery;
 pub use threadlane::{
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
     HostControlRuntimeState, HostControlStatusResponse, NativeToolOutputConfig,
