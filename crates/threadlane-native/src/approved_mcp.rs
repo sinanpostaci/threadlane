@@ -561,6 +561,14 @@ pub fn map_host_error_to_mcp(err: &HostError) -> (&'static str, &'static str) {
             "invalid_run_state",
             "Operation is not valid for the worker run's current lifecycle state.",
         ),
+        HostError::WakeupClaimNotFound { .. } => (
+            "wakeup_claim_not_found",
+            "Expected wake-up claim identifier does not match the current notification claim.",
+        ),
+        HostError::InvalidWakeupState { .. } => (
+            "invalid_wakeup_state",
+            "Notification wake-up state is not eligible for the requested recovery action.",
+        ),
         HostError::SecurityViolation { .. } => (
             "security_violation",
             "Security policy or private directory invariant was violated.",
@@ -1141,7 +1149,7 @@ pub(crate) async fn execute_start_approved_task(
     const TOOL: &str = "start_approved_task";
 
     let client = build_host_client_blocking(
-        authority,
+        Arc::clone(&authority),
         sessions_dir,
         &trusted_binding_id,
         &trusted_thread_uuid,
@@ -1149,13 +1157,26 @@ pub(crate) async fn execute_start_approved_task(
     )
     .await?;
 
-    let snapshot = client
-        .dispatch_task(&params.approval_id, &params.task_id)
-        .await
-        .map_err(|err| {
-            let (code, message) = map_host_error_to_mcp(&err);
+    let snapshot = crate::dispatch_guard::dispatch_approved_task_guarded(
+        &authority,
+        &client,
+        &trusted_binding_id,
+        &trusted_thread_uuid,
+        &params.approval_id,
+        &params.task_id,
+        None,
+        || async { Ok(()) },
+    )
+    .await
+    .map_err(|err| match err {
+        crate::dispatch_guard::GuardedDispatchError::PreEffect { code, message } => {
             format_approved_scoped_error(&trusted_binding_id, TOOL, code, message)
-        })?;
+        }
+        crate::dispatch_guard::GuardedDispatchError::Host(host_err) => {
+            let (code, message) = map_host_error_to_mcp(&host_err);
+            format_approved_scoped_error(&trusted_binding_id, TOOL, code, message)
+        }
+    })?;
 
     if snapshot.binding_id != trusted_binding_id || snapshot.thread_uuid != trusted_thread_uuid {
         return Err(format_approved_scoped_error(
@@ -1538,6 +1559,20 @@ mod lifecycle_error_tests {
                     detail: private.to_string(),
                 },
                 "host_restart_not_allowed",
+            ),
+            (
+                HostError::WakeupClaimNotFound {
+                    claim_id: private.to_string(),
+                },
+                "wakeup_claim_not_found",
+            ),
+            (
+                HostError::InvalidWakeupState {
+                    binding_id: private.to_string(),
+                    status: private.to_string(),
+                    action: private.to_string(),
+                },
+                "invalid_wakeup_state",
             ),
             (
                 HostError::Runtime {

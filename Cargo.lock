@@ -2496,6 +2496,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "threadlane-codex-bridge"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "threadlane-connectors"
 version = "0.1.0"
 dependencies = [

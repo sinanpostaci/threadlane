@@ -6,9 +6,9 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use threadlane::{
     resolve_worker_execution, ActivityPage, ErrorCode as RuntimeErrorCode, EventKind,
-    HostControlInfoRequest, HostControlRuntimeState, HostControlStatusResponse, ScopedClient,
-    StopIdleHostRequest, SupervisorClient, ValidatedWorkersConfig, WorkerAcceptanceState,
-    WorkerSnapshot, WorkerStatus,
+    HostControlInfoRequest, HostControlOwnerScope, HostControlRuntimeState,
+    HostControlStatusResponse, RearmHostWakeupRequest, ScopedClient, StopIdleHostRequest,
+    SupervisorClient, ValidatedWorkersConfig, WorkerAcceptanceState, WorkerSnapshot, WorkerStatus,
 };
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
 use threadlane_core::{AckResult, Binding, EventBatch, WorkerExecutionBinding};
@@ -34,7 +34,8 @@ use crate::storage::{
     verify_existing_private_dir, verify_existing_session_dir,
 };
 use crate::types::{
-    DependencyInputSummary, DependencyPredecessorSelection, HostPhase, HostSessionManifest,
+    DependencyInputSummary, DependencyPredecessorSelection, HostNotificationDeliveryStatus,
+    HostNotificationRearmReport, HostNotificationStatusReport, HostPhase, HostSessionManifest,
     HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent, TaskExecutionStatus,
     TaskRunReceipt, TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES,
     APPROVED_EVENT_BATCH_MAX_EVENTS, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
@@ -172,6 +173,388 @@ impl ApprovedHostClient {
             summary.gates.supervisor_authenticated_ready = false;
         }
         Ok(summary)
+    }
+
+    /// Returns a safe, token-free, path-free [`HostSessionSummary`] for `approval_id` with
+    /// additive live (or truthful unavailable) [`HostNotificationDeliveryStatus`] populated in
+    /// `summary.notification_delivery`.
+    pub async fn session_summary_with_notifications(
+        &self,
+        approval_id: &str,
+    ) -> Result<HostSessionSummary, HostError> {
+        let mut summary = self.session_summary(approval_id)?;
+        let notif_report = self.notification_status(approval_id).await?;
+        summary.notification_delivery = Some(notif_report.delivery);
+        Ok(summary)
+    }
+
+    /// Queries bounded, path-free, secret-free notification delivery status for `approval_id`.
+    ///
+    /// - Validates `approval_id`, caller `control_binding_id` and `native_thread_uuid`, private
+    ///   session directories, and `host-manifest.json`.
+    /// - When the host is live (`Ready` or `Stopping` with `host.lock` held and `instance_id`
+    ///   present), verifies live supervisor owner scope + `instance_id` via `host_control_info` and
+    ///   fetches authenticated scoped runtime `status` (never reading SQLite directly or exposing
+    ///   bearer tokens, paths, or raw error strings).
+    /// - When the host is stopped, failed, bootstrapping, unlocked, or unreachable, reports
+    ///   `availability = unavailable` and `wakeup_status = unavailable` (never faking `Idle`).
+    pub async fn notification_status(
+        &self,
+        approval_id: &str,
+    ) -> Result<HostNotificationStatusReport, HostError> {
+        let record = self.resolve_authorized_approval(approval_id)?;
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+            HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                reason: "host-manifest.json does not exist".to_string(),
+            }
+        })?;
+
+        let runtime_candidate = session_dir.join(RUNTIME_STATE_SUBDIR);
+        if std::fs::symlink_metadata(&runtime_candidate).is_ok() {
+            let _ = verify_existing_private_dir(&runtime_candidate)?;
+        }
+        let work_area_candidate = session_dir.join(WORK_AREA_SUBDIR);
+        if std::fs::symlink_metadata(&work_area_candidate).is_ok() {
+            let _ = verify_existing_private_dir(&work_area_candidate)?;
+        }
+
+        let lock_held = is_host_lock_held(&session_dir)?;
+        let build_report =
+            |delivery: HostNotificationDeliveryStatus| HostNotificationStatusReport {
+                approval_id: record.approval_id.clone(),
+                subject_digest: record.subject_digest.clone(),
+                binding_id: record.binding_id.clone(),
+                thread_uuid: record.thread_uuid.clone(),
+                session_binding_id: manifest.session_binding_id.clone(),
+                instance_id: manifest.instance_id.clone(),
+                phase: manifest.phase,
+                notifications: manifest.notifications.clone(),
+                delivery,
+            };
+
+        if !lock_held
+            || !matches!(manifest.phase, HostPhase::Ready | HostPhase::Stopping)
+            || (manifest.phase == HostPhase::Ready
+                && !manifest.gates.supervisor_authenticated_ready)
+        {
+            return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+        }
+
+        let session_binding_id =
+            manifest
+                .session_binding_id
+                .clone()
+                .ok_or_else(|| HostError::CorruptManifest {
+                    path: session_dir.display().to_string(),
+                    reason: format!("{} manifest is missing session_binding_id", manifest.phase),
+                })?;
+
+        let Some(ref instance_id) = manifest.instance_id else {
+            return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+        };
+
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let _work_area_dir = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+        let sup_client = match SupervisorClient::from_state_dir(&runtime_state_dir) {
+            Ok(client) => client,
+            Err(threadlane::Error::SecurityViolation(reason)) => {
+                return Err(HostError::SecurityViolation {
+                    path: runtime_state_dir.display().to_string(),
+                    reason,
+                });
+            }
+            Err(_) => {
+                return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+            }
+        };
+
+        let info = match sup_client
+            .host_control_info(&HostControlInfoRequest {
+                approval_id: record.approval_id.clone(),
+                subject_digest: record.subject_digest.clone(),
+                control_binding_id: self.control_binding_id.clone(),
+                thread_uuid: self.native_thread_uuid.clone(),
+                session_binding_id: session_binding_id.clone(),
+                expected_instance_id: instance_id.clone(),
+            })
+            .await
+        {
+            Ok(info) => info,
+            Err(threadlane::Error::Remote(api_err))
+                if api_err.code == RuntimeErrorCode::HostControlNotConfigured =>
+            {
+                return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+            }
+            Err(threadlane::Error::Transport(_)) => {
+                return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+            }
+            Err(other) => return Err(other.into()),
+        };
+
+        if info.approval_id != record.approval_id
+            || info.subject_digest != record.subject_digest
+            || info.control_binding_id != self.control_binding_id
+            || info.thread_uuid != self.native_thread_uuid
+            || info.session_binding_id != session_binding_id
+            || &info.instance_id != instance_id
+        {
+            return Err(HostError::CorruptSessionState {
+                reason: "live supervisor host_control_info returned mismatched owner scope"
+                    .to_string(),
+            });
+        }
+
+        let scoped_client =
+            match ScopedClient::from_state_dir(&runtime_state_dir, &session_binding_id) {
+                Ok(client) => client,
+                Err(threadlane::Error::SecurityViolation(reason)) => {
+                    return Err(HostError::SecurityViolation {
+                        path: runtime_state_dir.display().to_string(),
+                        reason,
+                    });
+                }
+                Err(_) => {
+                    return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+                }
+            };
+
+        let status = match scoped_client.status().await {
+            Ok(st) => st,
+            Err(threadlane::Error::Transport(_)) => {
+                return Ok(build_report(HostNotificationDeliveryStatus::unavailable()));
+            }
+            Err(other) => return Err(other.into()),
+        };
+
+        if status.binding.binding_id != session_binding_id
+            || status.wakeup.binding_id != session_binding_id
+        {
+            return Err(HostError::ScopeMismatch {
+                field: "session_binding_id".to_string(),
+                expected: session_binding_id,
+                actual: status.binding.binding_id,
+                reason: "authenticated scoped status returned mismatched session_binding_id"
+                    .to_string(),
+            });
+        }
+        if status.binding.thread_uuid != self.native_thread_uuid
+            || status.wakeup.thread_uuid != self.native_thread_uuid
+        {
+            return Err(HostError::ScopeMismatch {
+                field: "thread_uuid".to_string(),
+                expected: self.native_thread_uuid.clone(),
+                actual: status.binding.thread_uuid,
+                reason: "authenticated scoped status returned mismatched thread_uuid".to_string(),
+            });
+        }
+
+        let mut delivery =
+            HostNotificationDeliveryStatus::from_live(&status.binding, &status.wakeup);
+        delivery.rearm_eligible &= manifest.notifications.enabled;
+        Ok(build_report(delivery))
+    }
+
+    /// Explicitly re-arms a `WakeupStatus::Failed` notification claim matching `expected_claim_id`
+    /// on an active `Ready` host session after verifying `confirm_approval_digest` against the
+    /// frozen approval's `subject_digest`.
+    ///
+    /// - Strictly limited to `WakeupStatus::Failed`: `WakeupStatus::Unknown` and all other wake-up
+    ///   statuses are refused with [`HostError::InvalidWakeupState`].
+    /// - Compare-and-swap checked on `expected_claim_id` and the live host `instance_id` inside the
+    ///   supervisor's core transaction so stale or duplicate requests are deterministically refused.
+    pub async fn rearm_failed_notification(
+        &self,
+        approval_id: &str,
+        expected_claim_id: &str,
+        confirm_approval_digest: &str,
+    ) -> Result<HostNotificationRearmReport, HostError> {
+        self.rearm_failed_notification_with_instance(
+            approval_id,
+            expected_claim_id,
+            confirm_approval_digest,
+            None,
+        )
+        .await
+    }
+
+    /// Explicitly re-arms a `WakeupStatus::Failed` notification claim matching `expected_claim_id`
+    /// on an active `Ready` host session, optionally pinning an caller-supplied `expected_instance_id`.
+    pub async fn rearm_failed_notification_with_instance(
+        &self,
+        approval_id: &str,
+        expected_claim_id: &str,
+        confirm_approval_digest: &str,
+        expected_instance_id: Option<&str>,
+    ) -> Result<HostNotificationRearmReport, HostError> {
+        let record = self.resolve_authorized_approval(approval_id)?;
+        validate_identifier("expected_claim_id", expected_claim_id)?;
+        validate_hex_digest("confirm_approval", confirm_approval_digest)?;
+        if let Some(exp_inst) = expected_instance_id {
+            validate_host_instance_id("expected_instance_id", exp_inst)?;
+        }
+
+        if !constant_time_digest_eq(&record.subject_digest, confirm_approval_digest) {
+            return Err(HostError::ScopeMismatch {
+                field: "confirm_approval".to_string(),
+                expected: record.subject_digest.clone(),
+                actual: confirm_approval_digest.to_string(),
+                reason: format!(
+                    "confirm_approval digest does not match frozen subject_digest for approval `{}`",
+                    record.approval_id
+                ),
+            });
+        }
+
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+            HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                reason: "host-manifest.json does not exist".to_string(),
+            }
+        })?;
+
+        if let Some(exp_inst) = expected_instance_id {
+            if manifest.instance_id.as_deref() != Some(exp_inst) {
+                return Err(HostError::InstanceMismatch {
+                    approval_id: record.approval_id.clone(),
+                    expected_instance_id: exp_inst.to_string(),
+                    actual_instance_id: manifest.instance_id.clone(),
+                });
+            }
+        }
+
+        if manifest.phase != HostPhase::Ready || !manifest.gates.supervisor_authenticated_ready {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(manifest.phase),
+                reason: manifest
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| format!("host session is in phase `{}`", manifest.phase)),
+            });
+        }
+
+        if !is_host_lock_held(&session_dir)? {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(manifest.phase),
+                reason: "host.lock is not held by an active host process".to_string(),
+            });
+        }
+
+        let Some(ref instance_id) = manifest.instance_id else {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(manifest.phase),
+                reason: "ready manifest is missing instance_id".to_string(),
+            });
+        };
+
+        let session_binding_id =
+            manifest
+                .session_binding_id
+                .clone()
+                .ok_or_else(|| HostError::CorruptManifest {
+                    path: session_dir.display().to_string(),
+                    reason: "ready manifest is missing session_binding_id".to_string(),
+                })?;
+
+        if !manifest.notifications.enabled {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(manifest.phase),
+                reason: "host session notifications are disabled".to_string(),
+            });
+        }
+
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let _work_area_dir = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+
+        let sup_client =
+            SupervisorClient::from_state_dir(&runtime_state_dir).map_err(|err| match err {
+                threadlane::Error::SecurityViolation(reason) => HostError::SecurityViolation {
+                    path: runtime_state_dir.display().to_string(),
+                    reason,
+                },
+                other => HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: Some(manifest.phase),
+                    reason: format!("supervisor descriptor unavailable: {other}"),
+                },
+            })?;
+
+        let resp = match sup_client
+            .rearm_host_wakeup(&RearmHostWakeupRequest {
+                scope: HostControlOwnerScope {
+                    approval_id: record.approval_id.clone(),
+                    subject_digest: record.subject_digest.clone(),
+                    control_binding_id: self.control_binding_id.clone(),
+                    thread_uuid: self.native_thread_uuid.clone(),
+                    session_binding_id: session_binding_id.clone(),
+                    expected_instance_id: instance_id.clone(),
+                },
+                expected_claim_id: expected_claim_id.to_string(),
+            })
+            .await
+        {
+            Ok(resp) => resp,
+            Err(threadlane::Error::Remote(api_err))
+                if matches!(
+                    api_err.code,
+                    RuntimeErrorCode::HostStopping
+                        | RuntimeErrorCode::HostControlNotConfigured
+                        | RuntimeErrorCode::InvalidConfig
+                ) =>
+            {
+                return Err(HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: Some(manifest.phase),
+                    reason: api_err.message,
+                });
+            }
+            Err(threadlane::Error::Transport(_)) => {
+                return Err(HostError::MutationOutcomeUncertain {
+                    operation: "rearm_failed_notification".to_string(),
+                    detail: "rearm_host_wakeup transport outcome uncertain; inspect notification status before retrying"
+                        .to_string(),
+                });
+            }
+            Err(other) => return Err(other.into()),
+        };
+
+        if &resp.instance_id != instance_id
+            || resp.binding.binding_id != session_binding_id
+            || resp.wakeup.binding_id != session_binding_id
+            || resp.binding.thread_uuid != self.native_thread_uuid
+            || resp.wakeup.thread_uuid != self.native_thread_uuid
+        {
+            return Err(HostError::MutationOutcomeUncertain {
+                operation: "rearm_failed_notification".to_string(),
+                detail: "rearm_host_wakeup returned mismatched session or instance scope; inspect notification status before retrying"
+                    .to_string(),
+            });
+        }
+
+        let mut delivery = HostNotificationDeliveryStatus::from_live(&resp.binding, &resp.wakeup);
+        delivery.rearm_eligible &= manifest.notifications.enabled;
+        Ok(HostNotificationRearmReport {
+            approval_id: record.approval_id,
+            subject_digest: record.subject_digest,
+            binding_id: record.binding_id,
+            thread_uuid: record.thread_uuid,
+            session_binding_id,
+            instance_id: instance_id.clone(),
+            phase: manifest.phase,
+            notifications: manifest.notifications,
+            rearmed_from_claim_id: expected_claim_id.to_string(),
+            delivery,
+        })
     }
 
     /// Queries live authenticated host control status (`Ready` or `Stopping` + idle/busy counts)
@@ -2275,6 +2658,19 @@ fn post_stop_outcome_uncertain(approval_id: &str, detail: &'static str) -> HostE
         approval_id: approval_id.to_string(),
         detail: detail.to_string(),
     }
+}
+
+fn constant_time_digest_eq(a: &str, b: &str) -> bool {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let max_len = a_bytes.len().max(b_bytes.len());
+    let mut diff = a_bytes.len() ^ b_bytes.len();
+    for idx in 0..max_len {
+        let lhs = a_bytes.get(idx).copied().unwrap_or(0);
+        let rhs = b_bytes.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(lhs ^ rhs);
+    }
+    diff == 0
 }
 
 fn classify_post_stop_manifest(

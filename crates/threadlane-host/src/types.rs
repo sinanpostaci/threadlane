@@ -8,7 +8,7 @@ use threadlane::{
     MAX_CODEX_TIMEOUT_MS,
 };
 use threadlane_authority::ApprovalRecord;
-use threadlane_core::WorkerExecutionBinding;
+use threadlane_core::{Binding, WakeupNotice, WakeupStatus, WorkerExecutionBinding};
 use threadlane_operations::IntegrationStrategy;
 use threadlane_registry::ToolAdapter;
 use threadlane_workers::{validate_executable_file, DependencyInputSeal, WorkerProvider};
@@ -690,6 +690,7 @@ impl HostSessionManifest {
             native_route_task_ids: self.native_route_task_ids.clone(),
             gates: self.gates.clone(),
             notifications: self.notifications.clone(),
+            notification_delivery: None,
             last_error: self.last_error.clone(),
         }
     }
@@ -733,8 +734,333 @@ pub struct HostSessionSummary {
     /// Configured host notification policy summary (disabled by default; never implies delivery proof).
     #[serde(default)]
     pub notifications: HostNotificationSummary,
+    /// Optional bounded, path-free live notification delivery status when queried against the host runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_delivery: Option<HostNotificationDeliveryStatus>,
     /// Sanitized failure diagnostic when `phase` is [`HostPhase::Failed`].
     pub last_error: Option<String>,
+}
+
+/// Availability of live runtime notification state for an approved host session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostNotificationAvailability {
+    /// Authenticated runtime supervisor is live, holds `host.lock`, and matched the manifest's `instance_id` and owner scope.
+    Live,
+    /// Host session is stopped, failed, bootstrapping, or its runtime supervisor is not reachable; live wake-up state is unavailable.
+    Unavailable,
+}
+
+impl HostNotificationAvailability {
+    /// Returns the canonical `snake_case` wire label (`"live"` or `"unavailable"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Sanitized wake-up delivery status reported for an approved host session.
+///
+/// Never fakes `Idle` when the host runtime is stopped or unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostNotificationWakeupStatus {
+    /// Live runtime verified: no unacknowledged important events are waiting (`WakeupStatus::Idle`).
+    Idle,
+    /// Live runtime verified: important events are queued for wake-up delivery (`WakeupStatus::Pending`).
+    Pending,
+    /// Live runtime verified: a wake-up claim is currently in flight (`WakeupStatus::InFlight`).
+    InFlight,
+    /// Live runtime verified: a wake-up claim was submitted and awaits event acknowledgement (`WakeupStatus::Submitted`).
+    Submitted,
+    /// Live runtime verified: pre-send wake-up check or spawn failed before crossing the delivery boundary (`WakeupStatus::Failed`).
+    Failed,
+    /// Live runtime verified: wake-up delivery outcome is unknown after crossing the send boundary (`WakeupStatus::Unknown`).
+    Unknown,
+    /// Host runtime is stopped or unavailable; live wake-up status cannot be determined.
+    Unavailable,
+}
+
+impl HostNotificationWakeupStatus {
+    /// Converts a core [`WakeupStatus`] observed on a live runtime supervisor.
+    pub const fn from_core(status: WakeupStatus) -> Self {
+        match status {
+            WakeupStatus::Idle => Self::Idle,
+            WakeupStatus::Pending => Self::Pending,
+            WakeupStatus::InFlight => Self::InFlight,
+            WakeupStatus::Submitted => Self::Submitted,
+            WakeupStatus::Failed => Self::Failed,
+            WakeupStatus::Unknown => Self::Unknown,
+        }
+    }
+
+    /// Returns the canonical `snake_case` wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Pending => "pending",
+            Self::InFlight => "in_flight",
+            Self::Submitted => "submitted",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Sanitized, fixed machine-readable error class describing a wake-up failure or uncertainty.
+///
+/// Raw error text, filesystem paths, and process outputs are never exposed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostNotificationErrorClass {
+    /// Wake-up executable or tool-output configuration failed validation before send.
+    ConfigurationInvalid,
+    /// Wake-up executable could not be stat'd, was not a regular executable file, or was a symlink before spawn.
+    ExecutableValidationFailed,
+    /// Wake-up child process failed to spawn before any notification was sent.
+    SpawnFailed,
+    /// Native tool-output socket or peer validation failed before send.
+    TransportValidationFailed,
+    /// Native tool-output socket connection failed before send.
+    TransportConnectFailed,
+    /// Native tool-output pre-send protocol check (`thread/read`) was rejected before send.
+    TransportProtocolRejected,
+    /// Pre-send wake-up failure not matching a more specific pre-send class.
+    PreSendFailure,
+    /// Wake-up process or transport exchange timed out after crossing the send boundary (`Unknown`).
+    DeliveryTimedOut,
+    /// Wake-up process exited with a non-zero or ambiguous status after spawn (`Unknown`).
+    ProcessTerminatedAmbiguously,
+    /// An in-flight wake-up claim was marked `Unknown` during runtime reopen recovery.
+    InFlightInterruptedOnReopen,
+    /// Wake-up delivery outcome is unknown after crossing the send boundary (`Unknown`).
+    DeliveryOutcomeUnknown,
+    /// Host session is stopped or not running, so live runtime wake-up state is unavailable.
+    HostUnavailable,
+}
+
+impl HostNotificationErrorClass {
+    /// Returns the canonical `snake_case` wire label.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigurationInvalid => "configuration_invalid",
+            Self::ExecutableValidationFailed => "executable_validation_failed",
+            Self::SpawnFailed => "spawn_failed",
+            Self::TransportValidationFailed => "transport_validation_failed",
+            Self::TransportConnectFailed => "transport_connect_failed",
+            Self::TransportProtocolRejected => "transport_protocol_rejected",
+            Self::PreSendFailure => "pre_send_failure",
+            Self::DeliveryTimedOut => "delivery_timed_out",
+            Self::ProcessTerminatedAmbiguously => "process_terminated_ambiguously",
+            Self::InFlightInterruptedOnReopen => "in_flight_interrupted_on_reopen",
+            Self::DeliveryOutcomeUnknown => "delivery_outcome_unknown",
+            Self::HostUnavailable => "host_unavailable",
+        }
+    }
+
+    /// Classifies a core [`WakeupStatus`] and optional raw `last_error` string into a fixed,
+    /// path-free, secret-free [`HostNotificationErrorClass`].
+    pub fn from_wakeup(status: WakeupStatus, last_error: Option<&str>) -> Option<Self> {
+        let raw = last_error.unwrap_or_default().to_ascii_lowercase();
+        match status {
+            WakeupStatus::Idle
+            | WakeupStatus::Pending
+            | WakeupStatus::InFlight
+            | WakeupStatus::Submitted => None,
+            WakeupStatus::Failed => {
+                if raw.contains("configuration validation failed")
+                    || raw.contains("project_root validation failed")
+                {
+                    Some(Self::ConfigurationInvalid)
+                } else if raw.contains("executable")
+                    || raw.contains("symlink")
+                    || raw.contains("regular file")
+                    || raw.contains("permission")
+                {
+                    if raw.contains("failed to spawn") {
+                        Some(Self::SpawnFailed)
+                    } else {
+                        Some(Self::ExecutableValidationFailed)
+                    }
+                } else if raw.contains("failed to spawn") {
+                    Some(Self::SpawnFailed)
+                } else if raw.contains("socket validation failed")
+                    || raw.contains("peer verification failed")
+                {
+                    Some(Self::TransportValidationFailed)
+                } else if raw.contains("failed to connect") {
+                    Some(Self::TransportConnectFailed)
+                } else if raw.contains("thread/read") || raw.contains("rejected") {
+                    Some(Self::TransportProtocolRejected)
+                } else {
+                    Some(Self::PreSendFailure)
+                }
+            }
+            WakeupStatus::Unknown => {
+                if raw.contains("timed out") {
+                    Some(Self::DeliveryTimedOut)
+                } else if raw.contains("reopen") {
+                    Some(Self::InFlightInterruptedOnReopen)
+                } else if raw.contains("exited with failure")
+                    || raw.contains("terminated with ambiguous")
+                    || raw.contains("failed to wait")
+                {
+                    Some(Self::ProcessTerminatedAmbiguously)
+                } else {
+                    Some(Self::DeliveryOutcomeUnknown)
+                }
+            }
+        }
+    }
+}
+
+/// Bounded, path-free, secret-free live notification delivery status and cursor state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostNotificationDeliveryStatus {
+    /// Whether live authenticated runtime status is available (`live` or `unavailable`).
+    pub availability: HostNotificationAvailability,
+    /// Current wake-up delivery status (`idle`, `pending`, `in_flight`, `submitted`, `failed`, `unknown`, or `unavailable`).
+    pub wakeup_status: HostNotificationWakeupStatus,
+    /// Active or retained wake-up claim identifier (`wcl_<uuid>`) when present on the runtime notice.
+    pub claim_id: Option<String>,
+    /// Highest event sequence number delivered via `pull_events` (`None` when runtime is unavailable).
+    pub delivered_seq: Option<u64>,
+    /// Highest event sequence number acknowledged via `ack_events` (`None` when runtime is unavailable).
+    pub acked_seq: Option<u64>,
+    /// First unacknowledged important event sequence number (`0` when none; `None` when runtime is unavailable).
+    pub pending_since_seq: Option<u64>,
+    /// Latest important event sequence number recorded on the binding (`0` when none; `None` when runtime is unavailable).
+    pub latest_important_seq: Option<u64>,
+    /// Highest important event sequence number covered by the current/retained claim (`0` when none; `None` when runtime is unavailable).
+    pub covered_up_to_seq: Option<u64>,
+    /// Number of important events coalesced into the current/retained notice (`None` when runtime is unavailable).
+    pub coalesced_count: Option<u64>,
+    /// Cumulative wake-up claim attempt count on this binding (`None` when runtime is unavailable).
+    pub attempt_count: Option<u64>,
+    /// Timestamp (ms since Unix epoch) when the current/retained claim was acquired (`None` when none or unavailable).
+    pub claimed_at_ms: Option<i64>,
+    /// Timestamp (ms since Unix epoch) when the current/retained claim resolved (`None` when none or unavailable).
+    pub resolved_at_ms: Option<i64>,
+    /// Whether unacknowledged important events exist (`latest_important_seq > acked_seq`; `None` when runtime is unavailable).
+    pub unacked_important_events: Option<bool>,
+    /// Whether this notice is eligible for explicit `rearm-notification` (`true` only when `availability == Live`, `wakeup_status == Failed`, `claim_id.is_some()`, and `latest_important_seq > acked_seq`).
+    pub rearm_eligible: bool,
+    /// Whether operator reconciliation via `pull` + `ack` is needed (`true` when `wakeup_status` is `Unknown` or `Submitted`, or unacknowledged important events exist).
+    pub reconcile_by_pull_ack_required: bool,
+    /// Sanitized fixed error classification when `wakeup_status` is `Failed`, `Unknown`, or `Unavailable` (`None` otherwise).
+    pub error_class: Option<HostNotificationErrorClass>,
+}
+
+impl HostNotificationDeliveryStatus {
+    /// Projects a verified live runtime [`Binding`] and [`WakeupNotice`] into a bounded, path-free [`HostNotificationDeliveryStatus`].
+    pub fn from_live(binding: &Binding, wakeup: &WakeupNotice) -> Self {
+        let unacked_important = wakeup.latest_important_seq > binding.acked_seq;
+        let rearm_eligible =
+            wakeup.status == WakeupStatus::Failed && wakeup.claim_id.is_some() && unacked_important;
+        let reconcile_by_pull_ack_required = matches!(
+            wakeup.status,
+            WakeupStatus::Unknown | WakeupStatus::Submitted
+        ) || unacked_important;
+        Self {
+            availability: HostNotificationAvailability::Live,
+            wakeup_status: HostNotificationWakeupStatus::from_core(wakeup.status),
+            claim_id: wakeup.claim_id.clone(),
+            delivered_seq: Some(binding.delivered_seq),
+            acked_seq: Some(binding.acked_seq),
+            pending_since_seq: wakeup.pending_since_seq,
+            latest_important_seq: Some(wakeup.latest_important_seq),
+            covered_up_to_seq: Some(wakeup.covered_up_to_seq),
+            coalesced_count: Some(wakeup.coalesced_count),
+            attempt_count: Some(wakeup.attempt_count),
+            claimed_at_ms: wakeup.claimed_at_ms,
+            resolved_at_ms: wakeup.resolved_at_ms,
+            unacked_important_events: Some(unacked_important),
+            rearm_eligible,
+            reconcile_by_pull_ack_required,
+            error_class: HostNotificationErrorClass::from_wakeup(
+                wakeup.status,
+                wakeup.last_error.as_deref(),
+            ),
+        }
+    }
+
+    /// Constructs the truthful unavailable status reported when the host session is stopped,
+    /// failed, bootstrapping, or its runtime supervisor is unreachable. Never fakes `Idle`.
+    pub const fn unavailable() -> Self {
+        Self {
+            availability: HostNotificationAvailability::Unavailable,
+            wakeup_status: HostNotificationWakeupStatus::Unavailable,
+            claim_id: None,
+            delivered_seq: None,
+            acked_seq: None,
+            pending_since_seq: None,
+            latest_important_seq: None,
+            covered_up_to_seq: None,
+            coalesced_count: None,
+            attempt_count: None,
+            claimed_at_ms: None,
+            resolved_at_ms: None,
+            unacked_important_events: None,
+            rearm_eligible: false,
+            reconcile_by_pull_ack_required: false,
+            error_class: Some(HostNotificationErrorClass::HostUnavailable),
+        }
+    }
+}
+
+/// Safe, token-free, path-free notification delivery status report for an approved host session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostNotificationStatusReport {
+    /// Deterministic approval identifier (`apr_<32hex>`).
+    pub approval_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the frozen approval subject.
+    pub subject_digest: String,
+    /// Authoritative control-plane chat binding identifier (`ApprovalRecord::binding_id`).
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Single software-generated runtime session binding ID inside the host's runtime supervisor.
+    pub session_binding_id: Option<String>,
+    /// Public per-start host instance identifier (`hst_<32hex>`), or `None` for legacy manifests.
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    /// Current host session phase recorded in `host-manifest.json`.
+    pub phase: HostPhase,
+    /// Configured host notification policy summary (`enabled`, digests, timeout, route, transport).
+    pub notifications: HostNotificationSummary,
+    /// Live or unavailable notification delivery state and reconciliation cursors.
+    pub delivery: HostNotificationDeliveryStatus,
+}
+
+/// Safe, token-free, path-free report returned after explicitly re-arming a `Failed` notification claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostNotificationRearmReport {
+    /// Deterministic approval identifier (`apr_<32hex>`).
+    pub approval_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the frozen approval subject.
+    pub subject_digest: String,
+    /// Authoritative control-plane chat binding identifier (`ApprovalRecord::binding_id`).
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Single software-generated runtime session binding ID inside the host's runtime supervisor.
+    pub session_binding_id: String,
+    /// Verified live host instance identifier (`hst_<32hex>`).
+    pub instance_id: String,
+    /// Current host session phase (`Ready`).
+    pub phase: HostPhase,
+    /// Configured host notification policy summary.
+    pub notifications: HostNotificationSummary,
+    /// The `Failed` claim identifier (`wcl_<uuid>`) that was atomically verified and cleared.
+    pub rearmed_from_claim_id: String,
+    /// Post-rearm notification delivery state (`Pending`, `claim_id: None`) immediately committed by the core transaction.
+    pub delivery: HostNotificationDeliveryStatus,
 }
 
 /// Private persisted dispatch intent recorded in `task-receipts.json` before invoking

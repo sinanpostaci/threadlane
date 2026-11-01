@@ -277,4 +277,14 @@ children. Plan-only task records retain transitive dependents even without a
 live task observation. Resolution scans the binding's bounded authority records
 for that plan revision and verifies every affected approved task is stopped;
 omitting `approval_id` does not bypass a running execution. The same binding
-mutation lock serializes a new role dispatch with change recording.
+mutation lock serializes both `threadlane-flow` role handoffs and direct native
+task dispatch (`threadlane-session dispatch` and paired MCP `start_approved_task`,
+including before `ApprovedHostLauncher` auto-start) with `record-change` and
+`resolve-change` from admission through the sealed dispatch receipt, refusing
+blocked tasks with `blocked_by_conversation_change` (or
+`ambiguous_outcome_pending_reconciliation` when a prior cancel marker is
+unreconciled). Low-level `threadlane-host` direct CLI and raw
+`ApprovedHostClient::dispatch_task` reside in `threadlane-host` below
+`threadlane-native` and do not inspect `<plans_dir>/conversation-changes/`
+directly so `threadlane-host` remains free of crate cycles and reentrant lock
+deadlocks.

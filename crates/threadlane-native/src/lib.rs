@@ -29,6 +29,8 @@ pub mod approved_mcp;
 pub mod client;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
+/// Shared conversation-change advancement guard for direct native task dispatch.
+pub mod dispatch_guard;
 /// Structured error codes and redacted error types.
 pub mod error;
 /// Path validation, private `0700`/`0600` persistence, cross-process locking, and sanitization.
@@ -65,19 +67,24 @@ pub use client::{
     NativeMcpToolCallResult, NativeThread, NativeThreadPage,
 };
 pub use conversation_change::{
-    inspect_unresolved_blocking_changes, ConversationCancelAction, ConversationChangeDecision,
-    ConversationChangeDecisionKind, ConversationChangeError, ConversationChangeKind,
-    ConversationChangePage, ConversationChangePreview, ConversationChangeRecord,
-    ConversationChangeRequest, ConversationChangeResolution, ConversationChangeResolutionKind,
-    ConversationChangeRoute, ConversationChangeStatus, ConversationChangeStore,
-    ConversationDeliveryRequest, ListConversationChangesParams, LiveInputSupportStatus,
-    ObservedTaskStopState, ResolveConversationChangeRequest, SupersededApprovalChange,
-    UnresolvedBlockingChange, UnresolvedChangeBlockSummary, CONVERSATION_CHANGE_NAMESPACE_DIR,
+    acquire_conversation_advancement_guard, inspect_unresolved_blocking_changes,
+    ConversationCancelAction, ConversationChangeDecision, ConversationChangeDecisionKind,
+    ConversationChangeError, ConversationChangeKind, ConversationChangePage,
+    ConversationChangePreview, ConversationChangeRecord, ConversationChangeRequest,
+    ConversationChangeResolution, ConversationChangeResolutionKind, ConversationChangeRoute,
+    ConversationChangeStatus, ConversationChangeStore, ConversationDeliveryRequest,
+    ListConversationChangesParams, LiveInputSupportStatus, ObservedTaskStopState,
+    ResolveConversationChangeRequest, SupersededApprovalChange, UnresolvedBlockingChange,
+    UnresolvedChangeBlockSummary, CONVERSATION_CHANGE_NAMESPACE_DIR,
     CONVERSATION_CHANGE_POLICY_VERSION, CONVERSATION_CHANGE_SCHEMA_VERSION,
     DEFAULT_CONVERSATION_CHANGE_LIST_LIMIT, MAX_CONVERSATION_CHANGES_PER_BINDING,
     MAX_CONVERSATION_CHANGE_CURSOR_LEN, MAX_CONVERSATION_CHANGE_DETAIL_BYTES,
     MAX_CONVERSATION_CHANGE_LIST_LIMIT, MAX_CONVERSATION_CHANGE_RESOLUTION_NOTE_BYTES,
     MAX_CONVERSATION_CHANGE_STORE_BYTES, MAX_CONVERSATION_CHANGE_SUMMARY_BYTES,
+};
+pub use dispatch_guard::{
+    dispatch_approved_task_guarded, verify_no_blocking_conversation_changes,
+    with_guarded_native_dispatch, GuardedDispatchError,
 };
 pub use error::{NativeError, NativeErrorCode};
 pub use host_launcher::{
@@ -117,7 +124,9 @@ pub use threadlane_authority::{
     OperatorApprovalRequest,
 };
 pub use threadlane_host::{
-    ApprovedHostClient, HostError, HostExecutionGates, HostPhase, HostSessionManifest,
+    ApprovedHostClient, HostError, HostExecutionGates, HostNotificationAvailability,
+    HostNotificationDeliveryStatus, HostNotificationErrorClass, HostNotificationRearmReport,
+    HostNotificationStatusReport, HostNotificationWakeupStatus, HostPhase, HostSessionManifest,
     HostSessionSummary, TaskExecutionStatus, TaskRunReceipt, TaskStateSnapshot,
     APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
 };

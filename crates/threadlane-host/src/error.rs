@@ -214,6 +214,24 @@ pub enum HostError {
         reason: String,
     },
 
+    /// Expected wake-up claim identifier was not found or did not match the binding's current notice.
+    #[error("wake-up claim `{claim_id}` was not found or is stale")]
+    WakeupClaimNotFound {
+        /// Expected wake-up claim identifier (`wcl_<uuid>`).
+        claim_id: String,
+    },
+
+    /// Wake-up transition (such as `rearm-notification`) is invalid for the notice's current status.
+    #[error("invalid wake-up state `{status}` on binding `{binding_id}` during `{action}`")]
+    InvalidWakeupState {
+        /// Target session binding identifier.
+        binding_id: String,
+        /// Observed wake-up status.
+        status: String,
+        /// Attempted operation name.
+        action: String,
+    },
+
     /// Path traversal, symlink, foreign file, non-private permission, or directory overlap violation.
     #[error("security violation at `{path}`: {reason}")]
     SecurityViolation {
@@ -298,6 +316,8 @@ impl HostError {
             Self::StaleRevision { .. } => "stale_revision",
             Self::IdempotencyConflict { .. } => "idempotency_conflict",
             Self::InvalidRunState { .. } => "invalid_run_state",
+            Self::WakeupClaimNotFound { .. } => "wakeup_claim_not_found",
+            Self::InvalidWakeupState { .. } => "invalid_wakeup_state",
             Self::SecurityViolation { .. } => "security_violation",
             Self::CorruptManifest { .. } => "corrupt_manifest",
             Self::CorruptReceipts { .. } => "corrupt_receipts",
@@ -507,6 +527,44 @@ impl From<threadlane::Error> for HostError {
                         };
                     }
                 }
+                if api_err.code == RuntimeErrorCode::WakeupClaimNotFound {
+                    let claim_id = api_err
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("claim_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    return Self::WakeupClaimNotFound { claim_id };
+                }
+                if api_err.code == RuntimeErrorCode::InvalidWakeupState {
+                    let binding_id = api_err
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("binding_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let status = api_err
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("status"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let action = api_err
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get("action"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("rearm_notification")
+                        .to_string();
+                    return Self::InvalidWakeupState {
+                        binding_id,
+                        status,
+                        action,
+                    };
+                }
                 Self::Runtime {
                     code: runtime_error_code_str(api_err.code),
                     message: api_err.message,
@@ -564,6 +622,18 @@ fn map_core_err(err: CoreError) -> HostError {
             run_id,
             action: action.to_string(),
             reason: format!("run is in status `{status:?}`"),
+        },
+        CoreError::WakeupClaimNotFound { claim_id } => HostError::WakeupClaimNotFound { claim_id },
+        CoreError::InvalidWakeupState {
+            binding_id,
+            status,
+            action,
+        } => HostError::InvalidWakeupState {
+            binding_id,
+            status: crate::types::HostNotificationWakeupStatus::from_core(status)
+                .as_str()
+                .to_string(),
+            action: action.to_string(),
         },
         other => HostError::Runtime {
             code: "core_error".to_string(),

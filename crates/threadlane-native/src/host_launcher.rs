@@ -1714,6 +1714,7 @@ async fn wait_for_authenticated_ready(
 
 /// Executes `start_approved_task` with optional initial fresh-only host auto-start when
 /// `launcher` is configured.
+#[cfg(test)]
 pub(crate) async fn execute_start_approved_task_with_launcher<F>(
     authority: Arc<AuthorityStore>,
     sessions_dir: PathBuf,
@@ -1721,6 +1722,35 @@ pub(crate) async fn execute_start_approved_task_with_launcher<F>(
     trusted_thread_uuid: String,
     params: StartApprovedTaskParams,
     launcher: Option<Arc<ApprovedHostLauncher>>,
+    recheck_enrollment: F,
+) -> Result<CallToolResult, CallToolResult>
+where
+    F: Fn() -> Result<(), CallToolResult> + Send + Sync + 'static,
+{
+    execute_start_approved_task_with_launcher_until(
+        authority,
+        sessions_dir,
+        trusted_binding_id,
+        trusted_thread_uuid,
+        params,
+        launcher,
+        None,
+        recheck_enrollment,
+    )
+    .await
+}
+
+/// Executes `start_approved_task` with optional initial fresh-only host auto-start bounded by
+/// `startup_deadline` (or `Instant::now() + launcher.policy().startup_timeout()` when `None`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_start_approved_task_with_launcher_until<F>(
+    authority: Arc<AuthorityStore>,
+    sessions_dir: PathBuf,
+    trusted_binding_id: String,
+    trusted_thread_uuid: String,
+    params: StartApprovedTaskParams,
+    launcher: Option<Arc<ApprovedHostLauncher>>,
+    startup_deadline: Option<Instant>,
     recheck_enrollment: F,
 ) -> Result<CallToolResult, CallToolResult>
 where
@@ -1737,7 +1767,8 @@ where
         .await;
     };
 
-    let startup_deadline = Instant::now() + launcher.policy().startup_timeout();
+    let startup_deadline =
+        startup_deadline.unwrap_or_else(|| Instant::now() + launcher.policy().startup_timeout());
     let recheck_enrollment = Arc::new(recheck_enrollment);
 
     // 1. Validate approval, caller scope (binding_id + thread_uuid), sessions_dir, and that the

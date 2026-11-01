@@ -17,7 +17,8 @@ use threadlane_authority::{
     OperatorApprovalRequest,
 };
 use threadlane_connectors::{
-    probe_tool, ConnectorError, CredentialStore, KeyringCredentialStore, ToolProbe,
+    inspect_tool_versions, probe_tool, ConnectorError, CredentialStore, KeyringCredentialStore,
+    ToolProbe, ToolVersionInspection,
 };
 use threadlane_decisions::{
     DecisionAdvice, DecisionClient, DecisionError, DecisionProvider, DecisionRequest,
@@ -850,6 +851,28 @@ async fn desktop_registry_apply(
 }
 
 #[tauri::command]
+async fn desktop_tool_versions(
+    control: State<'_, DesktopControlState>,
+) -> Result<ToolVersionsSnapshot, AppError> {
+    let registry = control.registry.clone();
+    let snapshot = tauri::async_runtime::spawn_blocking(move || registry.snapshot())
+        .await
+        .map_err(|_| AppError::internal_join_error())?
+        .map_err(AppError::from_registry_error)?;
+    let tools = inspect_tool_versions(&snapshot.tools).await;
+    Ok(ToolVersionsSnapshot {
+        registry_revision: snapshot.revision,
+        tools,
+    })
+}
+
+#[derive(Serialize)]
+struct ToolVersionsSnapshot {
+    registry_revision: u64,
+    tools: Vec<ToolVersionInspection>,
+}
+
+#[tauri::command]
 async fn desktop_probe_tool(
     control: State<'_, DesktopControlState>,
     tool_id: String,
@@ -1335,6 +1358,7 @@ fn main() -> ExitCode {
             desktop_window_action,
             desktop_registry_snapshot,
             desktop_registry_apply,
+            desktop_tool_versions,
             desktop_probe_tool,
             desktop_secret_status,
             desktop_secret_set,

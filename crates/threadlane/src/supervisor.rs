@@ -31,8 +31,8 @@ use crate::error::{ApiError, Error, ErrorCode};
 use crate::protocol::{
     BindingListResponse, CreateBindingRequest, HostControlBusyCounts, HostControlConfig,
     HostControlInfoRequest, HostControlOwnerScope, HostControlRuntimeState,
-    HostControlStatusResponse, RetryWakeupRequest, ScopedRequest, ScopedResponse, StatusResponse,
-    StopIdleHostRequest,
+    HostControlStatusResponse, RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest,
+    ScopedRequest, ScopedResponse, StatusResponse, StopIdleHostRequest,
 };
 use crate::workers::{
     build_completion_record, build_pre_spawn_cancelled_completion, execute_claimed_worker,
@@ -712,6 +712,10 @@ fn build_router(state: Arc<SharedState>) -> Router {
         )
         .route("/v1/host-control/info", post(handle_host_control_info))
         .route("/v1/host-control/stop", post(handle_stop_idle_host))
+        .route(
+            "/v1/host-control/rearm-wakeup",
+            post(handle_rearm_host_wakeup),
+        )
         .fallback(handle_fallback)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
         .with_state(state)
@@ -1279,6 +1283,58 @@ async fn handle_stop_idle_host(
         HostControlRuntimeState::Stopping,
         busy,
     )))
+}
+
+async fn handle_rearm_host_wakeup(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<RearmHostWakeupResponse>, (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: RearmHostWakeupRequest = parse_json_body(body)?;
+    let now = current_time_ms();
+
+    let response = {
+        let mut access = state.acquire_for_request().await?;
+        state.ensure_not_stopping()?;
+        let control = verify_host_control_scope(&state, &req.scope)?;
+        let session_binding_id = control.session_binding_id.clone();
+        let instance_id = control.instance_id.clone();
+        let Some(codex_cfg) = state.codex.as_ref() else {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError::new(
+                    ErrorCode::InvalidConfig,
+                    "host wake-up notifications are not enabled on this supervisor",
+                )),
+            ));
+        };
+        if !codex_cfg.notify_bindings.contains(&session_binding_id) {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError::new(
+                    ErrorCode::InvalidConfig,
+                    "host wake-up notifications are not enabled for this session binding",
+                )),
+            ));
+        }
+        let binding = access
+            .core_mut()
+            .get_binding(&session_binding_id)
+            .map_err(|err| map_core_error(&state, "rearm_host_wakeup get_binding failed", err))?;
+        let wakeup = access
+            .core_mut()
+            .rearm_failed_wakeup(&session_binding_id, &req.expected_claim_id, now)
+            .map_err(|err| map_core_error(&state, "rearm_host_wakeup failed", err))?;
+        RearmHostWakeupResponse {
+            instance_id,
+            binding,
+            wakeup,
+        }
+    };
+
+    state.wake_notify.notify_one();
+    Ok(Json(response))
 }
 
 async fn run_background_worker(state: Arc<SharedState>, mut shutdown_rx: watch::Receiver<bool>) {
@@ -2823,5 +2879,171 @@ mod tests {
             let fatal = handle.shutdown_and_take_fatal().await;
             assert!(fatal.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn rearm_host_wakeup_requires_live_codex_config_and_allowlisted_owner_session_binding() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state_dir = temp.path().join("state");
+        let bin_dir = temp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("create bin dir");
+        let fake_codex = bin_dir.join("fake-codex-rearm");
+        std::fs::write(&fake_codex, "#!/bin/sh\nexit 0\n").expect("write fake codex");
+        std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake codex");
+
+        let boot = Supervisor::start(SupervisorConfig::new(&state_dir))
+            .await
+            .expect("boot");
+        let boot_client = SupervisorClient::from_state_dir(&state_dir).expect("boot client");
+        let session_binding = boot_client
+            .create_binding(THREAD_UUID, "session")
+            .await
+            .expect("create session binding");
+        let aux_binding = boot_client
+            .create_binding(OTHER_THREAD_UUID, "aux")
+            .await
+            .expect("create aux binding");
+        boot.shutdown().await;
+
+        let control = sample_host_control(&session_binding.binding_id);
+        let scope = owner_scope_from_config(&control);
+
+        // 1. Start supervisor with `codex: None` and seed a Failed wakeup claim on `session_binding`.
+        let mut cfg_disabled = SupervisorConfig::new(&state_dir);
+        cfg_disabled.tick_interval = Duration::from_secs(30);
+        let handle_disabled = Supervisor::start_with_host_control(cfg_disabled, control.clone())
+            .await
+            .expect("start disabled codex supervisor");
+        let failed_claim = {
+            let mut access = handle_disabled
+                .shared
+                .acquire_for_request()
+                .await
+                .expect("acquire active");
+            seed_pending_important_wakeup(
+                access.core_mut(),
+                &session_binding.binding_id,
+                "seed-failed-rearm-gate",
+            );
+            let now = current_time_ms();
+            let claim = access
+                .core_mut()
+                .claim_wakeup_for_binding(&session_binding.binding_id, now)
+                .expect("claim wakeup")
+                .expect("pending wakeup present");
+            access
+                .core_mut()
+                .record_wakeup_result(
+                    &claim.claim_id,
+                    threadlane_core::WakeupOutcome::Failed {
+                        error: "pre-send failure before stop/restart".to_string(),
+                    },
+                    now,
+                )
+                .expect("record Failed wakeup");
+            claim
+        };
+
+        let client_disabled =
+            SupervisorClient::from_state_dir(&state_dir).expect("client disabled");
+        let disabled_err = client_disabled
+            .rearm_host_wakeup(&RearmHostWakeupRequest {
+                scope: scope.clone(),
+                expected_claim_id: failed_claim.claim_id.clone(),
+            })
+            .await
+            .expect_err("rearm_host_wakeup must fail when codex config is None");
+        match disabled_err {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::InvalidConfig),
+            other => panic!("unexpected error when codex is None: {other:?}"),
+        }
+
+        let st_after_disabled = client_disabled
+            .status(&session_binding.binding_id)
+            .await
+            .expect("status after disabled refusal");
+        assert_eq!(st_after_disabled.wakeup.status, WakeupStatus::Failed);
+        assert_eq!(
+            st_after_disabled.wakeup.claim_id.as_deref(),
+            Some(failed_claim.claim_id.as_str())
+        );
+        handle_disabled.shutdown().await;
+
+        // 2. Start supervisor with `codex: Some(...)` where `notify_bindings` only contains
+        //    `aux_binding` (not `control.session_binding_id`). Rearm must still be refused before
+        //    mutating Core.
+        let mut cfg_unlisted = SupervisorConfig::new(&state_dir);
+        cfg_unlisted.tick_interval = Duration::from_secs(30);
+        let mut aux_only_bindings = BTreeSet::new();
+        aux_only_bindings.insert(aux_binding.binding_id.clone());
+        cfg_unlisted.codex = Some(CodexWakeupConfig {
+            executable: fake_codex.clone(),
+            notify_bindings: aux_only_bindings,
+            timeout: Duration::from_secs(5),
+            approved_session: None,
+        });
+        let handle_unlisted = Supervisor::start_with_host_control(cfg_unlisted, control.clone())
+            .await
+            .expect("start unlisted binding supervisor");
+        let client_unlisted =
+            SupervisorClient::from_state_dir(&state_dir).expect("client unlisted");
+        let unlisted_err = client_unlisted
+            .rearm_host_wakeup(&RearmHostWakeupRequest {
+                scope: scope.clone(),
+                expected_claim_id: failed_claim.claim_id.clone(),
+            })
+            .await
+            .expect_err(
+                "rearm_host_wakeup must fail when session_binding_id is not in notify_bindings",
+            );
+        match unlisted_err {
+            Error::Remote(err) => assert_eq!(err.code, ErrorCode::InvalidConfig),
+            other => panic!("unexpected error when binding not allowlisted: {other:?}"),
+        }
+
+        let st_after_unlisted = client_unlisted
+            .status(&session_binding.binding_id)
+            .await
+            .expect("status after unlisted refusal");
+        assert_eq!(st_after_unlisted.wakeup.status, WakeupStatus::Failed);
+        assert_eq!(
+            st_after_unlisted.wakeup.claim_id.as_deref(),
+            Some(failed_claim.claim_id.as_str())
+        );
+        handle_unlisted.shutdown().await;
+
+        // 3. Start supervisor with `session_binding_id` allowlisted in `notify_bindings` (with
+        //    background worker paused to inspect the immediate post-rearm state). Rearm succeeds.
+        let mut cfg_allowed = SupervisorConfig::new(&state_dir);
+        cfg_allowed.tick_interval = Duration::from_secs(30);
+        let mut allowed_bindings = BTreeSet::new();
+        allowed_bindings.insert(session_binding.binding_id.clone());
+        cfg_allowed.codex = Some(CodexWakeupConfig {
+            executable: fake_codex,
+            notify_bindings: allowed_bindings,
+            timeout: Duration::from_secs(5),
+            approved_session: None,
+        });
+        let mut handle_allowed = Supervisor::start_with_host_control(cfg_allowed, control)
+            .await
+            .expect("start allowed binding supervisor");
+        let worker_task = handle_allowed.worker_task.take().expect("worker task");
+        worker_task.abort();
+        let _ = worker_task.await;
+
+        let client_allowed = SupervisorClient::from_state_dir(&state_dir).expect("client allowed");
+        let rearmed = client_allowed
+            .rearm_host_wakeup(&RearmHostWakeupRequest {
+                scope,
+                expected_claim_id: failed_claim.claim_id,
+            })
+            .await
+            .expect("rearm_host_wakeup succeeds when session_binding_id is allowlisted");
+        assert_eq!(rearmed.wakeup.status, WakeupStatus::Pending);
+        assert!(rearmed.wakeup.claim_id.is_none());
+
+        let fatal = handle_allowed.shutdown_and_take_fatal().await;
+        assert!(fatal.is_none());
     }
 }

@@ -89,7 +89,16 @@ threadlane-session \
 ```
 
 Dispatch accepts the approved task ID, never prompt/model/executable/scope
-overrides. `session --approval-id ...` reads the host; `task --approval-id ...
+overrides. Both `threadlane-session dispatch` and paired MCP `start_approved_task`
+acquire the binding's conversation advancement guard and inspect unresolved
+conversational changes (`blocked_by_conversation_change`) and uncertain
+cancellation markers (`ambiguous_outcome_pending_reconciliation`) before any
+host auto-start, plan materialization, dispatch intent, or worker spawn, and
+hold the guard until the dispatch receipt is sealed. Low-level `threadlane-host`
+CLI commands (`serve`, `prepare-dependencies`) and raw `ApprovedHostClient::dispatch_task`
+live in `threadlane-host` below `threadlane-native` and are not gated by the
+native conversation-change ledger directly (to avoid crate dependency cycles and
+reentrant lock deadlocks with `role_flow`). `session --approval-id ...` reads the host; `task --approval-id ...
 --task-id ...` reads one task. Completion means `ready_for_review`, with
 `accepted: false`. Check the patch, tests and model/effort evidence before
 [review/integration](OPERATOR-WORKFLOW.md). Prepare
@@ -102,13 +111,26 @@ a bounded batch. Handle its prose as untrusted, then `ack --approval-id ...
 --batch-id ...` using the **actual returned** `data.batch_id`. CLI events are
 at `data.events`; paired MCP has its own nested shape. Never invent a batch ID.
 
+`session --approval-id ...` includes bounded, path-free `notification_delivery`
+status, and `notification-status --approval-id ...` returns a dedicated report
+covering live wakeup status (`idle`, `pending`, `in_flight`, `submitted`,
+`failed`, `unknown`, or `unavailable`), `claim_id`, sanitized `error_class`, and
+pending/acknowledged event cursors. On user status requests, check live
+delivery state (`session` or `notification-status`) and `pull` / `ack` any
+pending batches rather than relying on wake-up notices alone. If a wake-up
+failed pre-send (`status: "failed"`), explicitly rearm it with
+`rearm-notification --approval-id ... --expected-claim-id ...
+--confirm-approval ... --operator-approved` (and optional `--expected-instance`).
+`unknown` wakeups are refused by `rearm-notification` and must be reconciled via
+`pull` and `ack` first. See [notification recovery](NOTIFICATION-RECOVERY.md).
+
 `cancel` requires approval/task IDs, `--expected-revision`, the exact
 `--confirm-approval` digest and `--operator-approved`. Cancellation, process exit,
 review and integration remain distinct. On mutating session commands (`dispatch`,
-`cancel`, `stop`, `pull`, `ack`), known pre-effect refusals preserve their refusal
+`cancel`, `stop`, `pull`, `ack`, `rearm-notification`), known pre-effect refusals preserve their refusal
 codes (`unknown_task`, `stale_revision`, `host_not_ready`, `invalid_input`,
 `dependency_inputs_unverified`, `host_not_idle`, `host_instance_mismatch`,
-`security_violation`, etc.), while stage-known post-effect failures (such as
+`wakeup_claim_not_found`, `invalid_wakeup_state`, `security_violation`, etc.), while stage-known post-effect failures (such as
 receipt sealing after worker start or manifest/instance changes during post-stop
 confirmation) and ambiguous runtime/transport, I/O, or scope/integrity errors
 report `outcome_unknown`. Timeout or `outcome_unknown` requires reconciling current

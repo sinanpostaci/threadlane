@@ -1,33 +1,53 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-//! `threadlane-connectors`: safe CLI metadata probing and OS keychain credential boundary
+//! `threadlane-connectors`: safe CLI metadata probing, startup version inspection,
+//! static Codex desktop installation discovery, and OS keychain credential boundary
 //! for Threadlane Milestone 4.
 //!
 //! ## Key Invariants
 //!
-//! - **Explicit, fixed CLI templates without a shell**: Probes only execute when explicitly
-//!   requested (`probe_tool`), never on passive UI page load, and never invoke a shell or
-//!   model inference.
-//!   - `codex_cli`: `debug models --bundled` and `login status`
-//!   - `opencode_v2`: `api --standalone model.list` (standalone v2.2 catalog with per-model variants; never v1 `--verbose`/`--provider`)
-//!   - `antigravity`: `models`
-//!   - `git` / `codegraph`: `--version`; `tmux`: `-V`
-//! - **API adapters never spawn a CLI**: `jev_api` and `openai_decisions_api` return immediately
-//!   without executing any subprocess.
+//! - **Explicit full metadata probes vs. authorized version-only startup inspection**:
+//!   - **Explicit full catalog/login probes** ([`probe_tool`], [`probe_tool_with_options`]) only
+//!     execute when explicitly requested by the operator, never on passive UI page load, and never
+//!     invoke a shell or model inference:
+//!     - `codex_cli`: `debug models --bundled` and `login status`
+//!     - `opencode_v2`: `api --standalone model.list` (standalone v2.2 catalog with per-model
+//!       variants; never v1 `--verbose`/`--provider`)
+//!     - `antigravity`: `models`
+//!     - `git` / `codegraph`: `--version`; `tmux`: `-V`
+//!   - **Authorized startup/background version inspection** ([`inspect_tool_versions`],
+//!     [`inspect_tool_version`]) is separate from full catalog/authentication probes. It inspects
+//!     only enabled local CLI tools using fixed version-only argv (`--version` for
+//!     `codex_cli`/`opencode_v2`/`antigravity`/`git`/`codegraph`, and `-V` for `tmux`) with a
+//!     3-second per-process timeout and at most 4 concurrent subprocesses, never invoking login,
+//!     catalog, installer/update, or inference subcommands.
+//! - **Static current-Codex-desktop discovery**: When `executable_path` is `None` (`system`
+//!   selection mode), both [`inspect_tool_versions`] and [`probe_tool`] resolve `codex_cli`
+//!   through [`resolve_codex_system_executable`], preferring stable Nix profile standalone `codex`
+//!   and statically verified stable profile desktop bundles (`chatgpt` -> unwrapped launcher ->
+//!   active `resources/codex`, never `codex-threadlane-original` and never executing desktop
+//!   wrapper scripts) over stale inherited `/nix/store` `PATH` entries, while preserving explicit
+//!   `Some(...)` custom pins without fallback.
+//! - **API adapters and disabled tools never spawn a CLI**: `jev_api` and `openai_decisions_api`
+//!   (and disabled tools during version inspection) return immediately without executing any
+//!   subprocess.
 //! - **Distinct availability vs authentication and runtime entitlement**: `availability == "found"`
 //!   proves only that a valid executable exists on disk, and discovered catalog models/efforts
 //!   reflect installed CLI metadata rather than verified account routes or runtime subscription
 //!   entitlement. Unverified CLI authentication states remain `"unknown"`, and models without
 //!   evidenced catalog efforts leave `efforts` empty with `allow_no_effort: true`.
-//! - **Bounded process-group supervision**: Enforces a 10-second timeout, 1 MiB stdout/stderr
-//!   caps, sanitized Git environment variables, and Unix process-group termination/reaping.
+//! - **Bounded process-group supervision**: Enforces bounded timeouts (10s for full probes, 3s for
+//!   version inspection), 1 MiB stdout/stderr caps, sanitized Git environment variables, and Unix
+//!   process-group termination/reaping.
 //! - **OS keychain credential boundary**: [`KeyringCredentialStore`] uses `keyring` 4.2.0 (`v1`)
 //!   with zero plaintext fallback, zero ambient token migration, and zero secret exposure in
 //!   `Debug`, `Display`, or serialized errors.
 
 /// Trusted native-launcher XDG environment restoration for external CLI child processes.
 pub mod cli_environment;
+/// Static current-Codex-desktop bundle and stable Nix profile CLI discovery.
+pub mod codex_installation;
 /// OS keychain credential boundary (`CredentialStore`, `KeyringCredentialStore`, and test vault).
 pub mod credentials;
 /// Safe static connector error types and wire codes.
@@ -36,10 +56,21 @@ pub mod error;
 pub mod parsers;
 /// Explicit bounded CLI metadata probing (`ToolProbe`, `probe_tool`).
 pub mod probe;
+/// Startup/background CLI version inspection and Nix-profile-aware system executable resolution.
+pub mod version_inspection;
 
 pub use cli_environment::{
     restore_cli_environment, THREADLANE_CLI_XDG_CACHE_HOME, THREADLANE_CLI_XDG_CONFIG_HOME,
     THREADLANE_CLI_XDG_DATA_HOME, THREADLANE_CLI_XDG_STATE_HOME,
+};
+pub use codex_installation::{
+    derive_stable_profile_bin_dirs, extract_supported_wrapper_exec_target,
+    inspect_codex_desktop_launcher, resolve_codex_system_executable,
+    resolve_codex_system_installation, CodexDiscoveryError, CodexDiscoveryOptions,
+    CodexInstallation, CodexResolutionSource, DesktopPackageMetadata, BUNDLED_CODEX_BINARY_NAME,
+    EXPECTED_DESKTOP_BRAND, EXPECTED_DESKTOP_BUILD_FLAVOR, IGNORED_ORIGINAL_BINARY_NAME,
+    MAX_INSPECTED_FILES, MAX_PACKAGE_METADATA_BYTES, MAX_SYMLINK_HOPS, MAX_WRAPPER_SCRIPT_BYTES,
+    MAX_WRAPPER_SCRIPT_HOPS,
 };
 pub use credentials::{
     validate_tool_id, CredentialStore, FakeCredentialStore, InMemoryCredentialStore,
@@ -56,11 +87,20 @@ pub use parsers::{
     MAX_VERSION_BYTES,
 };
 pub use probe::{
-    is_process_group_alive, probe_command_template, probe_tool, probe_tool_with_timeout, ToolProbe,
-    AVAILABILITY_API_ONLY, AVAILABILITY_FOUND, AVAILABILITY_NOT_FOUND, DEFAULT_PROBE_TIMEOUT_MS,
-    MAX_PROBE_STREAM_BYTES,
+    is_process_group_alive, probe_command_template, probe_tool, probe_tool_with_options,
+    probe_tool_with_timeout, ToolProbe, AVAILABILITY_API_ONLY, AVAILABILITY_FOUND,
+    AVAILABILITY_NOT_FOUND, DEFAULT_PROBE_TIMEOUT_MS, MAX_PROBE_STREAM_BYTES,
 };
 pub use threadlane_registry::{ModelDefinition, ToolAdapter, ToolDefinition};
+pub use version_inspection::{
+    inspect_tool_version, inspect_tool_version_with_options, inspect_tool_versions,
+    inspect_tool_versions_with_options, inspect_tool_versions_with_timeout,
+    ordered_system_search_dirs, resolve_system_executable_in_path, resolve_tool_system_executable,
+    resolve_tool_system_executable_with_options, resolve_tool_system_executable_with_path,
+    version_command_template, PathSource, ToolVersionInspection, VersionInspectionOptions,
+    AVAILABILITY_DISABLED, DEFAULT_VERSION_INSPECTION_TIMEOUT_MS,
+    MAX_VERSION_INSPECTION_CONCURRENCY, SELECTION_MODE_CUSTOM, SELECTION_MODE_SYSTEM,
+};
 
 #[cfg(test)]
 mod tests {

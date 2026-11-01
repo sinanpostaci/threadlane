@@ -441,6 +441,14 @@ impl AppError {
                 "runtime_error",
                 "Host session runtime supervisor operation failed.",
             ),
+            HostError::WakeupClaimNotFound { .. } => (
+                "wakeup_claim_not_found",
+                "The notification claim changed. Refresh its status before retrying.",
+            ),
+            HostError::InvalidWakeupState { .. } => (
+                "invalid_wakeup_state",
+                "The current notification state does not allow this recovery action.",
+            ),
             HostError::Io { .. } => ("io_error", "Failed to read or write host session state."),
         };
         Self {
@@ -3423,6 +3431,20 @@ mod tests {
                     detail: "lock path /home/secret-operator/session".to_string(),
                 },
                 "host_restart_not_allowed",
+            ),
+            (
+                HostError::WakeupClaimNotFound {
+                    claim_id: "hidden /private/session with Bearer tl_raw".to_string(),
+                },
+                "wakeup_claim_not_found",
+            ),
+            (
+                HostError::InvalidWakeupState {
+                    binding_id: "hidden /home/secret-operator".to_string(),
+                    status: "hidden /private/session".to_string(),
+                    action: "Bearer tl_raw".to_string(),
+                },
+                "invalid_wakeup_state",
             ),
             (
                 HostError::Io {

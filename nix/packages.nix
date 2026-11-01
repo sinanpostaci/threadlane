@@ -68,6 +68,7 @@ let
       "--package" "threadlane-host"
       "--package" "threadlane-operations"
       "--package" "threadlane-decisions"
+      "--package" "threadlane-codex-bridge"
     ];
     nativeBuildInputs = [ pkgs.pkg-config ];
     doCheck = false;

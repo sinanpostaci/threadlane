@@ -75,8 +75,10 @@ pub use threadlane::{
 pub use threadlane_core::{AckResult, EventBatch};
 pub use types::{
     ApprovedHostNotificationConfig, DependencyInputSummary, DependencyPredecessorSelection,
-    HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus, HostNotificationRoute,
-    HostNotificationSummary, HostNotificationTransport, HostPhase, HostSessionManifest,
+    HostExecutionGates, HostLaunchIntent, HostLaunchIntentStatus, HostNotificationAvailability,
+    HostNotificationDeliveryStatus, HostNotificationErrorClass, HostNotificationRearmReport,
+    HostNotificationRoute, HostNotificationStatusReport, HostNotificationSummary,
+    HostNotificationTransport, HostNotificationWakeupStatus, HostPhase, HostSessionManifest,
     HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent,
     TaskEvidenceVerificationStatus, TaskExecutionStatus, TaskIntegrationLifecycleStatus,
     TaskLifecycleProjection, TaskReviewLifecycleStatus, TaskRunReceipt, TaskStateSnapshot,
@@ -7654,5 +7656,926 @@ exit 0
         );
 
         host.shutdown().await.expect("shutdown host");
+    }
+
+    #[test]
+    fn notification_error_class_mapping_is_path_free_and_exhaustive() {
+        use threadlane_core::WakeupStatus;
+
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Idle,
+                Some("/secret/path/codex failed")
+            ),
+            None
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Pending,
+                Some("/secret/path/codex failed")
+            ),
+            None
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::InFlight,
+                Some("/secret/path/codex failed")
+            ),
+            None
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Submitted,
+                Some("/secret/path/codex failed")
+            ),
+            None
+        );
+
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Failed,
+                Some(
+                    "executable `/secret/bin/codex` does not have any execute permission bits set"
+                )
+            ),
+            Some(HostNotificationErrorClass::ExecutableValidationFailed)
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Failed,
+                Some("failed to spawn codex queue `/secret/bin/codex`: Permission denied")
+            ),
+            Some(HostNotificationErrorClass::SpawnFailed)
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Failed,
+                Some("custom pre-send failure with token_secret_999")
+            ),
+            Some(HostNotificationErrorClass::PreSendFailure)
+        );
+
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Unknown,
+                Some("codex queue timed out after 80ms; delivery outcome is unknown")
+            ),
+            Some(HostNotificationErrorClass::DeliveryTimedOut)
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Unknown,
+                Some("codex queue process terminated with ambiguous status: exit status: 2")
+            ),
+            Some(HostNotificationErrorClass::ProcessTerminatedAmbiguously)
+        );
+        assert_eq!(
+            HostNotificationErrorClass::from_wakeup(
+                WakeupStatus::Unknown,
+                Some("in-flight wake-up claim became unknown on reopen")
+            ),
+            Some(HostNotificationErrorClass::InFlightInterruptedOnReopen)
+        );
+
+        let unavailable = HostNotificationDeliveryStatus::unavailable();
+        assert_eq!(
+            unavailable.availability,
+            HostNotificationAvailability::Unavailable
+        );
+        assert_eq!(
+            unavailable.wakeup_status,
+            HostNotificationWakeupStatus::Unavailable
+        );
+        assert_eq!(
+            unavailable.error_class,
+            Some(HostNotificationErrorClass::HostUnavailable)
+        );
+        assert!(!unavailable.rearm_eligible);
+        assert!(unavailable.claim_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn host_notification_failed_visibility_coalescing_without_auto_retry_checked_rearm_and_isolation(
+    ) {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-failed-rearm",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Failed notification observability and checked rearm"),
+        );
+        let foreign_approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-foreign",
+            BINDING_B,
+            THREAD_UUID_B,
+            default_tasks("Foreign approval isolation"),
+        );
+
+        let codex_log = fixture.root.join("failed-rearm-codex.log");
+        let fake_codex = fixture.root.join("bin/fake-codex-rearm");
+        write_fake_codex_script(&fake_codex, &codex_log, None);
+
+        let notify_cfg =
+            ApprovedHostNotificationConfig::new(fake_codex.clone(), 2_000).expect("notify config");
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(15))
+            .with_notifications(notify_cfg),
+        )
+        .await
+        .expect("start host with notifications");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // 1. Initial live notification status is Idle and rearm is refused.
+        let initial_report = client
+            .notification_status(&approval_id)
+            .await
+            .expect("initial notification_status");
+        assert_eq!(
+            initial_report.delivery.availability,
+            HostNotificationAvailability::Live
+        );
+        assert_eq!(
+            initial_report.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Idle
+        );
+        assert_eq!(initial_report.delivery.claim_id, None);
+        assert_eq!(initial_report.delivery.error_class, None);
+        assert!(!initial_report.delivery.rearm_eligible);
+        assert!(!initial_report.delivery.reconcile_by_pull_ack_required);
+        assert_eq!(
+            initial_report.delivery.unacked_important_events,
+            Some(false)
+        );
+
+        let idle_rearm_err = client
+            .rearm_failed_notification(
+                &approval_id,
+                "clm_0196ed00-0000-7000-8000-000000000001",
+                &host.approval().subject_digest,
+            )
+            .await
+            .expect_err("Idle wakeup must refuse rearm_failed_notification");
+        assert_eq!(idle_rearm_err.code(), "invalid_wakeup_state");
+
+        // 2. Induce a synthetic pre-send failure by removing execute permissions on `fake_codex`
+        //    before dispatching `task-root-agy`.
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 fake_codex to induce pre-send Failed wakeup");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+        wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let failed_report = loop {
+            let report = client
+                .notification_status(&approval_id)
+                .await
+                .expect("poll notification_status for Failed");
+            if report.delivery.wakeup_status == HostNotificationWakeupStatus::Failed {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Failed wakeup status; last: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let failed_claim_id = failed_report
+            .delivery
+            .claim_id
+            .clone()
+            .expect("Failed wakeup must expose claim_id");
+        assert_eq!(
+            failed_report.delivery.availability,
+            HostNotificationAvailability::Live
+        );
+        assert_eq!(
+            failed_report.delivery.error_class,
+            Some(HostNotificationErrorClass::SpawnFailed)
+        );
+        assert_eq!(failed_report.delivery.attempt_count, Some(1));
+        assert!(failed_report.delivery.covered_up_to_seq > failed_report.delivery.acked_seq);
+        assert_eq!(failed_report.delivery.unacked_important_events, Some(true));
+        assert!(failed_report.delivery.rearm_eligible);
+        assert!(failed_report.delivery.reconcile_by_pull_ack_required);
+        assert!(
+            !codex_log.exists(),
+            "pre-send failure must not invoke codex"
+        );
+
+        let summary_with_notif = client
+            .session_summary_with_notifications(&approval_id)
+            .await
+            .expect("session_summary_with_notifications");
+        assert_eq!(
+            summary_with_notif.notification_delivery.as_ref(),
+            Some(&failed_report.delivery)
+        );
+
+        // Ensure neither report nor summary leaks filesystem paths or raw error strings.
+        let serialized_report =
+            serde_json::to_string(&failed_report).expect("serialize failed_report");
+        let serialized_summary =
+            serde_json::to_string(&summary_with_notif).expect("serialize summary_with_notif");
+        assert!(!serialized_report.contains(&fixture.root.display().to_string()));
+        assert!(!serialized_report.contains(&fake_codex.display().to_string()));
+        assert!(!serialized_summary.contains(&fixture.root.display().to_string()));
+        assert!(!serialized_summary.contains(&fake_codex.display().to_string()));
+
+        // 3. Restore `0755` on `fake_codex` and complete a second task (`task-root-oc`).
+        //    Prove that later completed events coalesce into the pending range while wakeup_status
+        //    remains `Failed` without any automatic retry.
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("restore 0755 on fake_codex before second task");
+
+        let seq_before_second_task = failed_report.delivery.latest_important_seq;
+        let coalesced_before_second_task = failed_report.delivery.coalesced_count;
+
+        client
+            .dispatch_task(&approval_id, "task-root-oc")
+            .await
+            .expect("dispatch task-root-oc");
+        wait_for_task_status(&client, &approval_id, "task-root-oc", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let coalesced_failed = client
+            .notification_status(&approval_id)
+            .await
+            .expect("notification_status after second task");
+        assert_eq!(
+            coalesced_failed.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Failed,
+            "later completed task event must not automatically retry a Failed wakeup"
+        );
+        assert_eq!(
+            coalesced_failed.delivery.claim_id.as_deref(),
+            Some(failed_claim_id.as_str())
+        );
+        assert_eq!(coalesced_failed.delivery.attempt_count, Some(1));
+        assert!(coalesced_failed.delivery.latest_important_seq > seq_before_second_task);
+        assert!(coalesced_failed.delivery.coalesced_count > coalesced_before_second_task);
+        assert!(coalesced_failed.delivery.rearm_eligible);
+        assert!(
+            !codex_log.exists(),
+            "even with fake_codex restored to 0755, Failed wakeup must not auto-retry on later events"
+        );
+
+        // 4. Cross-approval, cross-binding, cross-thread, wrong digest, wrong instance, and stale
+        //    claim ID are all isolated and rejected without mutating the Failed claim.
+        let wrong_binding_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+        )
+        .expect("open wrong binding client");
+        assert_eq!(
+            wrong_binding_client
+                .notification_status(&approval_id)
+                .await
+                .expect_err("wrong binding notification_status denied")
+                .code(),
+            "scope_mismatch"
+        );
+        assert_eq!(
+            wrong_binding_client
+                .rearm_failed_notification(
+                    &approval_id,
+                    &failed_claim_id,
+                    &host.approval().subject_digest,
+                )
+                .await
+                .expect_err("wrong binding rearm denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        let wrong_thread_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_B,
+        )
+        .expect("open wrong thread client");
+        assert_eq!(
+            wrong_thread_client
+                .notification_status(&approval_id)
+                .await
+                .expect_err("wrong thread notification_status denied")
+                .code(),
+            "scope_mismatch"
+        );
+        assert_eq!(
+            wrong_thread_client
+                .rearm_failed_notification(
+                    &approval_id,
+                    &failed_claim_id,
+                    &host.approval().subject_digest,
+                )
+                .await
+                .expect_err("wrong thread rearm denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        assert_eq!(
+            client
+                .notification_status(&foreign_approval_id)
+                .await
+                .expect_err("foreign approval notification_status denied")
+                .code(),
+            "scope_mismatch"
+        );
+        assert_eq!(
+            client
+                .rearm_failed_notification(
+                    &foreign_approval_id,
+                    &failed_claim_id,
+                    &host.approval().subject_digest,
+                )
+                .await
+                .expect_err("foreign approval rearm denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        assert_eq!(
+            client
+                .rearm_failed_notification(&approval_id, &failed_claim_id, &"0".repeat(64))
+                .await
+                .expect_err("wrong confirm_approval digest denied")
+                .code(),
+            "scope_mismatch"
+        );
+
+        assert_eq!(
+            client
+                .rearm_failed_notification_with_instance(
+                    &approval_id,
+                    &failed_claim_id,
+                    &host.approval().subject_digest,
+                    Some("hst_ffffffffffffffffffffffffffffffff"),
+                )
+                .await
+                .expect_err("mismatched expected_instance_id denied")
+                .code(),
+            "host_instance_mismatch"
+        );
+
+        assert_eq!(
+            client
+                .rearm_failed_notification(
+                    &approval_id,
+                    "clm_0196ed00-0000-7000-8000-000000000099",
+                    &host.approval().subject_digest,
+                )
+                .await
+                .expect_err("stale/wrong expected_claim_id must be refused")
+                .code(),
+            "wakeup_claim_not_found"
+        );
+
+        // 5. Concurrent matching requests race on the same Failed claim. Exactly one may
+        //    rearm it; the loser must not create another claim or notification invocation.
+        let (first_rearm, second_rearm) = tokio::join!(
+            client.rearm_failed_notification_with_instance(
+                &approval_id,
+                &failed_claim_id,
+                &host.approval().subject_digest,
+                Some(host.instance_id()),
+            ),
+            client.rearm_failed_notification_with_instance(
+                &approval_id,
+                &failed_claim_id,
+                &host.approval().subject_digest,
+                Some(host.instance_id()),
+            ),
+        );
+        let (rearm_report, raced_refusal) = match (first_rearm, second_rearm) {
+            (Ok(report), Err(refusal)) | (Err(refusal), Ok(report)) => (report, refusal),
+            outcomes => panic!("exactly one matching rearm request must succeed: {outcomes:?}"),
+        };
+        assert!(matches!(
+            raced_refusal.code(),
+            "wakeup_claim_not_found" | "invalid_wakeup_state"
+        ));
+        assert_eq!(rearm_report.rearmed_from_claim_id, failed_claim_id);
+        assert_eq!(rearm_report.instance_id, host.instance_id());
+
+        let submit_deadline = Instant::now() + Duration::from_secs(5);
+        let submitted_report = loop {
+            let report = client
+                .notification_status(&approval_id)
+                .await
+                .expect("poll notification_status after rearm");
+            if report.delivery.wakeup_status == HostNotificationWakeupStatus::Submitted {
+                break report;
+            }
+            assert!(
+                Instant::now() < submit_deadline,
+                "timed out waiting for Submitted wakeup after rearm; last: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let new_claim_id = submitted_report
+            .delivery
+            .claim_id
+            .clone()
+            .expect("Submitted wakeup must expose new claim_id");
+        assert_ne!(new_claim_id, failed_claim_id);
+        assert_eq!(submitted_report.delivery.attempt_count, Some(2));
+        assert_eq!(
+            submitted_report.delivery.covered_up_to_seq,
+            coalesced_failed.delivery.latest_important_seq
+        );
+        assert!(!submitted_report.delivery.rearm_eligible);
+        assert_eq!(submitted_report.delivery.error_class, None);
+
+        let log_contents = fs::read_to_string(&codex_log).expect("read codex log after rearm");
+        assert_eq!(
+            log_contents.lines().count(),
+            1,
+            "explicit Failed rearm must produce exactly one new wakeup invocation"
+        );
+
+        // 6. Duplicate/raced rearm with the old `failed_claim_id` or the new `Submitted` claim is refused.
+        let dup_old_err = client
+            .rearm_failed_notification(
+                &approval_id,
+                &failed_claim_id,
+                &host.approval().subject_digest,
+            )
+            .await
+            .expect_err("replaying old claim_id after rearm must fail");
+        assert!(matches!(
+            dup_old_err.code(),
+            "wakeup_claim_not_found" | "invalid_wakeup_state"
+        ));
+
+        let submitted_rearm_err = client
+            .rearm_failed_notification(&approval_id, &new_claim_id, &host.approval().subject_digest)
+            .await
+            .expect_err("Submitted claim must refuse rearm_failed_notification");
+        assert_eq!(submitted_rearm_err.code(), "invalid_wakeup_state");
+        assert_eq!(
+            fs::read_to_string(&codex_log)
+                .expect("read codex log after duplicate rearm refusal")
+                .lines()
+                .count(),
+            1
+        );
+
+        host.shutdown().await.expect("shutdown host");
+    }
+
+    #[tokio::test]
+    async fn host_notification_unknown_refuses_rearm_reconciles_via_pull_ack_and_stopped_host_reports_unavailable(
+    ) {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-unknown-reconcile",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks(
+                "Unknown notification refusal, pull/ack reconciliation, and stopped host",
+            ),
+        );
+
+        let slow_codex_log = fixture.root.join("slow-codex-reconcile.log");
+        let slow_codex = fixture.root.join("bin/slow-codex-reconcile");
+        write_fake_codex_script(&slow_codex, &slow_codex_log, Some(30));
+
+        let notify_cfg =
+            ApprovedHostNotificationConfig::new(slow_codex, 80).expect("80ms timeout config");
+        let host = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(15))
+            .with_notifications(notify_cfg),
+        )
+        .await
+        .expect("start host with slow codex");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+        wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let unknown_report = loop {
+            let report = client
+                .notification_status(&approval_id)
+                .await
+                .expect("poll notification_status for Unknown");
+            if report.delivery.wakeup_status == HostNotificationWakeupStatus::Unknown {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Unknown wakeup status; last: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        let unknown_claim_id = unknown_report
+            .delivery
+            .claim_id
+            .clone()
+            .expect("Unknown wakeup must expose claim_id");
+        assert_eq!(
+            unknown_report.delivery.availability,
+            HostNotificationAvailability::Live
+        );
+        assert_eq!(
+            unknown_report.delivery.error_class,
+            Some(HostNotificationErrorClass::DeliveryTimedOut)
+        );
+        assert!(!unknown_report.delivery.rearm_eligible);
+        assert!(unknown_report.delivery.reconcile_by_pull_ack_required);
+        assert_eq!(unknown_report.delivery.unacked_important_events, Some(true));
+
+        // 1. Unknown wakeup cannot be rearmed via `rearm_failed_notification`.
+        let unknown_rearm_err = client
+            .rearm_failed_notification(
+                &approval_id,
+                &unknown_claim_id,
+                &host.approval().subject_digest,
+            )
+            .await
+            .expect_err("Unknown wakeup must refuse rearm_failed_notification");
+        assert_eq!(unknown_rearm_err.code(), "invalid_wakeup_state");
+
+        // 2. Actual `pull_events` + `ack_events` reconciles the Unknown wakeup back to Idle.
+        let batch = client
+            .pull_events(&approval_id, None, Some(APPROVED_EVENT_BATCH_MAX_EVENTS))
+            .await
+            .expect("pull events to reconcile Unknown wakeup");
+        assert!(!batch.events.is_empty());
+        let ack = client
+            .ack_events(&approval_id, batch.batch_id)
+            .await
+            .expect("ack pulled batch");
+        assert!(ack.advanced);
+        assert_eq!(ack.acked_seq, batch.to_seq);
+
+        let reconciled_report = client
+            .notification_status(&approval_id)
+            .await
+            .expect("notification_status after pull/ack reconciliation");
+        assert_eq!(
+            reconciled_report.delivery.availability,
+            HostNotificationAvailability::Live
+        );
+        assert_eq!(
+            reconciled_report.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Idle
+        );
+        assert_eq!(reconciled_report.delivery.claim_id, None);
+        assert_eq!(reconciled_report.delivery.error_class, None);
+        assert_eq!(
+            reconciled_report.delivery.unacked_important_events,
+            Some(false)
+        );
+        assert!(!reconciled_report.delivery.reconcile_by_pull_ack_required);
+        assert_eq!(reconciled_report.delivery.acked_seq, Some(batch.to_seq));
+
+        // 3. Shut down host and verify that stopped/unavailable host reports `unavailable`
+        //    (never faking `Idle`).
+        host.shutdown().await.expect("shutdown host");
+
+        let stopped_report = client
+            .notification_status(&approval_id)
+            .await
+            .expect("notification_status on stopped host");
+        assert_eq!(stopped_report.phase, HostPhase::Stopped);
+        assert_eq!(
+            stopped_report.delivery.availability,
+            HostNotificationAvailability::Unavailable
+        );
+        assert_eq!(
+            stopped_report.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Unavailable
+        );
+        assert_eq!(
+            stopped_report.delivery.error_class,
+            Some(HostNotificationErrorClass::HostUnavailable)
+        );
+        assert!(!stopped_report.delivery.rearm_eligible);
+        assert_eq!(stopped_report.delivery.claim_id, None);
+
+        let stopped_summary = client
+            .session_summary_with_notifications(&approval_id)
+            .await
+            .expect("session_summary_with_notifications on stopped host");
+        assert_eq!(stopped_summary.phase, HostPhase::Stopped);
+        assert_eq!(
+            stopped_summary.notification_delivery,
+            Some(HostNotificationDeliveryStatus::unavailable())
+        );
+
+        let stopped_rearm_err = client
+            .rearm_failed_notification(
+                &approval_id,
+                &unknown_claim_id,
+                &stopped_report.subject_digest,
+            )
+            .await
+            .expect_err("stopped host must refuse rearm_failed_notification");
+        assert_eq!(stopped_rearm_err.code(), "host_not_ready");
+    }
+
+    #[tokio::test]
+    async fn host_notification_failed_surviving_restart_without_notifications_reports_ineligible_refuses_rearm_and_reconciles_via_pull_ack(
+    ) {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-notify-failed-restart-disabled",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Failed notification across restart with notifications disabled"),
+        );
+
+        let codex_log = fixture.root.join("failed-restart-disabled-codex.log");
+        let fake_codex = fixture.root.join("bin/fake-codex-restart-disabled");
+        write_fake_codex_script(&fake_codex, &codex_log, None);
+
+        let notify_cfg =
+            ApprovedHostNotificationConfig::new(fake_codex.clone(), 2_000).expect("notify config");
+        let host1 = ApprovedHost::start(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(15))
+            .with_notifications(notify_cfg.clone()),
+        )
+        .await
+        .expect("start host1 with notifications enabled");
+        let first_instance_id = host1.instance_id().to_string();
+        let subject_digest = host1.approval().subject_digest.clone();
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        // 1. Induce a pre-send Failed wakeup on `host1`.
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 fake_codex to induce pre-send Failed wakeup");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+        wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let failed_before_stop = loop {
+            let report = client
+                .notification_status(&approval_id)
+                .await
+                .expect("poll notification_status for Failed on host1");
+            if report.delivery.wakeup_status == HostNotificationWakeupStatus::Failed {
+                break report;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for Failed wakeup on host1; last: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let failed_claim_id = failed_before_stop
+            .delivery
+            .claim_id
+            .clone()
+            .expect("Failed wakeup must expose claim_id");
+        assert!(failed_before_stop.notifications.enabled);
+        assert!(failed_before_stop.delivery.rearm_eligible);
+        assert!(!codex_log.exists());
+
+        // Restore execute permissions on `fake_codex` so any unexpected sender invocation after
+        // restart would write to `codex_log`.
+        fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))
+            .expect("restore 0755 on fake_codex before stop/restart");
+
+        // 2. Explicitly stop `host1` and restart without notification config using `ApprovedHost::restart_stopped`.
+        host1.shutdown().await.expect("shutdown host1 cleanly");
+
+        let host2 = ApprovedHost::restart_stopped(
+            ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )
+            .with_tick_interval(Duration::from_millis(15)),
+            &first_instance_id,
+        )
+        .await
+        .expect("restart_stopped without notifications");
+        let second_instance_id = host2.instance_id().to_string();
+        assert_ne!(second_instance_id, first_instance_id);
+        assert!(!host2.summary().notifications.enabled);
+
+        // 3. Observe that the durable Failed wakeup status and cursors are preserved truthfully,
+        //    top-level `notifications.enabled` is false, and `delivery.rearm_eligible` is false.
+        let report_after_restart = client
+            .notification_status(&approval_id)
+            .await
+            .expect("notification_status after restart without notifications");
+        assert!(!report_after_restart.notifications.enabled);
+        assert_eq!(
+            report_after_restart.delivery.availability,
+            HostNotificationAvailability::Live
+        );
+        assert_eq!(
+            report_after_restart.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Failed
+        );
+        assert_eq!(
+            report_after_restart.delivery.claim_id.as_deref(),
+            Some(failed_claim_id.as_str())
+        );
+        assert_eq!(
+            report_after_restart.delivery.error_class,
+            Some(HostNotificationErrorClass::SpawnFailed)
+        );
+        assert_eq!(
+            report_after_restart.delivery.latest_important_seq,
+            failed_before_stop.delivery.latest_important_seq
+        );
+        assert_eq!(
+            report_after_restart.delivery.covered_up_to_seq,
+            failed_before_stop.delivery.covered_up_to_seq
+        );
+        assert_eq!(
+            report_after_restart.delivery.unacked_important_events,
+            Some(true)
+        );
+        assert!(report_after_restart.delivery.reconcile_by_pull_ack_required);
+        assert!(
+            !report_after_restart.delivery.rearm_eligible,
+            "Failed wakeup on restarted host with notifications disabled must report rearm_eligible=false"
+        );
+
+        let summary_after_restart = client
+            .session_summary_with_notifications(&approval_id)
+            .await
+            .expect("session_summary_with_notifications after restart");
+        assert!(!summary_after_restart.notifications.enabled);
+        assert_eq!(
+            summary_after_restart.notification_delivery.as_ref(),
+            Some(&report_after_restart.delivery)
+        );
+
+        // 4. Explicit rearm is refused with `host_not_ready` and does not transition Failed -> Pending.
+        let rearm_disabled_err = client
+            .rearm_failed_notification_with_instance(
+                &approval_id,
+                &failed_claim_id,
+                &subject_digest,
+                Some(&second_instance_id),
+            )
+            .await
+            .expect_err("rearm must be refused when host notifications are disabled");
+        assert_eq!(rearm_disabled_err.code(), "host_not_ready");
+
+        // Even if the on-disk manifest is stale and claims `notifications.enabled == true`,
+        // the live runtime supervisor independently enforces `SharedState.codex` and refuses rearm
+        // before mutating the Failed wakeup.
+        let orig_manifest = host2.manifest().clone();
+        let mut stale_enabled_manifest = orig_manifest.clone();
+        stale_enabled_manifest.notifications = notify_cfg.summary();
+        write_host_manifest(host2.session_dir(), &stale_enabled_manifest)
+            .expect("write stale enabled notifications manifest");
+
+        let rearm_stale_manifest_err = client
+            .rearm_failed_notification_with_instance(
+                &approval_id,
+                &failed_claim_id,
+                &subject_digest,
+                Some(&second_instance_id),
+            )
+            .await
+            .expect_err("live runtime must refuse rearm when codex config is absent even if manifest is stale");
+        assert_eq!(rearm_stale_manifest_err.code(), "host_not_ready");
+
+        write_host_manifest(host2.session_dir(), &orig_manifest)
+            .expect("restore original disabled manifest");
+
+        let report_still_failed = client
+            .notification_status(&approval_id)
+            .await
+            .expect("notification_status after refused rearm");
+        assert_eq!(
+            report_still_failed.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Failed
+        );
+        assert_eq!(
+            report_still_failed.delivery.claim_id.as_deref(),
+            Some(failed_claim_id.as_str())
+        );
+        assert!(!report_still_failed.delivery.rearm_eligible);
+        assert!(
+            !codex_log.exists(),
+            "no fake Codex invocations may occur when notifications are disabled"
+        );
+
+        // 5. Pull and ACK remain available and reconcile the Failed wakeup and cursors back to Idle.
+        let batch = client
+            .pull_events(&approval_id, None, Some(APPROVED_EVENT_BATCH_MAX_EVENTS))
+            .await
+            .expect("pull_events after restart without notifications");
+        assert!(!batch.events.is_empty());
+        let ack = client
+            .ack_events(&approval_id, batch.batch_id)
+            .await
+            .expect("ack_events after restart without notifications");
+        assert!(ack.advanced);
+        assert_eq!(ack.acked_seq, batch.to_seq);
+
+        let reconciled = client
+            .notification_status(&approval_id)
+            .await
+            .expect("notification_status after pull/ack reconciliation");
+        assert_eq!(
+            reconciled.delivery.wakeup_status,
+            HostNotificationWakeupStatus::Idle
+        );
+        assert_eq!(reconciled.delivery.claim_id, None);
+        assert_eq!(reconciled.delivery.error_class, None);
+        assert!(!reconciled.delivery.rearm_eligible);
+        assert!(!reconciled.delivery.reconcile_by_pull_ack_required);
+        assert_eq!(reconciled.delivery.unacked_important_events, Some(false));
+        assert_eq!(reconciled.delivery.acked_seq, Some(batch.to_seq));
+        assert!(!codex_log.exists());
+
+        host2.shutdown().await.expect("shutdown host2");
     }
 }

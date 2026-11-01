@@ -14,7 +14,8 @@ use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, R
 use crate::error::{ApiError, Error};
 use crate::protocol::{
     BindingListResponse, CreateBindingRequest, HostControlInfoRequest, HostControlStatusResponse,
-    RetryWakeupRequest, ScopedRequest, ScopedResponse, StatusResponse, StopIdleHostRequest,
+    RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest,
+    ScopedResponse, StatusResponse, StopIdleHostRequest,
 };
 
 /// Maximum response body size accepted by [`SupervisorClient`] (2 MiB).
@@ -184,6 +185,16 @@ impl SupervisorClient {
         request: &StopIdleHostRequest,
     ) -> Result<HostControlStatusResponse, Error> {
         self.send_json(Method::POST, "/v1/host-control/stop", Some(request))
+            .await
+    }
+
+    /// Atomically verifies owner scope + `expected_instance_id` and re-arms a `Failed` wake-up
+    /// claim matching `expected_claim_id` on the session binding (`allow_unknown = false`).
+    pub async fn rearm_host_wakeup(
+        &self,
+        request: &RearmHostWakeupRequest,
+    ) -> Result<RearmHostWakeupResponse, Error> {
+        self.send_json(Method::POST, "/v1/host-control/rearm-wakeup", Some(request))
             .await
     }
 

@@ -16,11 +16,11 @@ use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
 };
 use threadlane_native::{
-    open_workflow_stores, ConversationChangeError, ConversationChangeRequest,
-    ConversationChangeStore, ListConversationChangesParams, NativeError, NativeErrorCode,
-    ResolveConversationChangeRequest, DEFAULT_APPROVED_ACTIVITY_LIMIT,
-    DEFAULT_APPROVED_EVENT_BATCH_LIMIT, MAX_APPROVAL_CURSOR_LEN, MAX_APPROVED_ACTIVITY_LIMIT,
-    MAX_APPROVED_CANCEL_REASON_LEN, MAX_APPROVED_EVENT_BATCH_LIMIT,
+    dispatch_approved_task_guarded, open_workflow_stores, ConversationChangeError,
+    ConversationChangeRequest, ConversationChangeStore, GuardedDispatchError,
+    ListConversationChangesParams, NativeError, NativeErrorCode, ResolveConversationChangeRequest,
+    DEFAULT_APPROVED_ACTIVITY_LIMIT, DEFAULT_APPROVED_EVENT_BATCH_LIMIT, MAX_APPROVAL_CURSOR_LEN,
+    MAX_APPROVED_ACTIVITY_LIMIT, MAX_APPROVED_CANCEL_REASON_LEN, MAX_APPROVED_EVENT_BATCH_LIMIT,
 };
 
 #[derive(Debug, Parser)]
@@ -188,6 +188,36 @@ enum SessionCommand {
         /// Batch identifier returned by `pull`.
         #[arg(long = "batch-id", value_name = "ID")]
         batch_id: String,
+    },
+    /// Inspect bounded, path-free notification delivery status for an approved host session.
+    #[command(name = "notification-status")]
+    NotificationStatus {
+        /// Approval identifier.
+        #[arg(long = "approval-id", value_name = "ID")]
+        approval_id: String,
+    },
+    /// Explicitly re-arm a `failed` notification wake-up claim (`Failed` only; `Unknown` must be reconciled via `pull`/`ack`).
+    #[command(name = "rearm-notification")]
+    RearmNotification {
+        /// Approval identifier.
+        #[arg(long = "approval-id", value_name = "ID")]
+        approval_id: String,
+
+        /// Exact current failed claim_id returned by notification-status.
+        #[arg(long = "expected-claim-id", value_name = "CLAIM_ID")]
+        expected_claim_id: String,
+
+        /// Optional expected running host instance identifier (`hst_<32hex>`).
+        #[arg(long = "expected-instance", value_name = "HST_ID")]
+        expected_instance: Option<String>,
+
+        /// Lowercase 64-character SHA-256 hex digest matching the approval record's `subject_digest`.
+        #[arg(long = "confirm-approval", value_name = "SHA256")]
+        confirm_approval: String,
+
+        /// Explicit operator approval confirmation flag.
+        #[arg(long = "operator-approved")]
+        operator_approved: bool,
     },
     /// Preview how an interpreted conversational change will be routed without mutating state.
     #[command(name = "preview-change", visible_alias = "change-preview")]
@@ -411,6 +441,12 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 }
             }
 
+            let notif_report = client
+                .notification_status(&approval_id)
+                .await
+                .map_err(|err| map_host_error(&err))?;
+            summary.notification_delivery = Some(notif_report.delivery);
+
             write_result(&globals.binding, &summary, false)
         }
         SessionCommand::Task {
@@ -452,12 +488,48 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 &globals.thread,
                 Some(&checked_confirm),
             )?;
+            validate_identifier("task_id", &task_id).map_err(|_| {
+                OperatorCliError::invalid_input("`--task-id` failed identifier syntax validation.")
+            })?;
 
-            verify_binding(&state_dir, &globals.binding, &globals.thread).await?;
-            let snapshot = client
-                .dispatch_task(&approval_id, &task_id)
-                .await
-                .map_err(|err| map_host_mutation_error(&err))?;
+            let binding_for_check = globals.binding.clone();
+            let thread_for_check = globals.thread.clone();
+            let state_dir_for_check = state_dir.clone();
+            let mut verify_err: Option<OperatorCliError> = None;
+
+            let snapshot = dispatch_approved_task_guarded(
+                &authority,
+                &client,
+                &globals.binding,
+                &globals.thread,
+                &approval_id,
+                &task_id,
+                Some(&checked_confirm),
+                || async {
+                    if let Err(err) =
+                        verify_binding(&state_dir_for_check, &binding_for_check, &thread_for_check)
+                            .await
+                    {
+                        verify_err = Some(err);
+                        return Err(GuardedDispatchError::pre_effect(
+                            "scope_mismatch",
+                            "Live binding verification failed before task dispatch.",
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .map_err(|err| match err {
+                GuardedDispatchError::PreEffect { code, message } => {
+                    if let Some(cli_err) = verify_err.take() {
+                        cli_err
+                    } else {
+                        OperatorCliError::new(code, message)
+                    }
+                }
+                GuardedDispatchError::Host(host_err) => map_host_mutation_error(&host_err),
+            })?;
             if snapshot.binding_id != globals.binding || snapshot.thread_uuid != globals.thread {
                 return Err(OperatorCliError::new(
                     "outcome_unknown",
@@ -643,6 +715,71 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 ));
             }
             write_result(&globals.binding, &ack, true)
+        }
+        SessionCommand::NotificationStatus { approval_id } => {
+            verify_operator_approval(
+                &authority,
+                &approval_id,
+                &globals.binding,
+                &globals.thread,
+                None,
+            )?;
+
+            let report = client
+                .notification_status(&approval_id)
+                .await
+                .map_err(|err| map_host_error(&err))?;
+            if report.binding_id != globals.binding || report.thread_uuid != globals.thread {
+                return Err(OperatorCliError::new(
+                    "scope_mismatch",
+                    "Approved notification status does not belong to the requested binding and thread scope.",
+                ));
+            }
+            write_result(&globals.binding, &report, false)
+        }
+        SessionCommand::RearmNotification {
+            approval_id,
+            expected_claim_id,
+            expected_instance,
+            confirm_approval,
+            operator_approved,
+        } => {
+            require_operator_approved(operator_approved)?;
+            validate_identifier("expected_claim_id", &expected_claim_id).map_err(|_| {
+                OperatorCliError::invalid_input("Invalid `--expected-claim-id` syntax.")
+            })?;
+            let checked_confirm = validate_confirm_approval(&confirm_approval)?;
+            verify_operator_approval(
+                &authority,
+                &approval_id,
+                &globals.binding,
+                &globals.thread,
+                Some(&checked_confirm),
+            )?;
+
+            verify_binding(&state_dir, &globals.binding, &globals.thread).await?;
+            let report = client
+                .rearm_failed_notification_with_instance(
+                    &approval_id,
+                    &expected_claim_id,
+                    &checked_confirm,
+                    expected_instance.as_deref(),
+                )
+                .await
+                .map_err(|err| map_host_mutation_error(&err))?;
+            if report.binding_id != globals.binding
+                || report.thread_uuid != globals.thread
+                || report.rearmed_from_claim_id != expected_claim_id
+                || expected_instance
+                    .as_deref()
+                    .is_some_and(|exp| report.instance_id != exp)
+            {
+                return Err(OperatorCliError::new(
+                    "outcome_unknown",
+                    "Notification re-arm completed, but returned report scope or instance failed validation.",
+                ));
+            }
+            write_result(&globals.binding, &report, true)
         }
         SessionCommand::PreviewChange { request } => {
             let change_request: ConversationChangeRequest = read_request(&request)?;
@@ -1026,6 +1163,12 @@ fn map_host_error(error: &HostError) -> OperatorCliError {
         HostError::InvalidRunState { .. } => {
             "Operation is not valid for the worker run's current lifecycle state."
         }
+        HostError::WakeupClaimNotFound { .. } => {
+            "Expected wake-up claim identifier does not match the current notification claim."
+        }
+        HostError::InvalidWakeupState { .. } => {
+            "Notification wake-up state is not Failed; Unknown wake-ups must be reconciled via pull and ack."
+        }
         HostError::SecurityViolation { .. } => {
             "Approved host session store path or permission security requirement was violated."
         }
@@ -1048,7 +1191,7 @@ fn map_host_error(error: &HostError) -> OperatorCliError {
 }
 
 /// Maps [`HostError`] returned after entering a mutating session command (`dispatch`,
-/// `cancel`, `stop`, `pull`, or `ack`).
+/// `cancel`, `stop`, `pull`, `ack`, or `rearm-notification`).
 ///
 /// Mutating session operations can persist an intent/receipt, start or cancel a worker,
 /// request an idle host stop, or advance delivered/acknowledged notification state before
@@ -1085,6 +1228,8 @@ fn map_host_mutation_error(error: &HostError) -> OperatorCliError {
         | HostError::StaleRevision { .. }
         | HostError::IdempotencyConflict { .. }
         | HostError::InvalidRunState { .. }
+        | HostError::WakeupClaimNotFound { .. }
+        | HostError::InvalidWakeupState { .. }
         | HostError::SecurityViolation { .. }
         | HostError::Authority { .. } => map_host_error(error),
     }
@@ -1824,6 +1969,20 @@ mod tests {
                 "invalid_run_state",
             ),
             (
+                HostError::WakeupClaimNotFound {
+                    claim_id: secret.to_string(),
+                },
+                "wakeup_claim_not_found",
+            ),
+            (
+                HostError::InvalidWakeupState {
+                    binding_id: "bnd_1".to_string(),
+                    status: secret.to_string(),
+                    action: secret.to_string(),
+                },
+                "invalid_wakeup_state",
+            ),
+            (
                 HostError::SecurityViolation {
                     path: secret.to_string(),
                     reason: secret.to_string(),
@@ -1862,6 +2021,8 @@ mod tests {
             vec!["threadlane-session", "activity", "--help"],
             vec!["threadlane-session", "pull", "--help"],
             vec!["threadlane-session", "ack", "--help"],
+            vec!["threadlane-session", "notification-status", "--help"],
+            vec!["threadlane-session", "rearm-notification", "--help"],
             vec!["threadlane-session", "preview-change", "--help"],
             vec!["threadlane-session", "record-change", "--help"],
             vec!["threadlane-session", "list-changes", "--help"],
@@ -1888,6 +2049,117 @@ mod tests {
                 "expected DisplayVersion for {version_args:?}"
             );
         }
+    }
+
+    #[test]
+    fn cli_parses_notification_status_and_rearm_notification_subcommands_and_rejects_missing_confirmations(
+    ) {
+        let notif_status = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "notification-status",
+            "--approval-id",
+            "apr_0123456789abcdef0123456789abcdef",
+        ])
+        .expect("parse notification-status");
+        match notif_status.command {
+            SessionCommand::NotificationStatus { approval_id } => {
+                assert_eq!(approval_id, "apr_0123456789abcdef0123456789abcdef");
+            }
+            other => panic!("expected NotificationStatus, got {other:?}"),
+        }
+
+        let rearm = Cli::try_parse_from([
+            "threadlane-session",
+            "--state-dir",
+            "/tmp/state",
+            "--registry-dir",
+            "/tmp/registry",
+            "--plans-dir",
+            "/tmp/plans",
+            "--authority-dir",
+            "/tmp/authority",
+            "--sessions-dir",
+            "/tmp/sessions",
+            "--binding",
+            BINDING_A,
+            "--thread",
+            THREAD_A,
+            "rearm-notification",
+            "--approval-id",
+            "apr_0123456789abcdef0123456789abcdef",
+            "--expected-claim-id",
+            "clm_0196ed00-0000-7000-8000-000000000001",
+            "--expected-instance",
+            "hst_0123456789abcdef0123456789abcdef",
+            "--confirm-approval",
+            DIGEST_A,
+            "--operator-approved",
+        ])
+        .expect("parse rearm-notification with expected-instance");
+        match rearm.command {
+            SessionCommand::RearmNotification {
+                approval_id,
+                expected_claim_id,
+                expected_instance,
+                confirm_approval,
+                operator_approved,
+            } => {
+                assert_eq!(approval_id, "apr_0123456789abcdef0123456789abcdef");
+                assert_eq!(
+                    expected_claim_id,
+                    "clm_0196ed00-0000-7000-8000-000000000001"
+                );
+                assert_eq!(
+                    expected_instance.as_deref(),
+                    Some("hst_0123456789abcdef0123456789abcdef")
+                );
+                assert_eq!(confirm_approval, DIGEST_A);
+                assert!(operator_approved);
+            }
+            other => panic!("expected RearmNotification, got {other:?}"),
+        }
+
+        // Missing --expected-claim-id or --confirm-approval must fail clap parsing.
+        assert!(
+            Cli::try_parse_from([
+                "threadlane-session",
+                "rearm-notification",
+                "--approval-id",
+                "apr_0123456789abcdef0123456789abcdef",
+                "--confirm-approval",
+                DIGEST_A,
+                "--operator-approved",
+            ])
+            .is_err(),
+            "rearm-notification without --expected-claim-id must fail clap parsing"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "threadlane-session",
+                "rearm-notification",
+                "--approval-id",
+                "apr_0123456789abcdef0123456789abcdef",
+                "--expected-claim-id",
+                "clm_0196ed00-0000-7000-8000-000000000001",
+                "--operator-approved",
+            ])
+            .is_err(),
+            "rearm-notification without --confirm-approval must fail clap parsing"
+        );
     }
 
     #[test]
@@ -2006,5 +2278,14 @@ mod tests {
             true,
         );
         assert_eq!(mapped.code, "task_not_proven_stopped");
+
+        let blocked = map_conversation_change_error(
+            &ConversationChangeError::BlockedByConversationChange {
+                reason: "Approved task dispatch is blocked by an unresolved conversational change.",
+            },
+            false,
+        );
+        assert_eq!(blocked.code, "blocked_by_conversation_change");
+        assert!(blocked.message.contains("unresolved conversational change"));
     }
 }

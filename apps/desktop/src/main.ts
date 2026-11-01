@@ -92,12 +92,25 @@ import {
   desktop_plans_snapshot,
   desktop_registry_snapshot,
   desktop_test_decision,
+  desktop_tool_versions,
   formatAppError,
   type DecisionAdvice,
   type DecisionProvider,
   type ModelDefinition,
 } from './registry/ipc.ts';
 import { visibleModelCount } from './registry/model-families.ts';
+import {
+  applyToolVersionScanError,
+  applyToolVersionScanSuccess,
+  beginStartupToolVersionScan,
+  beginToolVersionScan,
+  createToolVersionScanState,
+  markToolVersionInspectionsStale,
+  toolInspectionInputsChanged,
+  type ToolVersionScanReason,
+  type ToolVersionScanState,
+  type ToolVersionTicket,
+} from './registry/tool-versions.ts';
 import { createBrandIconElement, createUiIcon, type UiIconName } from './icons.ts';
 import { createButton, h } from './ui/dom.ts';
 import { ToolsPage } from './pages/tools.ts';
@@ -212,6 +225,8 @@ class ThreadlaneDesktopApp {
   private returnFocusKey: string | null = null;
   private pollTimerId: number | null = null;
   private sharedRefreshInFlight = false;
+  private toolVersionState: ToolVersionScanState = createToolVersionScanState();
+  private pendingToolVersionRecheckRevision: number | null = null;
 
   constructor(mountNode: HTMLElement) {
     const savedAppearance = loadSavedAppearance();
@@ -577,7 +592,19 @@ class ThreadlaneDesktopApp {
     try {
       const snapshot = await desktop_registry_snapshot();
       this.state = applyRegistryRefreshSuccess(this.state, started.ticket, snapshot);
+      if (
+        toolInspectionInputsChanged(previous.tools, this.state.registrySnapshot.tools)
+      ) {
+        this.toolVersionState = markToolVersionInspectionsStale(
+          this.toolVersionState,
+          this.state.registrySnapshot.revision
+        );
+      }
       changed = hasRegistrySnapshotChanged(previous, this.state.registrySnapshot);
+      // A failed first registry read must not suppress this app's startup scan
+      // after a later successful refresh.
+      this.startStartupToolVersionScan();
+      this.maybeStartPendingToolVersionRecheck(renderMode !== 'auto', false);
     } catch (err) {
       this.state = applyRegistryRefreshError(
         this.state,
@@ -660,6 +687,107 @@ class ThreadlaneDesktopApp {
       };
     }
     if (this.state.detailTarget === null && this.state.page === 'tools') {
+      this.renderPreserveActiveInput();
+    }
+  }
+
+  private startStartupToolVersionScan(): void {
+    if (this.state.registryError) {
+      return;
+    }
+    const started = beginStartupToolVersionScan(
+      this.toolVersionState,
+      this.state.registrySnapshot.revision
+    );
+    this.toolVersionState = started.state;
+    if (!started.ticket) {
+      return;
+    }
+    this.renderToolVersionsIfVisible();
+    void this.executeToolVersionScan(started.ticket);
+  }
+
+  private startToolVersionScan(
+    reason: Exclude<ToolVersionScanReason, 'startup'>,
+    renderLoading: boolean = true
+  ): void {
+    const started = beginToolVersionScan(
+      this.toolVersionState,
+      this.state.registrySnapshot.revision,
+      reason
+    );
+    this.toolVersionState = started.state;
+    if (!started.ticket) {
+      return;
+    }
+    if (renderLoading) {
+      this.renderToolVersionsIfVisible();
+    }
+    void this.executeToolVersionScan(started.ticket);
+  }
+
+  private startManualToolVersionScan(): void {
+    this.startToolVersionScan('manual');
+  }
+
+  private queueToolVersionRecheck(registryRevision: number): void {
+    if (!Number.isSafeInteger(registryRevision) || registryRevision < 0) {
+      return;
+    }
+    this.pendingToolVersionRecheckRevision = Math.max(
+      this.pendingToolVersionRecheckRevision ?? 0,
+      registryRevision
+    );
+    this.maybeStartPendingToolVersionRecheck();
+  }
+
+  private maybeStartPendingToolVersionRecheck(
+    renderLoading: boolean = true,
+    allowRefresh: boolean = true
+  ): void {
+    const targetRevision = this.pendingToolVersionRecheckRevision;
+    if (targetRevision === null || this.state.registryInFlight) {
+      return;
+    }
+    if (this.state.registrySnapshot.revision < targetRevision) {
+      if (this.state.registryError || !allowRefresh) {
+        this.pendingToolVersionRecheckRevision = null;
+        return;
+      }
+      void this.refreshRegistry(true, 'defer');
+      return;
+    }
+    this.pendingToolVersionRecheckRevision = null;
+    this.startToolVersionScan('after_save', renderLoading);
+  }
+
+  private async executeToolVersionScan(ticket: ToolVersionTicket): Promise<void> {
+    let nextState: ToolVersionScanState;
+    try {
+      const response = await desktop_tool_versions();
+      nextState = applyToolVersionScanSuccess(
+        this.toolVersionState,
+        ticket,
+        response,
+        this.state.registrySnapshot.revision
+      ).state;
+    } catch (err) {
+      nextState = applyToolVersionScanError(
+        this.toolVersionState,
+        ticket,
+        formatAppError(err, 'Failed to inspect installed tool versions.'),
+        this.state.registrySnapshot.revision
+      ).state;
+    }
+    if (nextState === this.toolVersionState) {
+      return;
+    }
+    this.toolVersionState = nextState;
+    this.renderToolVersionsIfVisible();
+  }
+
+  private renderToolVersionsIfVisible(): void {
+    if (this.state.page === 'tools' && this.state.detailTarget === null) {
       this.renderPreserveActiveInput();
     }
   }
@@ -1977,8 +2105,15 @@ class ThreadlaneDesktopApp {
         tools: this.state.tools,
         loading: this.state.toolsLoading,
         error: this.state.toolsError,
+        versions: this.toolVersionState,
         onRefreshDiscovery: () => {
           void this.refreshTools();
+        },
+        onRecheckVersions: () => {
+          this.startManualToolVersionScan();
+        },
+        onToolInspectionChanged: (registryRevision) => {
+          this.queueToolVersionRecheck(registryRevision);
         },
         onOpenProfiles: () => {
           this.handleOpenProfilesFromTools();

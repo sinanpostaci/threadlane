@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/threadlane-codex-bridge",
     "crates/threadlane-authority",
     "crates/threadlane-host",
     "crates/threadlane-workflow",

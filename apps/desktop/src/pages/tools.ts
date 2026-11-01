@@ -8,7 +8,12 @@ import type {
   RegistryChange,
   RegistrySnapshot,
   ToolDefinition,
+  ToolVersionInspection,
 } from '../registry/types.ts';
+import {
+  findToolVersionInspection,
+  type ToolVersionScanState,
+} from '../registry/tool-versions.ts';
 import {
   groupModelFamilies,
   visibleModelCount,
@@ -58,7 +63,10 @@ export interface ToolsRenderContext {
   tools?: readonly ToolsDiscoveryItem[];
   loading?: boolean;
   error?: string | null;
+  versions?: ToolVersionScanState;
   onRefreshDiscovery?: () => void;
+  onRecheckVersions?: () => void;
+  onToolInspectionChanged?: (registryRevision: number) => void;
   onOpenProfiles?: () => void;
 }
 
@@ -341,6 +349,38 @@ function availabilityTone(value: string): Tone {
   return value.trim().toLowerCase() === 'found' ? 'ok' : 'warn';
 }
 
+function versionAvailabilityLabel(value: ToolVersionInspection['availability']): string {
+  if (value === 'found') return 'Found';
+  if (value === 'not_found') return 'Not found';
+  if (value === 'api_only') return 'API tool';
+  return 'Disabled';
+}
+
+function versionAvailabilityStatus(
+  value: ToolVersionInspection['availability']
+): 'active' | 'warn' | undefined {
+  if (value === 'found') return 'active';
+  if (value === 'not_found' || value === 'disabled') return 'warn';
+  return undefined;
+}
+
+function safePath(value: string | null | undefined): string {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  if (!raw) return 'Not resolved';
+  const clean = raw.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 512);
+  return clean || 'Not resolved';
+}
+
+function versionStateSignature(state: ToolVersionScanState | null): string {
+  if (!state) return 'none';
+  return JSON.stringify({
+    status: state.status,
+    inspected_registry_revision: state.inspectedRegistryRevision,
+    error: state.error,
+    inspections: state.inspections,
+  });
+}
+
 function secretTone(value: string): Tone {
   const status = value.trim().toLowerCase();
   if (status === 'configured' || status === 'available') return 'ok';
@@ -530,7 +570,9 @@ function findRegisteredToolForDiscovery(
     tools.find(
       (tool) =>
         tool.adapter === setup.adapter &&
-        (tool.executable_path ?? '').trim() === path
+        // A null or blank executable_path is automatic system resolution, not a mismatch.
+        ((tool.executable_path ?? '').trim() === path ||
+          !(tool.executable_path ?? '').trim())
     ) ?? null
   );
 }
@@ -555,9 +597,13 @@ export class ToolsPage {
   private snapshot: RegistrySnapshot | null = null;
   private renderedRevision: number | null = null;
   private renderedDiscoverySig: string | null = null;
+  private renderedVersionSig: string | null = null;
   private discoveredTools: readonly ToolsDiscoveryItem[] = [];
   private discoveryLoading = false;
   private discoveryError: string | null = null;
+  private versionState: ToolVersionScanState | null = null;
+  private onRecheckVersions: (() => void) | null = null;
+  private onToolInspectionChanged: ((registryRevision: number) => void) | null = null;
   private disposed = false;
   private notice: Notice | null = null;
   private pending = new Set<string>();
@@ -598,8 +644,15 @@ export class ToolsPage {
       if (context.tools !== undefined) this.discoveredTools = context.tools;
       if (context.loading !== undefined) this.discoveryLoading = context.loading;
       if (context.error !== undefined) this.discoveryError = context.error;
+      if (context.versions !== undefined) this.versionState = context.versions;
       if (context.onRefreshDiscovery !== undefined) {
         this.onRefreshDiscovery = context.onRefreshDiscovery;
+      }
+      if (context.onRecheckVersions !== undefined) {
+        this.onRecheckVersions = context.onRecheckVersions;
+      }
+      if (context.onToolInspectionChanged !== undefined) {
+        this.onToolInspectionChanged = context.onToolInspectionChanged;
       }
       if (context.onOpenProfiles !== undefined) {
         this.onOpenProfiles = context.onOpenProfiles;
@@ -615,10 +668,11 @@ export class ToolsPage {
         executable_path: item.executable_path,
       })),
     });
-    const needsRender =
-      this.root === null ||
-      this.renderedRevision !== snapshot.revision ||
-      this.renderedDiscoverySig !== discoverySig;
+    const versionSig = versionStateSignature(this.versionState);
+    const revisionChanged = this.renderedRevision !== snapshot.revision;
+    const discoveryChanged = this.renderedDiscoverySig !== discoverySig;
+    const versionChanged = this.renderedVersionSig !== versionSig;
+    const needsRender = this.root === null || revisionChanged || discoveryChanged || versionChanged;
     this.snapshot = snapshot;
     if (this.newTool.baseRevision < 0) this.newTool.baseRevision = snapshot.revision;
     if (this.newModel.baseRevision < 0) this.newModel.baseRevision = snapshot.revision;
@@ -636,8 +690,49 @@ export class ToolsPage {
       });
     this.root = root;
     this.renderedDiscoverySig = discoverySig;
-    if (needsRender) this.rewrite();
+    if (needsRender) {
+      if (!revisionChanged && !discoveryChanged && versionChanged) {
+        // A background version result must not rebuild open forms or move focus.
+        this.patchVersionSections();
+      } else {
+        this.rewrite();
+      }
+    }
+    this.renderedVersionSig = versionSig;
     return root;
+  }
+
+  private patchVersionSections(): void {
+    const root = this.root;
+    const snapshot = this.snapshot;
+    if (!root || !snapshot) return;
+    const active =
+      typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const restoreKey =
+      active !== null && root.contains(active) ? active.dataset.focusKey ?? null : null;
+
+    const overview = root.querySelector<HTMLElement>('[data-version-slot="overview"]');
+    const overviewNode = this.buildVersionOverview();
+    if (overview) {
+      overview.replaceChildren(...(overviewNode ? [overviewNode] : []));
+    }
+
+    const toolById = new Map(snapshot.tools.map((tool) => [tool.id, tool]));
+    for (const slot of root.querySelectorAll<HTMLElement>('[data-tool-version-slot]')) {
+      const toolId = slot.dataset.toolVersionSlot;
+      const tool = toolId ? toolById.get(toolId) : undefined;
+      const panel = tool ? this.buildToolVersionPanel(tool) : null;
+      slot.replaceChildren(...(panel ? [panel] : []));
+    }
+
+    if (restoreKey) {
+      const restored = findByFocusKey(root, restoreKey);
+      if (restored && !(restored as { disabled?: boolean }).disabled) {
+        restored.focus({ preventScroll: true });
+      }
+    }
   }
 
   configureDiscoveredTool(toolId: string, label: string, executablePath: string): void {
@@ -679,7 +774,7 @@ export class ToolsPage {
         id: uniqueToolId(setup.idBase, this.snapshot.tools),
         label: setup.label,
         adapter: setup.adapter,
-        executable: path,
+        executable: '',
         enabled: true,
         baseRevision: this.snapshot.revision,
         dirty: true,
@@ -690,7 +785,7 @@ export class ToolsPage {
       this.notice = {
         tone: 'info',
         title: 'Customize before adding',
-        text: `Prefilled ${setup.label} from local PATH discovery. Review or adjust settings below, then click Save and choose models or Cancel.`,
+        text: `Prefilled ${setup.label} to use automatic system resolution. The detected command is not pinned to a canonical path; enter a custom executable only if you want an override. Review below, then click Save and choose models or Cancel.`,
       };
       this.rewrite();
       this.focusAndScroll('new-tool-label');
@@ -732,6 +827,10 @@ export class ToolsPage {
     this.snapshot = null;
     this.renderedRevision = null;
     this.renderedDiscoverySig = null;
+    this.renderedVersionSig = null;
+    this.versionState = null;
+    this.onRecheckVersions = null;
+    this.onToolInspectionChanged = null;
     this.notice = null;
     this.root?.replaceChildren();
     this.root = null;
@@ -762,7 +861,7 @@ export class ToolsPage {
       id: uniqueToolId(setup.idBase, this.snapshot.tools),
       label: setup.label,
       adapter: setup.adapter,
-      executable_path: path,
+      executable_path: null,
       enabled: true,
     };
     const key = `add-choose:${toolId}`;
@@ -792,10 +891,11 @@ export class ToolsPage {
         tone: 'info',
         title: `${tool.label} added`,
         text: openModelsAfter
-          ? `Saved ${tool.label} and reading its model catalog. Select the models you want to use in Profiles.`
-          : `Saved ${tool.label} at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
+          ? `Saved ${tool.label} with automatic system resolution and reading its model catalog. Select the models you want to use in Profiles.`
+          : `Saved ${tool.label} with automatic system resolution at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
       };
     });
+    if (saved && this.snapshot) this.requestToolInspectionRecheck(this.snapshot.revision);
     if (saved && openModelsAfter && !this.disposed && this.openPickers.has(tool.id)) {
       await this.probe(tool);
       if (!this.disposed && this.openPickers.has(tool.id)) {
@@ -1024,6 +1124,14 @@ export class ToolsPage {
     }
   }
 
+  private requestToolInspectionRecheck(registryRevision: number): void {
+    try {
+      this.onToolInspectionChanged?.(registryRevision);
+    } catch {
+      // Version inspection is advisory and must not fail a saved registry change.
+    }
+  }
+
   private build(snapshot: RegistrySnapshot): Node[] {
     const nodes: Node[] = [this.buildHeader(snapshot)];
     if (this.notice) nodes.push(this.buildNotice(this.notice));
@@ -1052,7 +1160,7 @@ export class ToolsPage {
         h(
           'p',
           { className: 'aq-note' },
-          'Add detected CLIs, choose models from their catalog, and assign them in Profiles. Nothing is probed or executed in the background.'
+          'Add detected CLIs, choose models from their catalog, and assign them in Profiles. Version-only checks run at startup; model catalogs and logins are never probed in the background.'
         )
       ),
       h(
@@ -1261,7 +1369,7 @@ export class ToolsPage {
           h(
             'p',
             { className: 'aq-note' },
-            'Step 1: Add a detected CLI or custom tool. Step 2: Click Choose models and add the models you want to assign in Profiles.'
+            'Step 1: Add a detected CLI with automatic system resolution or a custom tool. Step 2: Click Choose models and add the models you want to assign in Profiles.'
           )
         ),
         h(
@@ -1278,6 +1386,11 @@ export class ToolsPage {
           refreshBtn,
           customToggleBtn
         )
+      ),
+      h(
+        'div',
+        { 'data-version-slot': 'overview' },
+        this.buildVersionOverview()
       ),
       this.discoveryError
         ? h(
@@ -1347,6 +1460,242 @@ export class ToolsPage {
                 )
               )
             )
+          )
+        : null
+    );
+  }
+
+  private buildVersionOverview(): HTMLElement {
+    const state = this.versionState;
+    const status = state?.status ?? 'idle';
+    const loading = status === 'loading';
+    const hasRun =
+      state !== null &&
+      (state.inspectedRegistryRevision !== null || status === 'stale' || status === 'error');
+    const buttonLabel = loading ? 'Checking versions…' : hasRun ? 'Recheck versions' : 'Check versions';
+    const note =
+      status === 'loading'
+        ? 'Checking enabled local CLI tools in the background with version-only commands. Editing stays available.'
+        : status === 'ready'
+          ? 'Versions are CLI-reported; login, catalog, and entitlement are not checked.'
+          : status === 'stale'
+            ? 'The registry changed since these versions were checked. Recheck versions to match the current tools.'
+            : status === 'error'
+              ? safeText(state?.error ?? '', 'Version checks could not complete.')
+              : 'The startup version check is waiting for the initial registry snapshot.';
+    const recheck = this.button(
+      buttonLabel,
+      () => this.onRecheckVersions?.(),
+      'tool-versions-recheck',
+      undefined,
+      loading || !this.onRecheckVersions
+    );
+    recheck.dataset.action = 'recheck-tool-versions';
+    recheck.dataset.focus = 'tool-versions-recheck';
+    recheck.setAttribute('aria-label', hasRun ? 'Recheck installed tool versions' : 'Check installed tool versions');
+
+    return h(
+      'div',
+      {
+        className: 'aq-tools-version-overview',
+        'data-tone': status === 'error' ? 'danger' : status === 'stale' ? 'warn' : undefined,
+        role: status === 'error' ? 'alert' : undefined,
+        'aria-live': 'polite',
+      },
+      h(
+        'div',
+        { className: 'aq-tools-version-overview-copy' },
+        h('span', { className: 'aq-tools-version-overview-title' }, 'Installed CLI versions'),
+        h('p', { className: 'aq-tools-hint' }, note)
+      ),
+      h(
+        'div',
+        { className: 'aq-tools-version-overview-actions' },
+        recheck,
+        h(
+          'span',
+          { className: 'aq-tools-hint' },
+          'Version-only checks do not install or update packages.'
+        )
+      )
+    );
+  }
+
+  private buildToolVersionPanel(tool: ToolDefinition): HTMLElement | null {
+    const state = this.versionState;
+    const inspection = state ? findToolVersionInspection(state, tool.id) : null;
+    const loading = state?.status === 'loading';
+    const localCli = providerFor(tool.adapter) === null;
+
+    if (!inspection) {
+      if (loading && tool.enabled && localCli) {
+        return h(
+          'p',
+          { className: 'aq-tools-version-loading', role: 'status' },
+          `Checking the installed version for ${tool.label}…`
+        );
+      }
+      if (state?.status === 'ready' && tool.enabled && localCli) {
+        return h(
+          'p',
+          { className: 'aq-tools-hint' },
+          'No version result was returned for this tool. Recheck versions or reload the registry.'
+        );
+      }
+      return null;
+    }
+
+    const availability = inspection.availability;
+    const custom = inspection.selection_mode === 'custom';
+    const head = h(
+      'div',
+      { className: 'aq-tools-version-head' },
+      h('span', { className: 'aq-tools-version-title' }, 'Installed version'),
+      h(
+        'div',
+        { className: 'aq-tools-badges' },
+        h(
+          'span',
+          {
+            className: 'aq-badge',
+            'data-status': versionAvailabilityStatus(availability),
+          },
+          versionAvailabilityLabel(availability)
+        ),
+        availability !== 'api_only'
+          ? h('span', { className: 'aq-badge' }, custom ? 'Custom mode' : 'System mode')
+          : null
+      )
+    );
+
+    if (availability === 'api_only') {
+      return h(
+        'section',
+        {
+          className: 'aq-tools-version',
+          'data-availability': availability,
+          'aria-label': `Version details for ${tool.label}`,
+        },
+        head,
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          safeText(
+            inspection.message,
+            'This API adapter has no local executable version. No local process is started.'
+          )
+        )
+      );
+    }
+
+    if (availability === 'disabled') {
+      return h(
+        'section',
+        {
+          className: 'aq-tools-version',
+          'data-availability': availability,
+          'aria-label': `Version details for ${tool.label}`,
+        },
+        head,
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          safeText(
+            inspection.message,
+            'This tool is disabled, so no version process was started. Enable it to include it in version checks.'
+          )
+        )
+      );
+    }
+
+    const versionFact = (label: string, value: string, path = false): HTMLElement =>
+      h(
+        'div',
+        undefined,
+        h('dt', undefined, label),
+        h('dd', undefined, path ? h('code', { className: 'aq-tools-version-path' }, value) : value)
+      );
+
+    const facts = h(
+      'dl',
+      { className: 'aq-tools-version-facts' },
+      versionFact(
+        'Version',
+        inspection.version ? safeText(inspection.version, 'Not reported') : 'Not reported'
+      ),
+      versionFact('Resolved path', safePath(inspection.resolved_path), true),
+      custom
+        ? versionFact('Saved custom path', safePath(inspection.configured_path), true)
+        : null,
+      custom
+        ? versionFact(
+            'System version',
+            inspection.system_version
+              ? safeText(inspection.system_version, 'Not reported')
+              : 'Not reported'
+          )
+        : null,
+      custom
+        ? versionFact('System path', safePath(inspection.system_path), true)
+        : null
+    );
+
+    const comparisonNote =
+      custom && inspection.system_path_differs
+        ? 'This tool uses its custom path. The system command resolves to a different path; its version is shown separately and is not treated as newer or as a replacement.'
+        : custom && inspection.system_path === null
+          ? 'This tool uses its custom path. No system command was resolved for comparison; the saved custom path is unchanged until you choose Use system.'
+          : custom
+            ? 'This tool keeps a custom selection even when its current path matches the system resolution. Choose Use system to switch to automatic resolution.'
+            : null;
+
+    const busy =
+      this.pending.has(`tool-use-system:${tool.id}`) || this.pending.has(`tool-save:${tool.id}`);
+    const useSystemHint = inspection.system_path
+      ? 'Use system saves automatic system resolution for this tool with the revision-checked registry. It does not change models, efforts, profile assignments, or running approvals, and it does not install or update packages.'
+      : 'Use system saves automatic system resolution even though no system command is currently resolved. The next check will report its status. It does not install packages or change models, efforts, profile assignments, or approvals.';
+    const useSystemHintId = this.id(`tool-${tool.id}-use-system-hint`);
+    const useSystemButton = this.button(
+      busy ? 'Saving system selection…' : 'Use system',
+      () => void this.useSystemInstallation(tool),
+      `tool-${tool.id}-use-system`,
+      'primary',
+      busy
+    );
+    useSystemButton.setAttribute('aria-label', `Use system installation for ${tool.label}`);
+    useSystemButton.setAttribute('aria-describedby', useSystemHintId);
+
+    return h(
+      'section',
+      {
+        className: 'aq-tools-version',
+        'data-availability': availability,
+        'data-mode': custom ? 'custom' : 'system',
+        'aria-label': `Version details for ${tool.label}`,
+      },
+      head,
+      facts,
+      comparisonNote ? h('p', { className: 'aq-tools-hint' }, comparisonNote) : null,
+      inspection.message
+        ? h(
+            'p',
+            { className: 'aq-tools-message' },
+            safeText(inspection.message, 'Version check completed without a message.')
+          )
+        : null,
+      inspection.error_code
+        ? h(
+            'p',
+            { className: 'aq-tools-inline-error' },
+            h('code', { className: 'aq-tools-code' }, safeText(inspection.error_code, 'version_error'))
+          )
+        : null,
+      custom
+        ? h(
+            'div',
+            { className: 'aq-tools-version-action' },
+            useSystemButton,
+            h('p', { className: 'aq-tools-hint', id: useSystemHintId }, useSystemHint)
           )
         : null
     );
@@ -1436,7 +1785,7 @@ export class ToolsPage {
       h(
         'p',
         { className: 'aq-tools-hint' },
-        'Add and choose models saves this detected CLI to the registry and reads its model catalog without running a task.'
+        'Add and choose models saves this CLI with automatic system resolution, then reads its model catalog without running a task. The detected path is not pinned.'
       ),
       isConfiguringInline
         ? this.buildCreateTool(snapshot, item)
@@ -1447,7 +1796,7 @@ export class ToolsPage {
             h(
               'p',
               { className: 'aq-tools-hint' },
-              `Executable: ${path} · Adapter: ${ADAPTER_LABELS[setup.adapter]} · Default ID: ${defaultId}`
+              `Detected now: ${path} · Adapter: ${ADAPTER_LABELS[setup.adapter]} · Default ID: ${defaultId}. New tools use automatic system resolution unless a custom path is entered.`
             )
           )
     );
@@ -1568,7 +1917,7 @@ export class ToolsPage {
             this.field(
               'Executable path',
               executable,
-              'Optional absolute path for CLI tools. Never executed until you explicitly load models or run a task.'
+              'Leave blank to use automatic system resolution. Enter an absolute path only for a custom override. Never executed until you explicitly load models or run a task.'
             )
           )
         ),
@@ -1755,6 +2104,11 @@ export class ToolsPage {
           )
         )
       ),
+      h(
+        'div',
+        { 'data-tool-version-slot': tool.id },
+        this.buildToolVersionPanel(tool)
+      ),
       using.length === 0 && !pickerOpen && !open
         ? h(
             'p',
@@ -1793,7 +2147,7 @@ export class ToolsPage {
                 this.field(
                   'Executable path',
                   executable,
-                  'Custom path applies to this tool only. Save before loading models from a changed path.'
+                  'Leave blank to use the system command. A custom path applies to this tool only; save before loading models from a changed path.'
                 )
               ),
               this.buildStatus(provider, probe),
@@ -3518,6 +3872,9 @@ export class ToolsPage {
       draft.executable === submittedState.executable &&
       draft.enabled === submittedState.enabled;
 
+    const provider = providerFor(tool.adapter);
+    const resolutionNote =
+      provider === null && tool.executable_path === null ? ' with automatic system resolution' : '';
     let openModelsAfter = false;
     const saved = await this.apply('tool-create', { op: 'upsert_tool', tool }, (next) => {
       if (isSameCreateDraft()) {
@@ -3537,12 +3894,14 @@ export class ToolsPage {
         title: `${tool.label} added`,
         text:
           chooseModelsAfter && openModelsAfter
-            ? `Added "${tool.label}" at revision ${next.revision} and reading its model catalog.`
-            : `Added tool "${tool.label}" at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
+            ? `Added "${tool.label}"${resolutionNote} at revision ${next.revision} and reading its model catalog.`
+            : `Added tool "${tool.label}"${resolutionNote} at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
       };
     });
+    if (saved && provider === null && this.snapshot) {
+      this.requestToolInspectionRecheck(this.snapshot.revision);
+    }
     if (saved && openModelsAfter && !this.disposed && this.openPickers.has(tool.id)) {
-      const provider = providerFor(tool.adapter);
       if (provider === null) {
         await this.probe(tool);
         if (!this.disposed && this.openPickers.has(tool.id)) {
@@ -3586,7 +3945,7 @@ export class ToolsPage {
         current.enabled === submittedState.enabled
       );
     };
-    await this.apply(
+    const saved = await this.apply(
       `tool-save:${tool.id}`,
       { op: 'upsert_tool', tool: value },
       (next) => {
@@ -3617,6 +3976,34 @@ export class ToolsPage {
         }
       }
     );
+    const inspectionInputsChanged =
+      (tool.executable_path ?? '') !== (value.executable_path ?? '') ||
+      tool.enabled !== value.enabled ||
+      tool.adapter !== value.adapter;
+    if (
+      saved &&
+      inspectionInputsChanged &&
+      this.snapshot &&
+      (providerFor(tool.adapter) === null || providerFor(value.adapter) === null)
+    ) {
+      this.requestToolInspectionRecheck(this.snapshot.revision);
+    }
+  }
+
+  private async useSystemInstallation(tool: ToolDefinition): Promise<void> {
+    if (!this.snapshot || this.disposed || tool.executable_path === null) return;
+    const saved = await this.apply(
+      `tool-use-system:${tool.id}`,
+      { op: 'upsert_tool', tool: { ...tool, executable_path: null } },
+      (next) => {
+        this.notice = {
+          tone: 'success',
+          title: 'System installation selected',
+          text: `Saved "${tool.label}" to use automatic system resolution at revision ${next.revision}. Models, efforts, profile assignments, and running approvals were not changed.`,
+        };
+      }
+    );
+    if (saved && this.snapshot) this.requestToolInspectionRecheck(this.snapshot.revision);
   }
 
   private async deleteTool(tool: ToolDefinition): Promise<void> {

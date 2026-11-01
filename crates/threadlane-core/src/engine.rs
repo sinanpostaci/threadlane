@@ -971,6 +971,21 @@ impl Core {
         Ok(notice)
     }
 
+    /// Atomically rearms a `WakeupStatus::Failed` notice back to `WakeupStatus::Pending` when
+    /// `expected_claim_id` matches the binding's current live claim inside a single SQLite
+    /// compare-and-swap transaction.
+    ///
+    /// Never rearms `WakeupStatus::Unknown` (which must be reconciled via `pull_events` and
+    /// `ack_events`) or any non-`Failed` state.
+    pub fn rearm_failed_wakeup(
+        &mut self,
+        binding_id: &str,
+        expected_claim_id: &str,
+        now_ms: i64,
+    ) -> Result<WakeupNotice, CoreError> {
+        self.retry_wakeup(binding_id, expected_claim_id, false, now_ms)
+    }
+
     /// Lists persisted manual wake-up retry audit records for `binding_id` in chronological order.
     pub fn list_wakeup_retries(
         &self,

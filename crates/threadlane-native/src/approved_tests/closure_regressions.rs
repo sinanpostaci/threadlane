@@ -486,3 +486,109 @@ async fn caller_cancellation_during_final_enrollment_lock_never_spawns_host() {
         "caller cancellation must not become a detached spawn before the 2s startup deadline"
     );
 }
+
+/// A held per-binding conversation-change advancement lock
+/// during direct MCP `start_approved_task` admission must respect the approved-host startup deadline
+/// instead of blocking for the full duration of the lock holder, and must never spawn `threadlane-host`
+/// or a worker before or after the lock is released.
+#[tokio::test]
+async fn initial_conversation_change_lock_is_bounded_by_startup_deadline_and_never_spawns_late() {
+    let fixture = setup_approved_mcp_fixture().await;
+
+    let (plan_revision, plan_digest) = create_published_plan(
+        &fixture,
+        "plan-conversation-change-lock-deadline",
+        &fixture.binding_a,
+        default_plan_tasks("Synthetic conversation-change lock deadline regression"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-conversation-change-lock-deadline",
+        plan_revision,
+        &plan_digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_001_300_000,
+    );
+
+    let spy_exe = fixture.root.join("bin/spy-change-lock-host");
+    let spy_count = fixture.root.join("spy-change-lock-count.txt");
+    let spy_argv = fixture.root.join("spy-change-lock-argv.txt");
+    let spy_pid = fixture.root.join("spy-change-lock-pid.txt");
+    write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+    let policy = ApprovedHostLauncherPolicy::new(&spy_exe)
+        .expect("valid synthetic change-lock host policy")
+        .with_startup_timeout(Duration::from_millis(250))
+        .expect("250ms startup timeout");
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create change-lock test MCP server")
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+        .with_host_launcher_policy(policy)
+        .expect("attach change-lock test launcher policy");
+    enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+    let plans_dir = fixture.authority.plans().dir().to_path_buf();
+    let binding_for_lock = fixture.binding_a.clone();
+    let guard = crate::conversation_change::acquire_conversation_advancement_guard(
+        &plans_dir,
+        &binding_for_lock,
+    )
+    .await
+    .expect("acquire the actual per-binding advancement lock");
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
+    let change_lock_holder = std::thread::spawn(move || {
+        let _ = locked_tx.send(());
+        std::thread::sleep(Duration::from_millis(800));
+        drop(guard);
+    });
+    tokio::time::timeout(Duration::from_millis(500), locked_rx)
+        .await
+        .expect("synthetic conversation-change lock holder must signal acquisition")
+        .expect("synthetic conversation-change lock holder must acquire before timing out");
+
+    let started = Instant::now();
+    let request_result = mcp
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": approval.approval_id,
+                "task_id": "task-root-agy"
+            }),
+            None,
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    tokio::task::spawn_blocking(move || {
+        change_lock_holder
+            .join()
+            .expect("synthetic conversation-change lock holder must not panic");
+    })
+    .await
+    .expect("conversation-change lock holder join task must complete");
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let err_result = request_result
+        .expect_err("start_approved_task must fail closed while conversation-change lock is held");
+    let err_payload = err_result
+        .structured_content
+        .expect("structured error payload");
+    assert_eq!(err_payload["error"]["code"], "host_not_ready");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "conversation-change lock wait must respect the 250ms startup deadline (elapsed: {elapsed:?})"
+    );
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "a timed-out conversation-change lock wait must never spawn threadlane-host, before or after release"
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        0,
+        "no approved worker task may be dispatched without a started host"
+    );
+}

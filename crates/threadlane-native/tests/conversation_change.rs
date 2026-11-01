@@ -12,20 +12,24 @@ use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
 use threadlane_authority::{ApprovalRecord, AuthorityStore, OperatorApprovalRequest};
 use threadlane_host::{
     ApprovedHost, ApprovedHostClient, ApprovedHostConfig, ApprovedHostHandle, TaskExecutionStatus,
+    TaskStateSnapshot,
 };
 use threadlane_native::{
-    inspect_unresolved_blocking_changes, ConversationCancelAction, ConversationChangeDecisionKind,
-    ConversationChangeKind, ConversationChangePage, ConversationChangePreview,
-    ConversationChangeRecord, ConversationChangeRequest, ConversationChangeResolutionKind,
-    ConversationChangeRoute, ConversationChangeStatus, ConversationChangeStore,
-    ConversationDeliveryRequest, LiveInputSupportStatus, ObservedTaskStopState, PlanStore,
-    RegistryStore, ResolveConversationChangeRequest, CONVERSATION_CHANGE_NAMESPACE_DIR,
+    acquire_conversation_advancement_guard, dispatch_approved_task_guarded,
+    inspect_unresolved_blocking_changes, ApprovedHostLauncherPolicy, ConversationCancelAction,
+    ConversationChangeDecisionKind, ConversationChangeKind, ConversationChangePage,
+    ConversationChangePreview, ConversationChangeRecord, ConversationChangeRequest,
+    ConversationChangeResolutionKind, ConversationChangeRoute, ConversationChangeStatus,
+    ConversationChangeStore, ConversationDeliveryRequest, GuardedDispatchError,
+    LiveInputSupportStatus, ObservedTaskStopState, OperatorEnrollRequest, PairedMcpServer,
+    PairingStore, PlanStore, RegistryStore, ResolveConversationChangeRequest,
+    CONVERSATION_CHANGE_NAMESPACE_DIR,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -66,6 +70,21 @@ struct ChangeRoutingFixture {
 }
 
 impl ChangeRoutingFixture {
+    fn task_dispatch_intent(&self, task_id: &str) -> Option<threadlane_host::TaskDispatchIntent> {
+        let dir = self.sessions_dir.join(&self.approval_a.approval_id);
+        if !dir.exists() {
+            return None;
+        }
+        let manifest = threadlane_host::read_host_manifest_optional(&dir, &self.approval_a)
+            .expect("read host manifest")
+            .expect("existing session has a manifest");
+        let binding = manifest
+            .session_binding_id
+            .expect("started host has a binding");
+        threadlane_host::read_task_dispatch_intent(&dir, &self.approval_a, &binding, task_id)
+            .expect("read verified dispatch intent")
+    }
+
     async fn start() -> Self {
         let tmp = TempDir::new().expect("create tempdir");
         let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
@@ -410,6 +429,41 @@ impl ChangeRoutingFixture {
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0)
     }
+
+    fn enrolled_mcp_server_a(&self, host_launcher_exe: Option<PathBuf>) -> PairedMcpServer {
+        let root = self.requests_dir.parent().expect("fixture root");
+        let pairing_dir =
+            create_private_dir(root, &format!("pairing-store-{}", uuid::Uuid::new_v4()));
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open PairingStore");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+        let server = PairedMcpServer::new(&self.state_dir, pairing_store.clone())
+            .expect("create PairedMcpServer")
+            .with_workflow_stores(Arc::clone(&self.registry), Arc::clone(&self.plans))
+            .with_host_stores(Arc::clone(&self.authority), self.sessions_dir.clone());
+        let server = match host_launcher_exe {
+            Some(exe) => {
+                let policy = ApprovedHostLauncherPolicy::new(exe)
+                    .expect("create ApprovedHostLauncherPolicy");
+                server
+                    .with_host_launcher_policy(policy)
+                    .expect("attach host launcher policy")
+            }
+            None => server,
+        };
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: server.connection_nonce().to_string(),
+                    epoch_id: server.epoch_id().to_string(),
+                    binding_id: self.binding_a.clone(),
+                    thread_id: THREAD_A.to_string(),
+                    project_id: None,
+                },
+            )
+            .expect("enroll MCP server for binding A");
+        server
+    }
 }
 
 fn create_private_dir(root: &Path, name: &str) -> PathBuf {
@@ -554,7 +608,14 @@ case "$PROMPT" in
 esac
 
 if [ -d "src" ]; then
-    printf "pub fn base() -> u32 {{ 42 }}\n" > "src/lib.rs"
+    case "$PROMPT" in
+        *"Independent check"*)
+            printf "pub fn dep() -> u32 {{ 42 }}\n" > "src/dep.rs"
+            ;;
+        *)
+            printf "pub fn base() -> u32 {{ 42 }}\n" > "src/lib.rs"
+            ;;
+    esac
 fi
 
 printf '{{"type":"result","subtype":"success","session_id":"sess-agy-chg","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
@@ -1787,6 +1848,623 @@ async fn plan_only_resolution_cannot_hide_an_active_approved_execution() {
         TaskExecutionStatus::Running
     );
     assert_eq!(fx.worker_invocation_count(), 1);
+    host.shutdown().await.expect("shutdown host");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_cli_and_mcp_dispatch_enforce_pending_task_and_plan_blocks_while_allowing_questions_and_unaffected_siblings(
+) {
+    let mut fx = ChangeRoutingFixture::start().await;
+    let client_a = fx.host_client_a();
+    let store = fx.change_store();
+
+    // Configure a fake host launcher executable that would touch a marker file if ever spawned.
+    let root = fx.requests_dir.parent().expect("fixture root");
+    let fake_host_marker = root.join("host-autostart-invoked.flag");
+    let fake_host_exe = root.join("bin/fake-threadlane-host");
+    {
+        let script = format!(
+            "#!/usr/bin/env bash\necho invoked > \"{}\"\nexit 1\n",
+            fake_host_marker.display()
+        );
+        let mut f = File::create(&fake_host_exe).expect("create fake host exe");
+        f.write_all(script.as_bytes()).expect("write fake host exe");
+        f.sync_all().expect("sync fake host exe");
+        fs::set_permissions(&fake_host_exe, fs::Permissions::from_mode(0o700))
+            .expect("chmod fake host exe 0700");
+    }
+    let mcp_with_launcher = fx.enrolled_mcp_server_a(Some(fake_host_exe));
+
+    // 1. Record a pending clarification on task-1 (which also blocks dependent task-2, leaving task-3 unaffected).
+    let clarify_req = ConversationChangeRequest {
+        request_key: "req-direct-dispatch-clarify-task-1".to_string(),
+        expected_change_revision: 0,
+        approval_id: Some(fx.approval_a.approval_id.clone()),
+        plan_id: Some(PLAN_ID.to_string()),
+        expected_plan_revision: Some(1),
+        task_id: Some("task-1".to_string()),
+        expected_task_revision: None,
+        kind: ConversationChangeKind::Clarification,
+        route: None,
+        summary: "Clarify task-1 error format before starting.".to_string(),
+        detail: None,
+        proposed_write_paths: vec!["src/lib.rs".to_string()],
+        proposed_profile_id: None,
+        proposed_model_id: None,
+        proposed_effort: None,
+        requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+        cancel_action: None,
+    };
+    let clarify_record = store
+        .record_change(
+            &fx.binding_a,
+            THREAD_A,
+            &clarify_req,
+            &fx.plans,
+            &fx.authority,
+            &client_a,
+        )
+        .await
+        .expect("record task-1 clarification");
+
+    // 2. Before any host is started, MCP `start_approved_task` with `ApprovedHostLauncher` attached
+    //    must reject `task-1` BEFORE host auto-start, plan materialization, or dispatch intent.
+    let mcp_pre_host_err = mcp_with_launcher
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": fx.approval_a.approval_id,
+                "task_id": "task-1",
+            }),
+            None,
+        )
+        .await
+        .expect_err("MCP start_approved_task must reject blocked task-1 before host auto-start");
+    let mcp_pre_host_payload = mcp_pre_host_err
+        .structured_content
+        .expect("structured error payload");
+    assert_eq!(
+        mcp_pre_host_payload["error"]["code"],
+        "blocked_by_conversation_change"
+    );
+    assert!(
+        !fake_host_marker.exists(),
+        "ApprovedHostLauncher must not be invoked when conversation change blocks task dispatch"
+    );
+    assert!(
+        !fx.sessions_dir.join(&fx.approval_a.approval_id).exists(),
+        "no host session directory or launch intent may be created when blocked"
+    );
+    assert!(
+        fx.task_dispatch_intent("task-1").is_none(),
+        "no TaskDispatchIntent may be written when blocked"
+    );
+    assert_eq!(fx.worker_invocation_count(), 0);
+
+    // 3. Start the approved host for `approval_a` and verify CLI `dispatch` and MCP `start_approved_task`
+    //    parity: both reject `task-1` and downstream dependent `task-2` with `blocked_by_conversation_change`,
+    //    zero worker spawns, and zero dispatch intents.
+    let host = fx.start_host_for_approval(&fx.approval_a.approval_id).await;
+    let mcp_a = fx.enrolled_mcp_server_a(None);
+
+    for blocked_task in ["task-1", "task-2"] {
+        let cli_out = fx
+            .run_session_cli(
+                &fx.binding_a,
+                THREAD_A,
+                &[
+                    "dispatch",
+                    "--approval-id",
+                    &fx.approval_a.approval_id,
+                    "--task-id",
+                    blocked_task,
+                    "--confirm-approval",
+                    &fx.approval_a.subject_digest,
+                    "--operator-approved",
+                ],
+            )
+            .await;
+        let (cli_code, cli_message) = parse_cli_error(&cli_out);
+        assert_eq!(
+            cli_code, "blocked_by_conversation_change",
+            "CLI dispatch must block {blocked_task}"
+        );
+        assert!(
+            cli_message.contains("blocked"),
+            "blocked pre-effect refusal must explain the conversational block"
+        );
+
+        let mcp_err = mcp_a
+            .invoke_tool_json(
+                "start_approved_task",
+                json!({
+                    "approval_id": fx.approval_a.approval_id,
+                    "task_id": blocked_task,
+                }),
+                None,
+            )
+            .await
+            .expect_err("MCP start_approved_task must block affected task");
+        let mcp_payload = mcp_err.structured_content.expect("structured MCP error");
+        assert_eq!(
+            mcp_payload["error"]["code"], "blocked_by_conversation_change",
+            "MCP start_approved_task must block {blocked_task}"
+        );
+
+        assert!(
+            fx.task_dispatch_intent(blocked_task).is_none(),
+            "zero TaskDispatchIntent allowed for blocked {blocked_task}"
+        );
+    }
+    assert_eq!(fx.worker_invocation_count(), 0);
+
+    // 4. Record a read-only `question_or_status` observation on sibling `task-3` and verify that
+    //    neither `task-1`'s pending clarification nor `task-3`'s `question_or_status` record blocks
+    //    `task-3` from dispatching.
+    let question_req = ConversationChangeRequest {
+        request_key: "req-question-on-task-3".to_string(),
+        expected_change_revision: 1,
+        approval_id: Some(fx.approval_a.approval_id.clone()),
+        plan_id: Some(PLAN_ID.to_string()),
+        expected_plan_revision: Some(1),
+        task_id: Some("task-3".to_string()),
+        expected_task_revision: Some(0),
+        kind: ConversationChangeKind::QuestionOrStatus,
+        route: None,
+        summary: "Status check on independent sibling task-3.".to_string(),
+        detail: None,
+        proposed_write_paths: Vec::new(),
+        proposed_profile_id: None,
+        proposed_model_id: None,
+        proposed_effort: None,
+        requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+        cancel_action: None,
+    };
+    let question_rec = store
+        .record_change(
+            &fx.binding_a,
+            THREAD_A,
+            &question_req,
+            &fx.plans,
+            &fx.authority,
+            &client_a,
+        )
+        .await
+        .expect("record question_or_status on task-3");
+    assert_eq!(
+        question_rec.decision.status,
+        ConversationChangeStatus::RecordedOnly
+    );
+    assert!(!question_rec.decision.blocks_task_advancement);
+
+    fs::write(&fx.finish_gate_file, "go\n").expect("enable finish gate for task-3");
+    let mcp_task3_ok = mcp_a
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": fx.approval_a.approval_id,
+                "task_id": "task-3",
+            }),
+            None,
+        )
+        .await
+        .expect("unaffected sibling task-3 with question_or_status must dispatch cleanly");
+    let task3_data = mcp_task3_ok.structured_content.expect("task-3 MCP result")["data"].clone();
+    let task3_snap: TaskStateSnapshot =
+        serde_json::from_value(task3_data).expect("deserialize task-3 snapshot");
+    assert_eq!(task3_snap.task_id, "task-3");
+    wait_for_task_status(
+        &client_a,
+        &fx.approval_a.approval_id,
+        "task-3",
+        TaskExecutionStatus::ReadyForReview,
+    )
+    .await;
+    assert_eq!(fx.worker_invocation_count(), 1);
+
+    // 5. Resolve `task-1`'s clarification at the checkpoint, then record an approval/plan-wide
+    //    (`task_id: None`) `scope_change` and verify it blocks `task-1` across both CLI and MCP.
+    let resolve_clarify = ResolveConversationChangeRequest {
+        request_key: "req-resolve-clarify-task-1".to_string(),
+        change_id: clarify_record.change_id,
+        expected_change_revision: 2,
+        resolution_kind: ConversationChangeResolutionKind::CheckpointHandled,
+        target_plan_revision: Some(1),
+        new_approval_id: None,
+        resolution_note: Some("Clarified before task-1 started.".to_string()),
+    };
+    store
+        .resolve_change(
+            &fx.binding_a,
+            THREAD_A,
+            &resolve_clarify,
+            &fx.plans,
+            &fx.authority,
+            &client_a,
+        )
+        .await
+        .expect("resolve task-1 clarification");
+
+    let plan_scope_req = ConversationChangeRequest {
+        request_key: "req-plan-wide-scope-change".to_string(),
+        expected_change_revision: 3,
+        approval_id: Some(fx.approval_a.approval_id.clone()),
+        plan_id: Some(PLAN_ID.to_string()),
+        expected_plan_revision: Some(1),
+        task_id: None,
+        expected_task_revision: None,
+        kind: ConversationChangeKind::ScopeChange,
+        route: None,
+        summary: "Plan-wide scope expansion adding src/extra.rs.".to_string(),
+        detail: None,
+        proposed_write_paths: vec!["src/extra.rs".to_string()],
+        proposed_profile_id: None,
+        proposed_model_id: None,
+        proposed_effort: None,
+        requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+        cancel_action: None,
+    };
+    let plan_scope_record = store
+        .record_change(
+            &fx.binding_a,
+            THREAD_A,
+            &plan_scope_req,
+            &fx.plans,
+            &fx.authority,
+            &client_a,
+        )
+        .await
+        .expect("record plan-wide scope change");
+
+    let cli_plan_blocked = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &[
+                "dispatch",
+                "--approval-id",
+                &fx.approval_a.approval_id,
+                "--task-id",
+                "task-1",
+                "--confirm-approval",
+                &fx.approval_a.subject_digest,
+                "--operator-approved",
+            ],
+        )
+        .await;
+    assert_eq!(
+        parse_cli_error(&cli_plan_blocked).0,
+        "blocked_by_conversation_change"
+    );
+
+    let mcp_plan_blocked = mcp_a
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": fx.approval_a.approval_id,
+                "task_id": "task-1",
+            }),
+            None,
+        )
+        .await
+        .expect_err("plan-wide scope_change must block task-1 over MCP");
+    assert_eq!(
+        mcp_plan_blocked.structured_content.unwrap()["error"]["code"],
+        "blocked_by_conversation_change"
+    );
+    assert!(fx.task_dispatch_intent("task-1").is_none());
+    assert_eq!(fx.worker_invocation_count(), 1);
+
+    // 6. Publish and approve revision 2 (`approval_rev2`) and resolve the `scope_change` via
+    //    `linked_plan_revision`. Verify that the superseded `approval_a` remains blocked for
+    //    direct CLI and MCP dispatch while `approval_rev2` dispatches cleanly.
+    let approval_rev2 = fx.publish_and_approve_revision_2("src/extra.rs");
+    let resolve_replan = ResolveConversationChangeRequest {
+        request_key: "req-resolve-plan-wide-scope".to_string(),
+        change_id: plan_scope_record.change_id,
+        expected_change_revision: 4,
+        resolution_kind: ConversationChangeResolutionKind::LinkedPlanRevision,
+        target_plan_revision: Some(2),
+        new_approval_id: Some(approval_rev2.approval_id.clone()),
+        resolution_note: Some("Linked fresh approval for revision 2.".to_string()),
+    };
+    store
+        .resolve_change(
+            &fx.binding_a,
+            THREAD_A,
+            &resolve_replan,
+            &fx.plans,
+            &fx.authority,
+            &client_a,
+        )
+        .await
+        .expect("resolve plan-wide scope change to rev 2");
+
+    let cli_superseded = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &[
+                "dispatch",
+                "--approval-id",
+                &fx.approval_a.approval_id,
+                "--task-id",
+                "task-1",
+                "--confirm-approval",
+                &fx.approval_a.subject_digest,
+                "--operator-approved",
+            ],
+        )
+        .await;
+    assert_eq!(
+        parse_cli_error(&cli_superseded).0,
+        "blocked_by_conversation_change"
+    );
+
+    let mcp_superseded = mcp_a
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": fx.approval_a.approval_id,
+                "task_id": "task-1",
+            }),
+            None,
+        )
+        .await
+        .expect_err("superseded approval_a must remain blocked over MCP");
+    assert_eq!(
+        mcp_superseded.structured_content.unwrap()["error"]["code"],
+        "blocked_by_conversation_change"
+    );
+    assert_eq!(fx.worker_invocation_count(), 1);
+
+    host.shutdown().await.expect("shutdown host A");
+
+    let host2 = fx.start_host_for_approval(&approval_rev2.approval_id).await;
+    let cli_rev2_ok = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &[
+                "dispatch",
+                "--approval-id",
+                &approval_rev2.approval_id,
+                "--task-id",
+                "task-1",
+                "--confirm-approval",
+                &approval_rev2.subject_digest,
+                "--operator-approved",
+            ],
+        )
+        .await;
+    let rev2_snap: TaskStateSnapshot = parse_cli_data(&cli_rev2_ok, &fx.binding_a);
+    assert_eq!(rev2_snap.approval_id, approval_rev2.approval_id);
+    assert_eq!(rev2_snap.task_id, "task-1");
+    wait_for_task_status(
+        &client_a,
+        &approval_rev2.approval_id,
+        "task-1",
+        TaskExecutionStatus::ReadyForReview,
+    )
+    .await;
+    assert_eq!(fx.worker_invocation_count(), 2);
+
+    host2.shutdown().await.expect("shutdown host 2");
+    fx.shutdown().await;
+}
+
+#[tokio::test]
+async fn direct_cli_and_mcp_dispatch_block_on_uncertain_cancellation_marker_with_zero_worker_and_intent(
+) {
+    let mut fx = ChangeRoutingFixture::start().await;
+    let host = fx.start_host_for_approval(&fx.approval_a.approval_id).await;
+    let mcp_a = fx.enrolled_mcp_server_a(None);
+
+    // Persist an unresolved before-effect cancellation marker (`ambiguous_cancels`) for `approval_a`.
+    let store = fx.change_store();
+    let client = fx.host_client_a();
+    let observation = ConversationChangeRequest {
+        request_key: "req-prepare-uncertain-fixture".to_string(),
+        expected_change_revision: 0,
+        approval_id: Some(fx.approval_a.approval_id.clone()),
+        plan_id: Some(PLAN_ID.to_string()),
+        expected_plan_revision: Some(1),
+        task_id: Some("task-1".to_string()),
+        expected_task_revision: Some(0),
+        kind: ConversationChangeKind::QuestionOrStatus,
+        route: None,
+        summary: "Prepare the actual scoped ledger before an uncertain-cancel fixture.".to_string(),
+        detail: None,
+        proposed_write_paths: vec![],
+        proposed_profile_id: None,
+        proposed_model_id: None,
+        proposed_effort: None,
+        requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+        cancel_action: None,
+    };
+    store
+        .record_change(
+            &fx.binding_a,
+            THREAD_A,
+            &observation,
+            &fx.plans,
+            &fx.authority,
+            &client,
+        )
+        .await
+        .expect("create the actual scoped change ledger");
+    let ns_dir = fx.plans_dir.join(CONVERSATION_CHANGE_NAMESPACE_DIR);
+    fs::create_dir_all(&ns_dir).expect("create conversation-changes dir");
+    fs::set_permissions(&ns_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod conversation-changes dir 0700");
+    let ledger_path = fs::read_dir(&ns_dir)
+        .expect("read owned ledger directory")
+        .map(|entry| entry.expect("directory entry").path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .expect("record_change created a ledger");
+    let mut ledger_json: Value =
+        serde_json::from_slice(&fs::read(&ledger_path).expect("read owned ledger"))
+            .expect("valid owned ledger");
+    assert_eq!(ledger_json["binding_id"], fx.binding_a);
+    ledger_json["ambiguous_cancels"] = json!([
+        {
+            "request_key": "req-uncertain-cancel-1",
+            "request_digest": "a".repeat(64),
+            "expected_change_revision": 0,
+            "approval_id": fx.approval_a.approval_id,
+            "task_id": "task-1",
+            "expected_task_revision": 1
+        }
+    ]);
+    fs::write(
+        &ledger_path,
+        serde_json::to_vec_pretty(&ledger_json).expect("serialize ledger"),
+    )
+    .expect("write ledger with ambiguous_cancels");
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod ledger 0600");
+
+    let cli_out = fx
+        .run_session_cli(
+            &fx.binding_a,
+            THREAD_A,
+            &[
+                "dispatch",
+                "--approval-id",
+                &fx.approval_a.approval_id,
+                "--task-id",
+                "task-1",
+                "--confirm-approval",
+                &fx.approval_a.subject_digest,
+                "--operator-approved",
+            ],
+        )
+        .await;
+    assert_eq!(
+        parse_cli_error(&cli_out).0,
+        "ambiguous_outcome_pending_reconciliation"
+    );
+
+    let mcp_err = mcp_a
+        .invoke_tool_json(
+            "start_approved_task",
+            json!({
+                "approval_id": fx.approval_a.approval_id,
+                "task_id": "task-1",
+            }),
+            None,
+        )
+        .await
+        .expect_err("MCP start_approved_task must block on uncertain cancellation marker");
+    assert_eq!(
+        mcp_err.structured_content.unwrap()["error"]["code"],
+        "ambiguous_outcome_pending_reconciliation"
+    );
+    assert!(fx.task_dispatch_intent("task-1").is_none());
+    assert_eq!(fx.worker_invocation_count(), 0);
+
+    host.shutdown().await.expect("shutdown host");
+    fx.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn direct_dispatch_and_record_change_serialize_on_binding_advancement_lock() {
+    let mut fx = ChangeRoutingFixture::start().await;
+    let host = fx.start_host_for_approval(&fx.approval_a.approval_id).await;
+    let client_a = fx.host_client_a();
+    let store = Arc::new(fx.change_store());
+
+    // 1. Holding the conversation advancement guard blocks `record_change` from completing until released;
+    //    once released, `record_change` persists the blocking `scope_change` and subsequent direct dispatch
+    //    fails closed with `blocked_by_conversation_change`, zero worker invocations, and zero intent.
+    let advancement_guard = acquire_conversation_advancement_guard(&fx.plans_dir, &fx.binding_a)
+        .await
+        .expect("acquire conversation advancement guard");
+
+    let store_for_task = Arc::clone(&store);
+    let binding_for_task = fx.binding_a.clone();
+    let plans_for_task = Arc::clone(&fx.plans);
+    let authority_for_task = Arc::clone(&fx.authority);
+    let client_for_task = fx.host_client_a();
+    let approval_id_for_task = fx.approval_a.approval_id.clone();
+
+    let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+    let record_handle = tokio::spawn(async move {
+        let req = ConversationChangeRequest {
+            request_key: "req-race-scope-change".to_string(),
+            expected_change_revision: 0,
+            approval_id: Some(approval_id_for_task),
+            plan_id: Some(PLAN_ID.to_string()),
+            expected_plan_revision: Some(1),
+            task_id: Some("task-1".to_string()),
+            expected_task_revision: Some(0),
+            kind: ConversationChangeKind::ScopeChange,
+            route: None,
+            summary: "Race test scope expansion on task-1.".to_string(),
+            detail: None,
+            proposed_write_paths: vec!["src/extra.rs".to_string()],
+            proposed_profile_id: None,
+            proposed_model_id: None,
+            proposed_effort: None,
+            requested_delivery: ConversationDeliveryRequest::SafeCheckpointOrReplan,
+            cancel_action: None,
+        };
+        let res = store_for_task
+            .record_change(
+                &binding_for_task,
+                THREAD_A,
+                &req,
+                &plans_for_task,
+                &authority_for_task,
+                &client_for_task,
+            )
+            .await;
+        let _ = done_tx.send(());
+        res
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut done_rx)
+            .await
+            .is_err(),
+        "record_change must block while direct-dispatch advancement guard is held"
+    );
+
+    drop(advancement_guard);
+
+    tokio::time::timeout(Duration::from_secs(5), &mut done_rx)
+        .await
+        .expect("record_change should finish once advancement guard is released")
+        .expect("done signal");
+    let recorded = record_handle
+        .await
+        .expect("join record_change")
+        .expect("record_change succeeded");
+    assert_eq!(recorded.created_change_revision, 1);
+
+    let dispatch_err = dispatch_approved_task_guarded(
+        &fx.authority,
+        &client_a,
+        &fx.binding_a,
+        THREAD_A,
+        &fx.approval_a.approval_id,
+        "task-1",
+        Some(&fx.approval_a.subject_digest),
+        || async { Ok(()) },
+    )
+    .await
+    .expect_err("direct guarded dispatch must fail after blocking change is recorded");
+    assert!(matches!(
+        dispatch_err,
+        GuardedDispatchError::PreEffect {
+            code: "blocked_by_conversation_change",
+            ..
+        }
+    ));
+    assert!(fx.task_dispatch_intent("task-1").is_none());
+    assert_eq!(fx.worker_invocation_count(), 0);
+
     host.shutdown().await.expect("shutdown host");
     fx.shutdown().await;
 }

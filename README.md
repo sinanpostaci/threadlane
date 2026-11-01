@@ -53,6 +53,15 @@ not require switching to the panel for each task. See
 
 ### Optional Approved-Session Controls
 
+- **Installed CLI versions**: The desktop checks enabled local tools once per
+  startup, with manual refresh and explicit System/Custom executable selection.
+  Current Nix profile discovery avoids stale desktop-bundled Codex paths. See
+  [tool installations](docs/TOOL-INSTALLATIONS.md).
+
+- **Crash recovery**: Task state and events are persisted; interrupted workers
+  become unknown and are reconciled before continuation. Provider requests are
+  never blindly replayed. See [recovery and current limits](docs/RECOVERY.md).
+
 - **Packaged context commands**: `threadlane-context --context /private/context.json
   check` validates the selected private context and live target. Use the same
   prefix with `workflow ...`, `flow ...`, `session ...` or `advice ...` for

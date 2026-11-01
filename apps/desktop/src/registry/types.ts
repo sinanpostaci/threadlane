@@ -29,6 +29,7 @@ export interface ToolDefinition {
   id: string;
   label: string;
   adapter: ToolAdapter;
+  /** null means automatic system resolution; a nonnull path is a custom override. */
   executable_path: string | null;
   enabled: boolean;
 }
@@ -119,6 +120,33 @@ export interface ToolProbe {
   auth_status: string;
   models: ModelDefinition[];
   message: string;
+}
+
+export type ToolVersionAvailability = 'found' | 'not_found' | 'api_only' | 'disabled';
+
+export type ToolSelectionMode = 'system' | 'custom';
+
+/**
+ * Version-only startup inspection for one saved tool. These fields are read-only
+ * observations; no model catalog, login, installation, or update command is used.
+ */
+export interface ToolVersionInspection {
+  tool_id: string;
+  availability: ToolVersionAvailability;
+  selection_mode: ToolSelectionMode;
+  configured_path: string | null;
+  resolved_path: string | null;
+  system_path: string | null;
+  version: string | null;
+  system_version: string | null;
+  system_path_differs: boolean;
+  message: string;
+  error_code: string | null;
+}
+
+export interface DesktopToolVersionsSnapshot {
+  registry_revision: number;
+  tools: ToolVersionInspection[];
 }
 
 export type DecisionProvider = 'jev' | 'openai';

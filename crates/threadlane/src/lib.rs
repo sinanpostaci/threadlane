@@ -44,12 +44,12 @@ pub use native_tool_output::NativeToolOutputConfig;
 pub use protocol::{
     ActivityPage, BindingListResponse, CreateBindingRequest, Event, EventKind, EventPayload,
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
-    HostControlRuntimeState, HostControlStatusResponse, RetryWakeupRequest, RunSummary,
-    ScopedRequest, ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerAcceptanceState,
-    WorkerClaim, WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary,
-    WorkerProgressSummary, WorkerProgressUpdate, WorkerSnapshot, WorkerStatus,
-    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
-    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
+    HostControlRuntimeState, HostControlStatusResponse, RearmHostWakeupRequest,
+    RearmHostWakeupResponse, RetryWakeupRequest, RunSummary, ScopedRequest, ScopedResponse,
+    StatusResponse, StopIdleHostRequest, WorkerAcceptanceState, WorkerClaim,
+    WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressSummary,
+    WorkerProgressUpdate, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
+    WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS, WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 pub use supervisor::{
     Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,

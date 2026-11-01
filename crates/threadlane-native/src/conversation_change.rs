@@ -21,10 +21,9 @@
 //!   `frozen_approval_immutable: true`. Requesting `require_verified_live_input` fails closed
 //!   with `unsupported_capability`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -81,9 +80,6 @@ pub const MAX_CONVERSATION_CHANGE_RESOLUTION_NOTE_BYTES: usize = 1_024;
 const CHANGE_ID_PREFIX: &str = "chg_";
 const CHANGE_ID_HEX_LEN: usize = 32;
 const MAX_CANCEL_REASON_BYTES: usize = 512;
-
-static IN_PROCESS_CHANGE_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>> =
-    OnceLock::new();
 
 /// Interpreted category of a conversational human message submitted by native Codex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -819,6 +815,11 @@ pub enum ConversationChangeError {
         /// Static human-safe new approval requirement description.
         reason: &'static str,
     },
+    /// Task dispatch or workflow advancement is blocked by an unresolved conversational change or superseded approval.
+    BlockedByConversationChange {
+        /// Static human-safe blocking conversation-change description.
+        reason: &'static str,
+    },
     /// A prior mutating cancellation operation failed ambiguously and blocks blind replay.
     AmbiguousOutcomePendingReconciliation,
     /// A mutating operation crossed an effect boundary before failing with an uncertain outcome.
@@ -875,6 +876,7 @@ impl ConversationChangeError {
             Self::AmbiguousTaskState { .. } => "ambiguous_task_state",
             Self::ReplanRequired { .. } => "replan_required",
             Self::NewApprovalRequired { .. } => "new_approval_required",
+            Self::BlockedByConversationChange { .. } => "blocked_by_conversation_change",
             Self::AmbiguousOutcomePendingReconciliation => {
                 "ambiguous_outcome_pending_reconciliation"
             }
@@ -903,6 +905,7 @@ impl ConversationChangeError {
             | Self::AmbiguousTaskState { reason }
             | Self::ReplanRequired { reason }
             | Self::NewApprovalRequired { reason }
+            | Self::BlockedByConversationChange { reason }
             | Self::OutcomeUnknown { reason }
             | Self::InvalidRunState { reason }
             | Self::StoreLimitExceeded { reason }
@@ -1332,53 +1335,56 @@ impl ConversationChangeStore {
         validate_revision("expected_change_revision", request.expected_change_revision)?;
 
         let request_digest = compute_request_digest(&checked_binding, &checked_thread, request)?;
+        let (ledger_path, _binding_lock_guard) =
+            self.acquire_binding_lock_async(&checked_binding).await?;
 
-        let precheck = self.with_binding_lock(&checked_binding, |ledger_path| {
-            let ledger = read_ledger_locked(ledger_path, &checked_binding)?;
-            if ledger.ambiguous_cancels.iter().any(|p| {
-                p.request_key == request.request_key
-                    || (request.task_id.is_some()
-                        && request.task_id.as_deref() == Some(p.task_id.as_str()))
-            }) {
-                return Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation);
-            }
-            if let Some(existing) = ledger
-                .records
-                .iter()
-                .find(|r| r.request_key == request.request_key)
-            {
-                verify_idempotent_record_match(
-                    existing,
-                    &checked_binding,
-                    &checked_thread,
-                    request,
-                    &request_digest,
-                    ledger.current_revision,
-                )?;
-                return Ok(Some(existing.clone()));
-            }
-            if ledger.records.iter().any(|r| {
-                r.resolution
-                    .as_ref()
-                    .map(|res| res.resolution_request_key.as_str())
-                    == Some(request.request_key.as_str())
-            }) {
-                return Err(ConversationChangeError::IdempotencyConflict {
-                    reason: "request_key was already used for a change resolution operation.",
-                });
-            }
-            if request.expected_change_revision != ledger.current_revision {
-                return Err(ConversationChangeError::StaleRevision {
+        let precheck =
+            (|| -> Result<Option<ConversationChangeRecord>, ConversationChangeError> {
+                let ledger = read_ledger_locked(&ledger_path, &checked_binding)?;
+                if ledger.ambiguous_cancels.iter().any(|p| {
+                    p.request_key == request.request_key
+                        || (request.task_id.is_some()
+                            && request.task_id.as_deref() == Some(p.task_id.as_str()))
+                }) {
+                    return Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation);
+                }
+                if let Some(existing) = ledger
+                    .records
+                    .iter()
+                    .find(|r| r.request_key == request.request_key)
+                {
+                    verify_idempotent_record_match(
+                        existing,
+                        &checked_binding,
+                        &checked_thread,
+                        request,
+                        &request_digest,
+                        ledger.current_revision,
+                    )?;
+                    return Ok(Some(existing.clone()));
+                }
+                if ledger.records.iter().any(|r| {
+                    r.resolution
+                        .as_ref()
+                        .map(|res| res.resolution_request_key.as_str())
+                        == Some(request.request_key.as_str())
+                }) {
+                    return Err(ConversationChangeError::IdempotencyConflict {
+                        reason: "request_key was already used for a change resolution operation.",
+                    });
+                }
+                if request.expected_change_revision != ledger.current_revision {
+                    return Err(ConversationChangeError::StaleRevision {
                     reason: "expected_change_revision does not match current conversation-change store revision.",
                 });
-            }
-            if ledger.records.len() >= MAX_CONVERSATION_CHANGES_PER_BINDING {
-                return Err(ConversationChangeError::StoreLimitExceeded {
+                }
+                if ledger.records.len() >= MAX_CONVERSATION_CHANGES_PER_BINDING {
+                    return Err(ConversationChangeError::StoreLimitExceeded {
                     reason: "Conversation change ledger reached the maximum of 256 records for this binding.",
                 });
-            }
-            Ok(None)
-        })?;
+                }
+                Ok(None)
+            })()?;
 
         if let Some(idempotent_record) = precheck {
             return Ok(idempotent_record);
@@ -1413,15 +1419,14 @@ impl ConversationChangeStore {
 
             // Persist a pending cancel effect marker before crossing the host RPC boundary so
             // ambiguous failures cannot be blindly replayed.
-            self.with_binding_lock(&checked_binding, |ledger_path| {
-                let mut ledger = read_ledger_locked(ledger_path, &checked_binding)?;
+            (|| -> Result<(), ConversationChangeError> {
+                let mut ledger = read_ledger_locked(&ledger_path, &checked_binding)?;
                 if request.expected_change_revision != ledger.current_revision {
                     return Err(ConversationChangeError::StaleRevision {
                         reason: "expected_change_revision does not match current conversation-change store revision.",
                     });
                 }
-                // The earlier precheck precedes an await. Reserve the effect
-                // under this same exclusive ledger lock before any cancel RPC.
+                // Reserve the effect under the exclusive ledger lock before any cancel RPC.
                 if ledger.ambiguous_cancels.iter().any(|pending| {
                     pending.request_key == request.request_key
                         || (pending.approval_id == approval_id && pending.task_id == task_id)
@@ -1436,8 +1441,8 @@ impl ConversationChangeStore {
                     task_id: task_id.clone(),
                     expected_task_revision: cancel_action.expected_task_revision,
                 });
-                write_ledger_locked(&self.namespace_dir, ledger_path, &ledger)
-            })?;
+                write_ledger_locked(&self.namespace_dir, &ledger_path, &ledger)
+            })()?;
 
             match host_client
                 .cancel_task(
@@ -1473,13 +1478,13 @@ impl ConversationChangeStore {
                 }
                 Err(host_err) => {
                     if is_deterministic_pre_effect_host_error(&host_err) {
-                        let _ = self.with_binding_lock(&checked_binding, |ledger_path| {
-                            let mut ledger = read_ledger_locked(ledger_path, &checked_binding)?;
+                        let _ = (|| -> Result<(), ConversationChangeError> {
+                            let mut ledger = read_ledger_locked(&ledger_path, &checked_binding)?;
                             ledger
                                 .ambiguous_cancels
                                 .retain(|p| p.request_key != request.request_key);
-                            write_ledger_locked(&self.namespace_dir, ledger_path, &ledger)
-                        });
+                            write_ledger_locked(&self.namespace_dir, &ledger_path, &ledger)
+                        })();
                         return Err(map_host_cancel_error(&host_err));
                     }
                     return Err(ConversationChangeError::OutcomeUnknown {
@@ -1492,70 +1497,68 @@ impl ConversationChangeStore {
         let now_ms = now_epoch_ms();
         let change_id = generate_change_id();
 
-        self.with_binding_lock(&checked_binding, |ledger_path| {
-            let mut ledger = read_ledger_locked(ledger_path, &checked_binding)?;
-            ledger
-                .ambiguous_cancels
-                .retain(|p| p.request_key != request.request_key);
+        let mut ledger = read_ledger_locked(&ledger_path, &checked_binding)?;
+        ledger
+            .ambiguous_cancels
+            .retain(|p| p.request_key != request.request_key);
 
-            if request.expected_change_revision != ledger.current_revision {
-                if cancelled_snapshot.is_some() {
-                    return Err(ConversationChangeError::OutcomeUnknown {
-                        reason: "Task cancellation completed, but conversation-change store revision advanced concurrently.",
-                    });
-                }
-                return Err(ConversationChangeError::StaleRevision {
-                    reason: "expected_change_revision does not match current conversation-change store revision.",
+        if request.expected_change_revision != ledger.current_revision {
+            if cancelled_snapshot.is_some() {
+                return Err(ConversationChangeError::OutcomeUnknown {
+                    reason: "Task cancellation completed, but conversation-change store revision advanced concurrently.",
                 });
             }
-            if ledger.records.len() >= MAX_CONVERSATION_CHANGES_PER_BINDING {
-                return Err(ConversationChangeError::StoreLimitExceeded {
-                    reason: "Conversation change ledger reached the maximum of 256 records for this binding.",
+            return Err(ConversationChangeError::StaleRevision {
+                reason: "expected_change_revision does not match current conversation-change store revision.",
+            });
+        }
+        if ledger.records.len() >= MAX_CONVERSATION_CHANGES_PER_BINDING {
+            return Err(ConversationChangeError::StoreLimitExceeded {
+                reason: "Conversation change ledger reached the maximum of 256 records for this binding.",
+            });
+        }
+
+        let next_revision = ledger.current_revision.saturating_add(1);
+        let record = ConversationChangeRecord {
+            change_id,
+            request_key: request.request_key.clone(),
+            created_change_revision: next_revision,
+            updated_change_revision: next_revision,
+            binding_id: checked_binding.clone(),
+            thread_uuid: checked_thread.clone(),
+            approval_id: eval.approval_record.as_ref().map(|a| a.approval_id.clone()),
+            approval_subject_digest: eval
+                .approval_record
+                .as_ref()
+                .map(|a| a.subject_digest.clone()),
+            plan_id: eval.plan_id,
+            plan_revision: eval.plan_revision,
+            task_id: eval.task_id,
+            affected_dependent_task_ids: eval.dependent_task_ids,
+            summary: eval.summary,
+            detail: eval.detail,
+            proposed_write_paths: eval.proposed_write_paths,
+            proposed_profile_id: eval.proposed_profile_id,
+            proposed_model_id: eval.proposed_model_id,
+            proposed_effort: eval.proposed_effort,
+            decision: eval.decision,
+            cancelled_task_snapshot: cancelled_snapshot.clone(),
+            resolution: None,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        };
+
+        ledger.current_revision = next_revision;
+        ledger.records.push(record.clone());
+        if let Err(write_err) = write_ledger_locked(&self.namespace_dir, &ledger_path, &ledger) {
+            if cancelled_snapshot.is_some() {
+                return Err(ConversationChangeError::OutcomeUnknown {
+                    reason: "Task cancellation completed, but persisting the conversation-change record failed.",
                 });
             }
-
-            let next_revision = ledger.current_revision.saturating_add(1);
-            let record = ConversationChangeRecord {
-                change_id,
-                request_key: request.request_key.clone(),
-                created_change_revision: next_revision,
-                updated_change_revision: next_revision,
-                binding_id: checked_binding.clone(),
-                thread_uuid: checked_thread.clone(),
-                approval_id: eval.approval_record.as_ref().map(|a| a.approval_id.clone()),
-                approval_subject_digest: eval
-                    .approval_record
-                    .as_ref()
-                    .map(|a| a.subject_digest.clone()),
-                plan_id: eval.plan_id,
-                plan_revision: eval.plan_revision,
-                task_id: eval.task_id,
-                affected_dependent_task_ids: eval.dependent_task_ids,
-                summary: eval.summary,
-                detail: eval.detail,
-                proposed_write_paths: eval.proposed_write_paths,
-                proposed_profile_id: eval.proposed_profile_id,
-                proposed_model_id: eval.proposed_model_id,
-                proposed_effort: eval.proposed_effort,
-                decision: eval.decision,
-                cancelled_task_snapshot: cancelled_snapshot.clone(),
-                resolution: None,
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            };
-
-            ledger.current_revision = next_revision;
-            ledger.records.push(record.clone());
-            if let Err(write_err) = write_ledger_locked(&self.namespace_dir, ledger_path, &ledger) {
-                if cancelled_snapshot.is_some() {
-                    return Err(ConversationChangeError::OutcomeUnknown {
-                        reason: "Task cancellation completed, but persisting the conversation-change record failed.",
-                    });
-                }
-                return Err(write_err);
-            }
-            Ok(record)
-        })
+            return Err(write_err);
+        }
+        Ok(record)
     }
 
     /// Explicitly resolves a `pending_clarification` or `pending_replan` change after verifying
@@ -1598,73 +1601,79 @@ impl ConversationChangeStore {
             "resolution_note exceeds 1024 bytes or contains control characters.",
         )?;
 
-        let existing_record = self.with_binding_lock(&checked_binding, |ledger_path| {
-            let ledger = read_ledger_locked(ledger_path, &checked_binding)?;
-            if !ledger.ambiguous_cancels.is_empty() {
-                return Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation);
-            }
-            let record = ledger
-                .records
-                .iter()
-                .find(|r| r.change_id == request.change_id)
-                .cloned()
-                .ok_or(ConversationChangeError::ChangeNotFound)?;
+        let (ledger_path, _binding_lock_guard) =
+            self.acquire_binding_lock_async(&checked_binding).await?;
 
-            if record.binding_id != checked_binding || record.thread_uuid != checked_thread {
-                return Err(ConversationChangeError::ScopeMismatch {
-                    reason: "Conversation change record does not belong to the requested binding and thread scope.",
-                });
-            }
+        let existing_record =
+            (|| -> Result<(bool, ConversationChangeRecord), ConversationChangeError> {
+                let ledger = read_ledger_locked(&ledger_path, &checked_binding)?;
+                if !ledger.ambiguous_cancels.is_empty() {
+                    return Err(ConversationChangeError::AmbiguousOutcomePendingReconciliation);
+                }
+                let record = ledger
+                    .records
+                    .iter()
+                    .find(|r| r.change_id == request.change_id)
+                    .cloned()
+                    .ok_or(ConversationChangeError::ChangeNotFound)?;
 
-            if let Some(ref existing_res) = record.resolution {
-                if existing_res.resolution_request_key == request.request_key {
-                    let expected_matches = request.expected_change_revision
-                        == existing_res.resolved_change_revision.saturating_sub(1)
-                        || request.expected_change_revision == ledger.current_revision;
-                    if expected_matches
-                        && existing_res.resolution_kind == request.resolution_kind
-                        && (request.target_plan_revision.is_none()
-                            || existing_res.target_plan_revision == request.target_plan_revision)
-                        && existing_res.new_approval_id == request.new_approval_id
-                        && existing_res.resolution_note == clean_note
-                    {
-                        return Ok((true, record));
-                    }
-                    return Err(ConversationChangeError::IdempotencyConflict {
-                        reason: "Resolution request_key was already used with different resolution parameters.",
+                if record.binding_id != checked_binding || record.thread_uuid != checked_thread {
+                    return Err(ConversationChangeError::ScopeMismatch {
+                        reason: "Conversation change record does not belong to the requested binding and thread scope.",
                     });
                 }
-                return Err(ConversationChangeError::InvalidChangeState {
-                    reason: "Conversation change record is already resolved.",
-                });
-            }
 
-            if ledger.records.iter().any(|r| {
-                r.request_key == request.request_key
-                    || r.resolution
-                        .as_ref()
-                        .map(|res| res.resolution_request_key.as_str())
-                        == Some(request.request_key.as_str())
-            }) {
-                return Err(ConversationChangeError::IdempotencyConflict {
-                    reason: "request_key was already used by another conversation change operation.",
-                });
-            }
+                if let Some(ref existing_res) = record.resolution {
+                    if existing_res.resolution_request_key == request.request_key {
+                        let expected_matches = request.expected_change_revision
+                            == existing_res.resolved_change_revision.saturating_sub(1)
+                            || request.expected_change_revision == ledger.current_revision;
+                        if expected_matches
+                            && existing_res.resolution_kind == request.resolution_kind
+                            && (request.target_plan_revision.is_none()
+                                || existing_res.target_plan_revision
+                                    == request.target_plan_revision)
+                            && existing_res.new_approval_id == request.new_approval_id
+                            && existing_res.resolution_note == clean_note
+                        {
+                            return Ok((true, record));
+                        }
+                        return Err(ConversationChangeError::IdempotencyConflict {
+                            reason: "Resolution request_key was already used with different resolution parameters.",
+                        });
+                    }
+                    return Err(ConversationChangeError::InvalidChangeState {
+                        reason: "Conversation change record is already resolved.",
+                    });
+                }
 
-            if record.decision.status == ConversationChangeStatus::RecordedOnly {
-                return Err(ConversationChangeError::InvalidChangeState {
-                    reason: "Question or status observation records are read-only and cannot be resolved.",
-                });
-            }
+                if ledger.records.iter().any(|r| {
+                    r.request_key == request.request_key
+                        || r.resolution
+                            .as_ref()
+                            .map(|res| res.resolution_request_key.as_str())
+                            == Some(request.request_key.as_str())
+                }) {
+                    return Err(ConversationChangeError::IdempotencyConflict {
+                        reason:
+                            "request_key was already used by another conversation change operation.",
+                    });
+                }
 
-            if request.expected_change_revision != ledger.current_revision {
-                return Err(ConversationChangeError::StaleRevision {
-                    reason: "expected_change_revision does not match current conversation-change store revision.",
-                });
-            }
+                if record.decision.status == ConversationChangeStatus::RecordedOnly {
+                    return Err(ConversationChangeError::InvalidChangeState {
+                        reason: "Question or status observation records are read-only and cannot be resolved.",
+                    });
+                }
 
-            Ok((false, record))
-        })?;
+                if request.expected_change_revision != ledger.current_revision {
+                    return Err(ConversationChangeError::StaleRevision {
+                        reason: "expected_change_revision does not match current conversation-change store revision.",
+                    });
+                }
+
+                Ok((false, record))
+            })()?;
 
         if existing_record.0 {
             return Ok(existing_record.1);
@@ -1868,51 +1877,74 @@ impl ConversationChangeStore {
         };
 
         let now_ms = now_epoch_ms();
-        self.with_binding_lock(&checked_binding, |ledger_path| {
-            let mut ledger = read_ledger_locked(ledger_path, &checked_binding)?;
-            if request.expected_change_revision != ledger.current_revision {
-                return Err(ConversationChangeError::StaleRevision {
-                    reason: "expected_change_revision does not match current conversation-change store revision.",
-                });
-            }
-            let next_revision = ledger.current_revision.saturating_add(1);
-            let target = ledger
-                .records
-                .iter_mut()
-                .find(|r| r.change_id == request.change_id)
-                .ok_or(ConversationChangeError::ChangeNotFound)?;
-
-            if target.resolution.is_some() {
-                return Err(ConversationChangeError::InvalidChangeState {
-                    reason: "Conversation change record is already resolved.",
-                });
-            }
-
-            target.updated_change_revision = next_revision;
-            target.updated_at_ms = now_ms;
-            target.decision.status = ConversationChangeStatus::Resolved;
-            target.decision.blocks_task_advancement = false;
-            if let Some(stop_state) = verified_stop_state {
-                target.decision.observed_stop_state = Some(stop_state);
-                target.decision.prior_task_proven_stopped = stop_state.is_proven_stopped();
-            }
-            target.resolution = Some(ConversationChangeResolution {
-                resolution_request_key: request.request_key.clone(),
-                resolution_kind: request.resolution_kind,
-                resolved_change_revision: next_revision,
-                target_plan_revision: resolved_plan_rev,
-                target_plan_digest: resolved_plan_digest,
-                new_approval_id: verified_new_approval_id,
-                verified_stop_state,
-                resolution_note: clean_note,
-                resolved_at_ms: now_ms,
+        let mut ledger = read_ledger_locked(&ledger_path, &checked_binding)?;
+        if request.expected_change_revision != ledger.current_revision {
+            return Err(ConversationChangeError::StaleRevision {
+                reason: "expected_change_revision does not match current conversation-change store revision.",
             });
+        }
+        let next_revision = ledger.current_revision.saturating_add(1);
+        let target = ledger
+            .records
+            .iter_mut()
+            .find(|r| r.change_id == request.change_id)
+            .ok_or(ConversationChangeError::ChangeNotFound)?;
 
-            let resolved_clone = target.clone();
-            ledger.current_revision = next_revision;
-            write_ledger_locked(&self.namespace_dir, ledger_path, &ledger)?;
-            Ok(resolved_clone)
+        if target.resolution.is_some() {
+            return Err(ConversationChangeError::InvalidChangeState {
+                reason: "Conversation change record is already resolved.",
+            });
+        }
+
+        target.updated_change_revision = next_revision;
+        target.updated_at_ms = now_ms;
+        target.decision.status = ConversationChangeStatus::Resolved;
+        target.decision.blocks_task_advancement = false;
+        if let Some(stop_state) = verified_stop_state {
+            target.decision.observed_stop_state = Some(stop_state);
+            target.decision.prior_task_proven_stopped = stop_state.is_proven_stopped();
+        }
+        target.resolution = Some(ConversationChangeResolution {
+            resolution_request_key: request.request_key.clone(),
+            resolution_kind: request.resolution_kind,
+            resolved_change_revision: next_revision,
+            target_plan_revision: resolved_plan_rev,
+            target_plan_digest: resolved_plan_digest,
+            new_approval_id: verified_new_approval_id,
+            verified_stop_state,
+            resolution_note: clean_note,
+            resolved_at_ms: now_ms,
+        });
+
+        let resolved_clone = target.clone();
+        ledger.current_revision = next_revision;
+        write_ledger_locked(&self.namespace_dir, &ledger_path, &ledger)?;
+        Ok(resolved_clone)
+    }
+
+    async fn acquire_binding_lock_async(
+        &self,
+        binding_id: &str,
+    ) -> Result<(PathBuf, crate::fs_safety::CrossProcessLockGuard), ConversationChangeError> {
+        let namespace_dir = self.namespace_dir.clone();
+        let binding_id = binding_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<_, ConversationChangeError> {
+            let _ = prepare_private_dir(&namespace_dir, "conversation_changes_dir")
+                .map_err(map_fs_error)?;
+            let (ledger_path, lock_filename) =
+                ledger_paths_for_binding(&namespace_dir, &binding_id)?;
+            let file_lock_guard = acquire_cross_process_lock(
+                &namespace_dir,
+                &lock_filename,
+                "conversation_change_lock",
+            )
+            .map_err(map_fs_error)?;
+            Ok((ledger_path, file_lock_guard))
         })
+        .await
+        .map_err(|_| ConversationChangeError::Io {
+            reason: "Failed to acquire conversation-change binding lock.",
+        })?
     }
 
     fn read_ledger_readonly(
@@ -1927,41 +1959,25 @@ impl ConversationChangeStore {
         read_ledger_locked(&ledger_path, binding_id)
     }
 
+    #[cfg(test)]
     fn with_binding_lock<T, F>(&self, binding_id: &str, f: F) -> Result<T, ConversationChangeError>
     where
         F: FnOnce(&Path) -> Result<T, ConversationChangeError>,
     {
         let _ = prepare_private_dir(&self.namespace_dir, "conversation_changes_dir")
             .map_err(map_fs_error)?;
-        let (ledger_path, lock_filename) =
-            ledger_paths_for_binding(&self.namespace_dir, binding_id)?;
-        let lock_key = self.namespace_dir.join(&lock_filename);
-        let arc_mutex = {
-            let map_mutex = IN_PROCESS_CHANGE_LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()));
-            let mut map = map_mutex
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(
-                map.entry(lock_key)
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
-        let _in_proc_guard = arc_mutex
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _file_lock_guard = acquire_cross_process_lock(
-            &self.namespace_dir,
-            &lock_filename,
-            "conversation_change_lock",
-        )
-        .map_err(map_fs_error)?;
-        f(&ledger_path)
+        let (path, filename) = ledger_paths_for_binding(&self.namespace_dir, binding_id)?;
+        let _guard =
+            acquire_cross_process_lock(&self.namespace_dir, &filename, "conversation_change_lock")
+                .map_err(map_fs_error)?;
+        f(&path)
     }
 }
 
-/// Serializes role advancement with the binding's actual conversation-change mutations.
-/// The guard must remain alive through dispatch; preflight and observation never acquire it.
-pub(crate) async fn acquire_conversation_advancement_guard(
+/// Serializes role advancement and direct native task dispatch with the binding's actual
+/// conversation-change mutations. The guard must remain alive through dispatch; preflight
+/// and observation never acquire it.
+pub async fn acquire_conversation_advancement_guard(
     plans_dir: &Path,
     binding_id: &str,
 ) -> Result<crate::fs_safety::CrossProcessLockGuard, NativeError> {
@@ -3491,6 +3507,8 @@ fn is_deterministic_pre_effect_host_error(err: &HostError) -> bool {
             | HostError::StaleRevision { .. }
             | HostError::IdempotencyConflict { .. }
             | HostError::InvalidRunState { .. }
+            | HostError::WakeupClaimNotFound { .. }
+            | HostError::InvalidWakeupState { .. }
             | HostError::SecurityViolation { .. }
             | HostError::Authority { .. }
     )

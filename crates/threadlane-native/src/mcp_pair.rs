@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -32,8 +33,8 @@ use crate::approved_mcp::{
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{constant_time_str_eq, ensure_platform_supported};
 use crate::host_launcher::{
-    execute_start_approved_task_with_launcher, validate_host_executable_path, ApprovedHostLauncher,
-    ApprovedHostLauncherPolicy,
+    execute_start_approved_task_with_launcher_until, validate_host_executable_path,
+    ApprovedHostLauncher, ApprovedHostLauncherPolicy,
 };
 use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
@@ -1621,34 +1622,76 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("start_approved_task")?;
+        let authority_for_guard = Arc::clone(&stores.authority);
+        let guard_binding_id = trusted_binding_id.clone();
+        let guard_thread_uuid = trusted_thread_uuid.clone();
+        let guard_approval_id = params.approval_id.clone();
+        let guard_task_id = params.task_id.clone();
         let expected_binding_id = trusted_binding_id.clone();
         let expected_thread_uuid = trusted_thread_uuid.clone();
         let server_for_recheck = self.clone();
-        execute_start_approved_task_with_launcher(
-            stores.authority,
-            stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
-            params,
-            self.host_launcher.clone(),
-            move || {
-                let enrollment =
-                    server_for_recheck.verify_enrolled_binding_for_tool("start_approved_task")?;
-                if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
-                    || !constant_time_str_eq(&enrollment.thread_id, &expected_thread_uuid)
-                {
-                    return Err(Self::format_pairing_error(
-                        "start_approved_task",
-                        NativeError::new(
-                            NativeErrorCode::RebindRejected,
-                            "enrolled binding or native thread changed during approved host startup",
-                        ),
-                    ));
-                }
-                Ok(())
+        let host_launcher = self.host_launcher.clone();
+        let startup_deadline = host_launcher
+            .as_ref()
+            .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
+
+        crate::dispatch_guard::with_guarded_native_dispatch_until(
+            &authority_for_guard,
+            &guard_binding_id,
+            &guard_thread_uuid,
+            &guard_approval_id,
+            &guard_task_id,
+            None,
+            startup_deadline,
+            || async move {
+                Ok(execute_start_approved_task_with_launcher_until(
+                    stores.authority,
+                    stores.sessions_dir,
+                    trusted_binding_id,
+                    trusted_thread_uuid,
+                    params,
+                    host_launcher,
+                    startup_deadline,
+                    move || {
+                        let enrollment = server_for_recheck
+                            .verify_enrolled_binding_for_tool("start_approved_task")?;
+                        if !constant_time_str_eq(&enrollment.binding_id, &expected_binding_id)
+                            || !constant_time_str_eq(&enrollment.thread_id, &expected_thread_uuid)
+                        {
+                            return Err(Self::format_pairing_error(
+                                "start_approved_task",
+                                NativeError::new(
+                                    NativeErrorCode::RebindRejected,
+                                    "enrolled binding or native thread changed during approved host startup",
+                                ),
+                            ));
+                        }
+                        Ok(())
+                    },
+                )
+                .await)
             },
         )
         .await
+        .map_err(|err| match err {
+            crate::dispatch_guard::GuardedDispatchError::PreEffect { code, message } => {
+                crate::approved_mcp::format_approved_scoped_error(
+                    &guard_binding_id,
+                    "start_approved_task",
+                    code,
+                    message,
+                )
+            }
+            crate::dispatch_guard::GuardedDispatchError::Host(host_err) => {
+                let (code, message) = crate::approved_mcp::map_host_error_to_mcp(&host_err);
+                crate::approved_mcp::format_approved_scoped_error(
+                    &guard_binding_id,
+                    "start_approved_task",
+                    code,
+                    message,
+                )
+            }
+        })?
     }
 
     /// Reads the current execution status of an approved task within an operator approval record (requires verified operator enrollment).

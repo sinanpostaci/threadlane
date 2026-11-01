@@ -26,6 +26,7 @@ import {
   type DesktopSecretSetArgs,
   type DesktopSecretStatusArgs,
   type DesktopTestDecisionArgs,
+  type DesktopToolVersionsSnapshot,
   type ModelDefinition,
   type NativeThreadPage,
   type PlanChange,
@@ -34,6 +35,7 @@ import {
   type RegistryChange,
   type RegistrySnapshot,
   type ToolProbe,
+  type ToolVersionInspection,
 } from './types.ts';
 
 export * from './types.ts';
@@ -1001,6 +1003,68 @@ export function getDevPreviewContext(): {
   };
 }
 
+function previewToolVersionInspection(
+  tool: RegistrySnapshot['tools'][number]
+): ToolVersionInspection {
+  const syntheticMessage =
+    'Synthetic DEV preview metadata. No local command or version process was executed.';
+  if (isApiToolAdapter(tool.adapter)) {
+    return {
+      tool_id: tool.id,
+      availability: 'api_only',
+      selection_mode: 'system',
+      configured_path: null,
+      resolved_path: null,
+      system_path: null,
+      version: null,
+      system_version: null,
+      system_path_differs: false,
+      message: syntheticMessage,
+      error_code: null,
+    };
+  }
+
+  const custom = Boolean(tool.executable_path?.trim());
+  const configuredPath = custom ? `/threadlane-preview/custom/${tool.id}` : null;
+  if (!tool.enabled) {
+    return {
+      tool_id: tool.id,
+      availability: 'disabled',
+      selection_mode: custom ? 'custom' : 'system',
+      configured_path: configuredPath,
+      resolved_path: null,
+      system_path: null,
+      version: null,
+      system_version: null,
+      system_path_differs: false,
+      message: syntheticMessage,
+      error_code: null,
+    };
+  }
+
+  const systemPath = `/threadlane-preview/system/${tool.id}`;
+  return {
+    tool_id: tool.id,
+    availability: 'found',
+    selection_mode: custom ? 'custom' : 'system',
+    configured_path: configuredPath,
+    resolved_path: custom ? configuredPath : systemPath,
+    system_path: systemPath,
+    version: custom ? 'preview-custom-version' : 'preview-system-version',
+    system_version: 'preview-system-version',
+    system_path_differs: custom,
+    message: syntheticMessage,
+    error_code: null,
+  };
+}
+
+function previewToolVersionsSnapshot(): DesktopToolVersionsSnapshot {
+  return {
+    registry_revision: previewRegistry.revision,
+    tools: previewRegistry.tools.map(previewToolVersionInspection),
+  };
+}
+
 export async function desktop_registry_snapshot(): Promise<RegistrySnapshot> {
   if (!hasTauriRuntime()) {
     if (isDevPreviewFixtureMode()) {
@@ -1105,6 +1169,31 @@ export async function desktop_probe_tool(
     return await invoke<ToolProbe>('desktop_probe_tool', { toolId });
   } catch (err) {
     throw normalizeAppError(err, 'probe_failed', 'Failed to probe tool.');
+  }
+}
+
+/**
+ * Reads the current registry snapshot in Rust and performs bounded version-only
+ * checks for enabled local CLI tools. It does not mutate the registry.
+ */
+export async function desktop_tool_versions(): Promise<DesktopToolVersionsSnapshot> {
+  if (!hasTauriRuntime()) {
+    if (isDevPreviewFixtureMode()) {
+      return previewToolVersionsSnapshot();
+    }
+    throw new AppIpcError(
+      'bridge_disconnected',
+      'Tauri desktop bridge is not connected in this browser window.'
+    );
+  }
+  try {
+    return await invoke<DesktopToolVersionsSnapshot>('desktop_tool_versions');
+  } catch (err) {
+    throw normalizeAppError(
+      err,
+      'tool_versions_failed',
+      'Failed to inspect installed tool versions.'
+    );
   }
 }
 
@@ -1471,6 +1560,7 @@ export async function desktop_native_threads(
 export const desktopRegistrySnapshot = desktop_registry_snapshot;
 export const desktopRegistryApply = desktop_registry_apply;
 export const desktopProbeTool = desktop_probe_tool;
+export const desktopToolVersions = desktop_tool_versions;
 export const desktopSecretStatus = desktop_secret_status;
 export const desktopSecretSet = desktop_secret_set;
 export const desktopSecretDelete = desktop_secret_delete;
@@ -1483,6 +1573,7 @@ export const desktopNativeThreads = desktop_native_threads;
 export const ipcDesktopRegistrySnapshot = desktop_registry_snapshot;
 export const ipcDesktopRegistryApply = desktop_registry_apply;
 export const ipcDesktopProbeTool = desktop_probe_tool;
+export const ipcDesktopToolVersions = desktop_tool_versions;
 export const ipcDesktopSecretStatus = desktop_secret_status;
 export const ipcDesktopSecretSet = desktop_secret_set;
 export const ipcDesktopSecretDelete = desktop_secret_delete;

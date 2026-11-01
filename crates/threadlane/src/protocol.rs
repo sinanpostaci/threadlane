@@ -447,6 +447,32 @@ pub type HostControlInfoRequest = HostControlOwnerScope;
 /// Request payload for `POST /v1/host-control/stop`.
 pub type StopIdleHostRequest = HostControlOwnerScope;
 
+/// Authenticated owner-scoped request for `POST /v1/host-control/rearm-wakeup`.
+///
+/// Atomically verifies the frozen [`HostControlOwnerScope`] (including `expected_instance_id`)
+/// and re-arms a `WakeupStatus::Failed` claim matching `expected_claim_id` on `session_binding_id`
+/// (`allow_unknown` is unconditionally `false`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RearmHostWakeupRequest {
+    /// Frozen owner scope and expected live host instance identifier.
+    pub scope: HostControlOwnerScope,
+    /// Expected claim identifier (`wcl_<uuid>`) currently recorded on the session binding's `Failed` wake-up notice.
+    pub expected_claim_id: String,
+}
+
+/// Authenticated response returned by `POST /v1/host-control/rearm-wakeup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RearmHostWakeupResponse {
+    /// Verified live host instance identifier (`hst_<32hex>`).
+    pub instance_id: String,
+    /// Current session binding metadata and durable event cursors.
+    pub binding: Binding,
+    /// Updated wake-up notice (`WakeupStatus::Pending` with `claim_id: None`) committed by the core transaction.
+    pub wakeup: WakeupNotice,
+}
+
 /// Runtime host control lifecycle state reported by a host-control-enabled supervisor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

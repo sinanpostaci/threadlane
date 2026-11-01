@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -11,6 +10,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
 use crate::cli_environment::restore_cli_environment;
+use crate::codex_installation::{resolve_codex_system_executable, CodexDiscoveryOptions};
 use crate::credentials::validate_tool_id;
 use crate::error::ConnectorError;
 use crate::parsers::{
@@ -18,6 +18,7 @@ use crate::parsers::{
     parse_codex_login_status, parse_opencode_models, AUTH_STATUS_AUTHENTICATED,
     AUTH_STATUS_UNAUTHENTICATED, AUTH_STATUS_UNKNOWN,
 };
+use crate::version_inspection::resolve_system_executable_in_path;
 
 /// Default wall-clock timeout for a single CLI probe command (10 seconds).
 pub const DEFAULT_PROBE_TIMEOUT_MS: u64 = 10_000;
@@ -59,7 +60,7 @@ pub struct ToolProbe {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum AdapterKind {
+pub(crate) enum AdapterKind {
     CodexCli,
     OpencodeV2,
     Antigravity,
@@ -71,18 +72,18 @@ enum AdapterKind {
 }
 
 impl AdapterKind {
-    fn from_registry_adapter(adapter: &ToolAdapter) -> Result<Self, ConnectorError> {
+    pub(crate) fn from_registry_adapter(adapter: &ToolAdapter) -> Result<Self, ConnectorError> {
         let value = serde_json::to_value(adapter)
             .map_err(|_| ConnectorError::InvalidInput("Tool adapter could not be serialized."))?;
         serde_json::from_value(value)
             .map_err(|_| ConnectorError::InvalidInput("Unsupported tool adapter variant."))
     }
 
-    const fn is_api_adapter(self) -> bool {
+    pub(crate) const fn is_api_adapter(self) -> bool {
         matches!(self, Self::JevApi | Self::OpenaiDecisionsApi)
     }
 
-    const fn default_binaries(self) -> &'static [&'static str] {
+    pub(crate) const fn default_binaries(self) -> &'static [&'static str] {
         match self {
             Self::CodexCli => &["codex"],
             Self::OpencodeV2 => &["opencode"],
@@ -128,6 +129,16 @@ pub async fn probe_tool_with_timeout(
     tool: &ToolDefinition,
     timeout: Duration,
 ) -> Result<ToolProbe, ConnectorError> {
+    probe_tool_with_options(tool, timeout, &CodexDiscoveryOptions::ambient()).await
+}
+
+/// Explicitly probes a [`ToolDefinition`] with a caller-specified timeout and injectable
+/// [`CodexDiscoveryOptions`] for automatic system resolution when `executable_path` is `None`.
+pub async fn probe_tool_with_options(
+    tool: &ToolDefinition,
+    timeout: Duration,
+    codex_discovery: &CodexDiscoveryOptions,
+) -> Result<ToolProbe, ConnectorError> {
     validate_tool_id(&tool.id)?;
     if timeout.is_zero() {
         return Err(ConnectorError::InvalidInput(
@@ -153,7 +164,8 @@ pub async fn probe_tool_with_timeout(
 
     let resolved_exec = match resolve_and_validate_executable(
         tool.executable_path.as_deref(),
-        adapter.default_binaries(),
+        adapter,
+        codex_discovery,
     )? {
         Some(path) => path,
         None => {
@@ -294,7 +306,7 @@ async fn probe_utility_cli(
     })
 }
 
-fn ensure_unix_platform() -> Result<(), ConnectorError> {
+pub(crate) fn ensure_unix_platform() -> Result<(), ConnectorError> {
     #[cfg(unix)]
     {
         Ok(())
@@ -307,7 +319,7 @@ fn ensure_unix_platform() -> Result<(), ConnectorError> {
     }
 }
 
-fn validate_explicit_executable_path(path: &Path) -> Result<(), ConnectorError> {
+pub(crate) fn validate_explicit_executable_path(path: &Path) -> Result<(), ConnectorError> {
     let raw = path.as_os_str().to_string_lossy();
     if raw.is_empty() || raw.contains('\0') || raw.chars().any(char::is_control) {
         return Err(ConnectorError::InvalidExecutable(
@@ -329,7 +341,7 @@ fn validate_explicit_executable_path(path: &Path) -> Result<(), ConnectorError> 
     Ok(())
 }
 
-fn check_resolved_file_executable(path: &Path) -> Result<PathBuf, ConnectorError> {
+pub(crate) fn check_resolved_file_executable(path: &Path) -> Result<PathBuf, ConnectorError> {
     let meta = fs::metadata(path).map_err(|_| {
         ConnectorError::InvalidExecutable(
             "Configured executable path could not be resolved to an accessible target.",
@@ -376,7 +388,8 @@ fn check_resolved_file_executable(path: &Path) -> Result<PathBuf, ConnectorError
 
 fn resolve_and_validate_executable(
     configured: Option<&Path>,
-    default_binaries: &[&str],
+    adapter: AdapterKind,
+    codex_discovery: &CodexDiscoveryOptions,
 ) -> Result<Option<PathBuf>, ConnectorError> {
     if let Some(path) = configured {
         validate_explicit_executable_path(path)?;
@@ -396,36 +409,15 @@ fn resolve_and_validate_executable(
         }
     }
 
-    let path_os = std::env::var_os("PATH");
-    Ok(find_canonical_executable_in_path(
-        path_os.as_deref(),
-        default_binaries,
-    ))
-}
-
-fn find_canonical_executable_in_path(
-    path_var: Option<&OsStr>,
-    binaries: &[&str],
-) -> Option<PathBuf> {
-    let raw_path = path_var?;
-    for dir in std::env::split_paths(raw_path) {
-        if dir.as_os_str().is_empty() || !dir.is_absolute() {
-            continue;
-        }
-        if dir
-            .components()
-            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
-        {
-            continue;
-        }
-        for bin in binaries {
-            let candidate = dir.join(bin);
-            if let Ok(canonical) = check_resolved_file_executable(&candidate) {
-                return Some(canonical);
-            }
-        }
+    if adapter == AdapterKind::CodexCli {
+        return Ok(resolve_codex_system_executable(codex_discovery));
     }
-    None
+
+    let path_os = codex_discovery.effective_path_env();
+    Ok(resolve_system_executable_in_path(
+        path_os.as_deref(),
+        adapter.default_binaries(),
+    ))
 }
 
 /// Environments stripped from every CLI probe subprocess to prevent Git repository
@@ -475,10 +467,10 @@ fn configure_sanitized_probe_env(cmd: &mut Command) {
 }
 
 #[derive(Debug)]
-struct BoundedCommandOutput {
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
+pub(crate) struct BoundedCommandOutput {
+    pub(crate) exit_code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,7 +753,7 @@ async fn wait_for_readers_or_signal_stop<T1, T2>(
     let _ = stop_tx.send(true);
 }
 
-async fn run_bounded_probe_command(
+pub(crate) async fn run_bounded_probe_command(
     executable: &Path,
     args: &[&str],
     timeout: Duration,
