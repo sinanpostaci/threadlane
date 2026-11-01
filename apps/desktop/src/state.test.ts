@@ -19,6 +19,7 @@ import {
   beginSnapshotPoll,
   createInitialSnapshot,
   createInitialState,
+  isCurrentBindingSnapshot,
   navigateBack,
   navigateToPage,
   openRunDetail,
@@ -138,6 +139,98 @@ function makeDetail(task: TaskSummary, overrides: Partial<RunDetail> = {}): RunD
     ...overrides,
   };
 }
+
+describe('current binding snapshot guard', () => {
+  it('treats the initial state and null selection fallback as current', () => {
+    assert.equal(isCurrentBindingSnapshot(createInitialState()), true);
+
+    const fallback = { selectedBindingId: null, snapshot: makeSnapshot() };
+    assert.equal(isCurrentBindingSnapshot(fallback), true);
+
+    const matching = { selectedBindingId: 'bind-alpha', snapshot: makeSnapshot() };
+    assert.equal(isCurrentBindingSnapshot(matching), true);
+  });
+
+  it('rejects the retained snapshot immediately after switching bindings', () => {
+    const initial = createInitialState();
+    const initialPoll = beginSnapshotPoll(initial);
+    assert.ok(initialPoll.ticket !== null);
+    const withAlpha = applySnapshotPollSuccess(
+      initialPoll.state,
+      initialPoll.ticket,
+      makeSnapshot()
+    );
+    assert.equal(isCurrentBindingSnapshot(withAlpha), true);
+
+    const switched = selectBinding(withAlpha, 'bind-beta', true);
+    assert.ok(switched.ticket !== null);
+    assert.equal(switched.state.selectedBindingId, 'bind-beta');
+    assert.equal(switched.state.snapshot.selected_binding_id, 'bind-alpha');
+    assert.equal(isCurrentBindingSnapshot(switched.state), false);
+  });
+
+  it('accepts a snapshot only after it is applied for the selected binding', () => {
+    const initial = createInitialState();
+    const initialPoll = beginSnapshotPoll(initial);
+    assert.ok(initialPoll.ticket !== null);
+    const withAlpha = applySnapshotPollSuccess(
+      initialPoll.state,
+      initialPoll.ticket,
+      makeSnapshot()
+    );
+    const switched = selectBinding(withAlpha, 'bind-beta', true);
+    assert.ok(switched.ticket !== null);
+
+    const betaSnapshot = makeSnapshot({ selected_binding_id: 'bind-beta' });
+    const applied = applySnapshotPollSuccess(switched.state, switched.ticket, betaSnapshot);
+    assert.equal(applied.snapshot.selected_binding_id, 'bind-beta');
+    assert.equal(isCurrentBindingSnapshot(applied), true);
+  });
+
+  it('keeps rejecting the old snapshot when a stale reply arrives late', () => {
+    const initial = createInitialState();
+    const alphaPoll = beginSnapshotPoll(initial);
+    assert.ok(alphaPoll.ticket !== null);
+    const switched = selectBinding(alphaPoll.state, 'bind-beta', true);
+    assert.ok(switched.ticket !== null);
+
+    const staleSnapshot = makeSnapshot({ selected_binding_id: 'bind-alpha' });
+    const afterStale = applySnapshotPollSuccess(switched.state, alphaPoll.ticket, staleSnapshot);
+    assert.equal(afterStale.selectedBindingId, 'bind-beta');
+    assert.equal(isCurrentBindingSnapshot(afterStale), false);
+  });
+
+  it('does not expose the previous chat after a failed poll for the current selection', () => {
+    const initial = createInitialState();
+    const initialPoll = beginSnapshotPoll(initial);
+    assert.ok(initialPoll.ticket !== null);
+    const withAlpha = applySnapshotPollSuccess(
+      initialPoll.state,
+      initialPoll.ticket,
+      makeSnapshot()
+    );
+    const switched = selectBinding(withAlpha, 'bind-beta', true);
+    assert.ok(switched.ticket !== null);
+
+    const failedSwitch = applySnapshotPollError(
+      switched.state,
+      switched.ticket,
+      'runtime unavailable'
+    );
+    assert.equal(failedSwitch.selectedBindingId, 'bind-beta');
+    assert.equal(failedSwitch.snapshot.selected_binding_id, 'bind-alpha');
+    assert.equal(isCurrentBindingSnapshot(failedSwitch), false);
+
+    const currentPoll = beginSnapshotPoll(withAlpha);
+    assert.ok(currentPoll.ticket !== null);
+    const failedCurrent = applySnapshotPollError(
+      currentPoll.state,
+      currentPoll.ticket,
+      'runtime unavailable'
+    );
+    assert.equal(isCurrentBindingSnapshot(failedCurrent), true);
+  });
+});
 
 describe('snapshot polling & stale reply rejection', () => {
   it('prevents overlapping snapshot polls when one is already in flight', () => {

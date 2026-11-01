@@ -873,6 +873,19 @@ export function resolveActiveHistoryBindingId(state: DesktopStoreState): string 
 }
 
 /**
+ * Returns true only when the retained snapshot belongs to the effective active binding.
+ * A null explicit selection falls back to the snapshot's own selected binding.
+ */
+export function isCurrentBindingSnapshot(
+  state: Pick<DesktopStoreState, 'selectedBindingId' | 'snapshot'>
+): boolean {
+  return (
+    (state.selectedBindingId ?? state.snapshot.selected_binding_id) ===
+    state.snapshot.selected_binding_id
+  );
+}
+
+/**
  * Returns true only when the Activity History subview should be polled in the background:
  * - User is on the `activity` page (with no run detail overlay open)
  * - The History subview toggle is expanded

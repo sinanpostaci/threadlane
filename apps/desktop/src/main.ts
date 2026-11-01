@@ -57,6 +57,7 @@ import {
   createInitialState,
   hasPlansSnapshotChanged,
   hasRegistrySnapshotChanged,
+  isCurrentBindingSnapshot,
   navigateBack,
   navigateToPage,
   openRunDetail,
@@ -1299,6 +1300,11 @@ class ThreadlaneDesktopApp {
       frag.appendChild(filterRow);
     }
 
+    if (!isCurrentBindingSnapshot(this.state)) {
+      frag.appendChild(h('p', { className: 'aq-note' }, 'Loading selected conversation…'));
+      return frag;
+    }
+
     const activeBinding = bindings.find(
       (b) => b.binding_id === (this.state.selectedBindingId ?? selected_binding_id)
     );
@@ -1983,19 +1989,24 @@ class ThreadlaneDesktopApp {
 
   private buildChatsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
-    frag.appendChild(this.preserveOverviewExpansion(renderReadinessChecklist({
-      registry: this.state.registrySnapshot,
-      toolVersions: this.toolVersionState,
-      snapshot: this.state.snapshot,
-      registryLoading: this.state.registryLoading,
-      registryError: this.state.registryError,
-      onNavigate: (page) => {
-        this.returnFocusKey = null;
-        this.state = navigateToPage(this.state, page);
-        this.render(`nav-${page}`);
-        this.mainEl.scrollTop = 0;
-      },
-    }), 'readiness'));
+    const bindingSnapshotCurrent = isCurrentBindingSnapshot(this.state);
+    if (bindingSnapshotCurrent) {
+      frag.appendChild(this.preserveOverviewExpansion(renderReadinessChecklist({
+        registry: this.state.registrySnapshot,
+        toolVersions: this.toolVersionState,
+        snapshot: this.state.snapshot,
+        registryLoading: this.state.registryLoading,
+        registryError: this.state.registryError,
+        onNavigate: (page) => {
+          this.returnFocusKey = null;
+          this.state = navigateToPage(this.state, page);
+          this.render(`nav-${page}`);
+          this.mainEl.scrollTop = 0;
+        },
+      }), 'readiness'));
+    } else {
+      frag.appendChild(h('p', { className: 'aq-note' }, 'Loading selected conversation…'));
+    }
 
     const { bindings, selected_binding_id, active_runs, total_runs } = this.state.snapshot;
     const currentSelected = this.state.selectedBindingId ?? selected_binding_id;
@@ -2027,7 +2038,7 @@ class ThreadlaneDesktopApp {
     } else {
       for (const binding of bindings) {
         const isSelected = binding.binding_id === currentSelected;
-        const scopedStats = isSelected
+        const scopedStats = isSelected && bindingSnapshotCurrent
           ? `${active_runs} active · ${total_runs} total runs`
           : 'Select to view activity';
 
