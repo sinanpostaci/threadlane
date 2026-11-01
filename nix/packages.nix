@@ -6,6 +6,12 @@ let
 
   source = import ./source.nix { inherit lib src; };
 
+  # Embed only the helper text in the runtime closure. The source checkout is
+  # not part of the packaged desktop environment.
+  desktopEnvironment = pkgs.writeText "threadlane-desktop-environment.sh" (
+    builtins.readFile ../scripts/desktop-environment.sh
+  );
+
   # Recompute only when apps/desktop/package-lock.json changes.
   desktopNpmDepsHash = "sha256-X5rZ5gmquTWSPoHlMrAXKmJ72RDB+hki/RRWrrpLb9Q=";
 
@@ -61,6 +67,7 @@ let
       "--package" "threadlane-native"
       "--package" "threadlane-host"
       "--package" "threadlane-operations"
+      "--package" "threadlane-decisions"
     ];
     nativeBuildInputs = [ pkgs.pkg-config ];
     doCheck = false;
@@ -108,7 +115,8 @@ let
         --prefix PATH : "${lib.makeBinPath [ threadlane ]}" \
         --prefix LD_LIBRARY_PATH : "${lib.makeLibraryPath desktopLibs}" \
         --prefix GIO_EXTRA_MODULES : "${pkgs.glib-networking}/lib/gio/modules" \
-        --prefix XDG_DATA_DIRS : "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gtk3}/share"
+        --prefix XDG_DATA_DIRS : "${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:${pkgs.gtk3}/share" \
+        --run "source ${desktopEnvironment}; threadlane_configure_desktop_environment"
     '';
 
     meta = {

@@ -110,6 +110,16 @@ immutable operator approvals, separate local hosts, frozen root-task dispatch,
 and per-approval observation. See the [M4 checkpoint](M4-CHECKPOINT.md) for its
 fixture gates and qualified limits.
 
+The [Jev shadow advice package](JEV-SHADOW.md) adds an explicit
+`threadlane-advice` CLI and a fourth `advice` context family. `preview` performs
+no network or vault access, `models` reads the account catalog without importing
+it, and `classify` makes one advisory Jev Choice request or returns a completed
+cache hit. Advice never changes plans, profiles, difficulty, models, approvals,
+hosts, workers or Git. Offline fixtures and simulated HTTP responses cover the
+advisory lifecycle. One explicit Linux catalog GET with a GUI-entered key
+returned `jev-latest` and `jev-preview`; live classification, paid entitlement
+and cross-platform keychain acceptance remain separate gates.
+
 The [approved-session notification extension](APPROVED-NOTIFICATIONS.md) adds
 default-off startup policy, fixed approval wake-ups and transactional byte-bounded
 event pull/ACK through the original paired native enrollment. The

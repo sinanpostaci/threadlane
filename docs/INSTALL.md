@@ -71,10 +71,10 @@ nix run .#threadlane-desktop
 ```
 
 `nix run .#threadlane-desktop` starts a GUI; a graphical session is required.
-The desktop package is not exposed on Darwin. The Nix package installs only the
-desktop executable, with the compiled frontend embedded in it. It does not
-install an OS service, desktop autostart entry, driver setting, or system-wide
-configuration.
+The desktop package is not exposed on Darwin. The Nix package provides only the
+desktop executable and its small launcher environment helper, with the compiled
+frontend embedded in the executable. It does not install an OS service, desktop
+autostart entry, driver setting, or system-wide configuration.
 
 The desktop binary is wrapped with the Linux GTK/WebKit runtime environment:
 
@@ -82,8 +82,18 @@ The desktop binary is wrapped with the Linux GTK/WebKit runtime environment:
 - `GIO_EXTRA_MODULES` includes `glib-networking`.
 - `XDG_DATA_DIRS` includes the GSettings schemas and GTK data directories.
 
-These are process-local wrapper settings. The package does not force X11 and
-does not set an NVIDIA or compositor workaround globally.
+On a native Wayland session with a readable `/proc/driver/nvidia/version` and no
+explicit `GDK_BACKEND=x11`, the wrapper also defaults
+`__NV_DISABLE_EXPLICIT_SYNC=1` when that variable is unset. An operator value,
+including `0` or an empty value, is preserved. The helper text is packaged as a
+standalone store file, so the runtime closure does not include the source
+checkout. The default applies only to the packaged `threadlane-desktop`
+launcher; the development shells, source build wrapper, and CLI package are
+unchanged.
+
+These are process-local wrapper settings. The package does not force X11, set
+`WEBKIT_DISABLE_DMABUF_RENDERER`, or set an NVIDIA or compositor workaround
+globally.
 
 ## Source desktop build wrapper
 
@@ -136,6 +146,16 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_build_
 The tests use temporary checkout layouts and local Python fixture executables;
 they do not call npm, Cargo, a provider, or the network.
 
+The packaged desktop environment helper has separate offline fixtures:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/tests -p test_desktop_environment.py -v
+```
+
+They source the actual helper in a controlled POSIX shell with temporary NVIDIA
+driver fixtures; they do not read the real GPU, start a desktop session, or
+touch the network.
+
 ## Manual cross-platform CI
 
 The workflow `.github/workflows/packaging.yml` is manual-only. Open the
@@ -160,22 +180,35 @@ actual behavior remains unverified until a real dispatch is recorded.
 
 ## Linux runtime notes
 
-The milestone 3A preview showed a Wayland protocol error on the first NVIDIA
-host. The verified workaround was process-local:
+The packaged desktop wrapper applies the verified NVIDIA workaround as a
+process-local default. It does so only when the session is native Wayland
+(`WAYLAND_DISPLAY` is nonempty or `XDG_SESSION_TYPE=wayland`), the NVIDIA driver
+version node `/proc/driver/nvidia/version` is readable, and `GDK_BACKEND` is
+not explicitly `x11`.
+
+In that case it sets:
 
 ```sh
-__NV_DISABLE_EXPLICIT_SYNC=1 nix run .#threadlane-desktop
+__NV_DISABLE_EXPLICIT_SYNC=1
 ```
 
-If WebKit's DMABUF renderer is the specific failure on a host, this alternative
-is also process-local:
+only if `__NV_DISABLE_EXPLICIT_SYNC` is unset. Any operator-provided value is
+preserved, including `0` and an empty value. Override the default explicitly
+for one invocation when needed:
 
 ```sh
-WEBKIT_DISABLE_DMABUF_RENDERER=1 nix run .#threadlane-desktop
+__NV_DISABLE_EXPLICIT_SYNC=0 nix run .#threadlane-desktop
 ```
 
-Do not make either setting global, and do not force X11 by default. Other GPU,
-compositor, and platform combinations still need their own smoke tests.
+Do not try `WEBKIT_DISABLE_DMABUF_RENDERER=1` first. On the affected NVIDIA host
+it avoided the startup crash but left the window fully transparent, with only
+hovered elements repainting. Reserve it for a host where the DMABUF renderer is
+confirmed to be the specific failing layer; see WebKit bug 280210
+(<https://bugs.webkit.org/show_bug.cgi?id=280210>).
+
+The helper does not force X11, change compositing, or write a global environment,
+driver, or system setting. Other GPU, compositor, and platform combinations
+remain untested.
 
 ## Platform status
 

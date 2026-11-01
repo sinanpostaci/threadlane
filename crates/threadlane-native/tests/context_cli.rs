@@ -2,13 +2,15 @@
 //! End-to-end behavioral tests for the packaged `threadlane-context` CLI.
 //!
 //! Covers outer help/version without context or runtime, context-free `help workflow` /
-//! `help session` / `help flow` offline sibling help with hostile `PATH`, sanitized syntax errors,
-//! existing private v1 context validation with legacy installation metadata, `check` + `workflow
-//! catalog` + `session` missing-host refusal, flow forwarding with the same five bound stores as
-//! session, foreign/offline bindings, protected scope/context flag override refusals with zero side
-//! effects, bad schema/route/identity/duplicate fields, package-pin and store guards,
-//! symlink/insecure/oversized context files, missing or unsafe sibling binaries, and child
-//! stdio/exit/signal (`outcome_unknown`) handling.
+//! `help session` / `help flow` / `help advice` offline sibling help with hostile `PATH`,
+//! sanitized syntax errors, existing private v1 context validation with legacy installation
+//! metadata, `check` + `workflow catalog` + `session` missing-host refusal, flow forwarding with
+//! the same five bound stores as session, advice forwarding with the frozen four-flag scope
+//! (`--registry-dir`, `--cache-dir <plans_dir>/advice-cache`, `--project-root`, `--context-id`)
+//! without creating `advice-cache`, foreign/offline bindings, protected scope/context/cache/
+//! context-id flag override refusals with zero side effects, bad schema/route/identity/duplicate
+//! fields, package-pin and store guards, symlink/insecure/oversized context files, missing or
+//! unsafe sibling binaries, and child stdio/exit/signal (`outcome_unknown`) handling.
 
 use std::ffi::OsString;
 use std::fs;
@@ -468,6 +470,32 @@ fn workflow_scope_args(fixture: &ContextFixture) -> Vec<String> {
     ]
 }
 
+fn advice_scope_args(fixture: &ContextFixture) -> Vec<String> {
+    vec![
+        "--registry-dir".to_string(),
+        fixture
+            .registry_dir
+            .to_str()
+            .expect("utf8 registry_dir")
+            .to_string(),
+        "--cache-dir".to_string(),
+        fixture
+            .plans_dir
+            .join("advice-cache")
+            .to_str()
+            .expect("utf8 advice-cache dir")
+            .to_string(),
+        "--project-root".to_string(),
+        fixture
+            .project_root
+            .to_str()
+            .expect("utf8 project_root")
+            .to_string(),
+        "--context-id".to_string(),
+        THREAD_UUID.to_string(),
+    ]
+}
+
 fn expected_recorded_argv(scope: &[String], inner: &[&str]) -> Vec<String> {
     let mut expected = Vec::with_capacity(1 + scope.len() + inner.len());
     expected.push((scope.len() + inner.len()).to_string());
@@ -516,6 +544,8 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("threadlane-context"));
         assert!(stdout.contains("--context <ABS_PRIVATE_JSON>"));
+        assert!(stdout.contains("advice <ADVICE_ARGS>..."));
+        assert!(stdout.contains("help advice"));
     }
 
     for ver_flag in ["--version", "-V"] {
@@ -543,7 +573,7 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
         assert_error_code(&out, "invalid_input");
     }
 
-    // Extra arguments after `check` or missing arguments after `workflow`/`session`.
+    // Extra arguments after `check` or missing arguments after `workflow`/`session`/`flow`/`advice`.
     let extra_check = run_bin(
         bin,
         &[
@@ -561,6 +591,12 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
 
     let empty_session = run_bin(bin, &["--context", "/tmp/nonexistent.json", "session"]).await;
     assert_error_code(&empty_session, "invalid_input");
+
+    let empty_flow = run_bin(bin, &["--context", "/tmp/nonexistent.json", "flow"]).await;
+    assert_error_code(&empty_flow, "invalid_input");
+
+    let empty_advice = run_bin(bin, &["--context", "/tmp/nonexistent.json", "advice"]).await;
+    assert_error_code(&empty_advice, "invalid_input");
 
     // Non-UTF8 CLI arguments are rejected safely without panic.
     let non_utf8 = run_bin_os(
@@ -1211,6 +1247,856 @@ async fn flow_rejects_invalid_extra_and_protected_arguments_before_child_invocat
     assert!(
         marker_file.exists(),
         "valid flow forwarding must invoke the package flow sibling"
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn offline_advice_help_uses_fixed_help_without_context_supervisor_path_lookup_or_cache_creation(
+) {
+    let mut fixture = ContextFixture::start().await;
+    fixture.shutdown().await;
+
+    let hostile_dir = fixture.root.join("hostile-advice-help-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile advice help PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile advice help PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-advice-help-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    write_executable_script(&hostile_dir, "threadlane-advice", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile advice help PATH directory");
+
+    // A missing package advice sibling is refused even while PATH contains a same-named executable.
+    let missing = run_bin_with_path(&fixture.context_bin, &["help", "advice"], hostile_path).await;
+    assert_error_code(&missing, "not_configured");
+    assert!(
+        !hostile_marker.exists(),
+        "missing package advice sibling must not fall back to PATH"
+    );
+    assert!(
+        !fixture.plans_dir.join("advice-cache").exists(),
+        "offline `help advice` must never create advice-cache"
+    );
+
+    // With the supervisor stopped and no context argument, the offline form forwards exactly one
+    // fixed --help argument to the canonical package advice sibling.
+    let help_marker = fixture.root.join("advice-help-argv.marker");
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-advice", &help_marker);
+
+    let out = run_bin_with_path(&fixture.context_bin, &["help", "advice"], hostile_path).await;
+    assert!(
+        out.status.success(),
+        "offline `help advice` failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "offline `help advice` must not write stderr"
+    );
+    assert_eq!(
+        read_argv_marker(&help_marker),
+        vec!["1".to_string(), "--help".to_string()],
+        "offline `help advice` must forward exactly one fixed --help argument"
+    );
+    assert!(
+        !hostile_marker.exists(),
+        "offline `help advice` must not resolve a sibling through PATH"
+    );
+    assert!(
+        !fixture.plans_dir.join("advice-cache").exists(),
+        "offline `help advice` must not create advice-cache"
+    );
+}
+
+#[tokio::test]
+async fn advice_forwards_canonical_scope_argv_in_exact_order_without_creating_cache_and_preserves_legacy_families(
+) {
+    let mut fixture = ContextFixture::start().await;
+
+    let hostile_dir = fixture.root.join("hostile-advice-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile advice PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile advice PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-advice-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    let hostile_advice =
+        write_executable_script(&hostile_dir, "threadlane-advice", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile advice PATH directory");
+
+    // Non-operational context metadata naming an advice executable or cache path must never
+    // select a child binary or override the context-derived advice scope.
+    let mut advice_context = fixture.valid_context_json();
+    advice_context["advice_executable"] = json!(hostile_advice);
+    advice_context["advice_cache_dir"] = json!("/tmp/ignored-non-operational-cache");
+    advice_context["context_id"] = json!("0196ed00-0000-7000-8000-0000000000ff");
+    let ctx_path = fixture.write_private_context("advice-forwarding-context.json", &advice_context);
+    let ctx_str = ctx_path.to_str().expect("utf8 advice context path");
+    let ctx_eq = format!("--context={ctx_str}");
+
+    let advice_marker = fixture.root.join("advice-forward-argv.marker");
+    let flow_marker = fixture.root.join("advice-test-flow-argv.marker");
+    let session_marker = fixture.root.join("advice-test-session-argv.marker");
+    let workflow_marker = fixture.root.join("advice-test-workflow-argv.marker");
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-advice", &advice_marker);
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-flow", &flow_marker);
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-session", &session_marker);
+    write_argv_recording_sibling(
+        &fixture.pkg_bin_dir,
+        "threadlane-workflow",
+        &workflow_marker,
+    );
+
+    let req_path = fixture.root.join("advice-request.json");
+    let req_str = req_path.to_str().expect("utf8 advice request path");
+    let derived_cache_dir = fixture.plans_dir.join("advice-cache");
+    let expected_scope = advice_scope_args(&fixture);
+
+    // 1. `advice preview --request <ABS>`
+    let preview_inner = ["preview", "--request", req_str];
+    let mut preview_args = vec!["--context", ctx_str, "advice"];
+    preview_args.extend(preview_inner);
+    let preview_out = run_bin_with_path(&fixture.context_bin, &preview_args, hostile_path).await;
+    assert!(
+        preview_out.status.success(),
+        "advice preview forwarding failed: {}",
+        String::from_utf8_lossy(&preview_out.stderr)
+    );
+    assert!(
+        preview_out.stderr.is_empty(),
+        "advice preview forwarding must not write stderr"
+    );
+    assert!(
+        !hostile_marker.exists(),
+        "advice forwarding must not resolve a sibling through PATH or context metadata"
+    );
+    assert_eq!(
+        read_argv_marker(&advice_marker),
+        expected_recorded_argv(&expected_scope, &preview_inner),
+        "advice preview must prepend --registry-dir, --cache-dir, --project-root, --context-id in exact order"
+    );
+    assert!(
+        !derived_cache_dir.exists(),
+        "threadlane-context must never create plans_dir/advice-cache"
+    );
+
+    // 2. `advice [--cache-ttl-seconds N] classify --request <ABS> --refresh` via `--context=<ABS>`
+    let classify_inner = [
+        "--cache-ttl-seconds",
+        "1800",
+        "classify",
+        "--request",
+        req_str,
+        "--refresh",
+    ];
+    let mut classify_args = vec![ctx_eq.as_str(), "advice"];
+    classify_args.extend(classify_inner);
+    let classify_out = run_bin_with_path(&fixture.context_bin, &classify_args, hostile_path).await;
+    assert!(
+        classify_out.status.success(),
+        "advice classify forwarding failed: {}",
+        String::from_utf8_lossy(&classify_out.stderr)
+    );
+    assert!(classify_out.stderr.is_empty());
+    assert_eq!(
+        read_argv_marker(&advice_marker),
+        expected_recorded_argv(&expected_scope, &classify_inner),
+        "advice classify must prepend the exact four scope flags before inner args"
+    );
+    assert!(
+        !derived_cache_dir.exists(),
+        "threadlane-context router must not create advice-cache even on classify forwarding"
+    );
+
+    // 3. `advice models --tool-id jev-api`
+    let models_inner = ["models", "--tool-id", "jev-api"];
+    let mut models_args = vec!["--context", ctx_str, "advice"];
+    models_args.extend(models_inner);
+    let models_out = run_bin_with_path(&fixture.context_bin, &models_args, hostile_path).await;
+    assert!(
+        models_out.status.success(),
+        "advice models forwarding failed: {}",
+        String::from_utf8_lossy(&models_out.stderr)
+    );
+    assert!(models_out.stderr.is_empty());
+    assert_eq!(
+        read_argv_marker(&advice_marker),
+        expected_recorded_argv(&expected_scope, &models_inner),
+        "advice models must prepend the exact four scope flags before inner args"
+    );
+    assert!(!derived_cache_dir.exists());
+
+    // 4. Legacy families (`workflow`, `session`, `flow`) preserve their exact scope argv.
+    let legacy_inner = ["fixture-command", "--limit", "5"];
+
+    let mut flow_args = vec!["--context", ctx_str, "flow"];
+    flow_args.extend(legacy_inner);
+    let flow_out = run_bin(&fixture.context_bin, &flow_args).await;
+    assert!(flow_out.status.success());
+    assert_eq!(
+        read_argv_marker(&flow_marker),
+        expected_recorded_argv(&five_store_scope_args(&fixture), &legacy_inner)
+    );
+
+    let mut session_args = vec!["--context", ctx_str, "session"];
+    session_args.extend(legacy_inner);
+    let session_out = run_bin(&fixture.context_bin, &session_args).await;
+    assert!(session_out.status.success());
+    assert_eq!(
+        read_argv_marker(&session_marker),
+        expected_recorded_argv(&five_store_scope_args(&fixture), &legacy_inner)
+    );
+
+    let mut workflow_args = vec!["--context", ctx_str, "workflow"];
+    workflow_args.extend(legacy_inner);
+    let workflow_out = run_bin(&fixture.context_bin, &workflow_args).await;
+    assert!(workflow_out.status.success());
+    assert_eq!(
+        read_argv_marker(&workflow_marker),
+        expected_recorded_argv(&workflow_scope_args(&fixture), &legacy_inner)
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_or_unsafe_advice_sibling_and_binding_or_child_failures_fail_closed() {
+    let mut fixture = ContextFixture::start().await;
+    let ctx_path =
+        fixture.write_private_context("advice-sibling-context.json", &fixture.valid_context_json());
+    let ctx_str = ctx_path.to_str().unwrap();
+    let advice_sibling = fixture.pkg_bin_dir.join("threadlane-advice");
+
+    let hostile_dir = fixture.root.join("hostile-advice-sibling-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile advice sibling PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile advice sibling PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-advice-sibling.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    write_executable_script(&hostile_dir, "threadlane-advice", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile advice sibling PATH directory");
+
+    // 1. A missing package advice sibling is refused without falling back to PATH.
+    let missing = run_bin_with_path(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+        hostile_path,
+    )
+    .await;
+    assert_error_code(&missing, "not_configured");
+    assert!(
+        !hostile_marker.exists(),
+        "missing package advice sibling must not fall back to PATH"
+    );
+
+    // 2. A symlink advice sibling is refused for operational forwarding and offline help.
+    symlink(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-workflow")),
+        &advice_sibling,
+    )
+    .expect("symlink threadlane-advice sibling");
+    let symlink_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+    )
+    .await;
+    assert_error_code(&symlink_out, "security_violation");
+    let offline_symlink = run_bin(&fixture.context_bin, &["help", "advice"]).await;
+    assert_error_code(&offline_symlink, "security_violation");
+    fs::remove_file(&advice_sibling).expect("remove symlink advice sibling");
+
+    // 3. A directory in place of the advice sibling is refused.
+    fs::create_dir(&advice_sibling).expect("create directory advice sibling");
+    let dir_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+    )
+    .await;
+    assert_error_code(&dir_out, "security_violation");
+    fs::remove_dir(&advice_sibling).expect("remove directory advice sibling");
+
+    // 4. A non-executable regular file advice sibling is refused.
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-advice",
+        "#!/bin/sh\nexit 0\n",
+        0o600,
+    );
+    let non_exec_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+    )
+    .await;
+    assert_error_code(&non_exec_out, "security_violation");
+    fs::remove_file(&advice_sibling).expect("remove non-exec advice sibling");
+
+    // 5. Child non-zero exit code and stderr output are preserved transparently without replay.
+    let count_file = fixture.root.join("advice-child-count.txt");
+    let failing_child_script = format!(
+        "#!/bin/sh\nprintf 'x' >> \"{}\"\nprintf '{{\"code\":\"advice_refusal\",\"message\":\"advice child refused request\"}}\\n' >&2\nexit 23\n",
+        count_file.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-advice",
+        &failing_child_script,
+        0o755,
+    );
+    let child_fail_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "classify",
+            "--request",
+            "/tmp/req.json",
+        ],
+    )
+    .await;
+    assert_eq!(child_fail_out.status.code(), Some(23));
+    let child_err = assert_error_code(&child_fail_out, "advice_refusal");
+    assert_eq!(child_err["message"], "advice child refused request");
+    assert_eq!(
+        fs::read_to_string(&count_file)
+            .expect("read advice count")
+            .len(),
+        1,
+        "failing advice child must be invoked exactly once without replay"
+    );
+    fs::remove_file(&advice_sibling).expect("remove failing advice sibling");
+
+    // 6. Signal termination after child spawn emits `outcome_unknown` and never replays.
+    let sig_count_file = fixture.root.join("advice-sig-child-count.txt");
+    let signal_child_script = format!(
+        "#!/bin/sh\nprintf 'x' >> \"{}\"\nkill -TERM $$\n",
+        sig_count_file.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-advice",
+        &signal_child_script,
+        0o755,
+    );
+    let sig_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "classify",
+            "--request",
+            "/tmp/req.json",
+        ],
+    )
+    .await;
+    assert_error_code(&sig_out, "outcome_unknown");
+    assert_eq!(
+        fs::read_to_string(&sig_count_file)
+            .expect("read advice sig count")
+            .len(),
+        1,
+        "signal-terminated advice child must be invoked exactly once without replay"
+    );
+    fs::remove_file(&advice_sibling).expect("remove signal advice sibling");
+
+    // 7. Unknown binding, foreign thread, and offline supervisor fail before spawning advice child.
+    let spawn_marker = fixture.root.join("advice-unverified-binding.marker");
+    let spawn_script = format!(
+        "#!/bin/sh\nprintf 'spawned' > \"{}\"\nexit 0\n",
+        spawn_marker.display()
+    );
+    write_executable_script(
+        &fixture.pkg_bin_dir,
+        "threadlane-advice",
+        &spawn_script,
+        0o755,
+    );
+
+    let mut unknown_binding_json = fixture.valid_context_json();
+    unknown_binding_json["binding_id"] = json!("bnd_missing_advice_999");
+    let unknown_ctx =
+        fixture.write_private_context("advice-unknown-binding.json", &unknown_binding_json);
+    let unknown_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            unknown_ctx.to_str().unwrap(),
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+    )
+    .await;
+    assert_error_code(&unknown_out, "binding_not_found");
+    assert!(!spawn_marker.exists());
+
+    let mut foreign_thread_json = fixture.valid_context_json();
+    foreign_thread_json["thread_uuid"] = json!(OTHER_THREAD_UUID);
+    let foreign_ctx =
+        fixture.write_private_context("advice-foreign-thread.json", &foreign_thread_json);
+    let foreign_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            foreign_ctx.to_str().unwrap(),
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+    )
+    .await;
+    assert_error_code(&foreign_out, "thread_uuid_mismatch");
+    assert!(!spawn_marker.exists());
+
+    fixture.shutdown().await;
+    let offline_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "models",
+            "--tool-id",
+            "jev-api",
+        ],
+    )
+    .await;
+    assert_error_code(&offline_out, "transport_unavailable");
+    assert!(!spawn_marker.exists());
+    assert!(!fixture.plans_dir.join("advice-cache").exists());
+}
+
+#[tokio::test]
+async fn advice_rejects_invalid_extra_and_protected_arguments_before_child_invocation() {
+    let mut fixture = ContextFixture::start().await;
+    let ctx_path = fixture.write_private_context(
+        "advice-protected-context.json",
+        &fixture.valid_context_json(),
+    );
+    let ctx_str = ctx_path.to_str().unwrap();
+    let ctx_eq = format!("--context={ctx_str}");
+
+    let marker_file = fixture.root.join("advice-protected-child.marker");
+    let marker_script = format!(
+        "#!/bin/sh\nprintf 'spawned' > \"{}\"\nexit 0\n",
+        marker_file.display()
+    );
+    for sibling in [
+        "threadlane-advice",
+        "threadlane-workflow",
+        "threadlane-session",
+        "threadlane-flow",
+    ] {
+        write_executable_script(&fixture.pkg_bin_dir, sibling, &marker_script, 0o755);
+    }
+
+    let invalid_cases: &[&[&str]] = &[
+        // Missing operational inner arguments.
+        &["--context", ctx_str, "advice"],
+        // Offline help accepts no extra argument, context, or protected override.
+        &["help", "advice", "extra"],
+        &["help", "advice", SECRET_SENTINEL],
+        &["help", "advice", "--help"],
+        &["help", "advice", "--cache-dir=/tmp/other"],
+        &["help", "advice", "--context-id=other"],
+        &["help", "advice=ignored"],
+        &["--context", ctx_str, "help", "advice"],
+        &[ctx_eq.as_str(), "help", "advice"],
+        // A protected override cannot occupy the family position.
+        &[
+            "--context",
+            ctx_str,
+            "--cache-dir=/tmp/other",
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "--context-id=other",
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+        ],
+        // Protected scope, cache-dir, context-id, project-root, store, binding, thread, and
+        // context overrides are refused in separate, equals, underscore, and repeated forms.
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--registry-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--registry-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--registry_dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--cache-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--cache-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--cache_dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--cache_dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--cache-dir=/tmp/other",
+            "--cache-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--project-root",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--project-root=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--project_root=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--context-id",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            &format!("--context-id={OTHER_THREAD_UUID}"),
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--context_id",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            &format!("--context_id={OTHER_THREAD_UUID}"),
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--context-id",
+            OTHER_THREAD_UUID,
+            "--context-id",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--state-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--state-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--plans-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--plans-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--authority-dir",
+            "/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--sessions-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--binding",
+            "bnd_override",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--binding=bnd_override",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--thread",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            &format!("--thread={OTHER_THREAD_UUID}"),
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            "--context",
+            ctx_str,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+            ctx_eq.as_str(),
+        ],
+        // Legacy families also reject the new --cache-dir and --context-id protected flags.
+        &[
+            "--context",
+            ctx_str,
+            "workflow",
+            "catalog",
+            "--cache-dir=/tmp/other",
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "session",
+            "session",
+            "--context-id",
+            OTHER_THREAD_UUID,
+        ],
+        &[
+            "--context",
+            ctx_str,
+            "flow",
+            "fixture-command",
+            "--context-id=other",
+        ],
+    ];
+
+    for case in invalid_cases {
+        let out = run_bin(&fixture.context_bin, case).await;
+        assert_error_code(&out, "invalid_input");
+        assert!(
+            !marker_file.exists(),
+            "invalid advice/protected arguments must never spawn the child executable: {case:?}"
+        );
+        assert!(
+            !fixture.plans_dir.join("advice-cache").exists(),
+            "invalid advice/protected arguments must never create advice-cache: {case:?}"
+        );
+    }
+
+    // A valid advice invocation proves the marker sibling is live and the refusals above were
+    // caused by argument validation rather than a broken fixture.
+    let valid_out = run_bin(
+        &fixture.context_bin,
+        &[
+            "--context",
+            ctx_str,
+            "advice",
+            "preview",
+            "--request",
+            "/tmp/req.json",
+        ],
+    )
+    .await;
+    assert!(
+        valid_out.status.success(),
+        "valid advice forwarding failed: {}",
+        String::from_utf8_lossy(&valid_out.stderr)
+    );
+    assert!(
+        marker_file.exists(),
+        "valid advice forwarding must invoke the package advice sibling"
     );
 
     fixture.shutdown().await;

@@ -5,9 +5,10 @@ use threadlane_registry::ModelDefinition;
 
 use crate::error::DecisionError;
 use crate::schema::{
-    build_jev_classify_body, build_openai_classify_body, parse_jev_classify_response,
-    parse_jev_models_response, parse_openai_classify_response, parse_openai_models_response,
-    validate_request, validate_secret, validate_tool_id,
+    build_jev_classify_body, build_openai_classify_body, parse_jev_catalog_entries,
+    parse_jev_classify_response, parse_jev_models_response, parse_openai_classify_response,
+    parse_openai_models_response, validate_request, validate_secret, validate_tool_id,
+    JevCatalogEntry,
 };
 use crate::transport::{
     ensure_success_status, DecisionTransport, ReqwestTransport, TransportMethod, TransportRequest,
@@ -127,10 +128,37 @@ impl DecisionClient {
         }
     }
 
+    /// Queries the Jev `/v1/models` catalog for the specified `tool_id` and returns the
+    /// exact server-reported catalog entries (including optional description and release date).
+    ///
+    /// Performs metadata discovery only and never injects unreturned models or invokes
+    /// classification inference.
+    pub async fn jev_catalog_entries(
+        &self,
+        tool_id: &str,
+    ) -> Result<Vec<JevCatalogEntry>, DecisionError> {
+        let validated_tool_id = validate_tool_id(tool_id)?;
+        let bearer_token = self.read_bearer_token(validated_tool_id.clone()).await?;
+
+        let response = self
+            .transport
+            .execute(TransportRequest {
+                provider: DecisionProvider::Jev,
+                method: TransportMethod::Get,
+                url: self.jev_models_url.clone(),
+                bearer_token,
+                json_body: None,
+            })
+            .await?;
+
+        ensure_success_status(response.status, response.body.len())?;
+        parse_jev_catalog_entries(&validated_tool_id, &response.body)
+    }
+
     /// Executes a single advisory difficulty classification request without automatic retries.
     ///
-    /// Results are strictly advisory: refusals, `noul` abstentions, and low-confidence choices
-    /// set `needs_review = true` and never trigger fallback models or automatic approval.
+    /// Results are strictly advisory: low-confidence choices and provider refusals set
+    /// `needs_review = true` and never trigger fallback models or automatic approval.
     pub async fn classify(
         &self,
         request: DecisionRequest,

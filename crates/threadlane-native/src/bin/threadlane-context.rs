@@ -6,8 +6,8 @@
 //! Validates a private (`0600`) version-1 operator context JSON file, verifies the bound
 //! `(binding_id, thread_uuid)` target against the live authenticated local supervisor, and
 //! either emits a bounded `check` verification envelope or invokes the canonical sibling
-//! `threadlane-workflow`, `threadlane-session`, or `threadlane-flow` binary directly via `argv`
-//! (never a shell).
+//! `threadlane-workflow`, `threadlane-session`, `threadlane-flow`, or `threadlane-advice` binary
+//! directly via `argv` (never a shell).
 //!
 //! ## Security and Authority Boundaries
 //!
@@ -19,16 +19,17 @@
 //!   and XDG fields) is never granted authority to choose executables or override bound stores.
 //!   When `cli_package` is present, its `bin` directory must match the current executable's
 //!   canonical sibling directory.
-//! - **Canonical sibling execution only**: `workflow`, `session`, and `flow` resolve only the
-//!   canonical `threadlane-workflow`, `threadlane-session`, or `threadlane-flow` regular executable
-//!   in the current binary's canonical parent directory, rejecting missing, symlink, non-regular,
-//!   or non-executable targets.
-//! - **Context-free family help**: `help workflow`, `help session`, and `help flow` execute only the
-//!   canonical same-package sibling with a single fixed `--help` argument, without reading a
-//!   context, validating stores, or contacting a supervisor.
-//! - **Locked scope flags**: Bound store directories, `--binding`, `--thread`, and `--context`
-//!   come exclusively from the private context file; forwarded overrides (including `=` forms and
-//!   repeated flags) are rejected before child execution.
+//! - **Canonical sibling execution only**: `workflow`, `session`, `flow`, and `advice` resolve only
+//!   the canonical `threadlane-workflow`, `threadlane-session`, `threadlane-flow`, or
+//!   `threadlane-advice` regular executable in the current binary's canonical parent directory,
+//!   rejecting missing, symlink, non-regular, or non-executable targets.
+//! - **Context-free family help**: `help workflow`, `help session`, `help flow`, and `help advice`
+//!   execute only the canonical same-package sibling with a single fixed `--help` argument, without
+//!   reading a context, validating stores, or contacting a supervisor.
+//! - **Locked scope flags**: Bound store directories, `--cache-dir`, `--project-root`,
+//!   `--context-id`, `--binding`, `--thread`, and `--context` come exclusively from the private
+//!   context file; forwarded overrides (including `=` forms and repeated flags) are rejected before
+//!   child execution.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -50,6 +51,8 @@ const TRUSTED_LOCAL_OPERATOR_ROUTE: &str = "trusted_local_operator";
 const WORKFLOW_BINARY_NAME: &str = "threadlane-workflow";
 const SESSION_BINARY_NAME: &str = "threadlane-session";
 const FLOW_BINARY_NAME: &str = "threadlane-flow";
+const ADVICE_BINARY_NAME: &str = "threadlane-advice";
+const ADVICE_CACHE_DIR_NAME: &str = "advice-cache";
 
 const OUTER_HELP_TEXT: &str = "\
 threadlane-context — Packaged trusted local operator context CLI for Threadlane
@@ -59,9 +62,11 @@ USAGE:
     threadlane-context --context <ABS_PRIVATE_JSON> workflow <WORKFLOW_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> session <SESSION_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> flow <FLOW_ARGS>...
+    threadlane-context --context <ABS_PRIVATE_JSON> advice <ADVICE_ARGS>...
     threadlane-context help workflow
     threadlane-context help session
     threadlane-context help flow
+    threadlane-context help advice
     threadlane-context --help | -h | help
     threadlane-context --version | -V
 
@@ -70,7 +75,8 @@ FAMILIES:
     workflow    Invoke canonical sibling threadlane-workflow with context-bound scope flags
     session     Invoke canonical sibling threadlane-session with context-bound scope flags
     flow        Invoke canonical sibling threadlane-flow with the same five stores, binding, and thread as session
-    help        Display outer help, or context-free sibling help for workflow/session/flow
+    advice      Invoke canonical sibling threadlane-advice with context-bound registry, cache, project root, and context ID
+    help        Display outer help, or context-free sibling help for workflow/session/flow/advice
 ";
 
 const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
@@ -84,6 +90,8 @@ const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
     "--authority_dir",
     "--sessions-dir",
     "--sessions_dir",
+    "--cache-dir",
+    "--cache_dir",
     "--binding",
     "--binding-id",
     "--binding_id",
@@ -91,6 +99,8 @@ const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
     "--thread-uuid",
     "--thread_uuid",
     "--context",
+    "--context-id",
+    "--context_id",
     "--project-root",
     "--project_root",
 ];
@@ -100,6 +110,7 @@ enum ChildFamily {
     Workflow,
     Session,
     Flow,
+    Advice,
 }
 
 impl ChildFamily {
@@ -108,6 +119,7 @@ impl ChildFamily {
             Self::Workflow => WORKFLOW_BINARY_NAME,
             Self::Session => SESSION_BINARY_NAME,
             Self::Flow => FLOW_BINARY_NAME,
+            Self::Advice => ADVICE_BINARY_NAME,
         }
     }
 }
@@ -452,7 +464,7 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
     if args[0] == "help" {
         if args.len() != 2 {
             return Err(OperatorCliError::invalid_input(
-                "help command family accepts exactly one of workflow, session, or flow",
+                "help command family accepts exactly one of workflow, session, flow, or advice",
             ));
         }
         return match args[1] {
@@ -465,8 +477,11 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
             "flow" => Ok(OuterParseAction::DisplaySiblingHelp {
                 family: ChildFamily::Flow,
             }),
+            "advice" => Ok(OuterParseAction::DisplaySiblingHelp {
+                family: ChildFamily::Advice,
+            }),
             _ => Err(OperatorCliError::invalid_input(
-                "unsupported help family; only workflow, session, and flow are supported",
+                "unsupported help family; only workflow, session, flow, and advice are supported",
             )),
         };
     }
@@ -550,6 +565,18 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
                 inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
             }
         }
+        "advice" => {
+            if rest.is_empty() {
+                return Err(OperatorCliError::invalid_input(
+                    "advice command family requires subcommand arguments",
+                ));
+            }
+            reject_protected_overrides(rest)?;
+            ContextCommand::Forward {
+                family: ChildFamily::Advice,
+                inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
+            }
+        }
         "help" => {
             return Err(OperatorCliError::invalid_input(
                 "help command family is context-free and does not accept --context",
@@ -557,7 +584,7 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
         }
         _ => {
             return Err(OperatorCliError::invalid_input(
-                "unsupported command family; only check, workflow, session, and flow are supported",
+                "unsupported command family; only check, workflow, session, flow, and advice are supported",
             ));
         }
     };
@@ -950,6 +977,24 @@ fn build_child_args(
     family: ChildFamily,
     inner_args: &[String],
 ) -> Vec<OsString> {
+    if family == ChildFamily::Advice {
+        let cache_dir = validated.stores.plans_dir.join(ADVICE_CACHE_DIR_NAME);
+        let mut args = Vec::with_capacity(8 + inner_args.len());
+        args.push(OsString::from("--registry-dir"));
+        args.push(validated.stores.registry_dir.as_os_str().to_os_string());
+        args.push(OsString::from("--cache-dir"));
+        args.push(cache_dir.into_os_string());
+        args.push(OsString::from("--project-root"));
+        args.push(validated.project_root.as_os_str().to_os_string());
+        args.push(OsString::from("--context-id"));
+        args.push(OsString::from(&validated.thread_uuid));
+
+        for arg in inner_args {
+            args.push(OsString::from(arg));
+        }
+        return args;
+    }
+
     let mut args = Vec::with_capacity(14 + inner_args.len());
     args.push(OsString::from("--state-dir"));
     args.push(validated.stores.state_dir.as_os_str().to_os_string());
@@ -1101,6 +1146,32 @@ mod tests {
             }
         );
 
+        let advice = parse_outer_args(&[
+            OsString::from("--context"),
+            OsString::from("/tmp/context.json"),
+            OsString::from("advice"),
+            OsString::from("classify"),
+            OsString::from("--request"),
+            OsString::from("/tmp/advice-request.json"),
+            OsString::from("--refresh"),
+        ])
+        .expect("parse advice");
+        assert_eq!(
+            advice,
+            OuterParseAction::Execute {
+                context_path: PathBuf::from("/tmp/context.json"),
+                command: ContextCommand::Forward {
+                    family: ChildFamily::Advice,
+                    inner_args: vec![
+                        "classify".to_string(),
+                        "--request".to_string(),
+                        "/tmp/advice-request.json".to_string(),
+                        "--refresh".to_string(),
+                    ],
+                },
+            }
+        );
+
         // Non-UTF8 is rejected safely with invalid_input.
         let bad_utf8 = parse_outer_args(&[
             OsString::from("--context"),
@@ -1123,11 +1194,12 @@ mod tests {
         }
 
         // Protected flags in inner_args (separate and equals forms) are rejected for every
-        // forwarding family, including flow.
+        // forwarding family, including flow and advice.
         for (family, inner) in [
             ("workflow", "catalog"),
             ("session", "session"),
             ("flow", "fixture-command"),
+            ("advice", "preview"),
         ] {
             for bad_flag in [
                 "--state-dir",
@@ -1140,13 +1212,24 @@ mod tests {
                 "--authority-dir=/tmp/other",
                 "--sessions-dir",
                 "--sessions-dir=/tmp/other",
+                "--cache-dir",
+                "--cache-dir=/tmp/other",
+                "--cache_dir",
+                "--cache_dir=/tmp/other",
                 "--binding",
                 "--binding=bnd_other",
                 "--thread",
                 "--thread=0196ed00-0000-7000-8000-000000000099",
                 "--context",
                 "--context=/tmp/other.json",
+                "--context-id",
+                "--context-id=0196ed00-0000-7000-8000-000000000099",
+                "--context_id",
+                "--context_id=0196ed00-0000-7000-8000-000000000099",
+                "--project-root",
                 "--project-root=/tmp/other",
+                "--project_root",
+                "--project_root=/tmp/other",
             ] {
                 let err = parse_outer_args(&[
                     OsString::from("--context"),
@@ -1173,12 +1256,37 @@ mod tests {
             vec![
                 OsString::from("--context"),
                 OsString::from("/tmp/context.json"),
+                OsString::from("--cache-dir=/tmp/other"),
+                OsString::from("advice"),
+                OsString::from("preview"),
+            ],
+            vec![
+                OsString::from("--context"),
+                OsString::from("/tmp/context.json"),
                 OsString::from("flow"),
                 OsString::from("fixture-command"),
                 OsString::from("--thread"),
                 OsString::from("0196ed00-0000-7000-8000-000000000099"),
                 OsString::from("--thread"),
                 OsString::from("0196ed00-0000-7000-8000-000000000099"),
+            ],
+            vec![
+                OsString::from("--context"),
+                OsString::from("/tmp/context.json"),
+                OsString::from("advice"),
+                OsString::from("preview"),
+                OsString::from("--cache-dir"),
+                OsString::from("/tmp/other"),
+                OsString::from("--cache-dir"),
+                OsString::from("/tmp/other"),
+            ],
+            vec![
+                OsString::from("--context"),
+                OsString::from("/tmp/context.json"),
+                OsString::from("advice"),
+                OsString::from("preview"),
+                OsString::from("--context-id=other"),
+                OsString::from("--context-id=other"),
             ],
         ] {
             let err = parse_outer_args(&raw).expect_err("protected family/repeat must fail");
@@ -1195,6 +1303,7 @@ mod tests {
             ("workflow", ChildFamily::Workflow),
             ("session", ChildFamily::Session),
             ("flow", ChildFamily::Flow),
+            ("advice", ChildFamily::Advice),
         ] {
             let parsed = parse_outer_args(&[OsString::from("help"), OsString::from(family_token)])
                 .expect("parse context-free family help");
@@ -1214,6 +1323,7 @@ mod tests {
             &["help", "unknown"],
             &["help", "workflow=ignored"],
             &["help", "flow=ignored"],
+            &["help", "advice=ignored"],
             &["help", "--help"],
             &["help", "-h"],
             &["help", "--context"],
@@ -1222,8 +1332,12 @@ mod tests {
             &["help", "session", "--help"],
             &["help", "flow", "extra"],
             &["help", "flow", "--help"],
+            &["help", "advice", "extra"],
+            &["help", "advice", "--help"],
             &["help", "workflow", "--state-dir=/tmp/other"],
             &["help", "flow", "--state-dir=/tmp/other"],
+            &["help", "advice", "--cache-dir=/tmp/other"],
+            &["help", "advice", "--context-id=other"],
         ];
         for args in invalid_help_forms {
             let raw: Vec<OsString> = args.iter().map(|arg| OsString::from(*arg)).collect();
@@ -1235,6 +1349,8 @@ mod tests {
             &["--context", "/tmp/context.json", "help", "workflow"],
             &["--context=/tmp/context.json", "help", "session"],
             &["--context", "/tmp/context.json", "help", "flow"],
+            &["--context", "/tmp/context.json", "help", "advice"],
+            &["--context=/tmp/context.json", "help", "advice"],
             &["--context", "/tmp/context.json", "help"],
         ];
         for args in context_bearing_help_forms {
@@ -1242,5 +1358,51 @@ mod tests {
             let err = parse_outer_args(&raw).expect_err("context-bearing help must fail");
             assert_eq!(err.code, "invalid_input");
         }
+    }
+
+    #[test]
+    fn build_child_args_prepends_exact_family_scope_in_frozen_order() {
+        let validated = ValidatedContext {
+            project_root: PathBuf::from("/abs/project"),
+            binding_id: "bnd_123".to_string(),
+            thread_uuid: "0196ed00-0000-7000-8000-0000000000a1".to_string(),
+            stores: ValidatedStores {
+                state_dir: PathBuf::from("/abs/stores/state"),
+                registry_dir: PathBuf::from("/abs/stores/registry"),
+                plans_dir: PathBuf::from("/abs/stores/plans"),
+                authority_dir: PathBuf::from("/abs/stores/authority"),
+                sessions_dir: PathBuf::from("/abs/stores/sessions"),
+            },
+            current_bin_dir: PathBuf::from("/abs/pkg/bin"),
+            cli_package_pinned: true,
+        };
+
+        let advice_args = build_child_args(
+            &validated,
+            ChildFamily::Advice,
+            &[
+                "classify".to_string(),
+                "--request".to_string(),
+                "/abs/request.json".to_string(),
+                "--refresh".to_string(),
+            ],
+        );
+        assert_eq!(
+            advice_args,
+            vec![
+                OsString::from("--registry-dir"),
+                OsString::from("/abs/stores/registry"),
+                OsString::from("--cache-dir"),
+                OsString::from("/abs/stores/plans/advice-cache"),
+                OsString::from("--project-root"),
+                OsString::from("/abs/project"),
+                OsString::from("--context-id"),
+                OsString::from("0196ed00-0000-7000-8000-0000000000a1"),
+                OsString::from("classify"),
+                OsString::from("--request"),
+                OsString::from("/abs/request.json"),
+                OsString::from("--refresh"),
+            ]
+        );
     }
 }

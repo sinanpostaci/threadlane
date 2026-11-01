@@ -1,8 +1,11 @@
 use serde::{Deserialize, Serialize};
 use threadlane_registry::Difficulty;
 
-/// Pinned Jev model version for stable evaluation thresholds.
-pub const DEFAULT_JEV_MODEL: &str = "jev-1.14.0";
+/// Documented Jev alias model identifier.
+///
+/// `jev-latest` is an upstream alias and is never injected into `/v1/models` catalog responses
+/// or used as an automatic fallback to rewrite an explicit model selection.
+pub const DEFAULT_JEV_MODEL: &str = "jev-latest";
 
 /// Supported OpenAI Decisions API model identifier.
 pub const DEFAULT_OPENAI_DECISION_MODEL: &str = "gpt-6-luna";
@@ -49,16 +52,29 @@ impl std::fmt::Display for DecisionProvider {
 }
 
 /// Advisory difficulty classification request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` output intentionally redacts `task_summary` so raw task summaries do not leak into logs.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecisionRequest {
     /// Registry tool identifier used to look up the API key in the credential store.
     pub tool_id: String,
     /// Target decision provider.
     pub provider: DecisionProvider,
-    /// Requested provider model identifier (e.g. `"jev-1.14.0"` or `"gpt-6-luna"`).
+    /// Requested provider model identifier (e.g. `"jev-latest"`, `"jev-1.14.0"`, or `"gpt-6-luna"`).
     pub model: String,
     /// Bounded task summary to classify.
     pub task_summary: String,
+}
+
+impl std::fmt::Debug for DecisionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionRequest")
+            .field("tool_id", &self.tool_id)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("task_summary", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Validated advisory result returned by a decision provider.
@@ -71,13 +87,13 @@ pub struct DecisionAdvice {
     pub provider: DecisionProvider,
     /// Validated model identifier echoed by the provider.
     pub model: String,
-    /// Classified difficulty when the provider returned a valid choice answer, or `None` on refusal/abstention.
+    /// Classified difficulty when the provider returned a valid choice answer, or `None` on provider refusal.
     pub difficulty: Option<Difficulty>,
     /// Validated finite confidence in `[0.0, 1.0]` when available.
     pub confidence: Option<f64>,
-    /// `true` when the classification is uncertain, abstained (`noul`), refused, or low-confidence.
+    /// `true` when the classification is low-confidence or refused and requires operator review.
     pub needs_review: bool,
-    /// Machine-readable reason code (`"classified"`, `"low_confidence"`, `"noul"`, or `"refusal"`).
+    /// Machine-readable reason code (`"classified"`, `"low_confidence"`, or `"refusal"`).
     pub reason_code: String,
     /// Reported input token count when present and within JS-safe bounds.
     pub input_tokens: Option<u64>,

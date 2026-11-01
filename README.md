@@ -55,10 +55,19 @@ not require switching to the panel for each task. See
 
 - **Packaged context commands**: `threadlane-context --context /private/context.json
   check` validates the selected private context and live target. Use the same
-  prefix with `workflow ...`, `flow ...` or `session ...` for everyday commands. Executables
-  are fixed package siblings and bound scope flags cannot be overridden. It does
-  not create stores, start a daemon, grant approval, or call a provider. See
+  prefix with `workflow ...`, `flow ...`, `session ...` or `advice ...` for
+  everyday commands. Executables are fixed package siblings and bound scope
+  flags cannot be overridden. The router itself does not create stores, start a
+  daemon, grant approval, or call a provider; the advice sibling contacts Jev
+  only for explicit `classify` or `models`. See
   [native context commands](docs/NATIVE-CONTEXT.md).
+
+- **Shadow difficulty advice**: `threadlane-advice` and the `advice` context
+  family expose an enabled Jev tool's server catalog and explicit advisory
+  classification. `preview` performs no provider call or vault read; `classify`
+  is one request or a completed cache hit. Results are advisory-only and never
+  change plans, profiles, difficulty, models, approvals, hosts, workers or Git.
+  See [Jev shadow advice](docs/JEV-SHADOW.md).
 
 - **Profile-selected role cycles**: `threadlane-flow` validates only requested
   roles against an explicit model/effort policy, freezes an approved cycle, and

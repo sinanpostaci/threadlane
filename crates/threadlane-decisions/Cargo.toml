@@ -3,16 +3,25 @@ name = "threadlane-decisions"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Advisory decision provider client and schema validation for Threadlane Milestone 4"
+description = "Advisory decision provider client, Jev shadow advice cache, and CLI for Threadlane"
+
+[[bin]]
+name = "threadlane-advice"
+path = "src/bin/threadlane-advice.rs"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+rustix = { version = "1", features = ["fs", "process"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.10"
 thiserror = "1.0"
 threadlane-connectors = { path = "../threadlane-connectors" }
 threadlane-registry = { path = "../threadlane-registry" }
-tokio = { version = "1", features = ["rt", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

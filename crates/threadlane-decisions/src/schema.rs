@@ -5,8 +5,8 @@ use threadlane_registry::{Difficulty, ModelDefinition};
 
 use crate::error::DecisionError;
 use crate::types::{
-    DecisionAdvice, DecisionProvider, DecisionRequest, DEFAULT_JEV_MODEL,
-    DEFAULT_OPENAI_DECISION_MODEL, MAX_JS_SAFE_INTEGER, MIN_CONFIDENCE_THRESHOLD,
+    DecisionAdvice, DecisionProvider, DecisionRequest, DEFAULT_OPENAI_DECISION_MODEL,
+    MAX_JS_SAFE_INTEGER, MIN_CONFIDENCE_THRESHOLD,
 };
 
 /// Maximum length in bytes for `tool_id` and `model` identifiers.
@@ -18,18 +18,20 @@ pub const MAX_TASK_SUMMARY_BYTES: usize = 8 * 1024;
 /// Maximum number of models accepted from a provider catalog response.
 pub const MAX_CATALOG_MODELS: usize = 256;
 
-const QUESTION_NAME: &str = "difficulty";
-const JEV_INSTRUCTIONS: &str = "Select implementation difficulty from the supplied task evidence.";
+pub(crate) const QUESTION_NAME: &str = "difficulty";
+pub(crate) const JEV_INSTRUCTIONS: &str =
+    "Select implementation difficulty from the supplied task evidence.";
 const OPENAI_INSTRUCTIONS: &str = "Select implementation difficulty from the supplied evidence.";
 
-const EASY_DESCRIPTION: &str = "Small isolated behavior-preserving edit.";
-const MEDIUM_DESCRIPTION: &str = "Bounded multi-step change within known module boundaries.";
-const HARD_DESCRIPTION: &str =
+pub(crate) const EASY_DESCRIPTION: &str = "Small isolated behavior-preserving edit.";
+pub(crate) const MEDIUM_DESCRIPTION: &str =
+    "Bounded multi-step change within known module boundaries.";
+pub(crate) const HARD_DESCRIPTION: &str =
     "Substantial uncertainty, concurrency, or cross-module integration complexity.";
-const EXTREME_DESCRIPTION: &str =
+pub(crate) const EXTREME_DESCRIPTION: &str =
     "High-risk architectural, security-critical, or multi-system redesign.";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct ValidatedRequest {
     pub tool_id: String,
     pub provider: DecisionProvider,
@@ -179,6 +181,44 @@ fn validate_unit_interval(value: f64) -> Result<f64, DecisionError> {
         return Err(DecisionError::InvalidResponse);
     }
     Ok(value)
+}
+
+fn validate_four_way_probabilities(
+    selected: Difficulty,
+    entries: &[(String, f64)],
+) -> Result<(), DecisionError> {
+    if entries.len() != 4 {
+        return Err(DecisionError::InvalidResponse);
+    }
+
+    let mut seen = HashSet::with_capacity(4);
+    let mut sum = 0.0_f64;
+    let mut selected_prob: Option<f64> = None;
+    let mut max_prob = 0.0_f64;
+
+    for (raw_key, raw_prob) in entries {
+        let diff = parse_difficulty_choice(raw_key)?;
+        if !seen.insert(raw_key.as_str()) {
+            return Err(DecisionError::InvalidResponse);
+        }
+        let prob = validate_unit_interval(*raw_prob)?;
+        sum += prob;
+        if diff == selected {
+            selected_prob = Some(prob);
+        }
+        if prob > max_prob {
+            max_prob = prob;
+        }
+    }
+
+    if !sum.is_finite() || !(0.95..=1.05).contains(&sum) {
+        return Err(DecisionError::InvalidResponse);
+    }
+
+    match selected_prob {
+        Some(chosen) if chosen + 1e-6 >= max_prob => Ok(()),
+        _ => Err(DecisionError::InvalidResponse),
+    }
 }
 
 fn validate_probabilities(
@@ -351,6 +391,43 @@ pub(crate) fn build_jev_classify_body(
     serde_json::to_string(&payload).map_err(|_| DecisionError::InvalidRequest)
 }
 
+/// Validated catalog model metadata returned by Jev `GET /v1/models`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JevCatalogEntry {
+    /// Scoped registry model identifier (`"<tool_id>:<name>"`).
+    pub id: String,
+    /// Registry tool identifier that owns this model.
+    pub tool_id: String,
+    /// Upstream Jev model or alias name (`"<name>"`).
+    pub name: String,
+    /// Display label matching the upstream model name.
+    pub label: String,
+    /// Exact provider `model` argument to pass to Jev requests.
+    pub model_arg: String,
+    /// Optional bounded description returned by the Jev catalog.
+    pub description: Option<String>,
+    /// Optional release date string returned by the Jev catalog.
+    pub release_date: Option<String>,
+    /// Supported reasoning efforts (empty for Jev System One models).
+    pub efforts: Vec<String>,
+    /// Whether this model may be invoked without an effort parameter (`true` for Jev).
+    pub allow_no_effort: bool,
+}
+
+impl JevCatalogEntry {
+    /// Converts this catalog entry into a [`ModelDefinition`].
+    pub fn into_model_definition(self) -> ModelDefinition {
+        ModelDefinition {
+            id: self.id,
+            tool_id: self.tool_id,
+            label: self.label,
+            model_arg: self.model_arg,
+            efforts: self.efforts,
+            allow_no_effort: self.allow_no_effort,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JevModelsResponse {
@@ -358,28 +435,44 @@ struct JevModelsResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JevCatalogModel {
     name: String,
     #[serde(default)]
-    #[allow(dead_code)]
     description: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     release_date: Option<String>,
 }
 
-pub(crate) fn parse_jev_models_response(
+fn sanitize_optional_catalog_field(
+    value: Option<String>,
+    max_bytes: usize,
+) -> Result<Option<String>, DecisionError> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.len() > max_bytes || trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(DecisionError::InvalidResponse);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+pub(crate) fn parse_jev_catalog_entries(
     tool_id: &str,
     bytes: &[u8],
-) -> Result<Vec<ModelDefinition>, DecisionError> {
+) -> Result<Vec<JevCatalogEntry>, DecisionError> {
     let parsed: JevModelsResponse =
         serde_json::from_slice(bytes).map_err(|_| DecisionError::InvalidResponse)?;
     if parsed.models.len() > MAX_CATALOG_MODELS {
         return Err(DecisionError::InvalidResponse);
     }
 
-    let mut seen = HashSet::with_capacity(parsed.models.len() + 1);
-    let mut definitions = Vec::with_capacity(parsed.models.len() + 1);
+    let mut seen = HashSet::with_capacity(parsed.models.len());
+    let mut entries = Vec::with_capacity(parsed.models.len());
 
     for item in parsed.models {
         let name = item.name.trim();
@@ -389,31 +482,35 @@ pub(crate) fn parse_jev_models_response(
         if !seen.insert(name.to_string()) {
             return Err(DecisionError::InvalidResponse);
         }
-        definitions.push(ModelDefinition {
+        let description = sanitize_optional_catalog_field(item.description, 1024)?;
+        let release_date = sanitize_optional_catalog_field(item.release_date, 64)?;
+
+        entries.push(JevCatalogEntry {
             id: format!("{tool_id}:{name}"),
             tool_id: tool_id.to_string(),
+            name: name.to_string(),
             label: name.to_string(),
             model_arg: name.to_string(),
+            description,
+            release_date,
             efforts: Vec::new(),
             allow_no_effort: true,
         });
     }
 
-    // Jev's `/v1/models` catalog lists aliases (e.g. `jev-latest`) and may omit the pinned
-    // versioned model `jev-1.14.0`. Ensure the pinned versioned model is available when the
-    // catalog returned only aliases.
-    if !definitions.is_empty() && !seen.contains(DEFAULT_JEV_MODEL) {
-        definitions.push(ModelDefinition {
-            id: format!("{tool_id}:{DEFAULT_JEV_MODEL}"),
-            tool_id: tool_id.to_string(),
-            label: DEFAULT_JEV_MODEL.to_string(),
-            model_arg: DEFAULT_JEV_MODEL.to_string(),
-            efforts: Vec::new(),
-            allow_no_effort: true,
-        });
-    }
+    // Never inject any model or version that the server did not return.
+    Ok(entries)
+}
 
-    Ok(definitions)
+pub(crate) fn parse_jev_models_response(
+    tool_id: &str,
+    bytes: &[u8],
+) -> Result<Vec<ModelDefinition>, DecisionError> {
+    let entries = parse_jev_catalog_entries(tool_id, bytes)?;
+    Ok(entries
+        .into_iter()
+        .map(JevCatalogEntry::into_model_definition)
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -471,55 +568,35 @@ pub(crate) fn parse_jev_classify_response(
         None => (None, None),
     };
 
-    match answer.answer_type.as_str() {
-        "choice" => {
-            if answer.noul.is_some() {
-                return Err(DecisionError::InvalidResponse);
-            }
-            let raw_choice = answer
-                .choice
-                .as_deref()
-                .ok_or(DecisionError::InvalidResponse)?;
-            let difficulty = parse_difficulty_choice(raw_choice)?;
-            let raw_confidence = answer.confidence.ok_or(DecisionError::InvalidResponse)?;
-            let confidence = validate_unit_interval(raw_confidence)?;
-
-            if let Some(probabilities) = &answer.probabilities {
-                validate_probabilities(difficulty, &probabilities.0)?;
-            }
-
-            Ok(build_classified_advice(
-                DecisionProvider::Jev,
-                model,
-                difficulty,
-                confidence,
-                input_tokens,
-                output_tokens,
-            ))
-        }
-        "noul" => {
-            if answer.choice.is_some()
-                || answer.confidence.is_some()
-                || answer.probabilities.is_some()
-            {
-                return Err(DecisionError::InvalidResponse);
-            }
-            let noul_score = answer.noul.ok_or(DecisionError::InvalidResponse)?;
-            let _ = validate_unit_interval(noul_score)?;
-
-            Ok(DecisionAdvice {
-                provider: DecisionProvider::Jev,
-                model,
-                difficulty: None,
-                confidence: None,
-                needs_review: true,
-                reason_code: "noul".to_string(),
-                input_tokens,
-                output_tokens,
-            })
-        }
-        _ => Err(DecisionError::InvalidResponse),
+    // Difficulty is a four-way Choice question (`easy`, `medium`, `hard`, `extreme`).
+    // `noul` is a separate yes/no probability primitive in Jev, not abstention or confidence,
+    // so any non-`"choice"` answer (including `"noul"`) is invalid for this request.
+    if answer.answer_type != "choice" || answer.noul.is_some() {
+        return Err(DecisionError::InvalidResponse);
     }
+
+    let raw_choice = answer
+        .choice
+        .as_deref()
+        .ok_or(DecisionError::InvalidResponse)?;
+    let difficulty = parse_difficulty_choice(raw_choice)?;
+    let raw_confidence = answer.confidence.ok_or(DecisionError::InvalidResponse)?;
+    let confidence = validate_unit_interval(raw_confidence)?;
+
+    let probabilities = answer
+        .probabilities
+        .as_ref()
+        .ok_or(DecisionError::InvalidResponse)?;
+    validate_four_way_probabilities(difficulty, &probabilities.0)?;
+
+    Ok(build_classified_advice(
+        DecisionProvider::Jev,
+        model,
+        difficulty,
+        confidence,
+        input_tokens,
+        output_tokens,
+    ))
 }
 
 // ============================================================================

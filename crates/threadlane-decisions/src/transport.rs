@@ -59,7 +59,7 @@ impl std::fmt::Debug for TransportRequest {
             .field("method", &self.method)
             .field("url", &self.url)
             .field("bearer_token", &"[REDACTED]")
-            .field("json_body", &self.json_body)
+            .field("json_body", &self.json_body.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
 }
@@ -103,7 +103,9 @@ impl ReqwestTransport {
     /// Builds a production HTTPS transport with redirects disabled and strict timeouts.
     pub fn new() -> Result<Self, DecisionError> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .https_only(true)
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -119,7 +121,9 @@ impl ReqwestTransport {
     #[cfg(test)]
     pub(crate) fn new_for_test() -> Result<Self, DecisionError> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
             .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
