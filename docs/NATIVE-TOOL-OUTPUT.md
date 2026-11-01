@@ -82,6 +82,20 @@ operator reconciliation/re-arming. There is no indefinite background retry.
 Omitting `reconnect` preserves the original pinned-socket behavior, legacy JSON
 and configuration digest. Automatic endpoint refresh is currently Linux-only.
 
+A scoped Linux/NixOS pilot on 2026-11-01 kept the notification context, digest
+and approved host unchanged across a desktop restart. The replacement backend
+and socket were selected automatically; one tool-output notice reached the
+continued test chat, and Luna acknowledged all 27 events in two actual batches.
+The DeepSeek Go Max documentation task had matching observed model/effort and
+completed successfully. Its important event became eligible after the app had
+reopened, so this is endpoint-refresh evidence, not a live mid-send disconnect
+or app-closed wake-up test. A separate controlled operator test verified a
+question during execution, local worker cancellation for a scope change, and a
+fresh plan/approval before replacement work. The test required a saved local
+project and fresh scope after a handoff changed the chat ID. It does not prove
+remote inference termination, native per-call identity or general multi-chat
+routing.
+
 Start an existing approved session with the normal store and approval arguments,
 plus the following explicit notification options:
 
@@ -171,3 +185,4 @@ verify native conversation delivery on either platform.
 - [Existing approved-session notification policy](APPROVED-NOTIFICATIONS.md)
 - [Trusted operator CLI pull and ACK route](NATIVE-OPERATOR-NOTIFICATIONS.md)
 - [Native per-call routing gate](NATIVE-ROUTING.md)
+- [Linux native recovery operator checklist](NATIVE-RECOVERY-CHECKLIST.md)
