@@ -38,7 +38,12 @@ pub use descriptor::{
     DESCRIPTOR_FILENAME, DESCRIPTOR_VERSION, LOCK_FILENAME, LOOPBACK_HOST,
 };
 pub use error::{ApiError, Error, ErrorCode};
-pub use mcp::ThreadlaneMcpServer;
+pub use mcp::{
+    OperatingGuideParams, OperatingGuideResponse, ThreadlaneMcpServer, NATIVE_OPERATOR_DOC_PATH,
+    OPERATING_GUIDE_CLI_COMMAND, OPERATING_GUIDE_DOC_PATH, OPERATING_GUIDE_MARKDOWN,
+    OPERATING_GUIDE_TOOL, OPERATING_GUIDE_VERSION, PAIRED_MCP_STARTUP_INSTRUCTIONS,
+    SCOPED_MCP_STARTUP_INSTRUCTIONS,
+};
 pub use native_endpoint::NativeReconnectConfig;
 pub use native_tool_output::{NativeNotificationDelivery, NativeToolOutputConfig};
 pub use protocol::{

@@ -15,6 +15,12 @@ use threadlane::mcp::{
     ListActivityParams, ListRunQuestionsParams, ListRunRevisionsParams, ListRunsParams,
     PullEventsParams, StartDemoParams, StartWorkerParams, StatusParams, SteerParams,
 };
+pub use threadlane::mcp::{
+    OperatingGuideParams, OperatingGuideResponse, NATIVE_OPERATOR_DOC_PATH,
+    OPERATING_GUIDE_CLI_COMMAND, OPERATING_GUIDE_DOC_PATH, OPERATING_GUIDE_MARKDOWN,
+    OPERATING_GUIDE_TOOL, OPERATING_GUIDE_VERSION, PAIRED_MCP_STARTUP_INSTRUCTIONS,
+    SCOPED_MCP_STARTUP_INSTRUCTIONS,
+};
 use threadlane::{ScopedClient, ThreadlaneMcpServer};
 use threadlane_authority::AuthorityStore;
 use threadlane_workflow::{
@@ -640,6 +646,12 @@ impl PairedMcpServer {
                 let params: StatusParams = Self::parse_tool_params(tool_name, arguments)?;
                 self.status(Parameters(params)).await
             }
+            OPERATING_GUIDE_TOOL => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: OperatingGuideParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.operating_guide(Parameters(params)).await
+            }
             "get_run" => {
                 Self::ensure_no_rebind_keys(tool_name, &arguments)?;
                 let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
@@ -1133,6 +1145,26 @@ impl PairedMcpServer {
             "data": identity,
         });
         Ok(CallToolResult::structured(payload))
+    }
+
+    /// Delegated `operating_guide` tool (requires verified operator enrollment).
+    #[tool(
+        name = "operating_guide",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-01.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        annotations(
+            title = "Get Threadlane MCP Operating Guide",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn operating_guide(
+        &self,
+        Parameters(params): Parameters<OperatingGuideParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let delegate = self.enrolled_delegate(OPERATING_GUIDE_TOOL)?;
+        delegate.operating_guide(Parameters(params)).await
     }
 
     /// Delegated `status` tool (requires verified operator enrollment).
@@ -1843,8 +1875,6 @@ impl ServerHandler for PairedMcpServer {
                 "threadlane-native-mcp",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
-                "Threadlane paired MCP bootstrap server. Starts UNBOUND with a fresh connection nonce and epoch; only `connection_identity` is permitted until the trusted local operator enrolls this connection to a single native chat thread. Caller `_meta` and arguments cannot enroll or rebind.",
-            )
+            .with_instructions(PAIRED_MCP_STARTUP_INSTRUCTIONS)
     }
 }

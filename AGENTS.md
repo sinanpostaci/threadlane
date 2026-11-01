@@ -45,6 +45,12 @@ current milestone contract before editing.
 
 ## Native conversation workflow
 
+- Respect paired MCP bootstrap: only `connection_identity` is available before
+  trusted enrollment. Once allowed, on connection/resume or context uncertainty,
+  fetch the shared operating guide (`operating_guide` over MCP or offline `threadlane guide`
+  on the trusted-local CLI route; canonical source `docs/MCP-OPERATING-GUIDE.md`),
+  then refresh live scoped state and revisions (`status`, `get_plan`,
+  `approved_session`, `approved_task`) without a polling loop.
 - When the operator supplies a private Threadlane context, use
   `threadlane-workflow` for plans, `threadlane-flow` for profile/policy admission
   and durable role handoffs, and `threadlane-session` for approved tasks, events

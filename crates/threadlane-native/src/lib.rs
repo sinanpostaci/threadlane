@@ -94,8 +94,11 @@ pub use host_launcher::{
 };
 pub use mcp_pair::{
     open_workflow_stores, CatalogParams, ConnectionIdentityParams, DraftTaskParams, GetPlanParams,
-    ListPlansParams, PairedMcpServer, PlanTaskParams, PublishParams, PublishPlanParams,
-    SaveDraftParams, SavePlanDraftParams, WorkflowStoreHandles, WorkflowTaskParams,
+    ListPlansParams, OperatingGuideParams, OperatingGuideResponse, PairedMcpServer, PlanTaskParams,
+    PublishParams, PublishPlanParams, SaveDraftParams, SavePlanDraftParams, WorkflowStoreHandles,
+    WorkflowTaskParams, NATIVE_OPERATOR_DOC_PATH, OPERATING_GUIDE_CLI_COMMAND,
+    OPERATING_GUIDE_DOC_PATH, OPERATING_GUIDE_MARKDOWN, OPERATING_GUIDE_TOOL,
+    OPERATING_GUIDE_VERSION, PAIRED_MCP_STARTUP_INSTRUCTIONS, SCOPED_MCP_STARTUP_INSTRUCTIONS,
 };
 pub use pairing::{
     ConnectionEpochState, ConnectionIdentity, EnrollmentRecord, NativeVerificationStatus,
@@ -884,9 +887,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Verify capability count: `connection_identity` + 15 delegated runtime tools + 5 workflow tools + 8 approved-task tools = 29 tools.
+        // Verify capability count: `connection_identity` + 16 delegated runtime tools (including `operating_guide`) + 5 workflow tools + 8 approved-task tools = 30 tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 29, "PairedMcpServer must expose 29 tools");
+        assert_eq!(tools.len(), 30, "PairedMcpServer must expose 30 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1221,7 +1224,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 29);
+        assert_eq!(tools.len(), 30);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),
@@ -2319,6 +2322,339 @@ fi
                 .status,
             PlanStatus::Draft
         );
+    }
+
+    #[tokio::test]
+    async fn paired_mcp_operating_guide_startup_instructions_gating_and_read_only_behavior() {
+        use rmcp::ServerHandler;
+        use threadlane::{ScopedClient, ThreadlaneMcpServer};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+
+        let sup_handle = Supervisor::start(SupervisorConfig {
+            state_dir: state_dir.clone(),
+            tick_interval: Duration::from_millis(60_000),
+            codex: None,
+            workers: None,
+        })
+        .await
+        .expect("start supervisor");
+        let sup_client = SupervisorClient::from_state_dir(&state_dir).expect("sup client");
+        let binding_a = sup_client
+            .create_binding("0196ed00-0000-7000-8000-00000000020a", "Guide Chat A")
+            .await
+            .expect("create binding A");
+
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+        let mut mcp_a =
+            PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
+
+        // 1. Verify `get_info().instructions` on both PairedMcpServer and ThreadlaneMcpServer share
+        //    `OPERATING_GUIDE_VERSION` and place version + initial action in the first 512 chars.
+        let paired_info = mcp_a.get_info();
+        let paired_instructions = paired_info
+            .instructions
+            .as_deref()
+            .expect("paired ServerConfig instructions");
+        assert_eq!(paired_instructions, PAIRED_MCP_STARTUP_INSTRUCTIONS);
+        let paired_prefix: String = paired_instructions.chars().take(512).collect();
+        let ver_idx = paired_prefix
+            .find(OPERATING_GUIDE_VERSION)
+            .expect("paired instructions must contain version in first 512 chars");
+        let first_action_idx = paired_prefix
+            .find("First action")
+            .expect("paired instructions must contain First action in first 512 chars");
+        let identity_idx = paired_prefix
+            .find("connection_identity")
+            .expect("paired instructions must contain connection_identity in first 512 chars");
+        let guide_idx = paired_prefix
+            .find(OPERATING_GUIDE_TOOL)
+            .expect("paired instructions must contain operating_guide in first 512 chars");
+        assert!(ver_idx < first_action_idx);
+        assert!(first_action_idx < identity_idx);
+        assert!(identity_idx < guide_idx);
+
+        let scoped_server = ThreadlaneMcpServer::new(
+            ScopedClient::from_state_dir_lazy(&state_dir, &binding_a.binding_id)
+                .expect("lazy scoped client"),
+        );
+        let scoped_info = scoped_server.get_info();
+        let scoped_instructions = scoped_info
+            .instructions
+            .as_deref()
+            .expect("scoped ServerConfig instructions");
+        assert_eq!(scoped_instructions, SCOPED_MCP_STARTUP_INSTRUCTIONS);
+        let scoped_prefix: String = scoped_instructions.chars().take(512).collect();
+        assert!(scoped_prefix.contains(OPERATING_GUIDE_VERSION));
+        assert!(scoped_prefix.contains(OPERATING_GUIDE_TOOL));
+
+        // 2. Verify `operating_guide` registration, read-only annotations, and strict no-arg schema.
+        let tools = mcp_a.list_tools();
+        let guide_tool = tools
+            .iter()
+            .find(|tool| tool.name == OPERATING_GUIDE_TOOL)
+            .expect("operating_guide registered in PairedMcpServer");
+        let ann = guide_tool
+            .annotations
+            .as_ref()
+            .expect("operating_guide annotations");
+        assert_eq!(ann.read_only_hint, Some(true));
+        assert_eq!(ann.destructive_hint, Some(false));
+        assert_eq!(ann.idempotent_hint, Some(true));
+        assert_eq!(ann.open_world_hint, Some(false));
+        let schema = serde_json::to_value(&guide_tool.input_schema).expect("schema json");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(
+            schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_none_or(|props| props.is_empty()),
+            "operating_guide must accept no arguments"
+        );
+
+        // 3. While UNBOUND, `connection_identity` succeeds, while `operating_guide` fails closed
+        //    with `unbound_connection` even if caller `_meta` supplies binding/thread IDs.
+        let id_res = mcp_a
+            .invoke_tool_json("connection_identity", json!({}), None)
+            .await
+            .expect("connection_identity allowed while UNBOUND");
+        assert_eq!(
+            id_res.structured_content.unwrap()["data"]["state"],
+            "unbound"
+        );
+
+        let unbound_err = mcp_a
+            .invoke_tool_json(
+                OPERATING_GUIDE_TOOL,
+                json!({}),
+                Some(json!({
+                    "binding_id": binding_a.binding_id,
+                    "threadId": binding_a.thread_uuid
+                })),
+            )
+            .await
+            .expect_err("unbound operating_guide must be refused");
+        let unbound_payload = unbound_err.structured_content.unwrap();
+        assert_eq!(unbound_payload["tool"], OPERATING_GUIDE_TOOL);
+        assert_eq!(unbound_payload["error"]["code"], "unbound_connection");
+
+        // Spoofed identity/rebind keys are rejected with `rebind_rejected` before any state access.
+        for forbidden_key in ["binding_id", "thread_id", "connection_nonce", "epoch_id"] {
+            let mut bad_args = serde_json::Map::new();
+            bad_args.insert(
+                forbidden_key.to_string(),
+                Value::String("spoofed".to_string()),
+            );
+            let rebind_err = mcp_a
+                .invoke_tool_json(OPERATING_GUIDE_TOOL, Value::Object(bad_args), None)
+                .await
+                .expect_err("rebind key must be rejected");
+            assert_eq!(
+                rebind_err.structured_content.unwrap()["error"]["code"],
+                "rebind_rejected"
+            );
+        }
+
+        // 4. Enroll `mcp_a` to Chat A; verify unknown args are rejected and valid `{}` succeeds
+        //    with zero side effects or event ACK mutations.
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_a.connection_nonce().to_string(),
+                    epoch_id: mcp_a.epoch_id().to_string(),
+                    binding_id: binding_a.binding_id.clone(),
+                    thread_id: binding_a.thread_uuid.clone(),
+                    project_id: Some("proj-guide".to_string()),
+                },
+            )
+            .expect("enroll mcp_a");
+
+        let unknown_arg_err = mcp_a
+            .invoke_tool_json(OPERATING_GUIDE_TOOL, json!({"unexpected": true}), None)
+            .await
+            .expect_err("unknown arg must be rejected");
+        assert_eq!(
+            unknown_arg_err.structured_content.unwrap()["error"]["code"],
+            "validation_failed"
+        );
+
+        // Start a demo run and pull an event batch so there is an unacknowledged batch on Chat A.
+        mcp_a
+            .invoke_tool_json(
+                "start_demo",
+                json!({
+                    "command_key": "guide-side-effect-check",
+                    "instruction": "Verify operating_guide does not mutate state or ack events"
+                }),
+                None,
+            )
+            .await
+            .expect("start demo");
+        let pulled = mcp_a
+            .invoke_tool_json("pull_events", json!({"limit": 10}), None)
+            .await
+            .expect("pull events")
+            .structured_content
+            .unwrap();
+        let batch_id = pulled["data"]["batch_id"]
+            .as_str()
+            .expect("batch_id present")
+            .to_string();
+        let status_before = sup_client
+            .status(&binding_a.binding_id)
+            .await
+            .expect("status before guide");
+        assert!(status_before.binding.delivered_seq > 0);
+        assert_eq!(status_before.binding.acked_seq, 0);
+
+        let guide_ok = mcp_a
+            .invoke_tool_json(OPERATING_GUIDE_TOOL, json!({}), None)
+            .await
+            .expect("enrolled operating_guide must succeed")
+            .structured_content
+            .unwrap();
+        assert_eq!(guide_ok["untrusted_data"], true);
+        assert_eq!(guide_ok["demo_only"], false);
+        assert_eq!(guide_ok["binding_id"], binding_a.binding_id);
+        assert_eq!(guide_ok["tool"], OPERATING_GUIDE_TOOL);
+        assert_eq!(guide_ok["data"]["version"], OPERATING_GUIDE_VERSION);
+        assert_eq!(guide_ok["data"]["tool"], OPERATING_GUIDE_TOOL);
+        assert_eq!(guide_ok["data"]["doc_path"], OPERATING_GUIDE_DOC_PATH);
+        assert_eq!(
+            guide_ok["data"]["operator_doc_path"],
+            NATIVE_OPERATOR_DOC_PATH
+        );
+        assert_eq!(
+            guide_ok["data"]["cli_fallback_command"],
+            OPERATING_GUIDE_CLI_COMMAND
+        );
+        assert_eq!(guide_ok["data"]["guide_markdown"], OPERATING_GUIDE_MARKDOWN);
+
+        // Verify zero side effects on supervisor cursors, runs, or unacknowledged batch.
+        let status_after = sup_client
+            .status(&binding_a.binding_id)
+            .await
+            .expect("status after guide");
+        assert_eq!(
+            status_after.binding.delivered_seq,
+            status_before.binding.delivered_seq
+        );
+        assert_eq!(status_after.binding.acked_seq, 0);
+        assert_eq!(
+            status_after.recent_runs.len(),
+            status_before.recent_runs.len()
+        );
+
+        // The pulled batch is still unacknowledged and can be acknowledged normally.
+        mcp_a
+            .invoke_tool_json(
+                "ack_events",
+                json!({
+                    "command_key": "ack-after-guide",
+                    "batch_id": batch_id
+                }),
+                None,
+            )
+            .await
+            .expect("ack batch after reading guide");
+        let status_acked = sup_client
+            .status(&binding_a.binding_id)
+            .await
+            .expect("status after ack");
+        assert_eq!(
+            status_acked.binding.acked_seq,
+            status_before.binding.delivered_seq
+        );
+
+        // 5. Restart / stale epoch / explicit expiration / quarantined shared connection refusals.
+        let stale_clone = mcp_a.clone();
+        mcp_a.restart_epoch().expect("restart epoch");
+
+        // Restarted server is now UNBOUND again and refuses `operating_guide`.
+        let restarted_unbound_err = mcp_a
+            .invoke_tool_json(OPERATING_GUIDE_TOOL, json!({}), None)
+            .await
+            .expect_err("restarted unbound server must refuse operating_guide");
+        assert_eq!(
+            restarted_unbound_err.structured_content.unwrap()["error"]["code"],
+            "unbound_connection"
+        );
+
+        // Stale handle holding the old expired epoch is refused with `expired_epoch`.
+        let stale_epoch_err = stale_clone
+            .invoke_tool_json(OPERATING_GUIDE_TOOL, json!({}), None)
+            .await
+            .expect_err("stale epoch must refuse operating_guide");
+        assert_eq!(
+            stale_epoch_err.structured_content.unwrap()["error"]["code"],
+            "expired_epoch"
+        );
+
+        // Re-enroll the restarted epoch, then explicitly expire it in PairingStore.
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_a.connection_nonce().to_string(),
+                    epoch_id: mcp_a.epoch_id().to_string(),
+                    binding_id: binding_a.binding_id.clone(),
+                    thread_id: binding_a.thread_uuid.clone(),
+                    project_id: None,
+                },
+            )
+            .expect("re-enroll restarted mcp_a");
+        pairing_store
+            .expire_epoch(&operator_token, mcp_a.epoch_id())
+            .expect("expire epoch");
+        let expired_err = mcp_a
+            .invoke_tool_json(OPERATING_GUIDE_TOOL, json!({}), None)
+            .await
+            .expect_err("expired epoch must refuse operating_guide");
+        assert_eq!(
+            expired_err.structured_content.unwrap()["error"]["code"],
+            "expired_epoch"
+        );
+
+        // Quarantine a shared connection and verify `operating_guide` fails with `shared_connection_rejected`.
+        let mcp_shared =
+            PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp shared");
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_shared.connection_nonce().to_string(),
+                    epoch_id: mcp_shared.epoch_id().to_string(),
+                    binding_id: binding_a.binding_id.clone(),
+                    thread_id: binding_a.thread_uuid.clone(),
+                    project_id: None,
+                },
+            )
+            .expect("initial enroll on mcp_shared");
+        let _ = pairing_store.enroll(
+            &operator_token,
+            OperatorEnrollRequest {
+                connection_nonce: mcp_shared.connection_nonce().to_string(),
+                epoch_id: mcp_shared.epoch_id().to_string(),
+                binding_id: "bnd_0196ed00-0000-7000-8000-00000000020b".to_string(),
+                thread_id: "0196ed00-0000-7000-8000-00000000020b".to_string(),
+                project_id: None,
+            },
+        );
+        let shared_err = mcp_shared
+            .invoke_tool_json(OPERATING_GUIDE_TOOL, json!({}), None)
+            .await
+            .expect_err("quarantined shared connection must refuse operating_guide");
+        assert_eq!(
+            shared_err.structured_content.unwrap()["error"]["code"],
+            "shared_connection_rejected"
+        );
+
+        sup_handle.shutdown().await;
     }
 }
 

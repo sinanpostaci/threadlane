@@ -1834,7 +1834,7 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
         let missing_list = read_json_rpc_response(&mut missing_reader, 2).await;
         assert_eq!(
             missing_list["result"]["tools"].as_array().map(Vec::len),
-            Some(15)
+            Some(16)
         );
         assert!(
             !missing_state_dir.exists(),
@@ -1927,7 +1927,11 @@ async fn test_stdio_mcp_offline_discovery_online_recovery_restart_and_descriptor
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 15, "MCP tool count must remain 15");
+    assert_eq!(
+        tools.len(),
+        16,
+        "MCP tool count includes the operating guide"
+    );
 
     // 5. Calling `status` while supervisor is offline returns a structured transport_error tool result.
     send_json_rpc(

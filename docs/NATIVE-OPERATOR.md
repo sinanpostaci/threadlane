@@ -10,6 +10,20 @@ human approval. Results report `route: "trusted_local_operator"` and
 `native_per_call_identity_verified: false`. Do not install a universal fixed
 MCP binding or start another Codex app-server to claim automatic pairing.
 
+## Startup guide and compaction recovery
+
+Run `threadlane guide` to print the canonical versioned operating guide
+([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
+or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
+`threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
+fetch the same shared guide and version (`2026-11-01.v1`).
+
+Compaction detection and memory retention are not automatic. On initial
+connection, session resume, context uncertainty, or before external effects when
+rules or state are uncertain, refetch `operating_guide` (or run `threadlane guide`
+on the trusted-local CLI route) and then refresh live scoped state and revisions
+(`status`, `list-plans` / `get-plan`, `session` / `task`) without a polling loop.
+
 ## Setup and planning
 
 The Nix `threadlane` package includes the workflow, flow, session and authority

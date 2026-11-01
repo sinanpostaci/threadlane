@@ -756,7 +756,7 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
 
     // 3. Verify all 8 approved-task tools are registered in the actual `rmcp` tool router with strict schemas.
     let tools = configured_mcp.list_tools();
-    assert_eq!(tools.len(), 29);
+    assert_eq!(tools.len(), 30);
 
     for (
         tool_name,
@@ -3144,7 +3144,7 @@ async fn codex_first_auto_start_cli_and_policy_prerequisites_and_default_off_inv
     let enabled_server = cli_enabled.into_server().expect("enabled into_server");
     assert!(enabled_server.has_host_launcher_policy());
     assert_eq!(enabled_server.host_launcher_policy(), Some(&sibling_policy));
-    assert_eq!(enabled_server.list_tools().len(), 29);
+    assert_eq!(enabled_server.list_tools().len(), 30);
 
     // 6. Legacy/default-off server never spawns when `start_approved_task` is called on an unstarted approval.
     let (rev, digest) = create_published_plan(

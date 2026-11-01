@@ -7,7 +7,7 @@ use clap::{Parser, Subcommand};
 use crate::client::{ScopedClient, SupervisorClient};
 use crate::codex::{CodexWakeupConfig, DEFAULT_CODEX_TIMEOUT_MS};
 use crate::error::Error;
-use crate::mcp::ThreadlaneMcpServer;
+use crate::mcp::{ThreadlaneMcpServer, OPERATING_GUIDE_MARKDOWN};
 use crate::protocol::ScopedRequest;
 use crate::supervisor::{Supervisor, SupervisorConfig, DEFAULT_TICK_INTERVAL_MS};
 use crate::workers::WorkersConfig;
@@ -132,6 +132,14 @@ pub enum Subcommands {
         #[arg(long)]
         binding: String,
     },
+
+    /// Print the versioned Threadlane MCP operating guide offline without network or supervisor access.
+    Guide,
+}
+
+/// Returns the canonical versioned operating guide Markdown printed by `threadlane guide`.
+pub fn render_operating_guide() -> &'static str {
+    OPERATING_GUIDE_MARKDOWN
 }
 
 /// Builds a validated [`SupervisorConfig`] from CLI `serve` arguments (without worker profiles).
@@ -282,6 +290,10 @@ pub async fn run_cli(cli: Cli) -> Result<(), Error> {
             let server = ThreadlaneMcpServer::new(scoped);
             server.run_stdio().await
         }
+        Subcommands::Guide => {
+            print!("{}", render_operating_guide());
+            Ok(())
+        }
     }
 }
 
@@ -314,5 +326,31 @@ async fn wait_for_shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::OPERATING_GUIDE_VERSION;
+
+    #[tokio::test]
+    async fn cli_guide_subcommand_parses_without_args_and_executes_offline() {
+        let parsed = Cli::try_parse_from(["threadlane", "guide"])
+            .expect("`threadlane guide` must parse with no arguments");
+        assert!(matches!(parsed.command, Subcommands::Guide));
+
+        assert!(
+            Cli::try_parse_from(["threadlane", "guide", "--unexpected"]).is_err(),
+            "`threadlane guide` must reject unexpected arguments"
+        );
+
+        let rendered = render_operating_guide();
+        assert_eq!(rendered, OPERATING_GUIDE_MARKDOWN);
+        assert!(rendered.contains(OPERATING_GUIDE_VERSION));
+
+        run_cli(parsed)
+            .await
+            .expect("`threadlane guide` must succeed offline without supervisor or state_dir");
     }
 }
