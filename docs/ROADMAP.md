@@ -72,6 +72,11 @@ recovery, concurrent human steering, general multi-chat identity and other
 operating systems retain separate acceptance boundaries. Legacy queue
 notifications are not an automatic fallback.
 
+The [2026-11-01 installed-package check](NATIVE-TOOL-OUTPUT-RESTART-2026-11-01.md)
+verified manually reselected delivery after human activation and restart, with a
+human-confirmed response in the same native chat. It does not implement automatic
+endpoint refresh or promote a transport receipt into event handling or approval.
+
 Milestone 1's deterministic native conversation loop and Milestone 2A's bounded
 history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker
 library and diagnostic CLI provide provider evidence parsing, bounded process
