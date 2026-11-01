@@ -34,6 +34,54 @@ settings. The selected thread must already be loaded. The context is an
 operator-selected local scope; it does not authenticate native MCP per-call
 conversation provenance or prove automatic multi-chat isolation.
 
+### Automatic endpoint refresh on Linux
+
+An optional `reconnect` policy allows the same context to follow a restarted
+desktop application without editing its original `socket_path` after each run:
+
+```json
+{
+  "schema_version": 1,
+  "socket_path": "/private/runtime/initial-selected.sock",
+  "thread_id": "01900000-0000-7000-8000-000000000001",
+  "project_root": "/canonical/path/to/repository",
+  "model": "gpt-6-luna",
+  "effort": "max",
+  "reconnect": {
+    "descriptor_root": "/run/user/1000",
+    "backend_executable": "/canonical/installed/resources/codex-threadlane-original",
+    "application_executable": "/canonical/installed/.ChatGPT-wrapped"
+  }
+}
+```
+
+Use actual canonical paths from the explicitly selected installed application.
+The root must be a private same-user directory. The policy selects the existing
+launcher's immediate `tl-codex-*` session directories and private descriptors;
+it does not search arbitrary sockets or adopt another installation. The original
+socket path remains part of the frozen configuration, but reconnect mode resolves
+the current managed endpoint before each attempt instead of requiring that old
+socket to remain present.
+
+Each candidate must match the frozen backend/application executable paths and
+the same-user backend -> translator -> application process ancestry. Process
+start identities, private file/socket permissions and Unix peer credentials are
+checked again before delivery. Multiple live matching candidates are refused.
+Thread, repository, model and effort are independently checked through native
+metadata. An installation update that changes the pinned executable paths needs
+an explicit policy refresh.
+
+While this mode is selected, an unavailable endpoint, a connection lost before
+`turn/start`, or a chat that is not yet loaded can be retried within the existing
+notification timeout. Attempts use bounded backoff and shared frame/byte budgets.
+The client never forces a chat to load or changes its settings. Configure a
+suitable `--notify-timeout-ms` for the expected restart interval; the existing
+maximum is 300,000 ms. Expiry before a send remains `Failed` and needs explicit
+operator reconciliation/re-arming. There is no indefinite background retry.
+
+Omitting `reconnect` preserves the original pinned-socket behavior, legacy JSON
+and configuration digest. Automatic endpoint refresh is currently Linux-only.
+
 Start an existing approved session with the normal store and approval arguments,
 plus the following explicit notification options:
 
@@ -70,16 +118,19 @@ The observer UI does not consume or acknowledge events.
 
 ## Failure and recovery
 
-Connection, scope and configuration failures before the effect-bearing write
-record **Failed**. Once writing `turn/start` may have begun, disconnects,
+Terminal connection, scope and configuration failures before the effect-bearing
+write record **Failed**. Explicit reconnect mode can wait/reconnect only for
+known transient pre-write unavailability within its bounded timeout. Once
+writing `turn/start` may have begun, disconnects,
 timeouts, invalid responses and cancellation record **Unknown**. There is no
 automatic resend, fallback, model interruption, or replay after an uncertain
 outcome. Inspect and reconcile the actual chat and durable claim first.
 
-An app restart can invalidate the selected socket. Refresh the explicitly
-selected context and host policy through the operator workflow; do not scan for
-and adopt a different server or infer identity from a chat title. A descriptor
-alone is not per-chat routing proof.
+An app restart can invalidate a pinned socket. Use an explicitly configured
+reconnect policy to resolve its replacement, or refresh a pinned context through
+the operator workflow. A descriptor alone is not per-chat routing proof; a chat
+title never selects a target. Automatic endpoint refresh does not start hosts
+after reboot, replay worker tasks, or restore notification opt-in from a manifest.
 
 ## Evidence and platform limits
 

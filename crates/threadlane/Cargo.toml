@@ -17,7 +17,7 @@ fs2.workspace = true
 futures-util = { version = "0.3", features = ["sink"] }
 reqwest.workspace = true
 rmcp.workspace = true
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "fs"] }
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,7 +1,9 @@
 use std::fmt;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+#[cfg(unix)]
+use std::time::Duration;
 
 #[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +20,9 @@ use uuid::Uuid;
 use crate::codex::{ApprovedSessionWakeupContext, CodexWakeupConfig};
 use crate::descriptor::{ensure_platform_supported, validate_no_symlink_components};
 use crate::error::Error;
+use crate::native_endpoint::NativeReconnectConfig;
+#[cfg(unix)]
+use crate::native_endpoint::{EndpointError, ResolvedNativeEndpoint};
 
 /// Supported schema version for [`NativeToolOutputConfig`].
 pub const NATIVE_TOOL_OUTPUT_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -34,6 +39,9 @@ pub const MAX_NATIVE_WS_CUMULATIVE_BYTES: usize = 4_194_304;
 /// Maximum permitted incoming WebSocket frame count (`512`) across one native exchange.
 pub const MAX_NATIVE_WS_FRAMES: usize = 512;
 
+/// Maximum permitted endpoint resolution and pre-effect connection attempts (`64`) across one wake-up exchange when auto-reconnect is enabled.
+pub const MAX_NATIVE_RECONNECT_ATTEMPTS: usize = 64;
+
 /// Fixed tool name submitted in `turn/start.toolOutput`.
 pub const NATIVE_TOOL_OUTPUT_NAME: &str = "threadlane_events_available";
 
@@ -42,18 +50,23 @@ pub const NATIVE_TOOL_OUTPUT_NAMESPACE: &str = "threadlane";
 
 const NATIVE_WS_URL: &str = "ws://localhost/";
 const MAX_CONTROL_PING_BYTES: usize = 125;
+#[cfg(unix)]
+const INITIAL_RECONNECT_BACKOFF_MS: u64 = 5;
+#[cfg(unix)]
+const MAX_RECONNECT_BACKOFF_MS: u64 = 50;
 
 /// Explicit operator-selected native tool-output wake-up transport configuration.
 ///
 /// This configuration is an operator-selected target scope only and is not a per-call
-/// native identity proof. Every wake-up attempt revalidates the physical socket path,
+/// native identity proof. Every wake-up attempt revalidates the physical socket path
+/// (or resolves and validates the live native endpoint when `reconnect` is configured),
 /// parent directory ownership/permissions, canonical project root, and target thread identity.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeToolOutputConfig {
     /// Configuration schema version (must be `1`).
     pub schema_version: u32,
-    /// Absolute normalized path to the existing same-UID Unix domain socket in a same-UID `0700` parent directory.
+    /// Absolute normalized path to the existing same-UID Unix domain socket in a same-UID `0700` parent directory, or the normalized absolute initial selection when `reconnect` is configured.
     pub socket_path: PathBuf,
     /// Canonical lowercase hyphenated non-nil target thread UUID.
     pub thread_id: String,
@@ -63,6 +76,9 @@ pub struct NativeToolOutputConfig {
     pub model: String,
     /// Bounded non-empty expected reasoning effort identifier.
     pub effort: String,
+    /// Optional opt-in Linux native endpoint auto-reconnect selector configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnect: Option<NativeReconnectConfig>,
 }
 
 impl fmt::Debug for NativeToolOutputConfig {
@@ -74,12 +90,13 @@ impl fmt::Debug for NativeToolOutputConfig {
             .field("project_root", &"[REDACTED]")
             .field("model", &"[REDACTED]")
             .field("effort", &"[REDACTED]")
+            .field("reconnect", &self.reconnect)
             .finish()
     }
 }
 
 impl NativeToolOutputConfig {
-    /// Validates all structural, identifier, canonical project root, and physical Unix socket invariants.
+    /// Validates all structural, identifier, canonical project root, and Unix socket or reconnect invariants.
     pub fn validate(&self) -> Result<(), Error> {
         ensure_platform_supported()?;
         #[cfg(unix)]
@@ -105,7 +122,22 @@ impl NativeToolOutputConfig {
         validate_model_or_effort(&self.model, "model")?;
         validate_model_or_effort(&self.effort, "effort")?;
         validate_canonical_project_root(&self.project_root)?;
-        validate_physical_socket_path(&self.socket_path, expected_uid)?;
+
+        match self.reconnect {
+            None => {
+                validate_physical_socket_path(&self.socket_path, expected_uid)?;
+            }
+            Some(ref reconnect) => {
+                validate_initial_socket_selection(&self.socket_path, expected_uid)?;
+                if expected_uid != current_euid() {
+                    return Err(Error::SecurityViolation(
+                        "native tool-output reconnect configuration is not owned by the current effective UID"
+                            .to_string(),
+                    ));
+                }
+                reconnect.validate()?;
+            }
+        }
 
         Ok(())
     }
@@ -126,7 +158,7 @@ impl NativeToolOutputConfig {
 
     #[cfg(unix)]
     pub(crate) fn load_with_euid(path: &Path, expected_uid: u32) -> Result<Self, Error> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         if path.as_os_str().is_empty() {
             return Err(Error::InvalidConfig(
@@ -192,7 +224,12 @@ impl NativeToolOutputConfig {
             )));
         }
 
-        let file = File::open(&resolved)?;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(
+                (rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK).bits() as i32,
+            )
+            .open(&resolved)?;
         let open_meta = file.metadata()?;
         if !open_meta.file_type().is_file()
             || open_meta.dev() != sym_meta.dev()
@@ -244,6 +281,13 @@ impl NativeToolOutputConfig {
     /// The returned digest string is path-free and suitable for persistence in summaries.
     pub fn digest(&self) -> String {
         #[derive(Serialize)]
+        struct CanonicalReconnectConfig<'a> {
+            descriptor_root: &'a [u8],
+            backend_executable: &'a [u8],
+            application_executable: &'a [u8],
+        }
+
+        #[derive(Serialize)]
         struct CanonicalConfig<'a> {
             schema_version: u32,
             socket_path: &'a [u8],
@@ -251,6 +295,8 @@ impl NativeToolOutputConfig {
             project_root: &'a [u8],
             model: &'a str,
             effort: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            reconnect: Option<CanonicalReconnectConfig<'a>>,
         }
 
         let canonical = CanonicalConfig {
@@ -260,6 +306,16 @@ impl NativeToolOutputConfig {
             project_root: path_as_canonical_bytes(&self.project_root),
             model: &self.model,
             effort: &self.effort,
+            reconnect: self
+                .reconnect
+                .as_ref()
+                .map(|reconnect| CanonicalReconnectConfig {
+                    descriptor_root: path_as_canonical_bytes(&reconnect.descriptor_root),
+                    backend_executable: path_as_canonical_bytes(&reconnect.backend_executable),
+                    application_executable: path_as_canonical_bytes(
+                        &reconnect.application_executable,
+                    ),
+                }),
         };
         let encoded =
             serde_json::to_vec(&canonical).expect("canonical config serialization is infallible");
@@ -492,6 +548,48 @@ fn validate_physical_socket_path(socket_path: &Path, expected_uid: u32) -> Resul
 }
 
 #[cfg(unix)]
+fn validate_initial_socket_selection(socket_path: &Path, expected_uid: u32) -> Result<(), Error> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    validate_normalized_absolute_path(socket_path, "native tool-output socket_path")?;
+
+    let parent = socket_path.parent().ok_or_else(|| {
+        Error::InvalidConfig(
+            "native tool-output socket_path must have a direct parent directory".to_string(),
+        )
+    })?;
+
+    match fs::symlink_metadata(socket_path) {
+        Ok(sock_meta) => {
+            validate_private_parent_dir(
+                parent,
+                expected_uid,
+                "native tool-output socket parent directory",
+            )?;
+            if sock_meta.file_type().is_symlink() {
+                return Err(Error::SecurityViolation(
+                    "native tool-output socket_path must not be a symlink".to_string(),
+                ));
+            }
+            if !sock_meta.file_type().is_socket() {
+                return Err(Error::SecurityViolation(
+                    "native tool-output socket_path is not a Unix domain socket".to_string(),
+                ));
+            }
+            if sock_meta.uid() != expected_uid {
+                return Err(Error::SecurityViolation(
+                    "native tool-output socket_path is not owned by the current effective UID"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(Error::Io(err)),
+    }
+}
+
+#[cfg(unix)]
 #[derive(Serialize)]
 struct FixedToolOutputPayload<'a> {
     untrusted_data: bool,
@@ -510,6 +608,66 @@ struct PreparedExchangeMessages {
     read_req: String,
     resume_req: String,
     turn_start_req: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeError {
+    /// Transient pre-effect endpoint unavailability, connection loss, or `notLoaded` thread status.
+    Retryable(&'static str),
+    /// Terminal configuration, identity, metadata, protocol, budget, or security failure.
+    Terminal(&'static str),
+}
+
+#[cfg(unix)]
+impl ExchangeError {
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::Retryable(reason) | Self::Terminal(reason) => reason,
+        }
+    }
+}
+
+#[cfg(unix)]
+fn map_endpoint_error(err: EndpointError) -> ExchangeError {
+    match err {
+        EndpointError::Unavailable(reason) => ExchangeError::Retryable(reason),
+        EndpointError::Refused(reason) => ExchangeError::Terminal(reason),
+    }
+}
+
+#[cfg(unix)]
+fn is_ws_connection_loss(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    use tokio_tungstenite::tungstenite::Error as WsError;
+
+    matches!(
+        err,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Io(_)
+            | WsError::Protocol(
+                ProtocolError::HandshakeIncomplete | ProtocolError::ResetWithoutClosingHandshake
+            )
+    )
+}
+
+#[cfg(unix)]
+fn classify_ws_handshake_error(err: tokio_tungstenite::tungstenite::Error) -> ExchangeError {
+    if is_ws_connection_loss(&err) {
+        ExchangeError::Retryable("native tool-output WebSocket handshake failed")
+    } else {
+        ExchangeError::Terminal("native tool-output WebSocket handshake failed")
+    }
+}
+
+#[cfg(unix)]
+fn classify_ws_recv_error(err: tokio_tungstenite::tungstenite::Error) -> ExchangeError {
+    if is_ws_connection_loss(&err) {
+        ExchangeError::Retryable("native tool-output WebSocket receive error")
+    } else {
+        ExchangeError::Terminal("native tool-output WebSocket receive error")
+    }
 }
 
 #[cfg(unix)]
@@ -606,9 +764,11 @@ fn prepare_exchange_messages(
     })
 }
 
-/// Executes one bounded JSON-RPC WebSocket wake-up exchange over the configured Unix domain socket.
+/// Executes one bounded JSON-RPC WebSocket wake-up exchange over the configured or resolved Unix domain socket.
 ///
-/// Never spawns a child process, queue command, proxy, or server, and never retries automatically.
+/// Never spawns a child process, queue command, proxy, or server. When `reconnect` is `Some`,
+/// performs bounded pre-effect endpoint resolution and connection retries under the single overall
+/// timeout and shared frame/byte budget; never retries once `turn/start` may have been written.
 pub(crate) async fn invoke_native_tool_output_wakeup(
     config: &CodexWakeupConfig,
     claim: &WakeupClaim,
@@ -669,6 +829,7 @@ pub(crate) async fn invoke_native_tool_output_wakeup(
                     &messages,
                     &mut may_have_written,
                     &shutdown_check_rx,
+                    config.timeout,
                 ),
             ) => {
                 match timed {
@@ -713,10 +874,100 @@ async fn run_bounded_ws_exchange(
     messages: &PreparedExchangeMessages,
     may_have_written: &mut bool,
     shutdown_rx: &watch::Receiver<bool>,
+    timeout: Duration,
 ) -> Result<(), &'static str> {
-    let unix_stream = tokio::net::UnixStream::connect(&cfg.socket_path)
+    let deadline = tokio::time::Instant::now() + timeout;
+    let max_attempts = if cfg.reconnect.is_some() {
+        MAX_NATIVE_RECONNECT_ATTEMPTS
+    } else {
+        1
+    };
+
+    let mut frame_count = 0usize;
+    let mut cumulative_bytes = 0usize;
+
+    for attempt in 0..max_attempts {
+        if *shutdown_rx.borrow() {
+            return Err("supervisor shutdown during native tool-output wake-up exchange");
+        }
+
+        match run_single_ws_attempt(
+            cfg,
+            messages,
+            may_have_written,
+            shutdown_rx,
+            &mut frame_count,
+            &mut cumulative_bytes,
+        )
         .await
-        .map_err(|_| "failed to connect to native tool-output Unix socket")?;
+        {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if *may_have_written {
+                    return Err(err.reason());
+                }
+                match err {
+                    ExchangeError::Terminal(reason) => return Err(reason),
+                    ExchangeError::Retryable(reason) => {
+                        if cfg.reconnect.is_none() || attempt + 1 >= max_attempts {
+                            return Err(reason);
+                        }
+                        if *shutdown_rx.borrow() {
+                            return Err(
+                                "supervisor shutdown during native tool-output wake-up exchange",
+                            );
+                        }
+                        let shift = (attempt as u32).min(4);
+                        let delay_ms = INITIAL_RECONNECT_BACKOFF_MS
+                            .saturating_mul(1u64 << shift)
+                            .min(MAX_RECONNECT_BACKOFF_MS);
+                        // Spread the bounded attempt budget over the configured window.
+                        // Fast connection refusals must not exhaust it after only a few seconds.
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        let remaining_attempts = (max_attempts - attempt - 1) as u32;
+                        let paced_delay = remaining / remaining_attempts;
+                        let delay = Duration::from_millis(delay_ms).max(paced_delay);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+    }
+
+    Err("native tool-output wake-up exchange exhausted retry attempts")
+}
+
+#[cfg(unix)]
+async fn run_single_ws_attempt(
+    cfg: &NativeToolOutputConfig,
+    messages: &PreparedExchangeMessages,
+    may_have_written: &mut bool,
+    shutdown_rx: &watch::Receiver<bool>,
+    frame_count: &mut usize,
+    cumulative_bytes: &mut usize,
+) -> Result<(), ExchangeError> {
+    let resolved: Option<ResolvedNativeEndpoint> = match cfg.reconnect {
+        Some(ref reconnect_cfg) => Some(reconnect_cfg.resolve().map_err(map_endpoint_error)?),
+        None => None,
+    };
+
+    let target_socket_path = match resolved {
+        Some(ref endpoint) => &endpoint.socket_path,
+        None => &cfg.socket_path,
+    };
+
+    let unix_stream = tokio::net::UnixStream::connect(target_socket_path)
+        .await
+        .map_err(|_| {
+            ExchangeError::Retryable("failed to connect to native tool-output Unix socket")
+        })?;
+
+    if let Some(ref endpoint) = resolved {
+        endpoint
+            .validate_peer(&unix_stream)
+            .map_err(map_endpoint_error)?;
+    }
 
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_message_size = Some(MAX_NATIVE_WS_FRAME_BYTES);
@@ -725,23 +976,22 @@ async fn run_bounded_ws_exchange(
     let (mut ws, _response) =
         tokio_tungstenite::client_async_with_config(NATIVE_WS_URL, unix_stream, Some(ws_config))
             .await
-            .map_err(|_| "native tool-output WebSocket handshake failed")?;
-
-    let mut frame_count = 0usize;
-    let mut cumulative_bytes = 0usize;
+            .map_err(classify_ws_handshake_error)?;
 
     // 1. initialize(clientInfo)
     send_prevalidated_text(&mut ws, &messages.init_req).await?;
     let init_result = recv_rpc_response(
         &mut ws,
         1,
-        &mut frame_count,
-        &mut cumulative_bytes,
+        frame_count,
+        cumulative_bytes,
         "native tool-output initialize request rejected",
     )
     .await?;
     if !init_result.is_object() {
-        return Err("native tool-output initialize response was not an object");
+        return Err(ExchangeError::Terminal(
+            "native tool-output initialize response was not an object",
+        ));
     }
 
     // 2. initialized notification
@@ -752,8 +1002,8 @@ async fn run_bounded_ws_exchange(
     let read_result = recv_rpc_response(
         &mut ws,
         2,
-        &mut frame_count,
-        &mut cumulative_bytes,
+        frame_count,
+        cumulative_bytes,
         "native tool-output thread/read request rejected",
     )
     .await?;
@@ -764,15 +1014,30 @@ async fn run_bounded_ws_exchange(
     let resume_result = recv_rpc_response(
         &mut ws,
         3,
-        &mut frame_count,
-        &mut cumulative_bytes,
+        frame_count,
+        cumulative_bytes,
         "native tool-output thread/resume request rejected",
     )
     .await?;
     validate_thread_resume_result(&resume_result, cfg)?;
 
     if *shutdown_rx.borrow() {
-        return Err("supervisor shutdown before native tool-output turn/start send");
+        return Err(ExchangeError::Terminal(
+            "supervisor shutdown before native tool-output turn/start send",
+        ));
+    }
+
+    if let Some(ref endpoint) = resolved {
+        endpoint.validate_processes().map_err(map_endpoint_error)?;
+        endpoint
+            .validate_peer(ws.get_ref())
+            .map_err(map_endpoint_error)?;
+    }
+
+    if *shutdown_rx.borrow() {
+        return Err(ExchangeError::Terminal(
+            "supervisor shutdown before native tool-output turn/start send",
+        ));
     }
 
     // 5. Set uncertainty marker immediately BEFORE attempting turn/start write.
@@ -780,14 +1045,14 @@ async fn run_bounded_ws_exchange(
 
     ws.send(Message::Text(messages.turn_start_req.clone().into()))
         .await
-        .map_err(|_| "native tool-output turn/start send failed")?;
+        .map_err(|_| ExchangeError::Terminal("native tool-output turn/start send failed"))?;
 
     // 6. Receive and validate turn/start response.
     let turn_result = recv_rpc_response(
         &mut ws,
         4,
-        &mut frame_count,
-        &mut cumulative_bytes,
+        frame_count,
+        cumulative_bytes,
         "native tool-output turn/start request rejected",
     )
     .await?;
@@ -800,13 +1065,17 @@ async fn run_bounded_ws_exchange(
 async fn send_prevalidated_text(
     ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
     payload: &str,
-) -> Result<(), &'static str> {
+) -> Result<(), ExchangeError> {
     if payload.len() > MAX_NATIVE_WS_FRAME_BYTES {
-        return Err("native tool-output request exceeded maximum frame size");
+        return Err(ExchangeError::Terminal(
+            "native tool-output request exceeded maximum frame size",
+        ));
     }
     ws.send(Message::Text(payload.to_owned().into()))
         .await
-        .map_err(|_| "failed to send native tool-output WebSocket request")
+        .map_err(|_| {
+            ExchangeError::Retryable("failed to send native tool-output WebSocket request")
+        })
 }
 
 #[cfg(unix)]
@@ -816,35 +1085,44 @@ async fn recv_rpc_response(
     frame_count: &mut usize,
     cumulative_bytes: &mut usize,
     rejection_msg: &'static str,
-) -> Result<Value, &'static str> {
+) -> Result<Value, ExchangeError> {
     loop {
         if *frame_count >= MAX_NATIVE_WS_FRAMES {
-            return Err("native tool-output exchange exceeded maximum frame count");
+            return Err(ExchangeError::Terminal(
+                "native tool-output exchange exceeded maximum frame count",
+            ));
         }
 
         let Some(frame_res) = ws.next().await else {
-            return Err("native tool-output WebSocket closed before response completed");
+            return Err(ExchangeError::Retryable(
+                "native tool-output WebSocket closed before response completed",
+            ));
         };
-        let msg = frame_res.map_err(|_| "native tool-output WebSocket receive error")?;
+        let msg = frame_res.map_err(classify_ws_recv_error)?;
         *frame_count += 1;
 
         match msg {
             Message::Text(text) => {
                 let len = text.len();
                 if len > MAX_NATIVE_WS_FRAME_BYTES {
-                    return Err("native tool-output WebSocket frame exceeded maximum size");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output WebSocket frame exceeded maximum size",
+                    ));
                 }
                 *cumulative_bytes = cumulative_bytes.saturating_add(len);
                 if *cumulative_bytes > MAX_NATIVE_WS_CUMULATIVE_BYTES {
-                    return Err(
+                    return Err(ExchangeError::Terminal(
                         "native tool-output exchange exceeded cumulative response byte limit",
-                    );
+                    ));
                 }
 
-                let value: Value = serde_json::from_str(text.as_ref())
-                    .map_err(|_| "native tool-output received malformed JSON frame")?;
+                let value: Value = serde_json::from_str(text.as_ref()).map_err(|_| {
+                    ExchangeError::Terminal("native tool-output received malformed JSON frame")
+                })?;
                 let Some(obj) = value.as_object() else {
-                    return Err("native tool-output JSON frame must be an object");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output JSON frame must be an object",
+                    ));
                 };
 
                 let has_id = obj.get("id").is_some_and(|v| !v.is_null());
@@ -852,7 +1130,9 @@ async fn recv_rpc_response(
 
                 if has_method && !has_id {
                     if obj.contains_key("result") || obj.contains_key("error") {
-                        return Err("native tool-output received invalid JSON-RPC notification");
+                        return Err(ExchangeError::Terminal(
+                            "native tool-output received invalid JSON-RPC notification",
+                        ));
                     }
                     // Ignore untrusted server notifications.
                     continue;
@@ -860,62 +1140,80 @@ async fn recv_rpc_response(
 
                 if has_method && has_id {
                     // Fail closed on server-initiated requests; never auto-approve or execute.
-                    return Err("native tool-output rejected unexpected server-initiated request");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output rejected unexpected server-initiated request",
+                    ));
                 }
 
                 let Some(id_val) = obj.get("id").and_then(Value::as_u64) else {
-                    return Err("native tool-output response missing expected numeric id");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output response missing expected numeric id",
+                    ));
                 };
                 if id_val != expected_id {
-                    return Err("native tool-output response id did not match expected request id");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output response id did not match expected request id",
+                    ));
                 }
 
                 if let Some(err_val) = obj.get("error") {
                     if !err_val.is_null() {
-                        return Err(rejection_msg);
+                        return Err(ExchangeError::Terminal(rejection_msg));
                     }
                 }
 
                 let Some(result) = obj.get("result") else {
-                    return Err("native tool-output response missing result field");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output response missing result field",
+                    ));
                 };
                 return Ok(result.clone());
             }
             Message::Ping(payload) => {
                 let len = payload.len();
                 if len > MAX_CONTROL_PING_BYTES {
-                    return Err("native tool-output control ping exceeded maximum size");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output control ping exceeded maximum size",
+                    ));
                 }
                 *cumulative_bytes = cumulative_bytes.saturating_add(len);
                 if *cumulative_bytes > MAX_NATIVE_WS_CUMULATIVE_BYTES {
-                    return Err(
+                    return Err(ExchangeError::Terminal(
                         "native tool-output exchange exceeded cumulative response byte limit",
-                    );
+                    ));
                 }
-                ws.flush()
-                    .await
-                    .map_err(|_| "native tool-output failed to flush WebSocket pong")?;
+                ws.flush().await.map_err(|_| {
+                    ExchangeError::Retryable("native tool-output failed to flush WebSocket pong")
+                })?;
             }
             Message::Pong(payload) => {
                 let len = payload.len();
                 if len > MAX_CONTROL_PING_BYTES {
-                    return Err("native tool-output control pong exceeded maximum size");
+                    return Err(ExchangeError::Terminal(
+                        "native tool-output control pong exceeded maximum size",
+                    ));
                 }
                 *cumulative_bytes = cumulative_bytes.saturating_add(len);
                 if *cumulative_bytes > MAX_NATIVE_WS_CUMULATIVE_BYTES {
-                    return Err(
+                    return Err(ExchangeError::Terminal(
                         "native tool-output exchange exceeded cumulative response byte limit",
-                    );
+                    ));
                 }
             }
             Message::Binary(_) => {
-                return Err("native tool-output rejected unexpected binary WebSocket frame");
+                return Err(ExchangeError::Terminal(
+                    "native tool-output rejected unexpected binary WebSocket frame",
+                ));
             }
             Message::Close(_) => {
-                return Err("native tool-output WebSocket closed by peer before response");
+                return Err(ExchangeError::Retryable(
+                    "native tool-output WebSocket closed by peer before response",
+                ));
             }
             Message::Frame(_) => {
-                return Err("native tool-output rejected raw WebSocket frame");
+                return Err(ExchangeError::Terminal(
+                    "native tool-output rejected raw WebSocket frame",
+                ));
             }
         }
     }
@@ -925,23 +1223,63 @@ async fn recv_rpc_response(
 fn validate_thread_read_result(
     result: &Value,
     cfg: &NativeToolOutputConfig,
-) -> Result<(), &'static str> {
+) -> Result<(), ExchangeError> {
     let Some(thread) = result.get("thread").and_then(Value::as_object) else {
-        return Err("native tool-output thread/read response missing thread object");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/read response missing thread object",
+        ));
     };
 
     let Some(id) = thread.get("id").and_then(Value::as_str) else {
-        return Err("native tool-output thread/read response missing thread.id");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/read response missing thread.id",
+        ));
     };
     if id != cfg.thread_id {
-        return Err("native tool-output thread/read thread.id mismatch");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/read thread.id mismatch",
+        ));
     }
 
     let Some(cwd) = thread.get("cwd").and_then(Value::as_str) else {
-        return Err("native tool-output thread/read response missing thread.cwd");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/read response missing thread.cwd",
+        ));
     };
     if Path::new(cwd) != cfg.project_root.as_path() {
-        return Err("native tool-output thread/read thread.cwd mismatch");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/read thread.cwd mismatch",
+        ));
+    }
+
+    if let Some(model_val) = thread.get("model") {
+        if !model_val.is_null() {
+            let Some(model) = model_val.as_str() else {
+                return Err(ExchangeError::Terminal(
+                    "native tool-output thread/read thread.model is not a string",
+                ));
+            };
+            if model != cfg.model {
+                return Err(ExchangeError::Terminal(
+                    "native tool-output thread/read model mismatch",
+                ));
+            }
+        }
+    }
+
+    if let Some(effort_val) = thread.get("reasoningEffort") {
+        if !effort_val.is_null() {
+            let Some(effort) = effort_val.as_str() else {
+                return Err(ExchangeError::Terminal(
+                    "native tool-output thread/read thread.reasoningEffort is not a string",
+                ));
+            };
+            if effort != cfg.effort {
+                return Err(ExchangeError::Terminal(
+                    "native tool-output thread/read reasoningEffort mismatch",
+                ));
+            }
+        }
     }
 
     let status_type = match thread.get("status") {
@@ -950,37 +1288,14 @@ fn validate_thread_read_result(
         _ => None,
     };
     match status_type {
-        Some("idle" | "active") => {}
-        _ => {
-            return Err("native tool-output target thread is not loaded in idle or active status");
-        }
+        Some("idle" | "active") => Ok(()),
+        Some("notLoaded") => Err(ExchangeError::Retryable(
+            "native tool-output target thread is not loaded in idle or active status",
+        )),
+        _ => Err(ExchangeError::Terminal(
+            "native tool-output target thread is not loaded in idle or active status",
+        )),
     }
-
-    if let Some(model_val) = thread.get("model") {
-        if !model_val.is_null() {
-            let Some(model) = model_val.as_str() else {
-                return Err("native tool-output thread/read thread.model is not a string");
-            };
-            if model != cfg.model {
-                return Err("native tool-output thread/read model mismatch");
-            }
-        }
-    }
-
-    if let Some(effort_val) = thread.get("reasoningEffort") {
-        if !effort_val.is_null() {
-            let Some(effort) = effort_val.as_str() else {
-                return Err(
-                    "native tool-output thread/read thread.reasoningEffort is not a string",
-                );
-            };
-            if effort != cfg.effort {
-                return Err("native tool-output thread/read reasoningEffort mismatch");
-            }
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -988,29 +1303,41 @@ fn extract_consistent_string_field<'a>(
     outer: &'a serde_json::Map<String, Value>,
     inner: Option<&'a serde_json::Map<String, Value>>,
     field: &str,
-) -> Result<&'a str, &'static str> {
+) -> Result<&'a str, ExchangeError> {
     let outer_val = match outer.get(field) {
         Some(Value::Null) | None => None,
         Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => return Err("native tool-output thread/resume field has invalid type"),
+        Some(_) => {
+            return Err(ExchangeError::Terminal(
+                "native tool-output thread/resume field has invalid type",
+            ))
+        }
     };
     let inner_val = match inner.and_then(|m| m.get(field)) {
         Some(Value::Null) | None => None,
         Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => return Err("native tool-output thread/resume field has invalid type"),
+        Some(_) => {
+            return Err(ExchangeError::Terminal(
+                "native tool-output thread/resume field has invalid type",
+            ))
+        }
     };
 
     match (outer_val, inner_val) {
         (Some(a), Some(b)) => {
             if a != b {
-                Err("native tool-output thread/resume outer and inner fields disagreed")
+                Err(ExchangeError::Terminal(
+                    "native tool-output thread/resume outer and inner fields disagreed",
+                ))
             } else {
                 Ok(a)
             }
         }
         (Some(a), None) => Ok(a),
         (None, Some(b)) => Ok(b),
-        (None, None) => Err("native tool-output thread/resume missing required field"),
+        (None, None) => Err(ExchangeError::Terminal(
+            "native tool-output thread/resume missing required field",
+        )),
     }
 }
 
@@ -1018,58 +1345,80 @@ fn extract_consistent_string_field<'a>(
 fn validate_thread_resume_result(
     result: &Value,
     cfg: &NativeToolOutputConfig,
-) -> Result<(), &'static str> {
+) -> Result<(), ExchangeError> {
     let Some(result_obj) = result.as_object() else {
-        return Err("native tool-output thread/resume result must be an object");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/resume result must be an object",
+        ));
     };
     let thread_obj = match result_obj.get("thread") {
         Some(Value::Object(map)) => Some(map),
         Some(Value::Null) | None => None,
-        Some(_) => return Err("native tool-output thread/resume thread field must be an object"),
+        Some(_) => {
+            return Err(ExchangeError::Terminal(
+                "native tool-output thread/resume thread field must be an object",
+            ))
+        }
     };
 
     let id = extract_consistent_string_field(result_obj, thread_obj, "id")?;
     if id != cfg.thread_id {
-        return Err("native tool-output thread/resume thread.id mismatch");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/resume thread.id mismatch",
+        ));
     }
 
     let cwd = extract_consistent_string_field(result_obj, thread_obj, "cwd")?;
     if Path::new(cwd) != cfg.project_root.as_path() {
-        return Err("native tool-output thread/resume cwd mismatch");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/resume cwd mismatch",
+        ));
     }
 
     let model = extract_consistent_string_field(result_obj, thread_obj, "model")?;
     if model != cfg.model {
-        return Err("native tool-output thread/resume model mismatch");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/resume model mismatch",
+        ));
     }
 
     let effort = extract_consistent_string_field(result_obj, thread_obj, "reasoningEffort")?;
     if effort != cfg.effort {
-        return Err("native tool-output thread/resume reasoningEffort mismatch");
+        return Err(ExchangeError::Terminal(
+            "native tool-output thread/resume reasoningEffort mismatch",
+        ));
     }
 
     Ok(())
 }
 
 #[cfg(unix)]
-fn validate_turn_start_result(result: &Value) -> Result<(), &'static str> {
+fn validate_turn_start_result(result: &Value) -> Result<(), ExchangeError> {
     let Some(result_obj) = result.as_object() else {
-        return Err("native tool-output turn/start result must be an object");
+        return Err(ExchangeError::Terminal(
+            "native tool-output turn/start result must be an object",
+        ));
     };
 
     if let Some(err_val) = result_obj.get("error") {
         if !err_val.is_null() {
-            return Err("native tool-output turn/start reported an error");
+            return Err(ExchangeError::Terminal(
+                "native tool-output turn/start reported an error",
+            ));
         }
     }
 
     let Some(turn_obj) = result_obj.get("turn").and_then(Value::as_object) else {
-        return Err("native tool-output turn/start response missing turn object");
+        return Err(ExchangeError::Terminal(
+            "native tool-output turn/start response missing turn object",
+        ));
     };
 
     if let Some(turn_err) = turn_obj.get("error") {
         if !turn_err.is_null() {
-            return Err("native tool-output turn/start turn reported an error");
+            return Err(ExchangeError::Terminal(
+                "native tool-output turn/start turn reported an error",
+            ));
         }
     }
 
@@ -1078,23 +1427,32 @@ fn validate_turn_start_result(result: &Value) -> Result<(), &'static str> {
             Value::String(s) => Some(s.as_str()),
             Value::Object(map) => map.get("type").and_then(Value::as_str),
             Value::Null => None,
-            _ => return Err("native tool-output turn/start turn.status has invalid format"),
+            _ => {
+                return Err(ExchangeError::Terminal(
+                    "native tool-output turn/start turn.status has invalid format",
+                ))
+            }
         };
         if let Some(status) = status_str {
             if matches!(
                 status,
                 "failed" | "error" | "errored" | "cancelled" | "canceled" | "rejected"
             ) {
-                return Err("native tool-output turn/start returned a rejected turn status");
+                return Err(ExchangeError::Terminal(
+                    "native tool-output turn/start returned a rejected turn status",
+                ));
             }
         }
     }
 
     let Some(turn_id) = turn_obj.get("id").and_then(Value::as_str) else {
-        return Err("native tool-output turn/start response missing turn.id");
+        return Err(ExchangeError::Terminal(
+            "native tool-output turn/start response missing turn.id",
+        ));
     };
-    validate_canonical_non_nil_uuid(turn_id, "turn.id")
-        .map_err(|_| "native tool-output turn/start returned invalid turn.id")?;
+    validate_canonical_non_nil_uuid(turn_id, "turn.id").map_err(|_| {
+        ExchangeError::Terminal("native tool-output turn/start returned invalid turn.id")
+    })?;
 
     Ok(())
 }
@@ -1114,6 +1472,7 @@ mod tests {
             project_root: PathBuf::from("/tmp/secret-project-root"),
             model: "secret-model-id".to_string(),
             effort: "high".to_string(),
+            reconnect: None,
         };
 
         let dbg = format!("{cfg:?}");
@@ -1128,6 +1487,25 @@ mod tests {
         assert!(digest.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
         assert!(!digest.contains("secret"));
         assert_eq!(digest, cfg.digest());
+
+        let legacy_json = serde_json::to_string(&cfg).expect("serialize legacy config");
+        assert!(!legacy_json.contains("reconnect"));
+        let round_trip: NativeToolOutputConfig =
+            serde_json::from_str(&legacy_json).expect("deserialize legacy config");
+        assert_eq!(round_trip, cfg);
+        assert_eq!(round_trip.digest(), digest);
+
+        let mut with_reconnect = cfg.clone();
+        with_reconnect.reconnect = Some(NativeReconnectConfig {
+            descriptor_root: PathBuf::from("/tmp/secret-descriptor-root"),
+            backend_executable: PathBuf::from("/tmp/secret-backend-exe"),
+            application_executable: PathBuf::from("/tmp/secret-application-exe"),
+        });
+        let reconnect_dbg = format!("{with_reconnect:?}");
+        assert!(!reconnect_dbg.contains("secret-descriptor-root"));
+        assert!(!reconnect_dbg.contains("secret-backend-exe"));
+        assert!(!reconnect_dbg.contains("secret-application-exe"));
+        assert_ne!(with_reconnect.digest(), digest);
     }
 
     #[test]
@@ -1150,6 +1528,7 @@ mod tests {
             project_root,
             model: "gpt-5".to_string(),
             effort: "high".to_string(),
+            reconnect: None,
         };
 
         cfg.validate().expect("valid for current euid");

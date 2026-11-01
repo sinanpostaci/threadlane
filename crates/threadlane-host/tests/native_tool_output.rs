@@ -327,6 +327,7 @@ fn sample_native_config(
     NativeToolOutputConfig {
         schema_version: 1,
         socket_path: socket_path.to_path_buf(),
+        reconnect: None,
         thread_id: thread_id.to_string(),
         project_root: project_root.to_path_buf(),
         model: NATIVE_MODEL.to_string(),

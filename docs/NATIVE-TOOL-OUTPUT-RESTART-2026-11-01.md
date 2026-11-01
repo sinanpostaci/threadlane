@@ -4,6 +4,10 @@ This is a qualified follow-up to the [controlled product pilot](NATIVE-TOOL-OUTP
 It covers one existing disposable native chat on Linux/NixOS. It does not
 establish automatic restart recovery or general multi-chat routing.
 
+The later [opt-in Linux reconnect policy](NATIVE-TOOL-OUTPUT.md#automatic-endpoint-refresh-on-linux)
+implements endpoint refresh separately. This report remains evidence of the
+earlier manually selected live check, rather than a live test of that policy.
+
 ## Installation and endpoint
 
 The human activated the prepared NixOS integration and reported a restart.

@@ -100,6 +100,7 @@ impl TestEnv {
             project_root: self.project_root.clone(),
             model: "gpt-5-codex".to_string(),
             effort: "high".to_string(),
+            reconnect: None,
         }
     }
 

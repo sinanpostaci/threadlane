@@ -77,6 +77,12 @@ verified manually reselected delivery after human activation and restart, with a
 human-confirmed response in the same native chat. It does not implement automatic
 endpoint refresh or promote a transport receipt into event handling or approval.
 
+The subsequent opt-in [Linux reconnect policy](NATIVE-TOOL-OUTPUT.md#automatic-endpoint-refresh-on-linux)
+adds automatic managed-endpoint selection and bounded pre-effect connection
+recovery while an approved host is running. It preserves exact chat/settings
+checks and the no-replay rule after a possible send. Host restart after reboot,
+indefinite app-closed delivery, general identity and other platforms remain open.
+
 Milestone 1's deterministic native conversation loop and Milestone 2A's bounded
 history/replay contract passed their Linux/NixOS gates. The Milestone 2 worker
 library and diagnostic CLI provide provider evidence parsing, bounded process

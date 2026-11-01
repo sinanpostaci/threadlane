@@ -17,6 +17,8 @@ pub mod descriptor;
 pub mod error;
 /// Binding-scoped stdio MCP server built on official `rmcp`.
 pub mod mcp;
+/// Explicit Linux desktop native endpoint discovery, process-tree proof, and peer validation.
+pub mod native_endpoint;
 /// Explicit operator-selected native tool-output wake-up configuration and transport.
 pub mod native_tool_output;
 /// Wire protocol requests, compact status snapshots, and responses.
@@ -37,6 +39,7 @@ pub use descriptor::{
 };
 pub use error::{ApiError, Error, ErrorCode};
 pub use mcp::ThreadlaneMcpServer;
+pub use native_endpoint::NativeReconnectConfig;
 pub use native_tool_output::NativeToolOutputConfig;
 pub use protocol::{
     ActivityPage, BindingListResponse, CreateBindingRequest, Event, EventKind, EventPayload,
