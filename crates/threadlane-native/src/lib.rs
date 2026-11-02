@@ -34,6 +34,8 @@ pub mod codex_setup;
 pub mod control_runtime;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
+/// Trusted-local standing read-only planning/advice grant preparation, recording, and revocation helpers.
+pub mod coworker_grants;
 /// Shared durable contracts and per-binding ledger store for the end-to-end Coworker workflow.
 pub mod coworker_workflow;
 /// Shared conversation-change advancement guard for direct native task dispatch.
@@ -112,6 +114,14 @@ pub use conversation_change::{
     MAX_CONVERSATION_CHANGE_CURSOR_LEN, MAX_CONVERSATION_CHANGE_DETAIL_BYTES,
     MAX_CONVERSATION_CHANGE_LIST_LIMIT, MAX_CONVERSATION_CHANGE_RESOLUTION_NOTE_BYTES,
     MAX_CONVERSATION_CHANGE_STORE_BYTES, MAX_CONVERSATION_CHANGE_SUMMARY_BYTES,
+};
+pub use coworker_grants::{
+    get_planning_grant_summary, list_planning_grant_summaries, prepare_planning_grant_preview,
+    prepare_planning_grant_preview_from_dir_readonly, prepare_planning_grant_preview_with_store,
+    record_planning_grant, record_planning_grant_from_registry_dir, revoke_planning_grant_scoped,
+    FrozenPlanningRoleChoice, LocalOperatorGrantAttestation, PlanningGrantPreview,
+    PlanningGrantPreviewStatus, PlanningGrantSummary, PreparePlanningGrantRequest,
+    RecordPlanningGrantRequest, TrustedGrantScope, PLANNING_GRANT_PREVIEW_DOMAIN,
 };
 pub use dispatch_guard::{
     dispatch_approved_task_guarded, verify_no_blocking_conversation_changes,
