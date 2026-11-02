@@ -1,8 +1,10 @@
 import { h } from '../ui/dom.ts';
 import type { DesktopSnapshot, NavPage } from '../types.ts';
 import {
-  WORKFLOW_ROLES,
+  EXECUTION_ROLES,
   isApiToolAdapter,
+  isExecutionRole,
+  isWorkflowRole,
   type Difficulty,
   type ModelDefinition,
   type RegistrySnapshot,
@@ -23,7 +25,7 @@ const AGENT_TOOL_ADAPTERS: ReadonlySet<ToolAdapter> = new Set([
   'antigravity',
 ]);
 
-const REQUIRED_ROLE_COUNT = WORKFLOW_ROLES.length;
+const REQUIRED_ROLE_COUNT = EXECUTION_ROLES.length;
 
 const ROLE_LABELS: Record<WorkflowRole, string> = {
   follower: 'Follower',
@@ -104,6 +106,7 @@ interface ProfileEvaluation {
   profile: WorkflowProfile;
   name: string;
   isDefault: boolean;
+  activeAssignmentCount: number;
   missingDefaults: WorkflowRole[];
   issues: ModelChoiceIssue[];
   state: ReadinessProfileState;
@@ -159,8 +162,8 @@ function isSafeRevision(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-function isWorkflowRole(value: string): value is WorkflowRole {
-  return (WORKFLOW_ROLES as readonly string[]).includes(value);
+function isLegacyFollowerAssignment(assignment: RoleAssignment): boolean {
+  return assignment.role === 'follower';
 }
 
 function roleLabel(value: string): string {
@@ -209,7 +212,7 @@ function validateAssignment(
   registry: RegistrySnapshot,
   assignment: RoleAssignment
 ): string | null {
-  if (!isWorkflowRole(assignment.role)) {
+  if (!isWorkflowRole(assignment.role) || !isExecutionRole(assignment.role)) {
     return 'has an unknown workflow role.';
   }
 
@@ -254,15 +257,18 @@ function evaluateProfiles(registry: RegistrySnapshot): ProfileEvaluation[] {
     const profileId = typeof profile.id === 'string' ? profile.id : '';
     const name = safeText(profile.name, 'Unnamed profile', 64);
     const assignments = Array.isArray(profile.assignments) ? profile.assignments : [];
-    const missingDefaults = WORKFLOW_ROLES.filter(
+    const activeAssignments = assignments.filter(
+      (assignment) => !isLegacyFollowerAssignment(assignment)
+    );
+    const missingDefaults = EXECUTION_ROLES.filter(
       (role) =>
-        !assignments.some(
+        !activeAssignments.some(
           (assignment) => assignment.role === role && assignment.difficulty === null
         )
     );
     const issues: ModelChoiceIssue[] = [];
 
-    for (const assignment of assignments) {
+    for (const assignment of activeAssignments) {
       const message = validateAssignment(registry, assignment);
       if (message) {
         issues.push({
@@ -282,6 +288,7 @@ function evaluateProfiles(registry: RegistrySnapshot): ProfileEvaluation[] {
       name,
       isDefault:
         registry.default_profile_id !== null && registry.default_profile_id === profileId,
+      activeAssignmentCount: activeAssignments.length,
       missingDefaults,
       issues,
       state,
@@ -492,8 +499,7 @@ function projectModels(
   }
 
   const assignmentCount = evaluations.reduce(
-    (total, evaluation) =>
-      total + (Array.isArray(evaluation.profile.assignments) ? evaluation.profile.assignments.length : 0),
+    (total, evaluation) => total + evaluation.activeAssignmentCount,
     0
   );
   if (assignmentCount === 0) {
@@ -638,7 +644,7 @@ function projectProfiles(
       `Default ${defaultEvaluation.name} is complete. ${safeList(
         descriptions,
         2
-      )} still need all six role defaults.`
+      )} still need all five role defaults.`
     );
   }
 
@@ -646,7 +652,7 @@ function projectProfiles(
     'profiles',
     'ready',
     'Profiles complete',
-    `Default: ${defaultEvaluation.name}. Every saved profile has all six role defaults; difficulty overrides do not replace them.`
+    `Default: ${defaultEvaluation.name}. Every saved profile has all five role defaults; difficulty overrides do not replace them.`
   );
 }
 

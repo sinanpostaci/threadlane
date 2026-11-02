@@ -65,6 +65,30 @@ export const WORKFLOW_ROLES: readonly WorkflowRole[] = [
   'closure',
 ] as const;
 
+export type ExecutionWorkflowRole = Exclude<WorkflowRole, 'follower'>;
+
+export type ExecutionRole = ExecutionWorkflowRole;
+
+export const EXECUTION_ROLES: readonly ExecutionWorkflowRole[] = [
+  'orchestrator',
+  'architect',
+  'coder',
+  'reviewer',
+  'closure',
+] as const;
+
+export const EXECUTION_WORKFLOW_ROLES = EXECUTION_ROLES;
+
+export function isWorkflowRole(value: string): value is WorkflowRole {
+  return (WORKFLOW_ROLES as readonly string[]).includes(value);
+}
+
+export function isExecutionRole(value: string): value is ExecutionWorkflowRole {
+  return (EXECUTION_ROLES as readonly string[]).includes(value);
+}
+
+export const isExecutionWorkflowRole = isExecutionRole;
+
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'extreme';
 
 export const DIFFICULTIES: readonly Difficulty[] = [

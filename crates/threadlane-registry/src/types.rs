@@ -210,11 +210,15 @@ pub struct ModelChoice {
     pub effort: Option<String>,
 }
 
-/// Six canonical Threadlane workflow roles.
+/// Canonical Threadlane workflow roles, including the five configurable execution roles and
+/// the legacy [`Self::Follower`] variant retained for historical snapshot/plan compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowRole {
-    /// Conversational follower role.
+    /// Legacy conversational follower role retained for backward-compatible deserialization.
+    ///
+    /// Active native Coworker chat model selection is controlled by the human in Codex and is
+    /// not configured through profile execution role assignments.
     #[serde(rename = "follower")]
     Follower,
     /// Substantive workflow orchestrator role.
@@ -235,7 +239,7 @@ pub enum WorkflowRole {
 }
 
 impl WorkflowRole {
-    /// All six [`WorkflowRole`] variants in canonical workflow order.
+    /// All six [`WorkflowRole`] variants in canonical workflow order, including legacy [`Self::Follower`].
     pub const ALL: [Self; 6] = [
         Self::Follower,
         Self::Orchestrator,
@@ -244,6 +248,28 @@ impl WorkflowRole {
         Self::Reviewer,
         Self::Closure,
     ];
+
+    /// The five configurable execution roles in Threadlane profiles (`Orchestrator`, `Architect`, `Coder`, `Reviewer`, `Closure`).
+    ///
+    /// Native Coworker chat model selection is controlled by the human in Codex and is outside
+    /// profile execution role assignments.
+    pub const EXECUTION_ROLES: [Self; 5] = [
+        Self::Orchestrator,
+        Self::Architect,
+        Self::Coder,
+        Self::Reviewer,
+        Self::Closure,
+    ];
+
+    /// Returns `true` when `self` is one of the five configurable execution roles.
+    pub const fn is_execution_role(self) -> bool {
+        !matches!(self, Self::Follower)
+    }
+
+    /// Returns `true` when `self` is the legacy [`Self::Follower`] variant retained for historical deserialization.
+    pub const fn is_legacy_follower(self) -> bool {
+        matches!(self, Self::Follower)
+    }
 
     /// Returns the canonical `snake_case` identifier for this role.
     pub const fn as_str(self) -> &'static str {
@@ -424,6 +450,26 @@ pub struct WorkflowProfile {
     /// Optional decision advisor configuration (`None` when disabled/unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_advisor: Option<DecisionAdvisor>,
+}
+
+impl WorkflowProfile {
+    /// Iterates over role assignments that belong to the five configurable execution roles,
+    /// excluding any legacy [`WorkflowRole::Follower`] entries.
+    pub fn execution_assignments(&self) -> impl Iterator<Item = &RoleAssignment> {
+        self.assignments
+            .iter()
+            .filter(|assignment| assignment.role.is_execution_role())
+    }
+
+    /// Returns `true` when every role in [`WorkflowRole::EXECUTION_ROLES`] has an explicit
+    /// default assignment (`difficulty: None`).
+    pub fn has_complete_execution_defaults(&self) -> bool {
+        WorkflowRole::EXECUTION_ROLES.iter().all(|&role| {
+            self.assignments
+                .iter()
+                .any(|assignment| assignment.role == role && assignment.difficulty.is_none())
+        })
+    }
 }
 
 /// Complete versioned state of the global tool, model, and workflow profile registry.

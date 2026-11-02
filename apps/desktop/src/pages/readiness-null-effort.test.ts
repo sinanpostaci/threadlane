@@ -8,6 +8,7 @@ import {
   type ReadinessProjection,
 } from './readiness.ts';
 import {
+  EXECUTION_ROLES,
   WORKFLOW_ROLES,
   type ModelDefinition,
   type RegistrySnapshot,
@@ -49,6 +50,17 @@ function makeModel(overrides: Partial<ModelDefinition> = {}): ModelDefinition {
 }
 
 function fullAssignments(
+  modelId: string = 'model-null-effort',
+  effort: string | null = null
+): RoleAssignment[] {
+  return EXECUTION_ROLES.map((role) => ({
+    role,
+    difficulty: null,
+    choice: { model_id: modelId, effort },
+  }));
+}
+
+function legacySixRoleAssignments(
   modelId: string = 'model-null-effort',
   effort: string | null = null
 ): RoleAssignment[] {
@@ -198,11 +210,12 @@ describe('readiness null effort choices', () => {
     assert.deepEqual(registry.models[0].efforts, []);
     assert.equal(registry.models[0].allow_no_effort, true);
     assert.equal(models.state, 'ready');
-    assert.match(models.summary, /6 role choices resolve/);
+    assert.match(models.summary, /5 role choices resolve/);
     assert.match(models.detail, /permitted effort/);
     assert.equal(checkById(projection, 'profiles').state, 'ready');
     assert.equal(projection.profiles[0].state, 'complete');
-    assert.equal(projection.profiles[0].defaultCount, WORKFLOW_ROLES.length);
+    assert.equal(projection.profiles[0].defaultCount, EXECUTION_ROLES.length);
+    assert.equal(projection.profiles[0].requiredDefaultCount, EXECUTION_ROLES.length);
     assert.deepEqual(projection.profiles[0].missingDefaults, []);
     assert.equal(projection.complete, true);
   });
@@ -216,13 +229,13 @@ describe('readiness null effort choices', () => {
     const profiles = checkById(projection, 'profiles');
 
     assert.equal(models.state, 'blocked');
-    assert.match(models.summary, /6 model or effort choices need repair/);
+    assert.match(models.summary, /5 model or effort choices need repair/);
     assert.match(models.detail, /requires an explicit effort/);
     assert.match(models.detail, /Null effort model/);
     assert.doesNotMatch(models.detail, /does not list/);
     assert.equal(profiles.state, 'blocked');
     assert.equal(projection.profiles[0].state, 'invalid');
-    assert.equal(projection.profiles[0].issueCount, WORKFLOW_ROLES.length);
+    assert.equal(projection.profiles[0].issueCount, EXECUTION_ROLES.length);
     assert.equal(projection.readyCount, 3);
     assert.equal(projection.complete, false);
   });
@@ -245,8 +258,62 @@ describe('readiness null effort choices', () => {
     assert.match(agentTools.summary, /1 agent tool enabled/);
     assert.match(agentTools.detail, /decision API tools and their keys stay optional/);
     assert.equal(models.state, 'ready');
-    assert.match(models.summary, /6 role choices resolve/);
+    assert.match(models.summary, /5 role choices resolve/);
     assert.equal(projection.profiles[0].state, 'complete');
     assert.equal(projection.complete, true);
+  });
+
+  it('decodes legacy six-role profiles with follower and null effort without gating five-role readiness or mutating saved data', () => {
+    const cleanLegacyRegistry = makeRegistry({
+      profiles: [
+        makeProfile('profile-legacy-clean', 'Legacy Six Clean Null Effort', legacySixRoleAssignments()),
+      ],
+      default_profile_id: 'profile-legacy-clean',
+    });
+    const cleanBefore = JSON.stringify(cleanLegacyRegistry);
+    const cleanProjection = projectReadinessChecklist(makeInput({ registry: cleanLegacyRegistry }));
+    assert.equal(checkById(cleanProjection, 'models').state, 'ready');
+    assert.match(checkById(cleanProjection, 'models').summary, /5 role choices resolve/);
+    assert.equal(cleanProjection.complete, true);
+    assert.equal(JSON.stringify(cleanLegacyRegistry), cleanBefore);
+
+    const registry = makeRegistry({
+      models: [
+        makeModel(),
+        makeModel({
+          id: 'model-explicit-effort',
+          label: 'Explicit effort model',
+          efforts: ['high'],
+          allow_no_effort: false,
+        }),
+      ],
+      profiles: [
+        makeProfile('profile-legacy-six', 'Legacy Six Null Effort', [
+          {
+            role: 'follower',
+            difficulty: null,
+            choice: { model_id: 'model-explicit-effort', effort: null },
+          },
+          ...fullAssignments('model-null-effort', null),
+        ]),
+      ],
+      default_profile_id: 'profile-legacy-six',
+    });
+    const before = JSON.stringify(registry);
+    const projection = projectReadinessChecklist(makeInput({ registry }));
+    const models = checkById(projection, 'models');
+
+    assert.equal(models.state, 'ready');
+    assert.match(models.summary, /5 role choices resolve/);
+    assert.equal(checkById(projection, 'profiles').state, 'ready');
+    assert.equal(projection.profiles[0].state, 'complete');
+    assert.equal(projection.profiles[0].defaultCount, EXECUTION_ROLES.length);
+    assert.equal(projection.profiles[0].requiredDefaultCount, EXECUTION_ROLES.length);
+    assert.deepEqual(projection.profiles[0].missingDefaults, []);
+    assert.equal(projection.profiles[0].issueCount, 0);
+    assert.equal(projection.complete, true);
+    assert.equal(registry.profiles[0].assignments.length, WORKFLOW_ROLES.length);
+    assert.equal(registry.profiles[0].assignments[0].role, 'follower');
+    assert.equal(JSON.stringify(registry), before);
   });
 });

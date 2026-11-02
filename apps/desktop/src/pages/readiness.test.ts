@@ -8,14 +8,18 @@ import {
   type ReadinessProjection,
 } from './readiness.ts';
 import {
+  EXECUTION_ROLES,
   WORKFLOW_ROLES,
   createEmptyRegistrySnapshot,
+  isExecutionRole,
+  isWorkflowRole,
   type ModelDefinition,
   type RegistrySnapshot,
   type RoleAssignment,
   type ToolDefinition,
   type ToolVersionInspection,
   type WorkflowProfile,
+  type WorkflowRole,
 } from '../registry/types.ts';
 import type { ToolVersionScanState } from '../registry/tool-versions.ts';
 import type {
@@ -50,6 +54,17 @@ function makeModel(overrides: Partial<ModelDefinition> = {}): ModelDefinition {
 }
 
 function fullAssignments(
+  modelId: string = 'model-main',
+  effort: string | null = 'high'
+): RoleAssignment[] {
+  return EXECUTION_ROLES.map((role) => ({
+    role,
+    difficulty: null,
+    choice: { model_id: modelId, effort },
+  }));
+}
+
+function legacySixRoleAssignments(
   modelId: string = 'model-main',
   effort: string | null = 'high'
 ): RoleAssignment[] {
@@ -216,8 +231,8 @@ describe('local readiness projection', () => {
       name: 'Everyday',
       isDefault: true,
       state: 'complete',
-      defaultCount: 6,
-      requiredDefaultCount: 6,
+      defaultCount: 5,
+      requiredDefaultCount: 5,
       missingDefaults: [],
       issueCount: 0,
     });
@@ -397,7 +412,7 @@ describe('local readiness projection', () => {
   });
 
   it('requires every role default and does not let an override replace one', () => {
-    const assignments: RoleAssignment[] = WORKFLOW_ROLES.filter(
+    const assignments: RoleAssignment[] = EXECUTION_ROLES.filter(
       (role) => role !== 'coder'
     ).map((role) => ({
       role,
@@ -423,7 +438,8 @@ describe('local readiness projection', () => {
     assert.equal(projection.complete, false);
     assert.equal(projection.readyCount, 4);
     assert.deepEqual(projection.profiles[0].missingDefaults, ['Coder']);
-    assert.equal(projection.profiles[0].defaultCount, 5);
+    assert.equal(projection.profiles[0].defaultCount, 4);
+    assert.equal(projection.profiles[0].requiredDefaultCount, 5);
     assert.equal(projection.profiles[0].issueCount, 0);
   });
 
@@ -470,7 +486,7 @@ describe('local readiness projection', () => {
         makeProfile(),
         makeProfile('profile-draft', 'Draft profile', [
           {
-            role: 'follower',
+            role: 'orchestrator',
             difficulty: null,
             choice: { model_id: 'model-main', effort: 'high' },
           },
@@ -485,11 +501,221 @@ describe('local readiness projection', () => {
 
     assert.equal(profiles.state, 'attention');
     assert.match(profiles.detail, /Draft profile/);
+    assert.match(profiles.detail, /all five role defaults/i);
     assert.ok(draft);
     assert.equal(draft.state, 'partial');
     assert.equal(draft.defaultCount, 1);
-    assert.equal(draft.missingDefaults.length, 5);
+    assert.equal(draft.requiredDefaultCount, 5);
+    assert.equal(draft.missingDefaults.length, 4);
     assert.equal(projection.complete, false);
+  });
+
+  it('keeps a complete five-role profile ready when legacy Follower metadata is present or malformed while preserving raw records and role decoding', () => {
+    assert.equal(isWorkflowRole('follower'), true);
+    assert.equal(isExecutionRole('follower'), false);
+
+    const fiveRoleInput = makeInput({
+      registry: makeRegistry({
+        profiles: [makeProfile('profile-five', 'Five Execution Roles', fullAssignments('model-main', 'low'))],
+        default_profile_id: 'profile-five',
+      }),
+    });
+    const fiveBefore = JSON.stringify(fiveRoleInput);
+    const fiveProjection = projectReadinessChecklist(fiveRoleInput);
+    assert.equal(fiveProjection.complete, true);
+    assert.equal(checkById(fiveProjection, 'models').state, 'ready');
+    assert.match(checkById(fiveProjection, 'models').summary, /5 role choices resolve/);
+    assert.equal(checkById(fiveProjection, 'profiles').state, 'ready');
+    assert.match(checkById(fiveProjection, 'profiles').detail, /all five role defaults/i);
+    assert.deepEqual(fiveProjection.profiles[0], {
+      name: 'Five Execution Roles',
+      isDefault: true,
+      state: 'complete',
+      defaultCount: 5,
+      requiredDefaultCount: 5,
+      missingDefaults: [],
+      issueCount: 0,
+    });
+    assert.equal(JSON.stringify(fiveRoleInput), fiveBefore);
+
+    const legacySixInput = makeInput({
+      registry: makeRegistry({
+        profiles: [
+          makeProfile(
+            'profile-legacy-six',
+            'Legacy Six Roles',
+            legacySixRoleAssignments('model-main', 'high')
+          ),
+        ],
+        default_profile_id: 'profile-legacy-six',
+      }),
+    });
+    const sixBefore = JSON.stringify(legacySixInput);
+    const sixProjection = projectReadinessChecklist(legacySixInput);
+    assert.equal(sixProjection.complete, true);
+    assert.equal(checkById(sixProjection, 'models').state, 'ready');
+    assert.match(checkById(sixProjection, 'models').summary, /5 role choices resolve/);
+    assert.equal(checkById(sixProjection, 'profiles').state, 'ready');
+    assert.deepEqual(sixProjection.profiles[0], {
+      name: 'Legacy Six Roles',
+      isDefault: true,
+      state: 'complete',
+      defaultCount: 5,
+      requiredDefaultCount: 5,
+      missingDefaults: [],
+      issueCount: 0,
+    });
+    assert.equal(legacySixInput.registry.profiles[0].assignments.length, 6);
+    assert.equal(legacySixInput.registry.profiles[0].assignments[0].role, 'follower');
+    assert.equal(JSON.stringify(legacySixInput), sixBefore);
+
+    const brokenLegacyFollowerInput = makeInput({
+      registry: makeRegistry({
+        tools: [
+          makeTool(),
+          makeTool({
+            id: 'tool-disabled-legacy',
+            label: 'Disabled Codex',
+            adapter: 'codex_cli',
+            enabled: false,
+          }),
+        ],
+        models: [
+          makeModel(),
+          makeModel({
+            id: 'model-disabled-legacy',
+            tool_id: 'tool-disabled-legacy',
+            label: 'Legacy Disabled Model',
+            model_arg: 'codex/disabled',
+          }),
+        ],
+        profiles: [
+          makeProfile('profile-legacy-broken', 'Legacy Broken Follower', [
+            {
+              role: 'follower',
+              difficulty: null,
+              choice: { model_id: 'model-disabled-legacy', effort: 'unsupported-effort' },
+            },
+            {
+              role: 'follower',
+              difficulty: 'hard',
+              choice: { model_id: 'model-missing-legacy', effort: 'unsupported-effort' },
+            },
+            ...fullAssignments('model-main', 'high'),
+          ]),
+        ],
+        default_profile_id: 'profile-legacy-broken',
+      }),
+    });
+    const brokenBefore = JSON.stringify(brokenLegacyFollowerInput);
+    const brokenProjection = projectReadinessChecklist(brokenLegacyFollowerInput);
+    assert.equal(brokenProjection.complete, true);
+    assert.equal(checkById(brokenProjection, 'models').state, 'ready');
+    assert.match(checkById(brokenProjection, 'models').summary, /5 role choices resolve/);
+    assert.equal(checkById(brokenProjection, 'profiles').state, 'ready');
+    assert.deepEqual(brokenProjection.profiles[0], {
+      name: 'Legacy Broken Follower',
+      isDefault: true,
+      state: 'complete',
+      defaultCount: 5,
+      requiredDefaultCount: 5,
+      missingDefaults: [],
+      issueCount: 0,
+    });
+    assert.equal(brokenLegacyFollowerInput.registry.profiles[0].assignments.length, 7);
+    assert.equal(
+      brokenLegacyFollowerInput.registry.profiles[0].assignments[0].choice.model_id,
+      'model-disabled-legacy'
+    );
+    assert.equal(
+      brokenLegacyFollowerInput.registry.profiles[0].assignments[1].choice.model_id,
+      'model-missing-legacy'
+    );
+    assert.equal(JSON.stringify(brokenLegacyFollowerInput), brokenBefore);
+  });
+
+  it('still blocks invalid five-role execution defaults, invalid execution difficulty overrides, and unknown corrupt roles', () => {
+    for (const targetRole of EXECUTION_ROLES) {
+      const invalidExecutionDefault = makeInput({
+        registry: makeRegistry({
+          profiles: [
+            makeProfile(`profile-invalid-${targetRole}`, 'Invalid Execution Role', [
+              {
+                role: 'follower',
+                difficulty: null,
+                choice: { model_id: 'model-main', effort: 'high' },
+              },
+              ...EXECUTION_ROLES.map((role) => ({
+                role,
+                difficulty: null,
+                choice: {
+                  model_id: role === targetRole ? 'model-missing' : 'model-main',
+                  effort: 'high',
+                },
+              })),
+            ]),
+          ],
+          default_profile_id: `profile-invalid-${targetRole}`,
+        }),
+      });
+      const projection = projectReadinessChecklist(invalidExecutionDefault);
+      assert.equal(projection.complete, false, targetRole);
+      assert.equal(checkById(projection, 'models').state, 'blocked', targetRole);
+      assert.match(checkById(projection, 'models').detail, /not in the registry/i);
+      assert.equal(checkById(projection, 'profiles').state, 'blocked', targetRole);
+      assert.equal(projection.profiles[0].state, 'invalid', targetRole);
+      assert.equal(projection.profiles[0].issueCount, 1, targetRole);
+    }
+
+    const invalidOverrideInput = makeInput({
+      registry: makeRegistry({
+        profiles: [
+          makeProfile('profile-invalid-override', 'Invalid Execution Override', [
+            ...fullAssignments('model-main', 'high'),
+            {
+              role: 'coder',
+              difficulty: 'hard',
+              choice: { model_id: 'model-main', effort: 'unsupported-effort' },
+            },
+          ]),
+        ],
+        default_profile_id: 'profile-invalid-override',
+      }),
+    });
+    const overrideProjection = projectReadinessChecklist(invalidOverrideInput);
+    assert.equal(overrideProjection.complete, false);
+    assert.equal(checkById(overrideProjection, 'models').state, 'blocked');
+    assert.match(checkById(overrideProjection, 'models').detail, /Coder Hard override/);
+    assert.match(checkById(overrideProjection, 'models').detail, /does not list/);
+    assert.equal(checkById(overrideProjection, 'profiles').state, 'blocked');
+    assert.equal(overrideProjection.profiles[0].state, 'invalid');
+    assert.equal(overrideProjection.profiles[0].issueCount, 1);
+
+    const corruptRoleInput = makeInput({
+      registry: makeRegistry({
+        profiles: [
+          makeProfile('profile-corrupt-role', 'Corrupt Role Profile', [
+            ...fullAssignments('model-main', 'high'),
+            {
+              role: 'corrupt_role' as unknown as WorkflowRole,
+              difficulty: null,
+              choice: { model_id: 'model-main', effort: 'high' },
+            },
+          ]),
+        ],
+        default_profile_id: 'profile-corrupt-role',
+      }),
+    });
+    const corruptBefore = JSON.stringify(corruptRoleInput);
+    const corruptProjection = projectReadinessChecklist(corruptRoleInput);
+    assert.equal(corruptProjection.complete, false);
+    assert.equal(checkById(corruptProjection, 'models').state, 'blocked');
+    assert.match(checkById(corruptProjection, 'models').detail, /Unknown role role default/);
+    assert.match(checkById(corruptProjection, 'models').detail, /unknown workflow role/i);
+    assert.equal(checkById(corruptProjection, 'profiles').state, 'blocked');
+    assert.equal(corruptProjection.profiles[0].state, 'invalid');
+    assert.equal(corruptProjection.profiles[0].issueCount, 1);
+    assert.equal(JSON.stringify(corruptRoleInput), corruptBefore);
   });
 
   it('requires a real runtime attachment and a non-demo selected binding', () => {

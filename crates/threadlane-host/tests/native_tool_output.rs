@@ -660,6 +660,31 @@ fn cli_notify_tool_output_context_requires_notify_codex_and_validates_private_fi
         }),
     );
     assert!(base_args(unknown_field_path).into_host_config().is_err());
+
+    // 4. New Coworker notification context JSON without `model` or `effort` is accepted.
+    let coworker_context_path = fixture.private_dir.join("coworker-context.json");
+    write_private_json_context(
+        &coworker_context_path,
+        &json!({
+            "schema_version": 1,
+            "socket_path": fixture.socket_path,
+            "thread_id": THREAD_UUID_A,
+            "project_root": fixture.repo_dir
+        }),
+    );
+    let coworker_notify = base_args(coworker_context_path)
+        .into_host_config()
+        .expect("model-less coworker context must be accepted")
+        .notifications
+        .expect("notifications enabled");
+    assert_eq!(
+        coworker_notify.tool_output,
+        Some(NativeToolOutputConfig::new(
+            fixture.socket_path.clone(),
+            THREAD_UUID_A.to_string(),
+            fixture.repo_dir.clone()
+        ))
+    );
 }
 
 #[tokio::test]
@@ -887,6 +912,11 @@ async fn handle_one_native_tool_output_exchange(
             "excludeTurns": true
         })
     );
+    let (live_model, live_effort) = if thread_status_type == "active" {
+        ("o4-mini-switched", "low")
+    } else {
+        (NATIVE_MODEL, NATIVE_EFFORT)
+    };
     send_json_rpc(
         &mut ws,
         &json!({
@@ -898,8 +928,8 @@ async fn handle_one_native_tool_output_exchange(
                     "status": { "type": thread_status_type }
                 },
                 "cwd": cwd_str,
-                "model": NATIVE_MODEL,
-                "reasoningEffort": NATIVE_EFFORT
+                "model": live_model,
+                "reasoningEffort": live_effort
             }
         }),
     )

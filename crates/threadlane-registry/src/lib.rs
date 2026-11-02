@@ -1496,4 +1496,114 @@ mod tests {
             "corrupt_store"
         );
     }
+
+    #[test]
+    fn execution_roles_exclude_legacy_follower_while_preserving_legacy_snapshot_decode() {
+        assert_eq!(
+            WorkflowRole::EXECUTION_ROLES,
+            [
+                WorkflowRole::Orchestrator,
+                WorkflowRole::Architect,
+                WorkflowRole::Coder,
+                WorkflowRole::Reviewer,
+                WorkflowRole::Closure,
+            ]
+        );
+        assert_eq!(WorkflowRole::EXECUTION_ROLES.len(), 5);
+        assert_eq!(WorkflowRole::ALL.len(), 6);
+        assert!(!WorkflowRole::Follower.is_execution_role());
+        assert!(WorkflowRole::Follower.is_legacy_follower());
+        for role in WorkflowRole::EXECUTION_ROLES {
+            assert!(role.is_execution_role());
+            assert!(!role.is_legacy_follower());
+        }
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = RegistryStore::open(temp.path().join("registry")).expect("open store");
+        let s1 = store
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("agy", ToolAdapter::Antigravity),
+                },
+            )
+            .expect("upsert tool");
+        let s2 = store
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertModel {
+                    model: sample_model("argon", "agy", &["high"], false),
+                },
+            )
+            .expect("upsert model");
+
+        // 1. Five-role execution profile without Follower is complete and saves cleanly.
+        let five_role_assignments: Vec<RoleAssignment> = WorkflowRole::EXECUTION_ROLES
+            .into_iter()
+            .map(|role| RoleAssignment {
+                role,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "argon".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            })
+            .collect();
+        let five_role_profile = WorkflowProfile {
+            id: "five-role-default".to_string(),
+            name: "Five Role Default".to_string(),
+            assignments: five_role_assignments,
+            decision_advisor: None,
+        };
+        assert!(five_role_profile.has_complete_execution_defaults());
+        assert_eq!(five_role_profile.execution_assignments().count(), 5);
+
+        let s3 = store
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: five_role_profile.clone(),
+                },
+            )
+            .expect("save five-role profile");
+        assert_eq!(s3.profiles[0], five_role_profile);
+        let serialized_s3 = serde_json::to_string(&s3).expect("serialize s3");
+        assert!(!serialized_s3.contains("\"follower\""));
+
+        // 2. Legacy snapshot containing a `follower` role assignment still decodes and validates.
+        let mut legacy_assignments = five_role_profile.assignments.clone();
+        legacy_assignments.insert(
+            0,
+            RoleAssignment {
+                role: WorkflowRole::Follower,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "argon".to_string(),
+                    effort: Some("high".to_string()),
+                },
+            },
+        );
+        let legacy_profile = WorkflowProfile {
+            id: "legacy-six-role".to_string(),
+            name: "Legacy Six Role".to_string(),
+            assignments: legacy_assignments,
+            decision_advisor: None,
+        };
+        assert!(legacy_profile.has_complete_execution_defaults());
+        assert_eq!(legacy_profile.assignments.len(), 6);
+        assert_eq!(legacy_profile.execution_assignments().count(), 5);
+
+        let s4 = store
+            .apply(
+                s3.revision,
+                RegistryChange::UpsertProfile {
+                    profile: legacy_profile.clone(),
+                },
+            )
+            .expect("save legacy profile with follower");
+        let reloaded = store
+            .snapshot()
+            .expect("reload snapshot with legacy follower");
+        assert_eq!(reloaded, s4);
+    }
 }

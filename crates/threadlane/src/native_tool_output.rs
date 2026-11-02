@@ -9,7 +9,8 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
-use serde_json::{json, Value};
+use serde_json::json;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use threadlane_core::{WakeupClaim, WakeupOutcome, MAX_ID_LEN};
 use tokio::sync::watch;
@@ -84,6 +85,35 @@ impl NativeNotificationDelivery {
     }
 }
 
+/// Observational live native Coworker model and reasoning effort reported by a thread RPC response.
+///
+/// Fields are populated only when the native server actually provides a non-empty string value;
+/// absent or null values remain `None` and are never fabricated from configuration defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeObservedThreadModel {
+    /// Live model identifier reported by the native thread, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Live reasoning effort reported by the native thread, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl NativeObservedThreadModel {
+    /// Returns `true` when neither `model` nor `effort` was observed in the live response.
+    pub const fn is_empty(&self) -> bool {
+        self.model.is_none() && self.effort.is_none()
+    }
+}
+
+fn deserialize_optional_metadata_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// Explicit operator-configured native Unix WebSocket notification target context.
 ///
 /// This configuration is an operator-selected target scope only and is not a per-call
@@ -101,9 +131,25 @@ pub struct NativeToolOutputConfig {
     pub thread_id: String,
     /// Absolute normalized existing canonical project root directory.
     pub project_root: PathBuf,
-    /// Bounded non-empty expected model identifier.
+    /// Optional legacy model metadata.
+    ///
+    /// New Coworker notification contexts may omit this field or leave it empty; the active
+    /// Coworker model is chosen by the human in Codex and is never enforced by notification admission.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_metadata_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub model: String,
-    /// Bounded non-empty expected reasoning effort identifier.
+    /// Optional legacy reasoning effort metadata.
+    ///
+    /// New Coworker notification contexts may omit this field or leave it empty; the active
+    /// Coworker reasoning effort is chosen by the human in Codex and is never enforced by notification admission.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_metadata_string",
+        skip_serializing_if = "String::is_empty"
+    )]
     pub effort: String,
     /// Optional explicit native notification delivery mode (`tool_output` by default; omitted on legacy wire payloads when default).
     #[serde(
@@ -132,11 +178,47 @@ impl fmt::Debug for NativeToolOutputConfig {
 }
 
 impl NativeToolOutputConfig {
+    /// Creates a new [`NativeToolOutputConfig`] without legacy Coworker model or reasoning effort metadata.
+    pub const fn new(socket_path: PathBuf, thread_id: String, project_root: PathBuf) -> Self {
+        Self {
+            schema_version: NATIVE_TOOL_OUTPUT_CONFIG_SCHEMA_VERSION,
+            socket_path,
+            thread_id,
+            project_root,
+            model: String::new(),
+            effort: String::new(),
+            delivery: NativeNotificationDelivery::ToolOutput,
+            reconnect: None,
+        }
+    }
+
     /// Returns a copy of this configuration with the specified [`NativeNotificationDelivery`] mode.
     pub const fn with_delivery(mut self, delivery: NativeNotificationDelivery) -> Self {
         self.delivery = delivery;
         self
     }
+
+    /// Returns a copy of this configuration with the specified optional [`NativeReconnectConfig`].
+    pub fn with_reconnect(mut self, reconnect: Option<NativeReconnectConfig>) -> Self {
+        self.reconnect = reconnect;
+        self
+    }
+
+    /// Returns `true` when legacy `model` or `effort` metadata is populated.
+    pub fn has_legacy_model_metadata(&self) -> bool {
+        !self.model.is_empty() || !self.effort.is_empty()
+    }
+
+    /// Returns the legacy configured model metadata if non-empty, or `None` when omitted.
+    pub fn legacy_model(&self) -> Option<&str> {
+        (!self.model.is_empty()).then_some(self.model.as_str())
+    }
+
+    /// Returns the legacy configured reasoning effort metadata if non-empty, or `None` when omitted.
+    pub fn legacy_effort(&self) -> Option<&str> {
+        (!self.effort.is_empty()).then_some(self.effort.as_str())
+    }
+
     /// Validates all structural, identifier, canonical project root, and Unix socket or reconnect invariants.
     pub fn validate(&self) -> Result<(), Error> {
         ensure_platform_supported()?;
@@ -160,8 +242,12 @@ impl NativeToolOutputConfig {
         }
 
         validate_canonical_non_nil_uuid(&self.thread_id, "native tool-output thread_id")?;
-        validate_model_or_effort(&self.model, "model")?;
-        validate_model_or_effort(&self.effort, "effort")?;
+        if !self.model.is_empty() {
+            validate_model_or_effort(&self.model, "model")?;
+        }
+        if !self.effort.is_empty() {
+            validate_model_or_effort(&self.effort, "effort")?;
+        }
         validate_canonical_project_root(&self.project_root)?;
 
         match self.reconnect {
@@ -334,7 +420,9 @@ impl NativeToolOutputConfig {
             socket_path: &'a [u8],
             thread_id: &'a str,
             project_root: &'a [u8],
+            #[serde(skip_serializing_if = "str::is_empty")]
             model: &'a str,
+            #[serde(skip_serializing_if = "str::is_empty")]
             effort: &'a str,
             #[serde(skip_serializing_if = "NativeNotificationDelivery::is_default")]
             delivery: NativeNotificationDelivery,
@@ -1451,6 +1539,100 @@ async fn recv_rpc_response(
     }
 }
 
+/// Extracts observational live Coworker model and reasoning effort from a `thread/read` RPC result.
+///
+/// Never fabricates model identity when fields are omitted, `null`, or empty. Returns an error
+/// if `thread` is missing or if `model` or `reasoningEffort` is present with a non-string JSON type.
+pub fn observe_thread_read_model(result: &Value) -> Result<NativeObservedThreadModel, Error> {
+    let Some(thread) = result.get("thread").and_then(Value::as_object) else {
+        return Err(Error::InvalidConfig(
+            "native tool-output thread/read response missing thread object".to_string(),
+        ));
+    };
+    extract_thread_read_model_observation(thread)
+        .map_err(|reason| Error::InvalidConfig(reason.to_string()))
+}
+
+/// Extracts observational live Coworker model and reasoning effort from a `thread/resume` RPC result.
+///
+/// Never fabricates model identity when fields are omitted, `null`, or empty. Returns an error
+/// if `result` or `result.thread` has an invalid type, if `model` or `reasoningEffort` has a
+/// non-string JSON type, or if outer and inner `thread` fields disagree.
+pub fn observe_thread_resume_model(result: &Value) -> Result<NativeObservedThreadModel, Error> {
+    let Some(result_obj) = result.as_object() else {
+        return Err(Error::InvalidConfig(
+            "native tool-output thread/resume result must be an object".to_string(),
+        ));
+    };
+    let thread_obj = match result_obj.get("thread") {
+        Some(Value::Object(map)) => Some(map),
+        Some(Value::Null) | None => None,
+        Some(_) => {
+            return Err(Error::InvalidConfig(
+                "native tool-output thread/resume thread field must be an object".to_string(),
+            ))
+        }
+    };
+    let model = extract_optional_consistent_string_field_str(result_obj, thread_obj, "model")
+        .map_err(|reason| Error::InvalidConfig(reason.to_string()))?
+        .map(str::to_owned);
+    let effort =
+        extract_optional_consistent_string_field_str(result_obj, thread_obj, "reasoningEffort")
+            .map_err(|reason| Error::InvalidConfig(reason.to_string()))?
+            .map(str::to_owned);
+    Ok(NativeObservedThreadModel { model, effort })
+}
+
+fn extract_thread_read_model_observation(
+    thread: &serde_json::Map<String, Value>,
+) -> Result<NativeObservedThreadModel, &'static str> {
+    let model = match thread.get("model") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => (!s.is_empty()).then(|| s.clone()),
+        Some(_) => return Err("native tool-output thread/read thread.model is not a string"),
+    };
+
+    let effort = match thread.get("reasoningEffort") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => (!s.is_empty()).then(|| s.clone()),
+        Some(_) => {
+            return Err("native tool-output thread/read thread.reasoningEffort is not a string")
+        }
+    };
+
+    Ok(NativeObservedThreadModel { model, effort })
+}
+
+fn extract_optional_consistent_string_field_str<'a>(
+    outer: &'a serde_json::Map<String, Value>,
+    inner: Option<&'a serde_json::Map<String, Value>>,
+    field: &str,
+) -> Result<Option<&'a str>, &'static str> {
+    let outer_val = match outer.get(field) {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Err("native tool-output thread/resume field has invalid type"),
+    };
+    let inner_val = match inner.and_then(|m| m.get(field)) {
+        Some(Value::Null) | None => None,
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(_) => return Err("native tool-output thread/resume field has invalid type"),
+    };
+
+    match (outer_val, inner_val) {
+        (Some(a), Some(b)) => {
+            if a != b {
+                Err("native tool-output thread/resume outer and inner fields disagreed")
+            } else {
+                Ok((!a.is_empty()).then_some(a))
+            }
+        }
+        (Some(a), None) => Ok((!a.is_empty()).then_some(a)),
+        (None, Some(b)) => Ok((!b.is_empty()).then_some(b)),
+        (None, None) => Ok(None),
+    }
+}
+
 #[cfg(unix)]
 fn validate_thread_read_result(
     result: &Value,
@@ -1484,35 +1666,8 @@ fn validate_thread_read_result(
         ));
     }
 
-    if let Some(model_val) = thread.get("model") {
-        if !model_val.is_null() {
-            let Some(model) = model_val.as_str() else {
-                return Err(ExchangeError::Terminal(
-                    "native tool-output thread/read thread.model is not a string",
-                ));
-            };
-            if model != cfg.model {
-                return Err(ExchangeError::Terminal(
-                    "native tool-output thread/read model mismatch",
-                ));
-            }
-        }
-    }
-
-    if let Some(effort_val) = thread.get("reasoningEffort") {
-        if !effort_val.is_null() {
-            let Some(effort) = effort_val.as_str() else {
-                return Err(ExchangeError::Terminal(
-                    "native tool-output thread/read thread.reasoningEffort is not a string",
-                ));
-            };
-            if effort != cfg.effort {
-                return Err(ExchangeError::Terminal(
-                    "native tool-output thread/read reasoningEffort mismatch",
-                ));
-            }
-        }
-    }
+    let _observed_model =
+        extract_thread_read_model_observation(thread).map_err(ExchangeError::Terminal)?;
 
     let status_type = match thread.get("status") {
         Some(Value::String(s)) => Some(s.as_str()),
@@ -1537,41 +1692,11 @@ fn extract_consistent_string_field<'a>(
     inner: Option<&'a serde_json::Map<String, Value>>,
     field: &str,
 ) -> Result<&'a str, ExchangeError> {
-    let outer_val = match outer.get(field) {
-        Some(Value::Null) | None => None,
-        Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => {
-            return Err(ExchangeError::Terminal(
-                "native tool-output thread/resume field has invalid type",
-            ))
-        }
-    };
-    let inner_val = match inner.and_then(|m| m.get(field)) {
-        Some(Value::Null) | None => None,
-        Some(Value::String(s)) => Some(s.as_str()),
-        Some(_) => {
-            return Err(ExchangeError::Terminal(
-                "native tool-output thread/resume field has invalid type",
-            ))
-        }
-    };
-
-    match (outer_val, inner_val) {
-        (Some(a), Some(b)) => {
-            if a != b {
-                Err(ExchangeError::Terminal(
-                    "native tool-output thread/resume outer and inner fields disagreed",
-                ))
-            } else {
-                Ok(a)
-            }
-        }
-        (Some(a), None) => Ok(a),
-        (None, Some(b)) => Ok(b),
-        (None, None) => Err(ExchangeError::Terminal(
+    extract_optional_consistent_string_field_str(outer, inner, field)
+        .map_err(ExchangeError::Terminal)?
+        .ok_or(ExchangeError::Terminal(
             "native tool-output thread/resume missing required field",
-        )),
-    }
+        ))
 }
 
 #[cfg(unix)]
@@ -1609,19 +1734,12 @@ fn validate_thread_resume_result(
         ));
     }
 
-    let model = extract_consistent_string_field(result_obj, thread_obj, "model")?;
-    if model != cfg.model {
-        return Err(ExchangeError::Terminal(
-            "native tool-output thread/resume model mismatch",
-        ));
-    }
-
-    let effort = extract_consistent_string_field(result_obj, thread_obj, "reasoningEffort")?;
-    if effort != cfg.effort {
-        return Err(ExchangeError::Terminal(
-            "native tool-output thread/resume reasoningEffort mismatch",
-        ));
-    }
+    let _observed_model =
+        extract_optional_consistent_string_field_str(result_obj, thread_obj, "model")
+            .map_err(ExchangeError::Terminal)?;
+    let _observed_effort =
+        extract_optional_consistent_string_field_str(result_obj, thread_obj, "reasoningEffort")
+            .map_err(ExchangeError::Terminal)?;
 
     if cfg.delivery == NativeNotificationDelivery::UserMessageSteer {
         let status_val = thread_obj.and_then(|thread| thread.get("status"));
@@ -1984,5 +2102,129 @@ mod tests {
         let loaded = NativeToolOutputConfig::load(&cfg_path).expect("load for current euid");
         assert_eq!(loaded, cfg);
         assert!(NativeToolOutputConfig::load_with_euid(&cfg_path, wrong_uid).is_err());
+    }
+
+    #[test]
+    fn coworker_context_omits_model_and_effort_while_preserving_legacy_decode() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let project_root = root.join("repo");
+        fs::create_dir(&project_root).expect("create repo");
+
+        let sock_dir = root.join("sock");
+        fs::create_dir(&sock_dir).expect("create sock dir");
+        fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        let sock_path = sock_dir.join("codex.sock");
+        let _listener = UnixListener::bind(&sock_path).expect("bind unix socket");
+
+        let coworker_cfg = NativeToolOutputConfig::new(
+            sock_path.clone(),
+            "01968f52-8871-7d51-9914-79d2bc48eb5a".to_string(),
+            project_root.clone(),
+        );
+        assert!(!coworker_cfg.has_legacy_model_metadata());
+        assert_eq!(coworker_cfg.legacy_model(), None);
+        assert_eq!(coworker_cfg.legacy_effort(), None);
+        coworker_cfg
+            .validate()
+            .expect("model-less coworker config must validate");
+
+        let serialized = serde_json::to_string(&coworker_cfg).expect("serialize coworker config");
+        assert!(
+            !serialized.contains("\"model\""),
+            "new coworker config must not serialize model: {serialized}"
+        );
+        assert!(
+            !serialized.contains("\"effort\""),
+            "new coworker config must not serialize effort: {serialized}"
+        );
+        let decoded: NativeToolOutputConfig =
+            serde_json::from_str(&serialized).expect("deserialize coworker config");
+        assert_eq!(decoded, coworker_cfg);
+        assert_eq!(decoded.digest(), coworker_cfg.digest());
+
+        let explicit_null_json = serde_json::json!({
+            "schema_version": 1,
+            "socket_path": sock_path,
+            "thread_id": "01968f52-8871-7d51-9914-79d2bc48eb5a",
+            "project_root": project_root,
+            "model": null,
+            "effort": null,
+        });
+        let null_decoded: NativeToolOutputConfig =
+            serde_json::from_value(explicit_null_json).expect("decode explicit null model/effort");
+        assert_eq!(null_decoded, coworker_cfg);
+        null_decoded.validate().expect("validate null-decoded");
+
+        let mut malformed_legacy = coworker_cfg.clone();
+        malformed_legacy.model = "invalid model with spaces".to_string();
+        assert!(
+            malformed_legacy.validate().is_err(),
+            "non-empty malformed legacy model must still fail validation"
+        );
+    }
+
+    #[test]
+    fn live_model_observation_reports_only_provided_values_without_fabrication() {
+        let empty_read = serde_json::json!({
+            "thread": {
+                "id": "01968f52-8871-7d51-9914-79d2bc48eb5a",
+                "cwd": "/tmp/repo",
+                "status": { "type": "idle" }
+            }
+        });
+        let obs_empty_read = observe_thread_read_model(&empty_read).expect("observe empty read");
+        assert!(obs_empty_read.is_empty());
+        assert_eq!(obs_empty_read.model, None);
+        assert_eq!(obs_empty_read.effort, None);
+
+        let populated_read = serde_json::json!({
+            "thread": {
+                "id": "01968f52-8871-7d51-9914-79d2bc48eb5a",
+                "cwd": "/tmp/repo",
+                "model": "gpt-5.4-codex",
+                "reasoningEffort": "medium",
+                "status": { "type": "active" }
+            }
+        });
+        let obs_populated_read =
+            observe_thread_read_model(&populated_read).expect("observe populated read");
+        assert!(!obs_populated_read.is_empty());
+        assert_eq!(obs_populated_read.model.as_deref(), Some("gpt-5.4-codex"));
+        assert_eq!(obs_populated_read.effort.as_deref(), Some("medium"));
+
+        let empty_resume = serde_json::json!({
+            "id": "01968f52-8871-7d51-9914-79d2bc48eb5a",
+            "cwd": "/tmp/repo",
+            "model": null,
+            "reasoningEffort": ""
+        });
+        let obs_empty_resume =
+            observe_thread_resume_model(&empty_resume).expect("observe empty resume");
+        assert!(obs_empty_resume.is_empty());
+
+        let switched_resume = serde_json::json!({
+            "thread": {
+                "id": "01968f52-8871-7d51-9914-79d2bc48eb5a",
+                "cwd": "/tmp/repo",
+                "model": "o4-mini"
+            },
+            "reasoningEffort": "low"
+        });
+        let obs_switched_resume =
+            observe_thread_resume_model(&switched_resume).expect("observe switched resume");
+        assert_eq!(obs_switched_resume.model.as_deref(), Some("o4-mini"));
+        assert_eq!(obs_switched_resume.effort.as_deref(), Some("low"));
+
+        let disagreeing_resume = serde_json::json!({
+            "model": "gpt-5-codex",
+            "thread": {
+                "model": "o4-mini"
+            }
+        });
+        assert!(
+            observe_thread_resume_model(&disagreeing_resume).is_err(),
+            "outer/inner model disagreement must be rejected"
+        );
     }
 }

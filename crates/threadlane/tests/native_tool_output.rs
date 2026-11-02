@@ -106,6 +106,14 @@ impl TestEnv {
         }
     }
 
+    fn coworker_native_config(&self) -> NativeToolOutputConfig {
+        NativeToolOutputConfig::new(
+            self.socket_path.clone(),
+            TEST_THREAD_ID.to_string(),
+            self.project_root.clone(),
+        )
+    }
+
     fn sample_claim(&self) -> WakeupClaim {
         WakeupClaim {
             binding_id: TEST_BINDING_ID.to_string(),
@@ -401,14 +409,29 @@ async fn scope_status_model_and_effort_mismatches_fail_before_any_turn_start_wri
             json!({ "id": TEST_THREAD_ID, "model": "gpt-5-codex", "reasoningEffort": "high" }),
         ),
         (
-            "model mismatch in resume",
+            "thread.id mismatch in resume despite model switch",
             json!({ "id": TEST_THREAD_ID, "status": { "type": "idle" } }),
-            json!({ "id": TEST_THREAD_ID, "model": "other-model", "reasoningEffort": "high" }),
+            json!({ "id": "01968f52-0000-7d51-9914-79d2bc48eb5a", "model": "o4-mini", "reasoningEffort": "low" }),
         ),
         (
-            "effort mismatch in resume",
+            "cwd mismatch in resume despite model switch",
             json!({ "id": TEST_THREAD_ID, "status": { "type": "idle" } }),
-            json!({ "id": TEST_THREAD_ID, "model": "gpt-5-codex", "reasoningEffort": "low" }),
+            json!({ "id": TEST_THREAD_ID, "cwd": "/tmp/wrong-cwd", "model": "o4-mini", "reasoningEffort": "low" }),
+        ),
+        (
+            "outer and inner model disagreement in resume",
+            json!({ "id": TEST_THREAD_ID, "status": { "type": "idle" } }),
+            json!({
+                "id": TEST_THREAD_ID,
+                "model": "gpt-5-codex",
+                "reasoningEffort": "high",
+                "thread": { "id": TEST_THREAD_ID, "model": "o4-mini" }
+            }),
+        ),
+        (
+            "non-string model field in read",
+            json!({ "id": TEST_THREAD_ID, "model": 42, "status": { "type": "idle" } }),
+            json!({ "id": TEST_THREAD_ID, "model": "gpt-5-codex", "reasoningEffort": "high" }),
         ),
     ];
 
@@ -1210,6 +1233,388 @@ async fn user_message_steer_refuses_missing_or_completed_active_turn_and_marks_m
             other => panic!("expected Unknown after turn/steer write, got {other:?}"),
         }
         server.await.expect("server");
+        assert!(!env.queue_marker.exists());
+    }
+}
+
+#[tokio::test]
+async fn coworker_model_and_effort_switches_succeed_in_idle_and_busy_delivery_for_same_chat() {
+    let cases = [
+        (
+            "idle tool_output with legacy context and switched live model",
+            true,
+            NativeNotificationDelivery::ToolOutput,
+            false,
+            Some("o4-mini"),
+            Some("low"),
+        ),
+        (
+            "busy tool_output with model-less coworker context and switched live model",
+            false,
+            NativeNotificationDelivery::ToolOutput,
+            true,
+            Some("gpt-5.4-codex"),
+            Some("xhigh"),
+        ),
+        (
+            "idle user_message_steer with legacy context and switched live model",
+            true,
+            NativeNotificationDelivery::UserMessageSteer,
+            false,
+            Some("o4-mini"),
+            Some("medium"),
+        ),
+        (
+            "busy user_message_steer with model-less coworker context and switched live model",
+            false,
+            NativeNotificationDelivery::UserMessageSteer,
+            true,
+            Some("gpt-5.4-codex"),
+            Some("low"),
+        ),
+        (
+            "busy user_message_steer with omitted live model metadata",
+            false,
+            NativeNotificationDelivery::UserMessageSteer,
+            true,
+            None,
+            None,
+        ),
+    ];
+
+    for (label, use_legacy_cfg, delivery, is_busy, live_model, live_effort) in cases {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let base_cfg = if use_legacy_cfg {
+            env.base_native_config()
+        } else {
+            env.coworker_native_config()
+        };
+        let cfg = base_cfg.with_delivery(delivery);
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_clone = Arc::clone(&recorded);
+        let status_json = if is_busy {
+            json!({ "type": "active", "activeFlags": ["turnRunning"] })
+        } else {
+            json!({ "type": "idle" })
+        };
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+
+            let msg1 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg1);
+            ws.send(Message::Text(
+                json!({ "id": 1, "result": { "serverInfo": { "name": "fake" } } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("init");
+
+            let msg2 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg2);
+
+            let msg3 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg3);
+            let mut read_thread = json!({
+                "id": TEST_THREAD_ID,
+                "cwd": expected_cwd,
+                "status": status_json,
+            });
+            if let Some(m) = live_model {
+                read_thread["model"] = json!(m);
+            }
+            if let Some(e) = live_effort {
+                read_thread["reasoningEffort"] = json!(e);
+            }
+            ws.send(Message::Text(
+                json!({ "id": 2, "result": { "thread": read_thread } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("read");
+
+            let msg4 = read_json(&mut ws).await;
+            recorded_clone.lock().await.push(msg4);
+            let mut resume_result = json!({
+                "thread": {
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": status_json,
+                }
+            });
+            if let Some(m) = live_model {
+                resume_result["model"] = json!(m);
+                resume_result["thread"]["model"] = json!(m);
+            }
+            if let Some(e) = live_effort {
+                resume_result["reasoningEffort"] = json!(e);
+                resume_result["thread"]["reasoningEffort"] = json!(e);
+            }
+            ws.send(Message::Text(
+                json!({ "id": 3, "result": resume_result })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("resume");
+
+            match (delivery, is_busy) {
+                (NativeNotificationDelivery::UserMessageSteer, true) => {
+                    let msg5 = read_json(&mut ws).await;
+                    recorded_clone.lock().await.push(msg5);
+                    ws.send(Message::Text(
+                        json!({
+                            "id": 4,
+                            "result": {
+                                "data": [{ "id": TEST_TURN_ID, "status": "inProgress", "items": [] }],
+                                "nextCursor": null
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("turns/list");
+
+                    let msg6 = read_json(&mut ws).await;
+                    recorded_clone.lock().await.push(msg6);
+                    ws.send(Message::Text(
+                        json!({ "id": 5, "result": { "turnId": TEST_TURN_ID } })
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .expect("turn/steer");
+                }
+                _ => {
+                    let msg5 = read_json(&mut ws).await;
+                    recorded_clone.lock().await.push(msg5);
+                    ws.send(Message::Text(
+                        json!({
+                            "id": 4,
+                            "result": {
+                                "turn": {
+                                    "id": TEST_TURN_ID,
+                                    "status": { "type": "inProgress" },
+                                    "error": null
+                                }
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("turn/start");
+                }
+            }
+        });
+
+        let ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID)
+            .expect("ctx")
+            .with_tool_output_transport(cfg)
+            .expect("transport");
+        let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+        let claim = env.sample_claim();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+        assert_eq!(
+            outcome,
+            WakeupOutcome::Submitted,
+            "expected Submitted for case {label}"
+        );
+        assert!(!env.queue_marker.exists());
+
+        server.await.expect("server");
+        let calls = recorded.lock().await;
+        // Verify thread/resume never sends model or effort overrides.
+        assert_eq!(calls[3]["method"], "thread/resume");
+        assert!(calls[3]["params"].get("model").is_none());
+        assert!(calls[3]["params"].get("effort").is_none());
+        assert!(calls[3]["params"].get("reasoningEffort").is_none());
+
+        let final_call = calls.last().expect("final call");
+        assert!(final_call["params"].get("model").is_none());
+        assert!(final_call["params"].get("effort").is_none());
+        assert!(final_call["params"].get("reasoningEffort").is_none());
+        if delivery == NativeNotificationDelivery::UserMessageSteer && is_busy {
+            assert_eq!(final_call["method"], "turn/steer");
+            assert_eq!(final_call["params"]["expectedTurnId"], TEST_TURN_ID);
+        } else {
+            assert_eq!(final_call["method"], "turn/start");
+        }
+    }
+}
+
+#[tokio::test]
+async fn wrong_thread_project_or_active_turn_fails_before_effect_independent_of_model() {
+    for (label, wrong_thread, wrong_cwd, completed_turn, live_model) in [
+        (
+            "wrong thread with switched model",
+            true,
+            false,
+            false,
+            Some("o4-mini"),
+        ),
+        ("wrong thread with omitted model", true, false, false, None),
+        (
+            "wrong project cwd with switched model",
+            false,
+            true,
+            false,
+            Some("gpt-5.4-codex"),
+        ),
+        (
+            "wrong project cwd with omitted model",
+            false,
+            true,
+            false,
+            None,
+        ),
+        (
+            "completed active turn with switched model",
+            false,
+            false,
+            true,
+            Some("o4-mini"),
+        ),
+        (
+            "completed active turn with omitted model",
+            false,
+            false,
+            true,
+            None,
+        ),
+    ] {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env
+            .coworker_native_config()
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer);
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let saw_effect_write = Arc::new(Mutex::new(false));
+        let saw_effect_write_clone = Arc::clone(&saw_effect_write);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream).await.expect("ws");
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({ "id": 1, "result": {} }).to_string().into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = read_json(&mut ws).await;
+
+            let thread_id = if wrong_thread {
+                "01968f52-0000-7d51-9914-79d2bc48eb5a"
+            } else {
+                TEST_THREAD_ID
+            };
+            let cwd = if wrong_cwd {
+                "/tmp/wrong-project-root"
+            } else {
+                expected_cwd.as_str()
+            };
+            let mut read_thread = json!({
+                "id": thread_id,
+                "cwd": cwd,
+                "status": { "type": "active" }
+            });
+            if let Some(m) = live_model {
+                read_thread["model"] = json!(m);
+            }
+            let _ = ws
+                .send(Message::Text(
+                    json!({ "id": 2, "result": { "thread": read_thread } })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let val: Value = serde_json::from_str(&text).expect("json");
+                if val["method"] == "thread/resume" {
+                    let mut resume_res = json!({
+                        "thread": {
+                            "id": thread_id,
+                            "cwd": cwd,
+                            "status": { "type": "active" }
+                        }
+                    });
+                    if let Some(m) = live_model {
+                        resume_res["model"] = json!(m);
+                    }
+                    let _ = ws
+                        .send(Message::Text(
+                            json!({ "id": 3, "result": resume_res }).to_string().into(),
+                        ))
+                        .await;
+                    if let Some(Ok(Message::Text(next_text))) = ws.next().await {
+                        let next_val: Value = serde_json::from_str(&next_text).expect("json");
+                        if next_val["method"] == "thread/turns/list" && completed_turn {
+                            let _ = ws
+                                .send(Message::Text(
+                                    json!({
+                                        "id": 4,
+                                        "result": {
+                                            "data": [{ "id": TEST_TURN_ID, "status": "completed", "items": [] }],
+                                            "nextCursor": null
+                                        }
+                                    })
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await;
+                            if let Some(Ok(Message::Text(after_list))) = ws.next().await {
+                                let after_val: Value =
+                                    serde_json::from_str(&after_list).expect("json");
+                                if matches!(
+                                    after_val["method"].as_str(),
+                                    Some("turn/start" | "turn/steer")
+                                ) {
+                                    *saw_effect_write_clone.lock().await = true;
+                                }
+                            }
+                        } else if matches!(
+                            next_val["method"].as_str(),
+                            Some("turn/start" | "turn/steer")
+                        ) {
+                            *saw_effect_write_clone.lock().await = true;
+                        }
+                    }
+                } else if matches!(val["method"].as_str(), Some("turn/start" | "turn/steer")) {
+                    *saw_effect_write_clone.lock().await = true;
+                }
+            }
+        });
+
+        let ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID)
+            .expect("ctx")
+            .with_tool_output_transport(cfg)
+            .expect("transport");
+        let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+        let claim = env.sample_claim();
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+        assert!(
+            matches!(outcome, WakeupOutcome::Failed { .. }),
+            "expected Failed for case {label}, got {outcome:?}"
+        );
+        server.await.expect("server");
+        assert!(
+            !*saw_effect_write.lock().await,
+            "no effect write permitted for case {label}"
+        );
         assert!(!env.queue_marker.exists());
     }
 }

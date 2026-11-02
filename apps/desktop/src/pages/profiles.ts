@@ -19,6 +19,8 @@ import {
   type DecisionAdvisorValidation,
 } from '../registry/profile-advisor.ts';
 import {
+  EXECUTION_ROLES,
+  WORKFLOW_ROLES,
   isApiToolAdapter,
   type DecisionAdvisor,
   type Difficulty,
@@ -32,14 +34,9 @@ import {
 } from '../registry/types.ts';
 import { createButton, h } from '../ui/dom.ts';
 
-const ROLES: readonly WorkflowRole[] = [
-  'follower',
-  'orchestrator',
-  'architect',
-  'coder',
-  'reviewer',
-  'closure',
-];
+export const PROFILE_EXECUTION_ROLES: readonly WorkflowRole[] = [...EXECUTION_ROLES];
+
+const ROLES: readonly WorkflowRole[] = PROFILE_EXECUTION_ROLES;
 
 const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard', 'extreme'];
 
@@ -165,7 +162,7 @@ const DELETED_SIGNATURE = '__deleted__';
 
 let nextPageId = 1;
 
-function createEmptyTable(): AssignmentTable {
+export function createEmptyTable(): AssignmentTable {
   const table = {} as AssignmentTable;
   for (const role of ROLES) {
     const slots = {} as Record<Slot, Choice>;
@@ -187,7 +184,7 @@ function cloneTable(table: AssignmentTable): AssignmentTable {
   return next;
 }
 
-function tableFromProfile(profile: WorkflowProfile): AssignmentTable {
+export function tableFromProfile(profile: WorkflowProfile): AssignmentTable {
   const table = createEmptyTable();
   for (const assignment of profile.assignments) {
     if (!ROLES.includes(assignment.role)) {
@@ -206,7 +203,7 @@ function tableFromProfile(profile: WorkflowProfile): AssignmentTable {
   return table;
 }
 
-function assignmentsFromTable(table: AssignmentTable): RoleAssignment[] {
+export function assignmentsFromTable(table: AssignmentTable): RoleAssignment[] {
   const assignments: RoleAssignment[] = [];
   for (const role of ROLES) {
     for (const slot of SLOTS) {
@@ -224,7 +221,7 @@ function assignmentsFromTable(table: AssignmentTable): RoleAssignment[] {
   return assignments;
 }
 
-function profileFromDraft(draft: ProfileDraft): WorkflowProfile {
+export function profileFromDraft(draft: ProfileDraft): WorkflowProfile {
   return profileWithDecisionAdvisor(
     {
       id: draft.id,
@@ -590,7 +587,7 @@ export function profileSignature(profile: WorkflowProfile): string {
       effort: assignment.choice.effort ?? null,
     }))
     .sort((left, right) => {
-      const roleDelta = ROLES.indexOf(left.role) - ROLES.indexOf(right.role);
+      const roleDelta = WORKFLOW_ROLES.indexOf(left.role) - WORKFLOW_ROLES.indexOf(right.role);
       if (roleDelta !== 0) {
         return roleDelta;
       }
