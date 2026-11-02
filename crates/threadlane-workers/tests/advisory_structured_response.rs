@@ -13,9 +13,10 @@ use threadlane_workers::{
     run_advisory_worker, run_advisory_worker_with_structured_result,
     run_advisory_worker_with_structured_result_and_cancel,
     run_advisory_worker_with_structured_result_and_observer, AdvisoryResponseBudget,
-    AdvisoryResponseErrorCode, AdvisoryResponseSource, AdvisoryWorkerSpec, EffortEvidenceSource,
-    ExecutionBudgets, NormalizedWorkerEvent, OutputOverflowKind, WorkerError, WorkerErrorCode,
-    WorkerFilePermissions, WorkerProvider, WorkerRunStatus, DEFAULT_MAX_ADVISORY_RESPONSE_BYTES,
+    AdvisoryResponseErrorCode, AdvisoryResponseSource, AdvisoryStructuredExecution,
+    AdvisoryWorkerSpec, BoundedAdvisoryResponse, EffortEvidenceSource, ExecutionBudgets,
+    NormalizedWorkerEvent, OutputOverflowKind, WorkerError, WorkerErrorCode, WorkerFilePermissions,
+    WorkerProvider, WorkerRunStatus, DEFAULT_MAX_ADVISORY_RESPONSE_BYTES,
     MAX_ADVISORY_RESPONSE_BYTES,
 };
 
@@ -1080,4 +1081,167 @@ exit 0
     assert!(!legacy_obj.contains_key("response"));
     assert!(!legacy_obj.contains_key("response_error"));
     assert!(!legacy_obj.contains_key("prompt"));
+}
+
+#[tokio::test]
+async fn deserialized_response_integrity_and_tamper_resistance_enforces_hash_count_provider_and_budget(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let (_, payload_json) = build_large_sample_payload_for_tamper_test();
+    let result_line = serde_json::json!({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "response": payload_json
+        }
+    })
+    .to_string();
+    let payload_file = temp.path().join("tamper_result.json");
+    fs::write(&payload_file, &result_line).expect("write tamper_result");
+
+    let script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"event":"init","init":{{"session_id":"agy-tamper-1","model":"gemini-4-argon-high"}}}}'
+cat "{}"
+printf '\n'
+exit 0
+"#,
+        payload_file.display()
+    );
+    let fake_agy = write_executable_script(&bin_dir, "fake-agy-tamper", &script);
+
+    let spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::Antigravity,
+        executable: fake_agy,
+        model: "gemini-4-argon-high".to_string(),
+        effort: Some("high".to_string()),
+        allowed_models: BTreeSet::new(),
+        session_id: None,
+        standalone: false,
+        working_directory: workdir,
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "tamper test".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+
+    let frozen_budget_bytes = payload_json.len() + 32;
+    let genuine = run_advisory_worker_with_structured_result(
+        &spec,
+        AdvisoryResponseBudget::new(frozen_budget_bytes),
+    )
+    .await
+    .expect("supervised run");
+
+    // 1. Genuine supervised result round-trips through JSON and validates under frozen budget.
+    let serialized_exec = serde_json::to_string(&genuine).expect("serialize structured execution");
+    let roundtripped: AdvisoryStructuredExecution =
+        serde_json::from_str(&serialized_exec).expect("deserialize structured execution");
+    assert!(roundtripped.has_verified_response());
+    assert!(roundtripped.has_verified_response_within_budget(frozen_budget_bytes));
+    assert!(roundtripped.verified_response().is_some());
+    assert!(roundtripped
+        .verified_response_within_budget(frozen_budget_bytes)
+        .is_some());
+
+    let serialized_resp = serde_json::to_string(roundtripped.verified_response().unwrap())
+        .expect("serialize bounded response");
+    let roundtripped_resp: BoundedAdvisoryResponse =
+        serde_json::from_str(&serialized_resp).expect("deserialize bounded response");
+    roundtripped_resp
+        .validate_integrity(frozen_budget_bytes)
+        .expect("round-tripped response must validate");
+    roundtripped_resp
+        .validate_integrity_with_budget(AdvisoryResponseBudget::new(frozen_budget_bytes))
+        .expect("round-tripped response must validate with budget");
+    assert!(roundtripped_resp.is_valid(frozen_budget_bytes));
+
+    // 2. Per-call byte limit is rechecked when loading persisted artifacts.
+    let tighter_budget = payload_json.len() - 1;
+    assert!(roundtripped_resp
+        .validate_integrity(tighter_budget)
+        .is_err());
+    assert!(!roundtripped_resp.is_valid(tighter_budget));
+    assert!(!roundtripped.has_verified_response_within_budget(tighter_budget));
+    assert!(roundtripped
+        .verified_response_within_budget(tighter_budget)
+        .is_none());
+    assert!(roundtripped_resp.validate_integrity(0).is_err());
+    assert!(roundtripped_resp
+        .validate_integrity(MAX_ADVISORY_RESPONSE_BYTES + 1)
+        .is_err());
+
+    // 3. Tampered `text` (even same-length valid JSON) is rejected by SHA-256 integrity check.
+    let mut tampered_text = roundtripped.clone();
+    let orig_text = tampered_text.response.as_ref().unwrap().text.clone();
+    let altered_text = orig_text.replacen("\"node-01\"", "\"node-99\"", 1);
+    assert_eq!(altered_text.len(), orig_text.len());
+    tampered_text.response.as_mut().unwrap().text = altered_text;
+    // `parse_json` still parses untrusted JSON, but integrity/verified status rejects the tamper!
+    assert!(tampered_text
+        .response
+        .as_ref()
+        .unwrap()
+        .parse_json_object()
+        .is_ok());
+    assert!(!tampered_text.has_verified_response());
+    assert!(tampered_text.verified_response().is_none());
+    assert!(tampered_text
+        .response
+        .as_ref()
+        .unwrap()
+        .validate_integrity(frozen_budget_bytes)
+        .is_err());
+
+    // 4. Tampered `sha256_digest` is rejected.
+    let mut tampered_hash = roundtripped.clone();
+    tampered_hash.response.as_mut().unwrap().sha256_digest = "0".repeat(64);
+    assert!(!tampered_hash.has_verified_response());
+    assert!(tampered_hash.verified_response().is_none());
+
+    // 5. Tampered `byte_count` is rejected.
+    let mut tampered_count = roundtripped.clone();
+    tampered_count.response.as_mut().unwrap().byte_count += 1;
+    assert!(!tampered_count.has_verified_response());
+    assert!(tampered_count.verified_response().is_none());
+
+    // 6. Tampered `response.provider` (or `source` / `framing` mismatch against `execution`) is rejected.
+    let mut tampered_provider = roundtripped.clone();
+    tampered_provider.response.as_mut().unwrap().provider = WorkerProvider::OpenCodeV2;
+    assert!(!tampered_provider.has_verified_response());
+    assert!(tampered_provider.verified_response().is_none());
+
+    let mut tampered_source_and_provider = roundtripped.clone();
+    {
+        let r = tampered_source_and_provider.response.as_mut().unwrap();
+        r.provider = WorkerProvider::OpenCodeV2;
+        r.source = AdvisoryResponseSource::OpenCodeAssistantTextPartStop;
+        r.framing.response_line_number = 2;
+        r.framing.terminal_line_number = 3;
+        r.framing.effort_evidence_source = Some(EffortEvidenceSource::DirectStreamMetadata);
+    }
+    // `r` alone looks like OpenCode, but conflicts with `execution.provider == Antigravity`!
+    assert!(!tampered_source_and_provider.has_verified_response());
+    assert!(tampered_source_and_provider.verified_response().is_none());
+
+    // 7. Tampered `framing.session_id` conflicting with `execution` observed session is rejected.
+    let mut tampered_session = roundtripped;
+    tampered_session
+        .response
+        .as_mut()
+        .unwrap()
+        .framing
+        .session_id = Some("agy-other-session".to_string());
+    assert!(!tampered_session.has_verified_response());
+    assert!(tampered_session.verified_response().is_none());
+}
+
+fn build_large_sample_payload_for_tamper_test() -> (SampleAdvisoryPlanPayload, String) {
+    build_large_sample_plan_payload()
 }

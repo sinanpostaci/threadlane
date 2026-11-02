@@ -179,13 +179,158 @@ impl BoundedAdvisoryResponse {
     /// Deserializes the untrusted JSON response text into `T`.
     ///
     /// Parsing a valid JSON value grants no execution authority and triggers no side effects.
+    /// Callers loading persisted or cached responses must call [`Self::validate_integrity`]
+    /// with their frozen per-call `max_response_bytes` budget to verify framing and digest
+    /// integrity before trusting response metadata.
     pub fn parse_json<T: DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_str(&self.text)
     }
 
     /// Parses the untrusted response text as a top-level JSON object map.
+    ///
+    /// Parsing a valid JSON object grants no execution authority and triggers no side effects.
     pub fn parse_json_object(&self) -> Result<Map<String, Value>, serde_json::Error> {
         serde_json::from_str(&self.text)
+    }
+
+    /// Validates that this response satisfies all byte-budget, SHA-256 digest, complete top-level
+    /// JSON-object, and provider/source/framing coherence invariants under `max_response_bytes`.
+    ///
+    /// Callers reloading persisted or cached private advisory artifacts must pass their exact
+    /// frozen per-call/grant `max_response_bytes` limit here. Even when `Ok(())` is returned,
+    /// `self.text` remains untrusted model data and grants no execution or tool authority.
+    pub fn validate_integrity(&self, max_response_bytes: usize) -> Result<(), WorkerError> {
+        AdvisoryResponseBudget::new(max_response_bytes).validate()?;
+
+        let actual_bytes = self.text.len();
+        if actual_bytes == 0 || self.text.trim().is_empty() {
+            return Err(WorkerError::InvalidSpec(
+                "advisory response text must not be empty".to_string(),
+            ));
+        }
+        if self.byte_count != actual_bytes {
+            return Err(WorkerError::InvalidSpec(format!(
+                "advisory response byte_count ({}) does not match actual UTF-8 byte length ({actual_bytes})",
+                self.byte_count
+            )));
+        }
+        if actual_bytes > max_response_bytes {
+            return Err(WorkerError::InvalidSpec(format!(
+                "advisory response byte length ({actual_bytes}) exceeds max_response_bytes ({max_response_bytes})"
+            )));
+        }
+
+        if self.sha256_digest.len() != 64
+            || !self
+                .sha256_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(WorkerError::InvalidSpec(
+                "advisory response sha256_digest must be a 64-character lowercase hex SHA-256 digest"
+                    .to_string(),
+            ));
+        }
+        let computed_sha256 = compute_sha256_hex(self.text.as_bytes());
+        if self.sha256_digest != computed_sha256 {
+            return Err(WorkerError::InvalidSpec(format!(
+                "advisory response sha256_digest ({}) does not match computed SHA-256 ({computed_sha256})",
+                self.sha256_digest
+            )));
+        }
+
+        validate_structured_json_object(&self.text, self.framing.response_line_number).map_err(
+            |err| WorkerError::InvalidSpec(format!("advisory response invalid JSON object: {err}")),
+        )?;
+
+        if self.framing.response_line_number == 0
+            || self.framing.terminal_line_number == 0
+            || self.framing.terminal_line_number < self.framing.response_line_number
+        {
+            return Err(WorkerError::InvalidSpec(format!(
+                "advisory response framing line numbers are invalid (response_line_number={}, terminal_line_number={})",
+                self.framing.response_line_number, self.framing.terminal_line_number
+            )));
+        }
+
+        for (field_name, id_opt) in [
+            ("session_id", self.framing.session_id.as_deref()),
+            ("message_id", self.framing.message_id.as_deref()),
+            ("part_id", self.framing.part_id.as_deref()),
+        ] {
+            if let Some(id_val) = id_opt {
+                if !is_safe_stream_id(id_val) {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "advisory response framing `{field_name}` is malformed or exceeds bounds"
+                    )));
+                }
+            }
+        }
+
+        match self.provider {
+            WorkerProvider::Antigravity => {
+                if self.source != AdvisoryResponseSource::AntigravityFinalResultResponse {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "Antigravity advisory response has incompatible source `{}`",
+                        self.source.as_str()
+                    )));
+                }
+                if self.framing.response_line_number < 2
+                    || self.framing.response_line_number != self.framing.terminal_line_number
+                {
+                    return Err(WorkerError::InvalidSpec(
+                        "Antigravity advisory response framing requires response_line_number == terminal_line_number >= 2"
+                            .to_string(),
+                    ));
+                }
+                if self.framing.message_id.is_some() || self.framing.part_id.is_some() {
+                    return Err(WorkerError::InvalidSpec(
+                        "Antigravity advisory response framing must not carry OpenCode message_id or part_id"
+                            .to_string(),
+                    ));
+                }
+            }
+            WorkerProvider::OpenCodeV2 => {
+                if self.source != AdvisoryResponseSource::OpenCodeAssistantTextPartStop {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "OpenCode v2 advisory response has incompatible source `{}`",
+                        self.source.as_str()
+                    )));
+                }
+                if self.framing.response_line_number < 2
+                    || self.framing.terminal_line_number <= self.framing.response_line_number
+                {
+                    return Err(WorkerError::InvalidSpec(
+                        "OpenCode v2 advisory response framing requires 2 <= response_line_number < terminal_line_number"
+                            .to_string(),
+                    ));
+                }
+                if self.framing.effort_evidence_source
+                    == Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
+                {
+                    return Err(WorkerError::InvalidSpec(
+                        "OpenCode v2 advisory response framing cannot use AntigravityCatalogModelVariant effort source"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates response integrity against an explicit [`AdvisoryResponseBudget`].
+    pub fn validate_integrity_with_budget(
+        &self,
+        budget: AdvisoryResponseBudget,
+    ) -> Result<(), WorkerError> {
+        self.validate_integrity(budget.max_response_bytes)
+    }
+
+    /// Returns `true` if [`Self::validate_integrity`] succeeds for `max_response_bytes`.
+    #[must_use]
+    pub fn is_valid(&self, max_response_bytes: usize) -> bool {
+        self.validate_integrity(max_response_bytes).is_ok()
     }
 }
 
@@ -333,23 +478,138 @@ pub struct AdvisoryStructuredExecution {
 }
 
 impl AdvisoryStructuredExecution {
+    /// Validates that `execution` succeeded with complete natural completion evidence,
+    /// `response_error` is `None`, and `response` passes [`BoundedAdvisoryResponse::validate_integrity`]
+    /// under `max_response_bytes` while remaining coherent with `execution` (provider, line bounds,
+    /// effort evidence source, session binding, and OpenCode metadata).
+    ///
+    /// Callers reloading persisted or cached private advisory artifacts must pass their exact
+    /// frozen per-call/grant `max_response_bytes` limit here.
+    pub fn validate_verified_response(
+        &self,
+        max_response_bytes: usize,
+    ) -> Result<&BoundedAdvisoryResponse, WorkerError> {
+        if self.execution.status != WorkerRunStatus::Succeeded
+            || !self.execution.has_complete_natural_completion_evidence()
+        {
+            return Err(WorkerError::InvalidSpec(
+                "advisory execution does not have complete natural completion evidence".to_string(),
+            ));
+        }
+        if self.response_error.is_some() {
+            return Err(WorkerError::InvalidSpec(
+                "advisory execution carries a response_error alongside response".to_string(),
+            ));
+        }
+        let Some(ref response) = self.response else {
+            return Err(WorkerError::InvalidSpec(
+                "advisory execution is missing a captured response".to_string(),
+            ));
+        };
+
+        response.validate_integrity(max_response_bytes)?;
+
+        if response.provider != self.execution.provider {
+            return Err(WorkerError::InvalidSpec(format!(
+                "advisory response provider ({}) does not match execution.provider ({})",
+                response.provider.as_str(),
+                self.execution.provider.as_str()
+            )));
+        }
+        if response.framing.terminal_line_number > self.execution.evidence.total_lines {
+            return Err(WorkerError::InvalidSpec(format!(
+                "advisory response terminal_line_number ({}) exceeds execution total_lines ({})",
+                response.framing.terminal_line_number, self.execution.evidence.total_lines
+            )));
+        }
+        if response.framing.effort_evidence_source != self.execution.evidence.effort_evidence_source
+        {
+            return Err(WorkerError::InvalidSpec(
+                "advisory response effort_evidence_source does not match execution evidence"
+                    .to_string(),
+            ));
+        }
+
+        let expected_sid = self
+            .execution
+            .allocated_session_id
+            .as_deref()
+            .or(self.execution.requested_session_id.as_deref())
+            .or(self.execution.evidence.observed_session_id.as_deref());
+        if let Some(exp_sid) = expected_sid {
+            if response.framing.session_id.as_deref() != Some(exp_sid) {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "advisory response framing session_id ({:?}) does not match execution session ({exp_sid})",
+                    response.framing.session_id
+                )));
+            }
+        }
+
+        if self.execution.provider == WorkerProvider::OpenCodeV2 {
+            if self.execution.requested_session_id.is_none()
+                && self.execution.validated_opencode_metadata().is_none()
+            {
+                return Err(WorkerError::InvalidSpec(
+                    "owned OpenCode v2 advisory execution lacks validated session metadata"
+                        .to_string(),
+                ));
+            }
+            if let Some(meta) = self.execution.validated_opencode_metadata() {
+                if let Some(ref msg_id) = response.framing.message_id {
+                    if msg_id != &meta.terminal_message_id {
+                        return Err(WorkerError::InvalidSpec(format!(
+                            "advisory response framing message_id (`{msg_id}`) conflicts with OpenCode terminal_message_id (`{}`)",
+                            meta.terminal_message_id
+                        )));
+                    }
+                }
+            }
+        }
+
+        Ok(response)
+    }
+
     /// Returns `true` only when the worker execution succeeded with complete evidence and
-    /// produced a verified [`BoundedAdvisoryResponse`] with no `response_error`.
+    /// produced a [`BoundedAdvisoryResponse`] that passes full integrity and execution-coherence
+    /// validation within `max_response_bytes`.
+    #[must_use]
+    pub fn has_verified_response_within_budget(&self, max_response_bytes: usize) -> bool {
+        self.validate_verified_response(max_response_bytes).is_ok()
+    }
+
+    /// Returns a reference to the verified [`BoundedAdvisoryResponse`] if and only if
+    /// [`Self::validate_verified_response`] succeeds for `max_response_bytes`.
+    #[must_use]
+    pub fn verified_response_within_budget(
+        &self,
+        max_response_bytes: usize,
+    ) -> Option<&BoundedAdvisoryResponse> {
+        self.validate_verified_response(max_response_bytes).ok()
+    }
+
+    /// Returns `true` only when the worker execution succeeded with complete evidence and
+    /// produced a [`BoundedAdvisoryResponse`] that passes full integrity and execution-coherence
+    /// validation under [`MAX_ADVISORY_RESPONSE_BYTES`].
+    ///
+    /// Note: When reloading persisted or cached private advisory artifacts, callers must also
+    /// reapply their exact frozen per-call/grant byte limit via
+    /// [`Self::validate_verified_response`] or [`BoundedAdvisoryResponse::validate_integrity`].
     #[must_use]
     pub fn has_verified_response(&self) -> bool {
-        self.execution.status == WorkerRunStatus::Succeeded
-            && self.execution.has_complete_natural_completion_evidence()
-            && self.response.is_some()
-            && self.response_error.is_none()
+        self.validate_verified_response(MAX_ADVISORY_RESPONSE_BYTES)
+            .is_ok()
     }
 
     /// Returns a reference to the verified [`BoundedAdvisoryResponse`] if and only if
     /// [`Self::has_verified_response`] is `true`.
+    ///
+    /// Note: When reloading persisted or cached private advisory artifacts, callers must also
+    /// reapply their exact frozen per-call/grant byte limit via
+    /// [`Self::validate_verified_response`] or [`BoundedAdvisoryResponse::validate_integrity`].
     #[must_use]
     pub fn verified_response(&self) -> Option<&BoundedAdvisoryResponse> {
-        self.has_verified_response()
-            .then_some(self.response.as_ref())
-            .flatten()
+        self.validate_verified_response(MAX_ADVISORY_RESPONSE_BYTES)
+            .ok()
     }
 }
 
