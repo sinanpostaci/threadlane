@@ -278,6 +278,13 @@ impl From<WorkerError> for OperationsError {
     fn from(err: WorkerError) -> Self {
         match err {
             WorkerError::UnsupportedPlatform(msg) => Self::UnsupportedPlatform(msg),
+            WorkerError::UnsupportedCapability {
+                provider,
+                capability,
+                reason,
+            } => Self::InvalidInput(format!(
+                "unsupported capability `{capability}` for provider `{provider}`: {reason}"
+            )),
             WorkerError::InvalidSpec(msg) => Self::InvalidInput(msg),
             WorkerError::DisallowedModel { model } => {
                 Self::InvalidInput(format!("disallowed model `{model}`"))
@@ -313,5 +320,33 @@ impl From<WorkerError> for OperationsError {
             WorkerError::Io(io_err) => Self::Io(io_err),
             WorkerError::Json(json_err) => Self::Json(json_err),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_worker_unsupported_capability_maps_to_invalid_input_with_details() {
+        let worker_err = WorkerError::UnsupportedCapability {
+            provider: "antigravity".to_string(),
+            capability: "permission_mode.readonly_research".to_string(),
+            reason: "provider CLI lacks a dedicated read-only flag".to_string(),
+        };
+
+        let ops_err = OperationsError::from(worker_err);
+        assert_eq!(ops_err.error_code(), OperationsErrorCode::InvalidInput);
+        assert_eq!(ops_err.code(), "invalid_input");
+
+        let api_err = ops_err.to_api_error();
+        assert_eq!(api_err.code, OperationsErrorCode::InvalidInput);
+        assert_eq!(api_err.cleanup_refusal_reason, None);
+
+        let expected = "invalid input: unsupported capability \
+            `permission_mode.readonly_research` for provider `antigravity`: \
+            provider CLI lacks a dedicated read-only flag";
+        assert_eq!(ops_err.to_string(), expected);
+        assert_eq!(api_err.message, expected);
     }
 }
