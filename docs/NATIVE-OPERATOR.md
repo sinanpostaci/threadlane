@@ -16,7 +16,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-01.v1`).
+fetch the same shared guide and version (`2026-11-02.v1`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -25,6 +25,18 @@ on the trusted-local CLI route) and then refresh live scoped state and revisions
 (`status`, `list-plans` / `get-plan`, `session` / `task`) without a polling loop.
 
 ## Setup and planning
+
+On the managed Linux Codex desktop route, call the no-argument
+`connect_current_chat` MCP tool on first use, then `operating_guide`. It verifies
+the current MCP process's parent against the existing private desktop endpoint,
+cross-checks the request's thread hint against that thread's connection identity,
+and reuses or creates the durable binding. It may start the baseline control
+supervisor with no workers or notifications; approved hosts are not resumed.
+Later scoped MCP calls must carry the same host-provided thread ID. Missing or
+conflicting IDs are refused. This local route trusts the OS user and verified
+parent app-server; it does not claim cryptographic per-call identity. The CLI
+operator path below remains available for unsupported hosts. Automatic binding
+does not grant task execution approval.
 
 The Nix `threadlane` package includes the workflow, flow, session and authority
 operator binaries. Use existing,
@@ -35,7 +47,14 @@ package and target binding/thread. Preserve profiles and keep context outside Gi
 Start `threadlane serve --state-dir /private/runtime` explicitly, without
 worker profiles or notifications. Obtain a UUID from trusted native metadata,
 then `threadlane bind --state-dir ... --thread ... --label ...`; retain its actual
-returned binding. A title, working directory or worker claim is not identity proof.
+returned binding. For idempotent trusted-operator binding resolution after
+separate native identity validation, `SupervisorClient::get_or_create_binding`
+(`POST /v1/bindings/get-or-create`) returns an existing single binding unchanged
+(`created: false`), inserts a new binding and wake-up record when none exists
+(`created: true`), or fails closed with `ambiguous_thread_binding` if multiple
+bindings already exist for that thread UUID; it is never exposed over scoped MCP
+and does not perform automatic pairing. A title, working directory or worker
+claim is not identity proof.
 
 ```sh
 threadlane-workflow \

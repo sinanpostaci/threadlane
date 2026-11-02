@@ -15,10 +15,11 @@ over the documented public `codex app-server proxy` stdio interface.
     (`detail: "toolsAndAuthOnly"`).
   - `mcpServer/tool/call` scoped to `threadId` and `server: "threadlane"` for
     `connection_identity` and (when `--verify-status` is passed) read-only `status`.
-- **No conversation or state mutation**: Never reads turns or transcripts, never
+- **No conversation or work execution mutation**: Never reads turns or transcripts, never
   calls `thread/resume`, never starts a second app-server, never sends user
   messages or `turn/start` / `turn/steer` / `queue`, and never calls worker,
-  demo, or event-acknowledgement tools.
+  demo, or event-acknowledgement tools. The explicit `pair-check` mode does create
+  test bindings and enrolls connection epochs; `inspect` remains read-only.
 - **No secret or transcript disclosure**: Never prints `operator.token`,
   `connection_nonce`, `epoch_id`, raw MCP payloads, chat titles (`name`),
   `sessionId`, or conversation previews to `stdout`, `stderr`, or `Debug` output.
@@ -26,6 +27,49 @@ over the documented public `codex app-server proxy` stdio interface.
   `status` probes never mark `restart_persistence_gate`, `busy_turn_delivery_gate`,
   or `overall_live_gate` as verified; those remain `needs_verification` until an
   explicitly authorized live host experiment.
+- **Optional read-only managed WebSocket transport (`NativeClient`)**: On Linux,
+  `NativeClient::new_managed_websocket` (or `with_managed_websocket`) accepts an
+  explicit `threadlane::NativeReconnectConfig` (`0700` `descriptor_root` plus
+  canonical `backend_executable` and `application_executable`), verifies `/proc`
+  process ancestry, private socket identity, and `SO_PEERCRED`, and enforces a
+  strict read-only JSON-RPC allowlist (`thread/loaded/list`, `thread/list` without `projectId`,
+  `thread/read` with `includeTurns: false`, `mcpServerStatus/list` with
+  `detail: "toolsAndAuthOnly"`, and `mcpServer/tool/call` only for server
+  `threadlane`, tool `connection_identity`, and `{}` arguments). Observing a
+  matching nonce/epoch or distinct server PIDs across read-only probes does not
+  by itself prove general two-chat per-call isolation, which remains a separate
+  verification gate.
+
+The paired server advertises session-handshake MCP protocol versions through
+2025-11-25, rather than the newer stateless version. Its connection-epoch
+binding is process-scoped and does not yet authenticate the origin of every
+individual tool call. On the tested Codex desktop version, a loaded v2
+subagent was listed but rejected direct `mcpServer/tool/call`; its direct MCP
+call used a different process. This is an observation, not a general guarantee.
+
+On 2026-11-02, an ephemeral local CLI session using the bundled
+`codex-cli 0.166.0-alpha.5.1` called a disposable read-only MCP tool. The
+call's `_meta.threadId` matched that session's `thread.started` ID. This
+establishes the field for that CLI test only, not for desktop, other versions,
+or other platforms. Direct app-server callers can supply `_meta`, so it is an
+untrusted hint, never enrollment authority. The read-only
+`verify_thread_hint_candidate` helper cross-checks a hint against a thread-scoped
+connection and rereads it, but does not establish exclusive ownership or
+authenticate later calls. It does not perform enrollment.
+In a separate read-only Linux desktop check, the same candidate helper matched
+the current chat to its existing MCP process; no other chat was changed and
+no enrollment or work dispatch occurred.
+
+The separate `connect_current_chat` tool composes this check with managed-parent
+endpoint discovery, baseline runtime readiness, idempotent binding resolution,
+and private-store enrollment. It is available on the managed Linux desktop route
+only. Later scoped calls require a matching host-provided thread ID. Its trust
+boundary is the local OS user and the verified parent app-server; a same-user
+process with direct access to that private socket or private state is not an
+untrusted remote caller. Results continue to report
+`native_per_call_identity_verified: false`. The complete automatic desktop path
+still needs an installed-package acceptance test; read-only probes alone do not
+establish that gate or macOS/Windows support.
 
 ## CLI Modes
 

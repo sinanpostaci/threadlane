@@ -38,8 +38,10 @@ name = "threadlane-codex-setup"
 path = "src/bin/threadlane-codex-setup.rs"
 
 [dependencies]
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
+futures-util = { version = "0.3", features = ["sink"] }
 libc = "0.2"
 rmcp = { version = "=3.8.0", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = "1.0"
@@ -55,6 +57,7 @@ threadlane-host = { path = "../threadlane-host" }
 threadlane-workers = { path = "../threadlane-workers" }
 threadlane-workflow = { path = "../threadlane-workflow" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake"] }
 toml_edit = "0.25.17"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 

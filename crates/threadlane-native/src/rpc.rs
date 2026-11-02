@@ -202,6 +202,40 @@ pub fn build_proxy_args(socket: Option<&Path>) -> Vec<OsString> {
     args
 }
 
+/// Builds the standard `initialize` JSON-RPC request frame (`id = 1`, `experimentalApi: false`).
+pub(crate) fn build_initialize_request() -> Value {
+    json!({
+        "id": 1u64,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "threadlane",
+                "title": "Threadlane",
+                "version": "0.1.0"
+            },
+            "capabilities": {
+                "experimentalApi": false
+            }
+        }
+    })
+}
+
+/// Builds the standard `initialized` JSON-RPC notification frame.
+pub(crate) fn build_initialized_notification() -> Value {
+    json!({
+        "method": "initialized"
+    })
+}
+
+/// Builds a numbered JSON-RPC request frame (`id`, `method`, `params`).
+pub(crate) fn build_rpc_request(id: u64, method: &str, params: Value) -> Value {
+    json!({
+        "id": id,
+        "method": method,
+        "params": params
+    })
+}
+
 /// Detailed failure classification from a proxy JSON-RPC call, distinguishing whether
 /// the target request frame had already been written to the proxy transport.
 #[derive(Debug, Clone)]
@@ -488,20 +522,7 @@ where
 
     let exchange_res = tokio::time::timeout(timeout, async {
         // 1. Send `initialize` request (id = 1, omitting `jsonrpc` per verified proxy schema).
-        let init_req = json!({
-            "id": 1u64,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "threadlane",
-                    "title": "Threadlane",
-                    "version": "0.1.0"
-                },
-                "capabilities": {
-                    "experimentalApi": false
-                }
-            }
-        });
+        let init_req = build_initialize_request();
         write_frame(&mut stdin, &init_req).await?;
 
         // 2. Await `initialize` response (id = 1).
@@ -517,17 +538,11 @@ where
         })?;
 
         // 3. Send `initialized` notification.
-        let initialized_notif = json!({
-            "method": "initialized"
-        });
+        let initialized_notif = build_initialized_notification();
         write_frame(&mut stdin, &initialized_notif).await?;
 
         // 4. Send target request (id = 2).
-        let rpc_req = json!({
-            "id": 2u64,
-            "method": method,
-            "params": params
-        });
+        let rpc_req = build_rpc_request(2, method, params);
         let mut line = serde_json::to_vec(&rpc_req).map_err(|err| {
             NativeError::new(
                 NativeErrorCode::ProtocolError,

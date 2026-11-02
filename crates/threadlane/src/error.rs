@@ -16,6 +16,8 @@ pub enum ErrorCode {
     IncompatibleSchemaVersion,
     /// The specified `binding_id` does not exist.
     BindingNotFound,
+    /// Multiple pre-existing bindings match `thread_uuid`, making idempotent binding resolution ambiguous.
+    AmbiguousThreadBinding,
     /// The specified `run_id` does not exist within the configured binding scope.
     RunNotFound,
     /// The specified `question_id` does not exist for `(binding_id, run_id)`.
@@ -135,6 +137,22 @@ impl ApiError {
                     ErrorCode::BindingNotFound,
                     message,
                     json!({ "binding_id": binding_id }),
+                ),
+            ),
+            CoreError::AmbiguousThreadBinding {
+                thread_uuid,
+                match_count,
+                binding_ids,
+            } => (
+                StatusCode::CONFLICT,
+                Self::with_details(
+                    ErrorCode::AmbiguousThreadBinding,
+                    message,
+                    json!({
+                        "thread_uuid": thread_uuid,
+                        "match_count": match_count,
+                        "binding_ids": binding_ids,
+                    }),
                 ),
             ),
             CoreError::RunNotFound { binding_id, run_id } => (

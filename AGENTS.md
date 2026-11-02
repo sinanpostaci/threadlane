@@ -45,8 +45,11 @@ current milestone contract before editing.
 
 ## Native conversation workflow
 
-- Respect paired MCP bootstrap: only `connection_identity` is available before
-  trusted enrollment. Once allowed, on connection/resume or context uncertainty,
+- Respect paired MCP bootstrap: call `connect_current_chat` with `{}` on the
+  managed Linux desktop route. It must independently verify the parent backend
+  and thread-scoped MCP connection; metadata alone grants no authority. If the
+  route is unavailable, report its error and use only `connection_identity` for
+  diagnostics until a trusted operator connects it. Once connected, on resume or context uncertainty,
   fetch the shared operating guide (`operating_guide` over MCP or offline `threadlane guide`
   on the trusted-local CLI route; canonical source `docs/MCP-OPERATING-GUIDE.md`),
   then refresh live scoped state and revisions (`status`, `get_plan`,

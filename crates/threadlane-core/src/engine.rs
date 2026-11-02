@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -19,9 +19,10 @@ use crate::limits::{
 };
 use crate::types::{
     AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
-    EventPayload, Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run,
-    RunListPage, RunRevision, RunStatus, RunSummary, RuntimeIdleInspection, TickReport,
-    WakeupClaim, WakeupNotice, WakeupOutcome, WakeupRetryRecord, WakeupStatus,
+    EventPayload, GetOrCreateBindingOutcome, Question, QuestionHistoryPage, QuestionStatus,
+    RevisionHistoryPage, Run, RunListPage, RunRevision, RunStatus, RunSummary,
+    RuntimeIdleInspection, TickReport, WakeupClaim, WakeupNotice, WakeupOutcome, WakeupRetryRecord,
+    WakeupStatus,
 };
 use crate::worker::WorkerSnapshot;
 
@@ -87,6 +88,102 @@ impl Core {
         let binding = Self::load_binding_tx(&tx, &binding_id)?;
         tx.commit()?;
         Ok(binding)
+    }
+
+    /// Idempotently fetches an existing single trusted binding or creates a new one for a
+    /// validated canonical native Codex `thread_uuid` and human-readable `label`.
+    ///
+    /// Executes inside an immediate SQLite transaction (`BEGIN IMMEDIATE`):
+    /// - Validates `validated_thread_uuid` (requiring canonical lowercase hyphenated non-nil UUID
+    ///   format) and `label` on every call, including when a matching binding already exists.
+    /// - If no binding exists for `thread_uuid`, inserts a new [`Binding`] and `Idle` wake-up
+    ///   record once and returns [`GetOrCreateBindingOutcome`] with `created = true`.
+    /// - If exactly one binding exists for `thread_uuid`, returns it completely unchanged
+    ///   (preserving `binding_id`, `label`, `delivered_seq`, `acked_seq`, runs, events, and
+    ///   wake-up state) with `created = false`.
+    /// - If two or more pre-existing bindings match `thread_uuid`, returns
+    ///   [`CoreError::AmbiguousThreadBinding`] without modifying any records.
+    pub fn get_or_create_binding(
+        &mut self,
+        validated_thread_uuid: &str,
+        label: &str,
+    ) -> Result<GetOrCreateBindingOutcome, CoreError> {
+        let thread_uuid = validate_canonical_thread_uuid_input(validated_thread_uuid)?;
+        let clean_label = validate_label(label)?;
+
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut existing: Vec<Binding> = {
+            let mut stmt = tx.prepare(
+                "SELECT binding_id, thread_uuid, label, delivered_seq, acked_seq
+                 FROM bindings
+                 WHERE thread_uuid = ?1
+                 ORDER BY rowid ASC",
+            )?;
+            let mut rows = stmt.query(params![&thread_uuid])?;
+            let mut matches = Vec::new();
+            while let Some(row) = rows.next()? {
+                matches.push(Binding {
+                    binding_id: row.get(0)?,
+                    thread_uuid: row.get(1)?,
+                    label: row.get(2)?,
+                    delivered_seq: i64_to_u64("delivered_seq", row.get(3)?)?,
+                    acked_seq: i64_to_u64("acked_seq", row.get(4)?)?,
+                });
+            }
+            matches
+        };
+
+        match existing.len() {
+            0 => {
+                let binding_id = generate_id("bnd");
+                tx.execute(
+                    "INSERT INTO bindings (binding_id, thread_uuid, label, delivered_seq, acked_seq, next_event_seq)
+                     VALUES (?1, ?2, ?3, 0, 0, 1)",
+                    params![binding_id, thread_uuid, clean_label],
+                )?;
+                tx.execute(
+                    "INSERT INTO wakeups (
+                        binding_id, thread_uuid, status, claim_id, pending_since_seq,
+                        latest_important_seq, covered_up_to_seq, coalesced_count, attempt_count,
+                        last_error, claimed_at_ms, resolved_at_ms
+                     ) VALUES (?1, ?2, ?3, NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL)",
+                    params![binding_id, thread_uuid, WakeupStatus::Idle.as_str()],
+                )?;
+                let binding = Self::load_binding_tx(&tx, &binding_id)?;
+                tx.commit()?;
+                Ok(GetOrCreateBindingOutcome {
+                    binding,
+                    created: true,
+                })
+            }
+            1 => {
+                let binding = existing.pop().expect("single matching binding");
+                tx.commit()?;
+                Ok(GetOrCreateBindingOutcome {
+                    binding,
+                    created: false,
+                })
+            }
+            match_count => {
+                let binding_ids = existing.into_iter().map(|b| b.binding_id).collect();
+                Err(CoreError::AmbiguousThreadBinding {
+                    thread_uuid,
+                    match_count,
+                    binding_ids,
+                })
+            }
+        }
+    }
+
+    /// Alias for [`Core::get_or_create_binding`].
+    pub fn ensure_binding(
+        &mut self,
+        validated_thread_uuid: &str,
+        label: &str,
+    ) -> Result<GetOrCreateBindingOutcome, CoreError> {
+        self.get_or_create_binding(validated_thread_uuid, label)
     }
 
     /// Fetches a configured [`Binding`] by its `binding_id`.
@@ -3694,6 +3791,17 @@ pub(crate) fn enforce_compact_response_budget(output: &CommandOutput) -> Result<
         });
     }
     Ok(json)
+}
+
+pub(crate) fn validate_canonical_thread_uuid_input(raw: &str) -> Result<String, CoreError> {
+    let canonical = validate_thread_uuid(raw)?;
+    if raw != canonical {
+        return Err(CoreError::Validation {
+            field: "thread_uuid",
+            reason: "thread_uuid must be in canonical lowercase hyphenated UUID format".to_string(),
+        });
+    }
+    Ok(canonical)
 }
 
 pub(crate) fn generate_id(prefix: &str) -> String {

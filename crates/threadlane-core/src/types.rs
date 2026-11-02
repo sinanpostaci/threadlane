@@ -17,6 +17,22 @@ pub struct Binding {
     pub acked_seq: u64,
 }
 
+/// Outcome of an idempotent trusted local operator get-or-create binding operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetOrCreateBindingOutcome {
+    /// Existing or newly created [`Binding`] for the validated canonical `thread_uuid`.
+    pub binding: Binding,
+    /// `true` if a new binding and wake-up record were inserted; `false` if an existing single binding was returned unchanged.
+    pub created: bool,
+}
+
+/// Type alias for [`GetOrCreateBindingOutcome`].
+pub type EnsureBindingOutcome = GetOrCreateBindingOutcome;
+
+/// Type alias for [`GetOrCreateBindingOutcome`].
+pub type IdempotentBindingOutcome = GetOrCreateBindingOutcome;
+
 /// Lifecycle state of a deterministic demo or worker-backed run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

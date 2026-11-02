@@ -25,10 +25,13 @@
 
 /// Sealed approved-task MCP bridge parameters, response envelopes, and host/authority helpers.
 pub mod approved_mcp;
+mod auto_pair;
 /// Public `codex app-server proxy` client and native thread metadata types.
 pub mod client;
 /// Safe startup and CLI registration helper for `mcp_servers.threadlane` in Codex `config.toml`.
 pub mod codex_setup;
+/// Opt-in local operator helper for the Threadlane control-plane supervisor.
+pub mod control_runtime;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
 /// Shared conversation-change advancement guard for direct native task dispatch.
@@ -39,6 +42,8 @@ pub mod error;
 pub mod fs_safety;
 /// Validated operator launcher policy, CLI flags, and initial fresh-only host auto-start coordinator.
 pub mod host_launcher;
+/// Bounded read-only matching of native MCP connections to loaded chats.
+pub mod identity_matcher;
 /// Paired MCP stdio server delegating to [`threadlane::ThreadlaneMcpServer`] after enrollment.
 pub mod mcp_pair;
 /// Common validation, live-binding verification, and bounded I/O helpers for trusted local operator CLIs.
@@ -53,6 +58,8 @@ pub mod role_flow;
 pub mod rpc;
 /// Durable `Pending`/`Submitted`/`Unknown`/`Received` busy-turn wake-up store and `turn/steer` builder.
 pub mod wakeup;
+/// Read-only managed Unix WebSocket JSON-RPC transport and allowlist validator.
+pub mod ws_rpc;
 
 pub use approved_mcp::{
     open_host_stores, open_host_stores_with_known_dirs, ApprovalSummaryPage,
@@ -65,8 +72,9 @@ pub use approved_mcp::{
     MAX_APPROVED_EVENT_BATCH_LIMIT,
 };
 pub use client::{
-    NativeClient, NativeConfig, NativeDiagnosticReport, NativeMcpServerStatus,
-    NativeMcpToolCallResult, NativeThread, NativeThreadPage,
+    NativeClient, NativeConfig, NativeDiagnosticReport, NativeLoadedThreadPage,
+    NativeMcpServerStatus, NativeMcpToolCallResult, NativeThread, NativeThreadPage,
+    NativeTransport,
 };
 pub use codex_setup::{
     apply_codex_mcp_setup, build_desired_mcp_args, check_codex_mcp_setup, resolve_codex_home,
@@ -77,6 +85,15 @@ pub use codex_setup::{
     CodexSetupState, CODEX_CONFIG_FILENAME, CODEX_SETUP_LOCK_FILENAME,
     CODEX_SETUP_RECEIPT_FILENAME, DEFAULT_NATIVE_MCP_EXECUTABLE_NAME, MAX_SETUP_PATH_BYTES,
     MAX_SETUP_RECEIPT_BYTES, THREADLANE_CLI_XDG_STATE_HOME_ENV,
+};
+pub use control_runtime::{
+    build_control_runtime_serve_args, ensure_control_runtime,
+    validate_control_runtime_executable_path, validate_control_runtime_state_dir,
+    validate_control_runtime_timeout, ControlRuntimeEnsureOutcome, ControlRuntimeEnsureStatus,
+    ControlRuntimeError, ControlRuntimeErrorCode, ControlRuntimePolicy,
+    CONTROL_RUNTIME_IN_FLIGHT_RECOVERY_POLICY, CONTROL_RUNTIME_LIFETIME_POLICY,
+    CONTROL_RUNTIME_POLL_INTERVAL, DEFAULT_CONTROL_RUNTIME_STARTUP_TIMEOUT,
+    MAX_CONTROL_RUNTIME_STARTUP_TIMEOUT, MIN_CONTROL_RUNTIME_STARTUP_TIMEOUT,
 };
 pub use conversation_change::{
     acquire_conversation_advancement_guard, inspect_unresolved_blocking_changes,
@@ -103,6 +120,15 @@ pub use host_launcher::{
     validate_host_executable_path, ApprovedHostLauncherPolicy, HostLauncherPolicy, NativeMcpCli,
     APPROVED_HOST_STARTUP_POLL_INTERVAL, APPROVED_HOST_STARTUP_TIMEOUT,
     DEFAULT_HOST_EXECUTABLE_NAME,
+};
+pub use identity_matcher::{
+    encode_connection_identity_tool_result, match_native_thread_identity,
+    match_native_thread_identity_with_budget, validate_canonical_project_cwd,
+    verify_thread_hint_candidate, IdentityMatchBudget, IdentityMatchError, IdentityMatchErrorKind,
+    MatchedThreadCandidate, NativeIdentityMatcher, NativeIdentityProbeClient,
+    DEFAULT_MATCH_TIMEOUT, DEFAULT_MAX_MATCH_CANDIDATES, DEFAULT_MAX_MATCH_PAGES,
+    DEFAULT_MAX_PROBED_CANDIDATES, MAX_MATCH_CANDIDATES_LIMIT, MAX_MATCH_PAGES_LIMIT,
+    MAX_MATCH_TIMEOUT, MAX_PROBED_CANDIDATES_LIMIT,
 };
 pub use mcp_pair::{
     open_workflow_stores, CatalogParams, ConnectionIdentityParams, DraftTaskParams, GetPlanParams,
@@ -133,6 +159,7 @@ pub use role_flow::{
 pub use rpc::{
     build_proxy_args, is_process_alive, is_process_group_alive, InitializeResult, ProxyCallError,
     DEFAULT_PROXY_TIMEOUT, MAX_RPC_FRAME_BYTES, MAX_RPC_STDERR_BYTES, MAX_RPC_TOTAL_STDOUT_BYTES,
+    MAX_SKIPPED_NOTIFICATIONS,
 };
 pub use threadlane_authority::{
     ApprovalRecord, ApprovalSummary, AuthorityError, AuthorityStore, MaterializedPlan,
@@ -154,6 +181,10 @@ pub use threadlane_workflow::{
 pub use wakeup::{
     build_native_queue_fallback_args, build_turn_steer_params, NativeWakeupRecord,
     NativeWakeupStatus, NativeWakeupStore,
+};
+pub use ws_rpc::{
+    execute_ws_rpc, validate_ws_readonly_request, ALLOWED_WS_READONLY_METHODS,
+    MAX_WS_AGGREGATE_NOTIFICATION_BYTES,
 };
 
 #[cfg(test)]
@@ -899,9 +930,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Verify capability count: `connection_identity` + 16 delegated runtime tools (including `operating_guide`) + 5 workflow tools + 8 approved-task tools = 30 tools.
+        // Two connection tools, sixteen runtime tools, five workflow tools and eight approved-task tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 30, "PairedMcpServer must expose 30 tools");
+        assert_eq!(tools.len(), 31, "PairedMcpServer must expose 31 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1236,7 +1267,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 30);
+        assert_eq!(tools.len(), 31);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),
@@ -2380,8 +2411,8 @@ fi
             .find("First action")
             .expect("paired instructions must contain First action in first 512 chars");
         let identity_idx = paired_prefix
-            .find("connection_identity")
-            .expect("paired instructions must contain connection_identity in first 512 chars");
+            .find("connect_current_chat")
+            .expect("paired instructions must contain connect_current_chat in first 512 chars");
         let guide_idx = paired_prefix
             .find(OPERATING_GUIDE_TOOL)
             .expect("paired instructions must contain operating_guide in first 512 chars");

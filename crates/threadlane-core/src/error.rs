@@ -55,6 +55,20 @@ pub enum CoreError {
         binding_id: String,
     },
 
+    /// Multiple pre-existing bindings match `thread_uuid`, making idempotent binding resolution ambiguous.
+    #[error(
+        "ambiguous binding for thread `{thread_uuid}`: found {match_count} existing bindings ({})",
+        binding_ids.join(", ")
+    )]
+    AmbiguousThreadBinding {
+        /// Canonical native Codex thread UUID that matched multiple pre-existing bindings.
+        thread_uuid: String,
+        /// Number of pre-existing bindings found for `thread_uuid` (`>= 2`).
+        match_count: usize,
+        /// Ordered `binding_id` values of the conflicting pre-existing bindings.
+        binding_ids: Vec<String>,
+    },
+
     /// The specified `run_id` does not exist within `binding_id`.
     #[error("run `{run_id}` not found for binding `{binding_id}`")]
     RunNotFound {

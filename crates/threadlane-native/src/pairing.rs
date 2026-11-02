@@ -56,7 +56,7 @@ impl NativeVerificationStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionEpochState {
-    /// Initial state at MCP process startup; only `connection_identity` is permitted.
+    /// Initial state at MCP startup; diagnostics and verified managed-desktop connection are available.
     Unbound,
     /// Enrolled by the trusted operator to a single `(binding_id, thread_id)` scope.
     Enrolled,

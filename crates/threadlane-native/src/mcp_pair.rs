@@ -1,10 +1,11 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
+    model::{CallToolResult, Implementation, ProtocolVersion, ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,7 @@ use crate::approved_mcp::{
     ApprovedSessionParams, ApprovedTaskParams, CancelApprovedTaskParams, ListApprovalsParams,
     StartApprovedTaskParams, HOST_NOT_CONFIGURED_MESSAGE,
 };
+use crate::auto_pair::{parse_thread_hint, AutomaticPairing, CALL_THREAD_HINT};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{constant_time_str_eq, ensure_platform_supported};
 use crate::host_launcher::{
@@ -336,6 +338,7 @@ pub struct PairedMcpServer {
     host_stores: Option<HostStores>,
     host_launcher: Option<Arc<ApprovedHostLauncher>>,
     cached_workflow: Arc<Mutex<Option<CachedScopedWorkflow>>>,
+    automatic_pairing: AutomaticPairing,
     tool_router: ToolRouter<Self>,
 }
 
@@ -371,6 +374,7 @@ impl PairedMcpServer {
             host_stores: None,
             host_launcher: None,
             cached_workflow: Arc::new(Mutex::new(None)),
+            automatic_pairing: AutomaticPairing::default(),
             tool_router: Self::tool_router(),
         })
     }
@@ -609,6 +613,12 @@ impl PairedMcpServer {
         // Explicitly ignore `_untrusted_meta`: caller metadata is never trusted for chat identity
         // or enrollment authority.
         match tool_name {
+            "connect_current_chat" => {
+                let params: ConnectionIdentityParams = Self::parse_tool_params(tool_name, arguments)?;
+                let meta = _untrusted_meta.and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                self.connect_current_chat(Parameters(params), meta).await
+            }
             CONNECTION_IDENTITY_TOOL => {
                 let params: ConnectionIdentityParams =
                     Self::parse_tool_params(tool_name, arguments)?;
@@ -942,6 +952,10 @@ impl PairedMcpServer {
             ));
         }
 
+        self.automatic_pairing
+            .verify_call(&enrollment.thread_id)
+            .map_err(|err| Self::format_pairing_error(tool_name, err))?;
+
         Ok(enrollment)
     }
 
@@ -1261,6 +1275,39 @@ impl PairedMcpServer {
 
 #[tool_router(router = tool_router)]
 impl PairedMcpServer {
+    /// Connects the current managed-desktop chat after independent thread-scoped verification.
+    #[tool(
+        name = "connect_current_chat",
+        description = "Connect this Codex chat to Threadlane automatically using the managed local desktop connection. Call once on first use, then operating_guide. Takes no IDs or paths. Creates or reuses a chat binding; does not approve or dispatch work. Unsupported hosts return a connection error.",
+        annotations(
+            title = "Connect Current Chat",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn connect_current_chat(
+        &self,
+        Parameters(_params): Parameters<ConnectionIdentityParams>,
+        meta: rmcp::model::RequestMetaObject,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let result = async {
+            let hint = parse_thread_hint(meta.get("threadId").and_then(Value::as_str))?;
+            let identity = self
+                .pairing_store
+                .inspect_epoch(&self.connection_nonce, &self.epoch_id)?;
+            self.automatic_pairing
+                .connect(hint, &self.state_dir, &self.pairing_store, &identity)
+                .await
+        }
+        .await
+        .map_err(|error| Self::format_pairing_error("connect_current_chat", error))?;
+        Ok(CallToolResult::structured(
+            json!({"untrusted_data": false, "tool": "connect_current_chat", "data": result}),
+        ))
+    }
+
     /// Returns the connection nonce and epoch status for trusted operator thread-scoped pairing.
     #[tool(
         name = "connection_identity",
@@ -1293,7 +1340,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-01.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-02.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -2160,6 +2207,31 @@ impl PairedMcpServer {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for PairedMcpServer {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let hint = context
+            .meta
+            .get("threadId")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_thread_hint(Some(value)).ok());
+        CALL_THREAD_HINT
+            .scope(hint, async {
+                let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+                self.tool_router.call(tcc).await
+            })
+            .await
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        // The pairing store scopes one process/epoch to one chat. Newer MCP
+        // stateless transports may be pooled across chats without a verified
+        // per-call identity, so keep this server on the session handshake.
+        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
+    }
+
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
@@ -2195,6 +2267,75 @@ fn observation_result_plan_id(
         return None;
     }
     threadlane_core::observation::validate_correlation_id(header.get("plan_id")?.as_str()?)
+}
+
+#[cfg(test)]
+mod automatic_scope_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn automatic_scope_is_checked_at_delegation_for_each_concurrent_call() {
+        let tmp = tempfile::tempdir().expect("temporary state");
+        let state = tmp.path().join("runtime");
+        let supervisor = threadlane::Supervisor::start(threadlane::SupervisorConfig::new(&state))
+            .await
+            .expect("owned supervisor");
+        let client = threadlane::SupervisorClient::from_state_dir(&state).expect("client");
+        let thread = "0196ed00-0000-7000-8000-00000000000a";
+        let binding = client
+            .create_binding(thread, "Test chat")
+            .await
+            .expect("binding");
+        let store = PairingStore::open(tmp.path().join("pairing")).expect("pairing store");
+        let server = PairedMcpServer::new(&state, store.clone()).expect("server");
+        store
+            .enroll(
+                &store.operator_token().expect("private token"),
+                crate::OperatorEnrollRequest {
+                    connection_nonce: server.connection_nonce().into(),
+                    epoch_id: server.epoch_id().into(),
+                    binding_id: binding.binding_id.clone(),
+                    thread_id: thread.into(),
+                    project_id: None,
+                },
+            )
+            .expect("trusted fixture enrollment");
+        server
+            .automatic_pairing
+            .require_call_identity
+            .store(true, Ordering::Release);
+
+        let missing = server
+            .status(Parameters(StatusParams {}))
+            .await
+            .expect_err("missing identity must fail");
+        assert_eq!(
+            missing.structured_content.expect("error")["error"]["code"],
+            "shared_connection_rejected"
+        );
+        let good = CALL_THREAD_HINT.scope(
+            Some(thread.into()),
+            server.status(Parameters(StatusParams {})),
+        );
+        let wrong = CALL_THREAD_HINT.scope(
+            Some("0196ed00-0000-7000-8000-00000000000b".into()),
+            server.status(Parameters(StatusParams {})),
+        );
+        let (good, wrong) = tokio::join!(good, wrong);
+        assert_eq!(
+            good.expect("matching context")
+                .structured_content
+                .expect("status")["binding_id"],
+            binding.binding_id
+        );
+        assert!(
+            wrong.is_err(),
+            "a concurrent different chat must not inherit the good context"
+        );
+        assert_eq!(client.list_bindings().await.expect("bindings").len(), 1);
+        supervisor.shutdown().await;
+    }
 }
 
 #[cfg(test)]

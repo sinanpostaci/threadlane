@@ -36,10 +36,11 @@ pub use limits::{
     RESPONSE_WRAPPER_OVERHEAD_BYTES, SCHEMA_VERSION, WAKEUP_NOTICE_STATUS_MESSAGE,
 };
 pub use types::{
-    AckResult, ActivityPage, Binding, Command, CommandOutput, Event, EventBatch, EventKind,
-    EventPayload, Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run,
-    RunListPage, RunRevision, RunStatus, RunSummary, RuntimeIdleInspection, TickReport,
-    WakeupClaim, WakeupNotice, WakeupOutcome, WakeupRetryRecord, WakeupStatus,
+    AckResult, ActivityPage, Binding, Command, CommandOutput, EnsureBindingOutcome, Event,
+    EventBatch, EventKind, EventPayload, GetOrCreateBindingOutcome, IdempotentBindingOutcome,
+    Question, QuestionHistoryPage, QuestionStatus, RevisionHistoryPage, Run, RunListPage,
+    RunRevision, RunStatus, RunSummary, RuntimeIdleInspection, TickReport, WakeupClaim,
+    WakeupNotice, WakeupOutcome, WakeupRetryRecord, WakeupStatus,
 };
 pub use worker::{
     sanitize_worker_text, WorkerAcceptanceState, WorkerClaim, WorkerCompletionRecord,

@@ -1,11 +1,18 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-01.v1`
+Version: `2026-11-02.v1`
 
 ## Start and recover context
 
-- Paired MCP starts UNBOUND: only `connection_identity` is callable until trusted
-  operator enrollment. Caller arguments or metadata cannot enroll or rebind it.
+- Paired MCP starts UNBOUND. Call `connect_current_chat` with `{}` on first use.
+  On the managed Linux desktop route, Threadlane checks the Codex-provided thread
+  hint against that thread's actual MCP connection and the verified local parent
+  backend, then creates or reuses the chat binding. This starts no work and grants
+  no execution approval. It requires the managed desktop connection; other hosts,
+  missing metadata and unprobeable callers return a connection error. Do not guess
+  IDs, configure a global fixed binding, or retry in a polling loop.
+- `connection_identity` remains a read-only diagnostic and does not enroll a chat.
+  Caller arguments or metadata alone cannot enroll or rebind a connection.
 - Once enrolled, or on the configured scoped MCP connection, fetch
   `operating_guide` with `{}`. Refetch on session resume, context uncertainty, or
   after compaction when this need is known. Before effects, refresh uncertain

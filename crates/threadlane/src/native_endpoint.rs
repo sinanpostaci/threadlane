@@ -94,6 +94,49 @@ impl fmt::Debug for NativeReconnectConfig {
 }
 
 impl NativeReconnectConfig {
+    /// Discovers the existing managed desktop endpoint for this MCP process's direct parent.
+    /// Does not use a caller-provided thread ID, executable path, or socket path.
+    pub fn discover_for_mcp_parent() -> Result<(Self, u32), Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let proc_root = Path::new("/proc");
+            let uid = current_euid();
+            let inspect = |pid| {
+                read_process_snapshot(proc_root, pid, uid).map_err(|_| {
+                    Error::SecurityViolation("cannot verify managed MCP process ancestry".into())
+                })
+            };
+            let own = inspect(std::process::id())?;
+            let backend = inspect(own.ppid)?;
+            let wrapper = inspect(backend.ppid)?;
+            let app = inspect(wrapper.ppid)?;
+            let config = Self {
+                descriptor_root: PathBuf::from(format!("/run/user/{uid}")),
+                backend_executable: backend.exe_path.clone(),
+                application_executable: app.exe_path.clone(),
+            };
+            let endpoint = config.resolve().map_err(map_endpoint_error)?;
+            if endpoint.backend != backend
+                || endpoint.wrapper != wrapper
+                || endpoint.application != app
+            {
+                return Err(Error::SecurityViolation(
+                    "managed endpoint is not the MCP parent".into(),
+                ));
+            }
+            revalidate_process_snapshot(proc_root, &own).map_err(|_| {
+                Error::SecurityViolation("MCP process ancestry changed during discovery".into())
+            })?;
+            Ok((config, backend.pid))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(Error::UnsupportedPlatform(
+                "automatic MCP parent discovery is Linux-only".into(),
+            ))
+        }
+    }
+
     /// Validates static private `descriptor_root` directory policy and canonical executable policy
     /// for `backend_executable` and `application_executable`.
     ///
@@ -133,6 +176,51 @@ impl NativeReconnectConfig {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = expected_uid;
+            Err(Error::UnsupportedPlatform(
+                "native endpoint auto-reconnect is only supported on Linux".to_string(),
+            ))
+        }
+    }
+
+    /// Resolves the unique live matching native endpoint under `descriptor_root`, connects to its
+    /// verified private Unix domain socket, and revalidates process snapshots, socket identity,
+    /// and kernel peer credentials (`SO_PEERCRED`) on the connected stream.
+    ///
+    /// Returns a connected, peer-verified [`tokio::net::UnixStream`] without exposing raw socket
+    /// paths in error diagnostics. Non-Linux platforms fail closed.
+    #[cfg(unix)]
+    pub async fn connect_verified_stream(&self) -> Result<tokio::net::UnixStream, Error> {
+        self.connect_verified_stream_for_backend(None).await
+    }
+
+    /// Connects to the verified endpoint, optionally requiring the exact MCP parent backend PID.
+    #[cfg(unix)]
+    pub async fn connect_verified_stream_for_backend(
+        &self,
+        expected_backend_pid: Option<u32>,
+    ) -> Result<tokio::net::UnixStream, Error> {
+        #[cfg(target_os = "linux")]
+        {
+            let endpoint = self.resolve().map_err(map_endpoint_error)?;
+            if expected_backend_pid.is_some_and(|pid| pid != endpoint.backend.pid) {
+                return Err(Error::SecurityViolation(
+                    "managed endpoint does not match the MCP parent".into(),
+                ));
+            }
+            let stream = tokio::net::UnixStream::connect(&endpoint.socket_path)
+                .await
+                .map_err(|_| {
+                    Error::Transport("failed to connect to native endpoint Unix socket".to_string())
+                })?;
+            endpoint.validate_processes().map_err(map_endpoint_error)?;
+            endpoint
+                .validate_peer(&stream)
+                .map_err(map_endpoint_error)?;
+            Ok(stream)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = expected_backend_pid;
             Err(Error::UnsupportedPlatform(
                 "native endpoint auto-reconnect is only supported on Linux".to_string(),
             ))
@@ -531,6 +619,14 @@ struct LauncherDescriptor {
     socket_path: PathBuf,
     real_codex: PathBuf,
     transport: String,
+}
+
+#[cfg(target_os = "linux")]
+fn map_endpoint_error(err: EndpointError) -> Error {
+    match err {
+        EndpointError::Unavailable(reason) => Error::Transport(reason.to_string()),
+        EndpointError::Refused(reason) => Error::SecurityViolation(reason.to_string()),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2201,6 +2297,13 @@ mod tests {
                     real_resolved
                         .validate_processes()
                         .expect("validate_processes against real /proc");
+                    rt.block_on(async {
+                        let verified_stream = real_cfg
+                            .connect_verified_stream()
+                            .await
+                            .expect("connect_verified_stream against real /proc");
+                        drop(verified_stream);
+                    });
                 }
             }
         }

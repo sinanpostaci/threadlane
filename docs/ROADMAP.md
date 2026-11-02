@@ -44,6 +44,15 @@ cross-platform support remain in scope. Staging work must not erase those goals.
 
 ## Current checkpoint
 
+The managed Linux desktop route now exposes a no-argument
+`connect_current_chat` MCP operation. It checks the calling process's parent
+endpoint and thread-scoped connection, preserves an existing durable binding,
+and starts only the baseline control runtime when needed. Automatically connected
+scoped calls require matching host-provided thread metadata. Unit/protocol checks
+cover missing/forged hints and concurrent context isolation; installed desktop
+automatic connection, reconnect after reboot, and non-Linux acceptance remain
+separate live gates. See [native pairing](NATIVE-GATE.md).
+
 The [native operator commands](NATIVE-OPERATOR.md) expose existing scoped plan
 and approved-session operations to a trusted local caller. They preserve human
 scope approval, explicit host startup and review acceptance. This route does not

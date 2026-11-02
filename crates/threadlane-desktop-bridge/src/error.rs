@@ -148,6 +148,9 @@ impl BridgeError {
             CoreError::BindingNotFound { .. } => {
                 Self::NotFound("Selected chat binding was not found.")
             }
+            CoreError::AmbiguousThreadBinding { .. } => Self::InvalidState(
+                "Multiple bindings exist for this chat; resolve the duplicate before connecting.",
+            ),
             CoreError::RunNotFound { .. } | CoreError::WorkerNotFound { .. } => {
                 Self::NotFound("Requested task was not found in this chat.")
             }
@@ -192,6 +195,9 @@ impl BridgeError {
                 "Current platform does not support required private runtime permissions.",
             ),
             ErrorCode::BindingNotFound => Self::NotFound("Selected chat binding was not found."),
+            ErrorCode::AmbiguousThreadBinding => Self::InvalidState(
+                "Multiple bindings exist for this chat; resolve the duplicate before connecting.",
+            ),
             ErrorCode::RunNotFound | ErrorCode::WorkerNotFound => {
                 Self::NotFound("Requested task was not found in this chat.")
             }
@@ -238,6 +244,23 @@ impl BridgeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_binding_errors_do_not_expose_private_identifiers() {
+        let local = CoreError::AmbiguousThreadBinding {
+            thread_uuid: "private-thread".into(),
+            match_count: 2,
+            binding_ids: vec!["private-binding".into()],
+        };
+        let remote = threadlane::ApiError::new(ErrorCode::AmbiguousThreadBinding, "private-token");
+        for message in [
+            BridgeError::from_core_error(&local).to_string(),
+            BridgeError::from_threadlane_error(&threadlane::Error::Remote(remote)).to_string(),
+        ] {
+            assert!(message.contains("Multiple bindings"));
+            assert!(!message.contains("private-"));
+        }
+    }
 
     #[test]
     fn lifecycle_codes_keep_private_remote_details_out_of_observer_errors() {

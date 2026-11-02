@@ -13,7 +13,8 @@ use threadlane_core::{
 use crate::descriptor::{read_and_validate_descriptor, validate_lazy_state_dir, RuntimeDescriptor};
 use crate::error::{ApiError, Error};
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, HostControlInfoRequest, HostControlStatusResponse,
+    BindingListResponse, CreateBindingRequest, GetOrCreateBindingRequest,
+    GetOrCreateBindingResponse, HostControlInfoRequest, HostControlStatusResponse,
     RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest,
     ScopedResponse, StatusResponse, StopIdleHostRequest,
 };
@@ -124,6 +125,31 @@ impl SupervisorClient {
         };
         self.send_json(Method::POST, "/v1/bindings", Some(&req))
             .await
+    }
+
+    /// Idempotently fetches an existing single trusted binding or creates a new one for a
+    /// validated canonical native Codex `thread_uuid` and human-readable `label` (trusted local
+    /// operator only; never exposed on [`ScopedClient`] or MCP).
+    pub async fn get_or_create_binding(
+        &self,
+        thread_uuid: &str,
+        label: &str,
+    ) -> Result<GetOrCreateBindingResponse, Error> {
+        let req = GetOrCreateBindingRequest {
+            thread_uuid: thread_uuid.to_string(),
+            label: label.to_string(),
+        };
+        self.send_json(Method::POST, "/v1/bindings/get-or-create", Some(&req))
+            .await
+    }
+
+    /// Alias for [`SupervisorClient::get_or_create_binding`].
+    pub async fn ensure_binding(
+        &self,
+        thread_uuid: &str,
+        label: &str,
+    ) -> Result<GetOrCreateBindingResponse, Error> {
+        self.get_or_create_binding(thread_uuid, label).await
     }
 
     /// Lists all configured bindings (CLI only).

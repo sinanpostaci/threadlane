@@ -1,8 +1,8 @@
 //! `threadlane-native-mcp`: unbound paired-MCP stdio bootstrap server for native Codex threads.
 //!
 //! Starts in the `Unbound` state with a fresh CSPRNG `connection_nonce` and `epoch_id`,
-//! exposing only `connection_identity` until the trusted local operator queries the nonce
-//! via thread-scoped `mcpServer/tool/call` and enrolls the connection in [`PairingStore`].
+//! exposing diagnostics and `connect_current_chat` for verified managed Linux desktop pairing.
+//! Other hosts require a trusted local operator to query the thread-scoped connection and enroll it.
 //! After verified enrollment, delegates scoped tool calls to [`threadlane::ThreadlaneMcpServer`].
 //!
 //! Auto-starting initial approved hosts is **disabled by default** (`--auto-start-approved-hosts`

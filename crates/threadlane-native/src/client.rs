@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use threadlane::NativeReconnectConfig;
 
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -16,6 +18,7 @@ use crate::pairing::{
 };
 use crate::rpc::{execute_proxy_rpc, DEFAULT_PROXY_TIMEOUT, MAX_RPC_FRAME_BYTES};
 use crate::wakeup::{build_turn_steer_params, NativeWakeupRecord, NativeWakeupStore};
+use crate::ws_rpc::{execute_ws_rpc_for_backend, map_reconnect_error};
 
 const DEFAULT_THREAD_LIST_LIMIT: u32 = 25;
 const MAX_ID_CHARS: usize = 128;
@@ -47,6 +50,9 @@ pub struct NativeThread {
     pub model: Option<String>,
     /// Configured thread reasoning effort, if reported.
     pub effort: Option<String>,
+    /// Whether the host allows direct input to this loaded thread, when reported.
+    #[serde(default)]
+    pub can_accept_direct_input: Option<bool>,
 }
 
 /// Paginated response from [`NativeClient::threads`].
@@ -55,6 +61,15 @@ pub struct NativeThreadPage {
     /// Page of read-only native thread metadata entries.
     pub threads: Vec<NativeThread>,
     /// Opaque forward pagination cursor (`None` when no further pages exist).
+    pub next_cursor: Option<String>,
+}
+
+/// A bounded page of currently loaded native thread identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeLoadedThreadPage {
+    /// Canonical thread UUIDs returned by the app-server, without chat content.
+    pub thread_ids: Vec<String>,
+    /// Opaque continuation cursor, if another page exists.
     pub next_cursor: Option<String>,
 }
 
@@ -95,32 +110,127 @@ pub struct NativeDiagnosticReport {
     pub busy_turn_delivery_gate: NativeVerificationStatus,
 }
 
-/// Client for the public `codex app-server proxy` stdio JSON-RPC interface.
+/// Explicit transport selection for [`NativeClient`].
+#[derive(Clone, PartialEq, Eq)]
+pub enum NativeTransport {
+    /// Spawns `codex app-server proxy [--sock <path>]` over stdio in an isolated Unix process group.
+    Proxy(NativeConfig),
+    /// Connects directly to the verified Linux managed Unix WebSocket endpoint resolved via
+    /// [`threadlane::NativeReconnectConfig`] with a strict read-only RPC allowlist.
+    ManagedWebSocket(NativeReconnectConfig),
+}
+
+impl fmt::Debug for NativeTransport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Proxy(cfg) => f
+                .debug_struct("Proxy")
+                .field("executable", &"[REDACTED]")
+                .field("socket", &cfg.socket.as_ref().map(|_| "[REDACTED]"))
+                .finish(),
+            Self::ManagedWebSocket(reconnect) => {
+                f.debug_tuple("ManagedWebSocket").field(reconnect).finish()
+            }
+        }
+    }
+}
+
+/// Client for the public `codex app-server proxy` stdio JSON-RPC interface or the verified
+/// read-only managed Unix WebSocket endpoint.
 ///
 /// Uses only read-only metadata discovery (`thread/list` without experimental `projectId`,
 /// `thread/read` with `includeTurns: false`), thread-scoped MCP status/bootstrap calls,
-/// and `expectedTurnId`-checked `turn/steer` with [`threadlane_core::FIXED_WAKEUP_MESSAGE`].
+/// and (on the proxy transport only) `expectedTurnId`-checked `turn/steer` with
+/// [`threadlane_core::FIXED_WAKEUP_MESSAGE`].
 /// Never reads transcripts, never calls `thread/resume`, never spawns a new server, and never
 /// creates or messages chats with model/permission overrides.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NativeClient {
     config: NativeConfig,
+    transport: NativeTransport,
     cwd_filter: Option<PathBuf>,
     timeout: Duration,
     max_frame_bytes: usize,
+    expected_backend_pid: Option<u32>,
+}
+
+impl fmt::Debug for NativeClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NativeClient")
+            .field("transport", &self.transport)
+            .field(
+                "cwd_filter",
+                &self.cwd_filter.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("timeout", &self.timeout)
+            .field("max_frame_bytes", &self.max_frame_bytes)
+            .finish()
+    }
 }
 
 impl NativeClient {
-    /// Validates `config` and constructs a new [`NativeClient`].
+    /// Validates `config` and constructs a new proxy-backed [`NativeClient`].
     pub fn new(config: NativeConfig) -> Result<Self, NativeError> {
         let executable = validate_executable_path(&config.executable)?;
         let socket = validate_optional_socket_path(config.socket.as_deref())?;
+        let validated = NativeConfig { executable, socket };
         Ok(Self {
-            config: NativeConfig { executable, socket },
+            config: validated.clone(),
+            transport: NativeTransport::Proxy(validated),
             cwd_filter: None,
             timeout: DEFAULT_PROXY_TIMEOUT,
             max_frame_bytes: MAX_RPC_FRAME_BYTES,
+            expected_backend_pid: None,
         })
+    }
+
+    /// Validates `reconnect` and constructs a new read-only managed WebSocket [`NativeClient`].
+    ///
+    /// Requires an explicit [`threadlane::NativeReconnectConfig`] with a private `0700`
+    /// `descriptor_root` and canonical `backend_executable` and `application_executable` paths.
+    /// Non-Linux platforms fail closed with [`NativeErrorCode::UnsupportedPlatform`].
+    pub fn new_managed_websocket(reconnect: NativeReconnectConfig) -> Result<Self, NativeError> {
+        reconnect.validate().map_err(map_reconnect_error)?;
+        let config = NativeConfig {
+            executable: reconnect.backend_executable.clone(),
+            socket: None,
+        };
+        Ok(Self {
+            config,
+            transport: NativeTransport::ManagedWebSocket(reconnect),
+            cwd_filter: None,
+            timeout: DEFAULT_PROXY_TIMEOUT,
+            max_frame_bytes: MAX_RPC_FRAME_BYTES,
+            expected_backend_pid: None,
+        })
+    }
+
+    /// Validates `transport` and constructs a new [`NativeClient`].
+    pub fn with_transport(transport: NativeTransport) -> Result<Self, NativeError> {
+        match transport {
+            NativeTransport::Proxy(cfg) => Self::new(cfg),
+            NativeTransport::ManagedWebSocket(reconnect) => Self::new_managed_websocket(reconnect),
+        }
+    }
+
+    /// Requires the verified backend to remain this MCP process's discovered parent.
+    pub(crate) fn with_expected_backend_pid(mut self, pid: u32) -> Self {
+        self.expected_backend_pid = Some(pid);
+        self
+    }
+
+    /// Switches this client to the verified read-only managed WebSocket transport using `reconnect`.
+    pub fn with_managed_websocket(
+        mut self,
+        reconnect: NativeReconnectConfig,
+    ) -> Result<Self, NativeError> {
+        reconnect.validate().map_err(map_reconnect_error)?;
+        self.config = NativeConfig {
+            executable: reconnect.backend_executable.clone(),
+            socket: None,
+        };
+        self.transport = NativeTransport::ManagedWebSocket(reconnect);
+        Ok(self)
     }
 
     /// Returns a reference to the validated [`NativeConfig`].
@@ -128,7 +238,25 @@ impl NativeClient {
         &self.config
     }
 
-    /// Configures a bounded timeout for each `codex app-server proxy` exchange.
+    /// Returns the active [`NativeTransport`] configured for this client.
+    pub fn transport(&self) -> &NativeTransport {
+        &self.transport
+    }
+
+    /// Returns the configured [`NativeReconnectConfig`] when using the managed WebSocket transport.
+    pub fn managed_websocket_config(&self) -> Option<&NativeReconnectConfig> {
+        match &self.transport {
+            NativeTransport::ManagedWebSocket(reconnect) => Some(reconnect),
+            NativeTransport::Proxy(_) => None,
+        }
+    }
+
+    /// Returns `true` if this client is configured to use the read-only managed WebSocket transport.
+    pub fn is_managed_websocket(&self) -> bool {
+        matches!(self.transport, NativeTransport::ManagedWebSocket(_))
+    }
+
+    /// Configures a bounded timeout for each `codex app-server` RPC exchange.
     pub fn with_timeout(mut self, timeout: Duration) -> Result<Self, NativeError> {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(NativeError::new(
@@ -140,7 +268,7 @@ impl NativeClient {
         Ok(self)
     }
 
-    /// Configures the maximum byte length of a single JSON-RPC frame read from the proxy.
+    /// Configures the maximum byte length of a single JSON-RPC frame read from the transport.
     pub fn with_max_frame_bytes(mut self, max_frame_bytes: usize) -> Result<Self, NativeError> {
         if !(1024..=MAX_RPC_FRAME_BYTES * 4).contains(&max_frame_bytes) {
             return Err(NativeError::new(
@@ -167,6 +295,39 @@ impl NativeClient {
         }
     }
 
+    async fn execute_readonly_rpc<Resp>(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<Resp, NativeError>
+    where
+        Resp: serde::de::DeserializeOwned,
+    {
+        match &self.transport {
+            NativeTransport::Proxy(cfg) => execute_proxy_rpc(
+                &cfg.executable,
+                cfg.socket.as_deref(),
+                self.timeout,
+                self.max_frame_bytes,
+                method,
+                params,
+            )
+            .await
+            .map_err(|e| e.error),
+            NativeTransport::ManagedWebSocket(reconnect) => {
+                execute_ws_rpc_for_backend(
+                    reconnect,
+                    self.expected_backend_pid,
+                    self.timeout,
+                    self.max_frame_bytes,
+                    method,
+                    params,
+                )
+                .await
+            }
+        }
+    }
+
     /// Lists a page of native threads using the public `thread/list` RPC.
     ///
     /// Note: `ThreadListParams.projectId` is experimental in `codex app-server` and is **never**
@@ -179,6 +340,69 @@ impl NativeClient {
     ) -> Result<NativeThreadPage, NativeError> {
         self.threads_in_cwd(self.cwd_filter.as_deref(), project_id, cursor)
             .await
+    }
+
+    /// Lists currently loaded native thread IDs without reading chat history.
+    pub async fn loaded_thread_ids(
+        &self,
+        cursor: Option<String>,
+    ) -> Result<NativeLoadedThreadPage, NativeError> {
+        let mut params = json!({"limit": 100});
+        if let Some(cursor) = cursor {
+            if cursor.is_empty()
+                || cursor.len() > MAX_CURSOR_CHARS
+                || cursor.trim() != cursor
+                || cursor.chars().any(char::is_control)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "invalid loaded-thread cursor",
+                ));
+            }
+            params["cursor"] = json!(cursor);
+        }
+        let response: WireLoadedThreadListResult = self
+            .execute_readonly_rpc("thread/loaded/list", params)
+            .await?;
+        if response.data.len() > 100 {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "loaded-thread page exceeded limit",
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for id in &response.data {
+            let parsed = uuid::Uuid::parse_str(id).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "loaded-thread ID is invalid",
+                )
+            })?;
+            if parsed.is_nil() || parsed.hyphenated().to_string() != *id || !seen.insert(id) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "loaded-thread IDs are invalid or duplicated",
+                ));
+            }
+        }
+        let next_cursor = match response.next_cursor {
+            Some(cursor)
+                if cursor.is_empty()
+                    || cursor.len() > MAX_CURSOR_CHARS
+                    || cursor.trim() != cursor
+                    || cursor.chars().any(char::is_control) =>
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "loaded-thread response cursor is invalid",
+                ));
+            }
+            other => other,
+        };
+        Ok(NativeLoadedThreadPage {
+            thread_ids: response.data,
+            next_cursor,
+        })
     }
 
     /// Lists a page of native threads with an explicit optional stable `cwd` wire filter and
@@ -234,16 +458,9 @@ impl NativeClient {
             params.insert("cursor".to_string(), json!(cur));
         }
 
-        let wire_page: WireThreadListResult = execute_proxy_rpc(
-            &self.config.executable,
-            self.config.socket.as_deref(),
-            self.timeout,
-            self.max_frame_bytes,
-            "thread/list",
-            Value::Object(params),
-        )
-        .await
-        .map_err(|e| e.error)?;
+        let wire_page: WireThreadListResult = self
+            .execute_readonly_rpc("thread/list", Value::Object(params))
+            .await?;
 
         let mut threads = Vec::with_capacity(wire_page.data.len());
         for wire_thread in wire_page.data {
@@ -278,16 +495,8 @@ impl NativeClient {
             "includeTurns": false
         });
 
-        let wire_res: WireThreadReadResult = execute_proxy_rpc(
-            &self.config.executable,
-            self.config.socket.as_deref(),
-            self.timeout,
-            self.max_frame_bytes,
-            "thread/read",
-            params,
-        )
-        .await
-        .map_err(|e| e.error)?;
+        let wire_res: WireThreadReadResult =
+            self.execute_readonly_rpc("thread/read", params).await?;
 
         let mapped = wire_res.thread.into_native_thread()?;
         if mapped.id != clean_thread_id {
@@ -314,16 +523,9 @@ impl NativeClient {
             "limit": 20
         });
 
-        let wire_res: WireMcpServerStatusListResult = execute_proxy_rpc(
-            &self.config.executable,
-            self.config.socket.as_deref(),
-            self.timeout,
-            self.max_frame_bytes,
-            "mcpServerStatus/list",
-            params,
-        )
-        .await
-        .map_err(|e| e.error)?;
+        let wire_res: WireMcpServerStatusListResult = self
+            .execute_readonly_rpc("mcpServerStatus/list", params)
+            .await?;
 
         let mut out = Vec::with_capacity(wire_res.data.len());
         for entry in wire_res.data {
@@ -342,6 +544,10 @@ impl NativeClient {
 
     /// Invokes a thread-scoped MCP tool via `mcpServer/tool/call`, checking both JSON-RPC errors
     /// and `isError: true` in the tool result.
+    ///
+    /// On the managed WebSocket transport, only `server: "threadlane"`,
+    /// `tool: "connection_identity"`, and `arguments: {}` are permitted; all other MCP tool calls
+    /// are rejected before any frame is sent.
     ///
     /// Never emits `_meta` for identity provenance.
     pub async fn call_mcp_tool(
@@ -368,19 +574,18 @@ impl NativeClient {
             "arguments": arguments
         });
 
-        let wire_res: WireMcpToolCallResult = execute_proxy_rpc(
-            &self.config.executable,
-            self.config.socket.as_deref(),
-            self.timeout,
-            self.max_frame_bytes,
-            "mcpServer/tool/call",
-            params,
-        )
-        .await
-        .map_err(|e| e.error)?;
+        let wire_res: WireMcpToolCallResult = self
+            .execute_readonly_rpc("mcpServer/tool/call", params)
+            .await?;
 
         let is_error = wire_res.is_error.unwrap_or(false);
         if is_error {
+            if self.is_managed_websocket() {
+                return Err(NativeError::new(
+                    NativeErrorCode::McpToolError,
+                    "Threadlane MCP tool returned an error.",
+                ));
+            }
             let detail = wire_res
                 .structured_content
                 .as_ref()
@@ -409,39 +614,58 @@ impl NativeClient {
             .call_mcp_tool(thread_id, server_name, CONNECTION_IDENTITY_TOOL, json!({}))
             .await?;
 
-        if let Some(ref structured) = res.structured_content {
-            if let Some(data_val) = structured.get("data") {
-                if let Ok(identity) = serde_json::from_value::<ConnectionIdentity>(data_val.clone())
-                {
-                    return Ok(identity);
-                }
-            }
-            if let Ok(identity) = serde_json::from_value::<ConnectionIdentity>(structured.clone()) {
-                return Ok(identity);
-            }
-        }
+        let structured_identity = res
+            .structured_content
+            .as_ref()
+            .and_then(parse_connection_identity_value);
 
+        let mut text_identity = None;
         for block in &res.content {
             if let Some(text) = block.get("text").and_then(Value::as_str) {
                 if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                    if let Some(data_val) = parsed.get("data") {
-                        if let Ok(identity) =
-                            serde_json::from_value::<ConnectionIdentity>(data_val.clone())
+                    if let Some(identity) = parse_connection_identity_value(&parsed) {
+                        if text_identity
+                            .as_ref()
+                            .is_some_and(|previous| previous != &identity)
                         {
-                            return Ok(identity);
+                            return Err(NativeError::new(
+                                NativeErrorCode::ProtocolError,
+                                "connection_identity text content blocks disagreed",
+                            ));
                         }
-                    }
-                    if let Ok(identity) = serde_json::from_value::<ConnectionIdentity>(parsed) {
-                        return Ok(identity);
+                        text_identity = Some(identity);
                     }
                 }
             }
         }
 
-        Err(NativeError::new(
-            NativeErrorCode::ProtocolError,
-            "connection_identity tool response did not contain a valid ConnectionIdentity payload",
-        ))
+        if let (Some(ref s_id), Some(ref t_id)) = (&structured_identity, &text_identity) {
+            if s_id != t_id {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "connection_identity structuredContent and text content disagreed",
+                ));
+            }
+        }
+
+        let identity = structured_identity.or(text_identity).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "connection_identity tool response did not contain a valid ConnectionIdentity payload",
+            )
+        })?;
+
+        if identity.connection_nonce.trim().is_empty()
+            || identity.epoch_id.trim().is_empty()
+            || identity.server_pid == 0
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "connection_identity tool response contained an empty nonce, epoch_id, or zero server_pid",
+            ));
+        }
+
+        Ok(identity)
     }
 
     /// Performs the trusted operator enrollment flow for `thread_id` -> `binding_id`:
@@ -451,6 +675,9 @@ impl NativeClient {
     /// 3. Enrolls `(connection_nonce, epoch_id)` in `pairing_store` using `operator_token`.
     ///    If the MCP child connection is shared with another thread, `pairing_store` quarantines it
     ///    and returns [`NativeErrorCode::SharedConnectionRejected`].
+    ///
+    /// Note: The managed WebSocket transport is strictly read-only and rejects this method before
+    /// any wire frame or store mutation.
     pub async fn enroll_thread_connection(
         &self,
         pairing_store: &PairingStore,
@@ -459,6 +686,13 @@ impl NativeClient {
         binding_id: &str,
         expected_project_id: Option<&str>,
     ) -> Result<EnrollmentRecord, NativeError> {
+        if self.is_managed_websocket() {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedCapability,
+                "managed WebSocket transport is strictly read-only and does not permit thread connection enrollment",
+            ));
+        }
+
         let clean_binding = validate_bounded_identifier(binding_id, "binding_id", MAX_ID_CHARS)?;
         let expected_proj = match expected_project_id {
             Some(p) => Some(validate_bounded_identifier(
@@ -498,6 +732,8 @@ impl NativeClient {
     /// Sends a fixed-message busy-turn wake-up via public `turn/steer` with `expectedTurnId` verification
     /// and durable `Pending` / `Submitted` / `Unknown` / `Received` tracking in `wakeup_store`.
     ///
+    /// - Refuses with [`NativeErrorCode::UnsupportedCapability`] when using the read-only managed
+    ///   WebSocket transport (before touching `wakeup_store` or the wire).
     /// - Refuses with [`NativeErrorCode::MissingLiveTurnId`] if `expected_turn_id` is `None`
     ///   (never guesses from persisted turns or calls `thread/resume`).
     /// - Refuses with [`NativeErrorCode::AmbiguousWakeupPendingReconciliation`] if a prior submission
@@ -511,6 +747,13 @@ impl NativeClient {
         thread_id: &str,
         expected_turn_id: Option<&str>,
     ) -> Result<NativeWakeupRecord, NativeError> {
+        let NativeTransport::Proxy(ref proxy_cfg) = self.transport else {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedCapability,
+                "managed WebSocket transport is strictly read-only and does not permit turn/steer",
+            ));
+        };
+
         let Some(turn_id_raw) = expected_turn_id else {
             return Err(NativeError::new(
                 NativeErrorCode::MissingLiveTurnId,
@@ -523,8 +766,8 @@ impl NativeClient {
         let params = build_turn_steer_params(&pending.thread_id, &clean_turn_id)?;
 
         match execute_proxy_rpc::<WireTurnSteerResult>(
-            &self.config.executable,
-            self.config.socket.as_deref(),
+            &proxy_cfg.executable,
+            proxy_cfg.socket.as_deref(),
             self.timeout,
             self.max_frame_bytes,
             "turn/steer",
@@ -584,10 +827,27 @@ impl NativeClient {
     }
 }
 
+fn parse_connection_identity_value(val: &Value) -> Option<ConnectionIdentity> {
+    if let Some(data_val) = val.get("data") {
+        if let Ok(identity) = serde_json::from_value::<ConnectionIdentity>(data_val.clone()) {
+            return Some(identity);
+        }
+    }
+    serde_json::from_value::<ConnectionIdentity>(val.clone()).ok()
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireThreadListResult {
     data: Vec<WireThread>,
+    #[serde(default)]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireLoadedThreadListResult {
+    data: Vec<String>,
     #[serde(default)]
     next_cursor: Option<String>,
 }
@@ -614,6 +874,8 @@ struct WireThread {
     model: Option<String>,
     #[serde(default, alias = "effort")]
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    can_accept_direct_input: Option<bool>,
 }
 
 impl WireThread {
@@ -651,6 +913,7 @@ impl WireThread {
             status: self.status.into_status_string()?,
             model,
             effort,
+            can_accept_direct_input: self.can_accept_direct_input,
         })
     }
 }

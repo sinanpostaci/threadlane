@@ -29,10 +29,11 @@ use crate::descriptor::{
 };
 use crate::error::{ApiError, Error, ErrorCode};
 use crate::protocol::{
-    BindingListResponse, CreateBindingRequest, HostControlBusyCounts, HostControlConfig,
-    HostControlInfoRequest, HostControlOwnerScope, HostControlRuntimeState,
-    HostControlStatusResponse, RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest,
-    ScopedRequest, ScopedResponse, StatusResponse, StopIdleHostRequest,
+    BindingListResponse, CreateBindingRequest, GetOrCreateBindingRequest,
+    GetOrCreateBindingResponse, HostControlBusyCounts, HostControlConfig, HostControlInfoRequest,
+    HostControlOwnerScope, HostControlRuntimeState, HostControlStatusResponse,
+    RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, ScopedRequest,
+    ScopedResponse, StatusResponse, StopIdleHostRequest,
 };
 use crate::workers::{
     build_completion_record, build_pre_spawn_cancelled_completion, execute_claimed_worker,
@@ -701,6 +702,10 @@ fn build_router(state: Arc<SharedState>) -> Router {
             "/v1/bindings",
             post(handle_create_binding).get(handle_list_bindings),
         )
+        .route(
+            "/v1/bindings/get-or-create",
+            post(handle_get_or_create_binding),
+        )
         .route("/v1/bindings/{binding_id}", get(handle_get_binding))
         .route(
             "/v1/bindings/{binding_id}/command",
@@ -845,6 +850,28 @@ async fn handle_create_binding(
         .create_binding(&req.thread_uuid, &req.label)
         .map_err(|err| map_core_error(&state, "create_binding failed", err))?;
     Ok((StatusCode::CREATED, Json(binding)))
+}
+
+async fn handle_get_or_create_binding(
+    State(state): State<Arc<SharedState>>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<GetOrCreateBindingResponse>), (StatusCode, Json<ApiError>)> {
+    verify_bearer_auth(&headers, &state.token)?;
+    let req: GetOrCreateBindingRequest = parse_json_body(body)?;
+
+    let mut access = state.acquire_for_request().await?;
+    state.ensure_not_stopping()?;
+    let outcome = access
+        .core_mut()
+        .get_or_create_binding(&req.thread_uuid, &req.label)
+        .map_err(|err| map_core_error(&state, "get_or_create_binding failed", err))?;
+    let status = if outcome.created {
+        StatusCode::CREATED
+    } else {
+        StatusCode::OK
+    };
+    Ok((status, Json(outcome)))
 }
 
 async fn handle_list_bindings(

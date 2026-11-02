@@ -47,11 +47,13 @@ pub use mcp::{
 pub use native_endpoint::NativeReconnectConfig;
 pub use native_tool_output::{NativeNotificationDelivery, NativeToolOutputConfig};
 pub use protocol::{
-    ActivityPage, BindingListResponse, CreateBindingRequest, Event, EventKind, EventPayload,
+    ActivityPage, BindingListResponse, CreateBindingRequest, EnsureBindingOutcome,
+    EnsureBindingRequest, EnsureBindingResponse, Event, EventKind, EventPayload,
+    GetOrCreateBindingOutcome, GetOrCreateBindingRequest, GetOrCreateBindingResponse,
     HostControlBusyCounts, HostControlConfig, HostControlInfoRequest, HostControlOwnerScope,
-    HostControlRuntimeState, HostControlStatusResponse, RearmHostWakeupRequest,
-    RearmHostWakeupResponse, RetryWakeupRequest, RunSummary, ScopedRequest, ScopedResponse,
-    StatusResponse, StopIdleHostRequest, WorkerAcceptanceState, WorkerClaim,
+    HostControlRuntimeState, HostControlStatusResponse, IdempotentBindingOutcome,
+    RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, RunSummary, ScopedRequest,
+    ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerAcceptanceState, WorkerClaim,
     WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressSummary,
     WorkerProgressUpdate, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
     WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS, WORKER_EXECUTION_BINDING_SCHEMA_VERSION,

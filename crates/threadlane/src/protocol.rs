@@ -5,7 +5,8 @@ use threadlane_core::{
     DEFAULT_PAGE_LIMIT,
 };
 pub use threadlane_core::{
-    ActivityPage, Event, EventKind, EventPayload, RunSummary, WorkerAcceptanceState, WorkerClaim,
+    ActivityPage, EnsureBindingOutcome, Event, EventKind, EventPayload, GetOrCreateBindingOutcome,
+    IdempotentBindingOutcome, RunSummary, WorkerAcceptanceState, WorkerClaim,
     WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressSummary,
     WorkerProgressUpdate, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
     WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS, MAX_SUMMARY_TEXT_PREVIEW_CHARS,
@@ -21,6 +22,28 @@ pub struct CreateBindingRequest {
     /// Human-readable display label.
     pub label: String,
 }
+
+/// Trusted local operator request to idempotently fetch or create a binding for a validated
+/// canonical native Codex thread UUID and display label.
+///
+/// Explicitly excluded from [`ScopedRequest`] and MCP tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetOrCreateBindingRequest {
+    /// Canonical lowercase hyphenated non-nil Codex thread UUID.
+    pub thread_uuid: String,
+    /// Human-readable display label (validated on every call, including when an existing match is returned).
+    pub label: String,
+}
+
+/// Structured response returned by the trusted `POST /v1/bindings/get-or-create` endpoint.
+pub type GetOrCreateBindingResponse = GetOrCreateBindingOutcome;
+
+/// Type alias for [`GetOrCreateBindingRequest`].
+pub type EnsureBindingRequest = GetOrCreateBindingRequest;
+
+/// Type alias for [`GetOrCreateBindingResponse`].
+pub type EnsureBindingResponse = GetOrCreateBindingResponse;
 
 /// Response listing all configured bindings (trusted CLI only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

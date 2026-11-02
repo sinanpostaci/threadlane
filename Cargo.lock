@@ -2599,8 +2599,10 @@ dependencies = [
 name = "threadlane-native"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "fs2",
+ "futures-util",
  "libc",
  "rmcp",
  "rusqlite",
@@ -2617,6 +2619,7 @@ dependencies = [
  "threadlane-workers",
  "threadlane-workflow",
  "tokio",
+ "tokio-tungstenite",
  "toml_edit",
  "uuid",
 ]
