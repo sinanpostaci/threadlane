@@ -251,6 +251,33 @@ parser's retained-event truncation counter. With no observer it remains zero.
 This library interface is connected to the durable supervisor/MCP dispatcher;
 see [DISPATCH.md](DISPATCH.md) for its runtime profile and lifecycle contract.
 
+## Complete Structured Advisory Response Capture (`threadlane_workers::advisory_response`)
+
+`WorkerExecutionReport.evidence.retained_events[].summary` is intentionally secret-redacted and
+truncated at `MAX_DIAGNOSTIC_SUMMARY_BYTES` (`256` bytes) for safe UI/status diagnostics. Callers
+must never parse `retained_events[].summary` as a model plan or review response.
+
+For read-only `AdvisoryWorkerSpec` runs (`file_permissions == WorkerFilePermissions::ReadOnly`),
+`threadlane-workers` provides an opt-in complete response capture path integrated directly into
+the supervised stdout drain alongside `NdjsonStreamParser`:
+
+- **Entry points**:
+  - `run_advisory_worker_with_structured_result(spec: &AdvisoryWorkerSpec, response_budget: AdvisoryResponseBudget) -> Result<AdvisoryStructuredExecution, WorkerError>`
+  - `run_advisory_worker_with_structured_result_and_cancel(spec: &AdvisoryWorkerSpec, response_budget: AdvisoryResponseBudget, cancel_rx: &mut watch::Receiver<bool>) -> Result<AdvisoryStructuredExecution, WorkerError>`
+  - `run_advisory_worker_with_structured_result_and_observer(spec: &AdvisoryWorkerSpec, response_budget: AdvisoryResponseBudget, cancel_rx: &mut watch::Receiver<bool>, progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>) -> Result<AdvisoryStructuredExecution, WorkerError>`
+- **Additive types**:
+  - `AdvisoryResponseBudget { max_response_bytes: usize }` (`DEFAULT_MAX_ADVISORY_RESPONSE_BYTES = 256 KiB`, `MAX_ADVISORY_RESPONSE_BYTES = 4 MiB`, validated `1..=MAX_ADVISORY_RESPONSE_BYTES` pre-launch).
+  - `BoundedAdvisoryResponse { text, byte_count, sha256_digest, provider, source, framing }` where `text` is the exact unredacted UTF-8 string from the terminal provider framing, `byte_count == text.len()`, `sha256_digest` is the 64-character lowercase hex SHA-256 of `text.as_bytes()`, `source` is `AdvisoryResponseSource` (`AntigravityFinalResultResponse` or `OpenCodeAssistantTextPartStop`), and `framing` is `AdvisoryResponseFraming { response_line_number, terminal_line_number, session_id, message_id, part_id, effort_evidence_source }`.
+  - `AdvisoryStructuredExecution { execution: WorkerExecutionReport, response: Option<BoundedAdvisoryResponse>, response_error: Option<AdvisoryResponseError> }`.
+- **Provider framing & anti-spoofing rules**:
+  - **Antigravity (`antigravity`)**: Captures only from a single terminal `event: "result"` preceded by `event: "init"` where `result.status == "SUCCESS"` and `result.response` is a non-empty UTF-8 string containing a top-level JSON object. Intermediate `step_update` prose, tool events/markers, `ERROR` with exit `0`, duplicate results, or trailing events after `result` are rejected.
+  - **OpenCode v2 (`opencode_v2`)**: Captures only from a single complete assistant `type: "text"` (`part.type == "text"`, non-synthetic, no `delta`/partial flags, completed `part.time.end` when `part.time` is present) inside an active `step_start`..`step_finish` frame sealed by `type: "step_finish"` (`part.type == "step-finish"`, `reason == "stop"`). Binds `sessionID`, `messageID`, and `part.id`, and cross-checks `messageID` against `validated_opencode_metadata().terminal_message_id` on software-allocated OpenCode runs.
+- **Caller contract & limitations**:
+  - Pre-launch invalid configuration (`max_response_bytes == 0`, `max_response_bytes > MAX_ADVISORY_RESPONSE_BYTES`, or non-`ReadOnly` permissions) refuses before process spawn with `Err(WorkerError)`.
+  - Once spawned, `AdvisoryStructuredExecution.execution` always retains the complete `WorkerExecutionReport` even when the provider exited `0` (`WorkerRunStatus::Succeeded`) with missing, oversized (`ResponseTooLarge`), truncated/non-object JSON (`InvalidStructuredJson`), spoofed tool output (`SpoofedOrToolOutput`), or conflicting terminal framing (`ConflictingTerminalOutput`). Callers must check `structured.has_verified_response()` / `structured.verified_response()` rather than treating `execution.status == Succeeded` alone as a valid advisory payload.
+  - Dropped progress events (`budgets.max_events` cap on `retained_events`) do not affect terminal response capture.
+  - `BoundedAdvisoryResponse.text` is **untrusted model data**: parsing a valid JSON object grants no execution authority, approves no scope, and executes no tools. Legacy `WorkerExecutionReport` wire serialization and UI snapshots remain unchanged and never include the full prompt or full response text by default.
+
 ### 5. Git Worktree Manager, Diff Gate, and Safe Cleanup (`threadlane_workers::git`)
 
 - **Work-Area Ownership Marker and Preservation (`WorktreeManager::new`)**:

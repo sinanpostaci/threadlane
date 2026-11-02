@@ -911,7 +911,7 @@ fn extract_model_and_effort(
     Option<String>,
     Option<String>,
 ) {
-    let model_sources: [Option<String>; 10] = [
+    let model_sources = [
         obj.get("model").and_then(Value::as_str).map(str::to_string),
         obj.get("init")
             .and_then(Value::as_object)
@@ -947,14 +947,38 @@ fn extract_model_and_effort(
         obj.get("init")
             .and_then(Value::as_object)
             .and_then(extract_provider_plus_model_id),
+        obj.get("result")
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
         obj.get("part")
             .and_then(Value::as_object)
-            .and_then(extract_provider_plus_model_id)
-            .or_else(|| {
-                obj.get("model")
-                    .and_then(Value::as_object)
-                    .and_then(extract_provider_plus_model_id)
-            }),
+            .and_then(extract_provider_plus_model_id),
+        obj.get("message")
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
+        obj.get("model")
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
+        obj.get("part")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("model"))
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
+        obj.get("result")
+            .and_then(Value::as_object)
+            .and_then(|r| r.get("model"))
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
+        obj.get("init")
+            .and_then(Value::as_object)
+            .and_then(|i| i.get("model"))
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
+        obj.get("message")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_object)
+            .and_then(extract_provider_plus_model_id),
     ];
 
     let mut base_model: Option<String> = None;
@@ -1007,6 +1031,22 @@ fn extract_model_and_effort(
         obj.get("message").and_then(Value::as_object),
         obj.get("metadata").and_then(Value::as_object),
         obj.get("model").and_then(Value::as_object),
+        obj.get("part")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("model"))
+            .and_then(Value::as_object),
+        obj.get("result")
+            .and_then(Value::as_object)
+            .and_then(|r| r.get("model"))
+            .and_then(Value::as_object),
+        obj.get("init")
+            .and_then(Value::as_object)
+            .and_then(|i| i.get("model"))
+            .and_then(Value::as_object),
+        obj.get("message")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_object),
     ];
 
     let mut explicit_effort: Option<String> = None;
@@ -1323,7 +1363,7 @@ fn detect_blocked_event(
     None
 }
 
-fn has_object_error_field(obj: &Map<String, Value>) -> bool {
+pub(crate) fn has_object_error_field(obj: &Map<String, Value>) -> bool {
     match obj.get("error") {
         Some(Value::String(s)) => !s.trim().is_empty(),
         Some(Value::Object(_)) => true,
@@ -1394,7 +1434,11 @@ fn detect_error_event(
         .unwrap_or("")
         .to_ascii_lowercase();
     let nested_res_status = nested_res
-        .and_then(|r| r.get("status").or_else(|| r.get("subtype")))
+        .and_then(|r| {
+            r.get("status")
+                .or_else(|| r.get("subtype"))
+                .or_else(|| r.get("state"))
+        })
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_ascii_lowercase();
@@ -1505,6 +1549,7 @@ fn is_result_event(obj: &Map<String, Value>, event_type: &str, subtype: Option<&
             let nested_status = nested_res
                 .get("status")
                 .or_else(|| nested_res.get("subtype"))
+                .or_else(|| nested_res.get("state"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_ascii_lowercase();
@@ -1606,7 +1651,7 @@ fn extract_summary(obj: &Map<String, Value>) -> Option<String> {
     None
 }
 
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let start = bytes
         .iter()
         .position(|b| !b.is_ascii_whitespace())

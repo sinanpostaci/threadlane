@@ -29,6 +29,8 @@
 //!   diffs (explicitly labeled as post-run evidence, not preventive OS sandboxing), and enforces
 //!   safe ownership-verified cleanup without `--force` or auto-merge/push.
 
+/// Opt-in complete structured advisory response capture and framing provenance.
+pub mod advisory_response;
 /// Versioned exact-match AGY catalog model variant metadata.
 pub mod antigravity_models;
 /// Narrow diagnostic CLI parser and command runner (`threadlane-worker`).
@@ -54,6 +56,11 @@ pub mod stream;
 /// Unix process-group lifecycle supervision and bounded concurrent stream capture.
 pub mod supervisor;
 
+pub use advisory_response::{
+    AdvisoryResponseBudget, AdvisoryResponseError, AdvisoryResponseErrorCode,
+    AdvisoryResponseFraming, AdvisoryResponseSource, AdvisoryStructuredExecution,
+    BoundedAdvisoryResponse, DEFAULT_MAX_ADVISORY_RESPONSE_BYTES, MAX_ADVISORY_RESPONSE_BYTES,
+};
 pub use cli::{load_worker_spec_file, run_cli, CreatedWorktreesReport, WorkerCli, WorkerCommand};
 pub use dependency::{
     dependency_input_lock_path, read_dependency_input, validate_dependency_input_policy,
@@ -123,7 +130,9 @@ pub use stream::{
 };
 pub use supervisor::{
     is_process_alive, is_process_group_alive, run_advisory_worker, run_advisory_worker_with_cancel,
-    run_advisory_worker_with_observer, run_worker, run_worker_with_cancel,
+    run_advisory_worker_with_observer, run_advisory_worker_with_structured_result,
+    run_advisory_worker_with_structured_result_and_cancel,
+    run_advisory_worker_with_structured_result_and_observer, run_worker, run_worker_with_cancel,
     run_worker_with_observer, OutputOverflowKind, WorkerExecutionReport, WorkerRunStatus,
     POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
 };

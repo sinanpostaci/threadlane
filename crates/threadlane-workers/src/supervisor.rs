@@ -7,6 +7,9 @@ use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 
+use crate::advisory_response::{
+    AdvisoryResponseBudget, AdvisoryResponseCollector, AdvisoryStructuredExecution,
+};
 use crate::error::WorkerError;
 use crate::fs_safety::{
     ensure_platform_supported, sanitize_and_redact, validate_existing_canonical_dir,
@@ -756,7 +759,7 @@ pub async fn run_worker_with_observer(
     let initial_argv = spec.build_argv_for_workdir(&canonical_workdir)?;
     let child_env = spec.build_child_env_for_workdir(&canonical_workdir)?;
 
-    run_supervised_process_group(
+    let (report, _) = run_supervised_process_group(
         SupervisedLaunchInputs {
             provider: spec.provider,
             canonical_executable: validation.canonical_executable,
@@ -772,10 +775,12 @@ pub async fn run_worker_with_observer(
             effective_spec.session_id = Some(allocated_session_id.to_string());
             effective_spec.build_argv_for_workdir(&canonical_workdir)
         },
+        None,
         cancel_rx,
         progress_tx,
     )
-    .await
+    .await?;
+    Ok(report)
 }
 
 /// Runs a read-only [`AdvisoryWorkerSpec`] inside `spec.working_directory` under Unix
@@ -822,7 +827,7 @@ pub async fn run_advisory_worker_with_observer(
     let validation = spec.validate()?;
     let canonical_workdir = validation.canonical_working_directory.clone();
 
-    run_supervised_process_group(
+    let (report, _) = run_supervised_process_group(
         SupervisedLaunchInputs {
             provider: spec.provider,
             canonical_executable: validation.canonical_executable,
@@ -838,10 +843,99 @@ pub async fn run_advisory_worker_with_observer(
             effective_spec.session_id = Some(allocated_session_id.to_string());
             effective_spec.build_argv_for_workdir(&canonical_workdir)
         },
+        None,
         cancel_rx,
         progress_tx,
     )
+    .await?;
+    Ok(report)
+}
+
+/// Runs a read-only [`AdvisoryWorkerSpec`] with opt-in complete structured advisory response
+/// capture under `response_budget`.
+///
+/// Pre-launch configuration errors (including invalid `response_budget` or non-`read_only` mode)
+/// fail closed with [`WorkerError`] before spawning. Once spawned, the underlying
+/// [`WorkerExecutionReport`] is always preserved in [`AdvisoryStructuredExecution::execution`]
+/// even if the provider completed (`WorkerRunStatus::Succeeded`) with missing, oversized,
+/// truncated, non-JSON, spoofed, or conflicting output.
+pub async fn run_advisory_worker_with_structured_result(
+    spec: &AdvisoryWorkerSpec,
+    response_budget: AdvisoryResponseBudget,
+) -> Result<AdvisoryStructuredExecution, WorkerError> {
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    run_advisory_worker_with_structured_result_and_observer(
+        spec,
+        response_budget,
+        &mut cancel_rx,
+        None,
+    )
     .await
+}
+
+/// Runs a read-only [`AdvisoryWorkerSpec`] with opt-in complete structured advisory response
+/// capture under `response_budget` and cancellation via `cancel_rx`, with no live event observer
+/// (`progress_tx = None`).
+pub async fn run_advisory_worker_with_structured_result_and_cancel(
+    spec: &AdvisoryWorkerSpec,
+    response_budget: AdvisoryResponseBudget,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<AdvisoryStructuredExecution, WorkerError> {
+    run_advisory_worker_with_structured_result_and_observer(spec, response_budget, cancel_rx, None)
+        .await
+}
+
+/// Runs a read-only [`AdvisoryWorkerSpec`] with opt-in complete structured advisory response
+/// capture under `response_budget`, cancellation via `cancel_rx`, and optional nonblocking live
+/// event observation via `progress_tx`.
+pub async fn run_advisory_worker_with_structured_result_and_observer(
+    spec: &AdvisoryWorkerSpec,
+    response_budget: AdvisoryResponseBudget,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+) -> Result<AdvisoryStructuredExecution, WorkerError> {
+    ensure_platform_supported()?;
+    response_budget.validate()?;
+    let validation = spec.validate()?;
+    let canonical_workdir = validation.canonical_working_directory.clone();
+    let resolved_model = validation.resolved_model.clone();
+
+    let (execution, response_collector) = run_supervised_process_group(
+        SupervisedLaunchInputs {
+            provider: spec.provider,
+            canonical_executable: validation.canonical_executable,
+            canonical_workdir: canonical_workdir.clone(),
+            resolved_model: validation.resolved_model,
+            requested_session_id: spec.session_id.clone(),
+            initial_argv: validation.constructed_argv,
+            child_env: validation.child_env,
+            budgets: spec.budgets.clone(),
+        },
+        |allocated_session_id| {
+            let mut effective_spec = spec.clone();
+            effective_spec.session_id = Some(allocated_session_id.to_string());
+            effective_spec.build_argv_for_workdir(&canonical_workdir)
+        },
+        Some(response_budget),
+        cancel_rx,
+        progress_tx,
+    )
+    .await?;
+
+    let collector = response_collector.unwrap_or_else(|| {
+        let effective_session_id = execution
+            .allocated_session_id
+            .clone()
+            .or_else(|| spec.session_id.clone());
+        AdvisoryResponseCollector::new(
+            spec.provider,
+            resolved_model,
+            effective_session_id,
+            response_budget,
+        )
+    });
+
+    Ok(collector.finalize(execution))
 }
 
 struct SupervisedLaunchInputs {
@@ -858,9 +952,10 @@ struct SupervisedLaunchInputs {
 async fn run_supervised_process_group<F>(
     inputs: SupervisedLaunchInputs,
     rebuild_argv_with_session: F,
+    response_budget: Option<AdvisoryResponseBudget>,
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
-) -> Result<WorkerExecutionReport, WorkerError>
+) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
     F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
 {
@@ -922,29 +1017,32 @@ where
                     );
                     let duration_ms =
                         u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    return Ok(WorkerExecutionReport {
-                        provider,
-                        requested_model: resolved_model,
-                        requested_session_id,
-                        allocated_session_id,
-                        constructed_argv: Vec::new(),
-                        working_directory: canonical_workdir,
-                        status: abort_status,
-                        exit_code: None,
-                        signal: None,
-                        process_group_id: None,
-                        duration_ms,
-                        stdout_bytes_captured: 0,
-                        stderr_bytes_captured: 0,
-                        overflow: None,
-                        descendants_terminated_after_exit: false,
-                        cleanup_incomplete: false,
-                        redacted_stderr_summary: None,
-                        dropped_live_events: 0,
-                        evidence: empty_parser.finalize(),
-                        opencode_metadata: None,
-                        opencode_metadata_error: Some(abort_code.to_string()),
-                    });
+                    return Ok((
+                        WorkerExecutionReport {
+                            provider,
+                            requested_model: resolved_model,
+                            requested_session_id,
+                            allocated_session_id,
+                            constructed_argv: Vec::new(),
+                            working_directory: canonical_workdir,
+                            status: abort_status,
+                            exit_code: None,
+                            signal: None,
+                            process_group_id: None,
+                            duration_ms,
+                            stdout_bytes_captured: 0,
+                            stderr_bytes_captured: 0,
+                            overflow: None,
+                            descendants_terminated_after_exit: false,
+                            cleanup_incomplete: false,
+                            redacted_stderr_summary: None,
+                            dropped_live_events: 0,
+                            evidence: empty_parser.finalize(),
+                            opencode_metadata: None,
+                            opencode_metadata_error: Some(abort_code.to_string()),
+                        },
+                        None,
+                    ));
                 }
             }
             Err(alloc_err) => {
@@ -959,29 +1057,32 @@ where
                 );
                 let duration_ms =
                     u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
-                return Ok(WorkerExecutionReport {
-                    provider,
-                    requested_model: resolved_model,
-                    requested_session_id,
-                    allocated_session_id: None,
-                    constructed_argv: Vec::new(),
-                    working_directory: canonical_workdir,
-                    status,
-                    exit_code: None,
-                    signal: None,
-                    process_group_id: None,
-                    duration_ms,
-                    stdout_bytes_captured: 0,
-                    stderr_bytes_captured: 0,
-                    overflow: None,
-                    descendants_terminated_after_exit: false,
-                    cleanup_incomplete,
-                    redacted_stderr_summary: None,
-                    dropped_live_events: 0,
-                    evidence: empty_parser.finalize(),
-                    opencode_metadata: None,
-                    opencode_metadata_error: Some(alloc_err.as_str().to_string()),
-                });
+                return Ok((
+                    WorkerExecutionReport {
+                        provider,
+                        requested_model: resolved_model,
+                        requested_session_id,
+                        allocated_session_id: None,
+                        constructed_argv: Vec::new(),
+                        working_directory: canonical_workdir,
+                        status,
+                        exit_code: None,
+                        signal: None,
+                        process_group_id: None,
+                        duration_ms,
+                        stdout_bytes_captured: 0,
+                        stderr_bytes_captured: 0,
+                        overflow: None,
+                        descendants_terminated_after_exit: false,
+                        cleanup_incomplete,
+                        redacted_stderr_summary: None,
+                        dropped_live_events: 0,
+                        evidence: empty_parser.finalize(),
+                        opencode_metadata: None,
+                        opencode_metadata_error: Some(alloc_err.as_str().to_string()),
+                    },
+                    None,
+                ));
             }
         }
     }
@@ -1037,6 +1138,15 @@ where
     let (overflow_tx, mut overflow_rx) = mpsc::unbounded_channel::<OutputOverflowKind>();
     let (drain_stop_tx, drain_stop_rx) = watch::channel(false);
 
+    let response_collector = response_budget.map(|budget| {
+        AdvisoryResponseCollector::new(
+            provider,
+            resolved_model.clone(),
+            effective_session_id.clone(),
+            budget,
+        )
+    });
+
     let mut stdout_handle = tokio::spawn(drain_stdout_incremental(
         stdout_pipe,
         NdjsonStreamParser::new_for_provider(
@@ -1045,6 +1155,7 @@ where
             effective_session_id.clone(),
             budgets.max_events,
         ),
+        response_collector,
         budgets.clone(),
         overflow_tx.clone(),
         drain_stop_rx.clone(),
@@ -1111,6 +1222,7 @@ where
     let StdoutDrainOutput {
         bytes_captured: stdout_bytes_captured,
         evidence,
+        response_collector,
         overflow: stdout_overflow,
         dropped_live_events,
     } = match tokio::time::timeout(
@@ -1137,6 +1249,7 @@ where
             StdoutDrainOutput {
                 bytes_captured: 0,
                 evidence: empty_parser.finalize(),
+                response_collector: None,
                 overflow: None,
                 dropped_live_events: 0,
             }
@@ -1207,29 +1320,32 @@ where
 
     let duration_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    Ok(WorkerExecutionReport {
-        provider,
-        requested_model: resolved_model,
-        requested_session_id,
-        allocated_session_id,
-        constructed_argv,
-        working_directory: canonical_workdir,
-        status,
-        exit_code,
-        signal,
-        process_group_id: Some(pgid),
-        duration_ms,
-        stdout_bytes_captured,
-        stderr_bytes_captured,
-        overflow: final_overflow,
-        descendants_terminated_after_exit,
-        cleanup_incomplete,
-        redacted_stderr_summary,
-        dropped_live_events,
-        evidence,
-        opencode_metadata,
-        opencode_metadata_error,
-    })
+    Ok((
+        WorkerExecutionReport {
+            provider,
+            requested_model: resolved_model,
+            requested_session_id,
+            allocated_session_id,
+            constructed_argv,
+            working_directory: canonical_workdir,
+            status,
+            exit_code,
+            signal,
+            process_group_id: Some(pgid),
+            duration_ms,
+            stdout_bytes_captured,
+            stderr_bytes_captured,
+            overflow: final_overflow,
+            descendants_terminated_after_exit,
+            cleanup_incomplete,
+            redacted_stderr_summary,
+            dropped_live_events,
+            evidence,
+            opencode_metadata,
+            opencode_metadata_error,
+        },
+        response_collector,
+    ))
 }
 
 pub(crate) async fn wait_for_readers_or_signal_stop<T1, T2>(
@@ -1254,16 +1370,21 @@ pub(crate) async fn wait_for_readers_or_signal_stop<T1, T2>(
 struct StdoutDrainOutput {
     bytes_captured: usize,
     evidence: StreamEvidenceSummary,
+    response_collector: Option<AdvisoryResponseCollector>,
     overflow: Option<OutputOverflowKind>,
     dropped_live_events: usize,
 }
 
 fn ingest_and_observe_line(
     parser: &mut NdjsonStreamParser,
+    response_collector: Option<&mut AdvisoryResponseCollector>,
     raw_line: &[u8],
     progress_tx: Option<&mpsc::Sender<NormalizedWorkerEvent>>,
     dropped_live_events: &mut usize,
 ) {
+    if let Some(collector) = response_collector {
+        collector.ingest_line(raw_line);
+    }
     if let Some(tx) = progress_tx {
         if let Some(event) = parser.ingest_line_with_event(raw_line) {
             if tx.try_send(event).is_err() {
@@ -1278,6 +1399,7 @@ fn ingest_and_observe_line(
 async fn drain_stdout_incremental(
     mut reader: tokio::process::ChildStdout,
     mut parser: NdjsonStreamParser,
+    mut response_collector: Option<AdvisoryResponseCollector>,
     budgets: ExecutionBudgets,
     overflow_tx: mpsc::UnboundedSender<OutputOverflowKind>,
     mut drain_stop_rx: watch::Receiver<bool>,
@@ -1301,6 +1423,7 @@ async fn drain_stdout_incremental(
             if overflow.is_none() && !line_buf.is_empty() {
                 ingest_and_observe_line(
                     &mut parser,
+                    response_collector.as_mut(),
                     &line_buf,
                     progress_tx.as_ref(),
                     &mut dropped_live_events,
@@ -1314,6 +1437,7 @@ async fn drain_stdout_incremental(
                 if overflow.is_none() && !line_buf.is_empty() {
                     ingest_and_observe_line(
                         &mut parser,
+                        response_collector.as_mut(),
                         &line_buf,
                         progress_tx.as_ref(),
                         &mut dropped_live_events,
@@ -1351,6 +1475,7 @@ async fn drain_stdout_incremental(
                     if has_newline {
                         ingest_and_observe_line(
                             &mut parser,
+                            response_collector.as_mut(),
                             &line_buf,
                             progress_tx.as_ref(),
                             &mut dropped_live_events,
@@ -1373,6 +1498,7 @@ async fn drain_stdout_incremental(
     StdoutDrainOutput {
         bytes_captured: total_bytes,
         evidence: parser.finalize(),
+        response_collector,
         overflow,
         dropped_live_events,
     }
