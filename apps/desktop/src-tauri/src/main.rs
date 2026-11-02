@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod codex_setup;
 mod host_control;
 mod observation;
 
@@ -10,6 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use codex_setup::{CodexSetupService, CodexSetupServiceConfig};
 use host_control::HostControlHub;
 use observation::{ObservationService, ObservationSourceConfig};
 use serde::{Deserialize, Serialize};
@@ -33,7 +35,9 @@ use threadlane_desktop_bridge::{
     RunDetail, ToolStatus, WindowAction,
 };
 use threadlane_host::{HostSessionSummary, TaskStateSnapshot};
-use threadlane_native::{NativeClient, NativeConfig, NativeError, NativeThreadPage};
+use threadlane_native::{
+    CodexSetupReport, NativeClient, NativeConfig, NativeError, NativeThreadPage,
+};
 use threadlane_plans::{
     compile_plan_revision, Difficulty, PlanChange, PlanError, PlanRevision, PlanStatus, PlanStore,
     WorkflowRole,
@@ -1351,6 +1355,27 @@ async fn desktop_link_observation_context(
         .map_err(|_| AppError::internal_join_error())?
 }
 
+#[tauri::command]
+async fn desktop_codex_setup_status(
+    state: State<'_, CodexSetupService>,
+) -> Result<CodexSetupReport, AppError> {
+    state.status().await
+}
+
+#[tauri::command]
+async fn desktop_codex_setup_recheck(
+    state: State<'_, CodexSetupService>,
+) -> Result<CodexSetupReport, AppError> {
+    state.recheck().await
+}
+
+#[tauri::command]
+async fn desktop_codex_setup_apply(
+    state: State<'_, CodexSetupService>,
+) -> Result<CodexSetupReport, AppError> {
+    state.apply().await
+}
+
 fn main() -> ExitCode {
     let cli = DesktopCli::parse();
     let initial_runtime_state_dir = cli.state_dir.clone();
@@ -1391,6 +1416,15 @@ fn main() -> ExitCode {
                 sessions_dir,
                 cli_host_executable,
             )?;
+            let codex_setup = CodexSetupService::new(CodexSetupServiceConfig::from_desktop_dirs(
+                initial_runtime_state_dir.clone(),
+                control.registry.config_dir().to_path_buf(),
+                control.plans.dir().to_path_buf(),
+                control.authority.dir().to_path_buf(),
+                control.sessions_dir.clone(),
+                &app_data_dir,
+            ));
+            codex_setup.spawn_startup_apply();
             let observation = ObservationService::new(ObservationSourceConfig {
                 runtime_state_dir: initial_runtime_state_dir,
                 registry_dir: control.registry.config_dir().to_path_buf(),
@@ -1400,6 +1434,7 @@ fn main() -> ExitCode {
                 app_data_dir: control.registry.config_dir().to_path_buf(),
             });
             app.manage(control);
+            app.manage(codex_setup);
             app.manage(observation);
             Ok(())
         })
@@ -1437,6 +1472,9 @@ fn main() -> ExitCode {
             desktop_observation_snapshot,
             desktop_observation_sources,
             desktop_link_observation_context,
+            desktop_codex_setup_status,
+            desktop_codex_setup_recheck,
+            desktop_codex_setup_apply,
         ])
         .run(tauri::generate_context!());
 

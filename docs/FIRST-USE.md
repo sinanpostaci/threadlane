@@ -20,6 +20,13 @@ runtime snapshot; it does not execute a worker or test paid model access.
 - Attach the intended real runtime in **Settings → Connections**, then select
   its verified conversation binding in the same section.
   The local demo and browser preview do not establish a live Codex connection.
+- Verify **Codex MCP startup registration** in **Settings → Connections**. On
+  desktop startup, Threadlane registers or refreshes only its owned unbound
+  `mcp_servers.threadlane` entry in `${CODEX_HOME:-$HOME/.codex}/config.toml`
+  while preserving unrelated settings, comments, disabled entries, and manual
+  edits. Restart or refresh Codex MCP connections when the entry changes;
+  conversation pairing is still required before scoped MCP tools can run. See
+  [Codex MCP startup setup](CODEX-SETUP.md).
 
 The checklist cannot verify execution approval, notification delivery or an
 account's remaining quota. Those are checked for the concrete session.

@@ -60,9 +60,11 @@ not require switching to the panel for each task. See
 
 - **First-use checks and recovery overview**: Settings → Connections shows a read-only local
   setup checklist for installed tools, model/effort assignments, saved profiles
-  and the selected real runtime binding. Activity highlights uncertain or
+  and the selected real runtime binding, plus the startup `mcp_servers.threadlane`
+  registration status (`threadlane-codex-setup`) with explicit Recheck/Retry
+  controls and separate conversation pairing status. Activity highlights uncertain or
   unsuccessful recent runs and evidence review, without replaying work.
-  See [first everyday use](docs/FIRST-USE.md).
+  See [first everyday use](docs/FIRST-USE.md) and [Codex MCP startup setup](docs/CODEX-SETUP.md).
 
 - **Crash recovery**: Task state and events are persisted; interrupted workers
   become unknown and are reconciled before continuation. Provider requests are

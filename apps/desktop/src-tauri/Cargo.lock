@@ -4743,6 +4743,7 @@ dependencies = [
  "sha2 0.10.9",
  "tauri",
  "tauri-build",
+ "tempfile",
  "threadlane-authority",
  "threadlane-connectors",
  "threadlane-core",
@@ -4811,6 +4812,7 @@ dependencies = [
  "threadlane-workers",
  "threadlane-workflow",
  "tokio",
+ "toml_edit 0.25.17+spec-1.1.0",
  "uuid",
 ]
 
@@ -5072,6 +5074,7 @@ dependencies = [
  "indexmap 2.14.2",
  "toml_datetime 1.1.2+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 

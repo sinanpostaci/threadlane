@@ -134,6 +134,17 @@ import { NativeLinkingPanel } from './pages/native.ts';
 import { renderActivityHistorySection } from './pages/history.ts';
 import { renderReadinessChecklist } from './pages/readiness.ts';
 import { renderRecoveryOverview } from './pages/recovery-overview.ts';
+import {
+  applyCodexSetup,
+  fetchCodexSetupStatus,
+  recheckCodexSetup,
+} from './codex-setup/ipc.ts';
+import { buildCodexSetupPanel } from './codex-setup/panel.ts';
+import {
+  createBrowserPreviewCodexSetupReport,
+  createInitialCodexSetupReport,
+  type CodexSetupReport,
+} from './codex-setup/types.ts';
 
 const APPEARANCE_STORAGE_KEY = 'threadlane.desktop.appearance.v1';
 const EXECUTION_PREFS_STORAGE_KEY = 'threadlane.desktop.execution_prefs.v1';
@@ -443,6 +454,10 @@ class ThreadlaneDesktopApp {
   private observationLinkInFlight = false;
   private observationLinkError: string | null = null;
   private observationLinkNotice: string | null = null;
+  private codexSetupReport: CodexSetupReport = hasTauriRuntime()
+    ? createInitialCodexSetupReport()
+    : createBrowserPreviewCodexSetupReport();
+  private codexSetupBusy = false;
 
   constructor(mountNode: HTMLElement) {
     const savedAppearance = loadSavedAppearance();
@@ -523,6 +538,7 @@ class ThreadlaneDesktopApp {
   }
 
   private async initialize(): Promise<void> {
+    void this.loadCodexSetupStatusOnce();
     await Promise.all([
       this.triggerSnapshotPoll(true, false),
       this.refreshTools(),
@@ -531,6 +547,51 @@ class ThreadlaneDesktopApp {
       this.pollObservation(),
     ]);
     this.scheduleNextPoll();
+  }
+
+  private async loadCodexSetupStatusOnce(): Promise<void> {
+    if (!hasTauriRuntime()) {
+      this.codexSetupReport = createBrowserPreviewCodexSetupReport();
+      this.codexSetupBusy = false;
+      return;
+    }
+    this.codexSetupBusy = true;
+    try {
+      this.codexSetupReport = await fetchCodexSetupStatus();
+    } finally {
+      this.codexSetupBusy = false;
+      if (this.state.page === 'settings' && this.settingsSection === 'connections') {
+        this.renderPreserveActiveInput();
+      }
+    }
+  }
+
+  private async handleRecheckCodexSetup(): Promise<void> {
+    if (this.codexSetupBusy || !hasTauriRuntime()) {
+      return;
+    }
+    this.codexSetupBusy = true;
+    this.renderPreserveActiveInput();
+    try {
+      this.codexSetupReport = await recheckCodexSetup();
+    } finally {
+      this.codexSetupBusy = false;
+      this.renderPreserveActiveInput();
+    }
+  }
+
+  private async handleRetryCodexSetup(): Promise<void> {
+    if (this.codexSetupBusy || !hasTauriRuntime()) {
+      return;
+    }
+    this.codexSetupBusy = true;
+    this.renderPreserveActiveInput();
+    try {
+      this.codexSetupReport = await applyCodexSetup();
+    } finally {
+      this.codexSetupBusy = false;
+      this.renderPreserveActiveInput();
+    }
   }
 
   private scheduleNextPoll(): void {
@@ -2889,6 +2950,20 @@ class ThreadlaneDesktopApp {
         )
       );
     }
+
+    frag.appendChild(
+      buildCodexSetupPanel({
+        report: this.codexSetupReport,
+        busy: this.codexSetupBusy,
+        isBrowserPreview: !hasTauriRuntime(),
+        onRecheck: () => {
+          void this.handleRecheckCodexSetup();
+        },
+        onRetry: () => {
+          void this.handleRetryCodexSetup();
+        },
+      })
+    );
 
     frag.appendChild(
       this.nativeLinkingPanel.render(this.state.registrySnapshot, bindings)

@@ -27,6 +27,8 @@
 pub mod approved_mcp;
 /// Public `codex app-server proxy` client and native thread metadata types.
 pub mod client;
+/// Safe startup and CLI registration helper for `mcp_servers.threadlane` in Codex `config.toml`.
+pub mod codex_setup;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
 /// Shared conversation-change advancement guard for direct native task dispatch.
@@ -65,6 +67,16 @@ pub use approved_mcp::{
 pub use client::{
     NativeClient, NativeConfig, NativeDiagnosticReport, NativeMcpServerStatus,
     NativeMcpToolCallResult, NativeThread, NativeThreadPage,
+};
+pub use codex_setup::{
+    apply_codex_mcp_setup, build_desired_mcp_args, check_codex_mcp_setup, resolve_codex_home,
+    resolve_codex_home_with, resolve_default_runtime_state_dir,
+    resolve_default_runtime_state_dir_with, resolve_native_mcp_executable,
+    resolve_native_mcp_executable_with, run_codex_mcp_setup, validate_mcp_executable_path,
+    CodexMcpSetupReport, CodexMcpSetupRequest, CodexSetupMode, CodexSetupReport, CodexSetupRequest,
+    CodexSetupState, CODEX_CONFIG_FILENAME, CODEX_SETUP_LOCK_FILENAME,
+    CODEX_SETUP_RECEIPT_FILENAME, DEFAULT_NATIVE_MCP_EXECUTABLE_NAME, MAX_SETUP_PATH_BYTES,
+    MAX_SETUP_RECEIPT_BYTES, THREADLANE_CLI_XDG_STATE_HOME_ENV,
 };
 pub use conversation_change::{
     acquire_conversation_advancement_guard, inspect_unresolved_blocking_changes,

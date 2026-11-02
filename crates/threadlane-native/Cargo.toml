@@ -33,6 +33,10 @@ path = "src/bin/threadlane-context.rs"
 name = "threadlane-flow"
 path = "src/bin/threadlane-flow.rs"
 
+[[bin]]
+name = "threadlane-codex-setup"
+path = "src/bin/threadlane-codex-setup.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
@@ -51,6 +55,7 @@ threadlane-host = { path = "../threadlane-host" }
 threadlane-workers = { path = "../threadlane-workers" }
 threadlane-workflow = { path = "../threadlane-workflow" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+toml_edit = "0.25.17"
 uuid = { version = "1.8", features = ["v4", "serde"] }
 
 [dev-dependencies]
