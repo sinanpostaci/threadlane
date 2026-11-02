@@ -33,6 +33,9 @@
 //!   worktree checkout, tracks explicit index freshness (`missing`, `fresh`, `stale`, `unverified`),
 //!   and never conflates the `codegraph_explore` MCP server with a standalone CLI binary.
 
+/// Read-only final combined candidate inspection/freeze on owned `RunIntegration` checkouts and
+/// cross-process locked compare-and-swap closure-attempt ledger.
+pub mod candidate;
 /// Auxiliary `git`, `tmux`, and `codegraph` capability reporting, read-only `tmux` attachment
 /// descriptors, and owned-worktree CodeGraph project/freshness checks.
 pub mod capabilities;
@@ -47,6 +50,18 @@ pub mod integration;
 /// Review subject construction, SHA-256 digest binding, policy/test evidence gates, and frozen review receipts.
 pub mod review;
 
+pub use candidate::{
+    inspect_final_candidate_readonly, verify_final_candidate_subject_readonly,
+    verify_legacy_base_closure_insufficient, ClosureAttemptRecord, ClosureAttemptState,
+    ClosureExecutionEvidence, ClosureReservationOutcome, ClosureVerdict, ClosureVerdictKind,
+    FinalCandidateClosureLedger, FinalCandidateClosureStore, FinalCandidatePolicyBinding,
+    FinalCandidateSubject, FinalCandidateTaskInput, InspectFinalCandidateRequest,
+    MarkClosureSubmittedRequest, MarkClosureUnknownRequest, ReconcileClosureAttemptRequest,
+    RecordClosureVerdictRequest, ReserveClosureAttemptRequest, VerifiedCandidateTaskEvidence,
+    CLOSURES_SUBDIR, CLOSURE_LEDGER_FILENAME, CLOSURE_LEDGER_LOCK_FILENAME,
+    FINAL_CANDIDATE_CLOSURE_SCHEMA_VERSION, FINAL_CANDIDATE_SUBJECT_SCHEMA_VERSION,
+    MAX_CLOSURE_ATTEMPTS, MAX_CLOSURE_LEDGER_BYTES,
+};
 pub use capabilities::{
     build_tmux_readonly_descriptor, inspect_codegraph_worktree, inspect_tool_capabilities_passive,
     probe_tool_capabilities_explicit, propose_codegraph_index_plan, record_codegraph_index_receipt,
