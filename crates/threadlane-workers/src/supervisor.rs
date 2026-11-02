@@ -13,7 +13,9 @@ use crate::fs_safety::{
 };
 use crate::opencode_collector::{self, OpenCodeCollectorContext, OpenCodeCollectorError};
 use crate::opencode_metadata::{OpenCodeMetadataEvidence, OwnedOpenCodeSession};
-use crate::spec::{ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec};
+use crate::spec::{
+    AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec,
+};
 use crate::stream::{
     FieldEvidence, NdjsonStreamParser, NormalizedWorkerEvent, StreamEvidenceSummary,
 };
@@ -754,35 +756,152 @@ pub async fn run_worker_with_observer(
     let initial_argv = spec.build_argv_for_workdir(&canonical_workdir)?;
     let child_env = spec.build_child_env_for_workdir(&canonical_workdir)?;
 
+    run_supervised_process_group(
+        SupervisedLaunchInputs {
+            provider: spec.provider,
+            canonical_executable: validation.canonical_executable,
+            canonical_workdir: canonical_workdir.clone(),
+            resolved_model: validation.resolved_model,
+            requested_session_id: spec.session_id.clone(),
+            initial_argv,
+            child_env,
+            budgets: spec.budgets.clone(),
+        },
+        |allocated_session_id| {
+            let mut effective_spec = spec.clone();
+            effective_spec.session_id = Some(allocated_session_id.to_string());
+            effective_spec.build_argv_for_workdir(&canonical_workdir)
+        },
+        cancel_rx,
+        progress_tx,
+    )
+    .await
+}
+
+/// Runs a read-only [`AdvisoryWorkerSpec`] inside `spec.working_directory` under Unix
+/// process-group supervision, concurrent incremental stdout/stderr drainage, and
+/// timeout/overflow enforcement.
+///
+/// Fails closed with [`WorkerError::UnsupportedCapability`] before spawning if
+/// `spec.file_permissions` is not [`crate::permissions::WorkerFilePermissions::ReadOnly`].
+/// Never performs automatic replay if execution crashes or times out.
+pub async fn run_advisory_worker(
+    spec: &AdvisoryWorkerSpec,
+) -> Result<WorkerExecutionReport, WorkerError> {
+    let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+    run_advisory_worker_with_observer(spec, &mut cancel_rx, None).await
+}
+
+/// Runs a read-only [`AdvisoryWorkerSpec`] inside `spec.working_directory` under Unix
+/// process-group supervision, concurrent incremental stdout/stderr drainage, and
+/// timeout/cancel/overflow enforcement, with no live event observer (`progress_tx = None`).
+///
+/// Never performs automatic replay if execution crashes or times out.
+pub async fn run_advisory_worker_with_cancel(
+    spec: &AdvisoryWorkerSpec,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<WorkerExecutionReport, WorkerError> {
+    run_advisory_worker_with_observer(spec, cancel_rx, None).await
+}
+
+/// Runs a read-only [`AdvisoryWorkerSpec`] inside `spec.working_directory` under Unix
+/// process-group supervision, concurrent incremental stdout/stderr drainage,
+/// timeout/cancel/overflow enforcement, and optional nonblocking live event observation via
+/// `progress_tx`.
+///
+/// Distinguishes intentional provider-private logging/state outside `working_directory` and
+/// bounded stderr diagnostics from repository writes: stderr and owned OpenCode session
+/// metadata are captured within configured budgets while pipe-holding descendants are reaped
+/// within [`POST_EXIT_PIPE_DRAIN_TIMEOUT_MS`].
+pub async fn run_advisory_worker_with_observer(
+    spec: &AdvisoryWorkerSpec,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+) -> Result<WorkerExecutionReport, WorkerError> {
+    ensure_platform_supported()?;
+    let validation = spec.validate()?;
+    let canonical_workdir = validation.canonical_working_directory.clone();
+
+    run_supervised_process_group(
+        SupervisedLaunchInputs {
+            provider: spec.provider,
+            canonical_executable: validation.canonical_executable,
+            canonical_workdir: canonical_workdir.clone(),
+            resolved_model: validation.resolved_model,
+            requested_session_id: spec.session_id.clone(),
+            initial_argv: validation.constructed_argv,
+            child_env: validation.child_env,
+            budgets: spec.budgets.clone(),
+        },
+        |allocated_session_id| {
+            let mut effective_spec = spec.clone();
+            effective_spec.session_id = Some(allocated_session_id.to_string());
+            effective_spec.build_argv_for_workdir(&canonical_workdir)
+        },
+        cancel_rx,
+        progress_tx,
+    )
+    .await
+}
+
+struct SupervisedLaunchInputs {
+    provider: WorkerProvider,
+    canonical_executable: PathBuf,
+    canonical_workdir: PathBuf,
+    resolved_model: ResolvedModelTarget,
+    requested_session_id: Option<String>,
+    initial_argv: Vec<String>,
+    child_env: Vec<(String, String)>,
+    budgets: ExecutionBudgets,
+}
+
+async fn run_supervised_process_group<F>(
+    inputs: SupervisedLaunchInputs,
+    rebuild_argv_with_session: F,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+) -> Result<WorkerExecutionReport, WorkerError>
+where
+    F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
+{
+    let SupervisedLaunchInputs {
+        provider,
+        canonical_executable,
+        canonical_workdir,
+        resolved_model,
+        requested_session_id,
+        initial_argv,
+        child_env,
+        budgets,
+    } = inputs;
+
     let start_instant = Instant::now();
     let overall_deadline =
-        tokio::time::Instant::from_std(start_instant + spec.budgets.timeout_duration());
+        tokio::time::Instant::from_std(start_instant + budgets.timeout_duration());
     let started_at_ms = current_unix_epoch_ms()?;
 
     let is_new_opencode_run =
-        spec.provider == WorkerProvider::OpenCodeV2 && spec.session_id.is_none();
+        provider == WorkerProvider::OpenCodeV2 && requested_session_id.is_none();
 
     let mut collector_context: Option<OpenCodeCollectorContext> = None;
     let mut owned_session: Option<OwnedOpenCodeSession> = None;
     let mut allocated_session_id: Option<String> = None;
-    let mut effective_session_id = spec.session_id.clone();
+    let mut effective_session_id = requested_session_id.clone();
     let mut constructed_argv = initial_argv;
 
     if is_new_opencode_run {
         let ctx = OpenCodeCollectorContext {
-            executable: validation.canonical_executable.clone(),
+            executable: canonical_executable.clone(),
             canonical_workdir: canonical_workdir.clone(),
             child_env: child_env.clone(),
             overall_deadline,
             started_at_ms,
-            max_stderr_bytes: spec.budgets.max_stderr_bytes,
+            max_stderr_bytes: budgets.max_stderr_bytes,
         };
-        match opencode_collector::allocate(&ctx, &validation.resolved_model, cancel_rx).await {
+        match opencode_collector::allocate(&ctx, &resolved_model, cancel_rx).await {
             Ok(owned) => {
-                let mut effective_spec = spec.clone();
-                effective_spec.session_id = Some(owned.session_id.clone());
-                constructed_argv = effective_spec.build_argv_for_workdir(&canonical_workdir)?;
-                effective_session_id = effective_spec.session_id;
+                constructed_argv = rebuild_argv_with_session(&owned.session_id)?;
+                effective_session_id = Some(owned.session_id.clone());
                 allocated_session_id = Some(owned.session_id.clone());
                 owned_session = Some(owned);
                 collector_context = Some(ctx);
@@ -796,17 +915,17 @@ pub async fn run_worker_with_observer(
                 };
                 if let Some((abort_status, abort_code)) = pre_spawn_abort {
                     let empty_parser = NdjsonStreamParser::new_for_provider(
-                        spec.provider,
-                        validation.resolved_model.clone(),
+                        provider,
+                        resolved_model.clone(),
                         effective_session_id,
-                        spec.budgets.max_events,
+                        budgets.max_events,
                     );
                     let duration_ms =
                         u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
                     return Ok(WorkerExecutionReport {
-                        provider: spec.provider,
-                        requested_model: validation.resolved_model,
-                        requested_session_id: spec.session_id.clone(),
+                        provider,
+                        requested_model: resolved_model,
+                        requested_session_id,
                         allocated_session_id,
                         constructed_argv: Vec::new(),
                         working_directory: canonical_workdir,
@@ -833,17 +952,17 @@ pub async fn run_worker_with_observer(
                 let cleanup_incomplete =
                     matches!(alloc_err, OpenCodeCollectorError::CleanupIncomplete);
                 let empty_parser = NdjsonStreamParser::new_for_provider(
-                    spec.provider,
-                    validation.resolved_model.clone(),
-                    spec.session_id.clone(),
-                    spec.budgets.max_events,
+                    provider,
+                    resolved_model.clone(),
+                    requested_session_id.clone(),
+                    budgets.max_events,
                 );
                 let duration_ms =
                     u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
                 return Ok(WorkerExecutionReport {
-                    provider: spec.provider,
-                    requested_model: validation.resolved_model,
-                    requested_session_id: spec.session_id.clone(),
+                    provider,
+                    requested_model: resolved_model,
+                    requested_session_id,
                     allocated_session_id: None,
                     constructed_argv: Vec::new(),
                     working_directory: canonical_workdir,
@@ -867,7 +986,7 @@ pub async fn run_worker_with_observer(
         }
     }
 
-    let mut cmd = Command::new(&validation.canonical_executable);
+    let mut cmd = Command::new(&canonical_executable);
     cmd.args(&constructed_argv)
         .envs(child_env)
         .current_dir(&canonical_workdir)
@@ -921,12 +1040,12 @@ pub async fn run_worker_with_observer(
     let mut stdout_handle = tokio::spawn(drain_stdout_incremental(
         stdout_pipe,
         NdjsonStreamParser::new_for_provider(
-            spec.provider,
-            validation.resolved_model.clone(),
+            provider,
+            resolved_model.clone(),
             effective_session_id.clone(),
-            spec.budgets.max_events,
+            budgets.max_events,
         ),
-        spec.budgets.clone(),
+        budgets.clone(),
         overflow_tx.clone(),
         drain_stop_rx.clone(),
         progress_tx,
@@ -934,7 +1053,7 @@ pub async fn run_worker_with_observer(
 
     let mut stderr_handle = tokio::spawn(drain_stderr_incremental(
         stderr_pipe,
-        spec.budgets.max_stderr_bytes,
+        budgets.max_stderr_bytes,
         overflow_tx,
         drain_stop_rx,
     ));
@@ -1010,10 +1129,10 @@ pub async fn run_worker_with_observer(
             stdout_handle.abort();
             cleanup_incomplete = true;
             let empty_parser = NdjsonStreamParser::new_for_provider(
-                spec.provider,
-                validation.resolved_model.clone(),
+                provider,
+                resolved_model.clone(),
                 effective_session_id,
-                spec.budgets.max_events,
+                budgets.max_events,
             );
             StdoutDrainOutput {
                 bytes_captured: 0,
@@ -1070,9 +1189,7 @@ pub async fn run_worker_with_observer(
             signal,
             &evidence,
         ) {
-            match opencode_collector::collect(ctx, owned, &validation.resolved_model, cancel_rx)
-                .await
-            {
+            match opencode_collector::collect(ctx, owned, &resolved_model, cancel_rx).await {
                 Ok(meta) => {
                     opencode_metadata = Some(meta);
                     status = WorkerRunStatus::Succeeded;
@@ -1091,9 +1208,9 @@ pub async fn run_worker_with_observer(
     let duration_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     Ok(WorkerExecutionReport {
-        provider: spec.provider,
-        requested_model: validation.resolved_model,
-        requested_session_id: spec.session_id.clone(),
+        provider,
+        requested_model: resolved_model,
+        requested_session_id,
         allocated_session_id,
         constructed_argv,
         working_directory: canonical_workdir,

@@ -92,19 +92,29 @@ pub use opencode_metadata::{
     MAX_OPENCODE_MESSAGES,
 };
 pub use permissions::{
+    build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
     build_antigravity_task_files_settings_json,
-    build_antigravity_task_files_settings_json_for_scopes, is_unsafe_permission_pattern_char,
-    validate_permission_pattern_path, validate_permission_pattern_str, WorkerFilePermissions,
-    AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    build_antigravity_task_files_settings_json_for_scopes, build_opencode_config_content,
+    build_opencode_config_content_json, evaluate_antigravity_settings, evaluate_opencode_rules,
+    is_unsafe_permission_pattern_char, validate_advisory_provider_and_mode,
+    validate_advisory_read_only_workdir, validate_permission_pattern_path,
+    validate_permission_pattern_str, AntigravityPermissionsBlock, AntigravitySessionSettings,
+    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
+    OpenCodeRuleEffect, WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
+    AGY_PROTECTED_READ_DENY_PATTERNS, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    MAX_OPENCODE_CONFIG_BYTES, MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS,
+    OPENCODE_CONFIG_ENV_VAR, OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS,
+    OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS, OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
 };
 pub use spec::resolve_model_target;
 pub use spec::{
     is_control_config_path, is_path_allowed, is_path_allowed_by_scopes, is_path_allowed_syntactic,
-    validate_commit_ref, validate_repo_relative_path, validate_simple_identifier, ExecutionBudgets,
-    ResolvedModelTarget, SpecValidationReport, WorkerPolicy, WorkerProvider, WorkerSpec,
-    WriteScopeKind, DEFAULT_MAX_EVENTS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STDERR_BYTES,
-    DEFAULT_MAX_STDOUT_BYTES, DEFAULT_TIMEOUT_MS, MAX_EVENTS, MAX_IDENTIFIER_LEN, MAX_LINE_BYTES,
-    MAX_PATH_ENTRY_LEN, MAX_PROMPT_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
+    validate_commit_ref, validate_repo_relative_path, validate_simple_identifier,
+    AdvisorySpecValidationReport, AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget,
+    SpecValidationReport, WorkerPolicy, WorkerProvider, WorkerSpec, WriteScopeKind,
+    DEFAULT_MAX_EVENTS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_TIMEOUT_MS, MAX_EVENTS, MAX_IDENTIFIER_LEN, MAX_LINE_BYTES, MAX_PATH_ENTRY_LEN,
+    MAX_PROMPT_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
 pub use stream::{
     BlockedEvidence, BlockedKind, EffortEvidenceSource, FieldEvidence, MalformedLineDiagnostic,
@@ -112,7 +122,8 @@ pub use stream::{
     StreamEvidenceSummary,
 };
 pub use supervisor::{
-    is_process_alive, is_process_group_alive, run_worker, run_worker_with_cancel,
+    is_process_alive, is_process_group_alive, run_advisory_worker, run_advisory_worker_with_cancel,
+    run_advisory_worker_with_observer, run_worker, run_worker_with_cancel,
     run_worker_with_observer, OutputOverflowKind, WorkerExecutionReport, WorkerRunStatus,
     POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
 };

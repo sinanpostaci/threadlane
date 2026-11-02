@@ -9,15 +9,20 @@ use crate::fs_safety::{
     ensure_platform_supported, validate_absolute_no_symlink_components, validate_executable_file,
     validate_existing_canonical_dir,
 };
+pub use crate::permissions::{
+    build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
+    build_opencode_config_content, build_opencode_config_content_json,
+    evaluate_antigravity_settings, evaluate_opencode_rules, validate_advisory_provider_and_mode,
+    validate_advisory_read_only_workdir, AntigravityPermissionsBlock, AntigravitySessionSettings,
+    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
+    OpenCodeRuleEffect, WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
+    AGY_PROTECTED_READ_DENY_PATTERNS, MAX_OPENCODE_CONFIG_BYTES, MAX_TASK_FILES_SETTINGS_BYTES,
+    MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR, OPENCODE_DEFAULT_AGENT,
+    OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
+    OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
+};
 use crate::permissions::{
     build_antigravity_task_files_settings_json_for_scopes, validate_permission_pattern_path,
-};
-pub use crate::permissions::{
-    build_opencode_config_content, build_opencode_config_content_json, evaluate_opencode_rules,
-    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
-    OpenCodeRuleEffect, WorkerFilePermissions, MAX_OPENCODE_CONFIG_BYTES,
-    MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
-    OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS,
 };
 
 /// Default execution timeout (5 minutes in milliseconds).
@@ -360,9 +365,22 @@ impl WorkerSpec {
             }
         }
 
+        if self.allowed_write_paths.is_empty() {
+            return Err(WorkerError::InvalidSpec(
+                "allowed_write_paths must contain at least one repository-relative path"
+                    .to_string(),
+            ));
+        }
+        if self.file_permissions == WorkerFilePermissions::ReadOnly {
+            return Err(WorkerError::InvalidSpec(
+                "`file_permissions: read_only` requires `AdvisoryWorkerSpec` with zero write scopes; `WorkerSpec` is only for mutable task worktrees (`inherit` or `task_files`)"
+                    .to_string(),
+            ));
+        }
+
         self.file_permissions
             .validate_for_provider_and_paths(self.provider, &self.allowed_write_paths)?;
-        if self.file_permissions == WorkerFilePermissions::TaskFiles {
+        if self.file_permissions.requires_workdir_argv() {
             let _ = validate_permission_pattern_path(&work_area_root, "work_area_root")?;
         }
 
@@ -371,7 +389,10 @@ impl WorkerSpec {
         let workdir_argv_resolution_required = self.provider == WorkerProvider::Antigravity
             && self.file_permissions.requires_workdir_argv();
         let argv_resolution_note = workdir_argv_resolution_required.then(|| {
-            "file_permissions is `task_files`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.".to_string()
+            format!(
+                "file_permissions is `{}`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.",
+                self.file_permissions.as_str()
+            )
         });
 
         Ok(SpecValidationReport {
@@ -430,19 +451,19 @@ impl WorkerSpec {
     /// when `file_permissions` is [`WorkerFilePermissions::Inherit`].
     ///
     /// Returns [`WorkerError::InvalidSpec`] when `file_permissions` is
-    /// [`WorkerFilePermissions::TaskFiles`] because session-only `--settings <inline-json>`
-    /// requires validating and interpolating the actual canonical task working directory via
-    /// [`WorkerSpec::build_argv_for_workdir`].
+    /// [`WorkerFilePermissions::TaskFiles`] or [`WorkerFilePermissions::ReadOnly`] on Antigravity
+    /// because session-only `--settings <inline-json>` requires validating and interpolating the
+    /// actual canonical working directory via [`WorkerSpec::build_argv_for_workdir`].
     ///
     /// Never uses shell interpolation, never invents unsupported flags (such as `--variant`),
     /// and never adds `--dangerously-skip-permissions` or `--auto`.
     pub fn build_argv(&self) -> Result<Vec<String>, WorkerError> {
         let report = self.validate()?;
         if report.workdir_argv_resolution_required {
-            return Err(WorkerError::InvalidSpec(
-                "`file_permissions: task_files` requires a canonical task working directory to construct session-only `--settings`; call `WorkerSpec::build_argv_for_workdir`"
-                    .to_string(),
-            ));
+            return Err(WorkerError::InvalidSpec(format!(
+                "`file_permissions: {}` requires a canonical task working directory to construct session-only `--settings`; call `WorkerSpec::build_argv_for_workdir`",
+                self.file_permissions.as_str()
+            )));
         }
         Ok(report.constructed_argv)
     }
@@ -459,7 +480,8 @@ impl WorkerSpec {
     /// pinned `base_commit` tree via [`crate::git::resolve_allowed_write_scopes_at_base`] and
     /// injects `--settings <inline-json>` scoped to `working_directory` (granting descendant `/**`
     /// rules only for [`WriteScopeKind::DirectorySubtree`] scopes and exact-only rules for
-    /// [`WriteScopeKind::ExactFile`] scopes).
+    /// [`WriteScopeKind::ExactFile`] scopes). [`WorkerFilePermissions::ReadOnly`] is rejected on
+    /// [`WorkerSpec`] and must use [`AdvisoryWorkerSpec::build_argv_for_workdir`].
     pub fn build_argv_for_workdir(
         &self,
         working_directory: &Path,
@@ -480,6 +502,12 @@ impl WorkerSpec {
                     &canonical_workdir,
                     &resolved_write_scopes,
                 )?)
+            }
+            (WorkerProvider::Antigravity, WorkerFilePermissions::ReadOnly) => {
+                return Err(WorkerError::InvalidSpec(
+                    "`file_permissions: read_only` requires `AdvisoryWorkerSpec` with zero write scopes; `WorkerSpec` is only for mutable task worktrees (`inherit` or `task_files`)"
+                        .to_string(),
+                ));
             }
             (WorkerProvider::OpenCodeV2, _) => {
                 let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
@@ -541,8 +569,8 @@ impl WorkerSpec {
     /// For [`WorkerProvider::Antigravity`], returns an empty vector so legacy Antigravity launch
     /// behavior is completely unchanged. For [`WorkerProvider::OpenCodeV2`], returns
     /// `[("OPENCODE_CONFIG_CONTENT", <json>)]` so the child process receives bounded model/agent/
-    /// policy (and optional V2 `TaskFiles` permission) configuration overriding any inherited
-    /// `OPENCODE_CONFIG_CONTENT` in the child environment only.
+    /// policy (and optional V2 `TaskFiles` or `ReadOnly` permission) configuration overriding any
+    /// inherited `OPENCODE_CONFIG_CONTENT` in the child environment only.
     pub fn build_child_env_for_workdir(
         &self,
         working_directory: &Path,
@@ -564,49 +592,406 @@ impl WorkerSpec {
         resolved: &ResolvedModelTarget,
         settings_json: Option<String>,
     ) -> Vec<String> {
+        build_provider_argv_from_resolved(
+            self.provider,
+            resolved,
+            "accept-edits",
+            self.standalone,
+            self.session_id.as_deref(),
+            settings_json,
+            &self.prompt,
+        )
+    }
+}
+
+const fn default_advisory_file_permissions() -> WorkerFilePermissions {
+    WorkerFilePermissions::ReadOnly
+}
+
+/// Typed, pre-validated specification for launching a provider-configured read-only advisory
+/// worker process inside an existing canonical non-root working directory.
+///
+/// Unlike [`WorkerSpec`], an advisory worker never creates a mutable Git worktree, never
+/// accepts write scopes (`allowed_write_paths` must be empty), and fails closed with
+/// [`WorkerError::UnsupportedCapability`] if `file_permissions` is not
+/// [`WorkerFilePermissions::ReadOnly`]. For Antigravity, `AdvisoryWorkerSpec` constructs
+/// `--mode plan` (never `accept-edits`, `auto`, or `--dangerously-skip-permissions`) along
+/// with session-only `--settings <inline-json>`; for OpenCode v2, it constructs
+/// `OPENCODE_CONFIG_CONTENT` with read-only `policies` and `permissions`.
+///
+/// Static provider/mode admission and generated policy fixtures are distinct from live
+/// runtime enforcement inside the external CLI binary, and provider configuration is a
+/// provider-level policy rather than an OS-level filesystem or process sandbox.
+/// Credentials remain strictly provider-managed and are never embedded in `AdvisoryWorkerSpec`
+/// or emitted to snapshots/output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdvisoryWorkerSpec {
+    /// Target worker CLI provider (`antigravity` or `opencode_v2`).
+    pub provider: WorkerProvider,
+    /// Absolute path to the non-symlink worker executable.
+    pub executable: PathBuf,
+    /// Exact requested model identifier (`gemini-4-argon-high` or `provider/model` / `provider/model#variant`).
+    pub model: String,
+    /// Exact requested effort or variant (`high` for Antigravity; `#variant` for OpenCode v2).
+    #[serde(default, alias = "variant")]
+    pub effort: Option<String>,
+    /// Optional explicit trusted allowlist of permitted model identifiers.
+    #[serde(default)]
+    pub allowed_models: BTreeSet<String>,
+    /// Optional session identifier (`--session <ID>`, supported only for `opencode_v2`).
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Whether to pass the global `--standalone` flag before `run` (required `true` for `opencode_v2`; must be `false` for `antigravity`).
+    #[serde(default)]
+    pub standalone: bool,
+    /// Trusted canonical non-root advisory working directory (`cwd`).
+    pub working_directory: PathBuf,
+    /// Write scopes for the invocation; must always be empty (`0` paths) for advisory workers.
+    #[serde(default)]
+    pub allowed_write_paths: BTreeSet<String>,
+    /// Untrusted advisory prompt passed as data in the argument array.
+    pub prompt: String,
+    /// Trusted session-scoped provider file permission mode (defaults to `read_only`;
+    /// `inherit` and `task_files` are rejected with [`WorkerError::UnsupportedCapability`]).
+    #[serde(default = "default_advisory_file_permissions")]
+    pub file_permissions: WorkerFilePermissions,
+    /// Finite execution timeout and output capture budgets.
+    #[serde(default)]
+    pub budgets: ExecutionBudgets,
+}
+
+/// Structured result of validating an [`AdvisoryWorkerSpec`] and resolving its read-only
+/// launch argv and per-child environment overrides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdvisorySpecValidationReport {
+    /// Validated provider (`antigravity` or `opencode_v2`).
+    pub provider: WorkerProvider,
+    /// Validated file permission mode (always [`WorkerFilePermissions::ReadOnly`]).
+    pub file_permissions: WorkerFilePermissions,
+    /// Canonical executable path.
+    pub canonical_executable: PathBuf,
+    /// Canonical non-root advisory working directory.
+    pub canonical_working_directory: PathBuf,
+    /// Resolved model and effort/variant details.
+    pub resolved_model: ResolvedModelTarget,
+    /// Complete launch argv array (excluding `argv[0]`), including session-only `--settings`
+    /// when `provider` is [`WorkerProvider::Antigravity`].
+    pub constructed_argv: Vec<String>,
+    /// Per-child environment variable overrides (`[]` for Antigravity;
+    /// `[("OPENCODE_CONFIG_CONTENT", <json>)]` for OpenCode v2).
+    pub child_env: Vec<(String, String)>,
+    /// Validated (always empty) write-scope set.
+    pub allowed_write_paths: BTreeSet<String>,
+    /// Validated execution budgets.
+    pub budgets: ExecutionBudgets,
+}
+
+impl AdvisoryWorkerSpec {
+    /// Validates all fields of the advisory worker spec before launch and returns an
+    /// [`AdvisorySpecValidationReport`] with the resolved read-only launch argv and child env.
+    ///
+    /// Fails closed with [`WorkerError::UnsupportedCapability`] if `file_permissions` is not
+    /// [`WorkerFilePermissions::ReadOnly`], and with [`WorkerError::InvalidSpec`] if
+    /// `allowed_write_paths` is non-empty or `working_directory` is root `/`, contains symlinks
+    /// or glob metacharacters, or targets a protected control path.
+    pub fn validate(&self) -> Result<AdvisorySpecValidationReport, WorkerError> {
+        self.validate_for_workdir(&self.working_directory)
+    }
+
+    /// Validates the advisory spec and enforces an external trusted [`WorkerPolicy`].
+    pub fn validate_against_policy(
+        &self,
+        policy: &WorkerPolicy,
+    ) -> Result<AdvisorySpecValidationReport, WorkerError> {
+        let report = self.validate()?;
+        if !policy.allowed_executables.is_empty()
+            && !policy
+                .allowed_executables
+                .contains(&report.canonical_executable)
+            && !policy.allowed_executables.contains(&self.executable)
+        {
+            return Err(WorkerError::DisallowedExecutable {
+                executable: report.canonical_executable,
+            });
+        }
+        if !policy.allowed_models.is_empty()
+            && !policy.allowed_models.contains(&self.model)
+            && !policy
+                .allowed_models
+                .contains(&report.resolved_model.base_model)
+            && !policy
+                .allowed_models
+                .contains(&report.resolved_model.cli_model_arg)
+        {
+            return Err(WorkerError::DisallowedModel {
+                model: report.resolved_model.cli_model_arg,
+            });
+        }
+        Ok(report)
+    }
+
+    /// Resolves and validates the provider-specific model and effort/variant identifiers.
+    pub fn resolve_model_target(&self) -> Result<ResolvedModelTarget, WorkerError> {
+        resolve_model_target(self.provider, &self.model, self.effort.as_deref())
+    }
+
+    /// Validates the spec and returns the complete launch CLI argument array (excluding `argv[0]`)
+    /// for `self.working_directory`.
+    pub fn build_argv(&self) -> Result<Vec<String>, WorkerError> {
+        Ok(self.validate()?.constructed_argv)
+    }
+
+    /// Validates the spec and `working_directory` and returns the complete launch CLI argument
+    /// array (excluding `argv[0]`) for `working_directory`.
+    pub fn build_argv_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<Vec<String>, WorkerError> {
+        Ok(self
+            .validate_for_workdir(working_directory)?
+            .constructed_argv)
+    }
+
+    /// Validates the spec and returns the per-child environment variable overrides for
+    /// `self.working_directory`.
+    pub fn build_child_env(&self) -> Result<Vec<(String, String)>, WorkerError> {
+        Ok(self.validate()?.child_env)
+    }
+
+    /// Validates the spec and `working_directory` and returns the per-child environment variable
+    /// overrides for `working_directory`.
+    pub fn build_child_env_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<Vec<(String, String)>, WorkerError> {
+        Ok(self.validate_for_workdir(working_directory)?.child_env)
+    }
+
+    /// Builds the structured session-only Antigravity [`AntigravitySessionSettings`] for this
+    /// advisory spec.
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] if `self.provider` is not
+    /// [`WorkerProvider::Antigravity`].
+    pub fn build_antigravity_settings(&self) -> Result<AntigravitySessionSettings, WorkerError> {
+        let report = self.validate()?;
+        if self.provider != WorkerProvider::Antigravity {
+            return Err(WorkerError::InvalidSpec(format!(
+                "`build_antigravity_settings` is only supported for provider `antigravity` (got `{}`)",
+                self.provider.as_str()
+            )));
+        }
+        build_antigravity_read_only_settings(&report.canonical_working_directory)
+    }
+
+    /// Builds and serializes the session-only Antigravity `--settings <inline-json>` string for
+    /// this advisory spec.
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] if `self.provider` is not
+    /// [`WorkerProvider::Antigravity`].
+    pub fn build_antigravity_settings_json(&self) -> Result<String, WorkerError> {
+        let report = self.validate()?;
+        if self.provider != WorkerProvider::Antigravity {
+            return Err(WorkerError::InvalidSpec(format!(
+                "`build_antigravity_settings_json` is only supported for provider `antigravity` (got `{}`)",
+                self.provider.as_str()
+            )));
+        }
+        build_antigravity_read_only_settings_json(&report.canonical_working_directory)
+    }
+
+    /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for this advisory spec.
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] if `self.provider` is not
+    /// [`WorkerProvider::OpenCodeV2`].
+    pub fn build_opencode_config_content(&self) -> Result<OpenCodeConfigContent, WorkerError> {
+        let report = self.validate()?;
+        if self.provider != WorkerProvider::OpenCodeV2 {
+            return Err(WorkerError::InvalidSpec(format!(
+                "`build_opencode_config_content` is only supported for provider `opencode_v2` (got `{}`)",
+                self.provider.as_str()
+            )));
+        }
+        build_opencode_config_content(
+            &report.resolved_model,
+            self.file_permissions,
+            &report.canonical_working_directory,
+            &self.allowed_write_paths,
+        )
+    }
+
+    /// Builds and serializes the bounded per-child `OPENCODE_CONFIG_CONTENT` JSON string for this
+    /// advisory spec.
+    ///
+    /// Returns [`WorkerError::InvalidSpec`] if `self.provider` is not
+    /// [`WorkerProvider::OpenCodeV2`].
+    pub fn build_opencode_config_json(&self) -> Result<String, WorkerError> {
+        let report = self.validate()?;
+        if self.provider != WorkerProvider::OpenCodeV2 {
+            return Err(WorkerError::InvalidSpec(format!(
+                "`build_opencode_config_json` is only supported for provider `opencode_v2` (got `{}`)",
+                self.provider.as_str()
+            )));
+        }
+        build_opencode_config_content_json(
+            &report.resolved_model,
+            self.file_permissions,
+            &report.canonical_working_directory,
+            &self.allowed_write_paths,
+        )
+    }
+
+    fn validate_for_workdir(
+        &self,
+        working_directory: &Path,
+    ) -> Result<AdvisorySpecValidationReport, WorkerError> {
+        ensure_platform_supported()?;
+        self.budgets.validate()?;
+
+        self.file_permissions
+            .ensure_advisory_read_only_capability(self.provider)?;
+        self.file_permissions
+            .validate_for_provider_and_paths(self.provider, &self.allowed_write_paths)?;
+
+        let canonical_executable = validate_executable_file(&self.executable)?;
+        let canonical_working_directory = validate_advisory_read_only_workdir(working_directory)?;
+        let resolved_model = self.resolve_model_target()?;
+
+        if !self.allowed_models.is_empty()
+            && !self.allowed_models.contains(&self.model)
+            && !self.allowed_models.contains(&resolved_model.base_model)
+            && !self.allowed_models.contains(&resolved_model.cli_model_arg)
+        {
+            return Err(WorkerError::DisallowedModel {
+                model: resolved_model.cli_model_arg,
+            });
+        }
+
         match self.provider {
             WorkerProvider::Antigravity => {
-                let effort = resolved
-                    .effort
-                    .as_deref()
-                    .expect("Antigravity effort is verified during model target resolution");
-                let mut argv = Vec::with_capacity(if settings_json.is_some() { 14 } else { 12 });
-                argv.push("--model".to_string());
-                argv.push(resolved.cli_model_arg.clone());
-                argv.push("--effort".to_string());
-                argv.push(effort.to_string());
-                argv.push("--mode".to_string());
-                argv.push("accept-edits".to_string());
-                argv.push("--output-format".to_string());
-                argv.push("stream-json".to_string());
-                argv.push("--print-timeout".to_string());
-                argv.push("0".to_string());
-                if let Some(settings) = settings_json {
-                    argv.push("--settings".to_string());
-                    argv.push(settings);
+                if self.session_id.is_some() {
+                    return Err(WorkerError::InvalidSpec(
+                        "`session_id` (`--session`) is only supported for provider `opencode_v2`"
+                            .to_string(),
+                    ));
                 }
-                argv.push("--print".to_string());
-                argv.push(self.prompt.clone());
-                argv
+                if self.standalone {
+                    return Err(WorkerError::InvalidSpec(
+                        "`standalone` (`--standalone`) is only supported for provider `opencode_v2`"
+                            .to_string(),
+                    ));
+                }
             }
             WorkerProvider::OpenCodeV2 => {
-                let mut argv = Vec::with_capacity(10);
-                if self.standalone {
-                    argv.push("--standalone".to_string());
+                if !self.standalone {
+                    return Err(WorkerError::InvalidSpec(
+                        "provider `opencode_v2` requires `standalone: true` (`--standalone`) so each worker runs an isolated private server rather than attaching to an unowned shared background server"
+                            .to_string(),
+                    ));
                 }
-                argv.push("run".to_string());
-                argv.push("--model".to_string());
-                argv.push(resolved.cli_model_arg.clone());
-                argv.push("--format".to_string());
-                argv.push("json".to_string());
                 if let Some(ref session_id) = self.session_id {
-                    argv.push("--session".to_string());
-                    argv.push(session_id.clone());
+                    validate_simple_identifier(session_id, "session_id")?;
                 }
-                argv.push("--".to_string());
-                argv.push(self.prompt.clone());
-                argv
             }
+        }
+
+        validate_prompt(&self.prompt)?;
+
+        let (settings_json, child_env) = match self.provider {
+            WorkerProvider::Antigravity => {
+                let settings =
+                    build_antigravity_read_only_settings_json(&canonical_working_directory)?;
+                (Some(settings), Vec::new())
+            }
+            WorkerProvider::OpenCodeV2 => {
+                let config_json = build_opencode_config_content_json(
+                    &resolved_model,
+                    self.file_permissions,
+                    &canonical_working_directory,
+                    &self.allowed_write_paths,
+                )?;
+                (
+                    None,
+                    vec![(OPENCODE_CONFIG_ENV_VAR.to_string(), config_json)],
+                )
+            }
+        };
+
+        let constructed_argv = build_provider_argv_from_resolved(
+            self.provider,
+            &resolved_model,
+            "plan",
+            self.standalone,
+            self.session_id.as_deref(),
+            settings_json,
+            &self.prompt,
+        );
+
+        Ok(AdvisorySpecValidationReport {
+            provider: self.provider,
+            file_permissions: self.file_permissions,
+            canonical_executable,
+            canonical_working_directory,
+            resolved_model,
+            constructed_argv,
+            child_env,
+            allowed_write_paths: self.allowed_write_paths.clone(),
+            budgets: self.budgets.clone(),
+        })
+    }
+}
+
+fn build_provider_argv_from_resolved(
+    provider: WorkerProvider,
+    resolved: &ResolvedModelTarget,
+    antigravity_mode: &str,
+    standalone: bool,
+    session_id: Option<&str>,
+    settings_json: Option<String>,
+    prompt: &str,
+) -> Vec<String> {
+    match provider {
+        WorkerProvider::Antigravity => {
+            let effort = resolved
+                .effort
+                .as_deref()
+                .expect("Antigravity effort is verified during model target resolution");
+            let mut argv = Vec::with_capacity(if settings_json.is_some() { 14 } else { 12 });
+            argv.push("--model".to_string());
+            argv.push(resolved.cli_model_arg.clone());
+            argv.push("--effort".to_string());
+            argv.push(effort.to_string());
+            argv.push("--mode".to_string());
+            argv.push(antigravity_mode.to_string());
+            argv.push("--output-format".to_string());
+            argv.push("stream-json".to_string());
+            argv.push("--print-timeout".to_string());
+            argv.push("0".to_string());
+            if let Some(settings) = settings_json {
+                argv.push("--settings".to_string());
+                argv.push(settings);
+            }
+            argv.push("--print".to_string());
+            argv.push(prompt.to_string());
+            argv
+        }
+        WorkerProvider::OpenCodeV2 => {
+            let mut argv = Vec::with_capacity(10);
+            if standalone {
+                argv.push("--standalone".to_string());
+            }
+            argv.push("run".to_string());
+            argv.push("--model".to_string());
+            argv.push(resolved.cli_model_arg.clone());
+            argv.push("--format".to_string());
+            argv.push("json".to_string());
+            if let Some(session_id) = session_id {
+                argv.push("--session".to_string());
+                argv.push(session_id.to_string());
+            }
+            argv.push("--".to_string());
+            argv.push(prompt.to_string());
+            argv
         }
     }
 }

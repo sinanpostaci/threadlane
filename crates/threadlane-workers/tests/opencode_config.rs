@@ -334,6 +334,9 @@ fn pins_primary_and_auxiliary_models_and_provider_policies_under_inherit_and_tas
                 );
                 assert!(root.get("permissions").and_then(Value::as_array).is_some());
             }
+            WorkerFilePermissions::ReadOnly => {
+                unreachable!("loop exercises only WorkerSpec Inherit and TaskFiles modes")
+            }
         }
     }
 

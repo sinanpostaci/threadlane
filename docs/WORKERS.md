@@ -130,6 +130,41 @@ supervisor executes and records this resolved argv, while private runtime report
 artifacts continue to clear prompt argv. Missing observed model/effort evidence
 is not repaired by the permission option.
 
+### Read-only advisory worker permissions (`AdvisoryWorkerSpec`)
+
+`AdvisoryWorkerSpec` configures read-only advisory runs (`file_permissions: "read_only"`,
+`allowed_write_paths: []`) inside an existing canonical non-root `working_directory`
+free of symlink components, glob/rule metacharacters, and protected control-path
+components. Non-`read_only` modes (`inherit`, `task_files`) and unsupported
+providers fail closed with `WorkerError::UnsupportedCapability` before launch;
+ordinary mutable `WorkerSpec` invocations keep their legacy `--mode accept-edits`
+argv byte-for-byte.
+
+- **Antigravity (`agy` 1.4.12)**: `AdvisoryWorkerSpec` constructs `--mode plan`
+  (never `accept-edits`, `auto`, or `--dangerously-skip-permissions`) with
+  session-only `--settings <inline-json>`. The generated settings allow only
+  `read_file(<canonical_workdir>/**)` and explicitly deny file/notebook write
+  tools (`edit_file`, `write_file`, `write_to_file`, `replace_file_content`,
+  `multi_replace_file_content`, `notebook_edit`) both globally (`*`) and under
+  `<canonical_workdir>/**`, all shell/terminal, notebook execution,
+  subagent/workflow, MCP, web/browser execution and interaction, knowledge,
+  image, marketplace/account, and interactive tools in
+  `AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS` (`<tool>(*)`), and protected
+  secret/control reads (`AGY_PROTECTED_READ_DENY_PATTERNS`).
+- **OpenCode v2 (`opencode`)**: `AdvisoryWorkerSpec` passes per-child
+  `OPENCODE_CONFIG_CONTENT` pinning primary and auxiliary agent models
+  (`build`, `title`, `summary`, `compaction`), denying non-selected providers,
+  MCP, and effectful/delegation `tool.use` policies, and restricting V2
+  `permissions` to internal `read`/`glob`/`grep` with trailing `.env` and
+  control-directory denials.
+- **Verification boundary**: Static provider/mode admission and local fixture
+  evaluators (`evaluate_antigravity_settings`, `evaluate_opencode_rules`) verify
+  only our generated policy payloads and CLI flag construction. They do **not**
+  prove live runtime enforcement or default-denial semantics inside the external
+  `agy` or `opencode` binary (which require a separate bounded live provider
+  capability probe), and provider policy is **not** an OS-level filesystem,
+  process, or network sandbox.
+
 ### 3. Incremental NDJSON Evidence Parser (`threadlane_workers::stream`)
 
 `NdjsonStreamParser` processes stdout line-by-line within bounded memory and produces a

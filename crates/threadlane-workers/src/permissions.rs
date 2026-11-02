@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,111 @@ pub const AGY_WRITE_PERMISSION_TOOLS: [&str; 5] = [
     "write_to_file",
     "replace_file_content",
     "multi_replace_file_content",
+];
+
+/// Non-read execution, notebook, knowledge, workflow, shell, subagent, MCP, web/browser,
+/// marketplace/account, and interactive tool identifiers explicitly denied in Antigravity
+/// [`WorkerFilePermissions::ReadOnly`] `--settings` payloads.
+pub const AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS: &[&str] = &[
+    "run_command",
+    "bash",
+    "shell",
+    "execute",
+    "run_in_terminal",
+    "send_command_input",
+    "manage_task",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+    "subagent",
+    "task",
+    "agent",
+    "browser_subagent",
+    "run_workflow",
+    "notebook_edit",
+    "notebook_execution",
+    "delete_knowledge",
+    "generate_image",
+    "call_mcp_tool",
+    "list_resources",
+    "read_resource",
+    "mcp",
+    "search_web",
+    "web",
+    "webfetch",
+    "websearch",
+    "browser",
+    "open_browser_url",
+    "read_url_content",
+    "execute_browser_javascript",
+    "browser_click_element",
+    "browser_drag_pixel_to_pixel",
+    "browser_input",
+    "browser_mouse_down",
+    "browser_mouse_up",
+    "browser_move_mouse",
+    "browser_press_key",
+    "browser_refresh_page",
+    "browser_resize_window",
+    "browser_scroll",
+    "browser_scroll_dom",
+    "browser_select_option",
+    "click_browser_pixel",
+    "manage_inbox",
+    "search_marketplace",
+    "list_plugin_accounts",
+    "ask_question",
+    "schedule",
+];
+
+/// Protected secret and control-directory glob suffixes explicitly denied for `read_file`
+/// inside `<canonical_workdir>` in Antigravity [`WorkerFilePermissions::ReadOnly`] settings.
+pub const AGY_PROTECTED_READ_DENY_PATTERNS: [&str; 28] = OPENCODE_PROTECTED_READ_AND_EDIT_PATTERNS;
+
+/// Tool resources explicitly denied via `tool.use` policy rules when `file_permissions` is
+/// [`WorkerFilePermissions::ReadOnly`] in OpenCode V2 configuration.
+pub const OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES: [&str; 16] = [
+    "subagent",
+    "task",
+    "agent",
+    "edit",
+    "write",
+    "patch",
+    "apply_patch",
+    "multiedit",
+    "shell",
+    "bash",
+    "execute",
+    "web",
+    "webfetch",
+    "websearch",
+    "todowrite",
+    "question",
+];
+
+/// Action identifiers explicitly denied on `"*"` in OpenCode V2 [`WorkerFilePermissions::ReadOnly`]
+/// `permissions` rules before internal location-relative `read`/`glob`/`grep` rules are evaluated.
+pub const OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS: [&str; 19] = [
+    "*",
+    "external_directory",
+    "shell",
+    "bash",
+    "subagent",
+    "task",
+    "agent",
+    "execute",
+    "web",
+    "webfetch",
+    "websearch",
+    "mcp",
+    "edit",
+    "write",
+    "patch",
+    "apply_patch",
+    "multiedit",
+    "todowrite",
+    "question",
 ];
 
 /// Environment variable consumed by OpenCode 2.2.0 (`opencode_v2`) for per-process inline JSON configuration.
@@ -113,9 +218,12 @@ const OPENCODE_PROTECTED_EDIT_ONLY_PATTERNS: [&str; 22] = [
 
 /// Trusted provider file-permission scoping policy for a worker invocation.
 ///
-/// Provider permission flags and per-child configuration are session-only hints; they are **not**
-/// an OS-level sandbox, do **not** replace the mandatory post-run Git diff gate, and do **not**
-/// guarantee global deny isolation if user-inherited provider settings grant broader rules.
+/// Provider permission flags and per-child configuration are session-only provider capability
+/// policies; they are **not** an OS-level sandbox and do **not** replace the mandatory post-run
+/// Git diff gate for write tasks. Static mode admission and generated fixture policies are
+/// distinct from live provider runtime enforcement. [`WorkerFilePermissions::Inherit`] and
+/// [`WorkerFilePermissions::TaskFiles`] do not configure a read-only advisory deny policy;
+/// advisory roles must use [`WorkerFilePermissions::ReadOnly`].
 #[derive(
     Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -129,32 +237,91 @@ pub enum WorkerFilePermissions {
     /// (`--settings <inline-json>` for Antigravity; V2 `permissions` rules in
     /// `OPENCODE_CONFIG_CONTENT` for OpenCode v2).
     TaskFiles,
+    /// Configure session permissions for read-only advisory inspection inside the canonical
+    /// non-root working directory with zero allowed write scopes, explicit write/notebook/shell/
+    /// delegation/MCP/web/browser denials, and protected-control read denials (`--mode plan` and
+    /// `--settings <inline-json>` with scoped `allow` and `deny` for Antigravity; V2 `policies`
+    /// and `permissions` in `OPENCODE_CONFIG_CONTENT` for OpenCode v2).
+    ReadOnly,
 }
 
 impl WorkerFilePermissions {
-    /// Returns the canonical `snake_case` representation (`"inherit"` or `"task_files"`).
+    /// Returns the canonical `snake_case` representation (`"inherit"`, `"task_files"`, or `"read_only"`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Inherit => "inherit",
             Self::TaskFiles => "task_files",
+            Self::ReadOnly => "read_only",
         }
     }
 
-    /// Returns `true` when constructing the final launch argv for Antigravity requires the
-    /// canonical task working directory (`TaskFiles`).
-    pub fn requires_workdir_argv(self) -> bool {
-        matches!(self, Self::TaskFiles)
+    /// Returns `true` when this mode is [`WorkerFilePermissions::ReadOnly`].
+    pub fn is_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
     }
 
-    /// Validates that this permission mode is supported for `provider` and that all
-    /// `allowed_write_paths` entries are valid, within finite `TaskFiles` bounds, and free of
-    /// unsafe glob/rule metacharacters.
+    /// Returns `true` when this mode selects the provider read-only advisory permission policy
+    /// ([`WorkerFilePermissions::ReadOnly`]).
+    ///
+    /// [`WorkerFilePermissions::Inherit`] does not configure a read-only deny policy and
+    /// [`WorkerFilePermissions::TaskFiles`] grants write permissions.
+    pub fn enforces_preventive_read_only(self) -> bool {
+        matches!(self, Self::ReadOnly)
+    }
+
+    /// Returns `true` when constructing the final launch argv for Antigravity requires the
+    /// canonical working directory (`TaskFiles` or `ReadOnly`).
+    pub fn requires_workdir_argv(self) -> bool {
+        matches!(self, Self::TaskFiles | Self::ReadOnly)
+    }
+
+    /// Verifies that `(provider, self)` is admitted for read-only advisory provider configuration.
+    ///
+    /// Rejects non-`ReadOnly` modes (`Inherit` and `TaskFiles`) with
+    /// [`WorkerError::UnsupportedCapability`] before launch. This checks provider/mode admission
+    /// and generated policy support; it is not an OS sandbox or proof of live provider runtime
+    /// enforcement.
+    pub fn ensure_advisory_read_only_capability(
+        self,
+        provider: WorkerProvider,
+    ) -> Result<(), WorkerError> {
+        match self {
+            Self::ReadOnly => match provider {
+                WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => Ok(()),
+            },
+            Self::Inherit | Self::TaskFiles => Err(WorkerError::UnsupportedCapability {
+                provider: provider.as_str().to_string(),
+                capability: format!("advisory_file_permissions:{}", self.as_str()),
+                reason: format!(
+                    "advisory workers require preventive `file_permissions: read_only`; `{}` does not establish preventive read-only capability enforcement",
+                    self.as_str()
+                ),
+            }),
+        }
+    }
+
+    /// Validates that this permission mode is supported for `provider` and that
+    /// `allowed_write_paths` satisfies the mode's invariants:
+    /// - When `self` is [`WorkerFilePermissions::ReadOnly`], `allowed_write_paths` **must be empty**
+    ///   (zero write scopes).
+    /// - When `self` is [`WorkerFilePermissions::Inherit`] or [`WorkerFilePermissions::TaskFiles`],
+    ///   `allowed_write_paths` must be non-empty, within finite `TaskFiles` bounds, free of
+    ///   protected control paths, and free of unsafe glob/rule metacharacters.
     pub fn validate_for_provider_and_paths(
         self,
         provider: WorkerProvider,
         allowed_write_paths: &BTreeSet<String>,
     ) -> Result<(), WorkerError> {
-        let _ = provider;
+        if self == Self::ReadOnly {
+            self.ensure_advisory_read_only_capability(provider)?;
+            if !allowed_write_paths.is_empty() {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "allowed_write_paths must be empty when `file_permissions` is `read_only` (got {} entries)",
+                    allowed_write_paths.len()
+                )));
+            }
+            return Ok(());
+        }
 
         if allowed_write_paths.is_empty() {
             return Err(WorkerError::InvalidSpec(
@@ -184,6 +351,41 @@ impl WorkerFilePermissions {
 
         Ok(())
     }
+}
+
+/// Validates a raw provider identifier string and [`WorkerFilePermissions`] mode for read-only
+/// advisory worker admission, failing closed with [`WorkerError::UnsupportedCapability`] when the
+/// provider has no supported read-only advisory configuration (for example `codex_cli`, `jev_api`,
+/// `openai_decisions_api`, `git`, `tmux`, `codegraph`, or unknown providers) or when the mode is
+/// not [`WorkerFilePermissions::ReadOnly`].
+///
+/// This checks static provider/mode admission; it does not prove live provider runtime deny
+/// behavior or establish an OS sandbox.
+pub fn validate_advisory_provider_and_mode(
+    provider_id: &str,
+    file_permissions: WorkerFilePermissions,
+) -> Result<WorkerProvider, WorkerError> {
+    let trimmed = provider_id.trim();
+    let provider = match trimmed {
+        "antigravity" | "agy" => WorkerProvider::Antigravity,
+        "opencode_v2" | "open_code_v2" | "opencode-v2" | "opencode" => WorkerProvider::OpenCodeV2,
+        other => {
+            return Err(WorkerError::UnsupportedCapability {
+                provider: if other.is_empty() {
+                    "<empty>".to_string()
+                } else {
+                    other.to_string()
+                },
+                capability: "read_only_advisory_worker".to_string(),
+                reason: format!(
+                    "provider `{}` does not support preventive `read_only` advisory capability enforcement; only `antigravity` and `opencode_v2` are supported",
+                    if other.is_empty() { "<empty>" } else { other }
+                ),
+            });
+        }
+    };
+    file_permissions.ensure_advisory_read_only_capability(provider)?;
+    Ok(provider)
 }
 
 /// Exact provider, model, and optional variant target pinned in OpenCode V2 configuration.
@@ -247,19 +449,32 @@ pub struct OpenCodeConfigContent {
     pub agents: BTreeMap<String, OpenCodeAgentConfig>,
     /// Ordered provider and MCP policy rules (`provider.use` deny `*` then allow selected provider; `mcp.use` deny `*`).
     pub policies: Vec<OpenCodePermissionRule>,
-    /// Optional ordered V2 permission rules (present when `file_permissions` is [`WorkerFilePermissions::TaskFiles`]).
+    /// Optional ordered V2 permission rules (present when `file_permissions` is
+    /// [`WorkerFilePermissions::TaskFiles`] or [`WorkerFilePermissions::ReadOnly`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<Vec<OpenCodePermissionRule>>,
 }
 
+/// Structured session-only Antigravity `--settings <inline-json>` payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AntigravitySessionSettings {
-    permissions: AntigravityPermissionsBlock,
+#[serde(deny_unknown_fields)]
+pub struct AntigravitySessionSettings {
+    /// Session-scoped tool permission allow and deny rules.
+    pub permissions: AntigravityPermissionsBlock,
 }
 
+/// Antigravity `permissions` block containing `allow` and optional `deny` rule lists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AntigravityPermissionsBlock {
-    allow: Vec<String>,
+#[serde(deny_unknown_fields)]
+pub struct AntigravityPermissionsBlock {
+    /// Explicitly allowed tool rules (`<tool>(<pattern>)`).
+    pub allow: Vec<String>,
+    /// Explicitly denied tool rules (`<tool>(<pattern>)`).
+    ///
+    /// Omitted when empty so [`WorkerFilePermissions::TaskFiles`] serialization remains
+    /// byte-for-byte identical to existing profiles and snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// Returns `true` if `ch` is an ambiguous glob/rule metacharacter (`*`, `?`, `[`, `]`,
@@ -300,6 +515,263 @@ pub fn validate_permission_pattern_path(path: &Path, label: &str) -> Result<Stri
     })?;
     validate_permission_pattern_str(path_str, label)?;
     Ok(path_str.to_string())
+}
+
+/// Validates that `working_directory` is an existing canonical non-root directory without symlink
+/// components, glob/rule metacharacters, or protected control-path components (`.git`, `.codex`,
+/// `.gemini`, `.opencode`, `.agents`, `.claude`, `.github`, `.cargo`, `.env`, etc.) for
+/// [`WorkerFilePermissions::ReadOnly`].
+pub fn validate_advisory_read_only_workdir(
+    working_directory: &Path,
+) -> Result<PathBuf, WorkerError> {
+    let (canonical_workdir, _) = validate_read_only_canonical_workdir(working_directory)?;
+    Ok(canonical_workdir)
+}
+
+fn validate_read_only_canonical_workdir(
+    working_directory: &Path,
+) -> Result<(PathBuf, String), WorkerError> {
+    let canonical_workdir =
+        validate_existing_canonical_dir(working_directory, "working_directory")?;
+    if canonical_workdir.parent().is_none() {
+        return Err(WorkerError::InvalidSpec(
+            "refusing to grant `read_only` permissions on filesystem root directory `/`"
+                .to_string(),
+        ));
+    }
+
+    let workdir_str = validate_permission_pattern_path(&canonical_workdir, "working_directory")?;
+    let clean_workdir = workdir_str.trim_end_matches('/').to_string();
+    if clean_workdir.is_empty() {
+        return Err(WorkerError::InvalidSpec(
+            "refusing to grant `read_only` permissions on empty root directory".to_string(),
+        ));
+    }
+
+    for comp in canonical_workdir.components() {
+        if let Component::Normal(part) = comp {
+            let lowered = part.to_string_lossy().to_ascii_lowercase();
+            if is_protected_control_workdir_component(&lowered) {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "working_directory `{}` targets or resides inside protected control path component `{}`",
+                    canonical_workdir.display(),
+                    part.to_string_lossy()
+                )));
+            }
+        }
+    }
+
+    Ok((canonical_workdir, clean_workdir))
+}
+
+fn is_protected_control_workdir_component(lowered_component: &str) -> bool {
+    matches!(
+        lowered_component,
+        ".git"
+            | ".gitmodules"
+            | ".gitattributes"
+            | ".gitignore"
+            | "agents.md"
+            | "claude.md"
+            | "opencode.json"
+            | "opencode.jsonc"
+            | ".codex"
+            | ".gemini"
+            | ".opencode"
+            | ".agents"
+            | ".claude"
+            | ".github"
+            | ".cargo"
+    ) || lowered_component == ".env"
+        || lowered_component.starts_with(".env.")
+}
+
+/// Builds the structured session-only Antigravity `--settings <inline-json>` [`AntigravitySessionSettings`]
+/// for [`WorkerFilePermissions::ReadOnly`] from an existing canonical non-root `working_directory`.
+///
+/// Note: Session-only `--settings` is a generated provider-level capability policy, **not** an
+/// OS-level filesystem or process sandbox, and generating this payload is distinct from live
+/// runtime enforcement inside the external `agy` binary.
+///
+/// Populates in the generated settings payload:
+/// - `allow`: only `read_file(<canonical_workdir>/**)` (zero write, notebook, shell, subagent,
+///   MCP, or web/browser tools).
+/// - `deny`:
+///   - all file-edit and file-write tools (`edit_file`, `write_file`, `write_to_file`,
+///     `replace_file_content`, `multi_replace_file_content`) and `notebook_edit` both globally
+///     (`<tool>(*)`) and inside `<canonical_workdir>/**`;
+///   - all shell/terminal, notebook execution, subagent/workflow, MCP, web/browser, marketplace/
+///     account, and interactive tools in [`AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS`]
+///     (`<tool>(*)`);
+///   - `read_file(<canonical_workdir>/<pattern>)` for every protected secret and control path in
+///     [`AGY_PROTECTED_READ_DENY_PATTERNS`].
+pub fn build_antigravity_read_only_settings(
+    working_directory: &Path,
+) -> Result<AntigravitySessionSettings, WorkerError> {
+    let (_canonical_workdir, clean_workdir) =
+        validate_read_only_canonical_workdir(working_directory)?;
+
+    let allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({clean_workdir}/**)")];
+
+    let mut deny = Vec::with_capacity(
+        AGY_WRITE_PERMISSION_TOOLS.len() * 2
+            + 1
+            + AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS.len()
+            + AGY_PROTECTED_READ_DENY_PATTERNS.len(),
+    );
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        deny.push(format!("{tool}(*)"));
+        deny.push(format!("{tool}({clean_workdir}/**)"));
+    }
+    deny.push(format!("notebook_edit({clean_workdir}/**)"));
+    for &tool in AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS {
+        deny.push(format!("{tool}(*)"));
+    }
+    for pattern in AGY_PROTECTED_READ_DENY_PATTERNS {
+        deny.push(format!(
+            "{AGY_READ_PERMISSION_TOOL}({clean_workdir}/{pattern})"
+        ));
+    }
+
+    Ok(AntigravitySessionSettings {
+        permissions: AntigravityPermissionsBlock { allow, deny },
+    })
+}
+
+/// Builds and serializes the session-only Antigravity `--settings <inline-json>` payload for
+/// [`WorkerFilePermissions::ReadOnly`], enforcing [`MAX_TASK_FILES_SETTINGS_BYTES`] (`65_536` bytes).
+pub fn build_antigravity_read_only_settings_json(
+    working_directory: &Path,
+) -> Result<String, WorkerError> {
+    let settings = build_antigravity_read_only_settings(working_directory)?;
+    let json = serde_json::to_string(&settings)?;
+    if json.len() > MAX_TASK_FILES_SETTINGS_BYTES {
+        return Err(WorkerError::InvalidSpec(format!(
+            "serialized `read_only` `--settings` JSON payload ({} bytes) exceeds maximum of {MAX_TASK_FILES_SETTINGS_BYTES} bytes",
+            json.len()
+        )));
+    }
+    Ok(json)
+}
+
+/// Deterministically evaluates a generated [`AntigravitySessionSettings`] fixture structure for
+/// `(tool, resource)` using a local explicit-deny-then-allow-then-deny fixture model:
+/// - File/notebook path tools (`read_file`, [`AGY_WRITE_PERMISSION_TOOLS`], and `notebook_edit`)
+///   require a non-empty clean absolute target path without `.` or `..` traversal components or
+///   backslashes;
+/// - If any rule in `settings.permissions.deny` matches `(tool, resource)`, returns
+///   [`OpenCodeRuleEffect::Deny`];
+/// - Otherwise, if any rule in `settings.permissions.allow` matches `(tool, resource)`, returns
+///   [`OpenCodeRuleEffect::Allow`];
+/// - Otherwise, returns [`OpenCodeRuleEffect::Deny`].
+///
+/// Note: This function only inspects our generated `--settings` fixture structure for unit tests.
+/// It does **not** prove live Antigravity (`agy`) runtime enforcement, live default-denial
+/// semantics for unlisted tools, or OS-level sandboxing; live provider deny behavior requires a
+/// separate real provider capability probe.
+pub fn evaluate_antigravity_settings(
+    settings: &AntigravitySessionSettings,
+    tool: &str,
+    resource: Option<&str>,
+) -> OpenCodeRuleEffect {
+    if tool.is_empty() {
+        return OpenCodeRuleEffect::Deny;
+    }
+
+    let is_file_tool = tool == AGY_READ_PERMISSION_TOOL
+        || AGY_WRITE_PERMISSION_TOOLS.contains(&tool)
+        || tool == "notebook_edit";
+    let normalized_resource = match resource {
+        Some(raw) => {
+            if is_file_tool && !is_clean_absolute_permission_resource(raw) {
+                return OpenCodeRuleEffect::Deny;
+            }
+            Some(raw)
+        }
+        None => {
+            if is_file_tool {
+                return OpenCodeRuleEffect::Deny;
+            }
+            None
+        }
+    };
+
+    if settings
+        .permissions
+        .deny
+        .iter()
+        .any(|rule| antigravity_rule_matches(rule, tool, normalized_resource))
+    {
+        return OpenCodeRuleEffect::Deny;
+    }
+
+    if settings
+        .permissions
+        .allow
+        .iter()
+        .any(|rule| antigravity_rule_matches(rule, tool, normalized_resource))
+    {
+        return OpenCodeRuleEffect::Allow;
+    }
+
+    OpenCodeRuleEffect::Deny
+}
+
+impl AntigravitySessionSettings {
+    /// Evaluates `(tool, resource)` against this generated settings structure using the local
+    /// fixture rule model (`evaluate_antigravity_settings`). Does not prove live provider
+    /// runtime enforcement.
+    pub fn evaluate(&self, tool: &str, resource: Option<&str>) -> OpenCodeRuleEffect {
+        evaluate_antigravity_settings(self, tool, resource)
+    }
+}
+
+fn is_clean_absolute_permission_resource(resource: &str) -> bool {
+    if resource.is_empty()
+        || !resource.starts_with('/')
+        || resource.contains('\\')
+        || resource.contains('\0')
+        || resource.contains("//")
+    {
+        return false;
+    }
+    let path = Path::new(resource);
+    let mut saw_normal = false;
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                let s = part.to_string_lossy();
+                if s.is_empty() || s.chars().any(char::is_control) {
+                    return false;
+                }
+                saw_normal = true;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => return false,
+        }
+    }
+    saw_normal
+}
+
+fn antigravity_rule_matches(rule: &str, tool: &str, resource: Option<&str>) -> bool {
+    let (rule_tool, rule_pattern) = match rule.strip_suffix(')') {
+        Some(prefix) => match prefix.split_once('(') {
+            Some((t, p)) => (t.trim(), p),
+            None => return false,
+        },
+        None => (rule.trim(), "*"),
+    };
+
+    if rule_tool != "*" && rule_tool != tool {
+        return false;
+    }
+    if rule_pattern == "*" {
+        return true;
+    }
+    match resource {
+        Some(target) => opencode_glob_matches(rule_pattern, target),
+        None => false,
+    }
 }
 
 /// Builds the session-only Antigravity `--settings <inline-json>` payload for
@@ -454,7 +926,10 @@ pub fn build_antigravity_task_files_settings_json_for_scopes(
     }
 
     let settings = AntigravitySessionSettings {
-        permissions: AntigravityPermissionsBlock { allow },
+        permissions: AntigravityPermissionsBlock {
+            allow,
+            deny: Vec::new(),
+        },
     };
     let json = serde_json::to_string(&settings)?;
     if json.len() > MAX_TASK_FILES_SETTINGS_BYTES {
@@ -485,6 +960,10 @@ pub fn build_antigravity_task_files_settings_json_for_scopes(
 /// `execute`/`web` denied by baseline, internal `read`/`glob`/`grep` allowed on `*` with trailing
 /// `.env` and control-directory denies, and `edit` granted only to the exact selected
 /// repository-relative paths (plus `<dir>/**` descendants only for directory scopes).
+/// When `file_permissions` is [`WorkerFilePermissions::ReadOnly`], requires zero write scopes,
+/// denies all write/edit, shell, subagent, MCP, web, and interactive tools in both `policies`
+/// and `permissions`, and allows only location-relative internal `read`/`glob`/`grep` inspection
+/// with trailing `.env` and control-directory denies.
 pub fn build_opencode_config_content(
     resolved_model: &ResolvedModelTarget,
     file_permissions: WorkerFilePermissions,
@@ -559,8 +1038,13 @@ pub fn build_opencode_config_content(
             effect: OpenCodeRuleEffect::Deny,
         },
     ];
-    // Only the parent supervisor may dispatch separately scoped workers.
-    for resource in ["subagent", "task", "agent"] {
+    let denied_tool_policies: &[&str] = match file_permissions {
+        WorkerFilePermissions::Inherit | WorkerFilePermissions::TaskFiles => {
+            &["subagent", "task", "agent"]
+        }
+        WorkerFilePermissions::ReadOnly => &OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
+    };
+    for &resource in denied_tool_policies {
         policies.push(OpenCodePermissionRule {
             action: "tool.use".to_string(),
             resource: resource.to_string(),
@@ -574,6 +1058,9 @@ pub fn build_opencode_config_content(
             &canonical_workdir,
             allowed_write_paths,
         )?),
+        WorkerFilePermissions::ReadOnly => {
+            Some(build_opencode_read_only_rules(&canonical_workdir)?)
+        }
     };
     if let Some(rules) = &permissions {
         for agent in agents.values_mut() {
@@ -613,6 +1100,53 @@ pub fn build_opencode_config_content_json(
         )));
     }
     Ok(json)
+}
+
+fn build_opencode_read_only_rules(
+    canonical_workdir: &Path,
+) -> Result<Vec<OpenCodePermissionRule>, WorkerError> {
+    let (_canonical, _clean_workdir) = validate_read_only_canonical_workdir(canonical_workdir)?;
+
+    let mut rules = Vec::new();
+
+    // 1. Ordered deny* baseline and explicit non-file/external/write/shell/delegation action denies.
+    for action in OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS {
+        rules.push(OpenCodePermissionRule {
+            action: action.to_string(),
+            resource: "*".to_string(),
+            effect: OpenCodeRuleEffect::Deny,
+        });
+    }
+
+    // 2. Allow location-relative internal read/glob/grep inspection only (zero `edit` grants).
+    for action in ["read", "glob", "grep"] {
+        rules.push(OpenCodePermissionRule {
+            action: action.to_string(),
+            resource: "*".to_string(),
+            effect: OpenCodeRuleEffect::Allow,
+        });
+    }
+
+    // 3. Append `.env` and protected control denies LAST so last-matching-rule evaluation
+    // overrides `read`/`glob`/`grep` `*` and keeps all `edit` patterns explicitly denied.
+    for pattern in OPENCODE_PROTECTED_READ_AND_EDIT_PATTERNS {
+        for action in ["read", "glob", "grep", "edit"] {
+            rules.push(OpenCodePermissionRule {
+                action: action.to_string(),
+                resource: pattern.to_string(),
+                effect: OpenCodeRuleEffect::Deny,
+            });
+        }
+    }
+    for pattern in OPENCODE_PROTECTED_EDIT_ONLY_PATTERNS {
+        rules.push(OpenCodePermissionRule {
+            action: "edit".to_string(),
+            resource: pattern.to_string(),
+            effect: OpenCodeRuleEffect::Deny,
+        });
+    }
+
+    Ok(rules)
 }
 
 fn build_opencode_task_files_rules(
@@ -720,8 +1254,8 @@ fn build_opencode_task_files_rules(
     Ok(rules)
 }
 
-/// Evaluates an ordered slice of OpenCode V2 [`OpenCodePermissionRule`] rules for `(action, resource)`
-/// using OpenCode 2.2.0 semantics:
+/// Deterministically evaluates an ordered slice of OpenCode V2 [`OpenCodePermissionRule`] rules
+/// for `(action, resource)` using OpenCode 2.2.0 rule semantics over the generated configuration:
 /// - `write`, `edit`, `patch`, `apply_patch`, and `multiedit` map to the `"edit"` action;
 /// - `bash` and `shell` map to `"shell"`;
 /// - `task` and `subagent` map to `"subagent"`;
@@ -729,6 +1263,11 @@ fn build_opencode_task_files_rules(
 /// - internal file actions (`read`, `glob`, `grep`, `edit`) are location-relative, so absolute
 ///   paths or `..` traversal targets require `external_directory` permission first;
 /// - rules are evaluated in order and the **last matching rule wins** (defaulting to [`OpenCodeRuleEffect::Deny`]).
+///
+/// Note: This helper evaluates generated `OPENCODE_CONFIG_CONTENT` rule structures for
+/// deterministic unit and fixture verification; it is not live runtime proof of the external
+/// OpenCode binary's internal evaluator, and provider configuration is a session capability
+/// policy rather than an OS-level sandbox.
 pub fn evaluate_opencode_rules(
     rules: &[OpenCodePermissionRule],
     action: &str,
