@@ -540,9 +540,29 @@ export function formatFriendlyModel(value: string): string {
   return model;
 }
 
+export function isLocalMcpExecutor(
+  executor: ObservationExecutor | null | undefined
+): boolean {
+  if (!executor) {
+    return false;
+  }
+  const tool = trimOrNull(executor.tool);
+  if (tool === null || !/^threadlane_mcp$/i.test(tool) || trimOrNull(executor.provider) !== 'local') {
+    return false;
+  }
+  return [
+    executor.role,
+    executor.requested_model,
+    executor.observed_model,
+    executor.requested_effort,
+    executor.observed_effort,
+  ].every((value) => trimOrNull(value) === null);
+}
+
 export function formatFriendlyTool(executor: ObservationExecutor | null): string {
   const tool = trimOrNull(executor?.tool) ?? trimOrNull(executor?.provider);
   if (!tool) return 'Tool not recorded';
+  if (/^threadlane_mcp$/i.test(tool)) return 'Threadlane MCP';
   if (/^opencode(?:2|-go|_go)?$/i.test(tool)) {
     return /go/i.test(tool) ? 'OpenCode Go' : 'OpenCode';
   }
@@ -556,6 +576,14 @@ export function formatFriendlyTool(executor: ObservationExecutor | null): string
 export function projectExecutorDisplay(
   executor: ObservationExecutor | null | undefined
 ): ActivityExecutorDisplay {
+  if (isLocalMcpExecutor(executor)) {
+    return {
+      role: 'Threadlane MCP',
+      model: 'Local operation',
+      detail:
+        'Executor: Threadlane MCP · local. Local MCP operation; model and effort are not applicable.',
+    };
+  }
   const observed = trimOrNull(executor?.observed_model);
   const requested = trimOrNull(executor?.requested_model);
   const model = observed ?? requested;
@@ -598,6 +626,9 @@ export function projectRequestExecutorDisplay(view: ActivityRequestView): Activi
       model: view.childCoverage,
       detail: called.detail,
     };
+  }
+  if (isLocalMcpExecutor(root)) {
+    return projectExecutorDisplay(root);
   }
   if (hasExecutorRecord(root)) {
     return { role: formatFriendlyTool(root ?? null), model: null, detail: projectExecutorDisplay(root).detail };
@@ -815,6 +846,9 @@ export function formatExecutorIdentity(
 ): string {
   if (!hasExecutorRecord(executor)) {
     return 'Executor not recorded';
+  }
+  if (isLocalMcpExecutor(executor)) {
+    return 'Threadlane MCP · local';
   }
   const parts = [
     trimOrNull(executor?.role),
@@ -1044,7 +1078,9 @@ export function projectCalledExecutors(
 }
 
 export function projectUsage(
-  usage: ObservationUsage | null | undefined
+  usage: ObservationUsage | null | undefined,
+  executor: ObservationExecutor | null | undefined = null,
+  hasChildWork: boolean = false
 ): UsageView {
   const input = finiteCount(usage?.input_tokens);
   const output = finiteCount(usage?.output_tokens);
@@ -1054,6 +1090,18 @@ export function projectUsage(
   const reported = [input, output, cacheRead, total].some((value) => value !== null);
 
   if (!reported) {
+    if (isLocalMcpExecutor(executor) && !hasChildWork) {
+      return {
+        reported: false,
+        input,
+        output,
+        cacheRead,
+        total,
+        provenance,
+        summary: 'Local operation',
+        detail: 'Local Threadlane MCP handler; caller model usage is not attributed to this operation.',
+      };
+    }
     return {
       reported: false,
       input,
@@ -1191,7 +1239,13 @@ export function formatCompactUsage(
   usage: UsageView
 ): ActivityCompactEvidence {
   if (!usage.reported) {
-    return { value: 'Usage not reported', detail: usage.detail };
+    return {
+      value:
+        usage.summary === 'Local operation'
+          ? 'Local operation'
+          : 'Usage not reported',
+      detail: usage.detail,
+    };
   }
   if (usage.total === null) {
     return { value: 'Partial usage', detail: usage.detail };
@@ -1742,10 +1796,13 @@ export function buildActivityRequestView(
     request.children_count,
     childrenReturned
   );
-  const calledExecutor = hasExecutorRecord(executor)
-    ? null
-    : projectCalledExecutors(childCalls, childrenCount);
-  const usage = projectUsage(request.usage);
+  const calledExecutor =
+    hasExecutorRecord(executor) && !isLocalMcpExecutor(executor)
+      ? null
+      : projectCalledExecutors(childCalls, childrenCount);
+  const hasChildWork =
+    childrenReturned > 0 || childrenCount > 0 || calledExecutor !== null;
+  const usage = projectUsage(request.usage, executor, hasChildWork);
   const duration = projectDuration(request, nowMs);
   const delivery = sortDeliveryRecords(request.delivery);
   const deliveries = delivery.map((record) => buildDeliveryView(record));

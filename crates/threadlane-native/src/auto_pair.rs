@@ -9,9 +9,11 @@ use std::sync::{
 };
 use std::time::Duration;
 use threadlane::{NativeReconnectConfig, SupervisorClient};
+use threadlane_core::observation::VerifiedMcpObservationContext;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::fs_safety::constant_time_str_eq;
 use crate::{
     ensure_control_runtime, verify_thread_hint_candidate, ConnectionIdentity, NativeClient,
     NativeError, NativeErrorCode, OperatorEnrollRequest, PairingStore,
@@ -21,10 +23,19 @@ tokio::task_local! {
     pub(crate) static CALL_THREAD_HINT: Option<String>;
 }
 
+#[derive(Debug, Clone)]
+struct CachedObservationContext {
+    connection_nonce: String,
+    epoch_id: String,
+    server_pid: u32,
+    context: VerifiedMcpObservationContext,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AutomaticPairing {
     pub(crate) require_call_identity: Arc<AtomicBool>,
     coordinator: Arc<Mutex<()>>,
+    observation_context: Arc<std::sync::Mutex<Option<CachedObservationContext>>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +44,7 @@ pub(crate) struct AutomaticPairingResult {
     binding_id: String,
     thread_id: String,
     binding_created: bool,
+    conversation_role: &'static str,
     native_per_call_identity_verified: bool,
 }
 
@@ -73,6 +85,75 @@ impl AutomaticPairing {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn clear_observation_context(&self) {
+        if let Ok(mut guard) = self.observation_context.lock() {
+            *guard = None;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_verified_observation_context(
+        &self,
+        connection_nonce: &str,
+        epoch_id: &str,
+        server_pid: u32,
+        binding_id: &str,
+        thread_id: &str,
+        thread_title: &str,
+        canonical_cwd: &Path,
+        project_id: Option<&str>,
+    ) {
+        self.require_call_identity.store(true, Ordering::Release);
+        let context = VerifiedMcpObservationContext::new(
+            binding_id,
+            thread_id,
+            thread_title,
+            canonical_cwd,
+            project_id,
+        );
+        let mut guard = self
+            .observation_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(CachedObservationContext {
+            connection_nonce: connection_nonce.to_string(),
+            epoch_id: epoch_id.to_string(),
+            server_pid,
+            context,
+        });
+    }
+
+    pub(crate) fn observation_context_for_call(
+        &self,
+        connection_nonce: &str,
+        epoch_id: &str,
+        server_pid: u32,
+        binding_id: &str,
+        thread_id: &str,
+    ) -> Option<VerifiedMcpObservationContext> {
+        if !self.require_call_identity.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.verify_call(thread_id).is_err() {
+            return None;
+        }
+        let guard = self
+            .observation_context
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cached = guard.as_ref()?;
+        if cached.server_pid != server_pid
+            || !constant_time_str_eq(&cached.connection_nonce, connection_nonce)
+            || !constant_time_str_eq(&cached.epoch_id, epoch_id)
+        {
+            return None;
+        }
+        cached
+            .context
+            .matching_scope(binding_id, thread_id)
+            .cloned()
     }
 
     pub(crate) async fn connect(
@@ -185,6 +266,8 @@ impl AutomaticPairing {
                     "Codex connection changed during pairing",
                 ));
             }
+            let verified_cwd = checked.cwd.clone();
+            let verified_project_id = checked.project_id.clone();
             // Enable the per-call guard before enrollment becomes visible to another handler.
             self.require_call_identity.store(true, Ordering::Release);
             let token = store.operator_token()?;
@@ -198,11 +281,22 @@ impl AutomaticPairing {
                     project_id: checked.project_id,
                 },
             )?;
+            self.record_verified_observation_context(
+                &identity.connection_nonce,
+                &identity.epoch_id,
+                identity.server_pid,
+                &enrolled.binding_id,
+                &enrolled.thread_id,
+                label,
+                &verified_cwd,
+                verified_project_id.as_deref(),
+            );
             Ok(AutomaticPairingResult {
                 connected: true,
                 binding_id: enrolled.binding_id,
                 thread_id: enrolled.thread_id,
                 binding_created: binding.created,
+                conversation_role: "follower",
                 native_per_call_identity_verified: false,
             })
         };
@@ -242,6 +336,112 @@ mod tests {
                 assert!(state.verify_call("chat-a").is_ok());
             })
             .await;
+    }
+
+    #[tokio::test]
+    async fn cached_observation_context_enforces_exact_connection_binding_thread_and_call_scope() {
+        let state = AutomaticPairing::default();
+        let nonce = "nonce_0196ed00-0000-7000-8000-000000000001";
+        let epoch = "ep_0196ed00-0000-7000-8000-000000000001";
+        let pid = std::process::id();
+        let binding_a = "bnd_0196ed00-0000-7000-8000-000000000001";
+        let thread_a = "0196ed00-0000-7000-8000-00000000000a";
+
+        state.record_verified_observation_context(
+            nonce,
+            epoch,
+            pid,
+            binding_a,
+            thread_a,
+            "Architecture Chat",
+            Path::new("/tmp/workspace/threadlane"),
+            Some("proj_threadlane"),
+        );
+
+        // Without matching CALL_THREAD_HINT, observation context is never returned.
+        assert!(state
+            .observation_context_for_call(nonce, epoch, pid, binding_a, thread_a)
+            .is_none());
+
+        CALL_THREAD_HINT
+            .scope(Some("0196ed00-0000-7000-8000-00000000000b".into()), async {
+                assert!(state
+                    .observation_context_for_call(nonce, epoch, pid, binding_a, thread_a)
+                    .is_none());
+            })
+            .await;
+
+        CALL_THREAD_HINT
+            .scope(Some(thread_a.into()), async {
+                let ctx = state
+                    .observation_context_for_call(nonce, epoch, pid, binding_a, thread_a)
+                    .expect("matching verified call context");
+                assert_eq!(ctx.thread_label, "Architecture Chat");
+                assert_eq!(ctx.project_label, "threadlane");
+                assert_eq!(
+                    ctx.project_path.as_deref(),
+                    Some("/tmp/workspace/threadlane")
+                );
+                assert_eq!(
+                    ctx.actor.label.as_deref(),
+                    Some("Codex · Architecture Chat")
+                );
+                assert_eq!(ctx.actor.role.as_deref(), Some("follower"));
+                assert_eq!(ctx.actor.source.as_deref(), Some("paired_mcp"));
+                assert_eq!(ctx.actor.model, None);
+                assert_eq!(ctx.actor.effort, None);
+
+                // Cross-binding, cross-thread, wrong nonce, wrong epoch, or wrong PID must never inherit context.
+                assert!(state
+                    .observation_context_for_call(nonce, epoch, pid, "bnd_other", thread_a)
+                    .is_none());
+                assert!(state
+                    .observation_context_for_call(
+                        nonce,
+                        epoch,
+                        pid,
+                        binding_a,
+                        "0196ed00-0000-7000-8000-00000000000b"
+                    )
+                    .is_none());
+                assert!(state
+                    .observation_context_for_call("nonce_other", epoch, pid, binding_a, thread_a)
+                    .is_none());
+                assert!(state
+                    .observation_context_for_call(nonce, "ep_other", pid, binding_a, thread_a)
+                    .is_none());
+                assert!(state
+                    .observation_context_for_call(
+                        nonce,
+                        epoch,
+                        pid.saturating_add(1),
+                        binding_a,
+                        thread_a
+                    )
+                    .is_none());
+            })
+            .await;
+
+        state.clear_observation_context();
+        CALL_THREAD_HINT
+            .scope(Some(thread_a.into()), async {
+                assert!(state
+                    .observation_context_for_call(nonce, epoch, pid, binding_a, thread_a)
+                    .is_none());
+            })
+            .await;
+
+        let result_json = serde_json::to_value(AutomaticPairingResult {
+            connected: true,
+            binding_id: binding_a.to_string(),
+            thread_id: thread_a.to_string(),
+            binding_created: true,
+            conversation_role: "follower",
+            native_per_call_identity_verified: false,
+        })
+        .expect("serialize AutomaticPairingResult");
+        assert_eq!(result_json["conversation_role"], "follower");
+        assert_eq!(result_json["native_per_call_identity_verified"], false);
     }
 
     #[tokio::test]

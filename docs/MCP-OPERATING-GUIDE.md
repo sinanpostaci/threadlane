@@ -1,6 +1,27 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-02.v1`
+Version: `2026-11-02.v2`
+
+## Act as the Follower in the native Codex conversation
+
+- In the user's native Codex conversation, your role is `Follower`
+  (`conversation_role: "follower"`). Codex remains the user's interface: gather
+  human requirements, answer questions, handle `Steer`, track workers, and report
+  questions, progress, and results clearly.
+- After connecting and reading `operating_guide`, read the configured profile via
+  `catalog` (when workflow stores are configured) and refresh live scoped state and
+  revisions (`status`, `list_plans`, `get_plan`, `approved_session`, `approved_task`).
+- Consult the configured `Orchestrator` role for substantive task decomposition or
+  replanning, and consult the configured `Architect` role for high-impact design or
+  cross-cutting architectural decisions.
+- Coding (`coder`), review (`reviewer`), and closure are distinct workflow roles.
+  Do not silently perform coding or review work inside the `Follower` role, and
+  never silently switch or substitute model roles.
+- The saved `follower` model in a profile is configuration only; it never switches
+  or verifies the active Codex model. Active human model, effort, and quota
+  restrictions always override saved profiles.
+- Reading a profile, `catalog`, or role instructions grants no execution authority,
+  approval, host startup, or model permission.
 
 ## Start and recover context
 
@@ -32,7 +53,8 @@ Version: `2026-11-02.v1`
   advancement. Unsupported live provider input must not be reported as delivered.
 - The backend cannot infer unreported conversational directives. Persist approved
   requirements in the applicable plan, policy and change records; do not rely on
-  conversation memory alone. Never edit an old frozen approval to expand it.
+  conversation memory alone. Preserve explicit approvals and never edit an old
+  frozen approval to expand it.
 - Active human model, effort and quota restrictions override saved profiles.
   A catalog entry or role assignment is not permission to invoke that model.
 

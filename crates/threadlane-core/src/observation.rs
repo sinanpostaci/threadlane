@@ -77,7 +77,8 @@ pub struct ObservationSource {
 pub enum ObservationActorEvidence {
     /// Actor identity is not proven by trusted correlation, binding, or handoff receipts.
     Unknown,
-    /// Actor attributes reflect explicit configuration only, not observed runtime identity.
+    /// Actor attributes reflect explicit configuration or a declared conversation role on a
+    /// verified connection, not observed model execution.
     Configured,
     /// Actor attributes were directly observed from a verified runtime or handoff receipt.
     Observed,
@@ -100,15 +101,16 @@ impl ObservationActorEvidence {
 /// Requester / actor metadata attached to an [`ObservationRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationActor {
-    /// Human-readable actor label when proven; `None` when unknown.
+    /// Human-readable actor label when verified or configured; `None` when unknown.
     pub label: Option<String>,
-    /// Workflow role when proven by a role-flow handoff or receipt.
+    /// Workflow or declared conversation role when proven by a role-flow handoff, receipt, or
+    /// verified connection context (for example `"follower"`).
     pub role: Option<String>,
     /// Boundary or transport source (for example `trusted_local_operator` or `paired_mcp`).
     pub source: Option<String>,
-    /// Actor model only when proven; never inferred from profile defaults.
+    /// Actor model only when proven by runtime receipt; never inferred from profile defaults or thread configuration.
     pub model: Option<String>,
-    /// Actor reasoning effort only when proven; never inferred from profile defaults.
+    /// Actor reasoning effort only when proven by runtime receipt; never inferred from profile defaults or thread configuration.
     pub effort: Option<String>,
     /// Provenance level of the actor metadata.
     pub evidence: ObservationActorEvidence,
@@ -124,6 +126,21 @@ impl ObservationActor {
             model: None,
             effort: None,
             evidence: ObservationActorEvidence::Unknown,
+        }
+    }
+
+    /// Returns a verified paired-MCP caller actor record with display label `"Codex · <thread_label>"`,
+    /// declared conversation role `"follower"`, source `"paired_mcp"`, `Configured` evidence, and
+    /// `None` for `model` and `effort` (which are never inferred from profile defaults or thread configuration).
+    pub fn paired_follower(thread_label: &str) -> Self {
+        let sanitized = sanitize_observation_label(thread_label, "Codex chat");
+        Self {
+            label: Some(format!("Codex · {sanitized}")),
+            role: Some("follower".to_string()),
+            source: Some("paired_mcp".to_string()),
+            model: None,
+            effort: None,
+            evidence: ObservationActorEvidence::Configured,
         }
     }
 }
@@ -145,6 +162,108 @@ pub struct ObservationExecutor {
     pub requested_effort: Option<String>,
     /// Reasoning effort actually reported by the runtime or provider receipt.
     pub observed_effort: Option<String>,
+}
+
+impl ObservationExecutor {
+    /// Returns the local MCP handler executor record (`tool: "threadlane_mcp"`, `provider: "local"`,
+    /// and `None` for role, requested/observed model, and requested/observed effort).
+    ///
+    /// Describes only the local Threadlane MCP handler itself, never its caller or worker children.
+    pub fn local_mcp() -> Self {
+        Self {
+            tool: Some("threadlane_mcp".to_string()),
+            provider: Some("local".to_string()),
+            role: None,
+            requested_model: None,
+            observed_model: None,
+            requested_effort: None,
+            observed_effort: None,
+        }
+    }
+}
+
+/// Sanitizes a short display label (such as a chat title or project name), stripping control
+/// characters and bounding length to [`crate::MAX_LABEL_LEN`] bytes.
+pub fn sanitize_observation_label(raw: &str, fallback: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if !ch.is_control() && out.len() + ch.len_utf8() <= crate::MAX_LABEL_LEN {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Display-only observation enrichment context cached after independent native identity
+/// verification and pairing enrollment.
+///
+/// Carries no execution, approval, or binding authority and is never persisted into approval files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedMcpObservationContext {
+    /// Exact enrolled software `binding_id` that owns this context.
+    pub binding_id: String,
+    /// Exact verified native `thread_uuid` that owns this context.
+    pub thread_uuid: String,
+    /// Sanitized human-readable chat title from verified native thread metadata.
+    pub thread_label: String,
+    /// Sanitized human-readable project label derived from verified canonical `cwd` / project identity.
+    pub project_label: String,
+    /// Canonical project directory path from verified `MatchedThreadCandidate`.
+    pub project_path: Option<String>,
+    /// Verified caller actor record (`Codex · <thread_label>`, role `follower`, source `paired_mcp`, evidence `Configured`).
+    pub actor: ObservationActor,
+}
+
+impl VerifiedMcpObservationContext {
+    /// Constructs a display-only observation context from verified binding/thread scope,
+    /// native thread title, and canonical project directory / project identifier.
+    pub fn new(
+        binding_id: impl Into<String>,
+        thread_uuid: impl Into<String>,
+        thread_title: &str,
+        canonical_cwd: &Path,
+        project_id: Option<&str>,
+    ) -> Self {
+        let thread_label = sanitize_observation_label(thread_title, "Codex chat");
+        let cwd_name = canonical_cwd
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let raw_project_label = if !cwd_name.trim().is_empty() {
+            cwd_name
+        } else {
+            project_id.unwrap_or("Project")
+        };
+        let project_label = sanitize_observation_label(raw_project_label, "Project");
+        let project_path = canonical_cwd
+            .to_str()
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+            .map(str::to_string);
+        let actor = ObservationActor::paired_follower(&thread_label);
+        Self {
+            binding_id: binding_id.into(),
+            thread_uuid: thread_uuid.into(),
+            thread_label,
+            project_label,
+            project_path,
+            actor,
+        }
+    }
+
+    /// Returns `Some(self)` only when both `binding_id` and `thread_uuid` match the active call's
+    /// verified scope.
+    pub fn matching_scope(&self, binding_id: &str, thread_uuid: &str) -> Option<&Self> {
+        if self.binding_id == binding_id && self.thread_uuid == thread_uuid {
+            Some(self)
+        } else {
+            None
+        }
+    }
 }
 
 /// Per-call token usage and provenance metadata.
@@ -3704,5 +3823,73 @@ mod tests {
         {
             let _ = (&workspace, &target_dir, &rec);
         }
+    }
+
+    #[test]
+    fn verified_mcp_context_preserves_scope_and_declared_role_evidence() {
+        let exec = ObservationExecutor::local_mcp();
+        assert_eq!(exec.tool.as_deref(), Some("threadlane_mcp"));
+        assert_eq!(exec.provider.as_deref(), Some("local"));
+        assert_eq!(exec.role, None);
+        assert_eq!(exec.requested_model, None);
+        assert_eq!(exec.observed_model, None);
+        assert_eq!(exec.requested_effort, None);
+        assert_eq!(exec.observed_effort, None);
+
+        let ctx = VerifiedMcpObservationContext::new(
+            "bnd_0196ed00-0000-7000-8000-000000000001",
+            "0196ed00-0000-7000-8000-00000000000a",
+            "  Alpha\nChat\tTitle  ",
+            Path::new("/tmp/workspace/alpha-repo"),
+            Some("proj_alpha"),
+        );
+        assert_eq!(ctx.thread_label, "AlphaChatTitle");
+        assert_eq!(ctx.project_label, "alpha-repo");
+        assert_eq!(
+            ctx.project_path.as_deref(),
+            Some("/tmp/workspace/alpha-repo")
+        );
+        assert_eq!(ctx.actor.label.as_deref(), Some("Codex · AlphaChatTitle"));
+        assert_eq!(ctx.actor.role.as_deref(), Some("follower"));
+        assert_eq!(ctx.actor.source.as_deref(), Some("paired_mcp"));
+        assert_eq!(ctx.actor.model, None);
+        assert_eq!(ctx.actor.effort, None);
+        assert_eq!(ctx.actor.evidence, ObservationActorEvidence::Configured);
+
+        assert!(ctx
+            .matching_scope(
+                "bnd_0196ed00-0000-7000-8000-000000000001",
+                "0196ed00-0000-7000-8000-00000000000a"
+            )
+            .is_some());
+        assert!(ctx
+            .matching_scope(
+                "bnd_0196ed00-0000-7000-8000-000000000002",
+                "0196ed00-0000-7000-8000-00000000000a"
+            )
+            .is_none());
+        assert!(ctx
+            .matching_scope(
+                "bnd_0196ed00-0000-7000-8000-000000000001",
+                "0196ed00-0000-7000-8000-00000000000b"
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn verified_mcp_context_preserves_path_whitespace_and_bounds_display_labels() {
+        let path = Path::new("/tmp/workspace/ spaced-repo ");
+        let title = "🦀".repeat(crate::MAX_LABEL_LEN);
+        let context = VerifiedMcpObservationContext::new("binding", "thread", &title, path, None);
+        assert_eq!(context.project_path.as_deref(), path.to_str());
+        assert_eq!(context.project_label, "spaced-repo");
+        assert!(!context.thread_label.is_empty());
+        assert!(context.thread_label.len() <= crate::MAX_LABEL_LEN);
+        assert!(!context.thread_label.chars().any(char::is_control));
+
+        let invalid_path = Path::new("/tmp/workspace/control\npath");
+        let context =
+            VerifiedMcpObservationContext::new("binding", "thread", "Chat", invalid_path, None);
+        assert!(context.project_path.is_none());
     }
 }

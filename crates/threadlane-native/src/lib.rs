@@ -2699,6 +2699,191 @@ fi
 
         sup_handle.shutdown().await;
     }
+
+    #[tokio::test]
+    async fn paired_workflow_and_delegated_observations_preserve_verified_context_without_borrowing_profile_models(
+    ) {
+        use crate::auto_pair::CALL_THREAD_HINT;
+        use rmcp::handler::server::wrapper::Parameters;
+        use threadlane_core::observation::{
+            read_journal_records_readonly, ObservationActor, ObservationActorEvidence,
+            ObservationExecutor, ObservationRecordPhase,
+        };
+
+        let tmp = TempDir::new().expect("tempdir");
+        let state_dir = tmp.path().join("runtime-state");
+        let pairing_dir = tmp.path().join("pairing-state");
+        let (registry, plans, reg_rev) = setup_workflow_stores(&tmp);
+
+        let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+
+        let mcp_auto = PairedMcpServer::new(&state_dir, pairing_store.clone())
+            .expect("create mcp_auto")
+            .with_workflow_stores(
+                std::sync::Arc::clone(&registry),
+                std::sync::Arc::clone(&plans),
+            );
+        let mcp_manual = PairedMcpServer::new(&state_dir, pairing_store.clone())
+            .expect("create mcp_manual")
+            .with_workflow_stores(
+                std::sync::Arc::clone(&registry),
+                std::sync::Arc::clone(&plans),
+            );
+
+        let binding_auto = "bnd_0196ed00-0000-7000-8000-00000000030a";
+        let thread_auto = "0196ed00-0000-7000-8000-00000000030a";
+        let binding_manual = "bnd_0196ed00-0000-7000-8000-00000000030b";
+        let thread_manual = "0196ed00-0000-7000-8000-00000000030b";
+
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_auto.connection_nonce().to_string(),
+                    epoch_id: mcp_auto.epoch_id().to_string(),
+                    binding_id: binding_auto.to_string(),
+                    thread_id: thread_auto.to_string(),
+                    project_id: Some("proj_follower".to_string()),
+                },
+            )
+            .expect("enroll mcp_auto");
+        mcp_auto.record_test_observation_context(
+            binding_auto,
+            thread_auto,
+            "Follower Onboarding Chat",
+            Path::new("/tmp/workspace/follower-repo"),
+            Some("proj_follower"),
+        );
+
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp_manual.connection_nonce().to_string(),
+                    epoch_id: mcp_manual.epoch_id().to_string(),
+                    binding_id: binding_manual.to_string(),
+                    thread_id: thread_manual.to_string(),
+                    project_id: None,
+                },
+            )
+            .expect("enroll mcp_manual");
+
+        let saved_plan_id = CALL_THREAD_HINT
+            .scope(Some(thread_auto.to_string()), async {
+                mcp_auto
+                    .operating_guide(Parameters(OperatingGuideParams::default()))
+                    .await
+                    .expect("operating_guide on mcp_auto");
+                mcp_auto
+                    .catalog(Parameters(CatalogParams::default()))
+                    .await
+                    .expect("catalog on mcp_auto");
+                mcp_auto
+                    .list_plans(Parameters(ListPlansParams::default()))
+                    .await
+                    .expect("list_plans on mcp_auto");
+                let saved = mcp_auto
+                    .save_draft(Parameters(SaveDraftParams {
+                        command_key: "cmd-follower-obs".to_string(),
+                        plan_id: None,
+                        expected_revision: 0,
+                        profile_id: "default-profile".to_string(),
+                        profile_revision: reg_rev,
+                        summary: "Verify Follower observation attribution".to_string(),
+                        tasks: vec![PlanTaskParams {
+                            id: "task-1".to_string(),
+                            title: "Implement attribution".to_string(),
+                            role: WorkflowRole::Coder,
+                            difficulty: Difficulty::Easy,
+                            instruction: "Keep attribution honest.".to_string(),
+                            depends_on: Vec::new(),
+                            allowed_write_paths: vec!["src/lib.rs".to_string()],
+                        }],
+                    }))
+                    .await
+                    .expect("save_draft on mcp_auto")
+                    .structured_content
+                    .expect("save_draft structured content");
+                let plan_id = saved["data"]["plan_id"]
+                    .as_str()
+                    .expect("saved plan_id")
+                    .to_string();
+                mcp_auto
+                    .get_plan(Parameters(GetPlanParams {
+                        plan_id: plan_id.clone(),
+                        revision: Some(1),
+                        task_cursor: None,
+                        task_limit: None,
+                    }))
+                    .await
+                    .expect("get_plan on mcp_auto");
+                plan_id
+            })
+            .await;
+
+        // Manual connection on the same workflow stores must not inherit mcp_auto's verified context.
+        mcp_manual
+            .catalog(Parameters(CatalogParams::default()))
+            .await
+            .expect("catalog on mcp_manual");
+
+        let (records, warnings) =
+            read_journal_records_readonly(plans.dir()).expect("read workflow journal records");
+        assert!(warnings.is_empty());
+        // 5 tools on mcp_auto * 2 phases + 1 tool on mcp_manual * 2 phases = 12 records.
+        assert_eq!(records.len(), 12);
+
+        for rec in &records[0..10] {
+            assert_eq!(rec.binding_id.as_deref(), Some(binding_auto));
+            assert_eq!(rec.thread_uuid.as_deref(), Some(thread_auto));
+            assert_eq!(
+                rec.thread_label.as_deref(),
+                Some("Follower Onboarding Chat")
+            );
+            assert_eq!(rec.project_label.as_deref(), Some("follower-repo"));
+            assert_eq!(
+                rec.project_path.as_deref(),
+                Some("/tmp/workspace/follower-repo")
+            );
+            let actor = rec.actor.as_ref().expect("actor present");
+            assert_eq!(
+                actor.label.as_deref(),
+                Some("Codex · Follower Onboarding Chat")
+            );
+            assert_eq!(actor.role.as_deref(), Some("follower"));
+            assert_eq!(actor.source.as_deref(), Some("paired_mcp"));
+            // Must never borrow `gpt-follow` or `deepseek-flash` from the workflow profile!
+            assert_eq!(actor.model, None);
+            assert_eq!(actor.effort, None);
+            assert_eq!(actor.evidence, ObservationActorEvidence::Configured);
+            assert_eq!(rec.executor, Some(ObservationExecutor::local_mcp()));
+            assert_eq!(rec.usage, None);
+            if rec.phase == ObservationRecordPhase::Finish
+                && matches!(
+                    rec.operation.as_str(),
+                    "mcp.paired.save_draft" | "mcp.paired.get_plan"
+                )
+            {
+                assert_eq!(rec.plan_id.as_deref(), Some(saved_plan_id.as_str()));
+                assert_eq!(rec.job_id.as_deref(), Some(saved_plan_id.as_str()));
+            }
+        }
+
+        for rec in &records[10..12] {
+            assert_eq!(rec.binding_id.as_deref(), Some(binding_manual));
+            assert_eq!(rec.thread_uuid.as_deref(), Some(thread_manual));
+            assert_eq!(rec.thread_label, None);
+            assert_eq!(rec.project_label, None);
+            assert_eq!(rec.project_path, None);
+            assert_eq!(
+                rec.actor,
+                Some(ObservationActor::unknown(Some("paired_mcp".to_string())))
+            );
+            assert_eq!(rec.executor, Some(ObservationExecutor::local_mcp()));
+            assert_eq!(rec.usage, None);
+        }
+    }
 }
 
 #[cfg(test)]

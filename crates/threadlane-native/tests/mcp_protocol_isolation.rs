@@ -66,6 +66,14 @@ async fn paired_server_rejects_stateless_requests_and_negotiates_a_session_hands
     let initialized: Value = serde_json::from_str(&initialized).expect("JSON-RPC response");
     assert_eq!(initialized["id"], 2);
     assert_eq!(initialized["result"]["protocolVersion"], "2025-11-25");
+    let instructions = initialized["result"]["instructions"]
+        .as_str()
+        .expect("handshake instructions");
+    let first_512: String = instructions.chars().take(512).collect();
+    assert!(first_512.contains("2026-11-02.v2"));
+    assert!(first_512.contains("Follower"));
+    assert!(first_512.contains("connect_current_chat"));
+    assert!(first_512.contains("operating_guide"));
 
     input
         .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
@@ -75,7 +83,12 @@ async fn paired_server_rejects_stateless_requests_and_negotiates_a_session_hands
         (3, json!({}), "needs_verification"),
         (
             4,
-            json!({"threadId": "0196ed00-0000-7000-8000-00000000000a"}),
+            json!({
+                "threadId": "0196ed00-0000-7000-8000-00000000000a",
+                "title": "Spoofed Chat Title",
+                "model": "gpt-spoofed",
+                "projectPath": "/tmp/spoofed"
+            }),
             "not_configured",
         ),
     ] {

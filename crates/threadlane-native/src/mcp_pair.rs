@@ -27,7 +27,8 @@ use threadlane_authority::AuthorityStore;
 use threadlane_core::observation::{
     append_journal_record, current_observation_time_ms, current_process_instance,
     generate_observation_id, ObservationActor, ObservationCallState, ObservationDelivery,
-    ObservationDeliveryStage, ObservationJournalRecord, ObservationRecordPhase,
+    ObservationDeliveryStage, ObservationExecutor, ObservationJournalRecord,
+    ObservationRecordPhase, VerifiedMcpObservationContext,
 };
 use threadlane_workflow::{
     ensure_mcp_response_budget, Difficulty, PlanStore, PlanTask, RegistryStore, SavePlanDraft,
@@ -576,6 +577,7 @@ impl PairedMcpServer {
         if let Ok(mut guard) = self.cached_workflow.lock() {
             *guard = None;
         }
+        self.automatic_pairing.clear_observation_context();
         let next = self
             .pairing_store
             .register_restarted_epoch(&self.epoch_id, self.server_pid)?;
@@ -932,6 +934,7 @@ impl PairedMcpServer {
                 if let Ok(mut guard) = self.cached_workflow.lock() {
                     *guard = None;
                 }
+                self.automatic_pairing.clear_observation_context();
                 return Err(Self::format_pairing_error(tool_name, err));
             }
         };
@@ -943,6 +946,7 @@ impl PairedMcpServer {
             if let Ok(mut guard) = self.cached_workflow.lock() {
                 *guard = None;
             }
+            self.automatic_pairing.clear_observation_context();
             return Err(Self::format_pairing_error(
                 tool_name,
                 NativeError::new(
@@ -966,6 +970,41 @@ impl PairedMcpServer {
             .unwrap_or_else(|| self.state_dir.clone())
     }
 
+    fn matched_observation_context(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+    ) -> Option<VerifiedMcpObservationContext> {
+        self.automatic_pairing.observation_context_for_call(
+            &self.connection_nonce,
+            &self.epoch_id,
+            self.server_pid,
+            binding_id,
+            thread_uuid,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_test_observation_context(
+        &self,
+        binding_id: &str,
+        thread_id: &str,
+        thread_title: &str,
+        canonical_cwd: &Path,
+        project_id: Option<&str>,
+    ) {
+        self.automatic_pairing.record_verified_observation_context(
+            &self.connection_nonce,
+            &self.epoch_id,
+            self.server_pid,
+            binding_id,
+            thread_id,
+            thread_title,
+            canonical_cwd,
+            project_id,
+        );
+    }
+
     fn begin_paired_observation(
         &self,
         binding_id: &str,
@@ -979,6 +1018,11 @@ impl PairedMcpServer {
         let started_at_ms = current_observation_time_ms();
         let op = format!("mcp.paired.{tool_name}");
         let title = format!("mcp paired {}", tool_name.replace('_', " "));
+        let matched = self.matched_observation_context(binding_id, thread_uuid);
+        let actor = matched
+            .as_ref()
+            .map(|ctx| ctx.actor.clone())
+            .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
         let _ = append_journal_record(
             &dir,
             &ObservationJournalRecord {
@@ -990,11 +1034,11 @@ impl PairedMcpServer {
                 at_ms: started_at_ms,
                 pid: Some(std::process::id()),
                 process_instance: current_process_instance(),
-                project_label: None,
-                project_path: None,
+                project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
+                project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
                 binding_id: Some(binding_id.to_string()),
                 thread_uuid: Some(thread_uuid.to_string()),
-                thread_label: None,
+                thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
                 job_id: None,
                 plan_id: None,
                 task_id: task_id.map(str::to_string),
@@ -1002,8 +1046,8 @@ impl PairedMcpServer {
                 operation: op.clone(),
                 title,
                 state: ObservationCallState::Running,
-                actor: Some(ObservationActor::unknown(Some("paired_mcp".to_string()))),
-                executor: None,
+                actor: Some(actor),
+                executor: Some(ObservationExecutor::local_mcp()),
                 usage: None,
                 delivery: Vec::new(),
                 summary: Some(format!("MCP tool {op}")),
@@ -1040,6 +1084,11 @@ impl PairedMcpServer {
                 format!("Failed {op}"),
             ),
         };
+        let matched = self.matched_observation_context(binding_id, thread_uuid);
+        let actor = matched
+            .as_ref()
+            .map(|ctx| ctx.actor.clone())
+            .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
         let _ = append_journal_record(
             &dir,
             &ObservationJournalRecord {
@@ -1051,11 +1100,11 @@ impl PairedMcpServer {
                 at_ms: finished_at_ms,
                 pid: Some(std::process::id()),
                 process_instance: current_process_instance(),
-                project_label: None,
-                project_path: None,
+                project_label: matched.as_ref().map(|ctx| ctx.project_label.clone()),
+                project_path: matched.as_ref().and_then(|ctx| ctx.project_path.clone()),
                 binding_id: Some(binding_id.to_string()),
                 thread_uuid: Some(thread_uuid.to_string()),
-                thread_label: None,
+                thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
                 job_id: plan_id.clone(),
                 plan_id,
                 task_id: task_id.map(str::to_string),
@@ -1063,8 +1112,8 @@ impl PairedMcpServer {
                 operation: op,
                 title,
                 state,
-                actor: Some(ObservationActor::unknown(Some("paired_mcp".to_string()))),
-                executor: None,
+                actor: Some(actor),
+                executor: Some(ObservationExecutor::local_mcp()),
                 usage: None,
                 delivery: vec![ObservationDelivery {
                     stage,
@@ -1079,6 +1128,8 @@ impl PairedMcpServer {
 
     fn enrolled_delegate(&self, tool_name: &str) -> Result<ThreadlaneMcpServer, CallToolResult> {
         let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
+        let matched =
+            self.matched_observation_context(&enrollment.binding_id, &enrollment.thread_id);
 
         let scoped_client = ScopedClient::from_state_dir_lazy(
             &self.state_dir,
@@ -1095,7 +1146,8 @@ impl PairedMcpServer {
         })?;
 
         Ok(ThreadlaneMcpServer::new(scoped_client)
-            .with_paired_observation(enrollment.thread_id, self.observation_journal_dir()))
+            .with_paired_observation(enrollment.thread_id, self.observation_journal_dir())
+            .with_paired_observation_context(matched))
     }
 
     fn scoped_workflow_for_enrolled(
@@ -1340,7 +1392,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-02.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-02.v2) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -2384,5 +2436,151 @@ mod observation_correlation_tests {
             observation_result_plan_id("save_draft", "bnd_a", &failed),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn paired_and_delegated_observations_preserve_verified_context_local_executor_and_manual_fallback(
+    ) {
+        use std::fs;
+        use threadlane_core::observation::{
+            read_journal_records_readonly, ObservationActorEvidence,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("runtime");
+        fs::create_dir_all(&state_dir).expect("create state_dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 state_dir");
+        }
+        let sup_handle =
+            threadlane::Supervisor::start(threadlane::SupervisorConfig::new(&state_dir))
+                .await
+                .expect("start supervisor");
+        let sup_client =
+            threadlane::SupervisorClient::from_state_dir(&state_dir).expect("sup client");
+
+        let thread_auto = "0196ed00-0000-7000-8000-0000000000a1";
+        let thread_manual = "0196ed00-0000-7000-8000-0000000000b2";
+        let binding_auto = sup_client
+            .create_binding(thread_auto, "Auto Chat")
+            .await
+            .expect("binding auto");
+        let binding_manual = sup_client
+            .create_binding(thread_manual, "Manual Chat")
+            .await
+            .expect("binding manual");
+
+        let pairing_store = PairingStore::open(tmp.path().join("pairing")).expect("pairing store");
+        let token = pairing_store.operator_token().expect("operator token");
+
+        let server_auto = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("auto");
+        pairing_store
+            .enroll(
+                &token,
+                crate::OperatorEnrollRequest {
+                    connection_nonce: server_auto.connection_nonce().to_string(),
+                    epoch_id: server_auto.epoch_id().to_string(),
+                    binding_id: binding_auto.binding_id.clone(),
+                    thread_id: thread_auto.to_string(),
+                    project_id: Some("proj_auto".to_string()),
+                },
+            )
+            .expect("enroll auto");
+        server_auto
+            .automatic_pairing
+            .record_verified_observation_context(
+                server_auto.connection_nonce(),
+                server_auto.epoch_id(),
+                server_auto.server_pid,
+                &binding_auto.binding_id,
+                thread_auto,
+                "Auto Chat",
+                Path::new("/tmp/workspace/auto-project"),
+                Some("proj_auto"),
+            );
+
+        let server_manual =
+            PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("manual");
+        pairing_store
+            .enroll(
+                &token,
+                crate::OperatorEnrollRequest {
+                    connection_nonce: server_manual.connection_nonce().to_string(),
+                    epoch_id: server_manual.epoch_id().to_string(),
+                    binding_id: binding_manual.binding_id.clone(),
+                    thread_id: thread_manual.to_string(),
+                    project_id: None,
+                },
+            )
+            .expect("enroll manual");
+
+        CALL_THREAD_HINT
+            .scope(Some(thread_auto.to_string()), async {
+                server_auto
+                    .operating_guide(Parameters(OperatingGuideParams::default()))
+                    .await
+                    .expect("auto operating_guide");
+                server_auto
+                    .status(Parameters(StatusParams::default()))
+                    .await
+                    .expect("auto status");
+            })
+            .await;
+
+        // Manual connection has no AutomaticPairing context; it must retain unknown actor and no invented labels.
+        server_manual
+            .operating_guide(Parameters(OperatingGuideParams::default()))
+            .await
+            .expect("manual operating_guide");
+
+        let (records, warnings) =
+            read_journal_records_readonly(&state_dir).expect("read journal records");
+        assert!(warnings.is_empty());
+        assert_eq!(records.len(), 6);
+
+        for rec in &records[0..4] {
+            assert_eq!(
+                rec.binding_id.as_deref(),
+                Some(binding_auto.binding_id.as_str())
+            );
+            assert_eq!(rec.thread_uuid.as_deref(), Some(thread_auto));
+            assert_eq!(rec.thread_label.as_deref(), Some("Auto Chat"));
+            assert_eq!(rec.project_label.as_deref(), Some("auto-project"));
+            assert_eq!(
+                rec.project_path.as_deref(),
+                Some("/tmp/workspace/auto-project")
+            );
+            let actor = rec.actor.as_ref().expect("actor present");
+            assert_eq!(actor.label.as_deref(), Some("Codex · Auto Chat"));
+            assert_eq!(actor.role.as_deref(), Some("follower"));
+            assert_eq!(actor.source.as_deref(), Some("paired_mcp"));
+            assert_eq!(actor.model, None);
+            assert_eq!(actor.effort, None);
+            assert_eq!(actor.evidence, ObservationActorEvidence::Configured);
+            assert_eq!(rec.executor, Some(ObservationExecutor::local_mcp()));
+            assert_eq!(rec.usage, None);
+        }
+
+        for rec in &records[4..6] {
+            assert_eq!(
+                rec.binding_id.as_deref(),
+                Some(binding_manual.binding_id.as_str())
+            );
+            assert_eq!(rec.thread_uuid.as_deref(), Some(thread_manual));
+            assert_eq!(rec.thread_label, None);
+            assert_eq!(rec.project_label, None);
+            assert_eq!(rec.project_path, None);
+            assert_eq!(
+                rec.actor,
+                Some(ObservationActor::unknown(Some("paired_mcp".to_string())))
+            );
+            assert_eq!(rec.executor, Some(ObservationExecutor::local_mcp()));
+            assert_eq!(rec.usage, None);
+        }
+
+        sup_handle.shutdown().await;
     }
 }

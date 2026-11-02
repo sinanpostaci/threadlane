@@ -27,6 +27,7 @@ import {
   formatExecutorIdentity,
   formatExecutorRoleLabel,
   formatFeedTimestamp,
+  formatFriendlyTool,
   formatLifecycleLabel,
   formatLatestProvenReturnStage,
   formatOptionalField,
@@ -36,6 +37,7 @@ import {
   formatRequesterEvidence,
   formatRequesterIdentity,
   formatRequesterSummary,
+  isLocalMcpExecutor,
   projectActivityFeed,
   projectDuration,
   projectExecutorDisplay,
@@ -1760,5 +1762,134 @@ describe('activity feed request projection', () => {
     assert.doesNotMatch(source, /aq-feed-event-time/);
     assert.doesNotMatch(source, /footerCount/);
     assert.doesNotMatch(source, /onAllActivity/);
+  });
+
+  it('maps threadlane_mcp local executor to Threadlane MCP and Local operation without concealing worker or token evidence', () => {
+    const localMcp = makeExecutor({
+      tool: 'threadlane_mcp',
+      provider: 'local',
+      role: null,
+      requested_model: null,
+      observed_model: null,
+      requested_effort: null,
+      observed_effort: null,
+    });
+    assert.equal(isLocalMcpExecutor(localMcp), true);
+    assert.equal(isLocalMcpExecutor({ ...localMcp, provider: null }), false);
+    assert.equal(isLocalMcpExecutor({ ...localMcp, provider: 'openai' }), false);
+    assert.equal(isLocalMcpExecutor({ ...localMcp, requested_model: 'configured-model' }), false);
+    assert.equal(isLocalMcpExecutor(null), false);
+    assert.equal(isLocalMcpExecutor(makeExecutor()), false);
+    assert.equal(formatFriendlyTool(localMcp), 'Threadlane MCP');
+
+    // Verified paired Follower caller + local MCP handler without child work or tokens.
+    const localView = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        project_label: 'threadlane-follower-context',
+        thread_label: 'Follower Onboarding',
+        actor: makeActor({
+          label: 'Codex · Follower Onboarding',
+          role: 'follower',
+          source: 'paired_mcp',
+          model: null,
+          effort: null,
+          evidence: 'configured',
+        }),
+        executor: localMcp,
+        usage: null,
+        children: [],
+        children_count: 0,
+      })
+    );
+    assert.equal(localView.projectLabel, 'threadlane-follower-context');
+    assert.equal(localView.requesterLine.value, 'Codex · Follower Onboarding');
+    assert.equal(localView.requesterLine.evidence, 'Configured');
+    assert.equal(localView.actorRole, 'follower');
+    assert.equal(localView.actorModel, 'Not reported');
+    assert.equal(localView.actorEffort, 'Not reported');
+    assert.equal(localView.executorIdentity, 'Threadlane MCP · local');
+    const localExecDisplay = projectRequestExecutorDisplay(localView);
+    assert.equal(localExecDisplay.role, 'Threadlane MCP');
+    assert.equal(localExecDisplay.model, 'Local operation');
+    assert.match(localExecDisplay.detail, /Local MCP operation/);
+    assert.equal(localView.usage.reported, false);
+    assert.equal(localView.usage.summary, 'Local operation');
+    assert.equal(formatCompactUsage(localView.usage).value, 'Local operation');
+
+    // Explicit local MCP root with worker child calls must NOT conceal worker evidence or missing-usage warning.
+    const workerChild = makeCall({
+      id: 'worker-1',
+      executor: makeExecutor({
+        tool: 'opencode-go',
+        provider: 'opencode',
+        role: 'coder',
+        requested_model: 'opencode-go/deepseek-v4.1-flash',
+        observed_model: 'opencode-go/deepseek-v4.1-flash',
+        requested_effort: 'max',
+        observed_effort: 'max',
+      }),
+    });
+    const withWorker = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        executor: localMcp,
+        usage: null,
+        children: [workerChild],
+        children_count: 1,
+      })
+    );
+    assert.ok(withWorker.calledExecutor);
+    const withWorkerDisplay = projectRequestExecutorDisplay(withWorker);
+    assert.equal(withWorkerDisplay.role, 'Called Coder');
+    assert.equal(withWorkerDisplay.model, 'DeepSeek · Max');
+    assert.equal(withWorker.usage.summary, 'Usage not reported');
+    assert.equal(formatCompactUsage(withWorker.usage).value, 'Usage not reported');
+
+    // Reported tokens on a local MCP root are preserved and never concealed.
+    const withTokens = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        executor: localMcp,
+        usage: makeUsage({ total_tokens: 125 }),
+      })
+    );
+    assert.equal(withTokens.usage.reported, true);
+    assert.equal(formatCompactUsage(withTokens.usage).value, '125 tokens');
+
+    // Real model inference without reported tokens still reports 'Usage not reported'.
+    const realInferenceNoUsage = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        executor: makeExecutor(),
+        usage: null,
+      })
+    );
+    assert.equal(realInferenceNoUsage.usage.summary, 'Usage not reported');
+    assert.equal(
+      formatCompactUsage(realInferenceNoUsage.usage).value,
+      'Usage not reported'
+    );
+
+    // Unknown historic rows stay unknown without cosmetic invented attribution.
+    const unknownHistoric = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        actor: makeActor({
+          label: null,
+          role: null,
+          source: 'paired_mcp',
+          model: null,
+          effort: null,
+          evidence: 'unknown',
+        }),
+        executor: null,
+        usage: null,
+      })
+    );
+    assert.equal(unknownHistoric.requesterLine.value, 'Unknown');
+    assert.equal(projectRequestExecutorDisplay(unknownHistoric).role, 'Executor not recorded');
+    assert.equal(projectRequestExecutorDisplay(unknownHistoric).model, null);
+    assert.equal(formatCompactUsage(unknownHistoric.usage).value, 'Usage not reported');
   });
 });
