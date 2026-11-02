@@ -34,6 +34,8 @@ pub mod codex_setup;
 pub mod control_runtime;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
+/// Shared durable contracts and per-binding ledger store for the end-to-end Coworker workflow.
+pub mod coworker_workflow;
 /// Shared conversation-change advancement guard for direct native task dispatch.
 pub mod dispatch_guard;
 /// Structured error codes and redacted error types.
