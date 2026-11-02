@@ -1392,7 +1392,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-02.v2) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-03.v3) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -1712,7 +1712,7 @@ impl PairedMcpServer {
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
     #[tool(
         name = "catalog",
-        description = "List a bounded cursor-paginated page of configured workflow profiles and role/difficulty model assignments from the operator registry for the enrolled chat binding. Omits CLI executable paths and credentials; assignments referencing disabled tools report tool_enabled: false and available: false without model substitution.",
+        description = "List a bounded cursor-paginated page of configured workflow profiles and active five-role execution assignments from the operator registry for the enrolled chat binding. Omits legacy follower assignments, CLI executable paths, and credentials; assignments referencing disabled tools report tool_enabled: false and available: false without model substitution.",
         annotations(
             title = "List Workflow Profile Catalog",
             read_only_hint = true,
@@ -2555,7 +2555,7 @@ mod observation_correlation_tests {
             );
             let actor = rec.actor.as_ref().expect("actor present");
             assert_eq!(actor.label.as_deref(), Some("Codex · Auto Chat"));
-            assert_eq!(actor.role.as_deref(), Some("follower"));
+            assert_eq!(actor.role.as_deref(), Some("coworker"));
             assert_eq!(actor.source.as_deref(), Some("paired_mcp"));
             assert_eq!(actor.model, None);
             assert_eq!(actor.effort, None);

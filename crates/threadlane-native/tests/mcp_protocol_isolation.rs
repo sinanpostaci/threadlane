@@ -70,8 +70,8 @@ async fn paired_server_rejects_stateless_requests_and_negotiates_a_session_hands
         .as_str()
         .expect("handshake instructions");
     let first_512: String = instructions.chars().take(512).collect();
-    assert!(first_512.contains("2026-11-02.v2"));
-    assert!(first_512.contains("Follower"));
+    assert!(first_512.contains("2026-11-03.v3"));
+    assert!(first_512.contains("Coworker"));
     assert!(first_512.contains("connect_current_chat"));
     assert!(first_512.contains("operating_guide"));
 

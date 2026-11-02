@@ -142,6 +142,10 @@ impl ScopedWorkflow {
     ///
     /// - Page size defaults to [`DEFAULT_CATALOG_LIMIT`] (`20`) and cannot exceed [`MAX_CATALOG_LIMIT`] (`20`).
     /// - Summaries omit CLI executable paths and credentials.
+    /// - Exposes only the five active execution role assignments ([`WorkflowRole::is_execution_role`]),
+    ///   omitting legacy [`WorkflowRole::Follower`] assignments from catalog entries and active profile
+    ///   availability calculations while preserving stored historical profile snapshots and full model/tool
+    ///   corruption validation.
     /// - Assignments referencing disabled tools are marked `tool_enabled: false` and `available: false`
     ///   without substituting another model or tool.
     /// - Optional `decision_advisor` metadata is resolved from the same `registry_revision` snapshot;
@@ -939,6 +943,9 @@ fn build_catalog_profile(
             .ok_or(WorkflowError::CorruptStore(
                 "Registry model references a missing tool definition.",
             ))?;
+        if !assignment.role.is_execution_role() {
+            continue;
+        }
         let route = TaskExecutionRoute::from_adapter(tool.adapter);
         let tool_enabled = tool.enabled;
         let available = tool_enabled && route.is_supported();

@@ -159,9 +159,9 @@ pub struct CatalogProfile {
     pub profile_revision: u64,
     /// Whether this profile is the registry's current default workflow profile.
     pub is_default: bool,
-    /// Whether all assignments on this profile are available (`!assignments.is_empty()` and all `available`).
+    /// Whether all active execution role assignments on this profile are available (`!assignments.is_empty()` and all `available`).
     pub available: bool,
-    /// Resolved role/difficulty assignments configured on this profile.
+    /// Resolved active execution role/difficulty assignments configured on this profile ([`WorkflowRole::is_execution_role`]).
     pub assignments: Vec<CatalogRoleAssignment>,
     /// Optional read-only decision advisor configuration resolved from the same registry snapshot.
     ///

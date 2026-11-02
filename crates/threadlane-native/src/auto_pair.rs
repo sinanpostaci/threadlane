@@ -296,7 +296,7 @@ impl AutomaticPairing {
                 binding_id: enrolled.binding_id,
                 thread_id: enrolled.thread_id,
                 binding_created: binding.created,
-                conversation_role: "follower",
+                conversation_role: "coworker",
                 native_per_call_identity_verified: false,
             })
         };
@@ -386,7 +386,7 @@ mod tests {
                     ctx.actor.label.as_deref(),
                     Some("Codex · Architecture Chat")
                 );
-                assert_eq!(ctx.actor.role.as_deref(), Some("follower"));
+                assert_eq!(ctx.actor.role.as_deref(), Some("coworker"));
                 assert_eq!(ctx.actor.source.as_deref(), Some("paired_mcp"));
                 assert_eq!(ctx.actor.model, None);
                 assert_eq!(ctx.actor.effort, None);
@@ -436,11 +436,11 @@ mod tests {
             binding_id: binding_a.to_string(),
             thread_id: thread_a.to_string(),
             binding_created: true,
-            conversation_role: "follower",
+            conversation_role: "coworker",
             native_per_call_identity_verified: false,
         })
         .expect("serialize AutomaticPairingResult");
-        assert_eq!(result_json["conversation_role"], "follower");
+        assert_eq!(result_json["conversation_role"], "coworker");
         assert_eq!(result_json["native_per_call_identity_verified"], false);
     }
 

@@ -1675,7 +1675,14 @@ fi
         let prof = &cat_page.profiles[0];
         assert!(prof.is_default);
         assert!(prof.available);
-        assert_eq!(prof.assignments.len(), 4);
+        assert_eq!(prof.assignments.len(), 3);
+        assert!(
+            !prof
+                .assignments
+                .iter()
+                .any(|a| a.role == WorkflowRole::Follower),
+            "catalog must omit legacy Follower from active execution assignments"
+        );
         let hard_coder = prof
             .assignments
             .iter()
@@ -2409,6 +2416,9 @@ fi
         let ver_idx = paired_prefix
             .find(OPERATING_GUIDE_VERSION)
             .expect("paired instructions must contain version in first 512 chars");
+        let role_idx = paired_prefix
+            .find("Coworker")
+            .expect("paired instructions must contain Coworker in first 512 chars");
         let first_action_idx = paired_prefix
             .find("First action")
             .expect("paired instructions must contain First action in first 512 chars");
@@ -2418,7 +2428,8 @@ fi
         let guide_idx = paired_prefix
             .find(OPERATING_GUIDE_TOOL)
             .expect("paired instructions must contain operating_guide in first 512 chars");
-        assert!(ver_idx < first_action_idx);
+        assert!(ver_idx < role_idx);
+        assert!(role_idx < first_action_idx);
         assert!(first_action_idx < identity_idx);
         assert!(identity_idx < guide_idx);
 
@@ -2434,6 +2445,7 @@ fi
         assert_eq!(scoped_instructions, SCOPED_MCP_STARTUP_INSTRUCTIONS);
         let scoped_prefix: String = scoped_instructions.chars().take(512).collect();
         assert!(scoped_prefix.contains(OPERATING_GUIDE_VERSION));
+        assert!(scoped_prefix.contains("Coworker"));
         assert!(scoped_prefix.contains(OPERATING_GUIDE_TOOL));
 
         // 2. Verify `operating_guide` registration, read-only annotations, and strict no-arg schema.
@@ -2853,7 +2865,7 @@ fi
                 actor.label.as_deref(),
                 Some("Codex · Follower Onboarding Chat")
             );
-            assert_eq!(actor.role.as_deref(), Some("follower"));
+            assert_eq!(actor.role.as_deref(), Some("coworker"));
             assert_eq!(actor.source.as_deref(), Some("paired_mcp"));
             // Must never borrow `gpt-follow` or `deepseek-flash` from the workflow profile!
             assert_eq!(actor.model, None);

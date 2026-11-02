@@ -104,7 +104,7 @@ pub struct ObservationActor {
     /// Human-readable actor label when verified or configured; `None` when unknown.
     pub label: Option<String>,
     /// Workflow or declared conversation role when proven by a role-flow handoff, receipt, or
-    /// verified connection context (for example `"follower"`).
+    /// verified connection context (for example `"coworker"`).
     pub role: Option<String>,
     /// Boundary or transport source (for example `trusted_local_operator` or `paired_mcp`).
     pub source: Option<String>,
@@ -130,18 +130,23 @@ impl ObservationActor {
     }
 
     /// Returns a verified paired-MCP caller actor record with display label `"Codex · <thread_label>"`,
-    /// declared conversation role `"follower"`, source `"paired_mcp"`, `Configured` evidence, and
+    /// declared conversation role `"coworker"`, source `"paired_mcp"`, `Configured` evidence, and
     /// `None` for `model` and `effort` (which are never inferred from profile defaults or thread configuration).
-    pub fn paired_follower(thread_label: &str) -> Self {
+    pub fn paired_coworker(thread_label: &str) -> Self {
         let sanitized = sanitize_observation_label(thread_label, "Codex chat");
         Self {
             label: Some(format!("Codex · {sanitized}")),
-            role: Some("follower".to_string()),
+            role: Some("coworker".to_string()),
             source: Some("paired_mcp".to_string()),
             model: None,
             effort: None,
             evidence: ObservationActorEvidence::Configured,
         }
+    }
+
+    /// Compatibility alias for [`Self::paired_coworker`].
+    pub fn paired_follower(thread_label: &str) -> Self {
+        Self::paired_coworker(thread_label)
     }
 }
 
@@ -215,7 +220,7 @@ pub struct VerifiedMcpObservationContext {
     pub project_label: String,
     /// Canonical project directory path from verified `MatchedThreadCandidate`.
     pub project_path: Option<String>,
-    /// Verified caller actor record (`Codex · <thread_label>`, role `follower`, source `paired_mcp`, evidence `Configured`).
+    /// Verified caller actor record (`Codex · <thread_label>`, role `coworker`, source `paired_mcp`, evidence `Configured`).
     pub actor: ObservationActor,
 }
 
@@ -244,7 +249,7 @@ impl VerifiedMcpObservationContext {
             .to_str()
             .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
             .map(str::to_string);
-        let actor = ObservationActor::paired_follower(&thread_label);
+        let actor = ObservationActor::paired_coworker(&thread_label);
         Self {
             binding_id: binding_id.into(),
             thread_uuid: thread_uuid.into(),
@@ -3850,11 +3855,22 @@ mod tests {
             Some("/tmp/workspace/alpha-repo")
         );
         assert_eq!(ctx.actor.label.as_deref(), Some("Codex · AlphaChatTitle"));
-        assert_eq!(ctx.actor.role.as_deref(), Some("follower"));
+        assert_eq!(ctx.actor.role.as_deref(), Some("coworker"));
         assert_eq!(ctx.actor.source.as_deref(), Some("paired_mcp"));
         assert_eq!(ctx.actor.model, None);
         assert_eq!(ctx.actor.effort, None);
         assert_eq!(ctx.actor.evidence, ObservationActorEvidence::Configured);
+        assert_eq!(
+            ObservationActor::paired_follower("AlphaChatTitle"),
+            ctx.actor
+        );
+
+        let legacy_actor: ObservationActor = serde_json::from_str(
+            r#"{"label":"Codex · Legacy Chat","role":"follower","source":"paired_mcp","model":null,"effort":null,"evidence":"configured"}"#,
+        )
+        .expect("historical follower actor must still deserialize");
+        assert_eq!(legacy_actor.role.as_deref(), Some("follower"));
+        assert_eq!(legacy_actor.evidence, ObservationActorEvidence::Configured);
 
         assert!(ctx
             .matching_scope(

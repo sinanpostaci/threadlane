@@ -2434,4 +2434,152 @@ mod tests {
             corrupt_reg_bytes
         );
     }
+
+    #[test]
+    fn catalog_omits_legacy_follower_from_active_execution_assignments_and_availability_while_preserving_historical_profile_and_corruption_checks(
+    ) {
+        let (_tmp, registry, plans, rev) = setup_stores();
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("create workflow");
+
+        // Disable the legacy `codex` tool (`ToolAdapter::CodexCli`) used by the historical `Follower` slot,
+        // and configure a profile with all five active execution roles on enabled supported worker tools
+        // plus a legacy `Follower` assignment on the disabled `codex` tool.
+        let s1 = registry
+            .apply(
+                rev,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("codex", ToolAdapter::CodexCli, false),
+                },
+            )
+            .expect("disable codex tool");
+
+        let five_role_with_disabled_legacy_follower = WorkflowProfile {
+            id: "active-five-role".to_string(),
+            name: "Active Five-Role Profile With Historical Follower".to_string(),
+            assignments: vec![
+                RoleAssignment {
+                    role: WorkflowRole::Follower,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "luna-max".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Orchestrator,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Architect,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Coder,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "deepseek-flash".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Closure,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "deepseek-flash".to_string(),
+                        effort: Some("max".to_string()),
+                    },
+                },
+            ],
+            decision_advisor: None,
+        };
+
+        let s2 = registry
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertProfile {
+                    profile: five_role_with_disabled_legacy_follower,
+                },
+            )
+            .expect("upsert five-role profile with legacy follower");
+
+        let page = wf.catalog(None, None).expect("catalog page");
+        assert_eq!(page.registry_revision, s2.revision);
+        let cat_prof = page
+            .profiles
+            .iter()
+            .find(|p| p.profile_id == "active-five-role")
+            .expect("active-five-role in catalog");
+
+        // Disabled legacy `Follower` must NOT make the active five-role catalog profile unavailable,
+        // and `Follower` must be omitted from the exposed catalog assignments.
+        assert!(
+            cat_prof.available,
+            "disabled legacy Follower must not make active five-role catalog profile unavailable"
+        );
+        assert_eq!(cat_prof.assignments.len(), 5);
+        assert!(
+            !cat_prof
+                .assignments
+                .iter()
+                .any(|a| a.role == WorkflowRole::Follower),
+            "catalog must omit legacy Follower from exposed assignments"
+        );
+        let exposed_roles: Vec<WorkflowRole> =
+            cat_prof.assignments.iter().map(|a| a.role).collect();
+        assert_eq!(exposed_roles, WorkflowRole::EXECUTION_ROLES.to_vec());
+
+        // Stored historical profile in the registry snapshot must still decode with all 6 assignments intact.
+        let persisted_snapshot = registry.snapshot().expect("snapshot from disk");
+        let stored_prof = persisted_snapshot
+            .profiles
+            .iter()
+            .find(|p| p.id == "active-five-role")
+            .expect("stored active-five-role profile");
+        assert_eq!(stored_prof.assignments.len(), 6);
+        assert_eq!(stored_prof.assignments[0].role, WorkflowRole::Follower);
+        assert_eq!(stored_prof.execution_assignments().count(), 5);
+
+        // Corruption validation must still check stored legacy Follower model/tool references.
+        let raw_reg = fs::read_to_string(registry.registry_path()).expect("read registry.json");
+        let corrupt_follower_reg = raw_reg.replacen(
+            "\"model_id\": \"luna-max\"",
+            "\"model_id\": \"missing-legacy-follower-model\"",
+            1,
+        );
+        assert_ne!(raw_reg, corrupt_follower_reg);
+        fs::write(registry.registry_path(), &corrupt_follower_reg)
+            .expect("write registry.json with corrupt legacy follower model_id");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(registry.registry_path(), fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 registry.json");
+        }
+
+        let corrupt_err = wf
+            .catalog(None, None)
+            .expect_err("corrupt legacy follower reference must still fail closed");
+        assert_eq!(corrupt_err.code(), "corrupt_store");
+    }
 }
