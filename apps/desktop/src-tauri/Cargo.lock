@@ -4705,6 +4705,7 @@ dependencies = [
 name = "threadlane-core"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4727,6 +4728,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "threadlane-connectors",
+ "threadlane-core",
  "threadlane-registry",
  "tokio",
 ]
@@ -4738,10 +4740,12 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "threadlane-authority",
  "threadlane-connectors",
+ "threadlane-core",
  "threadlane-decisions",
  "threadlane-desktop-bridge",
  "threadlane-host",

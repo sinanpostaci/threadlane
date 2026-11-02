@@ -1392,6 +1392,20 @@ pub fn read_task_receipt(
     Ok(receipt)
 }
 
+/// Persisted pending dispatch intents and sealed task run receipts.
+pub type ReadonlyTaskLedger = (Vec<TaskDispatchIntent>, Vec<TaskRunReceipt>);
+
+/// Reads the persisted [`TaskDispatchIntent`] and [`TaskRunReceipt`] lists from `<session_dir>/task-receipts.json`
+/// in strictly read-only mode without opening or creating any lock file.
+pub fn read_session_task_ledger_readonly(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+) -> Result<Option<ReadonlyTaskLedger>, HostError> {
+    read_task_receipts_locked(session_dir, record, session_binding_id)
+        .map(|opt| opt.map(|ledger| (ledger.pending_intents, ledger.receipts)))
+}
+
 /// Verifies `<session_dir>/task-receipts.json` (if present) against `record` and `session_binding_id`
 /// without creating a missing lock file on disk.
 pub(crate) fn verify_existing_task_receipts(

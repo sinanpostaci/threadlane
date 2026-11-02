@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod host_control;
+mod observation;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use host_control::HostControlHub;
+use observation::{ObservationService, ObservationSourceConfig};
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State, Window};
 use threadlane_authority::{
@@ -19,6 +21,9 @@ use threadlane_authority::{
 use threadlane_connectors::{
     inspect_tool_versions, probe_tool, ConnectorError, CredentialStore, KeyringCredentialStore,
     ToolProbe, ToolVersionInspection,
+};
+use threadlane_core::observation::{
+    ObservationSnapshot, ObservationSnapshotRequest, ObservationSource,
 };
 use threadlane_decisions::{
     DecisionAdvice, DecisionClient, DecisionError, DecisionProvider, DecisionRequest,
@@ -746,12 +751,22 @@ async fn desktop_snapshot(
 #[tauri::command]
 async fn desktop_attach(
     bridge: State<'_, DesktopBridge>,
+    observation: State<'_, ObservationService>,
     state_dir: String,
 ) -> Result<DesktopSnapshot, String> {
-    bridge
+    let snapshot = bridge
         .attach(state_dir)
         .await
-        .map_err(|err| err.to_string())
+        .map_err(|err| err.to_string())?;
+    let runtime_state_dir = snapshot
+        .attachment
+        .state_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from);
+    observation.set_runtime_state_dir(runtime_state_dir);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -1304,8 +1319,41 @@ async fn desktop_native_threads(
         .map_err(AppError::from_native_error)
 }
 
+#[tauri::command]
+async fn desktop_observation_snapshot(
+    request: Option<ObservationSnapshotRequest>,
+    state: State<'_, ObservationService>,
+) -> Result<ObservationSnapshot, AppError> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.snapshot(request))
+        .await
+        .map_err(|_| AppError::internal_join_error())?
+}
+
+#[tauri::command]
+async fn desktop_observation_sources(
+    state: State<'_, ObservationService>,
+) -> Result<Vec<ObservationSource>, AppError> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.sources())
+        .await
+        .map_err(|_| AppError::internal_join_error())
+}
+
+#[tauri::command]
+async fn desktop_link_observation_context(
+    context_path: String,
+    state: State<'_, ObservationService>,
+) -> Result<ObservationSource, AppError> {
+    let service = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || service.link_context(Path::new(&context_path)))
+        .await
+        .map_err(|_| AppError::internal_join_error())?
+}
+
 fn main() -> ExitCode {
     let cli = DesktopCli::parse();
+    let initial_runtime_state_dir = cli.state_dir.clone();
     let bridge = match DesktopBridge::new(cli.state_dir, cli.demo_state_dir) {
         Ok(bridge) => bridge,
         Err(err) => {
@@ -1343,7 +1391,16 @@ fn main() -> ExitCode {
                 sessions_dir,
                 cli_host_executable,
             )?;
+            let observation = ObservationService::new(ObservationSourceConfig {
+                runtime_state_dir: initial_runtime_state_dir,
+                registry_dir: control.registry.config_dir().to_path_buf(),
+                plans_dir: control.plans.dir().to_path_buf(),
+                authority_dir: control.authority.dir().to_path_buf(),
+                sessions_dir: control.sessions_dir.clone(),
+                app_data_dir: control.registry.config_dir().to_path_buf(),
+            });
             app.manage(control);
+            app.manage(observation);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1377,6 +1434,9 @@ fn main() -> ExitCode {
             desktop_approved_task,
             desktop_approved_activity,
             desktop_native_threads,
+            desktop_observation_snapshot,
+            desktop_observation_sources,
+            desktop_link_observation_context,
         ])
         .run(tauri::generate_context!());
 

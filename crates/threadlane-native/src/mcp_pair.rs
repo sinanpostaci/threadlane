@@ -23,6 +23,11 @@ pub use threadlane::mcp::{
 };
 use threadlane::{ScopedClient, ThreadlaneMcpServer};
 use threadlane_authority::AuthorityStore;
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, ObservationActor, ObservationCallState, ObservationDelivery,
+    ObservationDeliveryStage, ObservationJournalRecord, ObservationRecordPhase,
+};
 use threadlane_workflow::{
     ensure_mcp_response_budget, Difficulty, PlanStore, PlanTask, RegistryStore, SavePlanDraft,
     ScopedWorkflow, WorkflowError, WorkflowRole,
@@ -940,6 +945,124 @@ impl PairedMcpServer {
         Ok(enrollment)
     }
 
+    fn observation_journal_dir(&self) -> PathBuf {
+        self.workflow_stores
+            .as_ref()
+            .map(|stores| stores.plans.dir().to_path_buf())
+            .unwrap_or_else(|| self.state_dir.clone())
+    }
+
+    fn begin_paired_observation(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        tool_name: &'static str,
+        approval_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> String {
+        let request_id = generate_observation_id("obsreq");
+        let dir = self.observation_journal_dir();
+        let started_at_ms = current_observation_time_ms();
+        let op = format!("mcp.paired.{tool_name}");
+        let title = format!("mcp paired {}", tool_name.replace('_', " "));
+        let _ = append_journal_record(
+            &dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id: request_id.clone(),
+                parent_request_id: None,
+                call_id: None,
+                phase: ObservationRecordPhase::Entry,
+                at_ms: started_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(binding_id.to_string()),
+                thread_uuid: Some(thread_uuid.to_string()),
+                thread_label: None,
+                job_id: None,
+                plan_id: None,
+                task_id: task_id.map(str::to_string),
+                approval_id: approval_id.map(str::to_string),
+                operation: op.clone(),
+                title,
+                state: ObservationCallState::Running,
+                actor: Some(ObservationActor::unknown(Some("paired_mcp".to_string()))),
+                executor: None,
+                usage: None,
+                delivery: Vec::new(),
+                summary: Some(format!("MCP tool {op}")),
+            },
+        );
+        request_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_paired_observation(
+        &self,
+        request_id: String,
+        binding_id: &str,
+        thread_uuid: &str,
+        tool_name: &'static str,
+        approval_id: Option<&str>,
+        task_id: Option<&str>,
+        result: &Result<CallToolResult, CallToolResult>,
+    ) {
+        let plan_id = observation_result_plan_id(tool_name, binding_id, result);
+        let dir = self.observation_journal_dir();
+        let finished_at_ms = current_observation_time_ms();
+        let op = format!("mcp.paired.{tool_name}");
+        let title = format!("mcp paired {}", tool_name.replace('_', " "));
+        let (state, stage, summary_detail) = match result {
+            Ok(_) => (
+                ObservationCallState::Completed,
+                ObservationDeliveryStage::ResponseReturned,
+                format!("Completed {op}"),
+            ),
+            Err(_) => (
+                ObservationCallState::Failed,
+                ObservationDeliveryStage::Failed,
+                format!("Failed {op}"),
+            ),
+        };
+        let _ = append_journal_record(
+            &dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id,
+                parent_request_id: None,
+                call_id: None,
+                phase: ObservationRecordPhase::Finish,
+                at_ms: finished_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(binding_id.to_string()),
+                thread_uuid: Some(thread_uuid.to_string()),
+                thread_label: None,
+                job_id: plan_id.clone(),
+                plan_id,
+                task_id: task_id.map(str::to_string),
+                approval_id: approval_id.map(str::to_string),
+                operation: op,
+                title,
+                state,
+                actor: Some(ObservationActor::unknown(Some("paired_mcp".to_string()))),
+                executor: None,
+                usage: None,
+                delivery: vec![ObservationDelivery {
+                    stage,
+                    at_ms: Some(finished_at_ms),
+                    summary: summary_detail.clone(),
+                    recipient: Some(binding_id.to_string()),
+                }],
+                summary: Some(summary_detail),
+            },
+        );
+    }
+
     fn enrolled_delegate(&self, tool_name: &str) -> Result<ThreadlaneMcpServer, CallToolResult> {
         let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
 
@@ -957,7 +1080,8 @@ impl PairedMcpServer {
             )
         })?;
 
-        Ok(ThreadlaneMcpServer::new(scoped_client))
+        Ok(ThreadlaneMcpServer::new(scoped_client)
+            .with_paired_observation(enrollment.thread_id, self.observation_journal_dir()))
     }
 
     fn scoped_workflow_for_enrolled(
@@ -1010,6 +1134,7 @@ impl PairedMcpServer {
     {
         let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
         let trusted_binding_id = enrollment.binding_id;
+        let trusted_thread_uuid = enrollment.thread_id;
 
         let Some(stores) = self.workflow_stores.as_ref() else {
             return Err(Self::format_scoped_error(
@@ -1021,6 +1146,13 @@ impl PairedMcpServer {
         };
 
         let workflow = self.scoped_workflow_for_enrolled(stores, &trusted_binding_id, tool_name)?;
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            tool_name,
+            None,
+            None,
+        );
 
         let outcome = tokio::task::spawn_blocking(move || op(workflow))
             .await
@@ -1031,16 +1163,27 @@ impl PairedMcpServer {
                     "io_error",
                     "Workflow background task failed to complete.",
                 )
-            })?;
+            });
 
-        match outcome {
-            Ok(data) => Self::format_workflow_result(&trusted_binding_id, tool_name, data),
-            Err(err) => Err(Self::format_workflow_error(
+        let result = match outcome {
+            Ok(Ok(data)) => Self::format_workflow_result(&trusted_binding_id, tool_name, data),
+            Ok(Err(err)) => Err(Self::format_workflow_error(
                 &trusted_binding_id,
                 tool_name,
                 err,
             )),
-        }
+            Err(err_res) => Err(err_res),
+        };
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            tool_name,
+            None,
+            None,
+            &result,
+        );
+        result
     }
 
     fn format_workflow_result<T: Serialize>(
@@ -1599,13 +1742,30 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("list_approvals")?;
-        execute_list_approvals(
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "list_approvals",
+            None,
+            None,
+        );
+        let res = execute_list_approvals(
             stores.authority,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "list_approvals",
+            None,
+            None,
+            &res,
+        );
+        res
     }
 
     /// Queries live authenticated host session readiness for an operator approval record owned by the enrolled chat binding and native thread (requires verified operator enrollment).
@@ -1626,14 +1786,32 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_session")?;
-        execute_approved_session(
+        let approval_id = params.approval_id.clone();
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_session",
+            Some(&approval_id),
+            None,
+        );
+        let res = execute_approved_session(
             stores.authority,
             stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_session",
+            Some(&approval_id),
+            None,
+            &res,
+        );
+        res
     }
 
     /// Dispatches an approved root worker task using its frozen instruction, profile, write scope, and deterministic command key (requires verified operator enrollment).
@@ -1667,7 +1845,15 @@ impl PairedMcpServer {
             .as_ref()
             .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
 
-        crate::dispatch_guard::with_guarded_native_dispatch_until(
+        let req_id = self.begin_paired_observation(
+            &guard_binding_id,
+            &guard_thread_uuid,
+            "start_approved_task",
+            Some(&guard_approval_id),
+            Some(&guard_task_id),
+        );
+
+        let res = crate::dispatch_guard::with_guarded_native_dispatch_until(
             &authority_for_guard,
             &guard_binding_id,
             &guard_thread_uuid,
@@ -1723,7 +1909,19 @@ impl PairedMcpServer {
                     message,
                 )
             }
-        })?
+        })
+        .and_then(|inner| inner);
+
+        self.finish_paired_observation(
+            req_id,
+            &guard_binding_id,
+            &guard_thread_uuid,
+            "start_approved_task",
+            Some(&guard_approval_id),
+            Some(&guard_task_id),
+            &res,
+        );
+        res
     }
 
     /// Reads the current execution status of an approved task within an operator approval record (requires verified operator enrollment).
@@ -1744,14 +1942,33 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_task")?;
-        execute_approved_task(
+        let approval_id = params.approval_id.clone();
+        let task_id = params.task_id.clone();
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_task",
+            Some(&approval_id),
+            Some(&task_id),
+        );
+        let res = execute_approved_task(
             stores.authority,
             stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_task",
+            Some(&approval_id),
+            Some(&task_id),
+            &res,
+        );
+        res
     }
 
     /// Requests revision-checked cancellation of an active approved root worker task (requires verified operator enrollment).
@@ -1772,14 +1989,33 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("cancel_approved_task")?;
-        execute_cancel_approved_task(
+        let approval_id = params.approval_id.clone();
+        let task_id = params.task_id.clone();
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "cancel_approved_task",
+            Some(&approval_id),
+            Some(&task_id),
+        );
+        let res = execute_cancel_approved_task(
             stores.authority,
             stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "cancel_approved_task",
+            Some(&approval_id),
+            Some(&task_id),
+            &res,
+        );
+        res
     }
 
     /// Lists a read-only bounded page of durable activity events from an approved host session (requires verified operator enrollment).
@@ -1800,14 +2036,33 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_activity")?;
-        execute_approved_activity(
+        let approval_id = params.approval_id.clone();
+        let task_id = params.task_id.clone();
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_activity",
+            Some(&approval_id),
+            task_id.as_deref(),
+        );
+        let res = execute_approved_activity(
             stores.authority,
             stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_activity",
+            Some(&approval_id),
+            task_id.as_deref(),
+            &res,
+        );
+        res
     }
 
     /// Pulls a bounded ordered batch of durable events from an approved host session (requires verified operator enrollment).
@@ -1828,14 +2083,32 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_pull_events")?;
-        execute_approved_pull_events(
+        let approval_id = params.approval_id.clone();
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_pull_events",
+            Some(&approval_id),
+            None,
+        );
+        let res = execute_approved_pull_events(
             stores.authority,
             stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_pull_events",
+            Some(&approval_id),
+            None,
+            &res,
+        );
+        res
     }
 
     /// Explicitly acknowledges processing of a delivered event batch from an approved host session (requires verified operator enrollment).
@@ -1856,14 +2129,32 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_ack_events")?;
-        execute_approved_ack_events(
+        let approval_id = params.approval_id.clone();
+        let req_id = self.begin_paired_observation(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_ack_events",
+            Some(&approval_id),
+            None,
+        );
+        let res = execute_approved_ack_events(
             stores.authority,
             stores.sessions_dir,
-            trusted_binding_id,
-            trusted_thread_uuid,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
             params,
         )
-        .await
+        .await;
+        self.finish_paired_observation(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "approved_ack_events",
+            Some(&approval_id),
+            None,
+            &res,
+        );
+        res
     }
 }
 
@@ -1876,5 +2167,81 @@ impl ServerHandler for PairedMcpServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(PAIRED_MCP_STARTUP_INSTRUCTIONS)
+    }
+}
+
+/// Reads a plan correlation only from our successful, binding-scoped workflow response.
+/// It never accepts IDs from free-text summaries, input environment, or another tool's payload.
+fn observation_result_plan_id(
+    tool_name: &str,
+    binding_id: &str,
+    result: &Result<CallToolResult, CallToolResult>,
+) -> Option<String> {
+    let response = result.as_ref().ok()?;
+    if response.is_error == Some(true) {
+        return None;
+    }
+    let payload = response.structured_content.as_ref()?;
+    if payload.get("binding_id")?.as_str()? != binding_id {
+        return None;
+    }
+    let data = payload.get("data")?;
+    let header = match tool_name {
+        "save_draft" => data,
+        "get_plan" | "publish" => data.get("header")?,
+        _ => return None,
+    };
+    if header.get("binding_id")?.as_str()? != binding_id {
+        return None;
+    }
+    threadlane_core::observation::validate_correlation_id(header.get("plan_id")?.as_str()?)
+}
+
+#[cfg(test)]
+mod observation_correlation_tests {
+    use super::*;
+
+    #[test]
+    fn only_successful_binding_scoped_workflow_results_correlate_a_job() {
+        let header = json!({"binding_id": "bnd_a", "plan_id": "plan_one"});
+        let saved = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            "save_draft",
+            &header,
+        ));
+        assert_eq!(
+            observation_result_plan_id("save_draft", "bnd_a", &saved).as_deref(),
+            Some("plan_one")
+        );
+        assert_eq!(
+            observation_result_plan_id("save_draft", "bnd_b", &saved),
+            None
+        );
+        assert_eq!(observation_result_plan_id("status", "bnd_a", &saved), None);
+        let published = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            "publish",
+            json!({"header": header}),
+        ));
+        assert_eq!(
+            observation_result_plan_id("publish", "bnd_a", &published).as_deref(),
+            Some("plan_one")
+        );
+        let wrong_inner = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            "save_draft",
+            json!({"binding_id":"bnd_b", "plan_id":"plan_one"}),
+        ));
+        assert_eq!(
+            observation_result_plan_id("save_draft", "bnd_a", &wrong_inner),
+            None
+        );
+        let failed = Err(CallToolResult::structured_error(
+            json!({"binding_id":"bnd_a", "data":header}),
+        ));
+        assert_eq!(
+            observation_result_plan_id("save_draft", "bnd_a", &failed),
+            None
+        );
     }
 }

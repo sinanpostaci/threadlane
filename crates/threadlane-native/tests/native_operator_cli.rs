@@ -2114,7 +2114,20 @@ async fn session_cli_reports_ready_stopped_and_restarted_host_lifecycle_truthful
         "duplicate stop of the already stopped session",
         &fx.binding_id,
     );
-    assert_eq!(duplicate_stopped, queried_stopped);
+    assert_eq!(
+        queried_stopped
+            .notification_delivery
+            .as_ref()
+            .map(|delivery| delivery.availability),
+        Some(threadlane_host::HostNotificationAvailability::Unavailable),
+        "the summary query separately observes notification availability after shutdown"
+    );
+    let mut expected_stopped = queried_stopped.clone();
+    expected_stopped.notification_delivery = None;
+    assert_eq!(
+        duplicate_stopped, expected_stopped,
+        "idempotent stop preserves the complete durable session summary without a live notification query"
+    );
     assert!(
         !fx.worker_marker.exists(),
         "duplicate stop must not dispatch or invoke a worker"

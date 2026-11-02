@@ -10,6 +10,12 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use threadlane_authority::validation::{validate_identifier, validate_sha256_hex};
 use threadlane_authority::{AuthorityError, AuthorityStore};
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, read_env_parent_request_id, read_env_plan_id, ObservationActor,
+    ObservationCallState, ObservationDelivery, ObservationDeliveryStage, ObservationJournalRecord,
+    ObservationRecordPhase,
+};
 use threadlane_host::{ApprovedHostClient, HostError, HostPhase};
 use threadlane_native::fs_safety::constant_time_str_eq;
 use threadlane_native::operator_cli::{
@@ -385,7 +391,134 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
     )
     .map_err(|err| map_host_error(&err))?;
 
-    match cli.command {
+    let (op_name, initial_approval_id, initial_task_id, is_mutating) = match &cli.command {
+        SessionCommand::Session { approval_id } => {
+            ("session.session", Some(approval_id.clone()), None, false)
+        }
+        SessionCommand::Task {
+            approval_id,
+            task_id,
+        } => (
+            "session.task",
+            Some(approval_id.clone()),
+            Some(task_id.clone()),
+            false,
+        ),
+        SessionCommand::Dispatch {
+            approval_id,
+            task_id,
+            ..
+        } => (
+            "session.dispatch",
+            Some(approval_id.clone()),
+            Some(task_id.clone()),
+            true,
+        ),
+        SessionCommand::Cancel {
+            approval_id,
+            task_id,
+            ..
+        } => (
+            "session.cancel",
+            Some(approval_id.clone()),
+            Some(task_id.clone()),
+            true,
+        ),
+        SessionCommand::Stop { approval_id, .. } => {
+            ("session.stop", Some(approval_id.clone()), None, true)
+        }
+        SessionCommand::Activity {
+            approval_id,
+            task_id,
+            ..
+        } => (
+            "session.activity",
+            Some(approval_id.clone()),
+            task_id.clone(),
+            false,
+        ),
+        SessionCommand::Pull { approval_id, .. } => {
+            ("session.pull", Some(approval_id.clone()), None, true)
+        }
+        SessionCommand::Ack { approval_id, .. } => {
+            ("session.ack", Some(approval_id.clone()), None, true)
+        }
+        SessionCommand::NotificationStatus { approval_id } => (
+            "session.notification-status",
+            Some(approval_id.clone()),
+            None,
+            false,
+        ),
+        SessionCommand::RearmNotification { approval_id, .. } => (
+            "session.rearm-notification",
+            Some(approval_id.clone()),
+            None,
+            true,
+        ),
+        SessionCommand::PreviewChange { .. } => ("session.preview-change", None, None, false),
+        SessionCommand::RecordChange { .. } => ("session.record-change", None, None, true),
+        SessionCommand::ListChanges {
+            approval_id,
+            task_id,
+            ..
+        } => (
+            "session.list-changes",
+            approval_id.clone(),
+            task_id.clone(),
+            false,
+        ),
+        SessionCommand::ResolveChange { .. } => ("session.resolve-change", None, None, true),
+    };
+
+    let parent_req = read_env_parent_request_id();
+    let should_journal = parent_req.is_some() || is_mutating;
+    let (request_id, call_id) = match &parent_req {
+        Some(parent) => (parent.clone(), Some(generate_observation_id("obsc"))),
+        None => (generate_observation_id("obsreq"), None),
+    };
+    let verified_job_id = initial_approval_id
+        .as_deref()
+        .and_then(|aid| authority.get_for_operator(aid).ok())
+        .filter(|r| r.binding_id == globals.binding && r.thread_uuid == globals.thread)
+        .map(|r| r.plan_id);
+    let initial_plan_id = verified_job_id.clone().or_else(read_env_plan_id);
+    let started_at_ms = current_observation_time_ms();
+    let actor = ObservationActor::unknown(Some("trusted_local_operator".to_string()));
+    if should_journal {
+        let _ = append_journal_record(
+            &plans_dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id: request_id.clone(),
+                parent_request_id: None,
+                call_id: call_id.clone(),
+                phase: ObservationRecordPhase::Entry,
+                at_ms: started_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(globals.binding.clone()),
+                thread_uuid: Some(globals.thread.clone()),
+                thread_label: None,
+                job_id: verified_job_id.clone(),
+                plan_id: initial_plan_id.clone(),
+                task_id: initial_task_id.clone(),
+                approval_id: initial_approval_id.clone(),
+                operation: op_name.to_string(),
+                title: op_name.replace('.', " "),
+                state: ObservationCallState::Running,
+                actor: Some(actor.clone()),
+                executor: None,
+                usage: None,
+                delivery: Vec::new(),
+                summary: Some(format!("Executing {op_name}")),
+            },
+        );
+    }
+
+    let outcome: Result<(), OperatorCliError> = async {
+        match cli.command {
         SessionCommand::Session { approval_id } => {
             verify_operator_approval(
                 &authority,
@@ -920,7 +1053,70 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             }
             write_result(&globals.binding, &record, true)
         }
+        }
+    }.await;
+
+    if should_journal {
+        let finished_at_ms = current_observation_time_ms();
+        let (final_state, delivery_stage, summary) = match &outcome {
+            Ok(()) => (
+                ObservationCallState::Completed,
+                ObservationDeliveryStage::ResponseReturned,
+                format!("Completed {op_name}"),
+            ),
+            Err(err) if err.code == "outcome_unknown" => (
+                ObservationCallState::Unknown,
+                ObservationDeliveryStage::Unknown,
+                format!("Outcome unknown for {op_name}: {}", err.code),
+            ),
+            Err(err) => (
+                ObservationCallState::Failed,
+                ObservationDeliveryStage::Failed,
+                format!("Failed {op_name}: {}", err.code),
+            ),
+        };
+        let _ = append_journal_record(
+            &plans_dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id,
+                parent_request_id: None,
+                call_id,
+                phase: ObservationRecordPhase::Finish,
+                at_ms: finished_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(globals.binding.clone()),
+                thread_uuid: Some(globals.thread),
+                thread_label: None,
+                job_id: verified_job_id,
+                plan_id: initial_plan_id,
+                task_id: initial_task_id,
+                approval_id: initial_approval_id,
+                operation: op_name.to_string(),
+                title: op_name.replace('.', " "),
+                state: final_state,
+                actor: Some(actor),
+                executor: None,
+                usage: None,
+                delivery: if parent_req.is_none() {
+                    vec![ObservationDelivery {
+                        stage: delivery_stage,
+                        at_ms: Some(finished_at_ms),
+                        summary: summary.clone(),
+                        recipient: Some(globals.binding),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                summary: Some(summary),
+            },
+        );
     }
+
+    outcome
 }
 
 fn require_operator_approved(operator_approved: bool) -> Result<(), OperatorCliError> {

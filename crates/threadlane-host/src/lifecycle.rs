@@ -33,7 +33,7 @@ use crate::types::{
 /// - Joins software-owned approval, task, run, worker, worktree, subject, and receipt identities.
 /// - Performs no mutations, file creation, provider invocations, or host startup.
 /// - Never trusts worker summary prose (`WorkerOutcomeSnapshot::final_summary`).
-pub(crate) fn project_task_lifecycle(
+pub fn project_task_lifecycle(
     record: &ApprovalRecord,
     session_dir: &Path,
     task: &ApprovedTaskRecord,

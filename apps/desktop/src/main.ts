@@ -1,6 +1,7 @@
 import './styles.css';
 import './pages/readiness.css';
 import './pages/recovery-overview.css';
+import './pages/job-plans.css';
 
 import {
   ACCENT_PALETTES,
@@ -68,7 +69,6 @@ import {
   setHistoryExpanded,
   shouldPollActivePlansStore,
   shouldPollHistory,
-  shouldRebuildMainOnPoll,
   toActivityHistoryIpcArgs,
   updateHistoryRunIdDraft,
   type DesktopStoreState,
@@ -91,17 +91,26 @@ import {
   isDevPreviewFixtureMode,
 } from './ipc.ts';
 import {
-  desktop_decision_models,
   desktop_plans_snapshot,
   desktop_registry_snapshot,
-  desktop_test_decision,
   desktop_tool_versions,
   formatAppError,
-  type DecisionAdvice,
-  type DecisionProvider,
-  type ModelDefinition,
 } from './registry/ipc.ts';
 import { visibleModelCount } from './registry/model-families.ts';
+import {
+  ipcLinkObservationContext,
+  ipcObservationSnapshot,
+  ipcObservationSources,
+} from './observation/ipc.ts';
+import type {
+  ObservationSnapshot,
+  ObservationSource,
+} from './observation/types.ts';
+import {
+  collectObservationWindow,
+  OBSERVATION_DEFAULT_PAGE_LIMIT,
+  OBSERVATION_MAX_WINDOW_REQUESTS,
+} from './observation/paging.ts';
 import {
   applyToolVersionScanError,
   applyToolVersionScanSuccess,
@@ -119,6 +128,8 @@ import { createButton, h } from './ui/dom.ts';
 import { ToolsPage } from './pages/tools.ts';
 import { ProfilesPage } from './pages/profiles.ts';
 import { PlansPage } from './pages/plans.ts';
+import { JobPlansPage } from './pages/job-plans.ts';
+import { ActivityFeedPage } from './pages/activity-feed.ts';
 import { NativeLinkingPanel } from './pages/native.ts';
 import { renderActivityHistorySection } from './pages/history.ts';
 import { renderReadinessChecklist } from './pages/readiness.ts';
@@ -130,10 +141,35 @@ const POLL_INTERVAL_MS = 2000;
 
 type StoreRenderMode = 'auto' | 'defer';
 type SnapshotRenderMode = 'preserve' | 'defer';
+type SettingsSection = 'general' | 'connections';
+type ObservationViewKey = 'activity' | 'plans';
+
+interface ObservationScope {
+  source_id: string;
+  job_id: string;
+}
+
+interface ObservationViewState {
+  snapshot: ObservationSnapshot | null;
+  loading: boolean;
+  error: string | null;
+  scope: ObservationScope | null;
+}
+
+type ObservationRequestMode = 'replace' | 'refresh' | 'more' | 'focus';
+
+interface ObservationTicket {
+  sequence: number;
+  viewKey: ObservationViewKey;
+  mode: ObservationRequestMode;
+  scope: ObservationScope | null;
+  cursor: string | null;
+  generation: number;
+  focusScope: ObservationScope | null;
+}
 
 const NAV_ITEMS: ReadonlyArray<{ page: NavPage; label: string; icon: UiIconName }> = [
   { page: 'activity', label: 'Activity', icon: 'activity' },
-  { page: 'chats', label: 'Chats', icon: 'messages-square' },
   { page: 'plans', label: 'Plans', icon: 'clipboard-list' },
   { page: 'tools', label: 'Tools', icon: 'blocks' },
   { page: 'profiles', label: 'Profiles', icon: 'sliders-horizontal' },
@@ -197,14 +233,170 @@ function saveExecutionPreferences(prefs: ExecutionPreferences): void {
   }
 }
 
-interface DecisionTestUiState {
-  selectedToolId: string;
-  selectedModel: string;
-  fetchedModels: ModelDefinition[];
-  loadingModels: boolean;
-  runningTest: boolean;
-  advice: DecisionAdvice | null;
-  error: string | null;
+function createObservationViewState(
+  scope: ObservationScope | null = null
+): ObservationViewState {
+  return {
+    snapshot: null,
+    loading: false,
+    error: null,
+    scope,
+  };
+}
+
+function mergeObservationRequests(
+  current: ObservationSnapshot['requests'],
+  next: ObservationSnapshot['requests']
+): ObservationSnapshot['requests'] {
+  const merged = [...current];
+  const indexByKey = new Map<string, number>();
+  for (let index = 0; index < merged.length; index += 1) {
+    const request = merged[index]!;
+    indexByKey.set(`${request.source_id}\u0000${request.id}`, index);
+  }
+  for (const request of next) {
+    const key = `${request.source_id}\u0000${request.id}`;
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex !== undefined) {
+      merged[existingIndex] = request;
+      continue;
+    }
+    indexByKey.set(key, merged.length);
+    merged.push(request);
+  }
+  return merged;
+}
+
+function mergeObservationWarnings(current: string[], next: string[]): string[] {
+  const merged: string[] = [];
+  for (const warning of [...current, ...next]) {
+    const trimmed = warning.trim();
+    if (trimmed && !merged.includes(trimmed)) {
+      merged.push(trimmed);
+    }
+  }
+  return merged;
+}
+
+function observationSourceLabel(source: ObservationSource): string {
+  return source.label.trim() || 'Unnamed source';
+}
+
+function observationJobMatches(
+  job: Pick<ObservationSnapshot['jobs'][number], 'source_id' | 'id'>,
+  scope: ObservationScope
+): boolean {
+  return job.source_id === scope.source_id && job.id === scope.job_id;
+}
+
+function observationSnapshotHasJob(
+  snapshot: ObservationSnapshot | null,
+  scope: ObservationScope
+): boolean {
+  return Boolean(snapshot?.jobs.some((job) => observationJobMatches(job, scope)));
+}
+
+/**
+ * Root generated_at_ms changes on every observation query. Everything else is
+ * the semantic snapshot used to decide whether the visible feed must re-render.
+ * Object keys are ordered so equivalent IPC payloads compare equal.
+ */
+function stableObservationValue(value: unknown, isRoot: boolean): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value) ?? 'null';
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableObservationValue(item, false)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record)
+    .filter((key) => !(isRoot && key === 'generated_at_ms'))
+    .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
+  return `{${keys
+    .map((key) => `${JSON.stringify(key)}:${stableObservationValue(record[key], false)}`)
+    .join(',')}}`;
+}
+
+function observationSemanticSignature(snapshot: ObservationSnapshot | null): string {
+  return snapshot === null ? 'null' : stableObservationValue(snapshot, true);
+}
+
+function observationSnapshotsSemanticallyEqual(
+  previous: ObservationSnapshot | null,
+  next: ObservationSnapshot | null
+): boolean {
+  return observationSemanticSignature(previous) === observationSemanticSignature(next);
+}
+
+/**
+ * Adds only the exact requested job and its source from a scoped observation
+ * response. Other jobs, request pages, and source scopes stay untouched.
+ */
+function mergeExactObservationJob(
+  current: ObservationSnapshot | null,
+  fetched: ObservationSnapshot,
+  scope: ObservationScope
+): ObservationSnapshot | null {
+  const job = fetched.jobs.find((candidate) => observationJobMatches(candidate, scope));
+  if (!job) {
+    return current;
+  }
+  const source =
+    fetched.sources.find((candidate) => candidate.id === scope.source_id) ?? null;
+  if (!current) {
+    return {
+      ...fetched,
+      sources: source ? [source] : [],
+      jobs: [job],
+      requests: [],
+      next_cursor: null,
+      has_more: false,
+      jobs_has_more: false,
+    };
+  }
+  let sources = current.sources;
+  if (source) {
+    const sourceIndex = sources.findIndex((candidate) => candidate.id === source.id);
+    sources =
+      sourceIndex >= 0
+        ? sources.map((candidate, index) => (index === sourceIndex ? source : candidate))
+        : [...sources, source];
+  }
+  return {
+    ...current,
+    sources,
+    jobs: [
+      ...current.jobs.filter((candidate) => !observationJobMatches(candidate, scope)),
+      job,
+    ],
+  };
+}
+
+/**
+ * Keeps an explicitly focused out-of-page job visible through later bounded
+ * list refreshes. Existing jobs and freshly observed sources stay authoritative.
+ */
+function preservePinnedObservationJob(
+  current: ObservationSnapshot,
+  previous: ObservationSnapshot | null,
+  scope: ObservationScope
+): ObservationSnapshot {
+  if (!previous || observationSnapshotHasJob(current, scope)) {
+    return current;
+  }
+  const job = previous.jobs.find((candidate) => observationJobMatches(candidate, scope));
+  if (!job) {
+    return current;
+  }
+  const hasSource = current.sources.some((source) => source.id === scope.source_id);
+  const source = hasSource
+    ? null
+    : previous.sources.find((candidate) => candidate.id === scope.source_id) ?? null;
+  return {
+    ...current,
+    sources: source ? [...current.sources, source] : current.sources,
+    jobs: [...current.jobs, job],
+  };
 }
 
 class ThreadlaneDesktopApp {
@@ -217,22 +409,40 @@ class ThreadlaneDesktopApp {
   private readonly toolsPage: ToolsPage;
   private readonly profilesPage: ProfilesPage;
   private readonly plansPage: PlansPage;
+  private readonly jobPlansPage: JobPlansPage;
+  private readonly activityFeedPage: ActivityFeedPage;
   private readonly nativeLinkingPanel: NativeLinkingPanel;
-  private decisionUi: DecisionTestUiState = {
-    selectedToolId: '',
-    selectedModel: '',
-    fetchedModels: [],
-    loadingModels: false,
-    runningTest: false,
-    advice: null,
-    error: null,
-  };
   private returnFocusKey: string | null = null;
   private readonly overviewExpansion = new Map<string, boolean>();
   private pollTimerId: number | null = null;
   private sharedRefreshInFlight = false;
   private toolVersionState: ToolVersionScanState = createToolVersionScanState();
   private pendingToolVersionRecheckRevision: number | null = null;
+  private settingsSection: SettingsSection = 'general';
+  private advancedControlsOpen = false;
+  private advancedActivityOpen = false;
+  private advancedPlansOpen = false;
+  private observationViews: Record<ObservationViewKey, ObservationViewState> = {
+    activity: createObservationViewState(),
+    plans: createObservationViewState(),
+  };
+  private pinnedPlansJob: ObservationScope | null = null;
+  private observationTicketSeq = 0;
+  private observationInFlightTicket: ObservationTicket | null = null;
+  private observationPendingTicket: ObservationTicket | null = null;
+  private readonly observationViewGeneration: Record<ObservationViewKey, number> = {
+    activity: 0,
+    plans: 0,
+  };
+  private observationSources: ObservationSource[] = [];
+  private observationSourcesLoading = false;
+  private observationSourcesError: string | null = null;
+  private observationSourcesRequestSeq = 0;
+  private observationSourcesInFlight = false;
+  private observationContextPath = '';
+  private observationLinkInFlight = false;
+  private observationLinkError: string | null = null;
+  private observationLinkNotice: string | null = null;
 
   constructor(mountNode: HTMLElement) {
     const savedAppearance = loadSavedAppearance();
@@ -266,6 +476,22 @@ class ThreadlaneDesktopApp {
     );
     this.plansPage = new PlansPage(() => {
       void this.refreshPlansPageData(true);
+    });
+    this.jobPlansPage = new JobPlansPage({
+      onViewActivity: ({ source_id, job_id }) => {
+        this.openActivityForJob(source_id, job_id);
+      },
+      onOpenAdvanced: () => {
+        this.openAdvancedPlans();
+      },
+    });
+    this.activityFeedPage = new ActivityFeedPage({
+      onViewJob: ({ source_id, job_id }) => {
+        this.openPlansForJob({ source_id, job_id });
+      },
+      onLoadMore: () => {
+        this.loadMoreObservation('activity');
+      },
     });
     this.nativeLinkingPanel = new NativeLinkingPanel(() => {
       this.returnFocusKey = null;
@@ -302,6 +528,7 @@ class ThreadlaneDesktopApp {
       this.refreshTools(),
       this.refreshRegistry(),
       this.refreshPlans(),
+      this.pollObservation(),
     ]);
     this.scheduleNextPoll();
   }
@@ -332,9 +559,10 @@ class ThreadlaneDesktopApp {
         if (this.isDocumentHidden()) {
           return;
         }
-        if (shouldPollHistory(this.state, false)) {
+        if (this.advancedActivityOpen && shouldPollHistory(this.state, false)) {
           await this.triggerHistoryQuery('poll', false);
         }
+        this.pollObservation();
       }
     } finally {
       this.scheduleNextPoll();
@@ -345,15 +573,548 @@ class ThreadlaneDesktopApp {
     return typeof document !== 'undefined' && Boolean(document.hidden);
   }
 
+  /**
+   * Observation-backed pages update their own components. A background runtime
+   * snapshot rebuild is only needed for the legacy activity diagnostics when
+   * they are explicitly open.
+   */
+  private shouldRebuildMainOnSnapshotPoll(): boolean {
+    if (this.state.detailTarget !== null) {
+      return true;
+    }
+    return this.state.page === 'activity' && this.advancedActivityOpen;
+  }
+
   private isPlansViewActive(): boolean {
     return this.state.page === 'plans' && this.state.detailTarget === null;
   }
 
   private canPollActivePlansStore(): boolean {
+    if (!this.advancedPlansOpen) {
+      return false;
+    }
     if (!hasTauriRuntime() && !isDevPreviewFixtureMode()) {
       return false;
     }
     return shouldPollActivePlansStore(this.state, this.isDocumentHidden());
+  }
+
+  private isConnectionsVisible(): boolean {
+    return (
+      this.state.page === 'settings' &&
+      this.state.detailTarget === null &&
+      this.settingsSection === 'connections'
+    );
+  }
+
+  private currentObservationView(): ObservationViewKey | null {
+    if (this.state.detailTarget !== null) {
+      return null;
+    }
+    if (this.state.page === 'activity') {
+      return 'activity';
+    }
+    if (this.state.page === 'plans' && !this.advancedPlansOpen) {
+      return 'plans';
+    }
+    return null;
+  }
+
+  private isObservationPageLayoutActive(): boolean {
+    if (
+      this.state.isDevPreviewFixture ||
+      this.state.detailTarget !== null ||
+      this.state.selectedToolId !== null
+    ) {
+      return false;
+    }
+    if (this.state.page === 'activity') {
+      return !this.advancedActivityOpen;
+    }
+    if (this.state.page === 'plans') {
+      return !this.advancedPlansOpen;
+    }
+    return false;
+  }
+
+  private renderObservationView(viewKey: ObservationViewKey): void {
+    if (this.state.detailTarget !== null) {
+      return;
+    }
+    const view = this.observationViews[viewKey];
+    if (viewKey === 'activity' && this.state.page === 'activity') {
+      this.activityFeedPage.update(view.snapshot, {
+        loading: view.loading,
+        error: view.error,
+        scope: view.scope,
+      });
+      return;
+    }
+    if (
+      viewKey === 'plans' &&
+      this.state.page === 'plans' &&
+      !this.advancedPlansOpen
+    ) {
+      this.jobPlansPage.update(view.snapshot, {
+        loading: view.loading,
+        error: view.error,
+      });
+    }
+  }
+
+  private hasObservationRequestFor(viewKey: ObservationViewKey): boolean {
+    return (
+      this.observationInFlightTicket?.viewKey === viewKey ||
+      this.observationPendingTicket?.viewKey === viewKey
+    );
+  }
+
+  private requestObservation(
+    viewKey: ObservationViewKey,
+    mode: ObservationRequestMode,
+    scope: ObservationScope | null,
+    options: {
+      cursor?: string | null;
+      focusScope?: ObservationScope | null;
+    } = {}
+  ): void {
+    const ticket: ObservationTicket = {
+      sequence: ++this.observationTicketSeq,
+      viewKey,
+      mode,
+      scope,
+      cursor: options.cursor ?? null,
+      generation: this.observationViewGeneration[viewKey],
+      focusScope: options.focusScope ?? null,
+    };
+    if (this.observationInFlightTicket) {
+      const pending = this.observationPendingTicket;
+      if (
+        pending?.mode === 'focus' &&
+        pending.viewKey === viewKey &&
+        pending.generation === ticket.generation &&
+        mode !== 'focus'
+      ) {
+        return;
+      }
+      this.observationPendingTicket = ticket;
+      return;
+    }
+    void this.executeObservationTicket(ticket);
+  }
+
+  private pollObservation(): void {
+    if (this.isDocumentHidden()) {
+      return;
+    }
+    const viewKey = this.currentObservationView();
+    if (!viewKey || this.hasObservationRequestFor(viewKey)) {
+      return;
+    }
+    const view = this.observationViews[viewKey];
+    this.requestObservation(
+      viewKey,
+      view.snapshot ? 'refresh' : 'replace',
+      viewKey === 'activity' ? view.scope : null
+    );
+  }
+
+  private ensureObservationForCurrentView(): void {
+    this.pollObservation();
+  }
+
+  private isObservationTicketCurrent(ticket: ObservationTicket): boolean {
+    if (this.observationInFlightTicket !== ticket) {
+      return false;
+    }
+    if (ticket.generation !== this.observationViewGeneration[ticket.viewKey]) {
+      return false;
+    }
+    if (this.currentObservationView() !== ticket.viewKey) {
+      return false;
+    }
+    if (ticket.viewKey === 'activity') {
+      const viewScope = this.observationViews.activity.scope;
+      if (
+        (viewScope?.source_id ?? null) !== (ticket.scope?.source_id ?? null) ||
+        (viewScope?.job_id ?? null) !== (ticket.scope?.job_id ?? null)
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private clearDiscardedObservationLoading(ticket: ObservationTicket): void {
+    if (this.observationPendingTicket?.viewKey === ticket.viewKey) {
+      return;
+    }
+    if (ticket.generation !== this.observationViewGeneration[ticket.viewKey]) {
+      return;
+    }
+    const current = this.observationViews[ticket.viewKey];
+    if (!current.loading) {
+      return;
+    }
+    if (ticket.viewKey === 'activity') {
+      const currentScope = current.scope;
+      if (
+        (currentScope?.source_id ?? null) !== (ticket.scope?.source_id ?? null) ||
+        (currentScope?.job_id ?? null) !== (ticket.scope?.job_id ?? null)
+      ) {
+        return;
+      }
+    }
+    this.observationViews[ticket.viewKey] = {
+      ...current,
+      loading: false,
+    };
+  }
+
+  private applyObservationSnapshot(
+    ticket: ObservationTicket,
+    snapshot: ObservationSnapshot
+  ): void {
+    const latest = this.observationViews[ticket.viewKey];
+    let nextSnapshot: ObservationSnapshot | null = snapshot;
+    if (ticket.mode === 'more' && latest.snapshot) {
+      const mergedRequests = mergeObservationRequests(
+        latest.snapshot.requests,
+        snapshot.requests
+      );
+      let mergedWarnings = mergeObservationWarnings(
+        latest.snapshot.warnings,
+        snapshot.warnings
+      );
+      if (mergedRequests.length > OBSERVATION_MAX_WINDOW_REQUESTS) {
+        mergedWarnings = mergeObservationWarnings(mergedWarnings, [
+          `Loaded request history exceeds the ${OBSERVATION_MAX_WINDOW_REQUESTS}-request refresh window. Older loaded rows remain visible; the next refresh reloads only the newest ${OBSERVATION_MAX_WINDOW_REQUESTS}.`,
+        ]);
+      }
+      nextSnapshot = {
+        ...snapshot,
+        requests: mergedRequests,
+        warnings: mergedWarnings,
+        jobs_has_more: latest.snapshot.jobs_has_more || snapshot.jobs_has_more,
+      };
+    } else if (ticket.mode === 'focus' && ticket.focusScope) {
+      nextSnapshot = mergeExactObservationJob(
+        latest.snapshot,
+        snapshot,
+        ticket.focusScope
+      );
+    }
+    if (
+      ticket.viewKey === 'plans' &&
+      ticket.mode !== 'focus' &&
+      this.pinnedPlansJob &&
+      nextSnapshot
+    ) {
+      nextSnapshot = preservePinnedObservationJob(
+        nextSnapshot,
+        latest.snapshot,
+        this.pinnedPlansJob
+      );
+    }
+    const previousSnapshot = latest.snapshot;
+    const previousError = latest.error;
+    const wasLoading = latest.loading;
+    const semanticChanged = !observationSnapshotsSemanticallyEqual(
+      previousSnapshot,
+      nextSnapshot
+    );
+    // Store the newest snapshot even for a silent refresh, but leave the
+    // component and its DOM untouched when only generated_at_ms changed.
+    this.observationViews[ticket.viewKey] = {
+      ...latest,
+      snapshot: nextSnapshot,
+      loading: false,
+      error: null,
+    };
+    if (semanticChanged || previousError !== null || wasLoading) {
+      this.renderObservationView(ticket.viewKey);
+    } else if (ticket.viewKey === 'activity') {
+      // Quiet refresh: advance relative times in place without replacing rows.
+      this.activityFeedPage.refreshTimeLabels();
+    }
+    if (
+      ticket.mode === 'focus' &&
+      ticket.focusScope &&
+      this.currentObservationView() === 'plans'
+    ) {
+      this.jobPlansPage.focusJob(ticket.focusScope);
+    }
+  }
+
+  private async executeObservationTicket(ticket: ObservationTicket): Promise<void> {
+    this.observationInFlightTicket = ticket;
+    try {
+      const initial = this.observationViews[ticket.viewKey];
+      // A background refresh of an already visible snapshot stays silent:
+      // retain the rendered data and any existing error until the request
+      // succeeds or fails, without showing loading or replacing the DOM.
+      const retainedRefresh = ticket.mode === 'refresh' && initial.snapshot !== null;
+      this.observationViews[ticket.viewKey] = {
+        ...initial,
+        snapshot: ticket.mode === 'replace' ? null : initial.snapshot,
+        loading: retainedRefresh ? false : true,
+        error: retainedRefresh ? initial.error : null,
+      };
+      if (!retainedRefresh) {
+        this.renderObservationView(ticket.viewKey);
+      }
+
+      const fetchPage = (cursor: string | null, limit: number) =>
+        ipcObservationSnapshot({
+          source_id: ticket.scope?.source_id ?? null,
+          job_id: ticket.scope?.job_id ?? null,
+          cursor,
+          limit,
+        });
+
+      let snapshot: ObservationSnapshot;
+      if (ticket.mode === 'refresh' || ticket.mode === 'replace') {
+        const loadedCount =
+          ticket.mode === 'refresh' ? initial.snapshot?.requests.length ?? 0 : 0;
+        const target = Math.max(
+          OBSERVATION_DEFAULT_PAGE_LIMIT,
+          Math.min(loadedCount, OBSERVATION_MAX_WINDOW_REQUESTS)
+        );
+        const collected = await collectObservationWindow({
+          target,
+          fetcher: ({ cursor, limit }) => fetchPage(cursor, limit),
+          shouldContinue: () => this.isObservationTicketCurrent(ticket),
+        });
+        if (collected.aborted) {
+          this.clearDiscardedObservationLoading(ticket);
+          return;
+        }
+        if (!collected.snapshot) {
+          throw new Error('Observation paging returned no snapshot.');
+        }
+        snapshot = collected.snapshot;
+      } else {
+        snapshot = await fetchPage(ticket.cursor, OBSERVATION_DEFAULT_PAGE_LIMIT);
+      }
+      if (!this.isObservationTicketCurrent(ticket)) {
+        this.clearDiscardedObservationLoading(ticket);
+        return;
+      }
+      this.applyObservationSnapshot(ticket, snapshot);
+    } catch (err) {
+      if (!this.isObservationTicketCurrent(ticket)) {
+        this.clearDiscardedObservationLoading(ticket);
+        return;
+      }
+      const latest = this.observationViews[ticket.viewKey];
+      this.observationViews[ticket.viewKey] = {
+        ...latest,
+        loading: false,
+        error:
+          err instanceof Error ? err.message : 'Failed to load observation snapshot.',
+      };
+      this.renderObservationView(ticket.viewKey);
+    } finally {
+      if (this.observationInFlightTicket === ticket) {
+        this.observationInFlightTicket = null;
+        const pending = this.observationPendingTicket;
+        this.observationPendingTicket = null;
+        if (pending && this.currentObservationView() === pending.viewKey) {
+          void this.executeObservationTicket(pending);
+        }
+      }
+    }
+  }
+
+  private loadMoreObservation(viewKey: ObservationViewKey): void {
+    const current = this.observationViews[viewKey];
+    const cursor = current.snapshot?.next_cursor;
+    if (!cursor) {
+      return;
+    }
+    const inFlight = this.observationInFlightTicket;
+    if (
+      inFlight?.viewKey === viewKey &&
+      inFlight.mode === 'more' &&
+      inFlight.cursor === cursor
+    ) {
+      return;
+    }
+    const pending = this.observationPendingTicket;
+    if (
+      pending?.viewKey === viewKey &&
+      pending.mode === 'more' &&
+      pending.cursor === cursor
+    ) {
+      return;
+    }
+    this.requestObservation(
+      viewKey,
+      'more',
+      viewKey === 'activity' ? current.scope : null,
+      { cursor }
+    );
+  }
+
+  private setActivityScope(scope: ObservationScope | null): void {
+    this.observationViewGeneration.activity += 1;
+    this.advancedActivityOpen = false;
+    this.observationViews.activity = {
+      ...createObservationViewState(scope),
+      loading: true,
+    };
+    this.returnFocusKey = null;
+    this.state = navigateToPage(this.state, 'activity');
+    this.render();
+    this.requestObservation('activity', 'replace', scope);
+  }
+
+  private openActivityForJob(sourceId: string, jobId: string): void {
+    this.setActivityScope({ source_id: sourceId, job_id: jobId });
+  }
+
+  private openPlansForJob(scope: ObservationScope): void {
+    const alreadyObserved = observationSnapshotHasJob(
+      this.observationViews.plans.snapshot,
+      scope
+    );
+    this.pinnedPlansJob = scope;
+    // A newer exact-job target invalidates any earlier plans ticket so an old
+    // source/job response cannot refocus or overwrite the new target.
+    this.observationViewGeneration.plans += 1;
+    if (this.observationPendingTicket?.viewKey === 'plans') {
+      this.observationPendingTicket = null;
+    }
+    this.observationViews.plans = {
+      ...this.observationViews.plans,
+      loading: !alreadyObserved,
+      error: alreadyObserved ? this.observationViews.plans.error : null,
+    };
+    this.advancedPlansOpen = false;
+    this.returnFocusKey = null;
+    this.state = navigateToPage(this.state, 'plans');
+    this.render('nav-plans');
+    if (alreadyObserved) {
+      this.jobPlansPage.focusJob(scope);
+      return;
+    }
+    this.renderObservationView('plans');
+    this.requestObservation('plans', 'focus', scope, { focusScope: scope });
+  }
+
+  private showAllActivity(): void {
+    this.setActivityScope(null);
+  }
+
+  private openAdvancedPlans(): void {
+    this.advancedControlsOpen = false;
+    this.returnFocusKey = null;
+    this.advancedActivityOpen = false;
+    this.advancedPlansOpen = true;
+    this.state = navigateToPage(this.state, 'plans');
+    this.render('nav-plans');
+    void this.refreshPlansPageData(true);
+  }
+
+  private closeAdvancedPlans(): void {
+    this.advancedPlansOpen = false;
+    this.render('nav-plans');
+    this.ensureObservationForCurrentView();
+  }
+
+  private openAdvancedActivityDiagnostics(): void {
+    this.advancedControlsOpen = false;
+    this.returnFocusKey = null;
+    this.advancedPlansOpen = false;
+    this.advancedActivityOpen = true;
+    this.state = navigateToPage(this.state, 'activity');
+    this.render('advanced-activity-close');
+    if (
+      this.state.history.expanded &&
+      !this.state.history.hasLoadedOnce &&
+      !this.state.history.inFlight
+    ) {
+      void this.triggerHistoryQuery('initial', false);
+    }
+  }
+
+  private closeAdvancedActivity(): void {
+    this.advancedActivityOpen = false;
+    this.returnFocusKey = null;
+    this.render('nav-activity');
+    this.ensureObservationForCurrentView();
+  }
+
+  private async refreshObservationSources(force: boolean = false): Promise<void> {
+    if (this.observationSourcesInFlight && !force) {
+      return;
+    }
+    const requestSeq = ++this.observationSourcesRequestSeq;
+    this.observationSourcesInFlight = true;
+    this.observationSourcesLoading = true;
+    this.observationSourcesError = null;
+    if (this.isConnectionsVisible()) {
+      this.renderPreserveActiveInput();
+    }
+    try {
+      const sources = await ipcObservationSources();
+      if (requestSeq !== this.observationSourcesRequestSeq) {
+        return;
+      }
+      this.observationSources = sources;
+    } catch (err) {
+      if (requestSeq !== this.observationSourcesRequestSeq) {
+        return;
+      }
+      this.observationSourcesError = formatAppError(
+        err,
+        'Failed to load linked observation sources.'
+      );
+    } finally {
+      if (requestSeq === this.observationSourcesRequestSeq) {
+        this.observationSourcesInFlight = false;
+        this.observationSourcesLoading = false;
+        if (this.isConnectionsVisible()) {
+          this.renderPreserveActiveInput();
+        }
+      }
+    }
+  }
+
+  private async handleLinkObservationContext(): Promise<void> {
+    const contextPath = this.observationContextPath.trim();
+    if (!contextPath) {
+      this.observationLinkError = 'Enter a local observation context path before linking.';
+      this.observationLinkNotice = null;
+      if (this.isConnectionsVisible()) {
+        this.renderPreserveActiveInput();
+      }
+      return;
+    }
+    if (this.observationLinkInFlight) {
+      return;
+    }
+    this.observationLinkInFlight = true;
+    this.observationLinkError = null;
+    this.observationLinkNotice = null;
+    if (this.isConnectionsVisible()) {
+      this.renderPreserveActiveInput();
+    }
+    try {
+      const source = await ipcLinkObservationContext(contextPath);
+      this.observationLinkNotice = `Linked ${observationSourceLabel(source)}.`;
+      await this.refreshObservationSources(true);
+    } catch (err) {
+      this.observationLinkError = formatAppError(
+        err,
+        'Failed to link the supplied observation context.'
+      );
+    } finally {
+      this.observationLinkInFlight = false;
+      if (this.isConnectionsVisible()) {
+        this.renderPreserveActiveInput();
+      }
+    }
   }
 
   private syncPlansStoredContext(deferView: boolean): void {
@@ -371,7 +1132,7 @@ class ThreadlaneDesktopApp {
   }
 
   private async refreshPlansPageData(force: boolean): Promise<void> {
-    if (!this.isPlansViewActive()) {
+    if (!this.isPlansViewActive() || !this.advancedPlansOpen) {
       return;
     }
     const previousPlansError = this.state.plansError;
@@ -421,6 +1182,7 @@ class ThreadlaneDesktopApp {
     if (
       !isBackgroundPoll &&
       this.state.page === 'activity' &&
+      this.advancedActivityOpen &&
       this.state.detailTarget === null &&
       this.state.history.expanded &&
       !this.state.history.hasLoadedOnce &&
@@ -447,12 +1209,17 @@ class ThreadlaneDesktopApp {
         );
       }
       this.executeAfterSnapshotSuccess(isBackgroundPoll);
+      if (isBackgroundPoll && this.isObservationPageLayoutActive()) {
+        // Observation pages own their data view; a successful runtime snapshot
+        // poll must not replace header or footer nodes behind it.
+        return;
+      }
       if (renderMode === 'defer') {
         this.renderHeader();
         this.renderFooter();
         return;
       }
-      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+      if (isBackgroundPoll && !this.shouldRebuildMainOnSnapshotPoll()) {
         this.renderHeader();
         this.renderFooter();
         return;
@@ -481,7 +1248,7 @@ class ThreadlaneDesktopApp {
         this.renderFooter();
         return;
       }
-      if (isBackgroundPoll && !shouldRebuildMainOnPoll(this.state)) {
+      if (isBackgroundPoll && !this.shouldRebuildMainOnSnapshotPoll()) {
         this.renderHeader();
         this.renderFooter();
         return;
@@ -577,7 +1344,6 @@ class ThreadlaneDesktopApp {
       this.state.page === 'tools' ||
       this.state.page === 'profiles' ||
       this.state.page === 'plans' ||
-      this.state.page === 'chats' ||
       this.state.page === 'settings'
     ) {
       this.renderPreserveActiveInput();
@@ -793,7 +1559,7 @@ class ThreadlaneDesktopApp {
   }
 
   private renderToolVersionsIfVisible(): void {
-    if ((this.state.page === 'tools' || this.state.page === 'chats') && this.state.detailTarget === null) {
+    if (this.state.page === 'tools' && this.state.detailTarget === null) {
       this.renderPreserveActiveInput();
     }
   }
@@ -974,6 +1740,8 @@ class ThreadlaneDesktopApp {
     this.root.dataset.theme = theme;
     this.root.dataset.surface = surface;
     this.root.dataset.accent = accent;
+    this.root.dataset.observationLayout =
+      this.isObservationPageLayoutActive() ? 'true' : 'false';
     this.root.style.colorScheme = colorScheme;
     this.root.style.setProperty('--aq-opacity', `${effectiveOpacity}%`);
     document.documentElement.style.colorScheme = colorScheme;
@@ -1079,8 +1847,10 @@ class ThreadlaneDesktopApp {
 
   private renderHeader(): void {
     const hasSubView = this.state.detailTarget !== null || this.state.selectedToolId !== null;
-    const pageTitle =
-      this.state.detailTarget !== null
+    const observationPage = this.isObservationPageLayoutActive();
+    const pageTitle = observationPage
+      ? 'Threadlane'
+      : this.state.detailTarget !== null
         ? 'Call details'
         : this.state.selectedToolId !== null
           ? 'Tool status'
@@ -1107,18 +1877,19 @@ class ThreadlaneDesktopApp {
       h('span', { className: 'aq-title-text', 'data-tauri-drag-region': 'true' }, pageTitle)
     );
 
-    const badgeLabel = formatAttachmentBadge(
-      this.state.snapshot.attachment,
-      this.state.isDevPreviewFixture
-    );
-    const badgeEl = h(
-      'span',
-      {
-        className: 'aq-preview-label',
-        'data-state': this.state.snapshot.attachment.connection,
-      },
-      badgeLabel
-    );
+    const badgeEl = observationPage
+      ? null
+      : h(
+          'span',
+          {
+            className: 'aq-preview-label',
+            'data-state': this.state.snapshot.attachment.connection,
+          },
+          formatAttachmentBadge(
+            this.state.snapshot.attachment,
+            this.state.isDevPreviewFixture
+          )
+        );
 
     const windowControls = h(
       'div',
@@ -1154,10 +1925,8 @@ class ThreadlaneDesktopApp {
   }
 
   private renderMain(): void {
-    // Only the visible Chats panel may keep an in-flight metadata query alive.
-    this.nativeLinkingPanel.setActive(
-      this.state.page === 'chats' && this.state.detailTarget === null
-    );
+    // Only the visible Connections settings panel may keep an in-flight metadata query alive.
+    this.nativeLinkingPanel.setActive(this.isConnectionsVisible());
     const nodes: Node[] = [];
 
     if (this.state.actionError) {
@@ -1188,9 +1957,6 @@ class ThreadlaneDesktopApp {
         case 'activity':
           nodes.push(this.buildActivityView());
           break;
-        case 'chats':
-          nodes.push(this.buildChatsView());
-          break;
         case 'plans':
           nodes.push(this.buildPlansView());
           break;
@@ -1210,6 +1976,53 @@ class ThreadlaneDesktopApp {
   }
 
   private buildActivityView(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    const view = this.observationViews.activity;
+
+    if (this.advancedActivityOpen) {
+      frag.appendChild(
+        h(
+          'div',
+          { className: 'aq-scope-bar' },
+          h(
+            'span',
+            undefined,
+            'Legacy activity diagnostics · runtime history and conversation-scoped surface'
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'aq-btn',
+              'data-action': 'close-advanced-activity',
+              'data-focus': 'advanced-activity-close',
+            },
+            h('span', undefined, 'Return to Activity')
+          )
+        )
+      );
+      frag.appendChild(
+        h(
+          'p',
+          { className: 'aq-note' },
+          'Secondary read-only diagnostics. This view never dispatches or starts a worker.'
+        )
+      );
+      frag.appendChild(this.buildLegacyActivityView());
+      return frag;
+    }
+
+    frag.appendChild(this.activityFeedPage.element);
+    this.activityFeedPage.update(view.snapshot, {
+      loading: view.loading,
+      error: view.error,
+      scope: view.scope,
+    });
+
+    return frag;
+  }
+
+  private buildLegacyActivityView(): DocumentFragment {
     const frag = document.createDocumentFragment();
     const { snapshot, providerFilter, showFilters, completedExpanded, pendingMutation } =
       this.state;
@@ -1987,9 +2800,12 @@ class ThreadlaneDesktopApp {
     return element;
   }
 
-  private buildChatsView(): DocumentFragment {
+  private buildConnectionsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
     const bindingSnapshotCurrent = isCurrentBindingSnapshot(this.state);
+
+    frag.appendChild(h('p', { className: 'aq-kicker' }, 'Connections'));
+
     if (bindingSnapshotCurrent) {
       frag.appendChild(this.preserveOverviewExpansion(renderReadinessChecklist({
         registry: this.state.registrySnapshot,
@@ -1998,10 +2814,17 @@ class ThreadlaneDesktopApp {
         registryLoading: this.state.registryLoading,
         registryError: this.state.registryError,
         onNavigate: (page) => {
+          const targetPage: NavPage = page === 'chats' ? 'settings' : page;
+          if (page === 'chats') {
+            this.settingsSection = 'connections';
+          }
           this.returnFocusKey = null;
-          this.state = navigateToPage(this.state, page);
-          this.render(`nav-${page}`);
+          this.state = navigateToPage(this.state, targetPage);
+          this.render(`nav-${targetPage}`);
           this.mainEl.scrollTop = 0;
+          if (page === 'chats') {
+            void this.refreshObservationSources(true);
+          }
         },
       }), 'readiness'));
     } else {
@@ -2015,26 +2838,12 @@ class ThreadlaneDesktopApp {
       h(
         'div',
         { className: 'aq-section', style: 'margin-top: 4px;' },
-        h('span', undefined, `Linked runtime conversations (${bindings.length})`),
-        createButton('Open Plans ledger', () => {
-          this.returnFocusKey = null;
-          this.state = navigateToPage(this.state, 'plans');
-          this.render('nav-plans');
-          void this.refreshPlansPageData(true);
-        })
+        h('span', undefined, `Linked runtime conversations (${bindings.length})`)
       )
     );
 
     if (bindings.length === 0) {
       frag.appendChild(h('p', { className: 'aq-note' }, 'No linked conversations yet.'));
-      if (this.state.snapshot.demo_controls.available) {
-        frag.appendChild(
-          this.buildDemoControlsBanner(
-            this.state.snapshot.demo_controls,
-            this.state.pendingMutation
-          )
-        );
-      }
     } else {
       for (const binding of bindings) {
         const isSelected = binding.binding_id === currentSelected;
@@ -2085,11 +2894,391 @@ class ThreadlaneDesktopApp {
       this.nativeLinkingPanel.render(this.state.registrySnapshot, bindings)
     );
 
+    const { snapshot, pendingMutation } = this.state;
+    const busy = pendingMutation !== null;
+
+    frag.appendChild(
+      h(
+        'p',
+        { className: 'aq-kicker', style: 'margin-top: 18px;' },
+        'Runtime attachment & local demo'
+      )
+    );
+
+    frag.appendChild(
+      h(
+        'dl',
+        { className: 'aq-facts', style: 'margin: 8px 0 12px;' },
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'Active mode'),
+          h('dd', undefined, snapshot.attachment.mode)
+        ),
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'Connection'),
+          h('dd', undefined, snapshot.attachment.connection)
+        ),
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'State dir'),
+          h('dd', undefined, snapshot.attachment.state_dir ?? 'None attached')
+        )
+      )
+    );
+
+    frag.appendChild(
+      h(
+        'div',
+        { className: 'aq-setting' },
+        h(
+          'label',
+          { className: 'aq-label', for: 'settings-state-dir-input' },
+          h('span', undefined, 'Attach runtime folder (read-only observer)')
+        ),
+        h(
+          'div',
+          { className: 'aq-input-row' },
+          h('input', {
+            id: 'settings-state-dir-input',
+            type: 'text',
+            className: 'aq-text-input',
+            value: this.state.stateDirDraft,
+            placeholder: '/path/to/threadlane/state-dir',
+            'data-input': 'state-dir',
+            'data-focus': 'state-dir-input',
+            disabled: busy,
+          }),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'aq-btn aq-btn-primary',
+              'data-action': 'attach-runtime',
+              'data-focus': 'settings-attach-btn',
+              disabled: busy,
+            },
+            pendingLabel(pendingMutation === 'attach', 'Attach', 'Attaching…')
+          )
+        ),
+        h(
+          'label',
+          { className: 'aq-toggle' },
+          h('span', undefined, 'Remember folder path on this device'),
+          h('input', {
+            type: 'checkbox',
+            checked: this.state.appearance.rememberStateDir,
+            'data-toggle-remember-dir': 'true',
+            'data-focus': 'remember-state-dir',
+          })
+        )
+      )
+    );
+
+    if (snapshot.demo_controls.available) {
+      const demoActive = snapshot.demo_controls.can_cancel;
+      frag.appendChild(
+        h(
+          'div',
+          { className: 'aq-setting' },
+          h('div', { className: 'aq-label' }, h('span', undefined, 'Local demo')),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'aq-btn',
+              'data-action': 'start-demo',
+              'data-focus': 'settings-start-demo',
+              disabled: busy || demoActive,
+            },
+            createUiIcon('play'),
+            h(
+              'span',
+              undefined,
+              pendingMutation === 'start_demo'
+                ? 'Starting…'
+                : demoActive
+                   ? 'Local demo active'
+                   : 'Run local demo'
+            )
+          )
+        )
+      );
+    }
+
+    frag.appendChild(this.buildObservationSourcesSection());
+    frag.appendChild(this.buildAdvancedControlsSection());
+
+    frag.appendChild(
+      h(
+        'p',
+        { className: 'aq-note' },
+        'Only appearance, bounded execution preferences, and an optional remembered folder path are saved locally. Prompts, run history, and credentials are never stored in browser storage.'
+      )
+    );
+
     return frag;
+  }
+
+  private buildObservationSourcesSection(): HTMLElement {
+    const refreshButton = h(
+      'button',
+      {
+        type: 'button',
+        className: 'aq-icon-button',
+        'data-action': 'refresh-observation-sources',
+        'data-focus': 'refresh-observation-sources',
+        'aria-label': 'Refresh linked observation sources',
+        title: 'Refresh linked sources',
+        disabled: this.observationSourcesLoading,
+      },
+      createUiIcon('refresh-cw')
+    );
+
+    const sourceNodes: Node[] = [];
+    if (this.observationSourcesLoading && this.observationSources.length === 0) {
+      sourceNodes.push(h('p', { className: 'aq-note', role: 'status' }, 'Loading linked observation sources…'));
+    } else if (this.observationSources.length === 0) {
+      sourceNodes.push(
+        h(
+          'p',
+          { className: 'aq-note' },
+          'No linked observation sources are available. Linking requires an explicit local context path below.'
+        )
+      );
+    } else {
+      sourceNodes.push(
+        h(
+          'ul',
+          { className: 'aq-observation-sources' },
+          ...this.observationSources.map((source) =>
+            h(
+              'li',
+              { className: 'aq-observation-source' },
+              h(
+                'div',
+                { className: 'aq-row-head' },
+                h(
+                  'span',
+                  { className: 'aq-task-name' },
+                  observationSourceLabel(source)
+                ),
+                h(
+                  'span',
+                  {
+                    className: 'aq-badge',
+                    'data-status': source.availability === 'available' ? 'active' : 'warn',
+                  },
+                  source.availability === 'available' ? 'Available' : 'Unavailable'
+                )
+              ),
+              h(
+                'details',
+                { className: 'aq-observation-source-details' },
+                h('summary', undefined, 'Source details'),
+                h(
+                  'dl',
+                  { className: 'aq-technical-grid' },
+                  h('dt', undefined, 'Project path'),
+                  h(
+                    'dd',
+                    undefined,
+                    source.project_path?.trim() || 'Not recorded'
+                  ),
+                  h('dt', undefined, 'Source ID'),
+                  h('dd', undefined, source.id)
+                ),
+                source.message
+                  ? h('p', { className: 'aq-sub' }, source.message)
+                  : null
+              )
+            )
+          )
+        )
+      );
+    }
+
+    const contextPathInput = h('input', {
+      id: 'observation-context-path-input',
+      type: 'text',
+      className: 'aq-text-input',
+      value: this.observationContextPath,
+      placeholder: '/path/to/local/observation/context',
+      'data-input': 'observation-context-path',
+      'data-focus': 'observation-context-path',
+      'aria-label': 'Observation context path',
+      disabled: this.observationLinkInFlight,
+    });
+
+    const linkButton = h(
+      'button',
+      {
+        type: 'button',
+        className: 'aq-btn aq-btn-primary',
+        'data-action': 'link-observation-context',
+        'data-focus': 'link-observation-context',
+        disabled:
+          this.observationLinkInFlight ||
+          this.observationContextPath.trim().length === 0,
+      },
+      h(
+        'span',
+        undefined,
+        this.observationLinkInFlight ? 'Linking…' : 'Link context'
+      )
+    );
+
+    return h(
+      'section',
+      { className: 'aq-setting', 'aria-label': 'Linked observation sources' },
+      h(
+        'div',
+        { className: 'aq-row-head' },
+        h('p', { className: 'aq-kicker', style: 'margin: 0;' }, 'Linked observation sources'),
+        refreshButton
+      ),
+      h(
+        'p',
+        { className: 'aq-note' },
+        'This list is read from the local observation bridge. It does not scan native chats or provider histories, and nothing is selected or linked automatically.'
+      ),
+      this.observationSourcesLoading && this.observationSources.length > 0
+        ? h('p', { className: 'aq-note', role: 'status' }, 'Refreshing linked sources…')
+        : null,
+      this.observationSourcesError
+        ? h(
+            'div',
+            { className: 'aq-banner aq-banner-error', role: 'alert' },
+            h('span', undefined, this.observationSourcesError)
+          )
+        : null,
+      this.observationLinkNotice
+        ? h(
+            'div',
+            { className: 'aq-banner', role: 'status' },
+            h('span', undefined, this.observationLinkNotice)
+          )
+        : null,
+      this.observationLinkError
+        ? h(
+            'div',
+            { className: 'aq-banner aq-banner-error', role: 'alert' },
+            h('span', undefined, this.observationLinkError)
+          )
+        : null,
+      ...sourceNodes,
+      h(
+        'div',
+        { className: 'aq-field', style: 'margin-top: 12px;' },
+        h(
+          'label',
+          { className: 'aq-field-label', for: 'observation-context-path-input' },
+          'Observation context path'
+        ),
+        h(
+          'div',
+          { className: 'aq-input-row' },
+          contextPathInput,
+          linkButton
+        ),
+        h(
+          'p',
+          { className: 'aq-note', style: 'margin: 6px 0 0;' },
+          'Submitting this typed path is the only action that links a context. No directory is selected automatically.'
+        )
+      )
+    );
+  }
+
+  private buildAdvancedControlsSection(): HTMLElement {
+    const details = h('details', {
+      className: 'aq-technical aq-advanced-controls',
+      'data-advanced-controls': 'true',
+      open: this.advancedControlsOpen,
+    });
+    details.appendChild(
+      h(
+        'summary',
+        { 'data-focus': 'advanced-controls' },
+        h('span', undefined, 'Advanced controls'),
+        createUiIcon('chevron-down')
+      )
+    );
+    details.appendChild(
+      h(
+        'div',
+        { className: 'aq-advanced-controls-body' },
+        h(
+          'p',
+          { className: 'aq-note' },
+          'Secondary read-only surfaces. Opening this section performs no work; choose a route explicitly. Neither route dispatches or starts a worker.'
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'aq-link',
+            'data-action': 'open-advanced-activity',
+            'data-focus': 'open-advanced-activity',
+          },
+          h('span', undefined, 'Legacy activity diagnostics'),
+          createUiIcon('chevron-right')
+        ),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'aq-link',
+            'data-action': 'open-advanced-plans',
+            'data-focus': 'open-advanced-plans',
+          },
+          h('span', undefined, 'Advanced plan editor'),
+          createUiIcon('chevron-right')
+        )
+      )
+    );
+    return details;
   }
 
   private buildPlansView(): DocumentFragment {
     const frag = document.createDocumentFragment();
+    const view = this.observationViews.plans;
+    if (!this.advancedPlansOpen) {
+      frag.appendChild(this.jobPlansPage.element);
+      this.jobPlansPage.update(view.snapshot, {
+        loading: view.loading,
+        error: view.error,
+      });
+      return frag;
+    }
+
+    frag.appendChild(
+      h(
+        'div',
+        { className: 'aq-scope-bar' },
+        h('span', undefined, 'Advanced plan editor · durable ledger and scoped approvals'),
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'aq-btn',
+            'data-action': 'close-advanced-plans',
+            'data-focus': 'close-advanced-plans',
+          },
+          h('span', undefined, 'Return to observed plans')
+        )
+      )
+    );
+    frag.appendChild(
+      h(
+        'p',
+        { className: 'aq-note' },
+        'Secondary editor: saving and publishing record plan revisions. Approval remains an explicit scoped operator action and never starts a worker automatically.'
+      )
+    );
     frag.appendChild(
       this.plansPage.render(
         this.state.plansSnapshot,
@@ -2203,8 +3392,46 @@ class ThreadlaneDesktopApp {
 
   private buildSettingsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
-    const { appearance, executionPrefs, snapshot, pendingMutation } = this.state;
-    const busy = pendingMutation !== null;
+    frag.appendChild(
+      h(
+        'div',
+        { className: 'aq-setting' },
+        h('div', { className: 'aq-label' }, h('span', undefined, 'Settings section')),
+        h(
+          'div',
+          { className: 'aq-segment', role: 'group', 'aria-label': 'Settings section' },
+          ...(
+            [
+              ['general', 'General'],
+              ['connections', 'Connections'],
+            ] as ReadonlyArray<readonly [SettingsSection, string]>
+          ).map(([section, label]) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                'data-settings-section': section,
+                'data-focus': `settings-${section}`,
+                'aria-pressed': String(this.settingsSection === section),
+              },
+              label
+            )
+          )
+        )
+      )
+    );
+
+    if (this.settingsSection === 'general') {
+      frag.appendChild(this.buildGeneralSettingsView());
+    } else {
+      frag.appendChild(this.buildConnectionsView());
+    }
+    return frag;
+  }
+
+  private buildGeneralSettingsView(): DocumentFragment {
+    const frag = document.createDocumentFragment();
+    const { appearance, executionPrefs } = this.state;
 
     frag.appendChild(h('p', { className: 'aq-kicker' }, 'Appearance'));
     frag.appendChild(
@@ -2277,115 +3504,6 @@ class ThreadlaneDesktopApp {
     );
 
     frag.appendChild(this.buildExecutionPreferencesSection(executionPrefs));
-    frag.appendChild(this.buildDecisionVerificationSection());
-
-    frag.appendChild(
-      h('p', { className: 'aq-kicker', style: 'margin-top: 18px;' }, 'Connection & local demo')
-    );
-
-    frag.appendChild(
-      h(
-        'dl',
-        { className: 'aq-facts', style: 'margin: 8px 0 12px;' },
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Active mode'),
-          h('dd', undefined, snapshot.attachment.mode)
-        ),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Connection'),
-          h('dd', undefined, snapshot.attachment.connection)
-        ),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'State dir'),
-          h('dd', undefined, snapshot.attachment.state_dir ?? 'None attached')
-        )
-      )
-    );
-
-    frag.appendChild(
-      h(
-        'div',
-        { className: 'aq-setting' },
-        h(
-          'label',
-          { className: 'aq-label', for: 'settings-state-dir-input' },
-          h('span', undefined, 'Attach runtime folder (read-only observer)')
-        ),
-        h(
-          'div',
-          { className: 'aq-input-row' },
-          h('input', {
-            id: 'settings-state-dir-input',
-            type: 'text',
-            className: 'aq-text-input',
-            value: this.state.stateDirDraft,
-            placeholder: '/path/to/threadlane/state-dir',
-            'data-input': 'state-dir',
-            'data-focus': 'state-dir-input',
-            disabled: busy,
-          }),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'aq-btn aq-btn-primary',
-              'data-action': 'attach-runtime',
-              'data-focus': 'settings-attach-btn',
-              disabled: busy,
-            },
-            pendingLabel(pendingMutation === 'attach', 'Attach', 'Attaching…')
-          )
-        ),
-        h(
-          'label',
-          { className: 'aq-toggle' },
-          h('span', undefined, 'Remember folder path on this device'),
-          h('input', {
-            type: 'checkbox',
-            checked: appearance.rememberStateDir,
-            'data-toggle-remember-dir': 'true',
-            'data-focus': 'remember-state-dir',
-          })
-        )
-      )
-    );
-
-    if (snapshot.demo_controls.available) {
-      const demoActive = snapshot.demo_controls.can_cancel;
-      frag.appendChild(
-        h(
-          'div',
-          { className: 'aq-setting' },
-          h('div', { className: 'aq-label' }, h('span', undefined, 'Local demo')),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'aq-btn',
-              'data-action': 'start-demo',
-              'data-focus': 'settings-start-demo',
-              disabled: busy || demoActive,
-            },
-            createUiIcon('play'),
-            h(
-              'span',
-              undefined,
-              pendingMutation === 'start_demo'
-                ? 'Starting…'
-                : demoActive
-                   ? 'Local demo active'
-                   : 'Run local demo'
-            )
-          )
-        )
-      );
-    }
 
     frag.appendChild(
       h(
@@ -2451,19 +3569,6 @@ class ThreadlaneDesktopApp {
       updatePref({ workerTimeoutSecs: Number(timeoutInput.value) }, 'exec-timeout-secs');
     });
 
-    const budgetInput = h('input', {
-      type: 'number',
-      className: 'aq-text-input',
-      min: String(EXECUTION_PREFERENCE_BOUNDS.decisionBudgetTokens.min),
-      max: String(EXECUTION_PREFERENCE_BOUNDS.decisionBudgetTokens.max),
-      value: String(prefs.decisionBudgetTokens),
-      'data-focus': 'exec-decision-budget',
-      'aria-label': 'Decision token budget',
-    });
-    budgetInput.addEventListener('change', () => {
-      updatePref({ decisionBudgetTokens: Number(budgetInput.value) }, 'exec-decision-budget');
-    });
-
     const redactToggle = h('input', {
       type: 'checkbox',
       checked: prefs.redactPathsInLogs,
@@ -2515,12 +3620,6 @@ class ThreadlaneDesktopApp {
           { className: 'aq-field' },
           h('span', { className: 'aq-field-label' }, 'Worker timeout secs (30–3600)'),
           timeoutInput
-        ),
-        h(
-          'label',
-          { className: 'aq-field' },
-          h('span', { className: 'aq-field-label' }, 'Decision budget tokens (128–8192)'),
-          budgetInput
         )
       ),
       h(
@@ -2541,251 +3640,6 @@ class ThreadlaneDesktopApp {
         'Typed bounds only: arbitrary shell flags, custom CLI arguments, and raw environment variable overrides are prohibited. Editing preferences here never alters running tasks.'
       )
     );
-  }
-
-  private buildDecisionVerificationSection(): HTMLElement {
-    const apiTools = this.state.registrySnapshot.tools.filter(
-      (t) => t.adapter === 'jev_api' || t.adapter === 'openai_decisions_api'
-    );
-
-    if (
-      !this.decisionUi.selectedToolId ||
-      !apiTools.some((t) => t.id === this.decisionUi.selectedToolId)
-    ) {
-      this.decisionUi.selectedToolId = apiTools[0]?.id ?? '';
-    }
-
-    const selectedTool =
-      apiTools.find((t) => t.id === this.decisionUi.selectedToolId) ?? null;
-    const provider: DecisionProvider =
-      selectedTool?.adapter === 'openai_decisions_api' ? 'openai' : 'jev';
-
-    if (!this.decisionUi.selectedModel) {
-      this.decisionUi.selectedModel =
-        this.decisionUi.fetchedModels[0]?.model_arg ??
-        (provider === 'openai' ? 'gpt-6-luna' : 'jev-1.14.0');
-    }
-
-    const busy = this.decisionUi.loadingModels || this.decisionUi.runningTest;
-
-    if (apiTools.length === 0) {
-      return h(
-        'section',
-        { className: 'aq-setting', 'aria-label': 'Decision API verification' },
-        h('p', { className: 'aq-kicker' }, 'Decision shadow-mode verification'),
-        h(
-          'p',
-          { className: 'aq-note' },
-          'Configure a Jev API or OpenAI Decisions API tool and OS keychain secret on the Tools page to test synthetic classification.'
-        ),
-        createButton('Configure API tool in Tools', () => {
-          this.returnFocusKey = null;
-          this.state = navigateToPage(this.state, 'tools');
-          this.render('nav-tools');
-        })
-      );
-    }
-
-    const toolSelect = h(
-      'select',
-      {
-        className: 'aq-select-input',
-        'aria-label': 'Decision API tool',
-        disabled: busy,
-      },
-      ...apiTools.map((tool) =>
-        h(
-          'option',
-          { value: tool.id, selected: tool.id === this.decisionUi.selectedToolId },
-          `${tool.label} (${tool.adapter})`
-        )
-      )
-    );
-    toolSelect.addEventListener('change', () => {
-      const nextTool = apiTools.find((t) => t.id === toolSelect.value);
-      const nextProvider: DecisionProvider =
-        nextTool?.adapter === 'openai_decisions_api' ? 'openai' : 'jev';
-      this.decisionUi.selectedToolId = toolSelect.value;
-      this.decisionUi.fetchedModels = [];
-      this.decisionUi.selectedModel =
-        nextProvider === 'openai' ? 'gpt-6-luna' : 'jev-1.14.0';
-      this.decisionUi.advice = null;
-      this.decisionUi.error = null;
-      this.render();
-    });
-
-    const modelInput = h('input', {
-      type: 'text',
-      className: 'aq-text-input',
-      value: this.decisionUi.selectedModel,
-      placeholder: provider === 'openai' ? 'gpt-6-luna' : 'jev-1.14.0',
-      'aria-label': 'Decision model',
-      disabled: busy,
-    });
-    modelInput.addEventListener('input', () => {
-      this.decisionUi.selectedModel = modelInput.value;
-    });
-
-    const fetchModelsBtn = createButton(
-      this.decisionUi.loadingModels ? 'Loading models…' : 'Fetch decision models',
-      () => {
-        void this.handleFetchDecisionModels(toolSelect.value, provider);
-      },
-      busy
-    );
-
-    const runSyntheticBtn = createButton(
-      this.decisionUi.runningTest
-        ? 'Testing synthetic sample…'
-        : 'Run fixed synthetic decision test',
-      () => {
-        void this.handleRunSyntheticDecisionTest(
-          toolSelect.value,
-          provider,
-          this.decisionUi.selectedModel
-        );
-      },
-      busy
-    );
-    runSyntheticBtn.classList.add('aq-btn-primary');
-
-    const adviceEl = this.decisionUi.advice
-      ? h(
-          'dl',
-          { className: 'aq-facts', style: 'margin-top: 8px;' },
-          h(
-            'div',
-            undefined,
-            h('dt', undefined, 'Provider / Model'),
-            h(
-              'dd',
-              undefined,
-              `${this.decisionUi.advice.provider} · ${this.decisionUi.advice.model}`
-            )
-          ),
-          h(
-            'div',
-            undefined,
-            h('dt', undefined, 'Difficulty'),
-            h('dd', undefined, this.decisionUi.advice.difficulty ?? 'Unclassified')
-          ),
-          h(
-            'div',
-            undefined,
-            h('dt', undefined, 'Confidence'),
-            h(
-              'dd',
-              undefined,
-              this.decisionUi.advice.confidence !== null
-                ? this.decisionUi.advice.confidence.toFixed(2)
-                : 'N/A'
-            )
-          ),
-          h(
-            'div',
-            undefined,
-            h('dt', undefined, 'Reason / Review'),
-            h(
-              'dd',
-              undefined,
-              `${this.decisionUi.advice.reason_code} · needs_review=${String(
-                this.decisionUi.advice.needs_review
-              )}`
-            )
-          )
-        )
-      : null;
-
-    return h(
-      'section',
-      { className: 'aq-setting', 'aria-label': 'Decision API verification' },
-      h(
-        'div',
-        { className: 'aq-row-head' },
-        h('p', { className: 'aq-kicker', style: 'margin: 0;' }, 'Decision shadow-mode verification'),
-        h('span', { className: 'aq-badge' }, 'Explicit click only')
-      ),
-      this.decisionUi.error
-        ? h(
-            'div',
-            { className: 'aq-banner aq-banner-error', role: 'alert' },
-            h('span', undefined, this.decisionUi.error)
-          )
-        : null,
-      h(
-        'div',
-        { className: 'aq-form-grid', style: 'margin-top: 8px;' },
-        h(
-          'label',
-          { className: 'aq-field' },
-          h('span', { className: 'aq-field-label' }, 'API Tool'),
-          toolSelect
-        ),
-        h(
-          'label',
-          { className: 'aq-field' },
-          h('span', { className: 'aq-field-label' }, 'Decision model'),
-          modelInput
-        )
-      ),
-      h('div', { className: 'aq-actions' }, fetchModelsBtn, runSyntheticBtn),
-      adviceEl,
-      h(
-        'p',
-        { className: 'aq-note', style: 'margin-bottom: 0;' },
-        'Uses a fixed synthetic verification task in Rust. User prompts are never sent, and decision advice never triggers automatic approval or execution.'
-      )
-    );
-  }
-
-  private async handleFetchDecisionModels(
-    toolId: string,
-    provider: DecisionProvider
-  ): Promise<void> {
-    this.decisionUi.loadingModels = true;
-    this.decisionUi.error = null;
-    this.render();
-    try {
-      const models = await desktop_decision_models({ toolId, provider });
-      this.decisionUi.fetchedModels = models;
-      if (models[0]) {
-        this.decisionUi.selectedModel = models[0].model_arg;
-      }
-    } catch (err) {
-      this.decisionUi.error = formatAppError(
-        err,
-        'Failed to fetch decision models metadata.'
-      );
-    } finally {
-      this.decisionUi.loadingModels = false;
-      this.render();
-    }
-  }
-
-  private async handleRunSyntheticDecisionTest(
-    toolId: string,
-    provider: DecisionProvider,
-    model: string
-  ): Promise<void> {
-    this.decisionUi.runningTest = true;
-    this.decisionUi.error = null;
-    this.render();
-    try {
-      const advice = await desktop_test_decision({
-        toolId,
-        provider,
-        model: model.trim(),
-      });
-      this.decisionUi.advice = advice;
-    } catch (err) {
-      this.decisionUi.error = formatAppError(
-        err,
-        'Synthetic decision verification test failed.'
-      );
-    } finally {
-      this.decisionUi.runningTest = false;
-      this.render();
-    }
   }
 
   private buildSegmentControl<T extends string>(
@@ -2819,6 +3673,11 @@ class ThreadlaneDesktopApp {
   }
 
   private renderFooter(): void {
+    if (this.isObservationPageLayoutActive()) {
+      // The observation footer stays hidden; leave its existing children
+      // untouched instead of replacing them on every render.
+      return;
+    }
     const status = formatFooterStatus(
       this.state.snapshot.attachment,
       this.state.isDevPreviewFixture
@@ -2899,14 +3758,78 @@ class ThreadlaneDesktopApp {
         void this.handleAttachRuntime();
         return;
       }
+      if (action === 'open-advanced-activity') {
+        this.openAdvancedActivityDiagnostics();
+        return;
+      }
+      if (action === 'close-advanced-activity') {
+        this.closeAdvancedActivity();
+        return;
+      }
+      if (action === 'toggle-advanced-activity') {
+        if (this.advancedActivityOpen) {
+          this.closeAdvancedActivity();
+        } else {
+          this.openAdvancedActivityDiagnostics();
+        }
+        return;
+      }
+      if (action === 'open-advanced-plans') {
+        this.openAdvancedPlans();
+        return;
+      }
+      if (action === 'close-advanced-plans') {
+        this.closeAdvancedPlans();
+        return;
+      }
+      if (action === 'activity-all') {
+        this.showAllActivity();
+        return;
+      }
+      if (action === 'refresh-observation-sources') {
+        void this.refreshObservationSources(true);
+        return;
+      }
+      if (action === 'link-observation-context') {
+        void this.handleLinkObservationContext();
+        return;
+      }
+
+      const settingsSection = button.dataset.settingsSection as
+        | SettingsSection
+        | undefined;
+      if (settingsSection) {
+        this.settingsSection = settingsSection;
+        if (settingsSection !== 'connections') {
+          this.advancedControlsOpen = false;
+        }
+        this.render(`settings-${settingsSection}`);
+        if (settingsSection === 'connections') {
+          void this.refreshObservationSources(true);
+        }
+        return;
+      }
 
       const navPage = button.dataset.navPage as NavPage | undefined;
       if (navPage) {
         this.returnFocusKey = null;
+        if (navPage !== 'settings') {
+          this.advancedControlsOpen = false;
+        }
+        if (navPage === 'activity') {
+          this.advancedActivityOpen = false;
+        }
+        if (navPage === 'plans') {
+          this.advancedPlansOpen = false;
+          this.pinnedPlansJob = null;
+        }
         this.state = navigateToPage(this.state, navPage);
         this.render(`nav-${navPage}`);
-        if (navPage === 'plans') {
-          void this.refreshPlansPageData(true);
+        if (navPage === 'activity' || navPage === 'plans') {
+          this.ensureObservationForCurrentView();
+        }
+        if (navPage === 'settings' && this.settingsSection === 'connections') {
+          void this.refreshObservationSources(true);
         }
         return;
       }
@@ -3016,6 +3939,20 @@ class ThreadlaneDesktopApp {
         return;
       }
 
+      if (
+        target instanceof HTMLInputElement &&
+        target.dataset.input === 'observation-context-path'
+      ) {
+        this.observationContextPath = target.value;
+        const linkButton = this.root.querySelector<HTMLButtonElement>(
+          '[data-action="link-observation-context"]'
+        );
+        if (linkButton) {
+          linkButton.disabled = this.observationLinkInFlight || !target.value.trim();
+        }
+        return;
+      }
+
       if (target instanceof HTMLInputElement && target.hasAttribute('data-opacity-slider')) {
         const nextOpacity = Math.round(Math.min(100, Math.max(65, Number(target.value))));
         this.state.appearance = {
@@ -3036,6 +3973,9 @@ class ThreadlaneDesktopApp {
         const target = event.target as HTMLElement | null;
         if (target instanceof HTMLDetailsElement && target.hasAttribute('data-completed-toggle')) {
           this.state.completedExpanded = target.open;
+        }
+        if (target instanceof HTMLDetailsElement && target.hasAttribute('data-advanced-controls')) {
+          this.advancedControlsOpen = target.open;
         }
       },
       true

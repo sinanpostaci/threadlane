@@ -2527,6 +2527,7 @@ dependencies = [
 name = "threadlane-core"
 version = "0.1.0"
 dependencies = [
+ "fs2",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2550,6 +2551,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "threadlane-connectors",
+ "threadlane-core",
  "threadlane-registry",
  "tokio",
 ]

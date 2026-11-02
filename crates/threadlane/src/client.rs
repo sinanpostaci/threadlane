@@ -108,6 +108,14 @@ impl SupervisorClient {
         })
     }
 
+    /// Returns the configured `state_dir` path when backed by a state directory.
+    pub fn state_dir(&self) -> Option<&Path> {
+        match &self.source {
+            DescriptorSource::StateDir(dir) => Some(dir.as_path()),
+            DescriptorSource::Fixed(_) => None,
+        }
+    }
+
     /// Creates a new trusted binding (CLI only).
     pub async fn create_binding(&self, thread_uuid: &str, label: &str) -> Result<Binding, Error> {
         let req = CreateBindingRequest {
@@ -313,6 +321,11 @@ impl ScopedClient {
     /// Returns the fixed `binding_id` for this scoped client.
     pub fn binding_id(&self) -> &str {
         &self.binding_id
+    }
+
+    /// Returns the configured `state_dir` path when backed by a state directory.
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.client.state_dir()
     }
 
     /// Executes a [`ScopedRequest`] on the fixed binding.

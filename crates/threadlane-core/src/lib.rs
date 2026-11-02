@@ -13,6 +13,8 @@ mod engine;
 pub mod error;
 /// Input validation limits and fixed protocol constants.
 pub mod limits;
+/// Persistent observation wire DTOs, safe metadata sanitization, and append-only journal helpers.
+pub mod observation;
 /// Serializable request, response, run, event, and wake-up types.
 pub mod types;
 /// Durable worker dispatch ledger, claims, progress, and outcome types.

@@ -676,7 +676,7 @@ async fn preflight_without_profile_id_uses_only_the_registry_default() {
 }
 
 #[tokio::test]
-async fn create_rejects_foreign_scope_and_non_private_json_without_store_writes() {
+async fn create_rejects_foreign_scope_and_non_private_json_without_workflow_store_mutations() {
     let mut fixture = FlowFixture::start().await;
     let plans_before = directory_entries(&fixture.plans_dir);
     let authority_before = directory_entries(&fixture.authority_dir);
@@ -692,9 +692,13 @@ async fn create_rejects_foreign_scope_and_non_private_json_without_store_writes(
     let foreign_output = run_flow(&foreign_args).await;
     expect_failure_code(&foreign_output, "foreign scope create", "scope_mismatch");
     assert_no_secret_echo(&foreign_output, "foreign scope create");
+    // Refusals are observable, but may not create any workflow state.
+    let mut expected_plan_entries = plans_before.clone();
+    expected_plan_entries.push("observation-journal.jsonl".to_string());
+    expected_plan_entries.sort();
     assert_eq!(
         directory_entries(&fixture.plans_dir),
-        plans_before,
+        expected_plan_entries,
         "foreign scope create must not write role-flow state"
     );
     assert_eq!(
@@ -751,7 +755,7 @@ async fn create_rejects_foreign_scope_and_non_private_json_without_store_writes(
 
     assert_eq!(
         directory_entries(&fixture.plans_dir),
-        plans_before,
+        expected_plan_entries,
         "refused request files must not write role-flow state"
     );
     assert_eq!(

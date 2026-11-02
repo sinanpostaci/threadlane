@@ -9,6 +9,13 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_connectors::CredentialStore;
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, read_env_parent_request_id, read_env_plan_id,
+    sanitize_observation_summary, ObservationActor, ObservationCallState, ObservationDelivery,
+    ObservationDeliveryStage, ObservationExecutor, ObservationJournalRecord,
+    ObservationRecordPhase, ObservationUsage,
+};
 use threadlane_registry::{
     DecisionAdvisorMode, Difficulty, RegistrySnapshot, RegistryStore, ToolAdapter,
 };
@@ -802,12 +809,12 @@ pub(crate) async fn classify_advice_with_options(
                             .map(|baseline| advice.difficulty == Some(baseline));
                         let elapsed_ms =
                             (started.elapsed().as_millis() as u64).min(MAX_JS_SAFE_INTEGER);
-                        return Ok(AdviceClassifyOutput {
+                        let output = AdviceClassifyOutput {
                             untrusted_data: true,
                             advisory_only: true,
                             mode: ADVICE_MODE_SHADOW.to_string(),
                             source: AdviceSource::Cache,
-                            context_id: validated_scope.context_id,
+                            context_id: validated_scope.context_id.clone(),
                             task_id: request.raw.task_id,
                             task_revision: request.raw.task_revision,
                             registry_revision: initial_snapshot.revision,
@@ -823,7 +830,18 @@ pub(crate) async fn classify_advice_with_options(
                             provider_call_performed: false,
                             cache_age_ms: Some(cache_age_ms),
                             elapsed_ms,
-                        });
+                        };
+                        let mut obs_tracker = AdviceObservationTracker::new(
+                            &validated_scope,
+                            &output.task_id,
+                            &output.tool_id,
+                            &output.requested_model,
+                            options.now_ms_override,
+                        );
+                        let started_ms = now_ms.saturating_sub(elapsed_ms.min(now_ms));
+                        obs_tracker.record_entry(started_ms);
+                        obs_tracker.finish_completed(&output, now_ms);
+                        return Ok(output);
                     }
                     prior_existing = Some(existing);
                 }
@@ -887,9 +905,19 @@ pub(crate) async fn classify_advice_with_options(
         return Err(AdviceError::from(pre_api_err));
     }
 
-    // 5. Execute single-attempt Jev classification while holding only `key_lock` (never `.cache.lock`).
-    //    Any error at or after this point may have incurred a paid API call and must remain
-    //    `Pending` or `Uncertain` until explicit `--refresh`.
+    // 5. Append observation `Entry` immediately before the provider call begins, then execute
+    //    single-attempt Jev classification while holding only `key_lock` (never `.cache.lock`).
+    //    Any error or cancellation at or after this point may have incurred a paid API call and
+    //    must remain `Pending` or `Uncertain` on disk and resolve observation state to `Unknown`.
+    let mut obs_tracker = AdviceObservationTracker::new(
+        &validated_scope,
+        &request.raw.task_id,
+        &resolved.tool_id,
+        &resolved.requested_model,
+        options.now_ms_override,
+    );
+    obs_tracker.record_entry(now_ms);
+
     let classify_res = client
         .classify(DecisionRequest {
             tool_id: resolved.tool_id.clone(),
@@ -921,6 +949,7 @@ pub(crate) async fn classify_advice_with_options(
                 options.expected_uid,
                 key_lock,
             );
+            obs_tracker.finish_uncertain(failed_at_ms, provider_err.code());
             return Err(AdviceError::from(provider_err));
         }
     };
@@ -965,6 +994,7 @@ pub(crate) async fn classify_advice_with_options(
             options.expected_uid,
             key_lock,
         );
+        obs_tracker.finish_uncertain(failed_at_ms, post_err.code());
         return Err(post_err);
     }
 
@@ -982,7 +1012,7 @@ pub(crate) async fn classify_advice_with_options(
         },
         ..pending_record
     };
-    publish_completed_record(
+    if let Err(pub_err) = publish_completed_record(
         &validated_scope.cache_dir,
         &cache_key,
         &record_path,
@@ -991,7 +1021,10 @@ pub(crate) async fn classify_advice_with_options(
         ttl_ms,
         options.expected_uid,
         key_lock,
-    )?;
+    ) {
+        obs_tracker.finish_uncertain(completed_at_ms, pub_err.code());
+        return Err(pub_err);
+    }
 
     let agrees_with_baseline = request
         .raw
@@ -999,7 +1032,7 @@ pub(crate) async fn classify_advice_with_options(
         .map(|baseline| advice.difficulty == Some(baseline));
     let elapsed_ms = (started.elapsed().as_millis() as u64).min(MAX_JS_SAFE_INTEGER);
 
-    Ok(AdviceClassifyOutput {
+    let output = AdviceClassifyOutput {
         untrusted_data: true,
         advisory_only: true,
         mode: ADVICE_MODE_SHADOW.to_string(),
@@ -1020,7 +1053,244 @@ pub(crate) async fn classify_advice_with_options(
         provider_call_performed: true,
         cache_age_ms: None,
         elapsed_ms,
-    })
+    };
+    obs_tracker.finish_completed(&output, completed_at_ms);
+    Ok(output)
+}
+
+struct AdviceObservationTracker {
+    journal_dir: Option<PathBuf>,
+    request_id: String,
+    parent_request_id: Option<String>,
+    call_id: String,
+    plan_id: Option<String>,
+    context_id: String,
+    task_id: String,
+    tool_id: String,
+    requested_model: String,
+    now_ms_override: Option<u64>,
+    entry_recorded: bool,
+    finished: bool,
+}
+
+impl AdviceObservationTracker {
+    fn new(
+        scope: &ValidatedScope,
+        task_id: &str,
+        tool_id: &str,
+        requested_model: &str,
+        now_ms_override: Option<u64>,
+    ) -> Self {
+        let journal_dir = scope
+            .cache_dir
+            .parent()
+            .filter(|parent| {
+                *parent != scope.registry_dir.as_path()
+                    && *parent != Path::new(&scope.project_root_str)
+            })
+            .map(Path::to_path_buf);
+        Self {
+            journal_dir,
+            request_id: generate_observation_id("obsreq"),
+            parent_request_id: read_env_parent_request_id(),
+            call_id: generate_observation_id("obsc"),
+            plan_id: read_env_plan_id(),
+            context_id: scope.context_id.clone(),
+            task_id: task_id.to_string(),
+            tool_id: tool_id.to_string(),
+            requested_model: requested_model.to_string(),
+            now_ms_override,
+            entry_recorded: false,
+            finished: false,
+        }
+    }
+
+    fn actor() -> ObservationActor {
+        ObservationActor::unknown(Some("advice_engine".to_string()))
+    }
+
+    fn executor(&self, observed_model: Option<String>) -> ObservationExecutor {
+        ObservationExecutor {
+            tool: Some(self.tool_id.clone()),
+            provider: Some("jev".to_string()),
+            role: None,
+            requested_model: Some(self.requested_model.clone()),
+            observed_model,
+            requested_effort: None,
+            observed_effort: None,
+        }
+    }
+
+    fn record_entry(&mut self, started_at_ms: u64) {
+        if self.entry_recorded {
+            return;
+        }
+        self.entry_recorded = true;
+        let Some(dir) = &self.journal_dir else {
+            return;
+        };
+        let at_ms = i64::try_from(started_at_ms).unwrap_or_else(|_| current_observation_time_ms());
+        let summary = sanitize_observation_summary(&format!(
+            "Jev classify: requested={}",
+            self.requested_model
+        ));
+        let record = ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id: self.request_id.clone(),
+            parent_request_id: self.parent_request_id.clone(),
+            call_id: Some(self.call_id.clone()),
+            phase: ObservationRecordPhase::Entry,
+            at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: None,
+            project_path: None,
+            binding_id: None,
+            thread_uuid: Some(self.context_id.clone()),
+            thread_label: None,
+            job_id: None,
+            plan_id: self.plan_id.clone(),
+            task_id: Some(self.task_id.clone()),
+            approval_id: None,
+            operation: "advice.classify".to_string(),
+            title: "advice classify".to_string(),
+            state: ObservationCallState::Running,
+            actor: Some(Self::actor()),
+            executor: Some(self.executor(None)),
+            usage: None,
+            delivery: Vec::new(),
+            summary: Some(summary),
+        };
+        let _ = append_journal_record(dir, &record);
+    }
+
+    fn finish_completed(&mut self, output: &AdviceClassifyOutput, finished_at_ms: u64) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let Some(dir) = &self.journal_dir else {
+            return;
+        };
+        let at_ms = i64::try_from(finished_at_ms).unwrap_or_else(|_| current_observation_time_ms());
+        let (provenance, usage) = match output.source {
+            AdviceSource::Cache => (
+                "cache_hit",
+                ObservationUsage {
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    total_tokens: None,
+                    provenance: "cache_hit".to_string(),
+                },
+            ),
+            AdviceSource::Provider => {
+                let total_tokens = match (output.advice.input_tokens, output.advice.output_tokens) {
+                    (Some(inp), Some(out)) => inp.checked_add(out),
+                    _ => None,
+                };
+                (
+                    "network_response",
+                    ObservationUsage {
+                        input_tokens: output.advice.input_tokens,
+                        output_tokens: output.advice.output_tokens,
+                        cache_read_tokens: None,
+                        total_tokens,
+                        provenance: "network_response".to_string(),
+                    },
+                )
+            }
+        };
+        let summary = sanitize_observation_summary(&format!(
+            "Jev classify ({provenance}): requested={}, observed={}, reason={}",
+            output.requested_model, output.advice.model, output.advice.reason_code
+        ));
+        let record = ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id: self.request_id.clone(),
+            parent_request_id: self.parent_request_id.clone(),
+            call_id: Some(self.call_id.clone()),
+            phase: ObservationRecordPhase::Finish,
+            at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: None,
+            project_path: None,
+            binding_id: None,
+            thread_uuid: Some(self.context_id.clone()),
+            thread_label: None,
+            job_id: None,
+            plan_id: self.plan_id.clone(),
+            task_id: Some(self.task_id.clone()),
+            approval_id: None,
+            operation: "advice.classify".to_string(),
+            title: "advice classify".to_string(),
+            state: ObservationCallState::Completed,
+            actor: Some(Self::actor()),
+            executor: Some(self.executor(Some(output.advice.model.clone()))),
+            usage: Some(usage),
+            delivery: vec![ObservationDelivery {
+                stage: ObservationDeliveryStage::ResponseReturned,
+                at_ms: Some(at_ms),
+                summary: summary.clone(),
+                recipient: None,
+            }],
+            summary: Some(summary),
+        };
+        let _ = append_journal_record(dir, &record);
+    }
+
+    fn finish_uncertain(&mut self, failed_at_ms: u64, error_code: &str) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let Some(dir) = &self.journal_dir else {
+            return;
+        };
+        let at_ms = i64::try_from(failed_at_ms).unwrap_or_else(|_| current_observation_time_ms());
+        let summary =
+            sanitize_observation_summary(&format!("Jev classify outcome unknown ({error_code})"));
+        let record = ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id: self.request_id.clone(),
+            parent_request_id: self.parent_request_id.clone(),
+            call_id: Some(self.call_id.clone()),
+            phase: ObservationRecordPhase::Finish,
+            at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: None,
+            project_path: None,
+            binding_id: None,
+            thread_uuid: Some(self.context_id.clone()),
+            thread_label: None,
+            job_id: None,
+            plan_id: self.plan_id.clone(),
+            task_id: Some(self.task_id.clone()),
+            approval_id: None,
+            operation: "advice.classify".to_string(),
+            title: "advice classify".to_string(),
+            state: ObservationCallState::Unknown,
+            actor: Some(Self::actor()),
+            executor: Some(self.executor(None)),
+            usage: None,
+            delivery: Vec::new(),
+            summary: Some(summary),
+        };
+        let _ = append_journal_record(dir, &record);
+    }
+}
+
+impl Drop for AdviceObservationTracker {
+    fn drop(&mut self) {
+        if self.entry_recorded && !self.finished {
+            let fallback_ms = self.now_ms_override.unwrap_or_else(|| {
+                u64::try_from(current_observation_time_ms().max(0)).unwrap_or(0)
+            });
+            self.finish_uncertain(fallback_ms, "cancelled");
+        }
+    }
 }
 
 async fn precheck_tool_credential(
@@ -2688,4 +2958,831 @@ fn sync_directory(dir: &Path) -> Result<(), AdviceError> {
 #[cfg(not(unix))]
 fn sync_directory(_dir: &Path) -> Result<(), AdviceError> {
     Err(AdviceError::unsupported_platform())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::collections::{BTreeSet, HashMap, VecDeque};
+    use std::os::unix::fs::PermissionsExt;
+    use threadlane_connectors::ConnectorError;
+    use threadlane_core::observation::{
+        read_journal_records_readonly, ENV_OBSERVATION_PARENT_REQUEST_ID, ENV_OBSERVATION_PLAN_ID,
+        OBSERVATION_JOURNAL_FILE_NAME,
+    };
+    use threadlane_registry::{ModelDefinition, RegistryChange, ToolDefinition};
+
+    use crate::transport::{
+        DecisionTransport, TransportFuture, TransportRequest, TransportResponse,
+    };
+
+    static ADVICE_TEST_SEQ: AtomicU64 = AtomicU64::new(1);
+    static ADVICE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct ScopedEnvVars {
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ScopedEnvVars {
+        fn set(vars: &[(&'static str, Option<&str>)]) -> Self {
+            let mut saved = Vec::with_capacity(vars.len());
+            for (key, val) in vars {
+                saved.push((*key, std::env::var(key).ok()));
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnvVars {
+        fn drop(&mut self) {
+            for (key, prior) in self.saved.drain(..) {
+                match prior {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    struct AdviceObsTestWorkspace {
+        base: PathBuf,
+        project_root: PathBuf,
+        registry_dir: PathBuf,
+        plans_dir: PathBuf,
+        cache_dir: PathBuf,
+    }
+
+    impl AdviceObsTestWorkspace {
+        fn new(label: &str) -> Self {
+            let raw_tmp =
+                fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+            let base = loop {
+                let seq = ADVICE_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+                let candidate = raw_tmp.join(format!(
+                    "threadlane-advice-obs-{label}-{}-{seq}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => break candidate,
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => panic!("create test base: {err}"),
+                }
+            };
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).expect("chmod base");
+
+            let project_root = base.join("project");
+            let registry_dir = base.join("registry");
+            let plans_dir = base.join("plans");
+            let cache_dir = plans_dir.join("advice-cache");
+
+            for dir in [&project_root, &registry_dir, &plans_dir] {
+                fs::create_dir_all(dir).expect("create dir");
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+            }
+
+            Self {
+                base,
+                project_root,
+                registry_dir,
+                plans_dir,
+                cache_dir,
+            }
+        }
+
+        fn scope(&self, context_id: &str) -> AdviceScope {
+            AdviceScope {
+                registry_dir: self.registry_dir.clone(),
+                cache_dir: self.cache_dir.clone(),
+                project_root: self.project_root.clone(),
+                context_id: context_id.to_string(),
+                cache_ttl_seconds: DEFAULT_CACHE_TTL_SECONDS,
+                profile_id: None,
+            }
+        }
+
+        fn write_private_file(&self, name: &str, contents: &[u8]) -> PathBuf {
+            let path = self.base.join(name);
+            fs::write(&path, contents).expect("write private test file");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 private test file");
+            path
+        }
+
+        fn seed_jev_registry(&self) -> u64 {
+            let store =
+                RegistryStore::open(self.registry_dir.clone()).expect("open registry store");
+            store
+                .apply(
+                    0,
+                    RegistryChange::UpsertTool {
+                        tool: ToolDefinition {
+                            id: "jev-api".to_string(),
+                            label: "TypeSafe Jev API".to_string(),
+                            adapter: ToolAdapter::JevApi,
+                            executable_path: None,
+                            enabled: true,
+                        },
+                    },
+                )
+                .expect("upsert jev tool");
+            let snap = store
+                .apply(
+                    1,
+                    RegistryChange::UpsertModels {
+                        models: vec![ModelDefinition {
+                            id: "jev-api:jev-latest".to_string(),
+                            tool_id: "jev-api".to_string(),
+                            label: "jev-latest".to_string(),
+                            model_arg: "jev-latest".to_string(),
+                            efforts: Vec::new(),
+                            allow_no_effort: true,
+                        }],
+                    },
+                )
+                .expect("upsert jev model");
+            snap.revision
+        }
+    }
+
+    impl Drop for AdviceObsTestWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+
+    #[derive(Default)]
+    struct MockVault {
+        secrets: Mutex<HashMap<String, String>>,
+    }
+
+    impl MockVault {
+        fn with_secret(tool_id: &str, secret: &str) -> Arc<Self> {
+            let mut map = HashMap::new();
+            map.insert(tool_id.to_string(), secret.to_string());
+            Arc::new(Self {
+                secrets: Mutex::new(map),
+            })
+        }
+
+        fn empty() -> Arc<Self> {
+            Arc::new(Self {
+                secrets: Mutex::new(HashMap::new()),
+            })
+        }
+    }
+
+    impl CredentialStore for MockVault {
+        fn set(&self, tool_id: &str, secret: &str) -> Result<(), ConnectorError> {
+            self.secrets
+                .lock()
+                .expect("vault lock")
+                .insert(tool_id.to_string(), secret.to_string());
+            Ok(())
+        }
+
+        fn get(&self, tool_id: &str) -> Result<Option<String>, ConnectorError> {
+            Ok(self
+                .secrets
+                .lock()
+                .expect("vault lock")
+                .get(tool_id)
+                .cloned())
+        }
+
+        fn delete(&self, tool_id: &str) -> Result<(), ConnectorError> {
+            self.secrets.lock().expect("vault lock").remove(tool_id);
+            Ok(())
+        }
+
+        fn status(&self, tool_id: &str) -> Result<String, ConnectorError> {
+            let configured = self
+                .secrets
+                .lock()
+                .expect("vault lock")
+                .contains_key(tool_id);
+            Ok(if configured {
+                "configured".to_string()
+            } else {
+                "not_configured".to_string()
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct MockTransport {
+        responses: Mutex<VecDeque<Result<TransportResponse, DecisionError>>>,
+        on_execute: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    }
+
+    impl MockTransport {
+        fn with_responses(
+            responses: impl IntoIterator<Item = Result<TransportResponse, DecisionError>>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                on_execute: Mutex::new(None),
+            })
+        }
+
+        fn set_on_execute(&self, hook: impl Fn() + Send + Sync + 'static) {
+            *self.on_execute.lock().expect("on_execute lock") = Some(Box::new(hook));
+        }
+    }
+
+    impl DecisionTransport for MockTransport {
+        fn execute<'a>(&'a self, _request: TransportRequest) -> TransportFuture<'a> {
+            Box::pin(async move {
+                if let Some(hook) = self.on_execute.lock().expect("on_execute lock").as_ref() {
+                    hook();
+                }
+                self.responses
+                    .lock()
+                    .expect("responses lock")
+                    .pop_front()
+                    .unwrap_or(Err(DecisionError::TransportFailed))
+            })
+        }
+    }
+
+    struct PendingTransport {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl DecisionTransport for PendingTransport {
+        fn execute<'a>(&'a self, _request: TransportRequest) -> TransportFuture<'a> {
+            let entered = Arc::clone(&self.entered);
+            Box::pin(async move {
+                entered.notify_one();
+                std::future::pending::<Result<TransportResponse, DecisionError>>().await
+            })
+        }
+    }
+
+    fn mock_jev_response(
+        model: &str,
+        choice: &str,
+        confidence: f64,
+        probs: (f64, f64, f64, f64),
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<TransportResponse, DecisionError> {
+        let (easy, medium, hard, extreme) = probs;
+        let body = format!(
+            r#"{{
+                "model": "{model}",
+                "answers": {{
+                    "difficulty": {{
+                        "type": "choice",
+                        "choice": "{choice}",
+                        "confidence": {confidence},
+                        "probabilities": {{
+                            "easy": {easy},
+                            "medium": {medium},
+                            "hard": {hard},
+                            "extreme": {extreme}
+                        }}
+                    }}
+                }},
+                "usage": {{"input_tokens": {input_tokens}, "output_tokens": {output_tokens}}}
+            }}"#
+        );
+        Ok(TransportResponse {
+            status: 200,
+            body: body.into_bytes(),
+        })
+    }
+
+    #[tokio::test]
+    async fn repeated_classify_for_same_cache_key_records_unique_ids_and_preserves_env_hints_without_setting_job_id(
+    ) {
+        let _env_guard = ADVICE_ENV_LOCK.lock().await;
+        let _scoped_env = ScopedEnvVars::set(&[
+            (
+                ENV_OBSERVATION_PARENT_REQUEST_ID,
+                Some("obsreq_parent_hint_101"),
+            ),
+            (ENV_OBSERVATION_PLAN_ID, Some("plan_hint_202")),
+        ]);
+
+        let ws = AdviceObsTestWorkspace::new("unique-ids-and-provenance");
+        let reg_rev = ws.seed_jev_registry();
+        let scope = ws.scope("0196ed00-0000-7000-8000-000000000077");
+
+        let secret = "sk-jev-secret-never-log-777";
+        let raw_task_summary = "Sensitive task description that must never appear in journal.";
+        let req_json = format!(
+            r#"{{
+                "schema_version": 1,
+                "expected_registry_revision": {reg_rev},
+                "tool_id": "jev-api",
+                "model_id": "jev-api:jev-latest",
+                "task_id": "task-obs-1",
+                "task_revision": 1,
+                "task_summary": "{raw_task_summary}",
+                "baseline_difficulty": "easy"
+            }}"#
+        );
+        let req_path = ws.write_private_file("req.json", req_json.as_bytes());
+
+        let vault = MockVault::with_secret("jev-api", secret);
+        let transport = MockTransport::with_responses([
+            mock_jev_response(
+                "jev-1.14.0",
+                "hard",
+                0.92,
+                (0.02, 0.04, 0.92, 0.02),
+                210,
+                18,
+            ),
+            mock_jev_response(
+                "jev-1.14.1",
+                "medium",
+                0.88,
+                (0.05, 0.88, 0.05, 0.02),
+                140,
+                12,
+            ),
+        ]);
+        let client = DecisionClient::with_transport(vault.clone(), transport).expect("client");
+
+        let opts_t0 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_000_000),
+            ..AdviceRuntimeOptions::default()
+        };
+        let first = classify_advice_with_options(
+            &scope,
+            &req_path,
+            false,
+            vault.clone(),
+            &client,
+            &opts_t0,
+        )
+        .await
+        .expect("first provider classify");
+        assert_eq!(first.source, AdviceSource::Provider);
+
+        let opts_t1 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_005_000),
+            ..AdviceRuntimeOptions::default()
+        };
+        let second_hit = classify_advice_with_options(
+            &scope,
+            &req_path,
+            false,
+            vault.clone(),
+            &client,
+            &opts_t1,
+        )
+        .await
+        .expect("second cache hit classify");
+        assert_eq!(second_hit.source, AdviceSource::Cache);
+        assert_eq!(second_hit.cache_key, first.cache_key);
+        assert_eq!(second_hit.advice.input_tokens, Some(210));
+        assert_eq!(second_hit.advice.output_tokens, Some(18));
+
+        let opts_t2 = AdviceRuntimeOptions {
+            now_ms_override: Some(1_700_000_010_000),
+            ..AdviceRuntimeOptions::default()
+        };
+        let third_refresh =
+            classify_advice_with_options(&scope, &req_path, true, vault.clone(), &client, &opts_t2)
+                .await
+                .expect("third refresh provider classify");
+        assert_eq!(third_refresh.source, AdviceSource::Provider);
+        assert_eq!(third_refresh.cache_key, first.cache_key);
+
+        let raw_journal = fs::read_to_string(ws.plans_dir.join(OBSERVATION_JOURNAL_FILE_NAME))
+            .expect("read raw journal");
+        assert!(!raw_journal.contains(secret));
+        assert!(!raw_journal.contains(raw_task_summary));
+
+        let (records, warnings) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read journal");
+        assert!(warnings.is_empty());
+        assert_eq!(records.len(), 6);
+
+        let record_ids: BTreeSet<String> = records.iter().map(|r| r.record_id.clone()).collect();
+        assert_eq!(record_ids.len(), 6, "every record_id must be unique");
+
+        for rec in &records {
+            assert_eq!(
+                rec.parent_request_id.as_deref(),
+                Some("obsreq_parent_hint_101")
+            );
+            assert_eq!(rec.plan_id.as_deref(), Some("plan_hint_202"));
+            assert_eq!(
+                rec.job_id, None,
+                "job_id must never be populated from observational plan_id"
+            );
+            assert_eq!(rec.task_id.as_deref(), Some("task-obs-1"));
+            assert_eq!(
+                rec.thread_uuid.as_deref(),
+                Some("0196ed00-0000-7000-8000-000000000077")
+            );
+            assert!(
+                !rec.request_id.contains(&first.cache_key[..12]),
+                "request_id must not be derived from cache_key"
+            );
+            assert_ne!(
+                rec.request_id, "obsreq_parent_hint_101",
+                "request_id must be fresh and distinct from parent_request_id"
+            );
+            let call_id = rec.call_id.as_deref().expect("child call_id present");
+            assert!(
+                !call_id.contains(&first.cache_key[..12]),
+                "call_id must not be derived from cache_key"
+            );
+            assert!(rec.has_live_process_instance());
+        }
+
+        // Pair 0 (provider call 1), Pair 1 (cache hit), Pair 2 (provider refresh) must each have
+        // distinct request_id and call_id values.
+        let mut req_ids = BTreeSet::new();
+        let mut call_ids = BTreeSet::new();
+        for pair in records.as_chunks::<2>().0 {
+            let entry = &pair[0];
+            let finish = &pair[1];
+            assert_eq!(entry.phase, ObservationRecordPhase::Entry);
+            assert_eq!(entry.state, ObservationCallState::Running);
+            assert_eq!(finish.phase, ObservationRecordPhase::Finish);
+            assert_eq!(finish.state, ObservationCallState::Completed);
+            assert_eq!(entry.request_id, finish.request_id);
+            assert_eq!(entry.call_id, finish.call_id);
+            assert_eq!(
+                entry
+                    .executor
+                    .as_ref()
+                    .and_then(|e| e.observed_model.as_deref()),
+                None,
+                "Entry must not claim observed_model before completion"
+            );
+            assert!(entry.usage.is_none());
+            assert!(entry.delivery.is_empty());
+
+            req_ids.insert(entry.request_id.clone());
+            call_ids.insert(entry.call_id.clone().expect("call_id"));
+        }
+        assert_eq!(
+            req_ids.len(),
+            3,
+            "each invocation must get a fresh request_id"
+        );
+        assert_eq!(
+            call_ids.len(),
+            3,
+            "each invocation must get a fresh call_id"
+        );
+
+        // Verify exact returned metadata and token usage provenance per invocation.
+        let finish_1 = &records[1];
+        assert_eq!(
+            finish_1
+                .executor
+                .as_ref()
+                .and_then(|e| e.requested_model.as_deref()),
+            Some("jev-latest")
+        );
+        assert_eq!(
+            finish_1
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            Some("jev-1.14.0")
+        );
+        assert_eq!(
+            finish_1.usage,
+            Some(ObservationUsage {
+                input_tokens: Some(210),
+                output_tokens: Some(18),
+                cache_read_tokens: None,
+                total_tokens: Some(228),
+                provenance: "network_response".to_string(),
+            })
+        );
+        assert_eq!(finish_1.delivery.len(), 1);
+        assert_eq!(
+            finish_1.delivery[0].stage,
+            ObservationDeliveryStage::ResponseReturned
+        );
+
+        let finish_2_cache = &records[3];
+        assert_eq!(
+            finish_2_cache
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            Some("jev-1.14.0")
+        );
+        assert_eq!(
+            finish_2_cache.usage,
+            Some(ObservationUsage {
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                total_tokens: None,
+                provenance: "cache_hit".to_string(),
+            })
+        );
+
+        let finish_3_refresh = &records[5];
+        assert_eq!(
+            finish_3_refresh
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            Some("jev-1.14.1")
+        );
+        assert_eq!(
+            finish_3_refresh.usage,
+            Some(ObservationUsage {
+                input_tokens: Some(140),
+                output_tokens: Some(12),
+                cache_read_tokens: None,
+                total_tokens: Some(152),
+                provenance: "network_response".to_string(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_is_appended_before_provider_call_and_preflight_refusal_never_claims_provider_call(
+    ) {
+        let _env_guard = ADVICE_ENV_LOCK.lock().await;
+        let _scoped_env = ScopedEnvVars::set(&[
+            (ENV_OBSERVATION_PARENT_REQUEST_ID, None),
+            (ENV_OBSERVATION_PLAN_ID, None),
+        ]);
+
+        let ws = AdviceObsTestWorkspace::new("entry-before-provider");
+        let reg_rev = ws.seed_jev_registry();
+        let scope = ws.scope("0196ed00-0000-7000-8000-000000000088");
+
+        let stale_req = ws.write_private_file(
+            "stale.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {},
+                    "tool_id": "jev-api",
+                    "model_id": "jev-api:jev-latest",
+                    "task_id": "task-pre",
+                    "task_revision": 1,
+                    "task_summary": "Preflight refusal test."
+                }}"#,
+                reg_rev + 99
+            )
+            .as_bytes(),
+        );
+        let valid_req = ws.write_private_file(
+            "valid.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "jev-api",
+                    "model_id": "jev-api:jev-latest",
+                    "task_id": "task-pre",
+                    "task_revision": 1,
+                    "task_summary": "Entry ordering test."
+                }}"#
+            )
+            .as_bytes(),
+        );
+
+        let empty_vault = MockVault::empty();
+        let transport = MockTransport::with_responses([mock_jev_response(
+            "jev-1.14.0",
+            "easy",
+            0.95,
+            (0.95, 0.03, 0.01, 0.01),
+            80,
+            8,
+        )]);
+        let empty_client =
+            DecisionClient::with_transport(empty_vault.clone(), transport.clone()).expect("client");
+
+        // 1. Registry revision preflight refusal must not write any observation record.
+        let err1 = classify_advice(
+            &scope,
+            &stale_req,
+            false,
+            empty_vault.clone(),
+            &empty_client,
+        )
+        .await
+        .expect_err("stale registry revision must fail");
+        assert_eq!(err1.code(), "stale_registry_revision");
+        let (recs_after_stale, _) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read journal");
+        assert!(recs_after_stale.is_empty());
+
+        // 2. Credential precheck refusal (`not_configured`) before external effect must not claim a provider call.
+        let err2 = classify_advice(&scope, &valid_req, false, empty_vault, &empty_client)
+            .await
+            .expect_err("missing credential must fail before provider call");
+        assert_eq!(err2.code(), "not_configured");
+        let (recs_after_cred_refusal, _) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read journal");
+        assert!(recs_after_cred_refusal.is_empty());
+
+        // 3. During a real provider call, `Entry` must already be present in the journal when
+        //    `transport.execute()` runs.
+        let plans_dir_in_flight = ws.plans_dir.clone();
+        let saw_entry_in_flight = Arc::new(Mutex::new(false));
+        let saw_entry_flag = Arc::clone(&saw_entry_in_flight);
+        transport.set_on_execute(move || {
+            let (in_flight_recs, warnings) =
+                read_journal_records_readonly(&plans_dir_in_flight).expect("read in flight");
+            assert!(warnings.is_empty());
+            assert_eq!(
+                in_flight_recs.len(),
+                1,
+                "Entry must be appended before transport executes"
+            );
+            assert_eq!(in_flight_recs[0].phase, ObservationRecordPhase::Entry);
+            assert_eq!(in_flight_recs[0].state, ObservationCallState::Running);
+            *saw_entry_flag.lock().expect("flag lock") = true;
+        });
+
+        let vault = MockVault::with_secret("jev-api", "jev-valid-secret");
+        let client = DecisionClient::with_transport(vault.clone(), transport).expect("client");
+        let out = classify_advice(&scope, &valid_req, false, vault, &client)
+            .await
+            .expect("classify should succeed");
+        assert_eq!(out.source, AdviceSource::Provider);
+        assert!(*saw_entry_in_flight.lock().expect("flag lock"));
+
+        let (final_recs, warnings) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read after finish");
+        assert!(warnings.is_empty());
+        assert_eq!(final_recs.len(), 2);
+        assert_eq!(final_recs[0].phase, ObservationRecordPhase::Entry);
+        assert_eq!(final_recs[1].phase, ObservationRecordPhase::Finish);
+        assert_eq!(final_recs[1].state, ObservationCallState::Completed);
+    }
+
+    #[tokio::test]
+    async fn uncertain_provider_errors_post_api_drift_and_cancellation_record_unknown_finish_without_fabricated_claims(
+    ) {
+        let _env_guard = ADVICE_ENV_LOCK.lock().await;
+        let _scoped_env = ScopedEnvVars::set(&[
+            (ENV_OBSERVATION_PARENT_REQUEST_ID, None),
+            (ENV_OBSERVATION_PLAN_ID, None),
+        ]);
+
+        let ws = AdviceObsTestWorkspace::new("uncertain-and-cancel");
+        let reg_rev = ws.seed_jev_registry();
+        let scope = ws.scope("0196ed00-0000-7000-8000-000000000099");
+
+        let req_path = ws.write_private_file(
+            "req.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {reg_rev},
+                    "tool_id": "jev-api",
+                    "model_id": "jev-api:jev-latest",
+                    "task_id": "task-uncertain",
+                    "task_revision": 1,
+                    "task_summary": "Uncertain provider outcome test."
+                }}"#
+            )
+            .as_bytes(),
+        );
+
+        let vault = MockVault::with_secret("jev-api", "jev-secret");
+
+        // 1. Provider timeout error -> Entry + Finish(Unknown) with no fabricated model/usage/delivery.
+        let timeout_transport = MockTransport::with_responses([Err(DecisionError::Timeout)]);
+        let timeout_client =
+            DecisionClient::with_transport(vault.clone(), timeout_transport).expect("client");
+        let err = classify_advice(&scope, &req_path, false, vault.clone(), &timeout_client)
+            .await
+            .expect_err("timeout must fail");
+        assert_eq!(err.code(), "timeout");
+
+        let (recs_1, _) = read_journal_records_readonly(&ws.plans_dir).expect("read after timeout");
+        assert_eq!(recs_1.len(), 2);
+        assert_eq!(recs_1[0].phase, ObservationRecordPhase::Entry);
+        assert_eq!(recs_1[1].phase, ObservationRecordPhase::Finish);
+        assert_eq!(recs_1[1].state, ObservationCallState::Unknown);
+        assert_eq!(
+            recs_1[1]
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            None
+        );
+        assert!(recs_1[1].usage.is_none());
+        assert!(recs_1[1].delivery.is_empty());
+
+        // 2. Post-API registry drift during `--refresh` -> Entry + Finish(Unknown) with no fabricated claims.
+        let drift_transport = MockTransport::with_responses([mock_jev_response(
+            "jev-1.14.0",
+            "easy",
+            0.94,
+            (0.94, 0.03, 0.02, 0.01),
+            100,
+            10,
+        )]);
+        let reg_dir_for_hook = ws.registry_dir.clone();
+        drift_transport.set_on_execute(move || {
+            let store = RegistryStore::open(reg_dir_for_hook.clone()).expect("open registry");
+            let _ = store
+                .apply(
+                    reg_rev,
+                    RegistryChange::SetDefaultProfile { profile_id: None },
+                )
+                .expect("advance registry during provider call");
+        });
+        let drift_client =
+            DecisionClient::with_transport(vault.clone(), drift_transport).expect("client");
+        let drift_err = classify_advice(&scope, &req_path, true, vault.clone(), &drift_client)
+            .await
+            .expect_err("post-API registry drift must fail");
+        assert_eq!(drift_err.code(), "stale_registry_revision");
+
+        let (recs_2, _) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read after post-API drift");
+        assert_eq!(recs_2.len(), 4);
+        assert_eq!(recs_2[2].phase, ObservationRecordPhase::Entry);
+        assert_eq!(recs_2[3].phase, ObservationRecordPhase::Finish);
+        assert_eq!(recs_2[3].state, ObservationCallState::Unknown);
+        assert_eq!(
+            recs_2[3]
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            None
+        );
+        assert!(recs_2[3].usage.is_none());
+        assert!(recs_2[3].delivery.is_empty());
+
+        // 3. Cancellation / dropping the in-flight classify future after Entry -> Finish(Unknown).
+        let latest_rev = RegistryStore::open(&ws.registry_dir)
+            .expect("open registry")
+            .snapshot()
+            .expect("snapshot")
+            .revision;
+        let cancel_req_path = ws.write_private_file(
+            "req-cancel.json",
+            format!(
+                r#"{{
+                    "schema_version": 1,
+                    "expected_registry_revision": {latest_rev},
+                    "tool_id": "jev-api",
+                    "model_id": "jev-api:jev-latest",
+                    "task_id": "task-cancel",
+                    "task_revision": 1,
+                    "task_summary": "Cancellation observation test."
+                }}"#
+            )
+            .as_bytes(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let entered_wait = entered.notified();
+        let pending_transport = Arc::new(PendingTransport {
+            entered: Arc::clone(&entered),
+        });
+        let pending_client =
+            DecisionClient::with_transport(vault.clone(), pending_transport).expect("client");
+
+        {
+            let mut in_flight_fut = Box::pin(classify_advice(
+                &scope,
+                &cancel_req_path,
+                true,
+                vault,
+                &pending_client,
+            ));
+            tokio::select! {
+                _ = &mut in_flight_fut => panic!("pending transport should not complete"),
+                _ = entered_wait => {}
+            }
+            // Drop `in_flight_fut` synchronously mid-flight after `Entry` was recorded.
+        }
+
+        let (recs_3, warnings) =
+            read_journal_records_readonly(&ws.plans_dir).expect("read after cancellation");
+        assert!(warnings.is_empty());
+        assert_eq!(recs_3.len(), 6);
+        assert_eq!(recs_3[4].phase, ObservationRecordPhase::Entry);
+        assert_eq!(recs_3[5].phase, ObservationRecordPhase::Finish);
+        assert_eq!(recs_3[5].state, ObservationCallState::Unknown);
+        assert_eq!(recs_3[4].request_id, recs_3[5].request_id);
+        assert_eq!(recs_3[4].call_id, recs_3[5].call_id);
+        assert_eq!(
+            recs_3[5]
+                .executor
+                .as_ref()
+                .and_then(|e| e.observed_model.as_deref()),
+            None
+        );
+        assert!(recs_3[5].usage.is_none());
+        assert!(recs_3[5].delivery.is_empty());
+    }
 }

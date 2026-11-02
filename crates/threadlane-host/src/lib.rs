@@ -55,17 +55,18 @@ pub use cli::{
 pub use client::ApprovedHostClient;
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
+pub use lifecycle::project_task_lifecycle;
 pub use storage::{
     derive_ack_command_key, derive_cancel_command_key, ensure_fresh_session_dir_locked,
     ensure_no_symlink_components, ensure_private_dir,
     has_prepared_dependency_input_or_ledger_entry, is_host_lock_held, paths_overlap,
     prepare_session_dir, read_and_verify_host_manifest, read_host_launch_intent_optional,
-    read_host_manifest_optional, read_task_dispatch_intent, read_task_receipt,
-    record_task_dispatch_intent, record_task_receipt, validate_approval_id,
+    read_host_manifest_optional, read_session_task_ledger_readonly, read_task_dispatch_intent,
+    read_task_receipt, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
     validate_canonical_thread_uuid, validate_hex_digest, validate_host_instance_id,
     validate_identifier, validate_sessions_root, verify_existing_private_dir,
     verify_existing_session_dir, write_host_launch_intent, write_host_manifest,
-    HostLaunchIntentLock, HostSessionLock,
+    HostLaunchIntentLock, HostSessionLock, ReadonlyTaskLedger,
 };
 pub use threadlane::native_tool_output::NativeNotificationDelivery;
 pub use threadlane::{

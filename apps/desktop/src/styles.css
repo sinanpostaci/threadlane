@@ -1,4 +1,5 @@
 @import './pages/history.css';
+@import './pages/job-plans.css';
 
 :root {
   color-scheme: light dark;
@@ -139,6 +140,76 @@ body,
   --aq-warn: #8a5a19;
   --aq-warn-bg: rgba(138, 90, 25, 0.11);
   --aq-accent: var(--aq-accent-light);
+}
+
+/*
+ * Approved reference presentation applies only to a real observation
+ * Activity/Plans page. Other views keep the integration-seed appearance.
+ */
+.aq-app[data-observation-layout="true"] {
+  --aq-text: #242b2e;
+  --aq-muted: #616b70;
+  --aq-line: #d7dcdc;
+  --aq-base: #f7f7f5;
+  --aq-field: #eff1ef;
+  --aq-hover: #e9eeec;
+  --aq-selected: #e9eeec;
+  --aq-border: #d7dcdc;
+  --aq-pad: 18px;
+  width: 100%;
+  border-radius: 15px;
+  font: 14px/1.5 ui-sans-serif, system-ui, sans-serif;
+}
+
+.aq-app[data-observation-layout="true"][data-accent="sage"] {
+  --aq-accent-light: #12777e;
+  --aq-accent-dark: #69b6be;
+}
+
+.aq-app[data-observation-layout="true"][data-theme="dark"] {
+  --aq-text: #e4e8e8;
+  --aq-muted: #a5afb3;
+  --aq-line: #495154;
+  --aq-base: #2d3335;
+  --aq-field: #272e30;
+  --aq-hover: #363e40;
+  --aq-selected: #363e40;
+  --aq-border: #495154;
+}
+
+@media (prefers-color-scheme: dark) {
+  .aq-app[data-observation-layout="true"][data-theme="system"] {
+    --aq-text: #e4e8e8;
+    --aq-muted: #a5afb3;
+    --aq-line: #495154;
+    --aq-base: #2d3335;
+    --aq-field: #272e30;
+    --aq-hover: #363e40;
+    --aq-selected: #363e40;
+    --aq-border: #495154;
+  }
+}
+
+.aq-app[data-observation-layout="true"] .aq-main {
+  padding: 0;
+}
+
+.aq-app[data-observation-layout="true"] .aq-top {
+  height: 52px;
+  min-height: 52px;
+  padding: 0 18px;
+}
+
+.aq-app[data-observation-layout="true"] .aq-title {
+  letter-spacing: -0.02em;
+}
+
+.aq-app[data-observation-layout="true"] .aq-main > .aq-banner {
+  margin: 10px 18px;
+}
+
+.aq-app[data-observation-layout="true"] .aq-foot {
+  display: none;
 }
 
 .aq-app :where(button, select, input) {
@@ -589,6 +660,12 @@ summary::-webkit-details-marker {
   overflow-wrap: anywhere;
 }
 
+.aq-app[data-observation-layout="true"] .aq-page-title {
+  font-size: 18px;
+  line-height: 1.3;
+  font-weight: 500;
+}
+
 .aq-note {
   color: var(--aq-muted);
   font-size: 12px;
@@ -897,6 +974,53 @@ summary::-webkit-details-marker {
   cursor: pointer;
 }
 
+.aq-observation-sources {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.aq-observation-source {
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid var(--aq-line);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--aq-field) 50%, transparent);
+}
+
+.aq-observation-source .aq-sub {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.aq-advanced-controls {
+  margin-top: 18px;
+  font-size: 12px;
+}
+
+.aq-advanced-controls > summary {
+  min-height: 34px;
+  color: var(--aq-text);
+  font-weight: 500;
+}
+
+.aq-advanced-controls-body {
+  padding-bottom: 6px;
+  color: var(--aq-text);
+}
+
+.aq-advanced-controls-body .aq-note {
+  margin: 6px 0 8px;
+}
+
+.aq-advanced-controls-body .aq-link {
+  width: 100%;
+  margin: 0;
+}
+
 .aq-role {
   padding: 12px 0;
   border-bottom: 1px solid var(--aq-line);
@@ -942,7 +1066,7 @@ summary::-webkit-details-marker {
 .aq-nav {
   flex: none;
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 2px;
   padding: 3px 7px 7px;
   border-top: 1px solid var(--aq-line);

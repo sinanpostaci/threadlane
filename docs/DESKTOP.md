@@ -1,6 +1,12 @@
 # Desktop Control Panel (Milestone 3A)
 
-This document describes the original Milestone 3A preview. For the current
+For the current Activity request feed, independent job plans, linked sources, and
+Settings → Connections, read [desktop observation](OBSERVATION.md).
+
+The historical Milestone 3A description below predates the durable read model.
+The new observation feed reads durable metadata directly in read-only mode so
+stopped sessions remain visible; the legacy runtime diagnostics still use the
+authenticated supervisor client. For the current
 editable tools/profiles and approved local workflow, read
 [configuration](CONFIGURATION.md), the [M4 checkpoint](M4-CHECKPOINT.md), and
 [optional session controls](SESSION-LIFECYCLE.md).

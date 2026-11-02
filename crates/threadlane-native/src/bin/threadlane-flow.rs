@@ -10,6 +10,12 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use threadlane_authority::validation::{validate_identifier, validate_sha256_hex};
 use threadlane_authority::{AuthorityError, AuthorityStore};
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, read_env_parent_request_id, read_env_plan_id, ObservationActor,
+    ObservationCallState, ObservationDelivery, ObservationDeliveryStage, ObservationJournalRecord,
+    ObservationRecordPhase,
+};
 use threadlane_host::{ApprovedHostClient, HostError};
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
@@ -349,153 +355,312 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
     // any workflow, authority, host, or role-flow store.
     verify_binding(&state_dir, &binding, &thread).await?;
 
-    match cli.command {
-        FlowCommand::Preflight { request, policy } => {
-            let preflight_request: PreflightRequest = read_request(&request)?;
-            let execution_policy: ExecutionPolicy = read_request(&policy)?;
-            let report: PreflightReport = role_flow::preflight_from_dir_readonly(
-                &registry_dir,
-                &preflight_request,
-                &execution_policy,
-            )
-            .map_err(|error| map_native_error(&error, false))?;
-            write_result(&binding, &report, false)
-        }
-        FlowCommand::Create { request } => {
-            let cycle_request: CreateRoleFlowCycleRequest = read_request(&request)?;
-            ensure_scope(
-                &cycle_request,
-                &binding,
-                &thread,
-                "scope_mismatch",
-                REQUEST_SCOPE_MISMATCH,
-            )?;
+    let (op_name, is_mutating) = match &cli.command {
+        FlowCommand::Preflight { .. } => ("flow.preflight", false),
+        FlowCommand::Create { .. } => ("flow.create", true),
+        FlowCommand::Get { .. } => ("flow.get", false),
+        FlowCommand::List { .. } => ("flow.list", false),
+        FlowCommand::Handoff { .. } => ("flow.handoff", true),
+        FlowCommand::Reconcile { .. } => ("flow.reconcile", true),
+        FlowCommand::ReserveClosure { .. } => ("flow.reserve-closure", true),
+    };
+    let parent_req = read_env_parent_request_id();
+    let should_journal = parent_req.is_some() || is_mutating;
+    let (request_id, call_id) = match &parent_req {
+        Some(parent) => (parent.clone(), Some(generate_observation_id("obsc"))),
+        None => (generate_observation_id("obsreq"), None),
+    };
+    let mut resolved_plan_id = read_env_plan_id();
+    let mut verified_job_id: Option<String> = None;
+    let mut resolved_approval_id: Option<String> = None;
+    let mut resolved_task_id: Option<String> = None;
+    let started_at_ms = current_observation_time_ms();
+    let actor = ObservationActor::unknown(Some("trusted_local_operator".to_string()));
+    if should_journal {
+        let _ = append_journal_record(
+            &plans_dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id: request_id.clone(),
+                parent_request_id: None,
+                call_id: call_id.clone(),
+                phase: ObservationRecordPhase::Entry,
+                at_ms: started_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(binding.clone()),
+                thread_uuid: Some(thread.clone()),
+                thread_label: None,
+                job_id: None,
+                plan_id: resolved_plan_id.clone(),
+                task_id: None,
+                approval_id: None,
+                operation: op_name.to_string(),
+                title: op_name.replace('.', " "),
+                state: ObservationCallState::Running,
+                actor: Some(actor.clone()),
+                executor: None,
+                usage: None,
+                delivery: Vec::new(),
+                summary: Some(format!("Executing {op_name}")),
+            },
+        );
+    }
 
-            let authority = open_authority(&registry_dir, &plans_dir, &authority_dir)?;
-            let store = open_flow_store(&plans_dir)?;
-            let cycle = store
-                .create_cycle(&cycle_request, &authority)
-                .map_err(|error| map_native_error(&error, true))?;
-            ensure_scope(
-                &cycle,
-                &binding,
-                &thread,
-                "outcome_unknown",
-                MUTATION_SCOPE_MISMATCH,
-            )?;
-            write_result(&binding, &cycle, true)
-        }
-        FlowCommand::Get { cycle_id } => {
-            validate_cycle_id(&cycle_id)?;
-            let store = open_flow_store(&plans_dir)?;
-            let cycle = store
-                .get_cycle(&binding, &cycle_id)
+    let outcome: Result<(), OperatorCliError> = async {
+        match cli.command {
+            FlowCommand::Preflight { request, policy } => {
+                let preflight_request: PreflightRequest = read_request(&request)?;
+                let execution_policy: ExecutionPolicy = read_request(&policy)?;
+                let report: PreflightReport = role_flow::preflight_from_dir_readonly(
+                    &registry_dir,
+                    &preflight_request,
+                    &execution_policy,
+                )
                 .map_err(|error| map_native_error(&error, false))?;
-            let Some(cycle) = cycle else {
-                return Err(OperatorCliError::new(
-                    "cycle_not_found",
-                    "Requested role-flow cycle was not found in this binding scope.",
-                ));
-            };
-            ensure_scope(
-                &cycle,
-                &binding,
-                &thread,
-                "scope_mismatch",
-                STORED_SCOPE_MISMATCH,
-            )?;
-            write_result(&binding, &cycle, false)
-        }
-        FlowCommand::List { cursor, limit } => {
-            let (limit, cursor) = validate_list_args(limit, cursor)?;
-            let store = open_flow_store(&plans_dir)?;
-            let snapshot = store
-                .get_binding_snapshot(&binding)
-                .map_err(|error| map_native_error(&error, false))?;
-            let page = build_cycle_page(snapshot, &binding, &thread, limit, cursor.as_deref())?;
-            write_result(&binding, &page, false)
-        }
-        FlowCommand::Handoff {
-            request,
-            confirm_approval,
-            operator_approved,
-        } => {
-            let mut handoff_request: RoleHandoffRequest = read_request(&request)?;
-            ensure_scope(
-                &handoff_request,
-                &binding,
-                &thread,
-                "scope_mismatch",
-                REQUEST_SCOPE_MISMATCH,
-            )?;
-            apply_handoff_confirmations(&mut handoff_request, operator_approved, confirm_approval)?;
+                write_result(&binding, &report, false)
+            }
+            FlowCommand::Create { request } => {
+                let cycle_request: CreateRoleFlowCycleRequest = read_request(&request)?;
+                ensure_scope(
+                    &cycle_request,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
 
-            let authority = open_authority(&registry_dir, &plans_dir, &authority_dir)?;
-            let client = open_client(Arc::clone(&authority), &sessions_dir, &binding, &thread)?;
-            let store = open_flow_store(&plans_dir)?;
-            let record = store
-                .handoff_role(&handoff_request, &authority, Some(&client))
-                .await
-                .map_err(|error| map_native_error(&error, true))?;
-            ensure_scope(
-                &record,
-                &binding,
-                &thread,
-                "outcome_unknown",
-                MUTATION_SCOPE_MISMATCH,
-            )?;
-            write_result(&binding, &record, true)
-        }
-        FlowCommand::Reconcile { request } => {
-            let reconcile_request: ReconcileRoleHandoffRequest = read_request(&request)?;
-            ensure_scope(
-                &reconcile_request,
-                &binding,
-                &thread,
-                "scope_mismatch",
-                REQUEST_SCOPE_MISMATCH,
-            )?;
+                let authority = open_authority(&registry_dir, &plans_dir, &authority_dir)?;
+                let store = open_flow_store(&plans_dir)?;
+                let cycle = store
+                    .create_cycle(&cycle_request, &authority)
+                    .map_err(|error| map_native_error(&error, true))?;
+                ensure_scope(
+                    &cycle,
+                    &binding,
+                    &thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                verified_job_id = Some(cycle.plan_id.clone());
+                resolved_plan_id = Some(cycle.plan_id.clone());
+                resolved_approval_id = Some(cycle.approval_id.clone());
+                write_result(&binding, &cycle, true)
+            }
+            FlowCommand::Get { cycle_id } => {
+                validate_cycle_id(&cycle_id)?;
+                let store = open_flow_store(&plans_dir)?;
+                let cycle = store
+                    .get_cycle(&binding, &cycle_id)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let Some(cycle) = cycle else {
+                    return Err(OperatorCliError::new(
+                        "cycle_not_found",
+                        "Requested role-flow cycle was not found in this binding scope.",
+                    ));
+                };
+                ensure_scope(
+                    &cycle,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+                verified_job_id = Some(cycle.plan_id.clone());
+                resolved_plan_id = Some(cycle.plan_id.clone());
+                resolved_approval_id = Some(cycle.approval_id.clone());
+                write_result(&binding, &cycle, false)
+            }
+            FlowCommand::List { cursor, limit } => {
+                let (limit, cursor) = validate_list_args(limit, cursor)?;
+                let store = open_flow_store(&plans_dir)?;
+                let snapshot = store
+                    .get_binding_snapshot(&binding)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let page = build_cycle_page(snapshot, &binding, &thread, limit, cursor.as_deref())?;
+                write_result(&binding, &page, false)
+            }
+            FlowCommand::Handoff {
+                request,
+                confirm_approval,
+                operator_approved,
+            } => {
+                let mut handoff_request: RoleHandoffRequest = read_request(&request)?;
+                ensure_scope(
+                    &handoff_request,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
+                apply_handoff_confirmations(
+                    &mut handoff_request,
+                    operator_approved,
+                    confirm_approval,
+                )?;
 
-            let authority = open_authority(&registry_dir, &plans_dir, &authority_dir)?;
-            let client = open_client(Arc::clone(&authority), &sessions_dir, &binding, &thread)?;
-            let store = open_flow_store(&plans_dir)?;
-            let record = store
-                .reconcile_handoff(&reconcile_request, &client)
-                .await
-                .map_err(|error| map_native_error(&error, true))?;
-            ensure_scope(
-                &record,
-                &binding,
-                &thread,
-                "outcome_unknown",
-                MUTATION_SCOPE_MISMATCH,
-            )?;
-            write_result(&binding, &record, true)
-        }
-        FlowCommand::ReserveClosure { request } => {
-            let closure_request: ReservePackageClosureRequest = read_request(&request)?;
-            ensure_scope(
-                &closure_request,
-                &binding,
-                &thread,
-                "scope_mismatch",
-                REQUEST_SCOPE_MISMATCH,
-            )?;
+                let authority = open_authority(&registry_dir, &plans_dir, &authority_dir)?;
+                let client = open_client(Arc::clone(&authority), &sessions_dir, &binding, &thread)?;
+                let store = open_flow_store(&plans_dir)?;
+                let record = store
+                    .handoff_role(&handoff_request, &authority, Some(&client))
+                    .await
+                    .map_err(|error| map_native_error(&error, true))?;
+                ensure_scope(
+                    &record,
+                    &binding,
+                    &thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                verified_job_id = authority
+                    .get_for_operator(&record.approval_id)
+                    .ok()
+                    .filter(|approval| {
+                        approval.binding_id == binding && approval.thread_uuid == thread
+                    })
+                    .map(|approval| approval.plan_id);
+                resolved_plan_id = verified_job_id.clone();
+                resolved_approval_id = Some(record.approval_id.clone());
+                resolved_task_id = Some(record.task_id.clone());
+                write_result(&binding, &record, true)
+            }
+            FlowCommand::Reconcile { request } => {
+                let reconcile_request: ReconcileRoleHandoffRequest = read_request(&request)?;
+                ensure_scope(
+                    &reconcile_request,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
 
-            let store = open_flow_store(&plans_dir)?;
-            let reservation = store
-                .reserve_closure(&closure_request)
-                .map_err(|error| map_native_error(&error, true))?;
-            ensure_scope(
-                &reservation,
-                &binding,
-                &thread,
-                "outcome_unknown",
-                MUTATION_SCOPE_MISMATCH,
-            )?;
-            write_result(&binding, &reservation, true)
+                let authority = open_authority(&registry_dir, &plans_dir, &authority_dir)?;
+                let client = open_client(Arc::clone(&authority), &sessions_dir, &binding, &thread)?;
+                let store = open_flow_store(&plans_dir)?;
+                let record = store
+                    .reconcile_handoff(&reconcile_request, &client)
+                    .await
+                    .map_err(|error| map_native_error(&error, true))?;
+                ensure_scope(
+                    &record,
+                    &binding,
+                    &thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                verified_job_id = authority
+                    .get_for_operator(&record.approval_id)
+                    .ok()
+                    .filter(|approval| {
+                        approval.binding_id == binding && approval.thread_uuid == thread
+                    })
+                    .map(|approval| approval.plan_id);
+                resolved_plan_id = verified_job_id.clone();
+                resolved_approval_id = Some(record.approval_id.clone());
+                resolved_task_id = Some(record.task_id.clone());
+                write_result(&binding, &record, true)
+            }
+            FlowCommand::ReserveClosure { request } => {
+                let closure_request: ReservePackageClosureRequest = read_request(&request)?;
+                ensure_scope(
+                    &closure_request,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
+
+                let store = open_flow_store(&plans_dir)?;
+                let reservation = store
+                    .reserve_closure(&closure_request)
+                    .map_err(|error| map_native_error(&error, true))?;
+                ensure_scope(
+                    &reservation,
+                    &binding,
+                    &thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                verified_job_id = store
+                    .get_cycle(&binding, &reservation.cycle_id)
+                    .ok()
+                    .flatten()
+                    .filter(|cycle| {
+                        cycle.thread_uuid == thread && cycle.approval_id == reservation.approval_id
+                    })
+                    .map(|cycle| cycle.plan_id);
+                resolved_plan_id = verified_job_id.clone();
+                resolved_approval_id = Some(reservation.approval_id.clone());
+                write_result(&binding, &reservation, true)
+            }
         }
     }
+    .await;
+
+    if should_journal {
+        let finished_at_ms = current_observation_time_ms();
+        let (final_state, delivery_stage, summary) = match &outcome {
+            Ok(()) => (
+                ObservationCallState::Completed,
+                ObservationDeliveryStage::ResponseReturned,
+                format!("Completed {op_name}"),
+            ),
+            Err(err) if err.code == "outcome_unknown" => (
+                ObservationCallState::Unknown,
+                ObservationDeliveryStage::Unknown,
+                format!("Outcome unknown for {op_name}: {}", err.code),
+            ),
+            Err(err) => (
+                ObservationCallState::Failed,
+                ObservationDeliveryStage::Failed,
+                format!("Failed {op_name}: {}", err.code),
+            ),
+        };
+        let _ = append_journal_record(
+            &plans_dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id,
+                parent_request_id: None,
+                call_id,
+                phase: ObservationRecordPhase::Finish,
+                at_ms: finished_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(binding.clone()),
+                thread_uuid: Some(thread),
+                thread_label: None,
+                job_id: verified_job_id,
+                plan_id: resolved_plan_id,
+                task_id: resolved_task_id,
+                approval_id: resolved_approval_id,
+                operation: op_name.to_string(),
+                title: op_name.replace('.', " "),
+                state: final_state,
+                actor: Some(actor),
+                executor: None,
+                usage: None,
+                delivery: if parent_req.is_none() {
+                    vec![ObservationDelivery {
+                        stage: delivery_stage,
+                        at_ms: Some(finished_at_ms),
+                        summary: summary.clone(),
+                        recipient: Some(binding),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                summary: Some(summary),
+            },
+        );
+    }
+
+    outcome
 }
 
 fn ensure_scope<T: FlowScoped>(

@@ -1,0 +1,315 @@
+/*
+ * Plans body, ported from the approved request-feed reference.
+ * The component owns its 18px side insets within the unpadded main region.
+ */
+
+.aq-job-plans {
+  --tl-space: 14px;
+
+  margin: 0;
+  padding: 0 18px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  color: var(--aq-text);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.aq-job-plans *,
+.aq-job-plans *::before,
+.aq-job-plans *::after {
+  box-sizing: border-box;
+}
+
+.aq-job-plans p {
+  margin: 0;
+}
+
+.aq-job-plans h2 {
+  margin: 0;
+  font-size: 18px;
+  line-height: 1.3;
+  font-weight: 500;
+}
+
+.aq-job-plans h3 {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.5;
+  font-weight: 500;
+}
+
+.aq-job-plans .tl-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 20px 0 10px;
+}
+
+.aq-job-plans .tl-muted {
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-job-plans .tl-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 0 12px;
+}
+
+.aq-job-plans .tl-jobs {
+  min-width: 0;
+}
+
+.aq-job-plans .tl-project {
+  min-width: 0;
+  padding: 10px 0 0;
+}
+
+.aq-job-plans .tl-project + .tl-project {
+  padding-top: 22px;
+}
+
+.aq-job-plans .tl-project-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 2px;
+  color: var(--aq-muted);
+}
+
+.aq-job-plans .tl-project-heading h3 {
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.aq-job-plans .tl-job {
+  min-width: 0;
+  border-bottom: 1px solid var(--aq-line);
+}
+
+.aq-job-plans .tl-job > summary {
+  list-style: none;
+  padding: var(--tl-space) 0;
+  cursor: pointer;
+}
+
+.aq-job-plans summary::-webkit-details-marker {
+  display: none;
+}
+
+.aq-job-plans .tl-job-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.aq-job-plans .tl-job-title > span:first-child {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.aq-job-plans .tl-job-status {
+  flex-shrink: 0;
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-job-plans .tl-job-status-active {
+  color: var(--aq-accent);
+}
+
+.aq-job-plans .tl-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: var(--aq-muted);
+}
+
+.aq-job-plans .tl-job[open] > summary .tl-chevron {
+  transform: rotate(90deg);
+}
+
+.aq-job-plans .tl-job-context {
+  margin-top: 5px;
+  color: var(--aq-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.aq-job-plans .tl-job-body {
+  display: grid;
+  gap: 14px;
+  padding: 0 0 18px;
+  min-width: 0;
+}
+
+.aq-job-plans .tl-label {
+  margin-bottom: 5px;
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-job-plans .tl-task {
+  display: grid;
+  gap: 3px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--aq-line);
+  min-width: 0;
+}
+
+.aq-job-plans .tl-job-body .tl-task {
+  padding: 8px 0;
+}
+
+.aq-job-plans .tl-task > span:first-child {
+  overflow-wrap: anywhere;
+}
+
+.aq-job-plans .tl-detail {
+  color: var(--aq-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.aq-job-plans .tl-action {
+  padding: 5px 9px;
+  border: 1px solid var(--aq-line);
+  border-radius: 6px;
+  background: var(--aq-field);
+  color: var(--aq-text);
+  font: inherit;
+}
+
+.aq-job-plans .tl-job-link {
+  justify-self: start;
+}
+
+.aq-job-plans .tl-empty {
+  padding: 17px 0;
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-job-plans .tl-notices {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  color: var(--aq-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.aq-job-plans .tl-notices[hidden] {
+  display: none;
+}
+
+.aq-job-plans .tl-notices > li + li {
+  margin-top: 4px;
+}
+
+.aq-job-plans .aq-banner {
+  margin: 0 0 12px;
+}
+
+.aq-job-plans .tl-technical {
+  margin-top: 2px;
+  padding-top: 12px;
+  border-top: 1px solid var(--aq-line);
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-job-plans .tl-technical > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  list-style: none;
+  padding: 0 0 8px;
+  cursor: pointer;
+}
+
+.aq-job-plans .tl-technical[open] > summary .tl-chevron {
+  transform: rotate(90deg);
+}
+
+.aq-job-plans .tl-technical .aq-technical-grid {
+  grid-template-columns: 92px minmax(0, 1fr);
+  padding: 2px 0 8px;
+  font-size: 11px;
+}
+
+.aq-job-plans .aq-job-technical-tasks {
+  margin: 2px 0 0;
+}
+
+.aq-job-plans .aq-job-technical-heading {
+  margin: 8px 0 4px;
+  color: var(--aq-muted);
+  font-size: 10.5px;
+  font-weight: 500;
+}
+
+.aq-job-plans .aq-job-technical-task-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+}
+
+.aq-job-plans .aq-job-technical-task {
+  min-width: 0;
+  padding: 6px 0;
+  border-top: 1px solid var(--aq-line);
+}
+
+.aq-job-plans .aq-job-technical-task-title {
+  display: block;
+  color: var(--aq-text);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.aq-job-plans .aq-job-technical-task .aq-technical-grid {
+  grid-template-columns: 88px minmax(0, 1fr);
+  padding: 3px 0 0;
+  font-size: 10px;
+}
+
+.aq-observation-source-details {
+  margin-top: 4px;
+  color: var(--aq-muted);
+  font-size: 11px;
+}
+
+.aq-observation-source-details > summary {
+  padding: 3px 0;
+  cursor: pointer;
+}
+
+.aq-observation-source-details .aq-technical-grid {
+  padding: 2px 0 4px;
+  font-size: 10px;
+}
+
+.aq-observation-source-details .aq-sub {
+  margin: 4px 0 0;
+}
+
+@media (pointer: coarse) {
+  .aq-job-plans .tl-action {
+    min-height: 44px;
+  }
+
+  .aq-job-plans summary {
+    min-height: 44px;
+  }
+}

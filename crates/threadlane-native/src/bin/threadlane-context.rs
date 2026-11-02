@@ -41,6 +41,13 @@ use std::process::{Command, ExitCode, Stdio};
 
 use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, read_env_parent_request_id, read_env_plan_id,
+    sanitize_cli_argv_metadata, ObservationActor, ObservationCallState, ObservationDelivery,
+    ObservationDeliveryStage, ObservationJournalRecord, ObservationRecordPhase,
+    ENV_OBSERVATION_PARENT_REQUEST_ID, ENV_OBSERVATION_PLAN_ID,
+};
 use threadlane_native::fs_safety::ensure_platform_supported;
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
@@ -120,6 +127,15 @@ impl ChildFamily {
             Self::Session => SESSION_BINARY_NAME,
             Self::Flow => FLOW_BINARY_NAME,
             Self::Advice => ADVICE_BINARY_NAME,
+        }
+    }
+
+    const fn family_label(self) -> &'static str {
+        match self {
+            Self::Workflow => "workflow",
+            Self::Session => "session",
+            Self::Flow => "flow",
+            Self::Advice => "advice",
         }
     }
 }
@@ -641,20 +657,106 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
     let current_bin_dir = resolve_current_bin_dir()?;
     let validated = validate_context(raw, &current_bin_dir)?;
 
+    let project_label = validated
+        .project_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("project")
+        .to_string();
+    let project_path = Some(validated.project_root.to_string_lossy().into_owned());
+    let plans_dir = validated.stores.plans_dir.clone();
+
     match command {
         ContextCommand::Check => {
-            verify_binding(
+            let request_id = generate_observation_id("obsreq");
+            let parent_request_id = read_env_parent_request_id();
+            let plan_id = read_env_plan_id();
+            let started_at_ms = current_observation_time_ms();
+            let actor = ObservationActor::unknown(Some(TRUSTED_LOCAL_OPERATOR_ROUTE.to_string()));
+
+            let _ = append_journal_record(
+                &plans_dir,
+                &ObservationJournalRecord {
+                    record_id: generate_observation_id("obsrec"),
+                    request_id: request_id.clone(),
+                    parent_request_id: parent_request_id.clone(),
+                    call_id: None,
+                    phase: ObservationRecordPhase::Entry,
+                    at_ms: started_at_ms,
+                    pid: Some(std::process::id()),
+                    process_instance: current_process_instance(),
+                    project_label: Some(project_label.clone()),
+                    project_path: project_path.clone(),
+                    binding_id: Some(validated.binding_id.clone()),
+                    thread_uuid: Some(validated.thread_uuid.clone()),
+                    thread_label: None,
+                    job_id: None,
+                    plan_id: plan_id.clone(),
+                    task_id: None,
+                    approval_id: None,
+                    operation: "context.check".to_string(),
+                    title: "context check".to_string(),
+                    state: ObservationCallState::Running,
+                    actor: Some(actor.clone()),
+                    executor: None,
+                    usage: None,
+                    delivery: Vec::new(),
+                    summary: Some("Operation context.check".to_string()),
+                },
+            );
+
+            if let Err(err) = verify_binding(
                 &validated.stores.state_dir,
                 &validated.binding_id,
                 &validated.thread_uuid,
             )
-            .await?;
+            .await
+            {
+                let finished_at_ms = current_observation_time_ms();
+                let _ = append_journal_record(
+                    &plans_dir,
+                    &ObservationJournalRecord {
+                        record_id: generate_observation_id("obsrec"),
+                        request_id,
+                        parent_request_id,
+                        call_id: None,
+                        phase: ObservationRecordPhase::Finish,
+                        at_ms: finished_at_ms,
+                        pid: Some(std::process::id()),
+                        process_instance: current_process_instance(),
+                        project_label: Some(project_label),
+                        project_path,
+                        binding_id: Some(validated.binding_id),
+                        thread_uuid: Some(validated.thread_uuid),
+                        thread_label: None,
+                        job_id: None,
+                        plan_id,
+                        task_id: None,
+                        approval_id: None,
+                        operation: "context.check".to_string(),
+                        title: "context check".to_string(),
+                        state: ObservationCallState::Failed,
+                        actor: Some(actor),
+                        executor: None,
+                        usage: None,
+                        delivery: vec![ObservationDelivery {
+                            stage: ObservationDeliveryStage::Failed,
+                            at_ms: Some(finished_at_ms),
+                            summary: format!("Context check failed ({})", err.code),
+                            recipient: None,
+                        }],
+                        summary: Some(format!("Context check failed: {}", err.code)),
+                    },
+                );
+                return Err(err);
+            }
 
             let report = ContextCheckReport {
                 schema_version: CONTEXT_SCHEMA_VERSION,
                 project_root: validated.project_root,
                 binding_id: validated.binding_id.clone(),
-                thread_uuid: validated.thread_uuid,
+                thread_uuid: validated.thread_uuid.clone(),
                 route: TRUSTED_LOCAL_OPERATOR_ROUTE,
                 native_per_call_identity_verified: false,
                 live_binding_verified: true,
@@ -663,21 +765,254 @@ async fn run(context_path: &Path, command: ContextCommand) -> Result<ExitCode, O
                 stores: validated.stores,
             };
             write_result(&validated.binding_id, &report, false)?;
+
+            let finished_at_ms = current_observation_time_ms();
+            let _ = append_journal_record(
+                &plans_dir,
+                &ObservationJournalRecord {
+                    record_id: generate_observation_id("obsrec"),
+                    request_id,
+                    parent_request_id,
+                    call_id: None,
+                    phase: ObservationRecordPhase::Finish,
+                    at_ms: finished_at_ms,
+                    pid: Some(std::process::id()),
+                    process_instance: current_process_instance(),
+                    project_label: Some(project_label),
+                    project_path,
+                    binding_id: Some(validated.binding_id.clone()),
+                    thread_uuid: Some(validated.thread_uuid),
+                    thread_label: None,
+                    job_id: None,
+                    plan_id,
+                    task_id: None,
+                    approval_id: None,
+                    operation: "context.check".to_string(),
+                    title: "context check".to_string(),
+                    state: ObservationCallState::Completed,
+                    actor: Some(actor),
+                    executor: None,
+                    usage: None,
+                    delivery: vec![ObservationDelivery {
+                        stage: ObservationDeliveryStage::ResponseReturned,
+                        at_ms: Some(finished_at_ms),
+                        summary: "Context check response returned".to_string(),
+                        recipient: Some(validated.binding_id),
+                    }],
+                    summary: Some("Context check verified live binding".to_string()),
+                },
+            );
             Ok(ExitCode::SUCCESS)
         }
         ContextCommand::Forward { family, inner_args } => {
-            let sibling_exe = resolve_sibling_executable(&validated.current_bin_dir, family)?;
-            verify_binding(
+            let safe_meta =
+                sanitize_cli_argv_metadata("context", family.family_label(), &inner_args);
+            let request_id = generate_observation_id("obsreq");
+            let started_at_ms = current_observation_time_ms();
+            let actor = ObservationActor::unknown(Some(TRUSTED_LOCAL_OPERATOR_ROUTE.to_string()));
+
+            let _ = append_journal_record(
+                &plans_dir,
+                &ObservationJournalRecord {
+                    record_id: generate_observation_id("obsrec"),
+                    request_id: request_id.clone(),
+                    parent_request_id: safe_meta.parent_request_id.clone(),
+                    call_id: None,
+                    phase: ObservationRecordPhase::Entry,
+                    at_ms: started_at_ms,
+                    pid: Some(std::process::id()),
+                    process_instance: current_process_instance(),
+                    project_label: Some(project_label.clone()),
+                    project_path: project_path.clone(),
+                    binding_id: Some(validated.binding_id.clone()),
+                    thread_uuid: Some(validated.thread_uuid.clone()),
+                    thread_label: None,
+                    job_id: None,
+                    plan_id: safe_meta.plan_id.clone(),
+                    task_id: safe_meta.task_id.clone(),
+                    approval_id: safe_meta.approval_id.clone(),
+                    operation: safe_meta.operation.clone(),
+                    title: safe_meta.title.clone(),
+                    state: ObservationCallState::Running,
+                    actor: Some(actor.clone()),
+                    executor: None,
+                    usage: None,
+                    delivery: Vec::new(),
+                    summary: Some(safe_meta.safe_summary.clone()),
+                },
+            );
+
+            let sibling_exe = match resolve_sibling_executable(&validated.current_bin_dir, family) {
+                Ok(exe) => exe,
+                Err(err) => {
+                    record_forward_finish(
+                        &plans_dir,
+                        &request_id,
+                        &safe_meta,
+                        &project_label,
+                        project_path.as_deref(),
+                        &validated.binding_id,
+                        &validated.thread_uuid,
+                        &actor,
+                        ObservationCallState::Failed,
+                        ObservationDeliveryStage::Failed,
+                        format!("Pre-dispatch executable validation failed ({})", err.code),
+                    );
+                    return Err(err);
+                }
+            };
+
+            if let Err(err) = verify_binding(
                 &validated.stores.state_dir,
                 &validated.binding_id,
                 &validated.thread_uuid,
             )
-            .await?;
+            .await
+            {
+                record_forward_finish(
+                    &plans_dir,
+                    &request_id,
+                    &safe_meta,
+                    &project_label,
+                    project_path.as_deref(),
+                    &validated.binding_id,
+                    &validated.thread_uuid,
+                    &actor,
+                    ObservationCallState::Failed,
+                    ObservationDeliveryStage::Failed,
+                    format!("Binding verification failed ({})", err.code),
+                );
+                return Err(err);
+            }
 
             let child_args = build_child_args(&validated, family, &inner_args);
-            execute_sibling_command(&sibling_exe, &child_args)
+            let corr_envs = build_correlation_envs(&request_id, safe_meta.plan_id.as_deref());
+            match execute_sibling_command_with_envs(&sibling_exe, &child_args, &corr_envs) {
+                Ok(code) => {
+                    if code == ExitCode::SUCCESS {
+                        record_forward_finish(
+                            &plans_dir,
+                            &request_id,
+                            &safe_meta,
+                            &project_label,
+                            project_path.as_deref(),
+                            &validated.binding_id,
+                            &validated.thread_uuid,
+                            &actor,
+                            ObservationCallState::Completed,
+                            ObservationDeliveryStage::ResponseReturned,
+                            format!("Completed {}", safe_meta.operation),
+                        );
+                    } else {
+                        record_forward_finish(
+                            &plans_dir,
+                            &request_id,
+                            &safe_meta,
+                            &project_label,
+                            project_path.as_deref(),
+                            &validated.binding_id,
+                            &validated.thread_uuid,
+                            &actor,
+                            ObservationCallState::Failed,
+                            ObservationDeliveryStage::Failed,
+                            format!(
+                                "Command {} exited with non-zero status",
+                                safe_meta.operation
+                            ),
+                        );
+                    }
+                    Ok(code)
+                }
+                Err(err) => {
+                    let (state, stage) = if err.code == "outcome_unknown" {
+                        (
+                            ObservationCallState::Unknown,
+                            ObservationDeliveryStage::Unknown,
+                        )
+                    } else {
+                        (
+                            ObservationCallState::Failed,
+                            ObservationDeliveryStage::Failed,
+                        )
+                    };
+                    record_forward_finish(
+                        &plans_dir,
+                        &request_id,
+                        &safe_meta,
+                        &project_label,
+                        project_path.as_deref(),
+                        &validated.binding_id,
+                        &validated.thread_uuid,
+                        &actor,
+                        state,
+                        stage,
+                        format!("Command {} ended with {}", safe_meta.operation, err.code),
+                    );
+                    Err(err)
+                }
+            }
         }
     }
+}
+
+fn build_correlation_envs(request_id: &str, plan_id: Option<&str>) -> Vec<(&'static str, String)> {
+    let mut envs = vec![(ENV_OBSERVATION_PARENT_REQUEST_ID, request_id.to_string())];
+    if let Some(pid) = plan_id {
+        envs.push((ENV_OBSERVATION_PLAN_ID, pid.to_string()));
+    }
+    envs
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_forward_finish(
+    plans_dir: &Path,
+    request_id: &str,
+    safe_meta: &threadlane_core::observation::SafeArgvMetadata,
+    project_label: &str,
+    project_path: Option<&str>,
+    binding_id: &str,
+    thread_uuid: &str,
+    actor: &ObservationActor,
+    state: ObservationCallState,
+    delivery_stage: ObservationDeliveryStage,
+    summary_text: String,
+) {
+    let finished_at_ms = current_observation_time_ms();
+    let _ = append_journal_record(
+        plans_dir,
+        &ObservationJournalRecord {
+            record_id: generate_observation_id("obsrec"),
+            request_id: request_id.to_string(),
+            parent_request_id: safe_meta.parent_request_id.clone(),
+            call_id: None,
+            phase: ObservationRecordPhase::Finish,
+            at_ms: finished_at_ms,
+            pid: Some(std::process::id()),
+            process_instance: current_process_instance(),
+            project_label: Some(project_label.to_string()),
+            project_path: project_path.map(str::to_string),
+            binding_id: Some(binding_id.to_string()),
+            thread_uuid: Some(thread_uuid.to_string()),
+            thread_label: None,
+            job_id: None,
+            plan_id: safe_meta.plan_id.clone(),
+            task_id: safe_meta.task_id.clone(),
+            approval_id: safe_meta.approval_id.clone(),
+            operation: safe_meta.operation.clone(),
+            title: safe_meta.title.clone(),
+            state,
+            actor: Some(actor.clone()),
+            executor: None,
+            usage: None,
+            delivery: vec![ObservationDelivery {
+                stage: delivery_stage,
+                at_ms: Some(finished_at_ms),
+                summary: summary_text.clone(),
+                recipient: Some(binding_id.to_string()),
+            }],
+            summary: Some(summary_text),
+        },
+    );
 }
 
 fn validate_context(
@@ -1025,26 +1360,37 @@ fn execute_sibling_command(
     sibling_exe: &Path,
     child_args: &[OsString],
 ) -> Result<ExitCode, OperatorCliError> {
-    let mut child = Command::new(sibling_exe)
-        .args(child_args)
+    execute_sibling_command_with_envs(sibling_exe, child_args, &[])
+}
+
+fn execute_sibling_command_with_envs(
+    sibling_exe: &Path,
+    child_args: &[OsString],
+    envs: &[(&str, String)],
+) -> Result<ExitCode, OperatorCliError> {
+    let mut cmd = Command::new(sibling_exe);
+    cmd.args(child_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|err| match err.kind() {
-            io::ErrorKind::NotFound => OperatorCliError::new(
-                "not_configured",
-                "required sibling operator executable does not exist",
-            ),
-            io::ErrorKind::PermissionDenied => OperatorCliError::new(
-                "security_violation",
-                "permission denied when spawning sibling operator executable",
-            ),
-            _ => OperatorCliError::new(
-                "io_error",
-                "failed to spawn sibling operator executable before execution",
-            ),
-        })?;
+        .stderr(Stdio::inherit());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+
+    let mut child = cmd.spawn().map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => OperatorCliError::new(
+            "not_configured",
+            "required sibling operator executable does not exist",
+        ),
+        io::ErrorKind::PermissionDenied => OperatorCliError::new(
+            "security_violation",
+            "permission denied when spawning sibling operator executable",
+        ),
+        _ => OperatorCliError::new(
+            "io_error",
+            "failed to spawn sibling operator executable before execution",
+        ),
+    })?;
 
     let status = child.wait().map_err(|_| {
         OperatorCliError::new(

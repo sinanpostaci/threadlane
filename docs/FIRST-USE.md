@@ -6,7 +6,7 @@ conversation. The desktop is an optional observer and configuration surface.
 
 ## Check local setup
 
-Open **Chats → Getting started**. This checklist reads the local registry and
+Open **Settings → Connections → Getting started**. This checklist reads the local registry and
 runtime snapshot; it does not execute a worker or test paid model access.
 
 - Configure an enabled CLI tool in **Tools**. System resolution follows the
@@ -17,8 +17,8 @@ runtime snapshot; it does not execute a worker or test paid model access.
 - Save the desired role assignments in **Profiles**. A complete workflow has
   valid role defaults; difficulty overrides supplement those defaults. A saved
   model assignment does not authorize using that model.
-- Attach the intended real runtime in **Settings**, then select its verified
-  conversation binding in **Chats**.
+- Attach the intended real runtime in **Settings → Connections**, then select
+  its verified conversation binding in the same section.
   The local demo and browser preview do not establish a live Codex connection.
 
 The checklist cannot verify execution approval, notification delivery or an
@@ -60,8 +60,11 @@ than being reported as delivered. See [conversation changes](CONVERSATION-CHANGE
 
 ## After an interruption
 
-Use **Activity → Needs attention** to inspect uncertain or unsuccessful recent
-runs. The overview is bounded to the selected snapshot; it is not an inventory
+Use **Activity** for the chronological request feed and **Plans** for independent
+jobs. Link an existing private project context under **Settings → Connections**
+when its durable stores differ from the configured defaults. For the older
+selected-runtime recovery view, open **Settings → Connections → Advanced controls
+→ Legacy activity diagnostics → Needs attention** to inspect uncertain or unsuccessful recent runs. That diagnostic overview is bounded to the selected snapshot; it is not an inventory
 of every approval or host. Use run details and the scoped operator commands for
 the exact task, worktree, host instance and notification cursor.
 

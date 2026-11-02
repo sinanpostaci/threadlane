@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, Implementation, ServerCapabilities, ServerConfig},
@@ -5,6 +7,11 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, ObservationActor, ObservationCallState, ObservationDelivery,
+    ObservationDeliveryStage, ObservationJournalRecord, ObservationRecordPhase,
+};
 use threadlane_core::EventKind;
 
 use crate::client::ScopedClient;
@@ -305,14 +312,135 @@ fn is_demo_only_tool(tool_name: &str) -> bool {
 pub struct ThreadlaneMcpServer {
     client: ScopedClient,
     tool_router: ToolRouter<Self>,
+    observation_source: &'static str,
+    observation_prefix: &'static str,
+    observation_thread_uuid: Option<String>,
+    observation_journal_dir: Option<PathBuf>,
 }
 
 impl ThreadlaneMcpServer {
     /// Creates a new [`ThreadlaneMcpServer`] bound to `client`.
     pub fn new(client: ScopedClient) -> Self {
+        let observation_journal_dir = client.state_dir().map(PathBuf::from);
         Self {
             client,
             tool_router: Self::tool_router(),
+            observation_source: "scoped_mcp",
+            observation_prefix: "mcp.scoped",
+            observation_thread_uuid: None,
+            observation_journal_dir,
+        }
+    }
+
+    /// Configures this server instance as an enrolled paired MCP delegate so journaled requests
+    /// record `paired_mcp` provenance, the enrolled `thread_uuid`, and the configured journal directory.
+    pub fn with_paired_observation(mut self, thread_uuid: String, journal_dir: PathBuf) -> Self {
+        self.observation_source = "paired_mcp";
+        self.observation_prefix = "mcp.paired";
+        self.observation_thread_uuid = Some(thread_uuid);
+        self.observation_journal_dir = Some(journal_dir);
+        self
+    }
+
+    fn begin_observation(&self, tool_name: &'static str) -> String {
+        let request_id = generate_observation_id("obsreq");
+        if let Some(dir) = self.observation_journal_dir.as_deref() {
+            let started_at_ms = current_observation_time_ms();
+            let op = format!("{}.{tool_name}", self.observation_prefix);
+            let title = format!(
+                "{} {}",
+                self.observation_prefix.replace('.', " "),
+                tool_name.replace('_', " ")
+            );
+            let _ = append_journal_record(
+                dir,
+                &ObservationJournalRecord {
+                    record_id: generate_observation_id("obsrec"),
+                    request_id: request_id.clone(),
+                    parent_request_id: None,
+                    call_id: None,
+                    phase: ObservationRecordPhase::Entry,
+                    at_ms: started_at_ms,
+                    pid: Some(std::process::id()),
+                    process_instance: current_process_instance(),
+                    project_label: None,
+                    project_path: None,
+                    binding_id: Some(self.client.binding_id().to_string()),
+                    thread_uuid: self.observation_thread_uuid.clone(),
+                    thread_label: None,
+                    job_id: None,
+                    plan_id: None,
+                    task_id: None,
+                    approval_id: None,
+                    operation: op.clone(),
+                    title,
+                    state: ObservationCallState::Running,
+                    actor: Some(ObservationActor::unknown(Some(
+                        self.observation_source.to_string(),
+                    ))),
+                    executor: None,
+                    usage: None,
+                    delivery: Vec::new(),
+                    summary: Some(format!("MCP tool {op}")),
+                },
+            );
+        }
+        request_id
+    }
+
+    fn finish_observation(
+        &self,
+        request_id: String,
+        tool_name: &'static str,
+        state: ObservationCallState,
+        stage: ObservationDeliveryStage,
+        summary_detail: String,
+    ) {
+        if let Some(dir) = self.observation_journal_dir.as_deref() {
+            let finished_at_ms = current_observation_time_ms();
+            let op = format!("{}.{tool_name}", self.observation_prefix);
+            let title = format!(
+                "{} {}",
+                self.observation_prefix.replace('.', " "),
+                tool_name.replace('_', " ")
+            );
+            let _ = append_journal_record(
+                dir,
+                &ObservationJournalRecord {
+                    record_id: generate_observation_id("obsrec"),
+                    request_id,
+                    parent_request_id: None,
+                    call_id: None,
+                    phase: ObservationRecordPhase::Finish,
+                    at_ms: finished_at_ms,
+                    pid: Some(std::process::id()),
+                    process_instance: current_process_instance(),
+                    project_label: None,
+                    project_path: None,
+                    binding_id: Some(self.client.binding_id().to_string()),
+                    thread_uuid: self.observation_thread_uuid.clone(),
+                    thread_label: None,
+                    job_id: None,
+                    plan_id: None,
+                    task_id: None,
+                    approval_id: None,
+                    operation: op,
+                    title,
+                    state,
+                    actor: Some(ObservationActor::unknown(Some(
+                        self.observation_source.to_string(),
+                    ))),
+                    executor: None,
+                    usage: None,
+                    delivery: vec![ObservationDelivery {
+                        stage,
+                        at_ms: Some(finished_at_ms),
+                        summary: summary_detail.clone(),
+                        recipient: Some(self.client.binding_id().to_string()),
+                    }],
+                    summary: Some(summary_detail),
+                },
+            );
         }
     }
 
@@ -353,9 +481,17 @@ impl ThreadlaneMcpServer {
 
     fn format_result<T: Serialize>(
         &self,
+        request_id: String,
         tool_name: &'static str,
         data: T,
     ) -> Result<CallToolResult, CallToolResult> {
+        self.finish_observation(
+            request_id,
+            tool_name,
+            ObservationCallState::Completed,
+            ObservationDeliveryStage::ResponseReturned,
+            format!("Completed {}.{tool_name}", self.observation_prefix),
+        );
         Ok(Self::build_structured_tool_result(
             self.client.binding_id(),
             tool_name,
@@ -365,10 +501,21 @@ impl ThreadlaneMcpServer {
 
     fn format_error(
         &self,
+        request_id: String,
         tool_name: &'static str,
         err: Error,
     ) -> Result<CallToolResult, CallToolResult> {
         let api_err = err.to_api_error();
+        self.finish_observation(
+            request_id,
+            tool_name,
+            ObservationCallState::Failed,
+            ObservationDeliveryStage::Failed,
+            format!(
+                "{}.{tool_name} failed ({:?})",
+                self.observation_prefix, api_err.code
+            ),
+        );
         let payload = json!({
             "untrusted_data": true,
             "demo_only": is_demo_only_tool(tool_name),
@@ -398,7 +545,12 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(_params): Parameters<OperatingGuideParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        self.format_result(OPERATING_GUIDE_TOOL, OperatingGuideResponse::current())
+        let req_id = self.begin_observation(OPERATING_GUIDE_TOOL);
+        self.format_result(
+            req_id,
+            OPERATING_GUIDE_TOOL,
+            OperatingGuideResponse::current(),
+        )
     }
 
     /// Get compact status for the bound chat, including wake-up state and recent run summaries.
@@ -417,9 +569,10 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(_params): Parameters<StatusParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("status");
         match self.client.status().await {
-            Ok(status) => self.format_result("status", status),
-            Err(err) => self.format_error("status", err),
+            Ok(status) => self.format_result(req_id, "status", status),
+            Err(err) => self.format_error(req_id, "status", err),
         }
     }
 
@@ -439,9 +592,10 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<GetRunParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("get_run");
         match self.client.get_run(params.run_id).await {
-            Ok(run) => self.format_result("get_run", run),
-            Err(err) => self.format_error("get_run", err),
+            Ok(run) => self.format_result(req_id, "get_run", run),
+            Err(err) => self.format_error(req_id, "get_run", err),
         }
     }
 
@@ -461,9 +615,10 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<ListRunsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("list_runs");
         match self.client.list_runs(params.cursor, params.limit).await {
-            Ok(page) => self.format_result("list_runs", page),
-            Err(err) => self.format_error("list_runs", err),
+            Ok(page) => self.format_result(req_id, "list_runs", page),
+            Err(err) => self.format_error(req_id, "list_runs", err),
         }
     }
 
@@ -483,13 +638,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<ListRunRevisionsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("list_run_revisions");
         match self
             .client
             .list_run_revisions(params.run_id, params.cursor, params.limit)
             .await
         {
-            Ok(page) => self.format_result("list_run_revisions", page),
-            Err(err) => self.format_error("list_run_revisions", err),
+            Ok(page) => self.format_result(req_id, "list_run_revisions", page),
+            Err(err) => self.format_error(req_id, "list_run_revisions", err),
         }
     }
 
@@ -509,13 +665,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<ListRunQuestionsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("list_run_questions");
         match self
             .client
             .list_run_questions(params.run_id, params.cursor, params.limit)
             .await
         {
-            Ok(page) => self.format_result("list_run_questions", page),
-            Err(err) => self.format_error("list_run_questions", err),
+            Ok(page) => self.format_result(req_id, "list_run_questions", page),
+            Err(err) => self.format_error(req_id, "list_run_questions", err),
         }
     }
 
@@ -535,6 +692,7 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<ListActivityParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("list_activity");
         match self
             .client
             .list_activity(
@@ -546,8 +704,8 @@ impl ThreadlaneMcpServer {
             )
             .await
         {
-            Ok(page) => self.format_result("list_activity", page),
-            Err(err) => self.format_error("list_activity", err),
+            Ok(page) => self.format_result(req_id, "list_activity", page),
+            Err(err) => self.format_error(req_id, "list_activity", err),
         }
     }
 
@@ -567,13 +725,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<StartDemoParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("start_demo");
         match self
             .client
             .start_demo(params.command_key, params.instruction, params.step_delay_ms)
             .await
         {
-            Ok(run) => self.format_result("start_demo", run),
-            Err(err) => self.format_error("start_demo", err),
+            Ok(run) => self.format_result(req_id, "start_demo", run),
+            Err(err) => self.format_error(req_id, "start_demo", err),
         }
     }
 
@@ -593,13 +752,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<PullEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("pull_events");
         match self
             .client
             .pull_events(params.after_seq, params.limit)
             .await
         {
-            Ok(batch) => self.format_result("pull_events", batch),
-            Err(err) => self.format_error("pull_events", err),
+            Ok(batch) => self.format_result(req_id, "pull_events", batch),
+            Err(err) => self.format_error(req_id, "pull_events", err),
         }
     }
 
@@ -619,13 +779,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<AckEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("ack_events");
         match self
             .client
             .ack_events(params.command_key, params.batch_id)
             .await
         {
-            Ok(ack) => self.format_result("ack_events", ack),
-            Err(err) => self.format_error("ack_events", err),
+            Ok(ack) => self.format_result(req_id, "ack_events", ack),
+            Err(err) => self.format_error(req_id, "ack_events", err),
         }
     }
 
@@ -645,6 +806,7 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<AnswerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("answer");
         match self
             .client
             .answer(
@@ -656,8 +818,8 @@ impl ThreadlaneMcpServer {
             )
             .await
         {
-            Ok(run) => self.format_result("answer", run),
-            Err(err) => self.format_error("answer", err),
+            Ok(run) => self.format_result(req_id, "answer", run),
+            Err(err) => self.format_error(req_id, "answer", err),
         }
     }
 
@@ -677,6 +839,7 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("steer");
         match self
             .client
             .steer(
@@ -687,8 +850,8 @@ impl ThreadlaneMcpServer {
             )
             .await
         {
-            Ok(run) => self.format_result("steer", run),
-            Err(err) => self.format_error("steer", err),
+            Ok(run) => self.format_result(req_id, "steer", run),
+            Err(err) => self.format_error(req_id, "steer", err),
         }
     }
 
@@ -708,13 +871,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<CancelParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("cancel");
         match self
             .client
             .cancel(params.command_key, params.run_id, params.reason)
             .await
         {
-            Ok(run) => self.format_result("cancel", run),
-            Err(err) => self.format_error("cancel", err),
+            Ok(run) => self.format_result(req_id, "cancel", run),
+            Err(err) => self.format_error(req_id, "cancel", err),
         }
     }
 
@@ -734,13 +898,14 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<StartWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("start_worker");
         match self
             .client
             .start_worker(params.command_key, params.profile_id, params.instruction)
             .await
         {
-            Ok(worker) => self.format_result("start_worker", worker),
-            Err(err) => self.format_error("start_worker", err),
+            Ok(worker) => self.format_result(req_id, "start_worker", worker),
+            Err(err) => self.format_error(req_id, "start_worker", err),
         }
     }
 
@@ -760,9 +925,10 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<GetWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("get_worker");
         match self.client.get_worker(params.run_id).await {
-            Ok(worker) => self.format_result("get_worker", worker),
-            Err(err) => self.format_error("get_worker", err),
+            Ok(worker) => self.format_result(req_id, "get_worker", worker),
+            Err(err) => self.format_error(req_id, "get_worker", err),
         }
     }
 
@@ -782,6 +948,7 @@ impl ThreadlaneMcpServer {
         &self,
         Parameters(params): Parameters<CancelWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
+        let req_id = self.begin_observation("cancel_worker");
         match self
             .client
             .cancel_worker(
@@ -792,8 +959,8 @@ impl ThreadlaneMcpServer {
             )
             .await
         {
-            Ok(worker) => self.format_result("cancel_worker", worker),
-            Err(err) => self.format_error("cancel_worker", err),
+            Ok(worker) => self.format_result(req_id, "cancel_worker", worker),
+            Err(err) => self.format_error(req_id, "cancel_worker", err),
         }
     }
 }

@@ -637,6 +637,7 @@ async fn test_stdio_mcp_initialize_list_and_scoped_tool_calls() {
         .map(|t| t["name"].as_str().expect("tool name"))
         .collect();
     let expected_names: BTreeSet<&str> = [
+        "operating_guide",
         "status",
         "get_run",
         "list_runs",

@@ -1,0 +1,364 @@
+/* Geometry follows the approved request-feed reference. */
+.aq-activity-feed {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  color: var(--aq-text);
+}
+
+.aq-activity-feed [hidden] {
+  display: none !important;
+}
+
+.aq-feed-header {
+  padding: 20px 18px 10px;
+}
+
+.aq-feed-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.aq-feed-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+
+.aq-feed-running-count,
+.aq-feed-scope {
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-feed-running-count {
+  flex: none;
+}
+
+.aq-feed-tools {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  padding: 0 18px 12px;
+}
+
+.aq-feed-scope {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-all-activity,
+.aq-activity-feed .aq-feed-view-job,
+.aq-activity-feed .aq-feed-load-more {
+  flex: none;
+  min-height: 0;
+  padding: 5px 9px;
+  border: 1px solid var(--aq-line);
+  border-radius: 6px;
+  background: var(--aq-field);
+  color: var(--aq-text);
+  font: inherit;
+}
+
+.aq-feed-list {
+  list-style: none;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.aq-feed-item {
+  min-width: 0;
+  margin: 0 18px;
+  border-bottom: 1px solid var(--aq-line);
+}
+
+.aq-feed-row,
+.aq-feed-summary {
+  display: block;
+  min-width: 0;
+}
+
+.aq-feed-summary {
+  padding: 14px 0;
+  cursor: pointer;
+  list-style: none;
+}
+
+.aq-feed-summary::-webkit-details-marker,
+.aq-feed-technical > summary::-webkit-details-marker {
+  display: none;
+}
+
+.aq-feed-context {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 5px;
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-feed-project {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-context-time {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.aq-feed-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.aq-feed-icon {
+  display: inline-grid;
+  flex: 0 0 16px;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  color: var(--aq-text);
+}
+
+.aq-feed-icon .aq-brand,
+.aq-feed-icon .aq-brand-fallback svg {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}
+
+.aq-feed-row-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-sub,
+.aq-feed-role-line,
+.aq-feed-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 4px 10px;
+  min-width: 0;
+  padding-left: 24px;
+  margin-top: 5px;
+  color: var(--aq-muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.aq-feed-job-line {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-requester {
+  justify-content: flex-start;
+  gap: 3px 5px;
+  color: var(--aq-text);
+}
+
+.aq-feed-requested-label {
+  color: var(--aq-muted);
+}
+
+.aq-feed-executor-value,
+.aq-feed-measure {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-status {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  color: var(--aq-muted);
+}
+
+.aq-feed-status[data-state="running"] {
+  color: var(--aq-accent);
+}
+
+.aq-feed-spinner {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  animation: aq-feed-spin 1.8s linear infinite;
+}
+
+.aq-activity-feed .aq-feed-spinner svg {
+  width: 13px;
+  height: 13px;
+}
+
+.aq-feed-detail {
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  margin: 0 0 16px 8px;
+  padding: 1px 0 1px 15px;
+  border-left: 1px solid var(--aq-line);
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+
+.aq-feed-detail-body {
+  min-width: 0;
+}
+
+.aq-feed-timeline {
+  list-style: none;
+  display: grid;
+  gap: 14px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+}
+
+.aq-feed-event {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.aq-feed-event-label {
+  color: var(--aq-text);
+}
+
+.aq-feed-event-copy,
+.aq-feed-event-line {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-feed-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.aq-feed-link {
+  padding: 0;
+  border: 0;
+  color: var(--aq-accent);
+  font-size: 12px;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-technical {
+  color: var(--aq-muted);
+  font-size: 12px;
+}
+
+.aq-feed-technical > summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.aq-feed-technical > summary::after {
+  display: inline-block;
+  margin-left: 5px;
+  content: '+';
+}
+
+.aq-feed-technical[open] > summary::after {
+  content: '−';
+}
+
+.aq-feed-technical-event {
+  display: grid;
+  gap: 3px;
+  margin-top: 14px;
+}
+
+.aq-feed-technical-event p {
+  margin: 0;
+}
+
+.aq-feed-technical-label {
+  color: var(--aq-text);
+}
+
+.aq-feed-empty,
+.aq-feed-footer {
+  margin: 0;
+  padding: 17px 18px;
+  color: var(--aq-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-footer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+/* Actual partial-source evidence stays visible at the bottom of the feed. */
+.aq-feed-notices:empty {
+  display: none;
+}
+
+.aq-feed-notices {
+  display: grid;
+  gap: 8px;
+  padding: 17px 18px;
+  color: var(--aq-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.aq-feed-notice-title {
+  margin: 0 0 3px;
+}
+
+.aq-feed-notice-list {
+  margin: 0;
+  padding-left: 16px;
+}
+
+.aq-feed-notice--danger {
+  color: var(--aq-danger);
+}
+
+@keyframes aq-feed-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aq-feed-spinner { animation: none; }
+}
+
+@media (pointer: coarse) {
+  .aq-feed-summary,
+  .aq-feed-all-activity,
+  .aq-activity-feed .aq-feed-view-job,
+  .aq-activity-feed .aq-feed-load-more,
+  .aq-feed-technical > summary {
+    min-height: 44px;
+  }
+}

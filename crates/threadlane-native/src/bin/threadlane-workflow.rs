@@ -22,6 +22,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use threadlane_core::observation::{
+    append_journal_record, current_observation_time_ms, current_process_instance,
+    generate_observation_id, read_env_parent_request_id, read_env_plan_id, ObservationActor,
+    ObservationCallState, ObservationDelivery, ObservationDeliveryStage, ObservationJournalRecord,
+    ObservationRecordPhase,
+};
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
 };
@@ -182,49 +188,211 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
         ("plans_dir", plans.dir()),
     ])?;
 
-    let workflow =
-        ScopedWorkflow::new(registry, plans, binding_id).map_err(|err| map_workflow_error(&err))?;
+    let workflow = ScopedWorkflow::new(registry, plans, binding_id.clone())
+        .map_err(|err| map_workflow_error(&err))?;
 
-    match cli.command {
-        WorkflowCommand::Catalog { cursor, limit } => {
-            let page = workflow
-                .catalog(cursor, limit)
-                .map_err(|err| map_workflow_error(&err))?;
-            write_result(workflow.binding_id(), &page, false)
-        }
-        WorkflowCommand::ListPlans { cursor, limit } => {
-            let page = workflow
-                .list_plans(cursor, limit)
-                .map_err(|err| map_workflow_error(&err))?;
-            write_result(workflow.binding_id(), &page, false)
-        }
-        WorkflowCommand::GetPlan {
-            plan_id,
-            revision,
-            cursor,
-            limit,
-        } => {
-            let page = workflow
-                .get_plan(&plan_id, revision, cursor, limit)
-                .map_err(|err| map_workflow_error(&err))?;
-            write_result(workflow.binding_id(), &page, false)
-        }
-        WorkflowCommand::SaveDraft { request } => {
-            let draft: SavePlanDraft = read_request(&request)?;
-            verify_binding(clean_state_dir, workflow.binding_id(), &thread_uuid).await?;
-            let summary = workflow
-                .save_draft(draft)
-                .map_err(|err| map_workflow_mutation_error(&err))?;
-            write_result(workflow.binding_id(), &summary, true)
-        }
-        WorkflowCommand::Publish { plan_id, revision } => {
-            verify_binding(clean_state_dir, workflow.binding_id(), &thread_uuid).await?;
-            let published = workflow
-                .publish(&plan_id, revision)
-                .map_err(|err| map_workflow_mutation_error(&err))?;
-            write_result(workflow.binding_id(), &published, true)
+    let (op_name, initial_plan_id) = match &cli.command {
+        WorkflowCommand::Catalog { .. } => ("workflow.catalog", read_env_plan_id()),
+        WorkflowCommand::ListPlans { .. } => ("workflow.list-plans", read_env_plan_id()),
+        WorkflowCommand::GetPlan { plan_id, .. } => ("workflow.get-plan", Some(plan_id.clone())),
+        WorkflowCommand::SaveDraft { .. } => ("workflow.save-draft", read_env_plan_id()),
+        WorkflowCommand::Publish { plan_id, .. } => ("workflow.publish", Some(plan_id.clone())),
+    };
+    let parent_req = read_env_parent_request_id();
+    let should_journal = parent_req.is_some()
+        || matches!(
+            cli.command,
+            WorkflowCommand::SaveDraft { .. } | WorkflowCommand::Publish { .. }
+        );
+    let (request_id, call_id) = match &parent_req {
+        Some(parent) => (parent.clone(), Some(generate_observation_id("obsc"))),
+        None => (generate_observation_id("obsreq"), None),
+    };
+    let started_at_ms = current_observation_time_ms();
+    let actor = ObservationActor::unknown(Some("trusted_local_operator".to_string()));
+    if should_journal {
+        let _ = append_journal_record(
+            clean_plans_dir,
+            &ObservationJournalRecord {
+                record_id: generate_observation_id("obsrec"),
+                request_id: request_id.clone(),
+                parent_request_id: None,
+                call_id: call_id.clone(),
+                phase: ObservationRecordPhase::Entry,
+                at_ms: started_at_ms,
+                pid: Some(std::process::id()),
+                process_instance: current_process_instance(),
+                project_label: None,
+                project_path: None,
+                binding_id: Some(binding_id.clone()),
+                thread_uuid: Some(thread_uuid.clone()),
+                thread_label: None,
+                job_id: None,
+                plan_id: initial_plan_id.clone(),
+                task_id: None,
+                approval_id: None,
+                operation: op_name.to_string(),
+                title: op_name.replace('.', " "),
+                state: ObservationCallState::Running,
+                actor: Some(actor.clone()),
+                executor: None,
+                usage: None,
+                delivery: Vec::new(),
+                summary: Some(format!("Executing {op_name}")),
+            },
+        );
+    }
+
+    let mut resolved_plan_id = initial_plan_id;
+    let mut verified_job_id = None;
+    let outcome: Result<(), OperatorCliError> = async {
+        match cli.command {
+            WorkflowCommand::Catalog { cursor, limit } => {
+                let page = workflow
+                    .catalog(cursor, limit)
+                    .map_err(|err| map_workflow_error(&err))?;
+                write_result(workflow.binding_id(), &page, false)
+            }
+            WorkflowCommand::ListPlans { cursor, limit } => {
+                let page = workflow
+                    .list_plans(cursor, limit)
+                    .map_err(|err| map_workflow_error(&err))?;
+                write_result(workflow.binding_id(), &page, false)
+            }
+            WorkflowCommand::GetPlan {
+                plan_id,
+                revision,
+                cursor,
+                limit,
+            } => {
+                let page = workflow
+                    .get_plan(&plan_id, revision, cursor, limit)
+                    .map_err(|err| map_workflow_error(&err))?;
+                verified_job_id = Some(page.header.plan_id.clone());
+                resolved_plan_id = Some(page.header.plan_id.clone());
+                write_result(workflow.binding_id(), &page, false)
+            }
+            WorkflowCommand::SaveDraft { request } => {
+                let draft: SavePlanDraft = read_request(&request)?;
+                verify_binding(clean_state_dir, workflow.binding_id(), &thread_uuid).await?;
+                let summary = workflow
+                    .save_draft(draft)
+                    .map_err(|err| map_workflow_mutation_error(&err))?;
+                verified_job_id = Some(summary.plan_id.clone());
+                resolved_plan_id = Some(summary.plan_id.clone());
+                write_result(workflow.binding_id(), &summary, true)
+            }
+            WorkflowCommand::Publish { plan_id, revision } => {
+                verify_binding(clean_state_dir, workflow.binding_id(), &thread_uuid).await?;
+                let published = workflow
+                    .publish(&plan_id, revision)
+                    .map_err(|err| map_workflow_mutation_error(&err))?;
+                verified_job_id = Some(published.header.plan_id.clone());
+                resolved_plan_id = Some(published.header.plan_id.clone());
+                write_result(workflow.binding_id(), &published, true)
+            }
         }
     }
+    .await;
+
+    if should_journal {
+        let finished_at_ms = current_observation_time_ms();
+        match &outcome {
+            Ok(()) => {
+                let _ = append_journal_record(
+                    clean_plans_dir,
+                    &ObservationJournalRecord {
+                        record_id: generate_observation_id("obsrec"),
+                        request_id,
+                        parent_request_id: None,
+                        call_id,
+                        phase: ObservationRecordPhase::Finish,
+                        at_ms: finished_at_ms,
+                        pid: Some(std::process::id()),
+                        process_instance: current_process_instance(),
+                        project_label: None,
+                        project_path: None,
+                        binding_id: Some(binding_id.clone()),
+                        thread_uuid: Some(thread_uuid),
+                        thread_label: None,
+                        job_id: verified_job_id,
+                        plan_id: resolved_plan_id,
+                        task_id: None,
+                        approval_id: None,
+                        operation: op_name.to_string(),
+                        title: op_name.replace('.', " "),
+                        state: ObservationCallState::Completed,
+                        actor: Some(actor),
+                        executor: None,
+                        usage: None,
+                        delivery: if parent_req.is_none() {
+                            vec![ObservationDelivery {
+                                stage: ObservationDeliveryStage::ResponseReturned,
+                                at_ms: Some(finished_at_ms),
+                                summary: format!("Completed {op_name}"),
+                                recipient: Some(binding_id),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        summary: Some(format!("Completed {op_name}")),
+                    },
+                );
+            }
+            Err(err) => {
+                let state = if err.code == "outcome_unknown" {
+                    ObservationCallState::Unknown
+                } else {
+                    ObservationCallState::Failed
+                };
+                let stage = if err.code == "outcome_unknown" {
+                    ObservationDeliveryStage::Unknown
+                } else {
+                    ObservationDeliveryStage::Failed
+                };
+                let _ = append_journal_record(
+                    clean_plans_dir,
+                    &ObservationJournalRecord {
+                        record_id: generate_observation_id("obsrec"),
+                        request_id,
+                        parent_request_id: None,
+                        call_id,
+                        phase: ObservationRecordPhase::Finish,
+                        at_ms: finished_at_ms,
+                        pid: Some(std::process::id()),
+                        process_instance: current_process_instance(),
+                        project_label: None,
+                        project_path: None,
+                        binding_id: Some(binding_id.clone()),
+                        thread_uuid: Some(thread_uuid),
+                        thread_label: None,
+                        job_id: verified_job_id,
+                        plan_id: resolved_plan_id,
+                        task_id: None,
+                        approval_id: None,
+                        operation: op_name.to_string(),
+                        title: op_name.replace('.', " "),
+                        state,
+                        actor: Some(actor),
+                        executor: None,
+                        usage: None,
+                        delivery: if parent_req.is_none() {
+                            vec![ObservationDelivery {
+                                stage,
+                                at_ms: Some(finished_at_ms),
+                                summary: format!("{op_name} ended with {}", err.code),
+                                recipient: Some(binding_id),
+                            }]
+                        } else {
+                            Vec::new()
+                        },
+                        summary: Some(format!("{op_name} ended with {}", err.code)),
+                    },
+                );
+            }
+        }
+    }
+    outcome
 }
 
 const fn map_workflow_error(err: &WorkflowError) -> OperatorCliError {
@@ -491,6 +659,33 @@ mod tests {
             .expect("read plan")
             .expect("rev 1 exists");
         assert_eq!(pub_rev.status, PlanStatus::Published);
+
+        let failed_publish = Cli {
+            state_dir: Some(state_dir.clone()),
+            registry_dir: Some(registry_dir.clone()),
+            plans_dir: Some(plans_dir.clone()),
+            binding: Some(binding.binding_id.clone()),
+            thread: Some(TEST_THREAD_UUID.to_string()),
+            command: WorkflowCommand::Publish {
+                plan_id: "plan-does-not-exist".to_string(),
+                revision: 1,
+            },
+        };
+        run(failed_publish)
+            .await
+            .expect_err("missing plan must remain a failed command");
+        let (records, warnings) =
+            threadlane_core::observation::read_journal_records_readonly(&plans_dir)
+                .expect("read operation journal");
+        assert!(warnings.is_empty());
+        assert_eq!(records.len(), 6, "each invocation records entry and finish");
+        let failed_entry = &records[4];
+        let failed_finish = &records[5];
+        assert_eq!(failed_entry.request_id, failed_finish.request_id);
+        assert_eq!(failed_finish.phase, ObservationRecordPhase::Finish);
+        assert_eq!(failed_finish.state, ObservationCallState::Failed);
+        assert_eq!(failed_finish.job_id, None, "a refused ID is not verified");
+        assert_eq!(records[3].job_id.as_deref(), Some("plan-unit-1"));
 
         sup.shutdown().await;
     }

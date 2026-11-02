@@ -2175,12 +2175,19 @@ mod tests {
             "even a 0.99 confident disagreeing classification must never mutate the registry"
         );
 
-        // Plans directory must contain only `advice-cache` and zero plan ledger mutations.
-        let plans_entries: Vec<_> = fs::read_dir(&ws.plans_dir)
+        // Advice may append its observation journal, but never a plan ledger.
+        let mut plans_entries: Vec<_> = fs::read_dir(&ws.plans_dir)
             .expect("read plans_dir")
             .map(|e| e.expect("entry").file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(plans_entries, vec!["advice-cache".to_string()]);
+        plans_entries.sort();
+        assert_eq!(
+            plans_entries,
+            vec![
+                "advice-cache".to_string(),
+                "observation-journal.jsonl".to_string()
+            ]
+        );
     }
 
     struct BarrierTransport {
