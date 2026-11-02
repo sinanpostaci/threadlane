@@ -24,11 +24,12 @@ let
     glib-networking
     gsettings-desktop-schemas
     libxkbcommon
-    xorg.libX11
-    xorg.libXcursor
-    xorg.libXrandr
-    xorg.libXi
-    xorg.libXext
+    # Legacy attributes are evaluated only when the current name is unavailable.
+    (pkgs.libx11 or pkgs.xorg.libX11)
+    (pkgs.libxcursor or pkgs.xorg.libXcursor)
+    (pkgs.libxrandr or pkgs.xorg.libXrandr)
+    (pkgs.libxi or pkgs.xorg.libXi)
+    (pkgs.libxext or pkgs.xorg.libXext)
   ];
 
   desktopFrontend = pkgs.buildNpmPackage {
