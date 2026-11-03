@@ -44,6 +44,10 @@ pub mod controller_policy;
 pub mod job_completion;
 /// Private per-job OS file-lock ownership, CSPRNG instance/challenge identity, and pre-effect validation.
 pub mod ownership;
+/// Automatic end-to-end Coworker workflow pipeline service and stateful `FuturesUnordered` driver
+/// connecting Phase 1 host reconciliation/dispatch, task verification, `Reviewer` stage, original
+/// per-task `RunIntegration`, downstream dependency seal preparation, and final job completion.
+pub mod pipeline;
 /// Asynchronous read-only Coworker planning and architectural advice service.
 pub mod planning;
 /// Strict task `Reviewer` JSON response parser and identity verification.
@@ -72,6 +76,7 @@ pub use controller::*;
 pub use controller_policy::*;
 pub use job_completion::*;
 pub use ownership::*;
+pub use pipeline::*;
 pub use planning::*;
 pub use review::*;
 pub use review_execution::*;
