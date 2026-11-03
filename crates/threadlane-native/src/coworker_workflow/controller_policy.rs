@@ -1833,6 +1833,8 @@ impl ControllerJobLeaseRecord {
 pub enum PendingControllerEffectKind {
     /// Initial or derived coder worker dispatch.
     CoderDispatch,
+    /// Task worktree Git commit of in-scope coder changes.
+    TaskCommit,
     /// Frozen check command execution on a task or integration worktree.
     CheckExecution,
     /// Structured read-only Reviewer worker invocation.
@@ -1848,6 +1850,7 @@ impl PendingControllerEffectKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CoderDispatch => "coder_dispatch",
+            Self::TaskCommit => "task_commit",
             Self::CheckExecution => "check_execution",
             Self::ReviewerInvocation => "reviewer_invocation",
             Self::TaskIntegration => "task_integration",

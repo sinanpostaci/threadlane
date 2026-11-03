@@ -2681,7 +2681,7 @@ fn find_task_attempt_outbox(
         .cloned()
 }
 
-fn is_task_fenced_by_hold_or_sibling(
+pub(crate) fn is_task_fenced_by_hold_or_sibling(
     candidate_task: &CoworkerTaskRecord,
     job: &CoworkerJobRecord,
     runtime_state: &ControllerJobRuntimeState,

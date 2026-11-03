@@ -50,6 +50,9 @@ pub mod review;
 pub mod review_execution;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.
 pub mod store;
+/// Completed coder task worktree commit, frozen verification check execution, and
+/// [`threadlane_operations::ReviewSubject`] preparation before `Reviewer` dispatch.
+pub mod task_verification;
 
 pub use checks::*;
 pub use contracts::*;
@@ -60,3 +63,4 @@ pub use planning::*;
 pub use review::*;
 pub use review_execution::*;
 pub use store::*;
+pub use task_verification::*;

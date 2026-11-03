@@ -13,15 +13,17 @@ use threadlane_host::{
     HostPhase, PrepareDependencyInputsRequest, TaskExecutionStatus,
 };
 use threadlane_native::coworker_workflow::{
-    sha256_hex, ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
-    ControllerConfigurationPreview, ControllerPolicyStore, ControllerRoleExecutionBudget,
-    CoworkerControllerPhase1Status, CoworkerControllerService, CoworkerControllerStepRequest,
-    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerPlanningService, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
+    read_persisted_check_report, sha256_hex, ApplyWorkflowHoldRequest, BindJobApprovalRequest,
+    CanonicalProjectBaseRef, ControllerConfigurationPreview, ControllerJobRuntimeState,
+    ControllerPolicyStore, ControllerRoleExecutionBudget, CoworkerControllerPhase1Status,
+    CoworkerControllerService, CoworkerControllerStepRequest, CoworkerJobOwnershipKey,
+    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
+    CoworkerTaskStage, CoworkerTaskVerificationRequest, CoworkerTaskVerificationService,
+    CoworkerTaskVerificationStatus, CoworkerWorkflowStore, CreateCoworkerJobRequest,
     CreatePlanningGrantRequest, FinalizeTaskOutboxRequest,
-    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckKind,
-    FrozenControllerCapabilityEnvelope, OrchestrateWorkBriefPlanRequest, OutboxDispatchKind,
-    OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
+    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckExecutionStatus,
+    FrozenCheckKind, FrozenControllerCapabilityEnvelope, OrchestrateWorkBriefPlanRequest,
+    OutboxDispatchKind, OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
     PendingControllerEffectStatus, PlannedCheckSuggestion, PlanningCallBudget,
     PlanningReadOnlyCapabilities, PlanningReservationStatus, RecordTaskReviewVerdictRequest,
     ReserveTaskOutboxRequest, ReviewVerdictOutcome, StructuredOrchestratorOutput,
@@ -1913,6 +1915,360 @@ async fn hold_stop_unknown_intent_and_conflicting_request_key_fence_dispatch_and
         NativeErrorCode::ValidationFailed.as_str()
     );
     assert!(conflict_err.message().contains("frozen command_key"));
+
+    session.release().expect("release session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_verification_commits_coder_worktree_executes_frozen_checks_and_reconciles_idempotently(
+) {
+    let fixture = setup_fixture();
+    let check_count_file = fixture
+        .plans_dir
+        .parent()
+        .expect("fixture root")
+        .join("cargo_check_count.txt");
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        &format!(
+            "#!/bin/sh\nset -eu\nc=0\nif [ -f \"{}\" ]; then c=$(cat \"{}\"); fi\nc=$((c + 1))\nprintf \"%s\" \"$c\" > \"{}\"\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
+            check_count_file.display(),
+            check_count_file.display(),
+            check_count_file.display(),
+        ),
+    );
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-verify-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_verify_a".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_verify_pass",
+        "plan-verify-pass",
+        vec![PlanTask {
+            id: "task-verify-a".to_string(),
+            title: "Verify Task A".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        task_interfaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 40_000)
+        .expect("open controller session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 40_100u64;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-verify-a")
+            .expect("task-verify-a observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-verify-a ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let outcome = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-verify-a".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts,
+            },
+        )
+        .await
+        .expect("verify_and_prepare_task_attempt");
+
+    assert_eq!(
+        outcome.status,
+        CoworkerTaskVerificationStatus::ReadyForReviewer
+    );
+    assert_eq!(outcome.task_stage, CoworkerTaskStage::ReadyForReview);
+    assert_ne!(outcome.committed_head_commit, fixture.base_commit);
+    assert_ne!(outcome.committed_tree_sha, fixture.base_tree_sha);
+    assert_eq!(read_invocation_count(&check_count_file), 1);
+    assert_eq!(outcome.check_reports.len(), 1);
+    assert_eq!(
+        outcome.check_reports[0].report.status,
+        FrozenCheckExecutionStatus::Passed
+    );
+    let persisted_report =
+        read_persisted_check_report(&fixture.plans_dir, &outcome.check_reports[0].effect_id)
+            .expect("read persisted check report")
+            .expect("persisted check report exists");
+    assert_eq!(persisted_report, outcome.check_reports[0].report);
+    assert_eq!(outcome.check_evidence.len(), 1);
+
+    let review_subject = outcome
+        .review_subject
+        .as_ref()
+        .expect("promoted ReviewSubject");
+    assert_eq!(
+        review_subject.task_head_commit,
+        outcome.committed_head_commit
+    );
+    assert_eq!(review_subject.task_tree_sha, outcome.committed_tree_sha);
+    assert_eq!(review_subject.base_commit, fixture.base_commit);
+
+    // Primary checkout must remain untouched at base_commit.
+    let primary_head =
+        resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve primary HEAD");
+    assert_eq!(primary_head, fixture.base_commit);
+    assert_eq!(
+        fs::read_to_string(fixture.repo_dir.join("src/a.rs")).expect("read primary src/a.rs"),
+        "pub fn a() -> u32 { 1 }\n"
+    );
+
+    let runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime")
+        .expect("runtime exists");
+    let art_key = ControllerJobRuntimeState::artifact_key("task-verify-a", 1);
+    let stored_art = runtime
+        .attempt_artifacts
+        .get(&art_key)
+        .expect("stored attempt artifacts");
+    assert_eq!(
+        stored_art.committed_head_commit.as_deref(),
+        Some(outcome.committed_head_commit.as_str())
+    );
+    assert_eq!(
+        stored_art.committed_tree_sha.as_deref(),
+        Some(outcome.committed_tree_sha.as_str())
+    );
+    assert_eq!(
+        stored_art.candidate_id.as_deref(),
+        Some(outcome.candidate_id.as_str())
+    );
+    assert_eq!(stored_art.check_evidence, outcome.check_evidence);
+    assert_eq!(stored_art.review_subject, outcome.review_subject);
+    assert!(stored_art.review_receipt.is_none());
+    assert!(stored_art.integration_receipt.is_none());
+
+    // Repeat call and reopened-session call must be idempotent without re-committing or re-running checks.
+    let repeat_outcome = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-verify-a".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 100,
+            },
+        )
+        .await
+        .expect("repeat verify_and_prepare_task_attempt");
+    assert_eq!(repeat_outcome, outcome);
+    assert_eq!(read_invocation_count(&check_count_file), 1);
+
+    session.release().expect("release session");
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 200)
+        .expect("reopen session");
+    let reopened_outcome = verifier
+        .verify_and_prepare_task_attempt(
+            reopened_session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-verify-a".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 300,
+            },
+        )
+        .await
+        .expect("reopened verify_and_prepare_task_attempt");
+    assert_eq!(reopened_outcome, outcome);
+    assert_eq!(read_invocation_count(&check_count_file), 1);
+
+    reopened_session
+        .release()
+        .expect("release reopened session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_verification_blocks_reviewer_on_failed_frozen_check_and_retains_artifacts() {
+    let fixture = setup_fixture();
+    let check_count_file = fixture
+        .plans_dir
+        .parent()
+        .expect("fixture root")
+        .join("cargo_fail_count.txt");
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        &format!(
+            "#!/bin/sh\nset -eu\nc=0\nif [ -f \"{}\" ]; then c=$(cat \"{}\"); fi\nc=$((c + 1))\nprintf \"%s\" \"$c\" > \"{}\"\necho \"test src_a ... FAILED\" >&2\nexit 1\n",
+            check_count_file.display(),
+            check_count_file.display(),
+            check_count_file.display(),
+        ),
+    );
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-verify-fail".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_verify_fail".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_verify_fail",
+        "plan-verify-fail",
+        vec![PlanTask {
+            id: "task-verify-fail".to_string(),
+            title: "Verify Failing Check Task".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        task_interfaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 50_000)
+        .expect("open controller session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 50_100u64;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-verify-fail")
+            .expect("task-verify-fail observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-verify-fail ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let outcome = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-verify-fail".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts,
+            },
+        )
+        .await
+        .expect("verify_and_prepare_task_attempt returns BlockedByFailedChecks");
+
+    assert_eq!(
+        outcome.status,
+        CoworkerTaskVerificationStatus::BlockedByFailedChecks
+    );
+    assert_eq!(outcome.task_stage, CoworkerTaskStage::ReadyForReview);
+    assert_eq!(read_invocation_count(&check_count_file), 1);
+    assert_eq!(outcome.check_reports.len(), 1);
+    assert_eq!(
+        outcome.check_reports[0].report.status,
+        FrozenCheckExecutionStatus::NonZeroExit
+    );
+    assert!(outcome.check_evidence.is_empty());
+    assert!(outcome.test_evidence_summary.is_none());
+    assert!(outcome.review_subject.is_none());
+
+    let persisted_report =
+        read_persisted_check_report(&fixture.plans_dir, &outcome.check_reports[0].effect_id)
+            .expect("read persisted failed check report")
+            .expect("persisted failed check report exists");
+    assert_eq!(persisted_report, outcome.check_reports[0].report);
+
+    let runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime")
+        .expect("runtime exists");
+    let art_key = ControllerJobRuntimeState::artifact_key("task-verify-fail", 1);
+    let stored_art = runtime
+        .attempt_artifacts
+        .get(&art_key)
+        .expect("stored attempt artifacts");
+    assert_eq!(
+        stored_art.committed_head_commit.as_deref(),
+        Some(outcome.committed_head_commit.as_str())
+    );
+    assert!(stored_art.check_evidence.is_empty());
+    assert!(stored_art.test_evidence_summary.is_none());
+    assert!(stored_art.review_subject.is_none());
 
     session.release().expect("release session");
     host_handle.shutdown().await.expect("shutdown host");
