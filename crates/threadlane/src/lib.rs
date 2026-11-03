@@ -11,6 +11,8 @@ pub mod cli;
 pub mod client;
 /// Optional Codex queue wake-up bridge and argument construction.
 pub mod codex;
+/// Typed Coworker job status wake-up context and bounded native Unix WebSocket notification API.
+pub mod coworker_wakeup;
 /// Runtime descriptor, process-lifetime state lock, and filesystem security checks.
 pub mod descriptor;
 /// Stable error codes, wire error envelopes, and runtime error conversions.
@@ -32,6 +34,12 @@ pub use client::{ScopedClient, SupervisorClient, MAX_CLIENT_RESPONSE_BYTES};
 pub use codex::{
     build_codex_queue_args, invoke_codex_wakeup, ApprovedSessionWakeupContext, CodexWakeupConfig,
     DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,
+};
+pub use coworker_wakeup::{
+    format_coworker_job_wakeup_message, invoke_coworker_job_wakeup, validate_coworker_job_id,
+    validate_coworker_notification_id, validate_coworker_transition_id, CoworkerJobNotification,
+    CoworkerJobWakeupAttempt, CoworkerJobWakeupContext, COWORKER_JOB_ID_HEX_LEN,
+    COWORKER_JOB_ID_PREFIX, MAX_COWORKER_NOTIFICATION_ID_LEN, MAX_COWORKER_TRANSITION_ID_LEN,
 };
 pub use descriptor::{
     prepare_state_dir, RuntimeDescriptor, SecretToken, StateLock, DATABASE_FILENAME,

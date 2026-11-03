@@ -500,7 +500,7 @@ async fn reconnect_discovers_replaced_session_directory_after_pre_effect_disconn
 }
 
 #[tokio::test]
-async fn terminal_refused_metadata_and_protocol_errors_do_not_retry() {
+async fn terminal_identity_and_protocol_rejections_do_not_retry_with_model_free_legacy_metadata() {
     tokio::time::timeout(Duration::from_secs(15), async {
         // 1. Multiple live matching candidates -> Refused -> immediate Failed without connecting.
         {
@@ -521,13 +521,16 @@ async fn terminal_refused_metadata_and_protocol_errors_do_not_retry() {
             );
         }
 
-        // 2. Metadata mismatch (wrong model in thread/resume) -> terminal Failed on first attempt without retry.
+        // 2. Legacy model metadata with a different live model in thread/resume is accepted. The
+        //    delivery stays model-free, completes exactly once, and is not retried.
         {
             let env = ReconnectTestEnv::new();
-            let (listener, _session_dir) = env.publish_symlinked_session("bad-model");
+            let (listener, _session_dir) = env.publish_symlinked_session("legacy-model");
             let expected_cwd = env.project_root.to_string_lossy().to_string();
             let connections = Arc::new(AtomicUsize::new(0));
             let connections_clone = Arc::clone(&connections);
+            let turn_starts = Arc::new(AtomicUsize::new(0));
+            let turn_starts_clone = Arc::clone(&turn_starts);
 
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept");
@@ -575,6 +578,29 @@ async fn terminal_refused_metadata_and_protocol_errors_do_not_retry() {
                     ))
                     .await;
 
+                let turn_req = read_json(&mut ws).await;
+                assert_eq!(turn_req["method"], "turn/start");
+                assert_eq!(turn_req["params"]["threadId"], TEST_THREAD_ID);
+                assert!(turn_req["params"].get("model").is_none());
+                assert!(turn_req["params"].get("reasoningEffort").is_none());
+                turn_starts_clone.fetch_add(1, Ordering::SeqCst);
+                let _ = ws
+                    .send(Message::Text(
+                        json!({
+                            "id": 4,
+                            "result": {
+                                "turn": {
+                                    "id": TEST_TURN_ID,
+                                    "status": { "type": "inProgress" },
+                                    "error": null
+                                }
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await;
+
                 // Watch briefly to ensure no second connection attempt occurs.
                 if tokio::time::timeout(Duration::from_millis(50), listener.accept())
                     .await
@@ -592,12 +618,17 @@ async fn terminal_refused_metadata_and_protocol_errors_do_not_retry() {
             let (_tx, mut rx) = watch::channel(false);
 
             let outcome = invoke_codex_wakeup(&wakeup_cfg, &env.sample_claim(), &mut rx).await;
-            assert!(matches!(outcome, WakeupOutcome::Failed { .. }));
+            assert_eq!(
+                outcome,
+                WakeupOutcome::Submitted,
+                "changed live model metadata must not block a model-free delivery"
+            );
             server.await.expect("server");
+            assert_eq!(turn_starts.load(Ordering::SeqCst), 1);
             assert_eq!(
                 connections.load(Ordering::SeqCst),
                 1,
-                "terminal model mismatch must not retry"
+                "accepted legacy metadata must not trigger a retry or replay"
             );
         }
 

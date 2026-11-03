@@ -192,6 +192,17 @@ impl NativeToolOutputConfig {
         }
     }
 
+    /// Creates a new [`NativeToolOutputConfig`] using the fixed [`NativeNotificationDelivery::UserMessageSteer`]
+    /// delivery mode without legacy Coworker model or reasoning effort metadata.
+    pub const fn new_user_message_steer(
+        socket_path: PathBuf,
+        thread_id: String,
+        project_root: PathBuf,
+    ) -> Self {
+        Self::new(socket_path, thread_id, project_root)
+            .with_delivery(NativeNotificationDelivery::UserMessageSteer)
+    }
+
     /// Returns a copy of this configuration with the specified [`NativeNotificationDelivery`] mode.
     pub const fn with_delivery(mut self, delivery: NativeNotificationDelivery) -> Self {
         self.delivery = delivery;
@@ -832,9 +843,62 @@ fn classify_ws_recv_error(err: tokio_tungstenite::tungstenite::Error) -> Exchang
 }
 
 #[cfg(unix)]
+enum NativeWakeupPayload<'a> {
+    ApprovedSession {
+        claim: &'a WakeupClaim,
+        approved_ctx: &'a ApprovedSessionWakeupContext,
+    },
+    CoworkerJobUserMessage {
+        notice_text: String,
+    },
+}
+
+#[cfg(unix)]
+fn prepare_user_message_steer_delivery(
+    tool_output_cfg: &NativeToolOutputConfig,
+    notice_text: String,
+) -> Result<PreparedDeliveryMessages, &'static str> {
+    let idle_turn_start_req = serde_json::to_string(&json!({
+        "id": 4u64,
+        "method": "turn/start",
+        "params": {
+            "threadId": tool_output_cfg.thread_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": notice_text,
+                }
+            ]
+        }
+    }))
+    .map_err(|_| "native tool-output request serialization failed")?;
+    if idle_turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+        return Err("native tool-output request exceeded maximum frame size");
+    }
+    let turns_list_req = serde_json::to_string(&json!({
+        "id": 4u64,
+        "method": "thread/turns/list",
+        "params": {
+            "threadId": tool_output_cfg.thread_id,
+            "limit": 1u32,
+            "sortDirection": "desc",
+            "itemsView": "summary",
+        }
+    }))
+    .map_err(|_| "native tool-output request serialization failed")?;
+    if turns_list_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+        return Err("native tool-output request exceeded maximum frame size");
+    }
+    Ok(PreparedDeliveryMessages::UserMessageSteer {
+        idle_turn_start_req,
+        turns_list_req,
+        notice_text,
+    })
+}
+
+#[cfg(unix)]
 fn prepare_exchange_messages(
-    claim: &WakeupClaim,
-    approved_ctx: &ApprovedSessionWakeupContext,
+    payload: NativeWakeupPayload<'_>,
     tool_output_cfg: &NativeToolOutputConfig,
 ) -> Result<PreparedExchangeMessages, &'static str> {
     let init_params = match tool_output_cfg.delivery {
@@ -900,76 +964,56 @@ fn prepare_exchange_messages(
         return Err("native tool-output request exceeded maximum frame size");
     }
 
-    let delivery = match tool_output_cfg.delivery {
-        NativeNotificationDelivery::ToolOutput => {
-            let output_payload = FixedToolOutputPayload {
-                untrusted_data: true,
-                approval_id: &approved_ctx.approval_id,
-                claim_id: &claim.claim_id,
-                pending_since_seq: claim.pending_since_seq,
-                covered_up_to_seq: claim.covered_up_to_seq,
-                coalesced_count: claim.coalesced_count,
-                notice: approved_ctx.wakeup_message(),
-            };
-            let serialized_output = serde_json::to_string(&output_payload)
-                .map_err(|_| "native tool-output payload serialization failed")?;
-            let turn_start_req = serde_json::to_string(&json!({
-                "id": 4u64,
-                "method": "turn/start",
-                "params": {
-                    "threadId": tool_output_cfg.thread_id,
-                    "input": [],
-                    "toolOutput": {
-                        "name": NATIVE_TOOL_OUTPUT_NAME,
-                        "namespace": NATIVE_TOOL_OUTPUT_NAMESPACE,
-                        "output": serialized_output,
-                    }
-                }
-            }))
-            .map_err(|_| "native tool-output request serialization failed")?;
-            if turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
-                return Err("native tool-output request exceeded maximum frame size");
-            }
-            PreparedDeliveryMessages::ToolOutput { turn_start_req }
-        }
-        NativeNotificationDelivery::UserMessageSteer => {
-            let notice_text = approved_ctx.wakeup_message();
-            let idle_turn_start_req = serde_json::to_string(&json!({
-                "id": 4u64,
-                "method": "turn/start",
-                "params": {
-                    "threadId": tool_output_cfg.thread_id,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": notice_text,
+    let delivery = match payload {
+        NativeWakeupPayload::ApprovedSession {
+            claim,
+            approved_ctx,
+        } => match tool_output_cfg.delivery {
+            NativeNotificationDelivery::ToolOutput => {
+                let output_payload = FixedToolOutputPayload {
+                    untrusted_data: true,
+                    approval_id: &approved_ctx.approval_id,
+                    claim_id: &claim.claim_id,
+                    pending_since_seq: claim.pending_since_seq,
+                    covered_up_to_seq: claim.covered_up_to_seq,
+                    coalesced_count: claim.coalesced_count,
+                    notice: approved_ctx.wakeup_message(),
+                };
+                let serialized_output = serde_json::to_string(&output_payload)
+                    .map_err(|_| "native tool-output payload serialization failed")?;
+                let turn_start_req = serde_json::to_string(&json!({
+                    "id": 4u64,
+                    "method": "turn/start",
+                    "params": {
+                        "threadId": tool_output_cfg.thread_id,
+                        "input": [],
+                        "toolOutput": {
+                            "name": NATIVE_TOOL_OUTPUT_NAME,
+                            "namespace": NATIVE_TOOL_OUTPUT_NAMESPACE,
+                            "output": serialized_output,
                         }
-                    ]
+                    }
+                }))
+                .map_err(|_| "native tool-output request serialization failed")?;
+                if turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
+                    return Err("native tool-output request exceeded maximum frame size");
                 }
-            }))
-            .map_err(|_| "native tool-output request serialization failed")?;
-            if idle_turn_start_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
-                return Err("native tool-output request exceeded maximum frame size");
+                PreparedDeliveryMessages::ToolOutput { turn_start_req }
             }
-            let turns_list_req = serde_json::to_string(&json!({
-                "id": 4u64,
-                "method": "thread/turns/list",
-                "params": {
-                    "threadId": tool_output_cfg.thread_id,
-                    "limit": 1u32,
-                    "sortDirection": "desc",
-                    "itemsView": "summary",
-                }
-            }))
-            .map_err(|_| "native tool-output request serialization failed")?;
-            if turns_list_req.len() > MAX_NATIVE_WS_FRAME_BYTES {
-                return Err("native tool-output request exceeded maximum frame size");
+            NativeNotificationDelivery::UserMessageSteer => {
+                prepare_user_message_steer_delivery(tool_output_cfg, approved_ctx.wakeup_message())?
             }
-            PreparedDeliveryMessages::UserMessageSteer {
-                idle_turn_start_req,
-                turns_list_req,
-                notice_text,
+        },
+        NativeWakeupPayload::CoworkerJobUserMessage { notice_text } => {
+            if tool_output_cfg.delivery != NativeNotificationDelivery::UserMessageSteer {
+                return Err("coworker job wake-up requires user_message_steer delivery");
             }
+            if tool_output_cfg.has_legacy_model_metadata() {
+                return Err(
+                    "coworker job wake-up configuration must not include model or effort metadata",
+                );
+            }
+            prepare_user_message_steer_delivery(tool_output_cfg, notice_text)?
         }
     };
 
@@ -980,6 +1024,54 @@ fn prepare_exchange_messages(
         resume_req,
         delivery,
     })
+}
+
+#[cfg(unix)]
+async fn execute_prepared_ws_exchange(
+    tool_output_cfg: &NativeToolOutputConfig,
+    messages: &PreparedExchangeMessages,
+    timeout: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> WakeupOutcome {
+    let mut may_have_written = false;
+    let shutdown_check_rx = shutdown_rx.clone();
+
+    let exchange_result: Result<Result<(), &'static str>, &'static str> = tokio::select! {
+        biased;
+        _ = wait_for_shutdown(shutdown_rx) => {
+            Err("supervisor shutdown during native tool-output wake-up exchange")
+        }
+        timed = tokio::time::timeout(
+            timeout,
+            run_bounded_ws_exchange(
+                tool_output_cfg,
+                messages,
+                &mut may_have_written,
+                &shutdown_check_rx,
+                timeout,
+            ),
+        ) => {
+            match timed {
+                Ok(inner) => Ok(inner),
+                Err(_elapsed) => Err("native tool-output wake-up exchange timed out"),
+            }
+        }
+    };
+
+    match exchange_result {
+        Ok(Ok(())) => WakeupOutcome::Submitted,
+        Ok(Err(reason)) | Err(reason) => {
+            if may_have_written {
+                WakeupOutcome::Unknown {
+                    reason: reason.to_string(),
+                }
+            } else {
+                WakeupOutcome::Failed {
+                    error: reason.to_string(),
+                }
+            }
+        }
+    }
 }
 
 /// Executes one bounded JSON-RPC WebSocket wake-up exchange over the configured or resolved Unix domain socket.
@@ -1023,7 +1115,13 @@ pub(crate) async fn invoke_native_tool_output_wakeup(
             };
         }
 
-        let messages = match prepare_exchange_messages(claim, approved_ctx, tool_output_cfg) {
+        let messages = match prepare_exchange_messages(
+            NativeWakeupPayload::ApprovedSession {
+                claim,
+                approved_ctx,
+            },
+            tool_output_cfg,
+        ) {
             Ok(messages) => messages,
             Err(reason) => {
                 return WakeupOutcome::Failed {
@@ -1032,45 +1130,68 @@ pub(crate) async fn invoke_native_tool_output_wakeup(
             }
         };
 
-        let mut may_have_written = false;
-        let shutdown_check_rx = shutdown_rx.clone();
+        execute_prepared_ws_exchange(tool_output_cfg, &messages, config.timeout, shutdown_rx).await
+    }
+}
 
-        let exchange_result: Result<Result<(), &'static str>, &'static str> = tokio::select! {
-            biased;
-            _ = wait_for_shutdown(shutdown_rx) => {
-                Err("supervisor shutdown during native tool-output wake-up exchange")
-            }
-            timed = tokio::time::timeout(
-                config.timeout,
-                run_bounded_ws_exchange(
-                    tool_output_cfg,
-                    &messages,
-                    &mut may_have_written,
-                    &shutdown_check_rx,
-                    config.timeout,
-                ),
-            ) => {
-                match timed {
-                    Ok(inner) => Ok(inner),
-                    Err(_elapsed) => Err("native tool-output wake-up exchange timed out"),
-                }
+/// Executes one bounded JSON-RPC WebSocket Coworker user-message/steer wake-up exchange over the
+/// configured or resolved Unix domain socket without requiring an approved-session claim or batch.
+pub(crate) async fn invoke_native_coworker_user_message_wakeup(
+    tool_output_cfg: &NativeToolOutputConfig,
+    notice_text: String,
+    timeout: Duration,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> WakeupOutcome {
+    #[cfg(not(unix))]
+    {
+        let _ = (tool_output_cfg, notice_text, timeout, shutdown_rx);
+        WakeupOutcome::Failed {
+            error: "unsupported platform: native coworker job wake-up transport is only supported on Unix"
+                .to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        if *shutdown_rx.borrow() {
+            return WakeupOutcome::Failed {
+                error: "supervisor shutdown before native tool-output wake-up started".to_string(),
+            };
+        }
+
+        if tool_output_cfg.delivery != NativeNotificationDelivery::UserMessageSteer {
+            return WakeupOutcome::Failed {
+                error: "coworker job wake-up requires user_message_steer delivery".to_string(),
+            };
+        }
+
+        if tool_output_cfg.has_legacy_model_metadata() {
+            return WakeupOutcome::Failed {
+                error:
+                    "coworker job wake-up configuration must not include model or effort metadata"
+                        .to_string(),
+            };
+        }
+
+        if tool_output_cfg.validate().is_err() {
+            return WakeupOutcome::Failed {
+                error: "native tool-output configuration validation failed".to_string(),
+            };
+        }
+
+        let messages = match prepare_exchange_messages(
+            NativeWakeupPayload::CoworkerJobUserMessage { notice_text },
+            tool_output_cfg,
+        ) {
+            Ok(messages) => messages,
+            Err(reason) => {
+                return WakeupOutcome::Failed {
+                    error: reason.to_string(),
+                };
             }
         };
 
-        match exchange_result {
-            Ok(Ok(())) => WakeupOutcome::Submitted,
-            Ok(Err(reason)) | Err(reason) => {
-                if may_have_written {
-                    WakeupOutcome::Unknown {
-                        reason: reason.to_string(),
-                    }
-                } else {
-                    WakeupOutcome::Failed {
-                        error: reason.to_string(),
-                    }
-                }
-            }
-        }
+        execute_prepared_ws_exchange(tool_output_cfg, &messages, timeout, shutdown_rx).await
     }
 }
 
