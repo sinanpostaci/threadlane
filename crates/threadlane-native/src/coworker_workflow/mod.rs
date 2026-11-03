@@ -33,6 +33,9 @@ pub mod candidate;
 pub mod checks;
 /// Serializable data contracts, validation rules, deterministic digests, and independence proofs.
 pub mod contracts;
+/// Automatic Coworker workflow controller (Phase 1: admission, physical ownership, original
+/// `Coder` host task reconciliation, dependency-seal gating, and bounded parallel dispatch).
+pub mod controller;
 /// Typed controller execution configuration/envelope, frozen check command specifications,
 /// per-task and job-wide correction/attempt/role budgets, declared interface-independence
 /// completeness receipts, derived correction attempt receipts, and per-job driver lease state.
@@ -46,6 +49,7 @@ pub mod store;
 
 pub use checks::*;
 pub use contracts::*;
+pub use controller::*;
 pub use controller_policy::*;
 pub use ownership::*;
 pub use planning::*;
