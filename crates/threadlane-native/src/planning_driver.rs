@@ -4,23 +4,238 @@
 //! [`CoworkerPlanningService`] while holding a live [`CoworkerJobOwnershipGuard`] across the
 //! entire service `.await` boundary and outcome recording.
 
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
 use serde::{Deserialize, Serialize};
 use threadlane_workflow::{PlanStatus, ScopedWorkflow, WorkflowRole};
 
 use crate::coworker_workflow::{
-    ArchitectConsultationRequestOutcome, CoworkerJobOwnershipGuard, CoworkerPlanningService,
-    HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanOutcome,
+    ArchitectConsultationRequestOutcome, CanonicalProjectBaseRef, CoworkerJobLockState,
+    CoworkerJobOwnershipGuard, CoworkerOwnershipSummary, CoworkerPlanningService,
+    CoworkerWorkflowStore, HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanOutcome,
     OrchestratorPlanningDecision, PersistedPlanningCallArtifact, PlanningAdviceGrant,
-    PlanningArtifactOutcomeKind, PlanningReservationStatus, StructuredOrchestratorOutput,
-    MAX_ORCHESTRATOR_ARCHITECT_ROUNDS, MAX_PLANNING_ARTIFACT_BYTES,
+    PlanningArtifactOutcomeKind, PlanningGrantStatus, PlanningReservationStatus,
+    StructuredOrchestratorOutput, MAX_COWORKER_ID_LEN, MAX_ORCHESTRATOR_ARCHITECT_ROUNDS,
+    MAX_PLANNING_ARTIFACT_BYTES,
 };
 use crate::error::{NativeError, NativeErrorCode};
-use crate::fs_safety::{constant_time_str_eq, read_private_file_bounded};
+use crate::fs_safety::{
+    constant_time_str_eq, ensure_platform_supported, prepare_private_dir,
+    read_private_file_bounded, validate_absolute_no_symlink_components,
+    validate_bounded_identifier,
+};
 use crate::mcp_pair::open_workflow_stores;
 use crate::planning_commands::{
-    current_wall_clock_ms, PlanningCommandPayload, PlanningCommandRecord, PlanningCommandResultRef,
-    PlanningCommandStatus, PlanningCommandStore,
+    current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandPayload,
+    PlanningCommandRecord, PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
 };
+use crate::profile_flow::SelectedRoleChoice;
+use crate::role_flow::read_registry_snapshot_readonly;
+
+/// Canonical private (`0700`) subdirectory name under `plans_dir` for durable planning commands
+/// and live job-ownership locks.
+pub const PLANNING_COMMANDS_DIR_NAME: &str = "coworker-planning-commands";
+
+/// Alias for [`PLANNING_COMMANDS_DIR_NAME`].
+pub const COWORKER_PLANNING_COMMANDS_DIR: &str = PLANNING_COMMANDS_DIR_NAME;
+
+/// Canonical private (`0700`) subdirectory name under `plans_dir` for persisted planning call
+/// artifacts and snapshots.
+pub const PLANNING_ARTIFACTS_DIR_NAME: &str = "coworker-planning-artifacts";
+
+/// Alias for [`PLANNING_ARTIFACTS_DIR_NAME`].
+pub const COWORKER_PLANNING_ARTIFACTS_DIR: &str = PLANNING_ARTIFACTS_DIR_NAME;
+
+/// Returns the canonical planning commands directory path under `plans_dir`.
+#[must_use]
+pub fn planning_commands_dir(plans_dir: &Path) -> PathBuf {
+    plans_dir.join(PLANNING_COMMANDS_DIR_NAME)
+}
+
+/// Returns the canonical planning artifacts directory path under `plans_dir`.
+#[must_use]
+pub fn planning_artifacts_dir(plans_dir: &Path) -> PathBuf {
+    plans_dir.join(PLANNING_ARTIFACTS_DIR_NAME)
+}
+
+/// Bounded, prompt-redacted summary of a [`PlanningCommandRecord`] for CLI and MCP responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningCommandSummary {
+    /// Deterministic command identifier (`pcm_<32hex>`).
+    pub command_id: String,
+    /// Idempotent caller request key.
+    pub command_key: String,
+    /// Frozen internal service request key (`psr_<32hex>`).
+    pub service_request_key: String,
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Standing [`PlanningAdviceGrant::grant_id`] authorizing this command.
+    pub grant_id: String,
+    /// Target [`crate::coworker_workflow::CoworkerJobRecord::job_id`] when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Target or published workflow `plan_id` when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Primary planning role (`Architect` or `Orchestrator`).
+    pub role: WorkflowRole,
+    /// Resolved headless worker choice verified against the grant profile and policy at enqueue.
+    pub selected_choice: SelectedRoleChoice,
+    /// Canonical repository and immutable base commit/tree verified at enqueue.
+    pub call_project_base: CanonicalProjectBaseRef,
+    /// 64-character lowercase hex SHA-256 context digest for the command.
+    pub context_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the caller's semantic request body.
+    pub request_body_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the immutable command fields and frozen payload.
+    pub command_digest: String,
+    /// Current command status (`Queued`, `Running`, `Completed`, `KnownFailed`, or `Unknown`).
+    pub status: PlanningCommandStatus,
+    /// Explicit marker that the command outcome is uncertain and requires artifact/receipt reconciliation.
+    pub pending_reconciliation: bool,
+    /// Public ownership summary bound when claimed by a live [`CoworkerJobOwnershipGuard`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Verified service result reference when `status == Completed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<PlanningCommandResultRef>,
+    /// Bounded diagnostic message when `KnownFailed` or `Unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    /// Local wall-clock timestamp (ms since Unix epoch) when the command was enqueued.
+    pub enqueued_at_ms: u64,
+    /// Local wall-clock timestamp (ms since Unix epoch) when claimed for `Running`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    /// Local wall-clock timestamp (ms since Unix epoch) when last updated.
+    pub updated_at_ms: u64,
+    /// Local wall-clock timestamp (ms since Unix epoch) when `Completed` or `KnownFailed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+}
+
+impl PlanningCommandSummary {
+    /// Builds a prompt-redacted [`PlanningCommandSummary`] from a [`PlanningCommandRecord`].
+    #[must_use]
+    pub fn from_record(record: &PlanningCommandRecord) -> Self {
+        let job_id = match &record.payload {
+            PlanningCommandPayload::Architect(_) => None,
+            PlanningCommandPayload::Orchestrator(req) => Some(req.job_id.clone()),
+        };
+        let plan_id = match &record.result_ref {
+            Some(PlanningCommandResultRef::OrchestratorPlan {
+                planning_result, ..
+            }) => Some(planning_result.plan_id.clone()),
+            _ => match &record.payload {
+                PlanningCommandPayload::Orchestrator(req) => req.plan_id.clone(),
+                PlanningCommandPayload::Architect(_) => None,
+            },
+        };
+        Self {
+            command_id: record.command_id.clone(),
+            command_key: record.command_key.clone(),
+            service_request_key: record.service_request_key.clone(),
+            binding_id: record.binding_id.clone(),
+            thread_uuid: record.thread_uuid.clone(),
+            grant_id: record.grant_id.clone(),
+            job_id,
+            plan_id,
+            role: record.role,
+            selected_choice: record.selected_choice.clone(),
+            call_project_base: record.call_project_base.clone(),
+            context_digest: record.context_digest.clone(),
+            request_body_digest: record.request_body_digest.clone(),
+            command_digest: record.command_digest.clone(),
+            status: record.status,
+            pending_reconciliation: record.pending_reconciliation,
+            owner_summary: record.owner_summary.clone(),
+            result_ref: record.result_ref.clone(),
+            diagnostic: record.diagnostic.clone(),
+            enqueued_at_ms: record.enqueued_at_ms,
+            started_at_ms: record.started_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            completed_at_ms: record.completed_at_ms,
+        }
+    }
+}
+
+/// Bounded read-only page of [`PlanningCommandSummary`] rows without raw prompts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningCommandPage {
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Current [` crate::planning_commands::PlanningCommandBindingLedger::revision`] (`0` when uninitialized).
+    pub ledger_revision: u64,
+    /// Bounded prompt-redacted command summaries.
+    pub commands: Vec<PlanningCommandSummary>,
+    /// Opaque pagination cursor (`command_id` of the last returned row) when more rows exist.
+    pub next_cursor: Option<String>,
+}
+
+/// Prompt-redacted summary of [`PlanningCommandExecutionOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningCommandExecutionSummary {
+    /// Flattened [`PlanningCommandSummary`] fields (`command_id`, `status`, `result_ref`, etc.).
+    #[serde(flatten)]
+    pub summary: PlanningCommandSummary,
+    /// Nested prompt-redacted command summary.
+    pub command: PlanningCommandSummary,
+    /// `true` when the command was already `Completed` and returned after re-verifying the stored
+    /// outcome without invoking a model call.
+    pub was_already_completed: bool,
+    /// `true` when an interrupted `Unknown` command was reconciled to `Completed` from a complete,
+    /// verified existing service outcome on disk without making a new model call.
+    pub reconciled_from_existing: bool,
+}
+
+impl PlanningCommandExecutionSummary {
+    /// Converts a [`PlanningCommandExecutionOutcome`] into a prompt-redacted summary.
+    #[must_use]
+    pub fn from_outcome(outcome: &PlanningCommandExecutionOutcome) -> Self {
+        let summary = PlanningCommandSummary::from_record(&outcome.command);
+        Self {
+            command: summary.clone(),
+            summary,
+            was_already_completed: outcome.was_already_completed,
+            reconciled_from_existing: outcome.reconciled_from_existing,
+        }
+    }
+}
+
+/// Honest submission state returned by [`start_planning_command_detached`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningCommandStartStatus {
+    /// Detached finite `execute-command` subprocess was spawned; not proof of `Running` or `Completed`.
+    SubmissionRequested,
+    /// Command already has active `Running` ownership evidence; no duplicate process was launched.
+    AlreadyRunning,
+    /// Command is already `Completed` with verified artifacts; no duplicate process was launched.
+    AlreadyCompleted,
+}
+
+/// Honest response returned by `coworker-planning start-command`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningCommandStartOutcome {
+    /// Honest submission state (`submission_requested`, `already_running`, or `already_completed`).
+    pub submission_status: PlanningCommandStartStatus,
+    /// `true` when a detached `execute-command` subprocess was launched by this call.
+    pub submission_requested: bool,
+    /// `true` when a detached `execute-command` subprocess was launched by this call.
+    pub launched: bool,
+    /// Diagnostic OS process ID of the spawned child when launched; never ownership or completion proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_hint: Option<u32>,
+    /// Flattened [`PlanningCommandSummary`] fields reflecting the current verified command state.
+    #[serde(flatten)]
+    pub summary: PlanningCommandSummary,
+    /// Nested prompt-redacted command summary.
+    pub command: PlanningCommandSummary,
+}
 
 /// Outcome of executing or reconciling a single durable [`PlanningCommandRecord`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +419,13 @@ fn open_scoped_workflow_for_binding(
     binding_id: &str,
 ) -> Result<ScopedWorkflow, NativeError> {
     verify_store_and_service_alignment(command_store, service)?;
+    open_scoped_workflow_for_store(command_store, binding_id)
+}
+
+fn open_scoped_workflow_for_store(
+    command_store: &PlanningCommandStore,
+    binding_id: &str,
+) -> Result<ScopedWorkflow, NativeError> {
     let (registry, plans) = open_workflow_stores(
         Some(command_store.registry_dir()),
         Some(command_store.workflow_store().plans_dir()),
@@ -891,13 +1113,22 @@ fn verify_published_plan_if_required(
     cmd: &PlanningCommandRecord,
     result_ref: &PlanningCommandResultRef,
 ) -> Result<(), NativeError> {
+    verify_store_and_service_alignment(command_store, service)?;
+    verify_published_plan_for_store(command_store, cmd, result_ref)
+}
+
+fn verify_published_plan_for_store(
+    command_store: &PlanningCommandStore,
+    cmd: &PlanningCommandRecord,
+    result_ref: &PlanningCommandResultRef,
+) -> Result<(), NativeError> {
     let PlanningCommandResultRef::OrchestratorPlan {
         planning_result, ..
     } = result_ref
     else {
         return Ok(());
     };
-    let scoped = open_scoped_workflow_for_binding(command_store, service, &cmd.binding_id)?;
+    let scoped = open_scoped_workflow_for_store(command_store, &cmd.binding_id)?;
     let page = scoped
         .get_plan(
             &planning_result.plan_id,
@@ -942,4 +1173,518 @@ fn verify_published_plan_if_required(
         ));
     }
     Ok(())
+}
+
+/// Opens a [`PlanningCommandDriver`] under canonical `plans_dir` and `registry_dir`, creating the
+/// private (`0700`) [`PLANNING_COMMANDS_DIR_NAME`] and [`PLANNING_ARTIFACTS_DIR_NAME`]
+/// subdirectories if they do not yet exist.
+pub fn open_planning_driver_for_plans_dir(
+    plans_dir: &Path,
+    registry_dir: &Path,
+) -> Result<PlanningCommandDriver, NativeError> {
+    ensure_platform_supported()?;
+    let workflow_store = CoworkerWorkflowStore::new(plans_dir)?;
+    let commands_dir = planning_commands_dir(workflow_store.plans_dir());
+    let artifacts_dir = planning_artifacts_dir(workflow_store.plans_dir());
+    let _ = prepare_private_dir(&commands_dir, "planning_commands_dir")?;
+    let _ = prepare_private_dir(&artifacts_dir, "planning_artifacts_dir")?;
+    let service =
+        CoworkerPlanningService::new(workflow_store.clone(), registry_dir, &artifacts_dir)?;
+    let command_store =
+        PlanningCommandStore::open_existing(&commands_dir, workflow_store, registry_dir)?
+            .with_artifacts_dir(&artifacts_dir)?;
+    PlanningCommandDriver::new(command_store, service)
+}
+
+/// Enqueues a [`PlanningCommandRecord`] under `plans_dir` and returns its prompt-redacted
+/// [`PlanningCommandSummary`].
+pub fn enqueue_planning_command_summary(
+    plans_dir: &Path,
+    registry_dir: &Path,
+    request: &EnqueuePlanningCommandRequest,
+) -> Result<PlanningCommandSummary, NativeError> {
+    ensure_platform_supported()?;
+    let workflow_store = CoworkerWorkflowStore::new(plans_dir)?;
+    let commands_dir = planning_commands_dir(workflow_store.plans_dir());
+    let artifacts_dir = planning_artifacts_dir(workflow_store.plans_dir());
+    let _ = prepare_private_dir(&commands_dir, "planning_commands_dir")?;
+    let _ = prepare_private_dir(&artifacts_dir, "planning_artifacts_dir")?;
+    let command_store =
+        PlanningCommandStore::open_existing(&commands_dir, workflow_store, registry_dir)?
+            .with_artifacts_dir(&artifacts_dir)?;
+    let mut record = command_store.enqueue_command(request)?;
+    if record.status == PlanningCommandStatus::Completed {
+        let verified_ref = command_store.verify_completed_command(&record)?;
+        verify_published_plan_for_store(&command_store, &record, &verified_ref)?;
+        record.result_ref = Some(verified_ref);
+    }
+    Ok(PlanningCommandSummary::from_record(&record))
+}
+
+/// Pure read-only lookup of a single planning command summary by `(binding_id, thread_uuid, command_id)`.
+///
+/// Never creates directories, state files, or lockfiles when [`PLANNING_COMMANDS_DIR_NAME`] or
+/// [`PLANNING_ARTIFACTS_DIR_NAME`] is absent. Requires [`PLANNING_ARTIFACTS_DIR_NAME`] and the
+/// persisted report artifact on disk when verifying a `Completed` command.
+pub fn get_planning_command_summary_readonly(
+    plans_dir: &Path,
+    registry_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+    command_id: &str,
+) -> Result<Option<PlanningCommandSummary>, NativeError> {
+    validate_bounded_identifier(command_id, "command_id", MAX_COWORKER_ID_LEN)?;
+    let Some(command_store) = open_planning_command_store_readonly(plans_dir, registry_dir)? else {
+        return Ok(None);
+    };
+    let Some(mut cmd) = command_store.get_command(binding_id, thread_uuid, command_id)? else {
+        return Ok(None);
+    };
+    cmd.validate()?;
+    if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "planning command scope does not match requested binding_id and thread_uuid",
+        ));
+    }
+    if cmd.status == PlanningCommandStatus::Completed {
+        let verified_ref = command_store.verify_completed_command(&cmd)?;
+        verify_published_plan_for_store(&command_store, &cmd, &verified_ref)?;
+        cmd.result_ref = Some(verified_ref);
+    }
+    Ok(Some(PlanningCommandSummary::from_record(&cmd)))
+}
+
+/// Pure read-only bounded list of prompt-redacted [`PlanningCommandSummary`] rows for `(binding_id, thread_uuid)`.
+///
+/// Never creates directories, state files, or lockfiles when [`PLANNING_COMMANDS_DIR_NAME`] or
+/// [`PLANNING_ARTIFACTS_DIR_NAME`] is absent.
+pub fn list_planning_command_summaries_readonly(
+    plans_dir: &Path,
+    registry_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+    limit: usize,
+    cursor: Option<&str>,
+) -> Result<PlanningCommandPage, NativeError> {
+    let Some(command_store) = open_planning_command_store_readonly(plans_dir, registry_dir)? else {
+        return Ok(PlanningCommandPage {
+            binding_id: binding_id.to_string(),
+            ledger_revision: 0,
+            commands: Vec::new(),
+            next_cursor: None,
+        });
+    };
+    let ledger = command_store.read_binding_ledger(binding_id)?;
+    if let Some(ref pinned) = ledger.thread_uuid {
+        if pinned != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "thread_uuid does not match the thread pinned to this binding's command ledger",
+            ));
+        }
+    }
+    let records = command_store.list_commands(binding_id, thread_uuid)?;
+    let mut summaries = Vec::with_capacity(records.len());
+    for mut cmd in records {
+        if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "planning command scope does not match requested binding_id and thread_uuid",
+            ));
+        }
+        if cmd.status == PlanningCommandStatus::Completed {
+            let verified_ref = command_store.verify_completed_command(&cmd)?;
+            verify_published_plan_for_store(&command_store, &cmd, &verified_ref)?;
+            cmd.result_ref = Some(verified_ref);
+        }
+        summaries.push(PlanningCommandSummary::from_record(&cmd));
+    }
+
+    let start = match cursor {
+        Some(cursor_id) => {
+            let pos = summaries
+                .iter()
+                .position(|s| s.command_id == cursor_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "pagination cursor was not found in this binding's planning command list",
+                    )
+                })?;
+            pos + 1
+        }
+        None => 0,
+    };
+    let end = start.saturating_add(limit).min(summaries.len());
+    let page_items = summaries[start..end].to_vec();
+    let next_cursor = if end < summaries.len() {
+        page_items.last().map(|s| s.command_id.clone())
+    } else {
+        None
+    };
+
+    Ok(PlanningCommandPage {
+        binding_id: binding_id.to_string(),
+        ledger_revision: ledger.revision,
+        commands: page_items,
+        next_cursor,
+    })
+}
+
+/// Validates a planning command under `(binding_id, thread_uuid, command_id)` and, when `Queued`,
+/// spawns a detached finite one-command subprocess of the canonical `current_exe()` running
+/// `coworker-planning execute-command --command-id <ID>` with the exact fixed store and scope arguments.
+#[allow(clippy::too_many_arguments)]
+pub fn start_planning_command_detached(
+    state_dir: &Path,
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+    command_id: &str,
+) -> Result<PlanningCommandStartOutcome, NativeError> {
+    validate_bounded_identifier(command_id, "command_id", MAX_COWORKER_ID_LEN)?;
+    let Some(command_store) = open_planning_command_store_readonly(plans_dir, registry_dir)? else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("planning command `{command_id}` was not found in binding `{binding_id}`"),
+        ));
+    };
+    let mut cmd = command_store
+        .get_command(binding_id, thread_uuid, command_id)?
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("planning command `{command_id}` was not found in binding `{binding_id}`"),
+            )
+        })?;
+    cmd.validate()?;
+    if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "planning command scope does not match requested binding_id and thread_uuid",
+        ));
+    }
+
+    match cmd.status {
+        PlanningCommandStatus::Completed => {
+            let verified_ref = command_store.verify_completed_command(&cmd)?;
+            verify_published_plan_for_store(&command_store, &cmd, &verified_ref)?;
+            cmd.result_ref = Some(verified_ref);
+            let summary = PlanningCommandSummary::from_record(&cmd);
+            Ok(PlanningCommandStartOutcome {
+                submission_status: PlanningCommandStartStatus::AlreadyCompleted,
+                submission_requested: false,
+                launched: false,
+                pid_hint: None,
+                command: summary.clone(),
+                summary,
+            })
+        }
+        PlanningCommandStatus::Running => {
+            let summary = PlanningCommandSummary::from_record(&cmd);
+            Ok(PlanningCommandStartOutcome {
+                submission_status: PlanningCommandStartStatus::AlreadyRunning,
+                submission_requested: false,
+                launched: false,
+                pid_hint: None,
+                command: summary.clone(),
+                summary,
+            })
+        }
+        PlanningCommandStatus::Unknown => Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            format!(
+                "planning command `{command_id}` is Unknown pending reconciliation and cannot be freshly launched"
+            ),
+        )),
+        PlanningCommandStatus::KnownFailed => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "planning command `{command_id}` already terminated in KnownFailed: {}",
+                cmd.diagnostic
+                    .as_deref()
+                    .unwrap_or("no diagnostic recorded")
+            ),
+        )),
+        PlanningCommandStatus::Queued => {
+            validate_queued_command_ready_for_launch(&command_store, &cmd)?;
+            let artifacts_dir = planning_artifacts_dir(command_store.workflow_store().plans_dir());
+            let _ = prepare_private_dir(&artifacts_dir, "planning_artifacts_dir")?;
+            let exe = resolve_canonical_current_exe()?;
+
+            let mut child_cmd = Command::new(&exe);
+            child_cmd
+                .arg("--state-dir")
+                .arg(state_dir)
+                .arg("--registry-dir")
+                .arg(registry_dir)
+                .arg("--plans-dir")
+                .arg(plans_dir)
+                .arg("--authority-dir")
+                .arg(authority_dir)
+                .arg("--sessions-dir")
+                .arg(sessions_dir)
+                .arg("--binding")
+                .arg(binding_id)
+                .arg("--thread")
+                .arg(thread_uuid)
+                .arg("coworker-planning")
+                .arg("execute-command")
+                .arg("--command-id")
+                .arg(command_id)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                child_cmd.process_group(0);
+            }
+
+            let child = child_cmd.spawn().map_err(|err| {
+                NativeError::new(
+                    NativeErrorCode::IoError,
+                    format!(
+                        "failed to spawn detached coworker-planning execute-command process: {err}"
+                    ),
+                )
+            })?;
+            let pid_hint = Some(child.id());
+            drop(child);
+
+            let summary = PlanningCommandSummary::from_record(&cmd);
+            Ok(PlanningCommandStartOutcome {
+                submission_status: PlanningCommandStartStatus::SubmissionRequested,
+                submission_requested: true,
+                launched: true,
+                pid_hint,
+                command: summary.clone(),
+                summary,
+            })
+        }
+    }
+}
+
+fn open_planning_command_store_readonly(
+    plans_dir: &Path,
+    registry_dir: &Path,
+) -> Result<Option<PlanningCommandStore>, NativeError> {
+    ensure_platform_supported()?;
+    let clean_plans_dir = validate_absolute_no_symlink_components(plans_dir, "plans_dir")?;
+    let _ = validate_absolute_no_symlink_components(registry_dir, "registry_dir")?;
+    let commands_dir = planning_commands_dir(&clean_plans_dir);
+    if !inspect_existing_private_subdir_readonly(&commands_dir, "planning_commands_dir")? {
+        return Ok(None);
+    }
+    let workflow_store = CoworkerWorkflowStore::new(&clean_plans_dir)?;
+    let mut store =
+        PlanningCommandStore::open_existing(&commands_dir, workflow_store, registry_dir)?;
+    let artifacts_dir = planning_artifacts_dir(&clean_plans_dir);
+    if inspect_existing_private_subdir_readonly(&artifacts_dir, "planning_artifacts_dir")? {
+        store = store.with_artifacts_dir(&artifacts_dir)?;
+    }
+    Ok(Some(store))
+}
+
+fn inspect_existing_private_subdir_readonly(dir: &Path, label: &str) -> Result<bool, NativeError> {
+    let clean = validate_absolute_no_symlink_components(dir, label)?;
+    let meta = match fs::symlink_metadata(&clean) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => {
+            return Err(NativeError::new(
+                NativeErrorCode::IoError,
+                format!("failed to inspect {label} directory metadata"),
+            ));
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!("{label} must be a private non-symlink directory"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if (meta.permissions().mode() & 0o077) != 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!("{label} directory has insecure permissions (expected 0700)"),
+            ));
+        }
+    }
+    Ok(true)
+}
+
+fn validate_queued_command_ready_for_launch(
+    command_store: &PlanningCommandStore,
+    cmd: &PlanningCommandRecord,
+) -> Result<(), NativeError> {
+    let cmd_ledger = command_store.read_binding_ledger(&cmd.binding_id)?;
+    if cmd_ledger
+        .commands
+        .iter()
+        .any(|c| c.status.is_in_flight_or_unknown())
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "another planning command on this binding is Running or Unknown pending reconciliation",
+        ));
+    }
+    let key = cmd.ownership_key()?;
+    if matches!(
+        command_store.ownership_store().inspect_job_lock(&key)?,
+        CoworkerJobLockState::HeldByActiveProcess { .. }
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            format!(
+                "planning command `{}` ownership lock is already held by an active process",
+                cmd.command_id
+            ),
+        ));
+    }
+
+    let now_ms = current_wall_clock_ms()?;
+    let wf_ledger = command_store
+        .workflow_store()
+        .read_binding_ledger(&cmd.binding_id)?;
+    if wf_ledger.binding_id != cmd.binding_id
+        || wf_ledger.thread_uuid.as_deref() != Some(cmd.thread_uuid.as_str())
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "binding workflow ledger does not match command binding_id and thread_uuid",
+        ));
+    }
+    if wf_ledger
+        .planning_grants
+        .iter()
+        .any(|g| g.reservations.iter().any(|r| r.status.is_ambiguous()))
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "a planning call reservation on this binding has an uncertain outcome pending reconciliation",
+        ));
+    }
+    let grant = wf_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == cmd.grant_id)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("standing grant `{}` was not found in binding", cmd.grant_id),
+            )
+        })?;
+    grant.validate()?;
+    if grant.binding_id != cmd.binding_id
+        || grant.thread_uuid != cmd.thread_uuid
+        || grant.status != PlanningGrantStatus::Active
+        || grant.revoked_at_ms.is_some()
+        || grant.revoked_reason.is_some()
+        || now_ms >= grant.expires_at_ms
+        || now_ms < grant.created_at_ms
+        || grant.usage.reserved_total_calls >= grant.budget.max_total_calls
+        || (cmd.role == WorkflowRole::Architect
+            && grant.usage.reserved_architect_calls >= grant.budget.max_architect_calls)
+        || (cmd.role == WorkflowRole::Orchestrator
+            && grant.usage.reserved_orchestrator_calls >= grant.budget.max_orchestrator_calls)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "standing planning grant is no longer active or within budget",
+        ));
+    }
+    let reg_snapshot = read_registry_snapshot_readonly(command_store.registry_dir())?;
+    if reg_snapshot.revision != grant.registry_revision {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "workflow registry revision drifted from standing grant",
+        ));
+    }
+    cmd.call_project_base.verify_live_repository()?;
+
+    if let PlanningCommandPayload::Orchestrator(req) = &cmd.payload {
+        let job = wf_ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == req.job_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!("requested job_id `{}` was not found in binding", req.job_id),
+                )
+            })?;
+        job.validate()?;
+        if job.binding_id != cmd.binding_id
+            || job.thread_uuid != cmd.thread_uuid
+            || wf_ledger
+                .jobs
+                .iter()
+                .any(|j| j.supersedes_job_id.as_deref() == Some(job.job_id.as_str()))
+            || job.holds.iter().any(|h| h.active)
+            || job.approval_linkage.is_some()
+            || !job.work_brief.is_ready_for_execution_planning()
+            || job.work_brief.project_base != cmd.call_project_base
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "target CoworkerJobRecord is no longer ready for Orchestrator planning",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_canonical_current_exe() -> Result<PathBuf, NativeError> {
+    let raw_exe = std::env::current_exe().map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::IoError,
+            "failed to resolve current executable path",
+        )
+    })?;
+    if !raw_exe.is_absolute() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "current_exe path must be absolute",
+        ));
+    }
+    let canonical = fs::canonicalize(&raw_exe).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "failed to canonicalize current executable path",
+        )
+    })?;
+    let clean = validate_absolute_no_symlink_components(&canonical, "current_exe")?;
+    let meta = fs::symlink_metadata(&clean).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "failed to inspect canonical current executable metadata",
+        )
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "canonical current_exe must be a regular non-symlink file",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if (mode & 0o111) == 0 || (mode & 0o022) != 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "canonical current_exe must be executable and not group- or world-writable",
+            ));
+        }
+    }
+    Ok(clean)
 }

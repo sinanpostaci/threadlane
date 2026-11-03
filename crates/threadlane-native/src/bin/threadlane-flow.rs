@@ -26,8 +26,8 @@ use threadlane_authority::{AuthorityError, AuthorityStore};
 use threadlane_core::observation::{
     append_journal_record, current_observation_time_ms, current_process_instance,
     generate_observation_id, read_env_parent_request_id, read_env_plan_id, ObservationActor,
-    ObservationCallState, ObservationDelivery, ObservationDeliveryStage, ObservationJournalRecord,
-    ObservationRecordPhase,
+    ObservationCallState, ObservationDelivery, ObservationDeliveryStage, ObservationExecutor,
+    ObservationJournalRecord, ObservationRecordPhase,
 };
 use threadlane_host::{ApprovedHostClient, HostError};
 use threadlane_native::coworker_grants::{
@@ -44,6 +44,12 @@ use threadlane_native::coworker_workflow::{
 };
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
+};
+use threadlane_native::planning_commands::EnqueuePlanningCommandRequest;
+use threadlane_native::planning_driver::{
+    enqueue_planning_command_summary, get_planning_command_summary_readonly,
+    list_planning_command_summaries_readonly, open_planning_driver_for_plans_dir,
+    start_planning_command_detached, PlanningCommandExecutionSummary, PlanningCommandSummary,
 };
 use threadlane_native::role_flow::{
     self, CreateRoleFlowCycleRequest, ReconcileRoleHandoffRequest, ReservePackageClosureRequest,
@@ -216,6 +222,49 @@ enum FlowCommand {
         visible_alias = "execution-envelope"
     )]
     CoworkerExecution(CoworkerExecutionCommand),
+    /// Enqueue, inspect, or execute durable Coworker planning commands (enqueue | get | list | execute-command | start-command).
+    #[command(subcommand, name = "coworker-planning")]
+    CoworkerPlanning(CoworkerPlanningCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum CoworkerPlanningCommand {
+    /// Validate and enqueue a durable planning command under an existing active planning grant.
+    Enqueue {
+        /// Absolute path to the private (`0600`) JSON [`EnqueuePlanningCommandRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+    },
+    /// Read one prompt-redacted planning command summary in the fixed binding and thread scope.
+    Get {
+        /// Planning command identifier (`pcm_<32hex>`).
+        #[arg(long = "command-id", value_name = "ID")]
+        command_id: String,
+    },
+    /// List bounded prompt-redacted planning command summary rows in the fixed binding and thread scope.
+    List {
+        /// Optional opaque pagination cursor (the last returned `command_id`).
+        #[arg(long = "cursor", value_name = "TEXT")]
+        cursor: Option<String>,
+
+        /// Maximum number of command rows to return (`1..=20`, default `20`).
+        #[arg(long = "limit", value_name = "N")]
+        limit: Option<usize>,
+    },
+    /// Execute or reconcile one durable planning command synchronously in the owned finite driver.
+    #[command(name = "execute-command")]
+    ExecuteCommand {
+        /// Planning command identifier (`pcm_<32hex>`).
+        #[arg(long = "command-id", value_name = "ID")]
+        command_id: String,
+    },
+    /// Validate and launch a detached finite `execute-command` subprocess of the canonical binary.
+    #[command(name = "start-command")]
+    StartCommand {
+        /// Planning command identifier (`pcm_<32hex>`).
+        #[arg(long = "command-id", value_name = "ID")]
+        command_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -466,6 +515,26 @@ impl FlowScoped for CoworkerJobRecord {
     }
 }
 
+impl FlowScoped for EnqueuePlanningCommandRequest {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for PlanningCommandSummary {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
 /// Deserialized private JSON body for `grant-record` before CLI flag enforcement.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -581,6 +650,19 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 ("flow.coworker-execution.inspect", false, false)
             }
         },
+        FlowCommand::CoworkerPlanning(sub) => match sub {
+            CoworkerPlanningCommand::Enqueue { .. } => {
+                ("flow.coworker-planning.enqueue", true, true)
+            }
+            CoworkerPlanningCommand::Get { .. } => ("flow.coworker-planning.get", false, false),
+            CoworkerPlanningCommand::List { .. } => ("flow.coworker-planning.list", false, false),
+            CoworkerPlanningCommand::ExecuteCommand { .. } => {
+                ("flow.coworker-planning.execute-command", true, true)
+            }
+            CoworkerPlanningCommand::StartCommand { .. } => {
+                ("flow.coworker-planning.start-command", true, true)
+            }
+        },
     };
     let parent_req = read_env_parent_request_id();
     let should_journal = is_mutating || (allow_parent_journal && parent_req.is_some());
@@ -592,6 +674,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
     let mut verified_job_id: Option<String> = None;
     let mut resolved_approval_id: Option<String> = None;
     let mut resolved_task_id: Option<String> = None;
+    let mut resolved_executor: Option<ObservationExecutor> = None;
     let started_at_ms = current_observation_time_ms();
     let actor = ObservationActor::unknown(Some("trusted_local_operator".to_string()));
     if should_journal {
@@ -931,6 +1014,22 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 &mut resolved_plan_id,
                 &mut resolved_approval_id,
             ),
+            FlowCommand::CoworkerPlanning(subcommand) => {
+                run_coworker_planning(
+                    subcommand,
+                    &state_dir,
+                    &registry_dir,
+                    &plans_dir,
+                    &authority_dir,
+                    &sessions_dir,
+                    &binding,
+                    &thread,
+                    &mut verified_job_id,
+                    &mut resolved_plan_id,
+                    &mut resolved_executor,
+                )
+                .await
+            }
         }
     }
     .await;
@@ -943,11 +1042,16 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 ObservationDeliveryStage::ResponseReturned,
                 format!("Completed {op_name}"),
             ),
-            Err(err) if err.code == "outcome_unknown" => (
-                ObservationCallState::Unknown,
-                ObservationDeliveryStage::Unknown,
-                format!("Outcome unknown for {op_name}: {}", err.code),
-            ),
+            Err(err)
+                if err.code == "outcome_unknown"
+                    || err.code == "ambiguous_wakeup_pending_reconciliation" =>
+            {
+                (
+                    ObservationCallState::Unknown,
+                    ObservationDeliveryStage::Unknown,
+                    format!("Outcome unknown for {op_name}: {}", err.code),
+                )
+            }
             Err(err) => (
                 ObservationCallState::Failed,
                 ObservationDeliveryStage::Failed,
@@ -978,7 +1082,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 title: op_name.replace('.', " "),
                 state: final_state,
                 actor: Some(actor),
-                executor: None,
+                executor: resolved_executor,
                 usage: None,
                 delivery: if parent_req.is_none() {
                     vec![ObservationDelivery {
@@ -1479,6 +1583,187 @@ fn run_coworker_execution(
     }
 }
 
+fn validate_command_id(value: &str) -> Result<(), OperatorCliError> {
+    validate_identifier("command_id", value)
+        .map(|_| ())
+        .map_err(|_| OperatorCliError::invalid_input("Invalid `--command-id` syntax."))
+}
+
+fn record_planning_observation_correlation(
+    summary: &PlanningCommandSummary,
+    verified_job_id: &mut Option<String>,
+    resolved_plan_id: &mut Option<String>,
+    resolved_executor: &mut Option<ObservationExecutor>,
+) {
+    if let Some(ref jid) = summary.job_id {
+        *verified_job_id = Some(jid.clone());
+    }
+    if let Some(ref pid) = summary.plan_id {
+        *resolved_plan_id = Some(pid.clone());
+    }
+    *resolved_executor = Some(ObservationExecutor {
+        tool: Some(summary.selected_choice.tool_id.clone()),
+        provider: Some(summary.selected_choice.adapter.as_str().to_string()),
+        role: Some(summary.role.as_str().to_string()),
+        requested_model: Some(summary.selected_choice.model_id.clone()),
+        observed_model: None,
+        requested_effort: summary.selected_choice.effort.clone(),
+        observed_effort: None,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_coworker_planning(
+    subcommand: CoworkerPlanningCommand,
+    state_dir: &Path,
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+    binding: &str,
+    thread: &str,
+    verified_job_id: &mut Option<String>,
+    resolved_plan_id: &mut Option<String>,
+    resolved_executor: &mut Option<ObservationExecutor>,
+) -> Result<(), OperatorCliError> {
+    match subcommand {
+        CoworkerPlanningCommand::Enqueue { request } => {
+            let enqueue_request: EnqueuePlanningCommandRequest = read_request(&request)?;
+            ensure_scope(
+                &enqueue_request,
+                binding,
+                thread,
+                "scope_mismatch",
+                REQUEST_SCOPE_MISMATCH,
+            )?;
+            if enqueue_request.payload.binding_id() != binding
+                || enqueue_request.payload.thread_uuid() != thread
+            {
+                return Err(OperatorCliError::new(
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                ));
+            }
+            let summary =
+                enqueue_planning_command_summary(plans_dir, registry_dir, &enqueue_request)
+                    .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &summary,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            record_planning_observation_correlation(
+                &summary,
+                verified_job_id,
+                resolved_plan_id,
+                resolved_executor,
+            );
+            write_result(binding, &summary, true)
+        }
+        CoworkerPlanningCommand::Get { command_id } => {
+            validate_command_id(&command_id)?;
+            let summary = get_planning_command_summary_readonly(
+                plans_dir,
+                registry_dir,
+                binding,
+                thread,
+                &command_id,
+            )
+            .map_err(|error| map_native_error(&error, false))?;
+            let Some(summary) = summary else {
+                return Err(OperatorCliError::new(
+                    "command_not_found",
+                    "Requested planning command was not found in this binding scope.",
+                ));
+            };
+            ensure_scope(
+                &summary,
+                binding,
+                thread,
+                "scope_mismatch",
+                STORED_SCOPE_MISMATCH,
+            )?;
+            write_result(binding, &summary, false)
+        }
+        CoworkerPlanningCommand::List { cursor, limit } => {
+            let (limit, cursor) = validate_list_args(limit, cursor)?;
+            let page = list_planning_command_summaries_readonly(
+                plans_dir,
+                registry_dir,
+                binding,
+                thread,
+                limit,
+                cursor.as_deref(),
+            )
+            .map_err(|error| map_native_error(&error, false))?;
+            for summary in &page.commands {
+                ensure_scope(
+                    summary,
+                    binding,
+                    thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+            }
+            write_result(binding, &page, false)
+        }
+        CoworkerPlanningCommand::ExecuteCommand { command_id } => {
+            validate_command_id(&command_id)?;
+            let driver = open_planning_driver_for_plans_dir(plans_dir, registry_dir)
+                .map_err(|error| map_native_error(&error, false))?;
+            let outcome = driver
+                .execute_command(binding, thread, &command_id)
+                .await
+                .map_err(|error| map_native_error(&error, true))?;
+            let exec_summary = PlanningCommandExecutionSummary::from_outcome(&outcome);
+            ensure_scope(
+                &exec_summary.summary,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            record_planning_observation_correlation(
+                &exec_summary.summary,
+                verified_job_id,
+                resolved_plan_id,
+                resolved_executor,
+            );
+            write_result(binding, &exec_summary, true)
+        }
+        CoworkerPlanningCommand::StartCommand { command_id } => {
+            validate_command_id(&command_id)?;
+            let start_outcome = start_planning_command_detached(
+                state_dir,
+                registry_dir,
+                plans_dir,
+                authority_dir,
+                sessions_dir,
+                binding,
+                thread,
+                &command_id,
+            )
+            .map_err(|error| map_native_error(&error, false))?;
+            ensure_scope(
+                &start_outcome.summary,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            record_planning_observation_correlation(
+                &start_outcome.summary,
+                verified_job_id,
+                resolved_plan_id,
+                resolved_executor,
+            );
+            write_result(binding, &start_outcome, true)
+        }
+    }
+}
+
 fn open_authority(
     registry_dir: &Path,
     plans_dir: &Path,
@@ -1545,6 +1830,9 @@ fn map_native_error(error: &NativeError, mutation: bool) -> OperatorCliError {
         NativeErrorCode::TimedOut => "Role-flow operation timed out before completion.",
         NativeErrorCode::AmbiguousTransportFailure => {
             "Role-flow operation may have crossed an execution boundary; inspect state before retrying."
+        }
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation => {
+            "Planning command or wakeup outcome is in flight or uncertain pending reconciliation; inspect state before retrying."
         }
         NativeErrorCode::TransportUnavailable => "Role-flow host transport is unavailable.",
         NativeErrorCode::ProtocolError

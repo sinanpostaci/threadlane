@@ -17,12 +17,20 @@ use threadlane_native::coworker_grants::{
     PlanningGrantSummary, PreparePlanningGrantRequest, RecordPlanningGrantRequest,
 };
 use threadlane_native::coworker_workflow::{
-    PlanningCallBudget, PlanningGrantStatus, PlanningReadOnlyCapabilities,
-    RevokePlanningGrantRequest,
+    ArchitectContextDependencies, CanonicalProjectBaseRef, CoworkerPlanningService,
+    CoworkerWorkflowStore, CreateCoworkerJobRequest, PlanningCallBudget, PlanningGrantStatus,
+    PlanningReadOnlyCapabilities, RevokePlanningGrantRequest, RunArchitectAdviceRequest, WorkBrief,
+    WorkBriefKind,
+};
+use threadlane_native::planning_driver::{
+    planning_artifacts_dir, planning_commands_dir, PlanningCommandPage,
+    PlanningCommandStartOutcome, PlanningCommandStartStatus, PlanningCommandSummary,
+    PLANNING_ARTIFACTS_DIR_NAME, PLANNING_COMMANDS_DIR_NAME,
 };
 use threadlane_native::{
-    Difficulty, ExecutionPolicy, PolicyAllowRule, RegistryStore, RoleExecutionRoute,
-    RolePreflightRequest, ToolAdapter, WorkflowProfile, WorkflowRole,
+    current_wall_clock_ms, Difficulty, EnqueuePlanningCommandRequest, ExecutionPolicy,
+    PlanningCommandResultRef, PlanningCommandStatus, PolicyAllowRule, RegistryStore,
+    RoleExecutionRoute, RolePreflightRequest, ToolAdapter, WorkflowProfile, WorkflowRole,
     EXECUTION_POLICY_SCHEMA_VERSION,
 };
 use threadlane_workers::{
@@ -959,6 +967,625 @@ async fn grant_record_list_get_and_revoke_lifecycle_with_cas_and_stale_registry_
     assert_eq!(
         revoked.revoked_reason.as_deref(),
         Some("Operator revoked standing planning grant")
+    );
+    assert!(!fixture.worker_marker.exists());
+
+    fixture.shutdown().await;
+}
+
+fn write_held_architect_worker(
+    script_path: &Path,
+    counter_path: &Path,
+    started_path: &Path,
+    release_path: &Path,
+) {
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf 'invoked\n' >> '{}'
+printf 'started\n' > '{}'
+i=0
+while [ ! -f '{}' ] && [ "$i" -lt 200 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+printf '{{"event":"init","init":{{"session_id":"agy-cli-sess-1","model":"gemini-4-argon-high"}}}}\n'
+RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_core\":\"Stable contract v1\"}},\"open_questions\":[]}}'
+printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$RESPONSE_JSON"
+exit 0
+"#,
+        counter_path.display(),
+        started_path.display(),
+        release_path.display(),
+    );
+    let _ = fs::remove_file(script_path);
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(script_path).expect("create held architect fake worker");
+        file.write_all(script.as_bytes())
+            .expect("write held architect fake worker");
+        file.sync_all().expect("sync held architect fake worker");
+    }
+    fs::set_permissions(script_path, fs::Permissions::from_mode(0o700))
+        .expect("chmod held architect fake worker 0700");
+}
+
+async fn create_live_grant_via_cli(
+    fixture: &GrantCliFixture,
+    request_key: &str,
+    created_at_ms: u64,
+    expires_at_ms: u64,
+) -> PlanningGrantSummary {
+    let mut prepare_req = fixture.sample_prepare_request(request_key);
+    prepare_req.created_at_ms = created_at_ms;
+    prepare_req.expires_at_ms = expires_at_ms;
+    let prepare_path = fixture.write_request(&format!("{request_key}-prepare.json"), &prepare_req);
+    let preview: PlanningGrantPreview = parse_envelope(
+        &run_flow(&fixture.flow_args(
+            "grant-prepare",
+            &["--request".to_string(), prepare_path.display().to_string()],
+        ))
+        .await,
+        "grant-prepare live clock",
+        &fixture.binding_id,
+    );
+    let record_req = RecordPlanningGrantRequest {
+        request_key: preview.request_key.clone(),
+        expected_ledger_revision: None,
+        confirmed_preview_digest: String::new(),
+        preview: preview.clone(),
+        attestation: LocalOperatorGrantAttestation::unattested(),
+    };
+    let record_path = fixture.write_request(&format!("{request_key}-record.json"), &record_req);
+    parse_envelope(
+        &run_flow(&fixture.flow_args(
+            "grant-record",
+            &[
+                "--request".to_string(),
+                record_path.display().to_string(),
+                "--confirm-preview".to_string(),
+                preview.preview_digest,
+                "--operator-approved".to_string(),
+            ],
+        ))
+        .await,
+        "grant-record live clock",
+        &fixture.binding_id,
+    )
+}
+
+fn create_job_and_architect_request(
+    fixture: &GrantCliFixture,
+    grant: &PlanningGrantSummary,
+    job_key: &str,
+    command_key: &str,
+    now_ms: u64,
+) -> EnqueuePlanningCommandRequest {
+    let project_base = CanonicalProjectBaseRef {
+        repository_path: fixture.repo_dir.to_string_lossy().into_owned(),
+        base_commit: fixture.base_commit.clone(),
+        base_tree_sha: fixture.base_tree_sha.clone(),
+    };
+    let workflow_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let brief = WorkBrief {
+        brief_id: format!("brf_{job_key}"),
+        binding_id: fixture.binding_id.clone(),
+        thread_uuid: THREAD_UUID.to_string(),
+        project_base: project_base.clone(),
+        kind: WorkBriefKind::NewJob,
+        summary: format!("Brief summary with {SECRET_SENTINEL}"),
+        confirmed_requirements: vec![
+            "Validate active grant and context before queueing".to_string()
+        ],
+        proposed_additions: Vec::new(),
+        assumptions: Vec::new(),
+        open_questions: Vec::new(),
+        accepted_architect_decisions: Vec::new(),
+    };
+    let job = workflow_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: job_key.to_string(),
+            expected_ledger_revision: None,
+            work_brief: brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job in workflow_store");
+    let dep_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &project_base,
+        &["src/lib.rs".to_string()],
+    )
+    .expect("compute dependency file blobs");
+
+    EnqueuePlanningCommandRequest::from_architect(RunArchitectAdviceRequest {
+        binding_id: fixture.binding_id.clone(),
+        thread_uuid: THREAD_UUID.to_string(),
+        grant_id: grant.grant_id.clone(),
+        request_key: command_key.to_string(),
+        expected_ledger_revision: None,
+        difficulty: Some(Difficulty::Hard),
+        context_dependencies: ArchitectContextDependencies {
+            project_base,
+            work_brief_digest: job.work_brief_digest,
+            plan_digest: None,
+            policy_digest: grant.policy_digest.clone(),
+            dependency_file_blobs: dep_blobs,
+            interface_ownership_digests: std::collections::BTreeMap::new(),
+            accepted_predecessor_trees: std::collections::BTreeMap::new(),
+        },
+        question_summary: format!(
+            "Should detached CLI execution outlive the launcher? {SECRET_SENTINEL}"
+        ),
+        prior_advice_context: Vec::new(),
+        accept_into_brief: false,
+        current_time_ms: now_ms,
+    })
+}
+
+#[tokio::test]
+async fn coworker_planning_detached_start_outlives_caller_and_enforces_single_invocation() {
+    let mut fixture = GrantCliFixture::start().await;
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let grant = create_live_grant_via_cli(
+        &fixture,
+        "req-grant-detached-1",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    )
+    .await;
+
+    let root = fixture
+        .repo_dir
+        .parent()
+        .expect("fixture root")
+        .to_path_buf();
+    let fake_worker_path = root.join("bin/fake-agy");
+    let started_path = root.join("worker-started");
+    let release_path = root.join("worker-release");
+    write_held_architect_worker(
+        &fake_worker_path,
+        &fixture.worker_marker,
+        &started_path,
+        &release_path,
+    );
+
+    let enqueue_req = create_job_and_architect_request(
+        &fixture,
+        &grant,
+        "req-job-detached-1",
+        "cmd-arch-detached-1",
+        now_ms,
+    );
+    let enqueue_path = fixture.write_request("enqueue-detached.json", &enqueue_req);
+
+    let enqueue_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "enqueue".to_string(),
+            "--request".to_string(),
+            enqueue_path.display().to_string(),
+        ],
+    ))
+    .await;
+    assert_no_secret_echo(&enqueue_out, "coworker-planning enqueue");
+    let enqueued: PlanningCommandSummary = parse_envelope(
+        &enqueue_out,
+        "coworker-planning enqueue",
+        &fixture.binding_id,
+    );
+    assert_eq!(enqueued.status, PlanningCommandStatus::Queued);
+    assert_eq!(enqueued.grant_id, grant.grant_id);
+    assert_eq!(enqueued.role, WorkflowRole::Architect);
+    assert!(!fixture.worker_marker.exists());
+
+    // Launch via real CLI `coworker-planning start-command`; it must exit immediately while the
+    // detached `execute-command` subprocess is still held on `release_path`.
+    let start_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "start-command".to_string(),
+            "--command-id".to_string(),
+            enqueued.command_id.clone(),
+        ],
+    ))
+    .await;
+    assert_no_secret_echo(&start_out, "coworker-planning start-command");
+    let started: PlanningCommandStartOutcome = parse_envelope(
+        &start_out,
+        "coworker-planning start-command",
+        &fixture.binding_id,
+    );
+    assert_eq!(
+        started.submission_status,
+        PlanningCommandStartStatus::SubmissionRequested
+    );
+    assert!(started.submission_requested);
+    assert!(started.launched);
+    assert!(started.pid_hint.is_some());
+    assert_eq!(started.summary.status, PlanningCommandStatus::Queued);
+    assert!(!release_path.exists());
+
+    // Wait until the detached child has claimed Running and entered the held fake worker.
+    let mut observed_running = None;
+    for _ in 0..80 {
+        if started_path.exists() {
+            let get_out = run_flow(&fixture.flow_args(
+                "coworker-planning",
+                &[
+                    "get".to_string(),
+                    "--command-id".to_string(),
+                    enqueued.command_id.clone(),
+                ],
+            ))
+            .await;
+            assert_no_secret_echo(&get_out, "coworker-planning get while running");
+            let current: PlanningCommandSummary =
+                parse_envelope(&get_out, "get while running", &fixture.binding_id);
+            if current.status == PlanningCommandStatus::Running {
+                observed_running = Some(current);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let running_summary = observed_running.expect("detached child must claim Running");
+    assert!(running_summary.owner_summary.is_some());
+
+    // Duplicate `start-command` while Running must report AlreadyRunning without launching a second process.
+    let second_start_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "start-command".to_string(),
+            "--command-id".to_string(),
+            enqueued.command_id.clone(),
+        ],
+    ))
+    .await;
+    let second_start: PlanningCommandStartOutcome = parse_envelope(
+        &second_start_out,
+        "second start-command while running",
+        &fixture.binding_id,
+    );
+    assert_eq!(
+        second_start.submission_status,
+        PlanningCommandStartStatus::AlreadyRunning
+    );
+    assert!(!second_start.submission_requested);
+    assert!(!second_start.launched);
+    assert_eq!(second_start.summary.status, PlanningCommandStatus::Running);
+    let invocations_while_running = fs::read_to_string(&fixture.worker_marker)
+        .expect("read worker_marker while running")
+        .lines()
+        .count();
+    assert_eq!(invocations_while_running, 1);
+
+    // Release the held fake worker and poll `coworker-planning get` until Completed.
+    fs::write(&release_path, b"release\n").expect("write release file");
+    let mut completed_summary = None;
+    for _ in 0..80 {
+        let get_out = run_flow(&fixture.flow_args(
+            "coworker-planning",
+            &[
+                "get".to_string(),
+                "--command-id".to_string(),
+                enqueued.command_id.clone(),
+            ],
+        ))
+        .await;
+        assert_no_secret_echo(&get_out, "coworker-planning get polling completion");
+        let current: PlanningCommandSummary =
+            parse_envelope(&get_out, "get polling completion", &fixture.binding_id);
+        if current.status == PlanningCommandStatus::Completed {
+            completed_summary = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let completed = completed_summary.expect("detached command must transition to Completed");
+    match completed.result_ref.as_ref().expect("completed result_ref") {
+        PlanningCommandResultRef::ArchitectAdvice {
+            advice_id,
+            reservation_id,
+            report_artifact_id,
+            artifact_verified,
+            reused_existing,
+            ..
+        } => {
+            assert!(*artifact_verified);
+            assert!(!*reused_existing);
+            assert!(advice_id.starts_with("adv_"));
+            assert!(reservation_id.starts_with("prs_"));
+            let artifact_file = planning_artifacts_dir(&fixture.plans_dir)
+                .join(format!("{report_artifact_id}.json"));
+            assert!(artifact_file.is_file(), "persisted artifact must exist");
+        }
+        other => panic!("expected ArchitectAdvice result_ref, got {other:?}"),
+    }
+
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let wf_ledger = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger");
+    let stored_grant = wf_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant.grant_id)
+        .expect("grant in ledger");
+    assert_eq!(stored_grant.usage.reserved_total_calls, 1);
+    assert_eq!(stored_grant.usage.reserved_architect_calls, 1);
+    assert_eq!(stored_grant.reservations.len(), 1);
+    assert_eq!(wf_ledger.architect_advice.len(), 1);
+
+    // Repeating `start-command` after completion returns AlreadyCompleted with no new worker invocation.
+    let repeat_start: PlanningCommandStartOutcome = parse_envelope(
+        &run_flow(&fixture.flow_args(
+            "coworker-planning",
+            &[
+                "start-command".to_string(),
+                "--command-id".to_string(),
+                enqueued.command_id.clone(),
+            ],
+        ))
+        .await,
+        "repeat start-command after completion",
+        &fixture.binding_id,
+    );
+    assert_eq!(
+        repeat_start.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!repeat_start.submission_requested);
+    assert!(!repeat_start.launched);
+    assert_eq!(
+        repeat_start.summary.status,
+        PlanningCommandStatus::Completed
+    );
+    let total_invocations = fs::read_to_string(&fixture.worker_marker)
+        .expect("read worker_marker after completion")
+        .lines()
+        .count();
+    assert_eq!(total_invocations, 1);
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn coworker_planning_readonly_absence_and_scope_or_expired_grant_refusal() {
+    let mut fixture = GrantCliFixture::start().await;
+    let commands_subdir = planning_commands_dir(&fixture.plans_dir);
+    let artifacts_subdir = planning_artifacts_dir(&fixture.plans_dir);
+    assert_eq!(
+        commands_subdir.file_name().and_then(|s| s.to_str()),
+        Some(PLANNING_COMMANDS_DIR_NAME)
+    );
+    assert_eq!(
+        artifacts_subdir.file_name().and_then(|s| s.to_str()),
+        Some(PLANNING_ARTIFACTS_DIR_NAME)
+    );
+    assert!(!commands_subdir.exists());
+    assert!(!artifacts_subdir.exists());
+
+    let plans_before = directory_entries(&fixture.plans_dir);
+    let parent_envs = [
+        ("THREADLANE_PARENT_REQUEST_ID", "obsreq_planning_readonly"),
+        ("THREADLANE_PLAN_ID", "plan_planning_readonly"),
+    ];
+
+    // 1. `list` and `get` on absent planning subdirectories must be pure read-only and create nothing.
+    let list_out = run_flow_with_env(
+        &fixture.flow_args("coworker-planning", &["list".to_string()]),
+        &parent_envs,
+    )
+    .await;
+    let empty_page: PlanningCommandPage = parse_envelope(
+        &list_out,
+        "coworker-planning list absent",
+        &fixture.binding_id,
+    );
+    assert_eq!(empty_page.binding_id, fixture.binding_id);
+    assert_eq!(empty_page.ledger_revision, 0);
+    assert!(empty_page.commands.is_empty());
+    assert!(empty_page.next_cursor.is_none());
+
+    let get_absent_out = run_flow_with_env(
+        &fixture.flow_args(
+            "coworker-planning",
+            &[
+                "get".to_string(),
+                "--command-id".to_string(),
+                "pcm_00000000000000000000000000000000".to_string(),
+            ],
+        ),
+        &parent_envs,
+    )
+    .await;
+    expect_failure_code(
+        &get_absent_out,
+        "coworker-planning get absent",
+        "command_not_found",
+    );
+    assert!(!commands_subdir.exists());
+    assert!(!artifacts_subdir.exists());
+    assert_eq!(directory_entries(&fixture.plans_dir), plans_before);
+
+    // 2. Reject unknown model-override or self-approval CLI flags and wrong CLI binding/thread scope.
+    expect_failure_code(
+        &run_flow_offline(&[
+            "coworker-planning",
+            "enqueue",
+            "--request",
+            "/tmp/req.json",
+            "--model",
+            "gpt-override",
+        ])
+        .await,
+        "unknown --model override flag",
+        "invalid_input",
+    );
+    expect_failure_code(
+        &run_flow(&fixture.flow_args_for(
+            &fixture.binding_id,
+            OTHER_THREAD_UUID,
+            "coworker-planning",
+            &["list".to_string()],
+        ))
+        .await,
+        "wrong CLI thread on coworker-planning list",
+        "thread_uuid_mismatch",
+    );
+
+    // 3. Create live grant and job, then verify wrong request scope and expired/revoked grant refusal.
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let active_grant = create_live_grant_via_cli(
+        &fixture,
+        "req-grant-refusal-active",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    )
+    .await;
+    let valid_enqueue = create_job_and_architect_request(
+        &fixture,
+        &active_grant,
+        "req-job-refusal-1",
+        "cmd-arch-refusal-1",
+        now_ms,
+    );
+
+    let mut wrong_thread_enqueue = valid_enqueue.clone();
+    wrong_thread_enqueue.thread_uuid = OTHER_THREAD_UUID.to_string();
+    let wrong_thread_path =
+        fixture.write_request("enqueue-wrong-thread.json", &wrong_thread_enqueue);
+    let wrong_thread_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "enqueue".to_string(),
+            "--request".to_string(),
+            wrong_thread_path.display().to_string(),
+        ],
+    ))
+    .await;
+    expect_failure_code(
+        &wrong_thread_out,
+        "wrong thread in enqueue request",
+        "scope_mismatch",
+    );
+    assert_no_secret_echo(&wrong_thread_out, "wrong thread in enqueue request");
+
+    let expired_grant = create_live_grant_via_cli(
+        &fixture,
+        "req-grant-refusal-expired",
+        now_ms.saturating_sub(60_000),
+        now_ms.saturating_sub(1_000),
+    )
+    .await;
+    let mut expired_enqueue = valid_enqueue.clone();
+    expired_enqueue.grant_id = expired_grant.grant_id.clone();
+    if let threadlane_native::PlanningCommandPayload::Architect(ref mut req) =
+        expired_enqueue.payload
+    {
+        req.grant_id = expired_grant.grant_id.clone();
+    }
+    let expired_path = fixture.write_request("enqueue-expired-grant.json", &expired_enqueue);
+    let expired_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "enqueue".to_string(),
+            "--request".to_string(),
+            expired_path.display().to_string(),
+        ],
+    ))
+    .await;
+    expect_failure_code(
+        &expired_out,
+        "enqueue under expired grant",
+        "validation_failed",
+    );
+    assert_no_secret_echo(&expired_out, "enqueue under expired grant");
+
+    // 4. Enqueue under active grant, verify get/list redact prompts, then revoke grant and verify
+    //    `start-command` is refused before launching the worker.
+    let valid_path = fixture.write_request("enqueue-valid-before-revoke.json", &valid_enqueue);
+    let enqueued: PlanningCommandSummary = parse_envelope(
+        &run_flow(&fixture.flow_args(
+            "coworker-planning",
+            &[
+                "enqueue".to_string(),
+                "--request".to_string(),
+                valid_path.display().to_string(),
+            ],
+        ))
+        .await,
+        "enqueue valid command",
+        &fixture.binding_id,
+    );
+
+    let get_queued_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "get".to_string(),
+            "--command-id".to_string(),
+            enqueued.command_id.clone(),
+        ],
+    ))
+    .await;
+    assert_no_secret_echo(&get_queued_out, "get queued command");
+    let got_queued: PlanningCommandSummary =
+        parse_envelope(&get_queued_out, "get queued command", &fixture.binding_id);
+    assert_eq!(got_queued, enqueued);
+
+    let list_queued_out =
+        run_flow(&fixture.flow_args("coworker-planning", &["list".to_string()])).await;
+    assert_no_secret_echo(&list_queued_out, "list queued commands");
+    let page: PlanningCommandPage = parse_envelope(
+        &list_queued_out,
+        "list queued commands",
+        &fixture.binding_id,
+    );
+    assert_eq!(page.commands, vec![enqueued.clone()]);
+
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let current_rev = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read workflow ledger")
+        .ledger_revision;
+    let revoke_req = RevokePlanningGrantRequest {
+        binding_id: fixture.binding_id.clone(),
+        thread_uuid: THREAD_UUID.to_string(),
+        grant_id: active_grant.grant_id.clone(),
+        expected_ledger_revision: Some(current_rev),
+        revoked_at_ms: current_wall_clock_ms().expect("wall clock"),
+        reason: "Revoke grant before start-command".to_string(),
+    };
+    let revoke_path = fixture.write_request("revoke-before-start.json", &revoke_req);
+    let _revoked: PlanningGrantSummary = parse_envelope(
+        &run_flow(&fixture.flow_args(
+            "grant-revoke",
+            &["--request".to_string(), revoke_path.display().to_string()],
+        ))
+        .await,
+        "revoke active grant before start-command",
+        &fixture.binding_id,
+    );
+
+    let start_revoked_out = run_flow(&fixture.flow_args(
+        "coworker-planning",
+        &[
+            "start-command".to_string(),
+            "--command-id".to_string(),
+            enqueued.command_id,
+        ],
+    ))
+    .await;
+    expect_failure_code(
+        &start_revoked_out,
+        "start-command after grant revocation",
+        "validation_failed",
     );
     assert!(!fixture.worker_marker.exists());
 
