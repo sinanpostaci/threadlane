@@ -314,6 +314,29 @@ impl CoworkerTaskCorrectionService {
     ) -> Result<CoworkerTaskCorrectionPrepareOutcome, NativeError> {
         prepare_task_correction_reservation(&self.controller, guard, request).await
     }
+
+    /// Executes (or idempotently reopens) an in-scope `Coder` correction attempt
+    /// (`prior_attempt_no + 1`) while holding physical OS job ownership.
+    pub async fn execute_task_correction(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        request: &super::task_correction_execution::CoworkerTaskCorrectionExecuteRequest,
+    ) -> Result<super::task_correction_execution::CoworkerTaskCorrectionExecuteOutcome, NativeError>
+    {
+        super::task_correction_execution::execute_task_correction(&self.controller, guard, request)
+            .await
+    }
+
+    /// Alias for [`Self::execute_task_correction`].
+    pub async fn execute_or_reopen_task_correction(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        request: &super::task_correction_execution::CoworkerTaskCorrectionExecuteRequest,
+    ) -> Result<super::task_correction_execution::CoworkerTaskCorrectionExecuteOutcome, NativeError>
+    {
+        super::task_correction_execution::execute_task_correction(&self.controller, guard, request)
+            .await
+    }
 }
 
 /// Alias for [`prepare_task_correction_reservation`].
@@ -1241,6 +1264,36 @@ fn verify_prior_attempt_and_persisted_reviewer_report(
     ),
     NativeError,
 > {
+    verify_prior_attempt_and_persisted_reviewer_report_with_live_check(
+        controller,
+        plans_dir,
+        request,
+        adm,
+        candidate_task,
+        approved_task,
+        true,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check(
+    controller: &CoworkerControllerService,
+    plans_dir: &Path,
+    request: &CoworkerTaskCorrectionPrepareRequest,
+    adm: &VerifiedControllerAdmission,
+    candidate_task: &CoworkerTaskRecord,
+    approved_task: &ApprovedTaskRecord,
+    require_unmodified_live_subject: bool,
+) -> Result<
+    (
+        TaskAttemptExecutionArtifacts,
+        TaskCandidateRef,
+        ReviewSubject,
+        StructuredReviewVerdict,
+        TaskReviewExecutionReport,
+    ),
+    NativeError,
+> {
     let prior_attempt_no = request.prior_attempt_no;
 
     // Check if the candidate in the ledger is an unreviewed check-failure candidate first.
@@ -1380,10 +1433,33 @@ fn verify_prior_attempt_and_persisted_reviewer_report(
         ));
     }
 
-    if prior_artifacts.observed_model != candidate_task.selected_choice.model_arg
-        || prior_artifacts.observed_model != approved_task.base_model
-        || approved_task.provider.map(WorkerProvider::as_str)
-            != Some(prior_artifacts.observed_provider.as_str())
+    let expected_coder_provider = match candidate_task.selected_choice.adapter {
+        ToolAdapter::Antigravity => WorkerProvider::Antigravity,
+        ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        _ => {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedCapability,
+                "unsupported Coder adapter on candidate_task.selected_choice",
+            ));
+        }
+    };
+    let resolved_coder_target = resolve_model_target(
+        expected_coder_provider,
+        &candidate_task.selected_choice.model_arg,
+        candidate_task.selected_choice.effort.as_deref(),
+    )
+    .map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("invalid frozen Coder model target: {err}"),
+        )
+    })?;
+    if (prior_artifacts.observed_model != resolved_coder_target.base_model
+        && prior_artifacts.observed_model != candidate_task.selected_choice.model_arg)
+        || resolved_coder_target.base_model != approved_task.base_model
+        || resolved_coder_target.effort != approved_task.effort
+        || approved_task.provider != Some(expected_coder_provider)
+        || prior_artifacts.observed_provider != expected_coder_provider.as_str()
     {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
@@ -1393,7 +1469,7 @@ fn verify_prior_attempt_and_persisted_reviewer_report(
             ),
         ));
     }
-    if let Some(ref exp_effort) = candidate_task.selected_choice.effort {
+    if let Some(ref exp_effort) = resolved_coder_target.effort {
         if prior_artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()) {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -2006,8 +2082,10 @@ fn verify_prior_attempt_and_persisted_reviewer_report(
         || review_subject.policy.policy_id != adm.runtime_state.envelope.policy.policy_id
         || review_subject.policy.requested_provider.as_deref()
             != approved_task.provider.map(WorkerProvider::as_str)
-        || review_subject.policy.requested_model.as_deref()
+        || (review_subject.policy.requested_model.as_deref()
             != Some(candidate_task.selected_choice.model_arg.as_str())
+            && review_subject.policy.requested_model.as_deref()
+                != Some(approved_task.base_model.as_str()))
         || review_subject.policy.requested_effort != candidate_task.selected_choice.effort
         || review_subject.policy.observed_model.as_deref()
             != Some(prior_artifacts.observed_model.as_str())
@@ -2020,26 +2098,30 @@ fn verify_prior_attempt_and_persisted_reviewer_report(
         ));
     }
 
-    let live_subject = inspect_review_subject_readonly(&InspectReviewSubjectRequest {
-        work_area_root: review_subject.work_area_root.clone(),
-        task_worktree_id: review_subject.task_worktree_id.clone(),
-        policy: review_subject.policy.clone(),
-        test_evidence: test_summary.clone(),
-        worker_status: Some(WorkerRunStatus::Succeeded),
-    })
-    .map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!("live task worktree failed ReviewSubject inspection before correction: {err}"),
-        )
-    })?;
-    if live_subject != review_subject
-        || !constant_time_str_eq(&live_subject.subject_digest, &review_subject.subject_digest)
-    {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "live task worktree drifted from the reviewed candidate ReviewSubject",
-        ));
+    if require_unmodified_live_subject {
+        let live_subject = inspect_review_subject_readonly(&InspectReviewSubjectRequest {
+            work_area_root: review_subject.work_area_root.clone(),
+            task_worktree_id: review_subject.task_worktree_id.clone(),
+            policy: review_subject.policy.clone(),
+            test_evidence: test_summary.clone(),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+        })
+        .map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "live task worktree failed ReviewSubject inspection before correction: {err}"
+                ),
+            )
+        })?;
+        if live_subject != review_subject
+            || !constant_time_str_eq(&live_subject.subject_digest, &review_subject.subject_digest)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "live task worktree drifted from the reviewed candidate ReviewSubject",
+            ));
+        }
     }
 
     Ok((
@@ -2181,7 +2263,7 @@ fn verify_no_uncertain_or_conflicting_derived_coder_state(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_reopen_existing_correction_reservation(
+pub(crate) fn try_reopen_existing_correction_reservation(
     controller: &CoworkerControllerService,
     guard: &CoworkerJobOwnershipGuard,
     request: &CoworkerTaskCorrectionPrepareRequest,
@@ -2387,7 +2469,7 @@ fn try_reopen_existing_correction_reservation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn construct_verified_derived_attempt_receipt(
+pub(crate) fn construct_verified_derived_attempt_receipt(
     adm: &VerifiedControllerAdmission,
     candidate_task: &CoworkerTaskRecord,
     approved_task: &ApprovedTaskRecord,
@@ -2468,7 +2550,7 @@ fn construct_verified_derived_attempt_receipt(
     Ok(receipt)
 }
 
-fn verify_original_approval_unchanged(
+pub(crate) fn verify_original_approval_unchanged(
     controller: &CoworkerControllerService,
     adm: &VerifiedControllerAdmission,
 ) -> Result<(), NativeError> {

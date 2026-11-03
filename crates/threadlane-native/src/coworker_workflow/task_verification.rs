@@ -12,10 +12,11 @@ use threadlane_operations::{
 };
 use threadlane_workers::{
     evaluate_diff_gate, is_commit_ancestor, is_worktree_clean, load_and_verify_manifest,
-    resolve_exact_commit_sha, resolve_exact_tree_sha, ChangedPathEntry, WorkerFilePermissions,
-    WorkerProvider, WorkerRunStatus, WorktreeKind, WorktreeManifest,
+    resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target, ChangedPathEntry,
+    WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorktreeKind, WorktreeManifest,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
+use threadlane_workflow::ToolAdapter;
 
 use crate::conversation_change::ConversationChangeStore;
 use crate::error::{NativeError, NativeErrorCode};
@@ -30,7 +31,8 @@ use super::checks::{
 };
 use super::contracts::{
     deterministic_prefixed_id, sha256_hex, CandidateCheckEvidence, CoworkerTaskRecord,
-    CoworkerTaskStage, MAX_COWORKER_ID_LEN, MAX_COWORKER_LEDGER_BYTES,
+    CoworkerTaskStage, OutboxDispatchKind, OutboxDispatchStatus, ReviewVerdictOutcome,
+    MAX_COWORKER_ID_LEN, MAX_COWORKER_LEDGER_BYTES,
 };
 use super::controller::{
     is_task_fenced_by_hold_or_sibling, CoworkerControllerService, VerifiedControllerAdmission,
@@ -41,6 +43,11 @@ use super::controller_policy::{
     TaskAttemptExecutionArtifacts, DEFAULT_CONTROLLER_LEASE_TTL_MS,
 };
 use super::ownership::CoworkerJobOwnershipGuard;
+use super::task_correction::{compute_derived_coder_effect_id, compute_derived_coder_request_key};
+use super::task_correction_execution::{
+    compute_derived_worktree_change_set_digest, read_persisted_derived_task_execution_report,
+    PersistedDerivedTaskExecutionArtifact,
+};
 
 static IN_FLIGHT_TASK_VERIFICATIONS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
 
@@ -238,8 +245,15 @@ pub async fn prepare_task_attempt_for_review(
         request.attempt_no,
     )?;
 
-    let (adm, controller_instance_id, lease_epoch, candidate_task, approved_task, artifacts) =
-        verify_live_task_verification_gate(controller, guard, request, None)?;
+    let (
+        adm,
+        controller_instance_id,
+        lease_epoch,
+        candidate_task,
+        approved_task,
+        artifacts,
+        derived_artifact,
+    ) = verify_live_task_verification_gate(controller, guard, request, None)?;
 
     let work_area_root = controller
         .sessions_dir()
@@ -261,6 +275,7 @@ pub async fn prepare_task_attempt_for_review(
             &adm,
             &candidate_task,
             &artifacts,
+            derived_artifact.as_ref(),
             &manifest,
             &controller_instance_id,
             lease_epoch,
@@ -345,7 +360,7 @@ pub async fn prepare_task_attempt_for_review(
 
     // Re-verify physical ownership, admission, lease epoch, ConversationChangeStore, and hold/stop
     // fences after all `.await` points and before promoting any check evidence or ReviewSubject.
-    let (post_adm, _, _, post_task, post_approved_task, post_artifacts) =
+    let (post_adm, _, _, post_task, post_approved_task, post_artifacts, _) =
         verify_live_task_verification_gate(
             controller,
             guard,
@@ -407,7 +422,7 @@ pub async fn prepare_task_attempt_for_review(
     let review_policy = ReviewPolicyBinding {
         policy_id: post_adm.runtime_state.envelope.policy.policy_id.clone(),
         requested_provider: post_approved_task.provider.map(|p| p.as_str().to_string()),
-        requested_model: Some(post_task.selected_choice.model_arg.clone()),
+        requested_model: Some(post_approved_task.base_model.clone()),
         requested_effort: post_task.selected_choice.effort.clone(),
         observed_model: Some(post_artifacts.observed_model.clone()),
         observed_effort: post_artifacts.observed_effort.clone(),
@@ -517,6 +532,7 @@ fn verify_live_task_verification_gate(
         CoworkerTaskRecord,
         ApprovedTaskRecord,
         TaskAttemptExecutionArtifacts,
+        Option<PersistedDerivedTaskExecutionArtifact>,
     ),
     NativeError,
 > {
@@ -758,10 +774,43 @@ fn verify_live_task_verification_gate(
         ));
     }
 
-    if artifacts.observed_model != candidate_task.selected_choice.model_arg
-        || artifacts.observed_model != approved_task.base_model
-        || approved_task.provider.map(WorkerProvider::as_str)
-            != Some(artifacts.observed_provider.as_str())
+    if (request.attempt_no >= 2) != artifacts.is_derived_attempt {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "task `{}` attempt `{}` is_derived_attempt `{}` does not match attempt_no",
+                request.task_id, request.attempt_no, artifacts.is_derived_attempt
+            ),
+        ));
+    }
+
+    let expected_coder_provider = match candidate_task.selected_choice.adapter {
+        ToolAdapter::Antigravity => WorkerProvider::Antigravity,
+        ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        _ => {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedCapability,
+                "unsupported Coder adapter on candidate_task.selected_choice",
+            ));
+        }
+    };
+    let resolved_coder_target = resolve_model_target(
+        expected_coder_provider,
+        &candidate_task.selected_choice.model_arg,
+        candidate_task.selected_choice.effort.as_deref(),
+    )
+    .map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("invalid frozen Coder model target: {err}"),
+        )
+    })?;
+    if (artifacts.observed_model != resolved_coder_target.base_model
+        && artifacts.observed_model != candidate_task.selected_choice.model_arg)
+        || resolved_coder_target.base_model != approved_task.base_model
+        || resolved_coder_target.effort != approved_task.effort
+        || approved_task.provider != Some(expected_coder_provider)
+        || artifacts.observed_provider != expected_coder_provider.as_str()
     {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
@@ -771,7 +820,7 @@ fn verify_live_task_verification_gate(
             ),
         ));
     }
-    if let Some(ref exp_effort) = candidate_task.selected_choice.effort {
+    if let Some(ref exp_effort) = resolved_coder_target.effort {
         if artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()) {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -820,6 +869,19 @@ fn verify_live_task_verification_gate(
         }
     }
 
+    let derived_artifact = if request.attempt_no >= 2 {
+        Some(verify_derived_attempt_for_task_verification(
+            plans_dir,
+            request,
+            &adm,
+            &candidate_task,
+            &approved_task,
+            &artifacts,
+        )?)
+    } else {
+        None
+    };
+
     Ok((
         adm,
         controller_instance_id,
@@ -827,7 +889,182 @@ fn verify_live_task_verification_gate(
         candidate_task,
         approved_task,
         artifacts,
+        derived_artifact,
     ))
+}
+
+fn verify_derived_attempt_for_task_verification(
+    plans_dir: &Path,
+    request: &CoworkerTaskVerificationRequest,
+    adm: &VerifiedControllerAdmission,
+    candidate_task: &CoworkerTaskRecord,
+    approved_task: &ApprovedTaskRecord,
+    artifacts: &TaskAttemptExecutionArtifacts,
+) -> Result<PersistedDerivedTaskExecutionArtifact, NativeError> {
+    if !adm
+        .linkage
+        .authorizes_in_scope_correction(request.attempt_no)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::UnauthorizedOperator,
+            format!(
+                "frozen approval linkage does not authorize derived correction attempt `{}` for task `{}`",
+                request.attempt_no, request.task_id
+            ),
+        ));
+    }
+    let receipt = adm
+        .runtime_state
+        .derived_attempts
+        .iter()
+        .find(|d| d.task_id == request.task_id && d.attempt_no == request.attempt_no)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing DerivedTaskAttemptReceipt for task `{}` derived attempt `{}`",
+                    request.task_id, request.attempt_no
+                ),
+            )
+        })?;
+    receipt.validate_against_task(candidate_task, &adm.runtime_state.envelope)?;
+
+    let prior_attempt_no = request.attempt_no - 1;
+    let prior_candidate = candidate_task
+        .candidates
+        .iter()
+        .find(|c| c.attempt_no == prior_attempt_no)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing prior rejected candidate for task `{}` attempt `{prior_attempt_no}`",
+                    request.task_id
+                ),
+            )
+        })?;
+    let prior_verdict = prior_candidate.review_verdict.as_ref().ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "prior attempt candidate has no recorded Reviewer verdict",
+        )
+    })?;
+    if prior_verdict.outcome != ReviewVerdictOutcome::CorrectInScope
+        || receipt.prior_rejected_candidate_id.as_deref()
+            != Some(prior_candidate.candidate_id.as_str())
+        || receipt.prior_review_verdict_id.as_deref() != Some(prior_verdict.verdict_id.as_str())
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "DerivedTaskAttemptReceipt does not match prior CorrectInScope candidate/verdict",
+        ));
+    }
+    let Some(ref prior_subject_digest) = receipt.prior_review_subject_digest else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "DerivedTaskAttemptReceipt is missing prior_review_subject_digest",
+        ));
+    };
+
+    let request_key = compute_derived_coder_request_key(
+        &request.job_id,
+        &request.task_id,
+        request.attempt_no,
+        &prior_candidate.candidate_id,
+        &prior_verdict.verdict_id,
+        prior_subject_digest,
+        &adm.runtime_state.envelope.envelope_digest,
+        &candidate_task.selected_choice,
+    );
+    let effect_id = compute_derived_coder_effect_id(
+        &request.job_id,
+        &request.task_id,
+        request.attempt_no,
+        &request_key,
+    );
+
+    let coder_eff = adm
+        .runtime_state
+        .pending_effects
+        .get(&effect_id)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing CoderDispatch PendingControllerEffect `{effect_id}` for derived attempt `{}`",
+                    request.attempt_no
+                ),
+            )
+        })?;
+    if coder_eff.kind != PendingControllerEffectKind::CoderDispatch
+        || coder_eff.status != PendingControllerEffectStatus::EffectConfirmed
+        || coder_eff.request_key != request_key
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "CoderDispatch PendingControllerEffect `{effect_id}` is not EffectConfirmed (`{:?}`)",
+                coder_eff.status
+            ),
+        ));
+    }
+
+    let outbox = adm
+        .job
+        .outbox
+        .iter()
+        .find(|o| {
+            o.task_id == request.task_id
+                && o.kind == OutboxDispatchKind::TaskAttemptDispatch
+                && o.attempt_no == request.attempt_no
+                && o.request_key == request_key
+        })
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing TaskAttemptDispatch outbox for task `{}` derived attempt `{}`",
+                    request.task_id, request.attempt_no
+                ),
+            )
+        })?;
+    if !matches!(
+        outbox.status,
+        OutboxDispatchStatus::DispatchedEffectConfirmed | OutboxDispatchStatus::ReconciledConfirmed
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "derived TaskAttemptDispatch outbox is not confirmed",
+        ));
+    }
+
+    let persisted_derived = read_persisted_derived_task_execution_report(plans_dir, &effect_id)?
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing persisted private 0600 PersistedDerivedTaskExecutionArtifact for derived attempt `{}` (`{effect_id}`)",
+                    request.attempt_no
+                ),
+            )
+        })?;
+    persisted_derived.validate_for_task_verification(receipt, candidate_task, approved_task)?;
+
+    if persisted_derived.pre_execution_head_commit != prior_candidate.head_commit
+        || persisted_derived.pre_execution_tree_sha != prior_candidate.tree_sha
+        || artifacts.run_id != receipt.run_id
+        || artifacts.worker_id != receipt.worker_id
+        || artifacts.task_worktree_id != receipt.task_worktree_id
+        || artifacts.integration_worktree_id != receipt.integration_worktree_id
+        || artifacts.execution_base_commit != receipt.execution_base_commit
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "PersistedDerivedTaskExecutionArtifact or TaskAttemptExecutionArtifacts does not match prior candidate HEAD/tree or receipt",
+        ));
+    }
+
+    Ok(persisted_derived)
 }
 
 fn load_and_verify_owned_task_manifest(
@@ -919,6 +1156,7 @@ fn reconcile_or_commit_task_worktree(
     adm: &VerifiedControllerAdmission,
     candidate_task: &CoworkerTaskRecord,
     artifacts: &TaskAttemptExecutionArtifacts,
+    derived_artifact: Option<&PersistedDerivedTaskExecutionArtifact>,
     manifest: &WorktreeManifest,
     controller_instance_id: &str,
     lease_epoch: u64,
@@ -929,6 +1167,10 @@ fn reconcile_or_commit_task_worktree(
             "FrozenControllerExecutionEnvelope.allow_task_worktree_commits is false; task worktree commits are not permitted",
         ));
     }
+
+    let expected_pre_commit_head = derived_artifact
+        .map(|d| d.pre_execution_head_commit.as_str())
+        .unwrap_or(manifest.base_commit.as_str());
 
     let work_area_root = &manifest.work_area_root;
     let current_head = resolve_exact_commit_sha(
@@ -961,8 +1203,8 @@ fn reconcile_or_commit_task_worktree(
             )
         })?;
 
-    // Check if TaskCommit was already confirmed and a mutating check left the worktree dirty.
-    if !worktree_clean && current_head != manifest.base_commit {
+    // Check if TaskCommit was already confirmed for this attempt and a mutating check left the worktree dirty.
+    if !worktree_clean && current_head != expected_pre_commit_head {
         if let Some(existing_commit_eff) = adm.runtime_state.pending_effects.values().find(|e| {
             e.kind == PendingControllerEffectKind::TaskCommit
                 && e.task_id.as_deref() == Some(request.task_id.as_str())
@@ -1004,7 +1246,14 @@ fn reconcile_or_commit_task_worktree(
         }
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            "task worktree has uncommitted modifications on top of a non-base HEAD commit",
+            "task worktree has uncommitted modifications on top of an unexpected HEAD commit",
+        ));
+    }
+
+    if worktree_clean && current_head == expected_pre_commit_head {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "task worktree has no uncommitted changes to commit at expected pre-commit HEAD",
         ));
     }
 
@@ -1023,6 +1272,25 @@ fn reconcile_or_commit_task_worktree(
             NativeErrorCode::ValidationFailed,
             "task worktree failed pre-commit diff gate or has no in-scope changes",
         ));
+    }
+
+    if !worktree_clean {
+        if let Some(derived) = derived_artifact {
+            let (live_derived_digest, live_has_changes) =
+                compute_derived_worktree_change_set_digest(
+                    &manifest.checkout_path,
+                    expected_pre_commit_head,
+                    &pre_diff_gate.changed_paths,
+                )?;
+            if !live_has_changes
+                || !constant_time_str_eq(&live_derived_digest, &derived.worktree_change_set_digest)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "live task worktree change-set drifted from persisted PersistedDerivedTaskExecutionArtifact before commit",
+                ));
+            }
+        }
     }
 
     let diff_digest =
@@ -1089,12 +1357,12 @@ fn reconcile_or_commit_task_worktree(
         .get(&commit_effect_id)
         .cloned();
 
-    // Case 1: Task worktree is already clean at a committed HEAD != base_commit.
-    if worktree_clean && current_head != manifest.base_commit {
+    // Case 1: Task worktree is already clean at a committed HEAD != expected_pre_commit_head.
+    if worktree_clean && current_head != expected_pre_commit_head {
         let Some(existing_eff) = existing_commit_effect else {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "task worktree HEAD advanced past base_commit without a recorded TaskCommit effect",
+                "task worktree HEAD advanced past expected pre-commit HEAD without a recorded TaskCommit effect",
             ));
         };
         if matches!(
@@ -1107,7 +1375,7 @@ fn reconcile_or_commit_task_worktree(
                 "TaskCommit effect was previously refused or failed terminally",
             ));
         }
-        let is_anc = is_commit_ancestor(
+        let is_anc_base = is_commit_ancestor(
             &manifest.checkout_path,
             &manifest.base_commit,
             &current_head,
@@ -1116,17 +1384,34 @@ fn reconcile_or_commit_task_worktree(
         .map_err(|err| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                format!("failed to verify task commit ancestry: {err}"),
+                format!("failed to verify task commit ancestry from base_commit: {err}"),
             )
         })?;
-        if !is_anc {
+        let is_anc_pre = is_commit_ancestor(
+            &manifest.checkout_path,
+            expected_pre_commit_head,
+            &current_head,
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "failed to verify task commit ancestry from expected pre-commit HEAD: {err}"
+                ),
+            )
+        })?;
+        if !is_anc_base || !is_anc_pre || current_head == manifest.base_commit {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "task worktree HEAD does not descend from manifest.base_commit",
+                "task worktree HEAD does not descend from manifest.base_commit and expected pre-commit HEAD",
             ));
         }
         if let Some(ref prev_head) = artifacts.committed_head_commit {
-            if prev_head != &manifest.base_commit && prev_head != &current_head {
+            if prev_head != &manifest.base_commit
+                && prev_head != expected_pre_commit_head
+                && prev_head != &current_head
+            {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
                     "task worktree HEAD drifted from previously recorded committed_head_commit",
@@ -1171,7 +1456,7 @@ fn reconcile_or_commit_task_worktree(
         return Ok((current_head, current_tree, candidate_id));
     }
 
-    // Case 2: Worktree is dirty at base_commit; check for unconfirmed/unknown prior commit effect.
+    // Case 2: Worktree is dirty at expected_pre_commit_head; check for unconfirmed/unknown prior commit effect.
     if let Some(existing_eff) = existing_commit_effect {
         if existing_eff.status == PendingControllerEffectStatus::ReservedBeforeEffect {
             let _ = controller.policy_store().mutate_job_runtime(
@@ -1295,6 +1580,7 @@ fn reconcile_or_commit_task_worktree(
         })?;
     if !post_clean
         || commit_report.task_head_commit == manifest.base_commit
+        || commit_report.task_head_commit == expected_pre_commit_head
         || !post_diff_gate.passed
         || !post_diff_gate.evidence_complete
     {
@@ -1388,7 +1674,7 @@ async fn execute_or_reconcile_single_check(
         &[&request.job_id, &request.task_id, &check_request_key],
     );
 
-    let (adm, _, _, _, _, _) = verify_live_task_verification_gate(
+    let (adm, _, _, _, _, _, _) = verify_live_task_verification_gate(
         controller,
         guard,
         request,

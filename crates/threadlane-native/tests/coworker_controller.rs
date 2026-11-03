@@ -13,22 +13,25 @@ use threadlane_host::{
     HostPhase, PrepareDependencyInputsRequest, TaskExecutionStatus,
 };
 use threadlane_native::coworker_workflow::{
-    compute_derived_coder_effect_id, compute_derived_coder_request_key,
-    compute_derived_task_attempt_receipt_id, compute_task_integration_subject_digest,
-    compute_task_review_effect_id, compute_task_review_request_key,
-    derive_final_job_integration_identifiers, derive_job_aggregation_receipt_id,
+    compute_derived_coder_effect_id, compute_derived_coder_report_artifact_id,
+    compute_derived_coder_request_key, compute_derived_task_attempt_receipt_id,
+    compute_task_integration_subject_digest, compute_task_review_effect_id,
+    compute_task_review_request_key, derive_final_job_integration_identifiers,
+    derive_job_aggregation_receipt_id, derived_execution_report_file_path,
     deterministic_prefixed_id, deterministic_task_integration_receipt_id,
     deterministic_task_integration_request_key, integrate_accepted_task,
     read_persisted_candidate_check_report, read_persisted_check_report,
-    read_persisted_job_integration_report, read_persisted_task_review_report, sha256_hex,
-    ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
-    ClosureExecutionArtifactRecord, CombinedCandidateStatus, ControllerConfigurationPreview,
-    ControllerJobRuntimeState, ControllerPolicyStore, ControllerRoleExecutionBudget,
-    CoworkerControllerPhase1Status, CoworkerControllerService, CoworkerControllerStepRequest,
-    CoworkerJobCompletionRequest, CoworkerJobCompletionService, CoworkerJobCompletionStatus,
-    CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
-    CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
-    CoworkerTaskCorrectionDisposition, CoworkerTaskCorrectionPrepareRequest,
+    read_persisted_derived_task_execution_report, read_persisted_job_integration_report,
+    read_persisted_task_review_report, sha256_hex, ApplyWorkflowHoldRequest,
+    BindJobApprovalRequest, CanonicalProjectBaseRef, ClosureExecutionArtifactRecord,
+    CombinedCandidateStatus, ControllerConfigurationPreview, ControllerJobRuntimeState,
+    ControllerPolicyStore, ControllerRoleExecutionBudget, CoworkerControllerPhase1Status,
+    CoworkerControllerService, CoworkerControllerStepRequest, CoworkerJobCompletionRequest,
+    CoworkerJobCompletionService, CoworkerJobCompletionStatus, CoworkerJobOwnershipGuard,
+    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
+    CoworkerPlanningService, CoworkerTaskCorrectionDisposition,
+    CoworkerTaskCorrectionExecuteRequest, CoworkerTaskCorrectionExecuteStatus,
+    CoworkerTaskCorrectionExecutionService, CoworkerTaskCorrectionPrepareRequest,
     CoworkerTaskCorrectionPrepareStatus, CoworkerTaskCorrectionService,
     CoworkerTaskIntegrationOutcome, CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService,
     CoworkerTaskIntegrationStatus, CoworkerTaskReviewStageRequest, CoworkerTaskReviewStageService,
@@ -238,6 +241,20 @@ printf '{"type":"init","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}\
 
 if [ -d "src" ]; then
     case "$PROMPT" in
+        *"<untrusted_required_in_scope_fixes>"*)
+            if ! grep -q "100" "src/a.rs"; then
+                echo "expected prior attempt 1 contents in src/a.rs before correction" >&2
+                exit 3
+            fi
+            case "$PROMPT" in
+                *HOLD_CORR_PROVIDER*)
+                    while true; do
+                        sleep 0.1
+                    done
+                    ;;
+            esac
+            printf "pub fn a() -> u32 { 101 }\n" > "src/a.rs"
+            ;;
         *CTRL_TASK_A*)
             printf "pub fn a() -> u32 { 100 }\n" > "src/a.rs"
             ;;
@@ -7734,3 +7751,6 @@ exit 0
     drop(fence_session);
     fence_host.shutdown().await.expect("shutdown fence_host");
 }
+
+#[path = "support/coworker_correction_execution.rs"]
+mod coworker_correction_execution;
