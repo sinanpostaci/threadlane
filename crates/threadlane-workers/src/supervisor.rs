@@ -1646,7 +1646,9 @@ pub(crate) async fn terminate_process_group_members(pgid: i32) {
     }
 }
 
-fn extract_exit_code_and_signal(status: Option<ExitStatus>) -> (Option<i32>, Option<i32>) {
+pub(crate) fn extract_exit_code_and_signal(
+    status: Option<ExitStatus>,
+) -> (Option<i32>, Option<i32>) {
     let Some(st) = status else {
         return (None, None);
     };

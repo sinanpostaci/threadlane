@@ -28,6 +28,9 @@
 /// Verified combined-candidate assembly, check evidence verification, and single-closure
 /// reservation/execution over [`threadlane_operations`] and [`CoworkerWorkflowStore`].
 pub mod candidate;
+/// Bounded frozen verification check execution over owned `Task` and `RunIntegration` worktrees
+/// and verified [`CandidateCheckEvidence`] promotion.
+pub mod checks;
 /// Serializable data contracts, validation rules, deterministic digests, and independence proofs.
 pub mod contracts;
 /// Typed controller execution configuration/envelope, frozen check command specifications,
@@ -41,6 +44,7 @@ pub mod planning;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.
 pub mod store;
 
+pub use checks::*;
 pub use contracts::*;
 pub use controller_policy::*;
 pub use ownership::*;

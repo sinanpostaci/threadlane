@@ -33,6 +33,8 @@
 pub mod advisory_response;
 /// Versioned exact-match AGY catalog model variant metadata.
 pub mod antigravity_models;
+/// Generic bounded-command execution primitive under isolated Unix process-group supervision.
+pub mod bounded_command;
 /// Narrow diagnostic CLI parser and command runner (`threadlane-worker`).
 pub mod cli;
 /// Sealed dependency input policy, manifest verification, and shared lock lease loader.
@@ -60,6 +62,11 @@ pub use advisory_response::{
     AdvisoryResponseBudget, AdvisoryResponseError, AdvisoryResponseErrorCode,
     AdvisoryResponseFraming, AdvisoryResponseSource, AdvisoryStructuredExecution,
     BoundedAdvisoryResponse, DEFAULT_MAX_ADVISORY_RESPONSE_BYTES, MAX_ADVISORY_RESPONSE_BYTES,
+};
+pub use bounded_command::{
+    run_bounded_command, run_bounded_command_with_cancel, BoundedCommandBudgets,
+    BoundedCommandOverflow, BoundedCommandReport, BoundedCommandSpec, BoundedCommandStatus,
+    MAX_BOUNDED_COMMAND_ARGV_LEN, MAX_BOUNDED_COMMAND_ARG_BYTES, MAX_BOUNDED_COMMAND_ENV_OVERRIDES,
 };
 pub use cli::{load_worker_spec_file, run_cli, CreatedWorktreesReport, WorkerCli, WorkerCommand};
 pub use dependency::{
