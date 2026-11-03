@@ -46,8 +46,8 @@ pub use service::{
     deterministic_plan_id, ensure_mcp_response_budget, measure_mcp_response_bytes, ScopedWorkflow,
 };
 pub use threadlane_plans::{
-    compile_plan_revision, preview_draft_compilation, DeliveryReceipt, PlanChange, PlanError,
-    PlanRevision, PlanStatus, PlanStore, PlanTask,
+    compile_plan_revision, preview_draft_compilation, CompiledPlan, DeliveryReceipt, PlanChange,
+    PlanError, PlanRevision, PlanStatus, PlanStore, PlanTask,
 };
 pub use threadlane_registry::{resolve_choice, validate_registry_identifier};
 pub use threadlane_registry::{

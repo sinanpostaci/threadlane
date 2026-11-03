@@ -45,6 +45,10 @@ use crate::approved_mcp::{
 };
 use crate::auto_pair::{parse_thread_hint, AutomaticPairing, CALL_THREAD_HINT};
 use crate::error::{NativeError, NativeErrorCode};
+use crate::execution_gateway::{
+    CoworkerExecutionGateway, ExecutionStatusParams, PreviewExecutionParams, StartExecutionParams,
+    StopExecutionParams,
+};
 use crate::fs_safety::{constant_time_str_eq, ensure_platform_supported};
 use crate::host_launcher::{
     execute_start_approved_task_with_launcher_until, validate_host_executable_path,
@@ -881,6 +885,30 @@ impl PairedMcpServer {
                 let params: PlanningCommandParams = Self::parse_tool_params(tool_name, arguments)?;
                 self.planning_command(Parameters(params)).await
             }
+            "preview_execution" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: PreviewExecutionParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.preview_execution(Parameters(params)).await
+            }
+            "start_execution" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: StartExecutionParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.start_execution(Parameters(params)).await
+            }
+            "execution_status" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: ExecutionStatusParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.execution_status(Parameters(params)).await
+            }
+            "stop_execution" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: StopExecutionParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.stop_execution(Parameters(params)).await
+            }
             _ => Err(Self::format_pairing_error(
                 tool_name,
                 NativeError::new(
@@ -1178,6 +1206,9 @@ impl PairedMcpServer {
             .or_else(|| {
                 initial_job_id.and_then(threadlane_core::observation::validate_correlation_id)
             });
+        let resolved_approval_id = approval_id
+            .map(str::to_string)
+            .or_else(|| observation_result_approval_id(tool_name, binding_id, result));
         let dir = self.observation_journal_dir();
         let finished_at_ms = current_observation_time_ms();
         let op = format!("mcp.paired.{tool_name}");
@@ -1218,7 +1249,7 @@ impl PairedMcpServer {
                 job_id,
                 plan_id,
                 task_id: task_id.map(str::to_string),
-                approval_id: approval_id.map(str::to_string),
+                approval_id: resolved_approval_id,
                 operation: op,
                 title,
                 state,
@@ -1429,6 +1460,49 @@ impl PairedMcpServer {
         };
 
         let mut gateway = CoworkerPlanningGateway::new(
+            &self.state_dir,
+            wf_stores.registry.config_dir(),
+            wf_stores.plans.dir(),
+            host_stores.authority.dir(),
+            &host_stores.sessions_dir,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
+        )
+        .map_err(|err| Self::format_planning_gateway_error(&trusted_binding_id, tool_name, err))?;
+
+        if let Some(ref anchor) = self.sibling_anchor_exe {
+            gateway = gateway.with_sibling_anchor_exe(anchor.clone());
+        }
+
+        Ok((trusted_binding_id, trusted_thread_uuid, gateway))
+    }
+
+    fn verified_execution_gateway(
+        &self,
+        tool_name: &str,
+    ) -> Result<(String, String, CoworkerExecutionGateway), CallToolResult> {
+        let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
+        let trusted_binding_id = enrollment.binding_id;
+        let trusted_thread_uuid = enrollment.thread_id;
+
+        let Some(wf_stores) = self.workflow_stores.as_ref() else {
+            return Err(Self::format_scoped_error(
+                &trusted_binding_id,
+                tool_name,
+                NativeErrorCode::NotConfigured.as_str(),
+                WORKFLOW_NOT_CONFIGURED_MESSAGE,
+            ));
+        };
+        let Some(host_stores) = self.host_stores.as_ref() else {
+            return Err(Self::format_scoped_error(
+                &trusted_binding_id,
+                tool_name,
+                NativeErrorCode::NotConfigured.as_str(),
+                HOST_NOT_CONFIGURED_MESSAGE,
+            ));
+        };
+
+        let mut gateway = CoworkerExecutionGateway::new(
             &self.state_dir,
             wf_stores.registry.config_dir(),
             wf_stores.plans.dir(),
@@ -2666,6 +2740,217 @@ impl PairedMcpServer {
         })
         .await
     }
+
+    /// Reads a process-free, provider-free preview of the concrete approval and execution scope for a Coworker job (requires verified operator enrollment).
+    #[tool(
+        name = "preview_execution",
+        description = "Read a pure read-only, process-free, provider-free preview of the concrete approval and frozen execution scope for a Coworker job_id in the enrolled (binding_id, thread_uuid). Returns canonical repository/base commits, plan/approval/envelope digests, prompt-redacted frozen tasks and write paths, exact role tool/model/effort choices, check commands, budgets/caps, max_parallel, and whether the job is actually approved. Never leaks raw prompts, secret tokens, hidden executable paths, or registry configs.",
+        annotations(
+            title = "Preview Coworker Execution Scope",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn preview_execution(
+        &self,
+        Parameters(params): Parameters<PreviewExecutionParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_execution_gateway("preview_execution")?;
+        let job_id = params.job_id.clone();
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "preview_execution",
+            Some(&job_id),
+            None,
+            None,
+        );
+        let outcome = tokio::task::spawn_blocking(move || gateway.preview_execution(&params))
+            .await
+            .map_err(|_| {
+                Self::format_scoped_error(
+                    &trusted_binding_id,
+                    "preview_execution",
+                    "io_error",
+                    "Coworker execution preview task failed to complete.",
+                )
+            });
+        let result = match outcome {
+            Ok(Ok(data)) => {
+                Self::format_planning_gateway_result(&trusted_binding_id, "preview_execution", data)
+            }
+            Ok(Err(err)) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                "preview_execution",
+                err,
+            )),
+            Err(err_res) => Err(err_res),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "preview_execution",
+            Some(&job_id),
+            None,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Starts or reuses the single verified physical `CoworkerCodeDriver` owner for an approved, envelope-frozen Coworker job (requires verified operator enrollment).
+    #[tool(
+        name = "start_execution",
+        description = "Start or reuse the single verified physical CoworkerCodeDriver owner for (job_id, expected_envelope_digest) in the enrolled (binding_id, thread_uuid) via the canonical sibling threadlane-flow binary. Refuses unapproved jobs or mismatched expected_envelope_digest before spawning any process or worker. Preserves the truthful Phase 1 pipeline boundary (completed Coder tasks reach ReadyForReview / AwaitingChecksOrReview).",
+        annotations(
+            title = "Start Approved Coworker Execution",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn start_execution(
+        &self,
+        Parameters(params): Parameters<StartExecutionParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_execution_gateway("start_execution")?;
+        let job_id = params.job_id.clone();
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "start_execution",
+            Some(&job_id),
+            None,
+            None,
+        );
+        let result = match gateway.start_execution(&params).await {
+            Ok(data) => {
+                Self::format_planning_gateway_result(&trusted_binding_id, "start_execution", data)
+            }
+            Err(err) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                "start_execution",
+                err,
+            )),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "start_execution",
+            Some(&job_id),
+            None,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Reads the current verified `CoworkerCodeDriver` status for an approved Coworker job (requires verified operator enrollment).
+    #[tool(
+        name = "execution_status",
+        description = "Read the current verified CoworkerCodeDriver execution status for job_id in the enrolled (binding_id, thread_uuid), including live physical owner verification, task stages, unknown-effect blocking flags, and the truthful Phase 1 pipeline boundary. Completed Coder runs report ReadyForReview / AwaitingChecksOrReview and are never inferred as accepted or integrated.",
+        annotations(
+            title = "Get Coworker Execution Status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn execution_status(
+        &self,
+        Parameters(params): Parameters<ExecutionStatusParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_execution_gateway("execution_status")?;
+        let job_id = params.job_id.clone();
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "execution_status",
+            Some(&job_id),
+            None,
+            None,
+        );
+        let result = match gateway.execution_status(&params).await {
+            Ok(data) => {
+                Self::format_planning_gateway_result(&trusted_binding_id, "execution_status", data)
+            }
+            Err(err) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                "execution_status",
+                err,
+            )),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "execution_status",
+            Some(&job_id),
+            None,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Records durable operator stop first and performs narrow `CoworkerCodeDriver` task cancellation for an approved Coworker job (requires verified operator enrollment).
+    #[tool(
+        name = "stop_execution",
+        description = "Record durable stop_requested state first and perform narrow CoworkerCodeDriver cancellation for job_id in the enrolled (binding_id, thread_uuid) with an optional bounded reason. Preserves the explicit Phase 1 cancellation boundary without broad process kills.",
+        annotations(
+            title = "Stop Coworker Execution",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn stop_execution(
+        &self,
+        Parameters(params): Parameters<StopExecutionParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_execution_gateway("stop_execution")?;
+        let job_id = params.job_id.clone();
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "stop_execution",
+            Some(&job_id),
+            None,
+            None,
+        );
+        let result = match gateway.stop_execution(&params).await {
+            Ok(data) => {
+                Self::format_planning_gateway_result(&trusted_binding_id, "stop_execution", data)
+            }
+            Err(err) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                "stop_execution",
+                err,
+            )),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "stop_execution",
+            Some(&job_id),
+            None,
+            None,
+            &result,
+        );
+        result
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -2757,7 +3042,14 @@ fn observation_result_job_id(
     }
     let data = payload.get("data")?;
     match tool_name {
-        "prepare_work" | "consult_architect" | "request_technical_plan" | "planning_command" => {
+        "prepare_work"
+        | "consult_architect"
+        | "request_technical_plan"
+        | "planning_command"
+        | "preview_execution"
+        | "start_execution"
+        | "execution_status"
+        | "stop_execution" => {
             if data.get("binding_id")?.as_str()? != binding_id {
                 return None;
             }
@@ -2767,6 +3059,33 @@ fn observation_result_job_id(
                     .and_then(Value::as_str)
             })?;
             threadlane_core::observation::validate_correlation_id(raw_job_id)
+        }
+        _ => None,
+    }
+}
+
+/// Reads an approval correlation only from our successful, binding-scoped execution gateway response.
+fn observation_result_approval_id(
+    tool_name: &str,
+    binding_id: &str,
+    result: &Result<CallToolResult, CallToolResult>,
+) -> Option<String> {
+    let response = result.as_ref().ok()?;
+    if response.is_error == Some(true) {
+        return None;
+    }
+    let payload = response.structured_content.as_ref()?;
+    if payload.get("binding_id")?.as_str()? != binding_id {
+        return None;
+    }
+    let data = payload.get("data")?;
+    match tool_name {
+        "preview_execution" | "start_execution" | "execution_status" | "stop_execution" => {
+            if data.get("binding_id")?.as_str()? != binding_id {
+                return None;
+            }
+            let raw_approval_id = data.get("approval_id").and_then(Value::as_str)?;
+            threadlane_core::observation::validate_correlation_id(raw_approval_id)
         }
         _ => None,
     }

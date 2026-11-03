@@ -44,6 +44,8 @@ pub mod coworker_workflow;
 pub mod dispatch_guard;
 /// Structured error codes and redacted error types.
 pub mod error;
+/// Scoped Coworker execution handoff gateway bridging MCP tool parameters to `CoworkerCodeDriver`.
+pub mod execution_gateway;
 /// Path validation, private `0700`/`0600` persistence, cross-process locking, and sanitization.
 pub mod fs_safety;
 /// Validated operator launcher policy, CLI flags, and initial fresh-only host auto-start coordinator.
@@ -147,6 +149,12 @@ pub use dispatch_guard::{
     with_guarded_native_dispatch, GuardedDispatchError,
 };
 pub use error::{NativeError, NativeErrorCode};
+pub use execution_gateway::{
+    CoworkerExecutionGateway, ExecutionPreviewCheckSummary, ExecutionPreviewResponse,
+    ExecutionPreviewTaskSummary, ExecutionReadinessStatus, ExecutionStatusParams,
+    ExecutionStatusResponse, PreviewExecutionParams, StartExecutionParams, StartExecutionResponse,
+    StopExecutionParams, StopExecutionResponse, TRUSTED_LOCAL_HUMAN_APPROVAL_ROUTE,
+};
 pub use host_launcher::{
     validate_host_executable_path, ApprovedHostLauncherPolicy, HostLauncherPolicy, NativeMcpCli,
     APPROVED_HOST_STARTUP_POLL_INTERVAL, APPROVED_HOST_STARTUP_TIMEOUT,
@@ -987,9 +995,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Two connection tools, sixteen runtime tools, five workflow tools, eight approved-task tools, and five Coworker planning tools.
+        // Two connection tools, sixteen runtime tools, five workflow tools, eight approved-task tools, five Coworker planning tools, and four Coworker execution tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 36, "PairedMcpServer must expose 36 tools");
+        assert_eq!(tools.len(), 40, "PairedMcpServer must expose 40 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1324,7 +1332,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 36);
+        assert_eq!(tools.len(), 40);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),

@@ -756,7 +756,7 @@ async fn approved_mcp_tools_registered_in_router_with_strict_schemas_and_store_c
 
     // 3. Verify all 8 approved-task tools are registered in the actual `rmcp` tool router with strict schemas.
     let tools = configured_mcp.list_tools();
-    assert_eq!(tools.len(), 36);
+    assert_eq!(tools.len(), 40);
 
     for (
         tool_name,

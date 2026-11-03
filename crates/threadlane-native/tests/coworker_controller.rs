@@ -7900,3 +7900,6 @@ mod coworker_code_driver;
 
 #[path = "support/coworker_check_failure.rs"]
 mod coworker_check_failure;
+
+#[path = "support/coworker_execution_gateway.rs"]
+mod coworker_execution_gateway;
