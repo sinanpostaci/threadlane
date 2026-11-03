@@ -43,11 +43,17 @@ use threadlane_workers::{
     WorkerError, WorktreeKind, WorktreeManifest, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 
+use crate::coworker_observation::{
+    begin_coworker_call_observation, resolve_coworker_journal_dir, CoworkerCallFinishSpec,
+    CoworkerCallObservationSpec, CoworkerObservationExecutorSpec, COWORKER_OBS_OP_CHECKS_CANDIDATE,
+    COWORKER_OBS_OP_CHECKS_TASK,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, ensure_platform_supported, sanitize_diagnostic_text,
     validate_absolute_no_symlink_components, validate_bounded_identifier,
 };
+use threadlane_core::observation::ObservationCallState;
 
 use super::contracts::{
     sha256_hex, CandidateCheckEvidence, MAX_COWORKER_ID_LEN, MAX_COWORKER_TEXT_BYTES,
@@ -892,11 +898,73 @@ pub async fn run_frozen_check_with_claim(
         },
     };
 
+    let obs_handle = resolve_coworker_journal_dir(
+        None,
+        Some(ownership_guard.lock_root_dir()),
+        Some(&canonical_work_area),
+        &subject.binding_id,
+    )
+    .map(|journal_dir| {
+        let operation = match subject.target_kind {
+            FrozenCheckTargetKind::TaskWorktree => COWORKER_OBS_OP_CHECKS_TASK,
+            FrozenCheckTargetKind::RunIntegrationWorktree => COWORKER_OBS_OP_CHECKS_CANDIDATE,
+        };
+        begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir,
+            operation: operation.to_string(),
+            title: format!("Verification check `{}`", spec.check_id),
+            call_key: format!(
+                "chk:{}:{}:{}:{}:{}:{}",
+                subject.job_id,
+                subject.target_kind.as_str(),
+                subject.worktree_id,
+                subject.expected_head_commit,
+                spec.check_id,
+                spec_digest
+            ),
+            binding_id: subject.binding_id.clone(),
+            thread_uuid: subject.thread_uuid.clone(),
+            repository_path: canonical_repo.clone(),
+            job_id: Some(subject.job_id.clone()),
+            plan_id: None,
+            task_id: subject.expected_task_id.clone(),
+            approval_id: None,
+            attempt_no: None,
+            run_id: Some(subject.expected_run_id.clone()),
+            worker_id: None,
+            candidate_id: None,
+            executor: CoworkerObservationExecutorSpec::local_verification_check(&spec.check_id),
+            verified_context: None,
+            entry_summary: Some(format!("check_id={}", spec.check_id)),
+        })
+    });
+
     let cmd_res = run_bounded_command_with_cancel(&bounded_spec, cancel_rx).await;
     let finish_res = worktree_job_guard.finish();
 
-    let cmd_report = cmd_res.map_err(map_worker_error_to_native)?;
-    finish_res.map_err(map_worker_error_to_native)?;
+    let cmd_report = match cmd_res {
+        Ok(rep) => rep,
+        Err(err) => {
+            if let Some(obs) = obs_handle {
+                let _ = obs.finish(CoworkerCallFinishSpec {
+                    state: Some(ObservationCallState::Failed),
+                    diagnostic: Some(err.to_string()),
+                    ..CoworkerCallFinishSpec::default()
+                });
+            }
+            return Err(map_worker_error_to_native(err));
+        }
+    };
+    if let Err(err) = finish_res {
+        if let Some(obs) = obs_handle {
+            let _ = obs.finish(CoworkerCallFinishSpec {
+                state: Some(ObservationCallState::Failed),
+                diagnostic: Some(err.to_string()),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
+        return Err(map_worker_error_to_native(err));
+    }
 
     // Post-run revalidation of live ownership guard and worktree state.
     let mut drift_reasons = Vec::new();
@@ -1005,6 +1073,31 @@ pub async fn run_frozen_check_with_claim(
     };
     report.evidence_digest = report.compute_evidence_digest()?;
     report.validate_integrity()?;
+
+    if let Some(obs) = obs_handle {
+        let obs_state = match report.status {
+            FrozenCheckExecutionStatus::Passed => ObservationCallState::Completed,
+            FrozenCheckExecutionStatus::Cancelled => ObservationCallState::Cancelled,
+            FrozenCheckExecutionStatus::IncompleteCleanup
+            | FrozenCheckExecutionStatus::OwnershipOrContextDrifted => {
+                ObservationCallState::Unknown
+            }
+            FrozenCheckExecutionStatus::NonZeroExit
+            | FrozenCheckExecutionStatus::OutputOverflow
+            | FrozenCheckExecutionStatus::TimedOut
+            | FrozenCheckExecutionStatus::DescendantsTerminatedAfterExit
+            | FrozenCheckExecutionStatus::SubjectMutatedOrDrifted => ObservationCallState::Failed,
+        };
+        let _ = obs.finish(CoworkerCallFinishSpec {
+            state: Some(obs_state),
+            artifact_id: Some(format!("fcr_{}", &report.evidence_digest[..16])),
+            diagnostic: report
+                .drift_reason
+                .clone()
+                .or_else(|| Some(format!("status={}", report.status.as_str()))),
+            ..CoworkerCallFinishSpec::default()
+        });
+    }
 
     Ok(report)
 }

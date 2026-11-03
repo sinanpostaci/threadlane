@@ -26,6 +26,7 @@ use threadlane_plans::{
     MAX_REVISIONS_PER_PLAN, PLAN_STORE_SCHEMA_VERSION,
 };
 
+use super::coworker_jobs::{project_coworker_jobs_and_dedupe_plans, VerifiedCoworkerJobScope};
 use super::requests::WorkerObservationLink;
 use super::sources::SourceSpec;
 
@@ -36,7 +37,7 @@ const PLANS_LEDGER_FILE_NAME: &str = "plans.json";
 const CORE_STATE_DB_FILE_NAME: &str = "state.db";
 const MAX_RAW_PLAN_REVISION_ENTRIES: usize = 4_096;
 const GENERIC_PROJECT_LABEL: &str = "Unbound Project";
-const FALLBACK_VERIFIED_PROJECT_LABEL: &str = "Project";
+pub(super) const FALLBACK_VERIFIED_PROJECT_LABEL: &str = "Project";
 const REDACTED_SUMMARY_MARKER: &str = "[redacted sensitive metadata]";
 
 const WARN_PLAN_LEDGER_INVALID: &str =
@@ -60,6 +61,7 @@ pub(crate) struct JobProjection {
     pub(crate) jobs: Vec<ObservationJob>,
     pub(crate) worker_links: Vec<WorkerObservationLink>,
     pub(crate) core_states: Vec<ReadonlyCoreStateSnapshot>,
+    pub(crate) coworker_scopes: BTreeMap<String, VerifiedCoworkerJobScope>,
     pub(crate) warnings: Vec<String>,
     pub(crate) jobs_has_more: bool,
 }
@@ -147,19 +149,16 @@ pub(crate) fn project_jobs(spec: &SourceSpec) -> JobProjection {
 
     let latest_plans = load_latest_plan_revisions(&spec.plans_dir, &mut projection.warnings);
     let approvals_state = load_verified_approvals(&spec.authority_dir, &mut projection.warnings);
-    if latest_plans.is_empty() {
-        return projection;
-    }
 
     let mut all_jobs = Vec::with_capacity(latest_plans.len());
     let mut candidate_links = Vec::new();
     let mut worker_id_owners: BTreeMap<String, (String, String, String)> = BTreeMap::new();
     let mut conflicted_worker_ids: BTreeSet<String> = BTreeSet::new();
 
-    for (_plan_id, latest_plan) in latest_plans {
+    for latest_plan in latest_plans.values() {
         let (job, job_links) = project_single_plan_job(
             spec,
-            &latest_plan,
+            latest_plan,
             &approvals_state,
             &mut projection.core_states,
             &mut seen_runtime_dirs,
@@ -183,6 +182,21 @@ pub(crate) fn project_jobs(spec: &SourceSpec) -> JobProjection {
         }
     }
 
+    project_coworker_jobs_and_dedupe_plans(
+        spec,
+        &latest_plans,
+        &approvals_state,
+        &projection.core_states,
+        &mut all_jobs,
+        &mut deduped_links,
+        &mut projection.coworker_scopes,
+        &mut projection.warnings,
+    );
+
+    if all_jobs.is_empty() {
+        return projection;
+    }
+
     all_jobs.sort_by(|left, right| {
         left.source_id
             .cmp(&right.source_id)
@@ -199,7 +213,7 @@ pub(crate) fn project_jobs(spec: &SourceSpec) -> JobProjection {
     projection
 }
 
-fn push_unique_warning(warnings: &mut Vec<String>, message: &'static str) {
+pub(super) fn push_unique_warning(warnings: &mut Vec<String>, message: &'static str) {
     if !warnings.iter().any(|existing| existing == message) {
         warnings.push(message.to_string());
     }
@@ -238,7 +252,7 @@ fn verify_same_file_identity(pre_meta: &fs::Metadata, post_meta: &fs::Metadata) 
     }
 }
 
-fn read_bounded_private_file_readonly(
+pub(super) fn read_bounded_private_file_readonly(
     dir: &Path,
     file_name: &str,
     max_bytes: usize,
@@ -416,11 +430,11 @@ fn load_latest_plan_revisions(
     latest_by_plan
 }
 
-struct LoadedApprovals {
-    ledger_corrupt: bool,
-    valid_by_target: BTreeMap<(String, u64), Vec<ApprovalRecord>>,
-    corrupt_targets: BTreeSet<(String, u64)>,
-    corrupt_plan_ids: BTreeSet<String>,
+pub(super) struct LoadedApprovals {
+    pub(super) ledger_corrupt: bool,
+    pub(super) valid_by_target: BTreeMap<(String, u64), Vec<ApprovalRecord>>,
+    pub(super) corrupt_targets: BTreeSet<(String, u64)>,
+    pub(super) corrupt_plan_ids: BTreeSet<String>,
 }
 
 fn load_verified_approvals(authority_dir: &Path, warnings: &mut Vec<String>) -> LoadedApprovals {
@@ -540,7 +554,7 @@ fn load_verified_approvals(authority_dir: &Path, warnings: &mut Vec<String>) -> 
     }
 }
 
-fn is_safe_repository_path(path: &Path) -> bool {
+pub(super) fn is_safe_repository_path(path: &Path) -> bool {
     if !path.is_absolute() || path.as_os_str().is_empty() {
         return false;
     }
@@ -656,7 +670,7 @@ fn resolve_plan_approval(
     ApprovalLookup::Unique(Box::new(candidate.clone()))
 }
 
-fn sanitize_label_or_fallback(raw: &str, fallback: &str) -> String {
+pub(super) fn sanitize_label_or_fallback(raw: &str, fallback: &str) -> String {
     let sanitized = sanitize_observation_summary(raw);
     if sanitized.is_empty() || sanitized == REDACTED_SUMMARY_MARKER {
         fallback.to_string()
@@ -676,7 +690,7 @@ fn derive_verified_project_metadata(record: &ApprovalRecord) -> (String, Option<
     (label, Some(path))
 }
 
-fn resolve_thread_label(
+pub(super) fn resolve_thread_label(
     binding_id: &str,
     thread_uuid: &str,
     core_states: &[ReadonlyCoreStateSnapshot],

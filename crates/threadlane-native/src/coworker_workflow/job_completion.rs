@@ -56,6 +56,10 @@ use threadlane_workers::{
 };
 
 use crate::conversation_change::ConversationChangeStore;
+use crate::coworker_observation::{
+    begin_coworker_call_observation, CoworkerCallFinishSpec, CoworkerCallObservationSpec,
+    CoworkerObservationExecutorSpec, COWORKER_OBS_OP_INTEGRATION_JOB_AGGREGATION,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, ensure_platform_supported, read_private_file_bounded,
@@ -63,6 +67,7 @@ use crate::fs_safety::{
     validate_private_file_path,
 };
 use crate::role_flow::RoleFlowStore;
+use threadlane_core::observation::ObservationCallState;
 
 use super::candidate::{
     AssembleJobAggregateCandidateRequest, AssembleOperationsFinalCandidateOutcome,
@@ -2299,10 +2304,40 @@ fn execute_or_reuse_final_job_aggregation(
         Some(entry_change_revision),
     )?;
 
+    let obs_handle = existing_persisted_report.is_none().then(|| {
+        begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir: plans_dir.to_path_buf(),
+            operation: COWORKER_OBS_OP_INTEGRATION_JOB_AGGREGATION.to_string(),
+            title: format!("Job integration aggregation `{}`", request.job_id),
+            call_key: agg_effect_id.clone(),
+            binding_id: request.binding_id.clone(),
+            thread_uuid: request.thread_uuid.clone(),
+            repository_path: canonical_repo.clone(),
+            job_id: Some(request.job_id.clone()),
+            plan_id: None,
+            task_id: None,
+            approval_id: Some(adm.approval.approval_id.clone()),
+            attempt_no: None,
+            run_id: Some(target_integration_run_id.clone()),
+            worker_id: None,
+            candidate_id: None,
+            executor: CoworkerObservationExecutorSpec::local_git_integration(),
+            verified_context: None,
+            entry_summary: Some(format!("worktree_id={integration_worktree_id}")),
+        })
+    });
+
     let report = match execute_job_integration(&exec_req) {
         Ok(rep) => rep,
         Err(err) => {
             let diag = sanitize_diagnostic_text(&err.to_string());
+            if let Some(obs) = obs_handle {
+                let _ = obs.finish(CoworkerCallFinishSpec {
+                    state: Some(ObservationCallState::Unknown),
+                    diagnostic: Some(diag.clone()),
+                    ..CoworkerCallFinishSpec::default()
+                });
+            }
             mark_effect_unknown_best_effort(
                 controller,
                 &request.binding_id,
@@ -2328,6 +2363,16 @@ fn execute_or_reuse_final_job_aggregation(
         )
         .map_err(map_operations_error)?;
         if disk_orig != vt.original_integration_receipt || disk_orig.job_aggregation.is_some() {
+            if let Some(obs) = obs_handle {
+                let _ = obs.finish(CoworkerCallFinishSpec {
+                    state: Some(ObservationCallState::Failed),
+                    diagnostic: Some(
+                        "original per-worker IntegrationReceipt was overwritten or mutated"
+                            .to_string(),
+                    ),
+                    ..CoworkerCallFinishSpec::default()
+                });
+            }
             return Err(NativeError::new(
                 NativeErrorCode::SecurityViolation,
                 format!(
@@ -2409,6 +2454,15 @@ fn execute_or_reuse_final_job_aggregation(
             Ok(())
         },
     )?;
+
+    if let Some(obs) = obs_handle {
+        let _ = obs.finish(CoworkerCallFinishSpec {
+            state: Some(ObservationCallState::Completed),
+            receipt_id: report.receipts.last().map(|r| r.receipt_id.clone()),
+            artifact_id: Some(format!("jagg_{}", &report_artifact_digest[..16])),
+            ..CoworkerCallFinishSpec::default()
+        });
+    }
 
     Ok(CoworkerJobAggregationOutcome {
         binding_id: request.binding_id.clone(),

@@ -942,3 +942,742 @@ fn linked_context_lock_worker() {
         ObservationSourceAvailability::Available
     );
 }
+
+#[cfg(unix)]
+mod coworker_projection_tests {
+    use super::*;
+    use crate::observation::ObservationService;
+    use threadlane_core::observation::{
+        append_journal_record, ObservationCallState, ObservationJobState, ObservationJournalRecord,
+        ObservationProcessInstance, ObservationRecordPhase, ObservationUsage,
+    };
+    use threadlane_native::coworker_observation::{
+        begin_coworker_call_observation, CoworkerCallFinishSpec, CoworkerCallObservationSpec,
+        CoworkerObservationExecutorSpec, COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
+        COWORKER_OBS_OP_REVIEW_TASK,
+    };
+    use threadlane_native::coworker_workflow::{
+        AcceptedPredecessorReceiptRef, CandidateCheckEvidence, CanonicalProjectBaseRef,
+        CombinedCandidateIdentity, CombinedCandidateStatus, CoworkerBindingLedger,
+        CoworkerJobPhase, CoworkerJobRecord, CoworkerTaskRecord, CoworkerTaskStage,
+        CoworkerWorkflowStore, FrozenApprovalLinkage, ReviewVerdictOutcome,
+        StructuredReviewVerdict, TaskCandidateRef, WorkBrief, WorkBriefKind, WorkflowHoldReason,
+        WorkflowHoldRecord, COWORKER_WORKFLOW_SCHEMA_VERSION,
+    };
+    use threadlane_native::profile_flow::{RoleExecutionRoute, SelectedRoleChoice};
+    use threadlane_plans::{
+        Difficulty, PlanRevision, PlanStatus, PlanTask, ToolAdapter, WorkflowRole,
+        PLAN_STORE_SCHEMA_VERSION,
+    };
+
+    fn sample_choice(_role: WorkflowRole) -> SelectedRoleChoice {
+        SelectedRoleChoice {
+            matched_difficulty: Some(Difficulty::Medium),
+            tool_id: "tool-opencode".to_string(),
+            adapter: ToolAdapter::OpencodeV2,
+            route: RoleExecutionRoute::HeadlessWorker,
+            model_id: "model-flash".to_string(),
+            model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+            effort: Some("max".to_string()),
+        }
+    }
+
+    fn sample_project_base(project_dir: &Path) -> CanonicalProjectBaseRef {
+        CanonicalProjectBaseRef {
+            repository_path: path_text(project_dir),
+            base_commit: "1111111111111111111111111111111111111111".to_string(),
+            base_tree_sha: "2222222222222222222222222222222222222222".to_string(),
+        }
+    }
+
+    fn make_job_record(
+        job_id: &str,
+        request_key: &str,
+        binding_id: &str,
+        thread_uuid: &str,
+        project_dir: &Path,
+        summary: &str,
+        phase: CoworkerJobPhase,
+    ) -> CoworkerJobRecord {
+        let work_brief = WorkBrief {
+            brief_id: format!("brf_{job_id}"),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            project_base: sample_project_base(project_dir),
+            kind: WorkBriefKind::NewJob,
+            summary: summary.to_string(),
+            confirmed_requirements: vec!["Preserve exact scope and truthful telemetry.".to_string()],
+            proposed_additions: Vec::new(),
+            assumptions: Vec::new(),
+            open_questions: Vec::new(),
+            accepted_architect_decisions: Vec::new(),
+        };
+        let work_brief_digest = work_brief.digest().expect("brief digest");
+        CoworkerJobRecord {
+            job_id: job_id.to_string(),
+            job_revision: 1,
+            create_request_key: request_key.to_string(),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            phase,
+            work_brief,
+            work_brief_digest,
+            supersedes_job_id: None,
+            planning_result: None,
+            approval_linkage: None,
+            tasks: Vec::new(),
+            holds: Vec::new(),
+            outbox: Vec::new(),
+            combined_candidates: Vec::new(),
+        }
+    }
+
+    fn make_approved_task(task_id: &str, stage: CoworkerTaskStage) -> CoworkerTaskRecord {
+        let cand_id = format!("cnd_{task_id}");
+        let mut accepted_candidate_id = None;
+        let mut candidates = Vec::new();
+        if matches!(
+            stage,
+            CoworkerTaskStage::Accepted | CoworkerTaskStage::Integrated
+        ) {
+            accepted_candidate_id = Some(cand_id.clone());
+            candidates.push(TaskCandidateRef {
+                candidate_id: cand_id.clone(),
+                task_id: task_id.to_string(),
+                attempt_no: 1,
+                base_commit: "1111111111111111111111111111111111111111".to_string(),
+                head_commit: "3333333333333333333333333333333333333333".to_string(),
+                tree_sha: "4444444444444444444444444444444444444444".to_string(),
+                diff_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                write_paths: vec!["src/lib.rs".to_string()],
+                check_evidence_digests: vec![
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                ],
+                review_subject_digest: Some(
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+                ),
+                review_verdict: Some(StructuredReviewVerdict {
+                    verdict_id: format!("vrd_{task_id}"),
+                    task_id: task_id.to_string(),
+                    attempt_no: 1,
+                    candidate_id: cand_id,
+                    base_commit: "1111111111111111111111111111111111111111".to_string(),
+                    task_head_commit: "3333333333333333333333333333333333333333".to_string(),
+                    task_tree_sha: "4444444444444444444444444444444444444444".to_string(),
+                    diff_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                    review_subject_digest:
+                        "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                            .to_string(),
+                    policy_digest:
+                        "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                            .to_string(),
+                    outcome: ReviewVerdictOutcome::Accept,
+                    findings: Vec::new(),
+                    required_in_scope_fixes: Vec::new(),
+                    conflicting_paths_or_interfaces: Vec::new(),
+                    prose_summary: Some("Accepted.".to_string()),
+                    prose_may_advance_acceptance: false,
+                }),
+                review_receipt_id: Some(format!("rev_{task_id}")),
+                integration_receipt_id: (stage == CoworkerTaskStage::Integrated)
+                    .then(|| format!("int_{task_id}")),
+            });
+        }
+
+        CoworkerTaskRecord {
+            task_id: task_id.to_string(),
+            task_digest: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                .to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Medium,
+            selected_choice: sample_choice(WorkflowRole::Coder),
+            depends_on: Vec::new(),
+            write_paths: vec!["src/lib.rs".to_string()],
+            owned_interfaces: Vec::new(),
+            consumed_interfaces: Vec::new(),
+            stage,
+            stage_before_hold: None,
+            current_attempt_no: 1,
+            active_candidate_id: accepted_candidate_id.clone(),
+            accepted_candidate_id,
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+            attempts: Vec::new(),
+            candidates,
+            active_hold_ids: Vec::new(),
+            unresolved_outbox_id: None,
+        }
+    }
+
+    fn attach_approval_linkage(job: &mut CoworkerJobRecord, plan_id: &str, approval_id: &str) {
+        job.approval_linkage = Some(FrozenApprovalLinkage {
+            approval_id: approval_id.to_string(),
+            approval_subject_digest:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+            plan_id: plan_id.to_string(),
+            plan_revision: 1,
+            plan_digest: "9999999999999999999999999999999999999999999999999999999999999999"
+                .to_string(),
+            project_base: job.work_brief.project_base.clone(),
+            profile_id: "prof-test".to_string(),
+            registry_revision: 1,
+            policy_id: "pol-test".to_string(),
+            policy_digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_string(),
+            approved_task_ids: vec!["task-1".to_string()],
+            approved_write_paths: vec!["src/lib.rs".to_string()],
+            controller_envelope: None,
+        });
+    }
+
+    fn write_binding_ledger(plans_dir: &Path, ledger: &CoworkerBindingLedger) -> PathBuf {
+        ledger
+            .validate(&ledger.binding_id)
+            .expect("test CoworkerBindingLedger must pass strict validation");
+        let store = CoworkerWorkflowStore::new(plans_dir).expect("open CoworkerWorkflowStore");
+        let path = store
+            .ledger_path_for_binding(&ledger.binding_id)
+            .expect("resolve ledger path");
+        let bytes = serde_json::to_vec_pretty(ledger).expect("serialize ledger");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .expect("open ledger file");
+        file.write_all(&bytes).expect("write ledger file");
+        file.sync_all().expect("sync ledger file");
+        drop(file);
+        set_mode(&path, 0o600);
+        path
+    }
+
+    #[test]
+    fn coworker_workflow_projects_stages_dedupes_verified_plan_and_requires_closure_for_completion()
+    {
+        let tree = TestTree::new("coworker-stages");
+        let stores = Stores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("project-alpha");
+        let binding_id = "bind-coworker-alpha";
+        let thread_uuid = "12121212-1212-4212-8212-121212121212";
+
+        // Write two legacy plans in `plans.json` with the exact same summary title:
+        // - `plan-linked` is bound to `job_awaiting` and must be deduplicated into `job_awaiting`.
+        // - `plan-unrelated-same-title` has the same title but a distinct `plan_id` and must NOT be deduplicated.
+        let plan_linked = PlanRevision {
+            plan_id: "plan-linked".to_string(),
+            revision: 1,
+            binding_id: binding_id.to_string(),
+            profile_id: "prof-test".to_string(),
+            profile_revision: 1,
+            status: PlanStatus::Published,
+            summary: "Shared Title For Dedupe Verification".to_string(),
+            tasks: vec![PlanTask {
+                id: "task-1".to_string(),
+                title: "Implement feature".to_string(),
+                instruction: "Implement within scope.".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Medium,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+            created_at_ms: 1_700_000_001_000,
+        };
+        let plan_unrelated = PlanRevision {
+            plan_id: "plan-unrelated-same-title".to_string(),
+            ..plan_linked.clone()
+        };
+        let plans_envelope = serde_json::json!({
+            "schema_version": PLAN_STORE_SCHEMA_VERSION,
+            "revisions": [plan_linked, plan_unrelated],
+        });
+        let plans_bytes = serde_json::to_vec_pretty(&plans_envelope).expect("serialize plans");
+        tree.write_file("stores/plans/plans.json", &plans_bytes, 0o600);
+
+        let job_planning = make_job_record(
+            "job_planning_01",
+            "req_planning_01",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Drafting technical plan",
+            CoworkerJobPhase::Planning,
+        );
+
+        let mut job_awaiting = make_job_record(
+            "job_awaiting_02",
+            "req_awaiting_02",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Shared Title For Dedupe Verification",
+            CoworkerJobPhase::AwaitingApproval,
+        );
+        // Bind `plan-linked` on `job_awaiting` via approval_linkage (or planning_result);
+        // here we test awaiting approval first, then executing/reviewing/held/completed on job_exec.
+        let mut job_running = make_job_record(
+            "job_running_03",
+            "req_running_03",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Active execution job",
+            CoworkerJobPhase::Executing,
+        );
+        attach_approval_linkage(&mut job_running, "plan-linked", "apr_running_03");
+        job_running.tasks = vec![make_approved_task("task-1", CoworkerTaskStage::Running)];
+
+        let mut job_reviewing = make_job_record(
+            "job_reviewing_04",
+            "req_reviewing_04",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Under review job",
+            CoworkerJobPhase::Executing,
+        );
+        attach_approval_linkage(&mut job_reviewing, "plan-review", "apr_reviewing_04");
+        job_reviewing.tasks = vec![make_approved_task(
+            "task-1",
+            CoworkerTaskStage::ReadyForReview,
+        )];
+
+        let mut job_needs_user = make_job_record(
+            "job_held_05",
+            "req_held_05",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Held awaiting user clarification",
+            CoworkerJobPhase::Held,
+        );
+        attach_approval_linkage(&mut job_needs_user, "plan-held", "apr_held_05");
+        job_needs_user.tasks = vec![make_approved_task("task-1", CoworkerTaskStage::Held)];
+        job_needs_user.holds.push(WorkflowHoldRecord {
+            hold_id: "hld_05".to_string(),
+            request_key: "req_hld_05".to_string(),
+            reason: WorkflowHoldReason::ConversationClarificationPending,
+            detail: "Awaiting user clarification.".to_string(),
+            directly_affected_task_ids: vec!["task-1".to_string()],
+            affected_write_paths: vec!["src/lib.rs".to_string()],
+            affected_interfaces: Vec::new(),
+            holds_entire_job: true,
+            active: true,
+            created_at_job_revision: 1,
+            resolved_at_job_revision: None,
+            resolution_note: None,
+        });
+
+        // A job where all tasks are `Integrated` but `phase` is still `Executing` (no Closure proof)
+        // must NOT project as `Completed`.
+        let mut job_integrated_not_closed = make_job_record(
+            "job_integrated_no_closure_06",
+            "req_integrated_06",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Integrated tasks awaiting closure",
+            CoworkerJobPhase::Executing,
+        );
+        attach_approval_linkage(
+            &mut job_integrated_not_closed,
+            "plan-integrated",
+            "apr_integrated_06",
+        );
+        job_integrated_not_closed.tasks =
+            vec![make_approved_task("task-1", CoworkerTaskStage::Integrated)];
+
+        // A job in `CoworkerJobPhase::Completed` WITH a verified `ClosureAccepted` combined candidate.
+        let mut job_completed = make_job_record(
+            "job_completed_07",
+            "req_completed_07",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Completed with closure acceptance",
+            CoworkerJobPhase::Completed,
+        );
+        attach_approval_linkage(&mut job_completed, "plan-completed", "apr_completed_07");
+        job_completed.tasks = vec![make_approved_task("task-1", CoworkerTaskStage::Integrated)];
+        let mut combined = CombinedCandidateIdentity {
+            combined_candidate_id: "cmb_completed_07".to_string(),
+            request_key: "req_cmb_07".to_string(),
+            job_id: job_completed.job_id.clone(),
+            job_revision: 1,
+            project_base: job_completed.work_brief.project_base.clone(),
+            final_commit_sha: Some("5555555555555555555555555555555555555555".to_string()),
+            final_tree_sha: "6666666666666666666666666666666666666666".to_string(),
+            plan_id: "plan-completed".to_string(),
+            plan_revision: 1,
+            plan_digest: "9999999999999999999999999999999999999999999999999999999999999999"
+                .to_string(),
+            approval_id: "apr_completed_07".to_string(),
+            approval_subject_digest:
+                "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
+            scope_policy_revision: 1,
+            policy_id: "pol-test".to_string(),
+            policy_digest: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_string(),
+            accepted_predecessor_receipts: vec![AcceptedPredecessorReceiptRef {
+                task_id: "task-1".to_string(),
+                candidate_id: "cnd_task-1".to_string(),
+                head_commit: "3333333333333333333333333333333333333333".to_string(),
+                tree_sha: "4444444444444444444444444444444444444444".to_string(),
+                review_subject_digest:
+                    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+                review_receipt_id: "rev_task-1".to_string(),
+                integration_receipt_id: "int_task-1".to_string(),
+            }],
+            check_evidence: vec![CandidateCheckEvidence {
+                check_id: "cargo_test".to_string(),
+                command_summary: "cargo test".to_string(),
+                passed: true,
+                exit_code: 0,
+                evidence_digest: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            }],
+            candidate_digest: String::new(),
+            closure_reservation_id: Some("cls_completed_07".to_string()),
+            status: CombinedCandidateStatus::ClosureAccepted,
+        };
+        combined.candidate_digest = combined.compute_candidate_digest().expect("cmb digest");
+        job_completed.combined_candidates.push(combined);
+
+        // Give `job_awaiting` no approval_linkage so it projects `AwaitingApproval` -> `NeedsUser` + `pending_approval`.
+        job_awaiting.phase = CoworkerJobPhase::AwaitingApproval;
+
+        let ledger = CoworkerBindingLedger {
+            schema_version: COWORKER_WORKFLOW_SCHEMA_VERSION,
+            binding_id: binding_id.to_string(),
+            thread_uuid: Some(thread_uuid.to_string()),
+            ledger_revision: 1,
+            planning_grants: Vec::new(),
+            architect_advice: Vec::new(),
+            jobs: vec![
+                job_planning,
+                job_awaiting,
+                job_running,
+                job_reviewing,
+                job_needs_user,
+                job_integrated_not_closed,
+                job_completed,
+            ],
+        };
+        write_binding_ledger(&stores.plans, &ledger);
+
+        let service = ObservationService::new(config(&app_data, &stores));
+        let snapshot = service.snapshot(None).expect("snapshot");
+
+        let by_id: std::collections::BTreeMap<&str, &threadlane_core::observation::ObservationJob> =
+            snapshot.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
+
+        assert_eq!(
+            by_id["job_planning_01"].state,
+            ObservationJobState::Planning
+        );
+        assert_eq!(by_id["job_planning_01"].approval_status, "draft");
+
+        assert_eq!(
+            by_id["job_awaiting_02"].state,
+            ObservationJobState::NeedsUser
+        );
+        assert_eq!(by_id["job_awaiting_02"].approval_status, "pending_approval");
+
+        assert_eq!(by_id["job_running_03"].state, ObservationJobState::Running);
+        assert_eq!(by_id["job_running_03"].execution_status, "running");
+
+        assert_eq!(
+            by_id["job_reviewing_04"].state,
+            ObservationJobState::Reviewing
+        );
+        assert_eq!(
+            by_id["job_reviewing_04"].execution_status,
+            "ready_for_review"
+        );
+
+        assert_eq!(by_id["job_held_05"].state, ObservationJobState::NeedsUser);
+        assert_eq!(by_id["job_held_05"].execution_status, "held");
+
+        // All tasks integrated without Closure proof must stay Reviewing, never Completed.
+        assert_eq!(
+            by_id["job_integrated_no_closure_06"].state,
+            ObservationJobState::Reviewing
+        );
+        assert_ne!(
+            by_id["job_integrated_no_closure_06"].state,
+            ObservationJobState::Completed
+        );
+
+        // Full job completion + ClosureAccepted proof projects Completed.
+        assert_eq!(
+            by_id["job_completed_07"].state,
+            ObservationJobState::Completed
+        );
+        assert_eq!(by_id["job_completed_07"].execution_status, "completed");
+        assert_eq!(
+            by_id["job_completed_07"].review_state.as_deref(),
+            Some("review_passed")
+        );
+
+        // Same-title unrelated legacy plan is preserved (`plan-unrelated-same-title`).
+        assert!(by_id.contains_key("plan-unrelated-same-title"));
+    }
+
+    #[test]
+    fn coworker_workflow_requests_bind_verified_scope_and_degrade_dead_process_or_forged_hints() {
+        let tree = TestTree::new("coworker-requests");
+        let stores = Stores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("project-beta");
+        let binding_id = "bind-coworker-beta";
+        let thread_uuid = "34343434-3434-4434-8434-343434343434";
+
+        let mut job_active = make_job_record(
+            "job_active_beta",
+            "req_active_beta",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Active beta job",
+            CoworkerJobPhase::Executing,
+        );
+        attach_approval_linkage(&mut job_active, "plan-beta", "apr_beta");
+        job_active.tasks = vec![make_approved_task("task-1", CoworkerTaskStage::UnderReview)];
+
+        let ledger = CoworkerBindingLedger {
+            schema_version: COWORKER_WORKFLOW_SCHEMA_VERSION,
+            binding_id: binding_id.to_string(),
+            thread_uuid: Some(thread_uuid.to_string()),
+            ledger_revision: 1,
+            planning_grants: Vec::new(),
+            architect_advice: Vec::new(),
+            jobs: vec![job_active],
+        };
+        write_binding_ledger(&stores.plans, &ledger);
+
+        // Also write a corrupt misnamed coworker ledger file to verify safe warning + skip.
+        tree.write_file(
+            "stores/plans/coworker-workflow-invalid-tag.json",
+            b"{not json",
+            0o600,
+        );
+
+        // 1. Record a real finished Reviewer call via `begin_coworker_call_observation` + `finish`.
+        let handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir: stores.plans.clone(),
+            operation: COWORKER_OBS_OP_REVIEW_TASK.to_string(),
+            title: "Task Reviewer: task-1".to_string(),
+            call_key: "rev_call_01".to_string(),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
+            repository_path: project.clone(),
+            job_id: Some("job_active_beta".to_string()),
+            plan_id: Some("plan-beta".to_string()),
+            task_id: Some("task-1".to_string()),
+            approval_id: Some("apr_beta".to_string()),
+            attempt_no: Some(1),
+            run_id: Some("run_rev_01".to_string()),
+            worker_id: Some("wrk_rev_01".to_string()),
+            candidate_id: Some("cnd_task-1".to_string()),
+            executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
+                WorkflowRole::Reviewer,
+                &sample_choice(WorkflowRole::Reviewer),
+            ),
+            verified_context: None,
+            entry_summary: Some("stage=task_review".to_string()),
+        });
+        let rev_req_id = handle.request_id().to_string();
+        let rev_call_id = handle.call_id().to_string();
+        handle.finish(CoworkerCallFinishSpec {
+            state: Some(ObservationCallState::Completed),
+            observed_model: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+            observed_effort: Some("max".to_string()),
+            // All-None usage must normalize to `None` (never fabricated 0).
+            usage: Some(ObservationUsage {
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                total_tokens: None,
+                provenance: "unreported".to_string(),
+            }),
+            receipt_id: Some("rev_task-1".to_string()),
+            artifact_id: Some("trr_01".to_string()),
+            diagnostic: Some("outcome=accept".to_string()),
+            ..Default::default()
+        });
+
+        // 2. Append a forged cross-binding `coworker.*` record claiming `job_active_beta`.
+        let forged_record = ObservationJournalRecord {
+            record_id: "obsrec_forged_01".to_string(),
+            request_id: "obsreq_forged_01".to_string(),
+            parent_request_id: None,
+            call_id: Some("obsc_forged_01".to_string()),
+            phase: ObservationRecordPhase::Finish,
+            at_ms: 1_700_000_010_000,
+            pid: Some(12345),
+            process_instance: None,
+            project_label: Some("project-beta".to_string()),
+            project_path: Some(path_text(&project)),
+            binding_id: Some("bind-wrong-foreign".to_string()),
+            thread_uuid: Some(thread_uuid.to_string()),
+            thread_label: None,
+            job_id: Some("job_active_beta".to_string()),
+            plan_id: Some("plan-beta".to_string()),
+            task_id: Some("task-1".to_string()),
+            approval_id: Some("apr_beta".to_string()),
+            operation: COWORKER_OBS_OP_PLANNING_ORCHESTRATOR.to_string(),
+            title: "Forged call".to_string(),
+            state: ObservationCallState::Completed,
+            actor: None,
+            executor: None,
+            usage: None,
+            delivery: Vec::new(),
+            summary: Some("forged".to_string()),
+        };
+        append_journal_record(&stores.plans, &forged_record).expect("append forged record");
+
+        // 3. Append an unfinished `Entry` record with a dead/reused `ObservationProcessInstance`.
+        let crashed_entry = ObservationJournalRecord {
+            record_id: "obsrec_crashed_01".to_string(),
+            request_id: "obsreq_crashed_01".to_string(),
+            parent_request_id: None,
+            call_id: Some("obsc_crashed_01".to_string()),
+            phase: ObservationRecordPhase::Entry,
+            at_ms: 1_700_000_020_000,
+            pid: Some(std::process::id()),
+            process_instance: Some(ObservationProcessInstance {
+                pid: std::process::id(),
+                boot_id: "dead-boot-id-mismatch".to_string(),
+                start_ticks: u64::MAX,
+            }),
+            project_label: Some("project-beta".to_string()),
+            project_path: Some(path_text(&project)),
+            binding_id: Some(binding_id.to_string()),
+            thread_uuid: Some(thread_uuid.to_string()),
+            thread_label: None,
+            job_id: Some("job_active_beta".to_string()),
+            plan_id: Some("plan-beta".to_string()),
+            task_id: Some("task-1".to_string()),
+            approval_id: Some("apr_beta".to_string()),
+            operation: COWORKER_OBS_OP_REVIEW_TASK.to_string(),
+            title: "Crashed Reviewer call".to_string(),
+            state: ObservationCallState::Running,
+            actor: None,
+            executor: None,
+            usage: None,
+            delivery: Vec::new(),
+            summary: Some("crashed".to_string()),
+        };
+        append_journal_record(&stores.plans, &crashed_entry).expect("append crashed entry");
+
+        let service = ObservationService::new(config(&app_data, &stores));
+        let snapshot = service.snapshot(None).expect("snapshot");
+
+        let rev_req = snapshot
+            .requests
+            .iter()
+            .find(|r| r.id == rev_req_id)
+            .expect("verified reviewer request");
+        assert_eq!(rev_req.job_id.as_deref(), Some("job_active_beta"));
+        assert_eq!(rev_req.state, ObservationCallState::Completed);
+        assert!(rev_req.usage.is_none(), "unreported usage must stay None");
+        assert_eq!(rev_req.children.len(), 1);
+        assert_eq!(rev_req.children[0].id, rev_call_id);
+        let exec = rev_req.executor.as_ref().expect("executor");
+        assert_eq!(exec.role.as_deref(), Some("reviewer"));
+        assert_eq!(
+            exec.requested_model.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            exec.observed_model.as_deref(),
+            Some("opencode-go/deepseek-v4.1-flash")
+        );
+
+        let forged_req = snapshot
+            .requests
+            .iter()
+            .find(|r| r.id == "obsreq_forged_01")
+            .expect("forged request");
+        assert_eq!(
+            forged_req.job_id, None,
+            "cross-binding forged hint must not attach to job"
+        );
+
+        let crashed_req = snapshot
+            .requests
+            .iter()
+            .find(|r| r.id == "obsreq_crashed_01")
+            .expect("crashed request");
+        assert_eq!(
+            crashed_req.state,
+            ObservationCallState::Unknown,
+            "unfinished Entry with dead/reused process_instance must degrade to Unknown"
+        );
+        assert_eq!(crashed_req.children[0].state, ObservationCallState::Unknown);
+
+        let projected_job = snapshot
+            .jobs
+            .iter()
+            .find(|j| j.id == "job_active_beta")
+            .expect("projected job");
+        assert_eq!(
+            projected_job.state,
+            ObservationJobState::Unknown,
+            "job with dead in-flight call must degrade to Unknown instead of staying Running/Reviewing"
+        );
+        assert!(snapshot.warnings.iter().any(|w| w.contains(
+            "Skipped unreadable or invalid coworker workflow ledger in observation source."
+        )));
+        assert!(snapshot.warnings.iter().any(|w| w
+            .contains("Ignored unverified job, plan, task, or approval hint on journal record.")));
+    }
+
+    #[test]
+    fn coworker_workflow_snapshot_is_strictly_readonly_and_stable_across_repeated_polls() {
+        let tree = TestTree::new("coworker-readonly");
+        let stores = Stores::new(&tree, "stores");
+        let app_data = tree.dir("app-data");
+        let project = tree.dir("project-gamma");
+        let binding_id = "bind-coworker-gamma";
+        let thread_uuid = "56565656-5656-4656-8656-565656565656";
+
+        let job = make_job_record(
+            "job_gamma_01",
+            "req_gamma_01",
+            binding_id,
+            thread_uuid,
+            &project,
+            "Readonly stability test",
+            CoworkerJobPhase::Planning,
+        );
+        let ledger = CoworkerBindingLedger {
+            schema_version: COWORKER_WORKFLOW_SCHEMA_VERSION,
+            binding_id: binding_id.to_string(),
+            thread_uuid: Some(thread_uuid.to_string()),
+            ledger_revision: 1,
+            planning_grants: Vec::new(),
+            architect_advice: Vec::new(),
+            jobs: vec![job],
+        };
+        write_binding_ledger(&stores.plans, &ledger);
+
+        let before_entries = tree_entries(tree.path());
+        let service = ObservationService::new(config(&app_data, &stores));
+        let snap1 = service.snapshot(None).expect("snapshot 1");
+        let snap2 = service.snapshot(None).expect("snapshot 2");
+        let after_entries = tree_entries(tree.path());
+
+        assert_eq!(
+            before_entries, after_entries,
+            "snapshot must not create files, locks, or directories"
+        );
+        assert_eq!(snap1.jobs, snap2.jobs);
+        assert_eq!(snap1.requests, snap2.requests);
+    }
+}

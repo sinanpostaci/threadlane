@@ -7903,3 +7903,6 @@ mod coworker_check_failure;
 
 #[path = "support/coworker_execution_gateway.rs"]
 mod coworker_execution_gateway;
+
+#[path = "support/coworker_observation.rs"]
+mod coworker_observation;

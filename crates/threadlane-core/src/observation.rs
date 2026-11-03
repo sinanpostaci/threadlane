@@ -759,8 +759,15 @@ pub fn current_observation_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn contains_sk_prefix_marker(lower: &str) -> bool {
+    let bytes = lower.as_bytes();
+    bytes.windows(3).enumerate().any(|(idx, window)| {
+        window == b"sk-" && (idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric())
+    })
+}
+
 fn contains_sensitive_marker(lower: &str) -> bool {
-    lower.contains("sk-")
+    contains_sk_prefix_marker(lower)
         || lower.contains("bearer")
         || lower.contains("api_key")
         || lower.contains("apikey")
@@ -793,6 +800,84 @@ pub fn validate_correlation_id(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+#[cfg(test)]
+mod correlation_marker_regression_tests {
+    use super::{contains_sensitive_marker, sanitize_observation_summary, validate_correlation_id};
+
+    #[test]
+    fn preserves_ordinary_task_correlation_ids_while_rejecting_sensitive_markers() {
+        for valid in [
+            "task-obs-main",
+            "task-root-a",
+            "task-0123456789abcdef0123456789abcdef",
+            "plan_01:step.2",
+        ] {
+            assert_eq!(
+                validate_correlation_id(valid),
+                Some(valid.to_string()),
+                "expected valid correlation id to be preserved: {valid}"
+            );
+        }
+
+        for sk_secret in [
+            "sk-1234567890abcdef",
+            "SK-UPPER-123456",
+            "prefix:sk-123456",
+            "task-sk-123456",
+            "scope_sk-123456",
+            "nested.sk-123456",
+        ] {
+            assert_eq!(
+                validate_correlation_id(sk_secret),
+                None,
+                "expected sk- token-boundary marker to be rejected: {sk_secret}"
+            );
+        }
+
+        assert!(contains_sensitive_marker("sk-live-key"));
+        assert!(contains_sensitive_marker("prefix:sk-live-key"));
+        assert!(contains_sensitive_marker("task-sk-live-key"));
+        assert!(contains_sensitive_marker("env_sk-live-key"));
+        assert!(!contains_sensitive_marker("task-obs-main"));
+        assert!(!contains_sensitive_marker("task-root-a"));
+        assert_eq!(
+            sanitize_observation_summary("task=task-obs-main duration_ms=7"),
+            "task=task-obs-main duration_ms=7"
+        );
+        assert_eq!(
+            sanitize_observation_summary("value=sk-1234567890abcdef duration_ms=7"),
+            "[redacted sensitive metadata]"
+        );
+
+        for other_sensitive in [
+            "bearer-xyz",
+            "my_api_key_1",
+            "apikey:123",
+            "authorization-1",
+            "task-secret-1",
+            "password-1",
+            "task-token-1",
+            "prompt-1",
+            "instruction-1",
+        ] {
+            assert_eq!(
+                validate_correlation_id(other_sensitive),
+                None,
+                "expected sensitive marker to be rejected: {other_sensitive}"
+            );
+        }
+
+        let max_len_id = "a".repeat(128);
+        let over_len_id = "a".repeat(129);
+        assert_eq!(validate_correlation_id(&max_len_id), Some(max_len_id));
+        assert_eq!(validate_correlation_id(&over_len_id), None);
+        assert_eq!(validate_correlation_id(""), None);
+        assert_eq!(validate_correlation_id("   "), None);
+        assert_eq!(validate_correlation_id("task/obs"), None);
+        assert_eq!(validate_correlation_id("task obs"), None);
+    }
+}
+
 /// Reads optional untrusted parent-request correlation from the process environment.
 pub fn read_env_parent_request_id() -> Option<String> {
     std::env::var(ENV_OBSERVATION_PARENT_REQUEST_ID)
@@ -819,7 +904,7 @@ pub fn sanitize_observation_summary(raw: &str) -> String {
         .join(" ");
 
     let lower = collapsed.to_ascii_lowercase();
-    if lower.contains("sk-")
+    if contains_sk_prefix_marker(&lower)
         || lower.contains("bearer ")
         || lower.contains("api_key")
         || lower.contains("apikey")

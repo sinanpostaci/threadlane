@@ -48,11 +48,18 @@ use threadlane_workers::{
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PROMPT_BYTES,
 };
 
+use crate::coworker_observation::{
+    begin_coworker_call_observation, extract_observed_model_and_effort,
+    map_worker_run_status_to_call_state, resolve_coworker_journal_dir, CoworkerCallFinishSpec,
+    CoworkerCallObservationSpec, CoworkerObservationExecutorSpec, COWORKER_OBS_OP_REVIEW_TASK,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, ensure_platform_supported, sanitize_diagnostic_text,
     validate_bounded_identifier,
 };
+use threadlane_core::observation::ObservationCallState;
+use threadlane_workflow::WorkflowRole;
 
 use super::contracts::{ReviewVerdictOutcome, StructuredReviewVerdict, MAX_COWORKER_ID_LEN};
 use super::ownership::{
@@ -613,13 +620,66 @@ pub async fn run_task_review_with_claim(
     };
     let response_budget = AdvisoryResponseBudget::new(request.max_response_bytes);
 
-    let structured_execution = run_advisory_worker_with_structured_result_and_cancel(
+    let obs_handle = resolve_coworker_journal_dir(
+        None,
+        Some(ownership_guard.lock_root_dir()),
+        Some(&request.subject.work_area_root),
+        &request.binding_id,
+    )
+    .map(|journal_dir| {
+        begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir,
+            operation: COWORKER_OBS_OP_REVIEW_TASK.to_string(),
+            title: format!("Task review `{}`", request.expected_identity.task_id),
+            call_key: format!(
+                "rev:{}:{}:{}:{}:{}",
+                request.job_id,
+                request.expected_identity.task_id,
+                request.expected_identity.attempt_no,
+                request.expected_identity.candidate_id,
+                request.subject.subject_digest
+            ),
+            binding_id: request.binding_id.clone(),
+            thread_uuid: request.thread_uuid.clone(),
+            repository_path: request.subject.repository_path.clone(),
+            job_id: Some(request.job_id.clone()),
+            plan_id: None,
+            task_id: Some(request.expected_identity.task_id.clone()),
+            approval_id: None,
+            attempt_no: Some(request.expected_identity.attempt_no),
+            run_id: Some(request.subject.run_id.clone()),
+            worker_id: None,
+            candidate_id: Some(request.expected_identity.candidate_id.clone()),
+            executor: CoworkerObservationExecutorSpec::from_resolved_model_target(
+                WorkflowRole::Reviewer,
+                request.provider,
+                None,
+                &resolved_model,
+            ),
+            verified_context: None,
+            entry_summary: None,
+        })
+    });
+
+    let structured_execution = match run_advisory_worker_with_structured_result_and_cancel(
         &advisory_spec,
         response_budget,
         cancel_rx,
     )
     .await
-    .map_err(map_worker_error_to_native)?;
+    {
+        Ok(exec) => exec,
+        Err(err) => {
+            if let Some(obs) = obs_handle {
+                let _ = obs.finish(CoworkerCallFinishSpec {
+                    state: Some(ObservationCallState::Failed),
+                    diagnostic: Some(err.to_string()),
+                    ..CoworkerCallFinishSpec::default()
+                });
+            }
+            return Err(map_worker_error_to_native(err));
+        }
+    };
 
     let observed_model = structured_execution
         .execution
@@ -791,6 +851,30 @@ pub async fn run_task_review_with_claim(
         verified_verdict,
     };
     report.validate_integrity()?;
+    if let Some(obs) = obs_handle {
+        let obs_state = match report.status {
+            TaskReviewExecutionStatus::VerifiedVerdict => ObservationCallState::Completed,
+            TaskReviewExecutionStatus::KnownTerminalFailure => {
+                map_worker_run_status_to_call_state(report.execution().status)
+            }
+            TaskReviewExecutionStatus::UnknownOutcome
+            | TaskReviewExecutionStatus::OwnershipLostOrDrifted => ObservationCallState::Unknown,
+            TaskReviewExecutionStatus::SubjectMutatedOrDrifted => ObservationCallState::Failed,
+        };
+        let (genuine_obs_model, genuine_obs_effort) =
+            extract_observed_model_and_effort(&report.structured_execution.execution);
+        let _ = obs.finish(CoworkerCallFinishSpec {
+            state: Some(obs_state),
+            observed_model: genuine_obs_model,
+            observed_effort: genuine_obs_effort,
+            receipt_id: report
+                .verified_verdict
+                .as_ref()
+                .map(|v| v.verdict_id.clone()),
+            diagnostic: report.diagnostic.clone(),
+            ..CoworkerCallFinishSpec::default()
+        });
+    }
     Ok(report)
 }
 

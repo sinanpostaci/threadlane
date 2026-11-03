@@ -44,6 +44,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
+use threadlane_core::observation::ObservationCallState;
 use threadlane_workers::{
     inspect_base_commit_path_kind, is_commit_ancestor, is_worktree_clean, resolve_exact_commit_sha,
     resolve_exact_tree_sha, resolve_model_target, run_advisory_worker_with_structured_result,
@@ -60,6 +61,11 @@ use threadlane_workflow::{
     SavePlanDraft, ScopedWorkflow, ToolAdapter, WorkflowError, WorkflowRole,
 };
 
+use crate::coworker_observation::{
+    begin_coworker_call_observation, extract_observed_model_and_effort, CoworkerCallFinishSpec,
+    CoworkerCallObservationSpec, CoworkerObservationExecutorSpec,
+    COWORKER_OBS_OP_PLANNING_ARCHITECT, COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
+};
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, sha256_hex, validate_bounded_text,
     validate_non_native_worker_choice, validate_unique_id_list, validate_unique_text_list,
@@ -2327,6 +2333,60 @@ impl CoworkerPlanningService {
             budgets: exec_budgets,
         };
 
+        let (matched_job_id, matched_plan_id) = {
+            let matching_jobs: Vec<&CoworkerJobRecord> = ledger
+                .jobs
+                .iter()
+                .filter(|j| {
+                    j.binding_id == request.binding_id
+                        && j.thread_uuid == request.thread_uuid
+                        && constant_time_str_eq(
+                            &j.work_brief_digest,
+                            &request.context_dependencies.work_brief_digest,
+                        )
+                })
+                .collect();
+            if matching_jobs.len() == 1 {
+                (
+                    Some(matching_jobs[0].job_id.clone()),
+                    matching_jobs[0]
+                        .planning_result
+                        .as_ref()
+                        .map(|pr| pr.plan_id.clone()),
+                )
+            } else {
+                (None, None)
+            }
+        };
+        let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir: self.store.plans_dir().to_path_buf(),
+            operation: COWORKER_OBS_OP_PLANNING_ARCHITECT.to_string(),
+            title: "Architect consultation".to_string(),
+            call_key: reservation.reservation_id.clone(),
+            binding_id: request.binding_id.clone(),
+            thread_uuid: request.thread_uuid.clone(),
+            repository_path: request
+                .context_dependencies
+                .project_base
+                .repository_path
+                .clone()
+                .into(),
+            job_id: matched_job_id,
+            plan_id: matched_plan_id,
+            task_id: None,
+            approval_id: None,
+            attempt_no: None,
+            run_id: None,
+            worker_id: None,
+            candidate_id: None,
+            executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
+                WorkflowRole::Architect,
+                &selected_choice,
+            ),
+            verified_context: None,
+            entry_summary: None,
+        });
+
         let run_result =
             run_advisory_worker_with_structured_result(&worker_spec, response_budget).await;
         let post_snapshot_check =
@@ -2338,7 +2398,7 @@ impl CoworkerPlanningService {
         let structured_exec = match run_result {
             Ok(exec) => exec,
             Err(worker_err) => {
-                return self.handle_worker_launch_error(
+                let res = self.handle_worker_launch_error(
                     &request.binding_id,
                     &request.thread_uuid,
                     &request.grant_id,
@@ -2346,10 +2406,41 @@ impl CoworkerPlanningService {
                     request.current_time_ms,
                     worker_err,
                 );
+                let terminal_state = match &res {
+                    Err(e)
+                        if e.code()
+                            == NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str() =>
+                    {
+                        ObservationCallState::Unknown
+                    }
+                    _ => ObservationCallState::Failed,
+                };
+                let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                    state: Some(terminal_state),
+                    diagnostic: Some("architect_worker_launch_failed".to_string()),
+                    ..Default::default()
+                });
+                return res;
             }
         };
 
+        let (observed_model, observed_effort) =
+            extract_observed_model_and_effort(&structured_exec.execution);
+        let failed_call_state = if structured_exec.execution.status == WorkerRunStatus::Cancelled {
+            ObservationCallState::Cancelled
+        } else {
+            ObservationCallState::Failed
+        };
+
         if let Err(post_err) = post_snapshot_check.and(post_repo_check) {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(failed_call_state),
+                observed_model,
+                observed_effort,
+                artifact_id: Some(artifact_id.clone()),
+                diagnostic: Some("architect_post_snapshot_check_failed".to_string()),
+                ..Default::default()
+            });
             return self.record_failed_after_effect(
                 &request.binding_id,
                 &request.thread_uuid,
@@ -2370,6 +2461,14 @@ impl CoworkerPlanningService {
             .verified_response_within_budget(response_budget.max_response_bytes)
             .cloned()
         else {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(failed_call_state),
+                observed_model,
+                observed_effort,
+                artifact_id: Some(artifact_id.clone()),
+                diagnostic: Some("architect_missing_or_invalid_response".to_string()),
+                ..Default::default()
+            });
             let err_msg = describe_missing_or_invalid_advisory_response(
                 &structured_exec.execution,
                 structured_exec.response_error.as_ref(),
@@ -2400,6 +2499,14 @@ impl CoworkerPlanningService {
         ) {
             Ok(parsed) => parsed,
             Err(parse_err) => {
+                let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                    state: Some(failed_call_state),
+                    observed_model,
+                    observed_effort,
+                    artifact_id: Some(artifact_id.clone()),
+                    diagnostic: Some("architect_invalid_json_response".to_string()),
+                    ..Default::default()
+                });
                 let msg = format!(
                         "Architect response is not valid StructuredArchitectAdviceOutput JSON: {parse_err}"
                     );
@@ -2424,6 +2531,14 @@ impl CoworkerPlanningService {
             match parsed_advice.validate_and_digest(&request.context_dependencies.project_base) {
                 Ok(d) => d,
                 Err(val_err) => {
+                    let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                        state: Some(failed_call_state),
+                        observed_model,
+                        observed_effort,
+                        artifact_id: Some(artifact_id.clone()),
+                        diagnostic: Some("architect_output_validation_failed".to_string()),
+                        ..Default::default()
+                    });
                     return self.record_failed_after_effect(
                         &request.binding_id,
                         &request.thread_uuid,
@@ -2480,7 +2595,18 @@ impl CoworkerPlanningService {
             },
             created_at_ms: request.current_time_ms,
         };
-        self.write_planning_artifact(&artifact)?;
+        if let Err(err) = self.write_planning_artifact(&artifact) {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(ObservationCallState::Unknown),
+                observed_model,
+                observed_effort,
+                run_id: Some(run_id),
+                artifact_id: Some(artifact_id),
+                diagnostic: Some("architect_artifact_persist_failed".to_string()),
+                ..Default::default()
+            });
+            return Err(err);
+        }
 
         let finalized = self
             .store
@@ -2492,7 +2618,7 @@ impl CoworkerPlanningService {
                 expected_ledger_revision: None,
                 status: PlanningReservationStatus::Completed,
                 updated_at_ms: request.current_time_ms,
-                run_id: Some(run_id),
+                run_id: Some(run_id.clone()),
                 report_artifact_id: Some(artifact_id.clone()),
                 output_digest: Some(verified_response.sha256_digest),
                 diagnostic: None,
@@ -2510,10 +2636,20 @@ impl CoworkerPlanningService {
                 context_dependencies: request.context_dependencies.clone(),
                 decision_summary: parsed_advice.decision_summary.clone(),
                 decision_digest,
-                report_artifact_id: Some(artifact_id),
+                report_artifact_id: Some(artifact_id.clone()),
                 status: desired_status,
                 created_at_ms: request.current_time_ms,
             })?;
+
+        let _ = obs_handle.finish(CoworkerCallFinishSpec {
+            state: Some(ObservationCallState::Completed),
+            observed_model,
+            observed_effort,
+            run_id: Some(run_id),
+            receipt_id: Some(record.advice_id.clone()),
+            artifact_id: Some(artifact_id),
+            ..Default::default()
+        });
 
         Ok(ArchitectAdviceOutcome {
             record,
@@ -3416,6 +3552,30 @@ impl CoworkerPlanningService {
             budgets: exec_budgets,
         };
 
+        let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir: self.store.plans_dir().to_path_buf(),
+            operation: COWORKER_OBS_OP_PLANNING_ORCHESTRATOR.to_string(),
+            title: "Orchestrator technical planning".to_string(),
+            call_key: reservation.reservation_id.clone(),
+            binding_id: request.binding_id.clone(),
+            thread_uuid: request.thread_uuid.clone(),
+            repository_path: call_base.repository_path.clone().into(),
+            job_id: Some(frozen_scope.job_id.clone()),
+            plan_id: request.plan_id.clone(),
+            task_id: None,
+            approval_id: None,
+            attempt_no: None,
+            run_id: None,
+            worker_id: None,
+            candidate_id: None,
+            executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
+                WorkflowRole::Orchestrator,
+                &selected_choice,
+            ),
+            verified_context: None,
+            entry_summary: None,
+        });
+
         let run_result =
             run_advisory_worker_with_structured_result(&worker_spec, response_budget).await;
         let post_snapshot_check = snapshot.verify_invariants(&call_base);
@@ -3425,7 +3585,7 @@ impl CoworkerPlanningService {
         let structured_exec = match run_result {
             Ok(exec) => exec,
             Err(worker_err) => {
-                return self.handle_worker_launch_error(
+                let res = self.handle_worker_launch_error(
                     &request.binding_id,
                     &request.thread_uuid,
                     &request.grant_id,
@@ -3433,10 +3593,41 @@ impl CoworkerPlanningService {
                     request.current_time_ms,
                     worker_err,
                 );
+                let terminal_state = match &res {
+                    Err(e)
+                        if e.code()
+                            == NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str() =>
+                    {
+                        ObservationCallState::Unknown
+                    }
+                    _ => ObservationCallState::Failed,
+                };
+                let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                    state: Some(terminal_state),
+                    diagnostic: Some("orchestrator_worker_launch_failed".to_string()),
+                    ..Default::default()
+                });
+                return res;
             }
         };
 
+        let (observed_model, observed_effort) =
+            extract_observed_model_and_effort(&structured_exec.execution);
+        let failed_call_state = if structured_exec.execution.status == WorkerRunStatus::Cancelled {
+            ObservationCallState::Cancelled
+        } else {
+            ObservationCallState::Failed
+        };
+
         if let Err(post_err) = post_snapshot_check.and(post_repo_check) {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(failed_call_state),
+                observed_model,
+                observed_effort,
+                artifact_id: Some(artifact_id.clone()),
+                diagnostic: Some("orchestrator_post_snapshot_check_failed".to_string()),
+                ..Default::default()
+            });
             return self.record_failed_after_effect(
                 &request.binding_id,
                 &request.thread_uuid,
@@ -3457,6 +3648,14 @@ impl CoworkerPlanningService {
             .verified_response_within_budget(response_budget.max_response_bytes)
             .cloned()
         else {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(failed_call_state),
+                observed_model,
+                observed_effort,
+                artifact_id: Some(artifact_id.clone()),
+                diagnostic: Some("orchestrator_missing_or_invalid_response".to_string()),
+                ..Default::default()
+            });
             let err_msg = describe_missing_or_invalid_advisory_response(
                 &structured_exec.execution,
                 structured_exec.response_error.as_ref(),
@@ -3487,6 +3686,14 @@ impl CoworkerPlanningService {
         ) {
             Ok(parsed) => parsed,
             Err(parse_err) => {
+                let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                    state: Some(failed_call_state),
+                    observed_model,
+                    observed_effort,
+                    artifact_id: Some(artifact_id.clone()),
+                    diagnostic: Some("orchestrator_invalid_json_response".to_string()),
+                    ..Default::default()
+                });
                 let msg = format!(
                         "Orchestrator response is not valid StructuredOrchestratorOutput JSON: {parse_err}"
                     );
@@ -3511,6 +3718,14 @@ impl CoworkerPlanningService {
             .validate(&call_base)
             .and_then(|()| parsed_output.validate_against_brief(&frozen_scope.work_brief))
         {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(failed_call_state),
+                observed_model,
+                observed_effort,
+                artifact_id: Some(artifact_id.clone()),
+                diagnostic: Some("orchestrator_output_validation_failed".to_string()),
+                ..Default::default()
+            });
             return self.record_failed_after_effect(
                 &request.binding_id,
                 &request.thread_uuid,
@@ -3566,7 +3781,18 @@ impl CoworkerPlanningService {
             },
             created_at_ms: request.current_time_ms,
         };
-        self.write_planning_artifact(&artifact)?;
+        if let Err(err) = self.write_planning_artifact(&artifact) {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(ObservationCallState::Unknown),
+                observed_model,
+                observed_effort,
+                run_id: Some(run_id),
+                artifact_id: Some(artifact_id),
+                diagnostic: Some("orchestrator_artifact_persist_failed".to_string()),
+                ..Default::default()
+            });
+            return Err(err);
+        }
 
         let finalized = self
             .store
@@ -3578,11 +3804,20 @@ impl CoworkerPlanningService {
                 expected_ledger_revision: None,
                 status: PlanningReservationStatus::Completed,
                 updated_at_ms: request.current_time_ms,
-                run_id: Some(run_id),
-                report_artifact_id: Some(artifact_id),
+                run_id: Some(run_id.clone()),
+                report_artifact_id: Some(artifact_id.clone()),
                 output_digest: Some(verified_response.sha256_digest),
                 diagnostic: None,
             })?;
+
+        let _ = obs_handle.finish(CoworkerCallFinishSpec {
+            state: Some(ObservationCallState::Completed),
+            observed_model,
+            observed_effort,
+            run_id: Some(run_id),
+            artifact_id: Some(artifact_id),
+            ..Default::default()
+        });
 
         Ok((
             finalized,

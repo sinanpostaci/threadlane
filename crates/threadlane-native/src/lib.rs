@@ -38,6 +38,8 @@ pub mod conversation_change;
 pub mod coworker_driver;
 /// Trusted-local standing read-only planning/advice grant preparation, recording, and revocation helpers.
 pub mod coworker_grants;
+/// Call-bound Activity journal observation helpers for the native Coworker workflow runtime.
+pub mod coworker_observation;
 /// Shared durable contracts and per-binding ledger store for the end-to-end Coworker workflow.
 pub mod coworker_workflow;
 /// Shared conversation-change advancement guard for direct native task dispatch.
@@ -143,6 +145,19 @@ pub use coworker_grants::{
     FrozenPlanningRoleChoice, LocalOperatorGrantAttestation, PlanningGrantPreview,
     PlanningGrantPreviewStatus, PlanningGrantSummary, PreparePlanningGrantRequest,
     RecordPlanningGrantRequest, TrustedGrantScope, PLANNING_GRANT_PREVIEW_DOMAIN,
+};
+pub use coworker_observation::{
+    begin_coworker_call_observation, current_verified_coworker_observation_context_for_scope,
+    derive_coworker_observation_ids, extract_observed_model_and_effort,
+    is_coworker_workflow_operation, map_worker_run_status_to_call_state,
+    resolve_coworker_journal_dir, with_verified_coworker_observation_context,
+    CoworkerCallFinishSpec, CoworkerCallObservationHandle, CoworkerCallObservationSpec,
+    CoworkerCallObservationSummary, CoworkerObservationExecutorSpec,
+    COWORKER_OBS_OP_CHECKS_CANDIDATE, COWORKER_OBS_OP_CHECKS_TASK,
+    COWORKER_OBS_OP_CLOSURE_CANDIDATE, COWORKER_OBS_OP_CODER_CORRECTION,
+    COWORKER_OBS_OP_INTEGRATION_JOB_AGGREGATION, COWORKER_OBS_OP_INTEGRATION_TASK,
+    COWORKER_OBS_OP_PLANNING_ARCHITECT, COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
+    COWORKER_OBS_OP_REVIEW_TASK,
 };
 pub use dispatch_guard::{
     dispatch_approved_task_guarded, verify_no_blocking_conversation_changes,

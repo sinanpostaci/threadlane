@@ -55,6 +55,10 @@ use threadlane_workers::{
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
 use crate::conversation_change::ConversationChangeStore;
+use crate::coworker_observation::{
+    begin_coworker_call_observation, extract_observed_model_and_effort, CoworkerCallFinishSpec,
+    CoworkerCallObservationSpec, CoworkerObservationExecutorSpec, COWORKER_OBS_OP_CODER_CORRECTION,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, read_private_file_bounded, validate_bounded_identifier,
@@ -65,6 +69,7 @@ use crate::profile_flow::{
     SelectedRoleChoice,
 };
 use crate::role_flow::read_registry_snapshot_readonly;
+use threadlane_core::observation::ObservationCallState;
 
 use super::contracts::{
     deterministic_prefixed_id, sha256_hex, validate_non_native_worker_choice, CoworkerJobPhase,
@@ -1514,6 +1519,35 @@ pub async fn execute_task_correction(
             }
         }
     });
+    let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+        journal_dir: controller.workflow_store().plans_dir().to_path_buf(),
+        operation: COWORKER_OBS_OP_CODER_CORRECTION.to_string(),
+        title: format!(
+            "Coder correction `{}` (attempt {})",
+            request.task_id, claimed_ctx.next_attempt_no
+        ),
+        call_key: claimed_ctx.effect_id.clone(),
+        binding_id: request.binding_id.clone(),
+        thread_uuid: request.thread_uuid.clone(),
+        repository_path: claimed_ctx.task_manifest.repository_path.clone(),
+        job_id: Some(request.job_id.clone()),
+        plan_id: None,
+        task_id: Some(request.task_id.clone()),
+        approval_id: Some(claimed_ctx.approval_id.clone()),
+        attempt_no: Some(claimed_ctx.next_attempt_no),
+        run_id: Some(claimed_ctx.receipt.run_id.clone()),
+        worker_id: Some(claimed_ctx.receipt.worker_id.clone()),
+        candidate_id: None,
+        executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
+            WorkflowRole::Coder,
+            &claimed_ctx.receipt.coder_choice,
+        ),
+        verified_context: None,
+        entry_summary: None,
+    });
+    let obs_receipt_id = claimed_ctx.receipt.receipt_id.clone();
+    let obs_artifact_id = claimed_ctx.report_artifact_id.clone();
+
     let exec_result = execute_worker_task_with_observer(
         &claimed_ctx.worker_spec,
         &claimed_ctx.task_manifest.run_id,
@@ -1525,17 +1559,65 @@ pub async fn execute_task_correction(
     .await;
     cancel_watcher.abort();
 
+    let (genuine_obs_model, genuine_obs_effort) = match &exec_result {
+        Ok(rep) => extract_observed_model_and_effort(&rep.worker_report),
+        Err(_) => (None, None),
+    };
+
     // Phase 3: Re-acquire `controller.step_mutex()`, re-verify physical ownership and lease, persist
     // the private `0600` execution artifact, and promote or record terminal/fenced state.
     let _step_serial_guard = controller.step_mutex().lock().await;
-    finalize_claimed_derived_coder_execution(
+    let finalize_res = finalize_claimed_derived_coder_execution(
         controller,
         guard,
         request,
         claimed_ctx,
         &manifest_task_id,
         exec_result,
-    )
+    );
+    match &finalize_res {
+        Ok(outcome) => {
+            let obs_state = match outcome.status {
+                CoworkerTaskCorrectionExecuteStatus::ReadyForVerification => {
+                    ObservationCallState::Completed
+                }
+                CoworkerTaskCorrectionExecuteStatus::CancelledTerminal => {
+                    ObservationCallState::Cancelled
+                }
+                CoworkerTaskCorrectionExecuteStatus::FailedTerminal
+                | CoworkerTaskCorrectionExecuteStatus::FencedLateOutputPreserved
+                | CoworkerTaskCorrectionExecuteStatus::WaitingForParallelCapacity => {
+                    ObservationCallState::Failed
+                }
+            };
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(obs_state),
+                observed_model: genuine_obs_model,
+                observed_effort: genuine_obs_effort,
+                receipt_id: Some(obs_receipt_id),
+                artifact_id: Some(obs_artifact_id),
+                diagnostic: outcome.diagnostic.clone(),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
+        Err(err) => {
+            let obs_state = if err.code == NativeErrorCode::AmbiguousWakeupPendingReconciliation {
+                ObservationCallState::Unknown
+            } else {
+                ObservationCallState::Failed
+            };
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(obs_state),
+                observed_model: genuine_obs_model,
+                observed_effort: genuine_obs_effort,
+                receipt_id: Some(obs_receipt_id),
+                artifact_id: Some(obs_artifact_id),
+                diagnostic: Some(err.message.clone()),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
+    }
+    finalize_res
 }
 
 enum PrepareOrClaimDisposition {

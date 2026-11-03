@@ -1,3 +1,4 @@
+pub(crate) mod coworker_jobs;
 pub(crate) mod jobs;
 pub(crate) mod requests;
 pub(crate) mod sources;
@@ -116,7 +117,7 @@ impl ObservationService {
                 }
             }
 
-            let job_projection = jobs::project_jobs(spec);
+            let mut job_projection = jobs::project_jobs(spec);
             raw_warnings.extend(job_projection.warnings);
             if job_projection.jobs_has_more {
                 upstream_jobs_has_more = true;
@@ -125,12 +126,24 @@ impl ObservationService {
             let (journal_records, journal_warnings) = read_source_journal_records(spec);
             raw_warnings.extend(journal_warnings);
 
-            let request_projection = requests::project_requests(
+            let prepared_journal = coworker_jobs::prepare_journal_records_for_projection(
+                &journal_records,
+                &job_projection.coworker_scopes,
+            );
+            raw_warnings.extend(prepared_journal.warnings.clone());
+
+            let mut request_projection = requests::project_requests(
                 &spec.source.id,
                 &job_projection.jobs,
-                &journal_records,
+                &prepared_journal.records,
                 &job_projection.core_states,
                 &job_projection.worker_links,
+            );
+            coworker_jobs::finalize_projected_coworker_requests(
+                &mut job_projection.jobs,
+                &mut request_projection,
+                &job_projection.coworker_scopes,
+                &prepared_journal,
             );
             raw_warnings.extend(request_projection.warnings);
 

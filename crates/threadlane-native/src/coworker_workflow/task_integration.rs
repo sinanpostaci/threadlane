@@ -17,10 +17,15 @@ use threadlane_workers::{
 };
 
 use crate::conversation_change::ConversationChangeStore;
+use crate::coworker_observation::{
+    begin_coworker_call_observation, CoworkerCallFinishSpec, CoworkerCallObservationSpec,
+    CoworkerObservationExecutorSpec, COWORKER_OBS_OP_INTEGRATION_TASK,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, sanitize_diagnostic_text, validate_bounded_identifier,
 };
+use threadlane_core::observation::ObservationCallState;
 
 use super::candidate::map_operations_error;
 use super::contracts::{
@@ -526,6 +531,27 @@ pub fn integrate_accepted_task(
     let operator_id = format!("ctrl_{controller_instance_id}");
     let integrated_at_ms = i64::try_from(request.now_ms).unwrap_or(i64::MAX);
 
+    let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+        journal_dir: controller.workflow_store().plans_dir().to_path_buf(),
+        operation: COWORKER_OBS_OP_INTEGRATION_TASK.to_string(),
+        title: format!("Task integration `{}`", request.task_id),
+        call_key: expected_effect_id.clone(),
+        binding_id: request.binding_id.clone(),
+        thread_uuid: request.thread_uuid.clone(),
+        repository_path: task_manifest.repository_path.clone(),
+        job_id: Some(request.job_id.clone()),
+        plan_id: None,
+        task_id: Some(request.task_id.clone()),
+        approval_id: Some(adm.approval.approval_id.clone()),
+        attempt_no: Some(accepted_candidate.attempt_no),
+        run_id: Some(artifacts.run_id.clone()),
+        worker_id: Some(artifacts.worker_id.clone()),
+        candidate_id: Some(accepted_candidate.candidate_id.clone()),
+        executor: CoworkerObservationExecutorSpec::local_git_integration(),
+        verified_context: None,
+        entry_summary: Some(format!("strategy={expected_strategy:?}")),
+    });
+
     let exec_result = execute_integration(&ExecuteIntegrationRequest {
         work_area_root: work_area_root.clone(),
         integration_worktree_id: int_manifest.worktree_id.clone(),
@@ -545,6 +571,12 @@ pub fn integrate_accepted_task(
         Ok(receipt) => receipt,
         Err(op_err) => {
             let diag = sanitize_diagnostic_text(&op_err.to_string());
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(ObservationCallState::Unknown),
+                receipt_id: Some(expected_receipt_id.clone()),
+                diagnostic: Some(diag.clone()),
+                ..CoworkerCallFinishSpec::default()
+            });
             mark_integration_intent_unknown(
                 controller,
                 request,
@@ -578,6 +610,12 @@ pub fn integrate_accepted_task(
         Some(&executed_receipt),
     ) {
         let diag = sanitize_diagnostic_text(verify_err.message());
+        let _ = obs_handle.finish(CoworkerCallFinishSpec {
+            state: Some(ObservationCallState::Unknown),
+            receipt_id: Some(expected_receipt_id.clone()),
+            diagnostic: Some(diag.clone()),
+            ..CoworkerCallFinishSpec::default()
+        });
         mark_integration_intent_unknown(
             controller,
             request,
@@ -590,7 +628,7 @@ pub fn integrate_accepted_task(
         return Err(verify_err);
     }
 
-    finalize_verified_integration_after_effect(
+    let finalize_res = finalize_verified_integration_after_effect(
         controller,
         guard,
         request,
@@ -604,7 +642,30 @@ pub fn integrate_accepted_task(
         &reserved_outbox,
         &expected_effect_id,
         false,
-    )
+    );
+    match &finalize_res {
+        Ok(_) => {
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(ObservationCallState::Completed),
+                receipt_id: Some(executed_receipt.receipt_id.clone()),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
+        Err(err) => {
+            let obs_state = if err.code == NativeErrorCode::AmbiguousWakeupPendingReconciliation {
+                ObservationCallState::Unknown
+            } else {
+                ObservationCallState::Failed
+            };
+            let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                state: Some(obs_state),
+                receipt_id: Some(executed_receipt.receipt_id.clone()),
+                diagnostic: Some(err.message.clone()),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
+    }
+    finalize_res
 }
 
 #[allow(clippy::too_many_arguments)]

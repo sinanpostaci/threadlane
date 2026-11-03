@@ -30,6 +30,11 @@ use threadlane_workers::{
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
+use crate::coworker_observation::{
+    begin_coworker_call_observation, extract_observed_model_and_effort, CoworkerCallFinishSpec,
+    CoworkerCallObservationHandle, CoworkerCallObservationSpec, CoworkerObservationExecutorSpec,
+    COWORKER_OBS_OP_CLOSURE_CANDIDATE,
+};
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, validate_non_native_worker_choice, AcceptedPredecessorReceiptRef,
     CandidateCheckEvidence, CombinedCandidateIdentity, CombinedCandidateStatus, CoworkerJobPhase,
@@ -55,6 +60,7 @@ use crate::role_flow::{
     read_registry_snapshot_readonly, ClosureSubjectSource, PackageClosureReservation,
     ReservePackageClosureRequest, RoleFlowStore,
 };
+use threadlane_core::observation::ObservationCallState;
 
 /// Schema version for structured closure model JSON responses.
 pub const STRUCTURED_CLOSURE_RESPONSE_SCHEMA_VERSION: u32 = 1;
@@ -1279,6 +1285,7 @@ impl CoworkerCandidateService {
             actual_observed_effort,
             recorded_at_ms,
             cumulative_runtime_ms,
+            obs_ctx,
         ) = if let Some(submitted_attempt) = submitted_for_subject {
             let effect_id = deterministic_prefixed_id(
                 "threadlane-native:controller-closure-effect:v1",
@@ -1411,6 +1418,7 @@ impl CoworkerCandidateService {
                 recovered_effort,
                 recovered_recorded_at_ms,
                 cumulative_ms,
+                None,
             )
         } else {
             let has_cached_accepted = initial_closure_ledger.attempts.iter().any(|a| {
@@ -1612,6 +1620,33 @@ impl CoworkerCandidateService {
                 },
             };
 
+            let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+                journal_dir: self.store.plans_dir().to_path_buf(),
+                operation: COWORKER_OBS_OP_CLOSURE_CANDIDATE.to_string(),
+                title: format!(
+                    "Final candidate closure `{}`",
+                    request.combined_candidate_id
+                ),
+                call_key: effect_id.clone(),
+                binding_id: request.binding_id.clone(),
+                thread_uuid: request.thread_uuid.clone(),
+                repository_path: request.final_subject.repository_path.clone(),
+                job_id: Some(request.job_id.clone()),
+                plan_id: None,
+                task_id: None,
+                approval_id: Some(request.final_subject.policy.approval_id.clone()),
+                attempt_no: None,
+                run_id: Some(request.final_subject.run_id.clone()),
+                worker_id: None,
+                candidate_id: Some(request.combined_candidate_id.clone()),
+                executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
+                    WorkflowRole::Closure,
+                    &closure_choice,
+                ),
+                verified_context: None,
+                entry_summary: None,
+            });
+
             let structured_exec =
                 match run_advisory_worker_with_structured_result(&advisory_spec, response_budget)
                     .await
@@ -1621,6 +1656,11 @@ impl CoworkerCandidateService {
                         let reason = format!(
                             "closure worker invocation failed with uncertain outcome: {worker_err}"
                         );
+                        let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                            state: Some(ObservationCallState::Unknown),
+                            diagnostic: Some(reason.clone()),
+                            ..CoworkerCallFinishSpec::default()
+                        });
                         return self.record_unknown_closure_outcome(
                             policy_store,
                             &closure_store,
@@ -1664,6 +1704,7 @@ impl CoworkerCandidateService {
                     recorded_at_ms: recorded_at_ms.max(0) as u64,
                 },
             )?;
+            let obs_artifact_id = artifact_ref.artifact_id.clone();
 
             // Record compact cryptographically bound artifact reference and update completion counters.
             let cumulative_runtime_ms = policy_store.mutate_job_runtime_for_operator(
@@ -1713,6 +1754,7 @@ impl CoworkerCandidateService {
                 actual_observed_effort,
                 recorded_at_ms,
                 cumulative_runtime_ms,
+                Some((obs_handle, obs_artifact_id)),
             )
         };
 
@@ -1728,6 +1770,19 @@ impl CoworkerCandidateService {
         {
             let reason =
                 "closure worker process-group cleanup remained incomplete after exit".to_string();
+            if let Some((obs, art_id)) = obs_ctx {
+                let (genuine_model, genuine_effort) =
+                    extract_observed_model_and_effort(&structured_exec.execution);
+                let _ = obs.finish(CoworkerCallFinishSpec {
+                    state: Some(ObservationCallState::Unknown),
+                    observed_model: genuine_model,
+                    observed_effort: genuine_effort,
+                    worker_id: Some(worker_id.clone()),
+                    artifact_id: Some(art_id),
+                    diagnostic: Some(reason.clone()),
+                    ..CoworkerCallFinishSpec::default()
+                });
+            }
             return self.record_unknown_closure_outcome(
                 policy_store,
                 &closure_store,
@@ -1764,6 +1819,7 @@ impl CoworkerCandidateService {
                 actual_observed_effort,
                 false,
                 recorded_at_ms,
+                obs_ctx,
             );
         }
 
@@ -1801,6 +1857,7 @@ impl CoworkerCandidateService {
                     actual_observed_effort,
                     false,
                     recorded_at_ms,
+                    obs_ctx,
                 );
             }
         };
@@ -1834,6 +1891,7 @@ impl CoworkerCandidateService {
                     actual_observed_effort,
                     false,
                     recorded_at_ms,
+                    obs_ctx,
                 );
             }
         };
@@ -1854,6 +1912,7 @@ impl CoworkerCandidateService {
                 actual_observed_effort,
                 false,
                 recorded_at_ms,
+                obs_ctx,
             );
         };
         if observed_model != &request.final_subject.policy.requested_model {
@@ -1876,6 +1935,7 @@ impl CoworkerCandidateService {
                 actual_observed_effort,
                 false,
                 recorded_at_ms,
+                obs_ctx,
             );
         }
         if request.final_subject.policy.require_effort_evidence
@@ -1901,6 +1961,7 @@ impl CoworkerCandidateService {
                 actual_observed_effort,
                 false,
                 recorded_at_ms,
+                obs_ctx,
             );
         }
 
@@ -1924,6 +1985,7 @@ impl CoworkerCandidateService {
                 actual_observed_effort,
                 true,
                 recorded_at_ms,
+                obs_ctx,
             );
         }
 
@@ -1983,6 +2045,7 @@ impl CoworkerCandidateService {
                         actual_observed_effort,
                         false,
                         recorded_at_ms,
+                        obs_ctx,
                     );
                 }
             };
@@ -2012,6 +2075,20 @@ impl CoworkerCandidateService {
             Some(&verdict),
             None,
         )?;
+
+        if let Some((obs, art_id)) = obs_ctx {
+            let (genuine_model, genuine_effort) =
+                extract_observed_model_and_effort(&structured_exec.execution);
+            let _ = obs.finish(CoworkerCallFinishSpec {
+                state: Some(ObservationCallState::Completed),
+                observed_model: genuine_model,
+                observed_effort: genuine_effort,
+                worker_id: Some(worker_id),
+                receipt_id: Some(verdict.verdict_id.clone()),
+                artifact_id: Some(art_id),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
 
         Ok(ExecuteFinalCandidateClosureOutcome {
             job: updated_job,
@@ -2277,6 +2354,7 @@ impl CoworkerCandidateService {
         observed_effort: Option<String>,
         fenced_late_output: bool,
         recorded_at_ms: i64,
+        obs_ctx: Option<(CoworkerCallObservationHandle, String)>,
     ) -> Result<ExecuteFinalCandidateClosureOutcome, NativeError> {
         let response_digest = structured_exec
             .response
@@ -2347,6 +2425,24 @@ impl CoworkerCandidateService {
                 None,
             )?
         };
+
+        if let Some((obs, art_id)) = obs_ctx {
+            let (genuine_model, genuine_effort) =
+                extract_observed_model_and_effort(&structured_exec.execution);
+            let obs_state = if structured_exec.execution.status == WorkerRunStatus::Cancelled {
+                ObservationCallState::Cancelled
+            } else {
+                ObservationCallState::Failed
+            };
+            let _ = obs.finish(CoworkerCallFinishSpec {
+                state: Some(obs_state),
+                observed_model: genuine_model,
+                observed_effort: genuine_effort,
+                artifact_id: Some(art_id),
+                diagnostic: Some(reason.to_string()),
+                ..CoworkerCallFinishSpec::default()
+            });
+        }
 
         Ok(ExecuteFinalCandidateClosureOutcome {
             job,
