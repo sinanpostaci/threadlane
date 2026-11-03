@@ -79,14 +79,21 @@ pub use dependency::{
 };
 pub use error::{OperationsApiError, OperationsError, OperationsErrorCode};
 pub use integration::{
-    cleanup_integrated_task_worktree, execute_integration, execute_push,
-    execute_remote_branch_delete, load_integration_receipt, propose_integration, propose_push,
-    propose_remote_branch_delete, ExecuteIntegrationRequest, ExecutePushRequest,
-    ExecuteRemoteDeleteRequest, IntegrationProposal, IntegrationProposalRequest,
-    IntegrationReceipt, IntegrationStrategy, PushProposal, PushProposalRequest, PushReceipt,
-    RemoteDeleteProposal, RemoteDeleteProposalRequest, RemoteDeleteReceipt,
-    VerifiedIntegratedCleanupRequest, INTEGRATION_RECEIPT_SCHEMA_VERSION,
-    PUSH_RECEIPT_SCHEMA_VERSION, REMOTE_DELETE_RECEIPT_SCHEMA_VERSION,
+    cleanup_integrated_task_worktree, execute_integration, execute_job_integration, execute_push,
+    execute_remote_branch_delete, inspect_job_integration_intent_readonly,
+    load_integration_receipt, mark_job_integration_intent_unknown, propose_integration,
+    propose_job_integration, propose_push, propose_remote_branch_delete,
+    record_job_integration_intent_before_effect, ExecuteIntegrationRequest,
+    ExecuteJobIntegrationRequest, ExecutePushRequest, ExecuteRemoteDeleteRequest,
+    IntegrationProposal, IntegrationProposalRequest, IntegrationReceipt, IntegrationStrategy,
+    JobAggregationReceiptProvenance, JobIntegrationIntent, JobIntegrationIntentState,
+    JobIntegrationPlannedTask, JobIntegrationProposal, JobIntegrationReport,
+    JobIntegrationScopeProvenance, JobIntegrationTaskInput, JobTaskDependencyExecutionProof,
+    JobTaskIntegrationProposal, ProposeJobIntegrationRequest, PushProposal, PushProposalRequest,
+    PushReceipt, RemoteDeleteProposal, RemoteDeleteProposalRequest, RemoteDeleteReceipt,
+    VerifiedIntegratedCleanupRequest, INTEGRATION_RECEIPT_SCHEMA_VERSION, JOB_INTEGRATIONS_SUBDIR,
+    JOB_INTEGRATION_INTENT_SCHEMA_VERSION, PUSH_RECEIPT_SCHEMA_VERSION,
+    REMOTE_DELETE_RECEIPT_SCHEMA_VERSION,
 };
 pub use review::{
     accept_review_subject, commit_task_worktree_changes, inspect_review_subject,

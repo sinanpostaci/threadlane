@@ -13,17 +13,23 @@ use threadlane_workers::{
     run_sanitized_git, run_sanitized_git_bytes, sanitize_and_redact,
     validate_absolute_no_symlink_components, validate_exact_40_hex_sha,
     validate_existing_canonical_dir, validate_repo_relative_path, validate_sha256_hex_digest,
-    validate_simple_identifier, write_private_json_atomic, ChangedPathEntry, DiffChangeKind,
-    WorkAreaOwnershipMarker, WorktreeKind, WorktreeManifest, WriteScopeKind, CHECKOUTS_SUBDIR,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
-    DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, WORK_AREA_MARKER_FILENAME,
+    validate_simple_identifier, write_private_json_atomic, ChangedPathEntry, DependencyInputSeal,
+    DiffChangeKind, WorkAreaOwnershipMarker, WorktreeKind, WorktreeManifest, WriteScopeKind,
+    CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS,
+    DEFAULT_MAX_GIT_OUTPUT_BYTES, DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES,
+    MANIFESTS_SUBDIR, MAX_DEPENDENCY_INPUT_BYTES, WORK_AREA_MARKER_FILENAME,
     WORK_AREA_MARKER_VERSION,
 };
 use uuid::Uuid;
 
-use crate::dependency::MAX_DEPENDENCY_CLOSURE_TASKS;
+use crate::dependency::{
+    dependency_input_snapshot_ref, DEPENDENCIES_SUBDIR, MAX_DEPENDENCY_CLOSURE_TASKS,
+};
 use crate::error::OperationsError;
-use crate::integration::{load_integration_receipt, IntegrationReceipt, IntegrationStrategy};
+use crate::integration::{
+    inspect_job_integration_intent_readonly, load_integration_receipt, IntegrationReceipt,
+    IntegrationStrategy, JobIntegrationIntentState,
+};
 use crate::review::{
     ensure_worktree_inactive_readonly, inspect_review_subject_readonly,
     load_and_verify_task_manifest, load_review_receipt, sha256_hex, verify_review_receipt_readonly,
@@ -598,6 +604,17 @@ pub fn inspect_final_candidate_readonly(
 
     // Verify no active job/writer on the RunIntegration worktree without creating a lock file.
     ensure_worktree_inactive_readonly(&integration_manifest)?;
+    if let Some(job_intent) = inspect_job_integration_intent_readonly(
+        &canonical_work_area,
+        &integration_manifest.worktree_id,
+    )? {
+        if job_intent.state != JobIntegrationIntentState::Completed {
+            return Err(OperationsError::UncertainWorkerOutcome(format!(
+                "RunIntegration worktree `{}` has unresolved job integration intent `{}` in state `{:?}`; cannot freeze final candidate until resolved",
+                integration_manifest.worktree_id, job_intent.intent_id, job_intent.state
+            )));
+        }
+    }
 
     let integration_checkout = validate_existing_canonical_dir(
         &integration_manifest.checkout_path,
@@ -729,6 +746,15 @@ pub fn inspect_final_candidate_readonly(
     let mut aggregate_allowed_write_paths = BTreeSet::new();
     let mut union_task_changed_paths = BTreeSet::new();
     let mut latest_run_integration_receipt: Option<IntegrationReceipt> = None;
+    let mut observed_job_aggregation_scope: Option<(
+        String,
+        u64,
+        String,
+        String,
+        String,
+        BTreeSet<String>,
+    )> = None;
+    let mut saw_legacy_same_run_receipt = false;
 
     for task_input in &sorted_inputs {
         validate_simple_identifier(&task_input.task_id, "predecessor.task_id")?;
@@ -782,20 +808,49 @@ pub fn inspect_final_candidate_readonly(
                 task_input.task_id, task_input.task_worktree_id
             )));
         }
-        if task_manifest.task_id.as_deref() != Some(task_input.task_id.as_str()) {
-            return Err(OperationsError::WorktreeNotOwned(format!(
-                "predecessor task worktree `{}` manifest task_id `{:?}` does not match `{}`",
-                task_input.task_worktree_id, task_manifest.task_id, task_input.task_id
-            )));
-        }
-
         let review_receipt =
             load_review_receipt(&canonical_work_area, &task_input.review_receipt_id)?;
         let integration_receipt =
             load_integration_receipt(&canonical_work_area, &task_input.integration_receipt_id)?;
 
-        if review_receipt.task_id != task_input.task_id
-            || review_receipt.task_worktree_id != task_input.task_worktree_id
+        match integration_receipt.job_aggregation {
+            Some(ref agg) => {
+                if agg.logical_task_id != task_input.task_id {
+                    return Err(OperationsError::ReceiptInvalidated(format!(
+                        "predecessor task `{}` integration receipt `{}` job_aggregation.logical_task_id `{}` mismatch",
+                        task_input.task_id, integration_receipt.receipt_id, agg.logical_task_id
+                    )));
+                }
+                if task_manifest.task_id.as_deref() != Some(review_receipt.task_id.as_str())
+                    || task_manifest.task_id.as_deref()
+                        != Some(integration_receipt.task_id.as_str())
+                {
+                    return Err(OperationsError::WorktreeNotOwned(format!(
+                        "predecessor task `{}` worktree `{}` manifest task_id `{:?}` does not match review/integration receipt task_id `{}`",
+                        task_input.task_id,
+                        task_input.task_worktree_id,
+                        task_manifest.task_id,
+                        review_receipt.task_id
+                    )));
+                }
+            }
+            None => {
+                if task_manifest.task_id.as_deref() != Some(task_input.task_id.as_str()) {
+                    return Err(OperationsError::WorktreeNotOwned(format!(
+                        "predecessor task worktree `{}` manifest task_id `{:?}` does not match `{}`",
+                        task_input.task_worktree_id, task_manifest.task_id, task_input.task_id
+                    )));
+                }
+                if review_receipt.task_id != task_input.task_id {
+                    return Err(OperationsError::ReceiptInvalidated(format!(
+                        "review receipt `{}` identity mismatch for predecessor task `{}`",
+                        review_receipt.receipt_id, task_input.task_id
+                    )));
+                }
+            }
+        }
+
+        if review_receipt.task_worktree_id != task_input.task_worktree_id
             || review_receipt.run_id != task_manifest.run_id
             || review_receipt.repository_path != canonical_repo
             || review_receipt.work_area_root != canonical_work_area
@@ -948,15 +1003,234 @@ pub fn inspect_final_candidate_readonly(
             )));
         }
 
+        if task_manifest.run_id != integration_manifest.run_id
+            && (integration_receipt.job_aggregation.is_none()
+                || integration_receipt.integration_worktree_id != integration_manifest.worktree_id)
+        {
+            return Err(OperationsError::ReceiptInvalidated(format!(
+                "predecessor `{}` from run `{}` cannot satisfy RunIntegration run `{}` without a verified job_aggregation receipt targeting worktree `{}`",
+                task_input.task_id,
+                task_manifest.run_id,
+                integration_manifest.run_id,
+                integration_manifest.worktree_id
+            )));
+        }
+
         if integration_receipt.integration_worktree_id == integration_manifest.worktree_id {
-            if integration_receipt.run_id != integration_manifest.run_id
-                || integration_receipt.integration_checkout_path != integration_checkout
+            if integration_receipt.integration_checkout_path != integration_checkout
                 || integration_receipt.integration_branch_name != integration_manifest.branch_name
             {
                 return Err(OperationsError::ReceiptInvalidated(format!(
                     "predecessor `{}` integration receipt `{}` has mismatched RunIntegration metadata",
                     task_input.task_id, integration_receipt.receipt_id
                 )));
+            }
+            match integration_receipt.job_aggregation {
+                Some(ref agg) => {
+                    if saw_legacy_same_run_receipt {
+                        return Err(OperationsError::ReceiptInvalidated(
+                            "cannot mix legacy same-run and job-aggregated integration receipts on the same RunIntegration worktree"
+                                .to_string(),
+                        ));
+                    }
+                    if agg.original_task_run_id != task_manifest.run_id
+                        || agg.original_task_run_id != review_receipt.run_id
+                        || agg.original_task_run_id != integration_receipt.run_id
+                        || agg.target_integration_run_id != integration_manifest.run_id
+                        || agg.approved_base_commit != approved_base_commit
+                        || agg.logical_task_id != task_input.task_id
+                        || agg.task_digest != task_digest
+                        || agg.approval_id != request.policy.approval_id
+                        || agg.approval_subject_digest != request.policy.approval_subject_digest
+                        || agg.accepted_task_tree_sha != live_task_subject.task_tree_sha
+                        || agg.accepted_task_diff_digest != live_task_subject.diff_digest
+                        || agg.task_allowed_write_paths != live_task_subject.allowed_write_paths
+                        || agg.task_policy != live_task_subject.policy
+                        || agg.task_test_evidence != live_task_subject.test_evidence
+                    {
+                        return Err(OperationsError::ReceiptInvalidated(format!(
+                            "predecessor `{}` integration receipt `{}` job_aggregation provenance does not match target RunIntegration run, task digest, or approval policy",
+                            task_input.task_id, integration_receipt.receipt_id
+                        )));
+                    }
+                    if review_receipt.base_commit == approved_base_commit {
+                        if agg.dependency_seal_digest.is_some()
+                            || agg.dependency_snapshot_ref.is_some()
+                        {
+                            return Err(OperationsError::ReceiptInvalidated(format!(
+                                "root predecessor `{}` integration receipt `{}` must not carry dependency seal provenance",
+                                task_input.task_id, integration_receipt.receipt_id
+                            )));
+                        }
+                    } else {
+                        let (Some(ref expected_seal_digest), Some(ref expected_snapshot_ref)) =
+                            (&agg.dependency_seal_digest, &agg.dependency_snapshot_ref)
+                        else {
+                            return Err(OperationsError::ReceiptInvalidated(format!(
+                                "non-root predecessor `{}` integration receipt `{}` is missing dependency_seal_digest or dependency_snapshot_ref",
+                                task_input.task_id, integration_receipt.receipt_id
+                            )));
+                        };
+                        let canonical_snapshot_ref = dependency_input_snapshot_ref(
+                            &request.policy.approval_id,
+                            &task_input.task_id,
+                        )?;
+                        if expected_snapshot_ref != &canonical_snapshot_ref {
+                            return Err(OperationsError::ReceiptInvalidated(format!(
+                                "non-root predecessor `{}` integration receipt `{}` dependency_snapshot_ref `{expected_snapshot_ref}` does not match `{canonical_snapshot_ref}`",
+                                task_input.task_id, integration_receipt.receipt_id
+                            )));
+                        }
+                        let seal_path = canonical_work_area
+                            .join(MANIFESTS_SUBDIR)
+                            .join(DEPENDENCIES_SUBDIR)
+                            .join(format!("{}.json", task_input.task_id));
+                        let seal: DependencyInputSeal = read_private_json(
+                            &seal_path,
+                            MAX_DEPENDENCY_INPUT_BYTES as u64,
+                            "dependency input seal",
+                        )
+                        .map_err(|err| {
+                            OperationsError::ReceiptInvalidated(format!(
+                                "non-root predecessor `{}` dependency input seal at `{}` could not be read: {err}",
+                                task_input.task_id,
+                                seal_path.display()
+                            ))
+                        })?;
+                        seal.verify_integrity()?;
+                        if &seal.seal_digest != expected_seal_digest
+                            || &seal.snapshot_ref != expected_snapshot_ref
+                            || seal.approval_id != request.policy.approval_id
+                            || seal.approval_subject_digest
+                                != request.policy.approval_subject_digest
+                            || seal.task_id != task_input.task_id
+                            || seal.task_digest != task_digest
+                            || seal.repository_path != canonical_repo
+                            || seal.work_area_root != canonical_work_area
+                            || seal.approved_base_commit != approved_base_commit
+                            || seal.execution_base_commit != review_receipt.base_commit
+                        {
+                            return Err(OperationsError::ReceiptInvalidated(format!(
+                                "non-root predecessor `{}` persisted DependencyInputSeal does not match integration receipt `{}` and candidate policy",
+                                task_input.task_id, integration_receipt.receipt_id
+                            )));
+                        }
+                        let resolved_snapshot_sha = resolve_exact_commit_sha(
+                            &canonical_repo,
+                            expected_snapshot_ref,
+                            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+                        )?;
+                        let resolved_snapshot_tree = resolve_exact_tree_sha(
+                            &canonical_repo,
+                            &resolved_snapshot_sha,
+                            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+                        )?;
+                        if resolved_snapshot_sha != seal.execution_base_commit
+                            || resolved_snapshot_tree != seal.execution_tree_sha
+                        {
+                            return Err(OperationsError::ReceiptInvalidated(format!(
+                                "non-root predecessor `{}` dependency snapshot ref `{expected_snapshot_ref}` does not match sealed execution base/tree",
+                                task_input.task_id
+                            )));
+                        }
+                        for dep_pred in &seal.predecessors {
+                            let Some(matching_input) = request
+                                .predecessor_tasks
+                                .iter()
+                                .find(|cand_pred| cand_pred.task_id == dep_pred.task_id)
+                            else {
+                                return Err(OperationsError::ReceiptInvalidated(format!(
+                                    "non-root predecessor `{}` depends on sealed predecessor `{}` which is missing from candidate predecessor_tasks",
+                                    task_input.task_id, dep_pred.task_id
+                                )));
+                            };
+                            if matching_input.task_digest != dep_pred.task_digest
+                                || matching_input.task_worktree_id != dep_pred.task_worktree_id
+                                || matching_input.review_receipt_id != dep_pred.review_receipt_id
+                                || matching_input.integration_receipt_id
+                                    == dep_pred.integration_receipt_id
+                            {
+                                return Err(OperationsError::ReceiptInvalidated(format!(
+                                    "non-root predecessor `{}` sealed predecessor `{}` proof does not match candidate predecessor_tasks entry",
+                                    task_input.task_id, dep_pred.task_id
+                                )));
+                            }
+                            let pred_manifest = load_and_verify_task_manifest(
+                                &canonical_work_area,
+                                &dep_pred.task_worktree_id,
+                            )?;
+                            let pred_review = load_review_receipt(
+                                &canonical_work_area,
+                                &dep_pred.review_receipt_id,
+                            )?;
+                            let pred_orig_int = load_integration_receipt(
+                                &canonical_work_area,
+                                &dep_pred.integration_receipt_id,
+                            )?;
+                            if pred_manifest.task_id.as_deref()
+                                != Some(pred_review.task_id.as_str())
+                                || pred_manifest.task_id.as_deref()
+                                    != Some(pred_orig_int.task_id.as_str())
+                                || pred_review.run_id != pred_manifest.run_id
+                                || pred_review.task_worktree_id != dep_pred.task_worktree_id
+                                || pred_review.subject_digest != dep_pred.review_subject_digest
+                                || pred_review.receipt_digest != dep_pred.review_receipt_digest
+                                || pred_review.task_head_commit
+                                    != dep_pred.accepted_task_head_commit
+                                || pred_orig_int.job_aggregation.is_some()
+                                || pred_orig_int.run_id != pred_manifest.run_id
+                                || pred_orig_int.task_worktree_id != dep_pred.task_worktree_id
+                                || pred_orig_int.receipt_digest
+                                    != dep_pred.integration_receipt_digest
+                                || pred_orig_int.review_receipt_id != dep_pred.review_receipt_id
+                                || pred_orig_int.review_receipt_digest
+                                    != dep_pred.review_receipt_digest
+                                || pred_orig_int.review_subject_digest
+                                    != dep_pred.review_subject_digest
+                                || pred_orig_int.accepted_task_head_commit
+                                    != dep_pred.accepted_task_head_commit
+                            {
+                                return Err(OperationsError::ReceiptInvalidated(format!(
+                                    "non-root predecessor `{}` sealed predecessor `{}` persisted manifest or receipts failed verification",
+                                    task_input.task_id, dep_pred.task_id
+                                )));
+                            }
+                        }
+                    }
+                    let current_scope = (
+                        agg.job_id.clone(),
+                        agg.job_revision,
+                        agg.approval_id.clone(),
+                        agg.approval_subject_digest.clone(),
+                        agg.target_integration_run_id.clone(),
+                        agg.job_aggregate_allowed_write_paths.clone(),
+                    );
+                    if let Some(ref existing_scope) = observed_job_aggregation_scope {
+                        if existing_scope != &current_scope {
+                            return Err(OperationsError::ReceiptInvalidated(format!(
+                                "predecessor `{}` integration receipt `{}` job_aggregation scope diverges from other predecessors in the candidate",
+                                task_input.task_id, integration_receipt.receipt_id
+                            )));
+                        }
+                    } else {
+                        observed_job_aggregation_scope = Some(current_scope);
+                    }
+                }
+                None => {
+                    if observed_job_aggregation_scope.is_some() {
+                        return Err(OperationsError::ReceiptInvalidated(
+                            "cannot mix legacy same-run and job-aggregated integration receipts on the same RunIntegration worktree"
+                                .to_string(),
+                        ));
+                    }
+                    saw_legacy_same_run_receipt = true;
+                    if integration_receipt.run_id != integration_manifest.run_id {
+                        return Err(OperationsError::ReceiptInvalidated(format!(
+                            "predecessor `{}` integration receipt `{}` has mismatched RunIntegration metadata",
+                            task_input.task_id, integration_receipt.receipt_id
+                        )));
+                    }
+                }
             }
             let replace_latest = match latest_run_integration_receipt {
                 None => true,
@@ -3023,6 +3297,7 @@ fn ensure_task_receipts_not_superseded(
         {
             let other = load_integration_receipt(canonical_work_area, other_int_id)?;
             if other.task_worktree_id == integration_receipt.task_worktree_id
+                && other.integration_worktree_id == integration_receipt.integration_worktree_id
                 && other.receipt_id != integration_receipt.receipt_id
                 && other.integrated_at_ms >= integration_receipt.integrated_at_ms
             {
