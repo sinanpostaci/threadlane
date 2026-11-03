@@ -53,6 +53,10 @@ use crate::host_launcher::{
 use crate::pairing::{
     ConnectionIdentity, EnrollmentRecord, PairingStore, CONNECTION_IDENTITY_TOOL,
 };
+use crate::planning_gateway::{
+    ConsultArchitectParams, CoworkerPlanningGateway, CoworkerStatusParams, PlanningCommandParams,
+    PrepareWorkParams, RequestTechnicalPlanParams,
+};
 
 const WORKFLOW_NOT_CONFIGURED_MESSAGE: &str =
     "Workflow registry and plan stores are not configured for this MCP server.";
@@ -338,6 +342,7 @@ pub struct PairedMcpServer {
     workflow_stores: Option<WorkflowStores>,
     host_stores: Option<HostStores>,
     host_launcher: Option<Arc<ApprovedHostLauncher>>,
+    sibling_anchor_exe: Option<PathBuf>,
     cached_workflow: Arc<Mutex<Option<CachedScopedWorkflow>>>,
     automatic_pairing: AutomaticPairing,
     tool_router: ToolRouter<Self>,
@@ -374,10 +379,18 @@ impl PairedMcpServer {
             workflow_stores: None,
             host_stores: None,
             host_launcher: None,
+            sibling_anchor_exe: None,
             cached_workflow: Arc::new(Mutex::new(None)),
             automatic_pairing: AutomaticPairing::default(),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Overrides the anchor executable path whose parent directory is searched for the canonical
+    /// same-package sibling `threadlane-flow` binary when launching planning commands.
+    pub fn with_sibling_anchor_exe(mut self, anchor_exe: impl Into<PathBuf>) -> Self {
+        self.sibling_anchor_exe = Some(anchor_exe.into());
+        self
     }
 
     /// Attaches trusted operator-configured shared [`RegistryStore`] and [`PlanStore`] handles
@@ -836,6 +849,38 @@ impl PairedMcpServer {
                     Self::parse_tool_params(tool_name, arguments)?;
                 self.approved_ack_events(Parameters(params)).await
             }
+            "coworker_status" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: CoworkerStatusParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.coworker_status(Parameters(params)).await
+            }
+            "prepare_work" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: PrepareWorkParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.prepare_work(Parameters(params)).await
+            }
+            "consult_architect" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: ConsultArchitectParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                self.consult_architect(Parameters(params)).await
+            }
+            "request_technical_plan" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: RequestTechnicalPlanParams =
+                    Self::parse_tool_params(tool_name, arguments)?;
+                self.request_technical_plan(Parameters(params)).await
+            }
+            "planning_command" => {
+                Self::ensure_no_rebind_keys(tool_name, &arguments)?;
+                let _ = self.verify_enrolled_binding_for_tool(tool_name)?;
+                let params: PlanningCommandParams = Self::parse_tool_params(tool_name, arguments)?;
+                self.planning_command(Parameters(params)).await
+            }
             _ => Err(Self::format_pairing_error(
                 tool_name,
                 NativeError::new(
@@ -880,6 +925,21 @@ impl PairedMcpServer {
                             ),
                         ),
                     ));
+                }
+            }
+            if let Some(amendment_obj) = obj.get("amendment").and_then(Value::as_object) {
+                for forbidden_key in FORBIDDEN_IDENTITY_KEYS {
+                    if amendment_obj.contains_key(forbidden_key) {
+                        return Err(Self::format_pairing_error(
+                            tool_name,
+                            NativeError::new(
+                                NativeErrorCode::RebindRejected,
+                                format!(
+                                    "caller-supplied `{forbidden_key}` is forbidden; scope comes exclusively from verified operator enrollment"
+                                ),
+                            ),
+                        ));
+                    }
                 }
             }
             if let Some(tasks) = obj.get("tasks").and_then(Value::as_array) {
@@ -1013,6 +1073,25 @@ impl PairedMcpServer {
         approval_id: Option<&str>,
         task_id: Option<&str>,
     ) -> String {
+        self.begin_paired_observation_with_job(
+            binding_id,
+            thread_uuid,
+            tool_name,
+            None,
+            approval_id,
+            task_id,
+        )
+    }
+
+    fn begin_paired_observation_with_job(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        tool_name: &'static str,
+        job_id: Option<&str>,
+        approval_id: Option<&str>,
+        task_id: Option<&str>,
+    ) -> String {
         let request_id = generate_observation_id("obsreq");
         let dir = self.observation_journal_dir();
         let started_at_ms = current_observation_time_ms();
@@ -1023,6 +1102,8 @@ impl PairedMcpServer {
             .as_ref()
             .map(|ctx| ctx.actor.clone())
             .unwrap_or_else(|| ObservationActor::unknown(Some("paired_mcp".to_string())));
+        let correlated_job_id =
+            job_id.and_then(threadlane_core::observation::validate_correlation_id);
         let _ = append_journal_record(
             &dir,
             &ObservationJournalRecord {
@@ -1039,7 +1120,7 @@ impl PairedMcpServer {
                 binding_id: Some(binding_id.to_string()),
                 thread_uuid: Some(thread_uuid.to_string()),
                 thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
-                job_id: None,
+                job_id: correlated_job_id,
                 plan_id: None,
                 task_id: task_id.map(str::to_string),
                 approval_id: approval_id.map(str::to_string),
@@ -1067,7 +1148,36 @@ impl PairedMcpServer {
         task_id: Option<&str>,
         result: &Result<CallToolResult, CallToolResult>,
     ) {
+        self.finish_paired_observation_with_job(
+            request_id,
+            binding_id,
+            thread_uuid,
+            tool_name,
+            None,
+            approval_id,
+            task_id,
+            result,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_paired_observation_with_job(
+        &self,
+        request_id: String,
+        binding_id: &str,
+        thread_uuid: &str,
+        tool_name: &'static str,
+        initial_job_id: Option<&str>,
+        approval_id: Option<&str>,
+        task_id: Option<&str>,
+        result: &Result<CallToolResult, CallToolResult>,
+    ) {
         let plan_id = observation_result_plan_id(tool_name, binding_id, result);
+        let job_id = observation_result_job_id(tool_name, binding_id, result)
+            .or_else(|| plan_id.clone())
+            .or_else(|| {
+                initial_job_id.and_then(threadlane_core::observation::validate_correlation_id)
+            });
         let dir = self.observation_journal_dir();
         let finished_at_ms = current_observation_time_ms();
         let op = format!("mcp.paired.{tool_name}");
@@ -1105,7 +1215,7 @@ impl PairedMcpServer {
                 binding_id: Some(binding_id.to_string()),
                 thread_uuid: Some(thread_uuid.to_string()),
                 thread_label: matched.as_ref().map(|ctx| ctx.thread_label.clone()),
-                job_id: plan_id.clone(),
+                job_id,
                 plan_id,
                 task_id: task_id.map(str::to_string),
                 approval_id: approval_id.map(str::to_string),
@@ -1291,6 +1401,136 @@ impl PairedMcpServer {
         };
 
         Ok((trusted_binding_id, trusted_thread_uuid, stores.clone()))
+    }
+
+    fn verified_planning_gateway(
+        &self,
+        tool_name: &str,
+    ) -> Result<(String, String, CoworkerPlanningGateway), CallToolResult> {
+        let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
+        let trusted_binding_id = enrollment.binding_id;
+        let trusted_thread_uuid = enrollment.thread_id;
+
+        let Some(wf_stores) = self.workflow_stores.as_ref() else {
+            return Err(Self::format_scoped_error(
+                &trusted_binding_id,
+                tool_name,
+                NativeErrorCode::NotConfigured.as_str(),
+                WORKFLOW_NOT_CONFIGURED_MESSAGE,
+            ));
+        };
+        let Some(host_stores) = self.host_stores.as_ref() else {
+            return Err(Self::format_scoped_error(
+                &trusted_binding_id,
+                tool_name,
+                NativeErrorCode::NotConfigured.as_str(),
+                HOST_NOT_CONFIGURED_MESSAGE,
+            ));
+        };
+
+        let mut gateway = CoworkerPlanningGateway::new(
+            &self.state_dir,
+            wf_stores.registry.config_dir(),
+            wf_stores.plans.dir(),
+            host_stores.authority.dir(),
+            &host_stores.sessions_dir,
+            trusted_binding_id.clone(),
+            trusted_thread_uuid.clone(),
+        )
+        .map_err(|err| Self::format_planning_gateway_error(&trusted_binding_id, tool_name, err))?;
+
+        if let Some(ref anchor) = self.sibling_anchor_exe {
+            gateway = gateway.with_sibling_anchor_exe(anchor.clone());
+        }
+
+        Ok((trusted_binding_id, trusted_thread_uuid, gateway))
+    }
+
+    async fn run_planning_gateway_blocking<T, F>(
+        &self,
+        tool_name: &'static str,
+        initial_job_id: Option<&str>,
+        op: F,
+    ) -> Result<CallToolResult, CallToolResult>
+    where
+        T: Serialize + Send + 'static,
+        F: FnOnce(CoworkerPlanningGateway) -> Result<T, NativeError> + Send + 'static,
+    {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_planning_gateway(tool_name)?;
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            tool_name,
+            initial_job_id,
+            None,
+            None,
+        );
+
+        let outcome = tokio::task::spawn_blocking(move || op(gateway))
+            .await
+            .map_err(|_| {
+                Self::format_scoped_error(
+                    &trusted_binding_id,
+                    tool_name,
+                    "io_error",
+                    "Coworker planning background task failed to complete.",
+                )
+            });
+
+        let result = match outcome {
+            Ok(Ok(data)) => {
+                Self::format_planning_gateway_result(&trusted_binding_id, tool_name, data)
+            }
+            Ok(Err(err)) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                tool_name,
+                err,
+            )),
+            Err(err_res) => Err(err_res),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            tool_name,
+            initial_job_id,
+            None,
+            None,
+            &result,
+        );
+        result
+    }
+
+    fn format_planning_gateway_result<T: Serialize>(
+        binding_id: &str,
+        tool_name: &'static str,
+        data: T,
+    ) -> Result<CallToolResult, CallToolResult> {
+        if let Err(err) = ensure_mcp_response_budget(binding_id, tool_name, &data) {
+            return Err(Self::format_workflow_error(binding_id, tool_name, err));
+        }
+        Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            binding_id, tool_name, data,
+        ))
+    }
+
+    fn format_planning_gateway_error(
+        binding_id: &str,
+        tool_name: &str,
+        err: NativeError,
+    ) -> CallToolResult {
+        let payload = json!({
+            "untrusted_data": true,
+            "demo_only": false,
+            "binding_id": binding_id,
+            "tool": tool_name,
+            "error": {
+                "code": err.code(),
+                "message": err.message(),
+            }
+        });
+        CallToolResult::structured_error(payload)
     }
 
     fn format_scoped_error(
@@ -2255,6 +2495,177 @@ impl PairedMcpServer {
         );
         res
     }
+
+    /// Reads bounded Coworker standing-grant, job, advice, and planning-command summaries for the enrolled chat binding (requires verified operator enrollment).
+    #[tool(
+        name = "coworker_status",
+        description = "Read a bounded (<= 20 per collection), prompt-redacted snapshot of standing planning grants, Coworker jobs, Architect advice metadata, and planning commands for the enrolled (binding_id, thread_uuid). Never exposes raw prompts or secret tokens.",
+        annotations(
+            title = "Get Coworker Planning Status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn coworker_status(
+        &self,
+        Parameters(params): Parameters<CoworkerStatusParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.run_planning_gateway_blocking("coworker_status", None, move |gateway| {
+            gateway.coworker_status(&params)
+        })
+        .await
+    }
+
+    /// Creates a new Coworker job or amends an existing job's structured work brief under an active standing planning grant (requires verified operator enrollment).
+    #[tool(
+        name = "prepare_work",
+        description = "Create a new Coworker job or record a revision-checked work-brief amendment under an active operator-attested standing planning grant for the enrolled (binding_id, thread_uuid). Separates confirmed requirements, proposed additions, assumptions, open questions, and accepted Architect decisions. Never creates grants, self-approves execution, or starts workers.",
+        annotations(
+            title = "Prepare or Amend Coworker Work Brief",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn prepare_work(
+        &self,
+        Parameters(params): Parameters<PrepareWorkParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let initial_job_id = params.amendment.as_ref().map(|a| a.target_job_id.clone());
+        self.run_planning_gateway_blocking(
+            "prepare_work",
+            initial_job_id.as_deref(),
+            move |gateway| gateway.prepare_work(&params),
+        )
+        .await
+    }
+
+    /// Enqueues a dependency-bound Architect consultation command and triggers detached execution via `threadlane-flow` (requires verified operator enrollment).
+    #[tool(
+        name = "consult_architect",
+        description = "Enqueue a read-only, dependency-bound Architect consultation command for (grant_id, job_id) and trigger detached background execution via the canonical sibling threadlane-flow process. Computes real SHA-256 file blob digests at the job's canonical project_base. Advisory output is untrusted data and is not accepted into the work brief until explicitly recorded via prepare_work.",
+        annotations(
+            title = "Consult Read-Only Architect",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn consult_architect(
+        &self,
+        Parameters(params): Parameters<ConsultArchitectParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_planning_gateway("consult_architect")?;
+        let job_id = params.job_id.clone();
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "consult_architect",
+            Some(&job_id),
+            None,
+            None,
+        );
+        let result = match gateway.consult_architect(&params).await {
+            Ok(data) => {
+                Self::format_planning_gateway_result(&trusted_binding_id, "consult_architect", data)
+            }
+            Err(err) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                "consult_architect",
+                err,
+            )),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "consult_architect",
+            Some(&job_id),
+            None,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Enqueues an Orchestrator technical planning command for a prepared Coworker job and triggers detached execution via `threadlane-flow` (requires verified operator enrollment).
+    #[tool(
+        name = "request_technical_plan",
+        description = "Enqueue an Orchestrator technical planning command for (grant_id, job_id) under an active standing planning grant and trigger detached background execution via the canonical sibling threadlane-flow process. Open technical questions and proposed additions are allowed into technical planning, while execution approval remains blocked until open questions and unconfirmed proposals are resolved. Never accepts caller-built task DAGs, never self-approves execution, and never starts coder/reviewer workers.",
+        annotations(
+            title = "Request Orchestrator Technical Plan",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn request_technical_plan(
+        &self,
+        Parameters(params): Parameters<RequestTechnicalPlanParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        let (trusted_binding_id, trusted_thread_uuid, gateway) =
+            self.verified_planning_gateway("request_technical_plan")?;
+        let job_id = params.job_id.clone();
+        let req_id = self.begin_paired_observation_with_job(
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "request_technical_plan",
+            Some(&job_id),
+            None,
+            None,
+        );
+        let result = match gateway.request_technical_plan(&params).await {
+            Ok(data) => Self::format_planning_gateway_result(
+                &trusted_binding_id,
+                "request_technical_plan",
+                data,
+            ),
+            Err(err) => Err(Self::format_planning_gateway_error(
+                &trusted_binding_id,
+                "request_technical_plan",
+                err,
+            )),
+        };
+        self.finish_paired_observation_with_job(
+            req_id,
+            &trusted_binding_id,
+            &trusted_thread_uuid,
+            "request_technical_plan",
+            Some(&job_id),
+            None,
+            None,
+            &result,
+        );
+        result
+    }
+
+    /// Reads the current status and verified structured outcome (without raw prompts) of a scoped planning command (requires verified operator enrollment).
+    #[tool(
+        name = "planning_command",
+        description = "Read the current status and verified structured outcome (Architect advice, Orchestrator published plan summary, clarification request, or Architect consultation request) for a planning command_id owned by the enrolled (binding_id, thread_uuid). Omits raw prompts; model/advisory output is untrusted data.",
+        annotations(
+            title = "Get Planning Command Status and Outcome",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn planning_command(
+        &self,
+        Parameters(params): Parameters<PlanningCommandParams>,
+    ) -> Result<CallToolResult, CallToolResult> {
+        self.run_planning_gateway_blocking("planning_command", None, move |gateway| {
+            gateway.planning_command(&params)
+        })
+        .await
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -2294,7 +2705,7 @@ impl ServerHandler for PairedMcpServer {
     }
 }
 
-/// Reads a plan correlation only from our successful, binding-scoped workflow response.
+/// Reads a plan correlation only from our successful, binding-scoped workflow or planning command response.
 /// It never accepts IDs from free-text summaries, input environment, or another tool's payload.
 fn observation_result_plan_id(
     tool_name: &str,
@@ -2310,6 +2721,15 @@ fn observation_result_plan_id(
         return None;
     }
     let data = payload.get("data")?;
+    if tool_name == "planning_command" {
+        if data.get("binding_id")?.as_str()? != binding_id {
+            return None;
+        }
+        let summary = data.get("orchestrator_plan_summary")?;
+        return threadlane_core::observation::validate_correlation_id(
+            summary.get("plan_id")?.as_str()?,
+        );
+    }
     let header = match tool_name {
         "save_draft" => data,
         "get_plan" | "publish" => data.get("header")?,
@@ -2319,6 +2739,37 @@ fn observation_result_plan_id(
         return None;
     }
     threadlane_core::observation::validate_correlation_id(header.get("plan_id")?.as_str()?)
+}
+
+/// Reads a Coworker job correlation only from our successful, binding-scoped planning gateway response.
+fn observation_result_job_id(
+    tool_name: &str,
+    binding_id: &str,
+    result: &Result<CallToolResult, CallToolResult>,
+) -> Option<String> {
+    let response = result.as_ref().ok()?;
+    if response.is_error == Some(true) {
+        return None;
+    }
+    let payload = response.structured_content.as_ref()?;
+    if payload.get("binding_id")?.as_str()? != binding_id {
+        return None;
+    }
+    let data = payload.get("data")?;
+    match tool_name {
+        "prepare_work" | "consult_architect" | "request_technical_plan" | "planning_command" => {
+            if data.get("binding_id")?.as_str()? != binding_id {
+                return None;
+            }
+            let raw_job_id = data.get("job_id").and_then(Value::as_str).or_else(|| {
+                data.get("job")
+                    .and_then(|j| j.get("job_id"))
+                    .and_then(Value::as_str)
+            })?;
+            threadlane_core::observation::validate_correlation_id(raw_job_id)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2435,6 +2886,38 @@ mod observation_correlation_tests {
         assert_eq!(
             observation_result_plan_id("save_draft", "bnd_a", &failed),
             None
+        );
+
+        let prep = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            "prepare_work",
+            json!({"binding_id": "bnd_a", "job_id": "cjob_one", "job": {"job_id": "cjob_one"}}),
+        ));
+        assert_eq!(
+            observation_result_job_id("prepare_work", "bnd_a", &prep).as_deref(),
+            Some("cjob_one")
+        );
+        assert_eq!(
+            observation_result_job_id("prepare_work", "bnd_b", &prep),
+            None
+        );
+
+        let pcmd = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            "bnd_a",
+            "planning_command",
+            json!({
+                "binding_id": "bnd_a",
+                "job_id": "cjob_one",
+                "orchestrator_plan_summary": {"plan_id": "plan_orch_1"}
+            }),
+        ));
+        assert_eq!(
+            observation_result_job_id("planning_command", "bnd_a", &pcmd).as_deref(),
+            Some("cjob_one")
+        );
+        assert_eq!(
+            observation_result_plan_id("planning_command", "bnd_a", &pcmd).as_deref(),
+            Some("plan_orch_1")
         );
     }
 

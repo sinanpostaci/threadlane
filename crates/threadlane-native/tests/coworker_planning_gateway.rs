@@ -1,0 +1,1017 @@
+#![cfg(unix)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+//! Behavioral integration tests for [`CoworkerPlanningGateway`] and the five Paired MCP
+//! Coworker planning tools (`coworker_status`, `prepare_work`, `consult_architect`,
+//! `request_technical_plan`, and `planning_command`).
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value};
+use tempfile::TempDir;
+use threadlane::{Supervisor, SupervisorClient, SupervisorConfig, SupervisorHandle};
+use threadlane_native::coworker_workflow::{
+    ArchitectContextDependencies, CanonicalProjectBaseRef, CoworkerJobOwnershipStore,
+    CoworkerJobPhase, CoworkerPlanningService, CoworkerWorkflowStore, CreatePlanningGrantRequest,
+    PlanningCallBudget, PlanningReadOnlyCapabilities, RevokePlanningGrantRequest,
+    RunArchitectAdviceRequest, WorkBriefKind,
+};
+use threadlane_native::{
+    current_wall_clock_ms, planning_commands_dir, ConsultArchitectParams, CoworkerPlanningGateway,
+    CoworkerStatusParams, CoworkerStatusResponse, Difficulty, EnqueuePlanningCommandRequest,
+    ExecutionPolicy, NativeErrorCode, OperatorEnrollRequest, PairedMcpServer, PairingStore,
+    PlanStatus, PlanningCommandDetailResponse, PlanningCommandResultRef,
+    PlanningCommandStartStatus, PlanningCommandStatus, PlanningCommandStore,
+    PlanningCommandSubmissionResponse, PolicyAllowRule, PrepareWorkResponse, RegistryStore,
+    ToolAdapter, WorkflowProfile, WorkflowRole, EXECUTION_POLICY_SCHEMA_VERSION,
+};
+use threadlane_workers::{
+    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+};
+use threadlane_workflow::{
+    ModelChoice, ModelDefinition, RegistryChange, RoleAssignment, ToolDefinition,
+};
+
+const THREAD_UUID: &str = "0196ed00-0000-7000-8000-0000000000a1";
+const BINDING_LABEL: &str = "gateway-chat";
+const PROFILE_ID: &str = "profile-coworker";
+const TOOL_ID: &str = "tool-agy";
+const MODEL_ID: &str = "model-argon";
+const SECRET_SENTINEL: &str = "THREADLANE_GATEWAY_SECRET_SENTINEL_9b3e7f";
+
+struct GatewayFixture {
+    _tmp: TempDir,
+    repo_dir: PathBuf,
+    project_base: CanonicalProjectBaseRef,
+    worker_marker: PathBuf,
+    release_path: PathBuf,
+    mode_path: PathBuf,
+    state_dir: PathBuf,
+    pairing_dir: PathBuf,
+    registry_dir: PathBuf,
+    plans_dir: PathBuf,
+    authority_dir: PathBuf,
+    sessions_dir: PathBuf,
+    supervisor: Option<SupervisorHandle>,
+    binding_id: String,
+}
+
+impl GatewayFixture {
+    async fn start() -> Self {
+        let tmp = TempDir::new().expect("create gateway tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize gateway tempdir");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("chmod gateway root 0700");
+
+        let repo_dir = root.join("repo");
+        let project_base = init_git_repo(&repo_dir);
+
+        let bin_dir = root.join("bin");
+        create_private_dir(&bin_dir);
+        let fake_worker_path = bin_dir.join("fake-agy");
+        let worker_marker = root.join("worker-invoked");
+        let started_path = root.join("worker-started");
+        let release_path = root.join("worker-release");
+        let mode_path = root.join("worker-mode");
+        fs::write(&release_path, b"release\n").expect("open release gate by default");
+        fs::write(&mode_path, b"architect\n").expect("default worker mode");
+        write_fake_worker(
+            &fake_worker_path,
+            &worker_marker,
+            &started_path,
+            &release_path,
+            &mode_path,
+        );
+
+        let state_dir = root.join("runtime");
+        let pairing_dir = root.join("pairing");
+        let registry_dir = root.join("registry-store");
+        let plans_dir = root.join("plans-store");
+        let authority_dir = root.join("authority-store");
+        let sessions_dir = root.join("sessions-store");
+        for dir in [
+            &state_dir,
+            &pairing_dir,
+            &registry_dir,
+            &plans_dir,
+            &authority_dir,
+            &sessions_dir,
+        ] {
+            create_private_dir(dir);
+        }
+
+        let supervisor = Supervisor::start(SupervisorConfig::new(state_dir.clone()))
+            .await
+            .expect("start disposable gateway supervisor");
+        let supervisor_client =
+            SupervisorClient::from_state_dir(&state_dir).expect("connect gateway supervisor");
+        let binding = supervisor_client
+            .create_binding(THREAD_UUID, BINDING_LABEL)
+            .await
+            .expect("create gateway control binding");
+
+        let registry = RegistryStore::open(&registry_dir).expect("open gateway registry store");
+        let s1 = registry
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: TOOL_ID.to_string(),
+                        label: "Antigravity gateway fixture".to_string(),
+                        adapter: ToolAdapter::Antigravity,
+                        executable_path: Some(fake_worker_path.clone()),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert gateway tool");
+        let s2 = registry
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertModel {
+                    model: ModelDefinition {
+                        id: MODEL_ID.to_string(),
+                        tool_id: TOOL_ID.to_string(),
+                        label: "Gemini 4 Argon High".to_string(),
+                        model_arg: "gemini-4-argon-high".to_string(),
+                        efforts: vec!["high".to_string(), "medium".to_string()],
+                        allow_no_effort: false,
+                    },
+                },
+            )
+            .expect("upsert gateway model");
+        registry
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: None,
+                        id: PROFILE_ID.to_string(),
+                        name: "Gateway fixture profile".to_string(),
+                        assignments: vec![
+                            RoleAssignment {
+                                role: WorkflowRole::Orchestrator,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: MODEL_ID.to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Architect,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: MODEL_ID.to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Coder,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: MODEL_ID.to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                        ],
+                    },
+                },
+            )
+            .expect("upsert gateway profile");
+
+        let registry_lock = registry_dir.join("registry.lock");
+        if registry_lock.exists() {
+            fs::remove_file(&registry_lock).expect("remove initial registry.lock");
+        }
+
+        Self {
+            _tmp: tmp,
+            repo_dir,
+            project_base,
+            worker_marker,
+            release_path,
+            mode_path,
+            state_dir,
+            pairing_dir,
+            registry_dir,
+            plans_dir,
+            authority_dir,
+            sessions_dir,
+            supervisor: Some(supervisor),
+            binding_id: binding.binding_id,
+        }
+    }
+
+    fn gateway(&self) -> CoworkerPlanningGateway {
+        CoworkerPlanningGateway::new(
+            &self.state_dir,
+            &self.registry_dir,
+            &self.plans_dir,
+            &self.authority_dir,
+            &self.sessions_dir,
+            &self.binding_id,
+            THREAD_UUID,
+        )
+        .expect("create CoworkerPlanningGateway")
+        .with_sibling_anchor_exe(PathBuf::from(env!("CARGO_BIN_EXE_threadlane-flow")))
+    }
+
+    fn enrolled_mcp(&self) -> PairedMcpServer {
+        let pairing_store = PairingStore::open(&self.pairing_dir).expect("open pairing store");
+        let operator_token = pairing_store.operator_token().expect("operator token");
+        let mcp = PairedMcpServer::new(&self.state_dir, pairing_store.clone())
+            .expect("create PairedMcpServer")
+            .with_workflow_dirs(&self.registry_dir, &self.plans_dir)
+            .expect("with_workflow_dirs")
+            .with_host_dirs(&self.authority_dir, &self.sessions_dir)
+            .expect("with_host_dirs")
+            .with_sibling_anchor_exe(PathBuf::from(env!("CARGO_BIN_EXE_threadlane-flow")));
+        pairing_store
+            .enroll(
+                &operator_token,
+                OperatorEnrollRequest {
+                    connection_nonce: mcp.connection_nonce().to_string(),
+                    epoch_id: mcp.epoch_id().to_string(),
+                    binding_id: self.binding_id.clone(),
+                    thread_id: THREAD_UUID.to_string(),
+                    project_id: None,
+                },
+            )
+            .expect("enroll PairedMcpServer");
+        mcp
+    }
+
+    fn create_grant(&self, request_key: &str, created_at_ms: u64, expires_at_ms: u64) -> String {
+        let workflow_store =
+            CoworkerWorkflowStore::new(&self.plans_dir).expect("open CoworkerWorkflowStore");
+        workflow_store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: self.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                request_key: request_key.to_string(),
+                expected_ledger_revision: None,
+                project_base: self.project_base.clone(),
+                profile_id: PROFILE_ID.to_string(),
+                registry_revision: 3,
+                policy: default_policy(),
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 6,
+                    max_orchestrator_calls: 4,
+                    max_architect_calls: 2,
+                    max_timeout_ms_per_call: 60_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms,
+                expires_at_ms,
+                operator_attested: true,
+            })
+            .expect("create planning grant")
+            .grant_id
+    }
+
+    async fn shutdown(&mut self) {
+        if let Some(supervisor) = self.supervisor.take() {
+            supervisor.shutdown().await;
+        }
+    }
+}
+
+fn default_policy() -> ExecutionPolicy {
+    ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "policy-gateway-test".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: TOOL_ID.to_string(),
+            model_id: MODEL_ID.to_string(),
+            efforts: vec!["high".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+        }],
+    }
+}
+
+fn init_git_repo(repo_dir: &Path) -> CanonicalProjectBaseRef {
+    fs::create_dir_all(repo_dir.join("src")).expect("create repo src");
+    fs::write(
+        repo_dir.join("src/lib.rs"),
+        "pub fn gateway_seed() -> u32 { 11 }\n",
+    )
+    .expect("write src/lib.rs");
+
+    for args in [
+        &["init", "--quiet"][..],
+        &["config", "user.email", "test@threadlane.local"][..],
+        &["config", "user.name", "Threadlane Test"][..],
+        &["add", "."][..],
+        &["commit", "-m", "initial commit", "--quiet"][..],
+    ] {
+        run_sanitized_git(repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS).expect("git init step");
+    }
+    let commit = resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve HEAD commit");
+    let tree = resolve_exact_tree_sha(repo_dir, &commit, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+        .expect("resolve HEAD tree");
+    CanonicalProjectBaseRef {
+        repository_path: repo_dir.to_string_lossy().into_owned(),
+        base_commit: commit,
+        base_tree_sha: tree,
+    }
+}
+
+fn create_private_dir(path: &Path) {
+    fs::create_dir_all(path).expect("create private fixture directory");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+}
+
+fn directory_entries(path: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(path)
+        .expect("read directory")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn write_fake_worker(
+    script_path: &Path,
+    counter_path: &Path,
+    started_path: &Path,
+    release_path: &Path,
+    mode_path: &Path,
+) {
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+printf 'invoked\n' >> '{}'
+printf 'started\n' > '{}'
+i=0
+while [ ! -f '{}' ] && [ "$i" -lt 200 ]; do
+    sleep 0.05
+    i=$((i + 1))
+done
+MODE="architect"
+if [ -f '{}' ]; then
+    MODE=$(cat '{}' | tr -d '[:space:]')
+fi
+printf '{{"event":"init","init":{{"session_id":"agy-gw-sess-1","model":"gemini-4-argon-high"}}}}\n'
+case "$MODE" in
+    orch_clarify)
+        RESPONSE_JSON='{{\"outcome\":\"requires_human_clarification\",\"schema_version\":1,\"summary\":\"Need human decision before planning\",\"questions\":[\"Should we support multiple commands per batch?\"],\"referenced_files\":[\"src/lib.rs\"]}}'
+        ;;
+    orch_plan)
+        RESPONSE_JSON='{{\"outcome\":\"plan\",\"schema_version\":1,\"summary\":\"Implement gateway slice\",\"tasks\":[{{\"task_id\":\"task_gateway_core\",\"title\":\"Implement planning gateway\",\"description\":\"Wire MCP tools to sibling threadlane-flow.\",\"role\":\"coder\",\"difficulty\":\"hard\",\"depends_on\":[],\"allowed_write_paths\":[\"src/lib.rs\"],\"owned_interfaces\":[\"iface_gateway\"],\"consumed_interfaces\":[]}}],\"check_suggestions\":[{{\"check_id\":\"cargo_test_gateway\",\"command_summary\":\"cargo test -p threadlane-native --test coworker_planning_gateway\",\"required\":true}}],\"unconfirmed_proposal_notes\":[\"Proposal stays unconfirmed\"],\"resolved_open_questions\":[],\"deferred_proposals\":[]}}'
+        ;;
+    *)
+        RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_gateway\":\"Stable contract v1\"}},\"open_questions\":[]}}'
+        ;;
+esac
+printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$RESPONSE_JSON"
+exit 0
+"#,
+        counter_path.display(),
+        started_path.display(),
+        release_path.display(),
+        mode_path.display(),
+        mode_path.display(),
+    );
+    fs::write(script_path, script).expect("write fake worker");
+    fs::set_permissions(script_path, fs::Permissions::from_mode(0o700))
+        .expect("chmod fake worker 0700");
+}
+
+async fn invoke_mcp_ok<T: DeserializeOwned>(mcp: &PairedMcpServer, tool: &str, args: Value) -> T {
+    let payload = mcp
+        .invoke_tool_json(tool, args, None)
+        .await
+        .unwrap_or_else(|err| panic!("{tool} failed: {:?}", err.structured_content))
+        .structured_content
+        .expect("structured_content");
+    assert_eq!(payload["untrusted_data"], json!(true));
+    assert_eq!(payload["tool"], json!(tool));
+    let raw = payload.to_string();
+    assert!(
+        !raw.contains(SECRET_SENTINEL),
+        "{tool} response must never leak secret sentinel"
+    );
+    serde_json::from_value(payload["data"].clone()).expect("deserialize tool data")
+}
+
+async fn invoke_mcp_err_code(mcp: &PairedMcpServer, tool: &str, args: Value) -> String {
+    let err = mcp
+        .invoke_tool_json(tool, args, None)
+        .await
+        .expect_err("expected MCP tool error")
+        .structured_content
+        .expect("error structured_content");
+    err["error"]["code"]
+        .as_str()
+        .expect("error.code string")
+        .to_string()
+}
+
+#[tokio::test]
+async fn coworker_planning_tools_advertised_routing_guards_and_readonly_status_absence() {
+    let mut fixture = GatewayFixture::start().await;
+
+    // 1. Direct gateway `coworker_status` on empty `plans_dir` is pure read-only and creates nothing.
+    let plans_before = directory_entries(&fixture.plans_dir);
+    let registry_before = directory_entries(&fixture.registry_dir);
+    assert!(plans_before.is_empty());
+    assert!(!registry_before.contains(&"registry.lock".to_string()));
+
+    let gw = fixture.gateway();
+    let direct_status = gw
+        .coworker_status(&CoworkerStatusParams::default())
+        .expect("direct coworker_status on empty plans_dir");
+    assert_eq!(direct_status.binding_id, fixture.binding_id);
+    assert_eq!(direct_status.thread_uuid, THREAD_UUID);
+    assert_eq!(direct_status.workflow_ledger_revision, 0);
+    assert_eq!(direct_status.command_ledger_revision, 0);
+    assert!(direct_status.active_grant.is_none());
+    assert!(direct_status.grants.is_empty());
+    assert!(direct_status.jobs.is_empty());
+    assert!(direct_status.architect_advice.is_empty());
+    assert!(direct_status.commands.is_empty());
+    assert_eq!(directory_entries(&fixture.plans_dir), plans_before);
+    assert_eq!(directory_entries(&fixture.registry_dir), registry_before);
+
+    // 2. PairedMcpServer advertises all 5 Coworker planning tools (36 tools total) and blocks unbound calls.
+    let pairing_store = PairingStore::open(&fixture.pairing_dir).expect("open pairing store");
+    let mcp_unbound =
+        PairedMcpServer::new(&fixture.state_dir, pairing_store.clone()).expect("new unbound mcp");
+    let tools = mcp_unbound.list_tools();
+    assert_eq!(tools.len(), 36);
+    for (name, expected_ro) in [
+        ("coworker_status", true),
+        ("prepare_work", false),
+        ("consult_architect", false),
+        ("request_technical_plan", false),
+        ("planning_command", true),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        assert_eq!(
+            tool.annotations.as_ref().and_then(|a| a.read_only_hint),
+            Some(expected_ro)
+        );
+        assert_eq!(
+            invoke_mcp_err_code(&mcp_unbound, name, json!({})).await,
+            "unbound_connection"
+        );
+    }
+
+    // 3. Enrolled server without workflow/host store dirs fails closed with `not_configured`.
+    let token = pairing_store.operator_token().expect("operator token");
+    let mcp_unconfigured =
+        PairedMcpServer::new(&fixture.state_dir, pairing_store.clone()).expect("new unconfigured");
+    pairing_store
+        .enroll(
+            &token,
+            OperatorEnrollRequest {
+                connection_nonce: mcp_unconfigured.connection_nonce().to_string(),
+                epoch_id: mcp_unconfigured.epoch_id().to_string(),
+                binding_id: fixture.binding_id.clone(),
+                thread_id: THREAD_UUID.to_string(),
+                project_id: None,
+            },
+        )
+        .expect("enroll unconfigured");
+    assert_eq!(
+        invoke_mcp_err_code(&mcp_unconfigured, "coworker_status", json!({})).await,
+        "not_configured"
+    );
+
+    // 4. Configured enrolled server rejects caller-supplied identity/rebind keys and unknown fields.
+    let mcp = fixture.enrolled_mcp();
+    for forbidden in [
+        "binding_id",
+        "thread_id",
+        "thread_uuid",
+        "session_id",
+        "connection_nonce",
+        "epoch_id",
+    ] {
+        let mut obj = serde_json::Map::new();
+        obj.insert(forbidden.to_string(), json!("forged"));
+        assert_eq!(
+            invoke_mcp_err_code(&mcp, "coworker_status", Value::Object(obj)).await,
+            "rebind_rejected"
+        );
+    }
+    assert_eq!(
+        invoke_mcp_err_code(&mcp, "coworker_status", json!({ "unknown_field": 1 })).await,
+        "validation_failed"
+    );
+    assert_eq!(
+        invoke_mcp_err_code(&mcp, "coworker_status", json!({ "limit": 0 })).await,
+        "validation_failed"
+    );
+
+    let mcp_status: CoworkerStatusResponse =
+        invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    assert_eq!(mcp_status, direct_status);
+    assert!(!planning_commands_dir(&fixture.plans_dir).exists());
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn prepare_work_idempotency_head_progression_proposals_amendment_and_grant_revocation_expiry()
+{
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let grant_id = fixture.create_grant(
+        "req-grant-prep-1",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+    let commit_1 = fixture.project_base.base_commit.clone();
+    let tree_1 = fixture.project_base.base_tree_sha.clone();
+
+    // 1. Prepare initial work brief keeping confirmed_requirements, proposed_additions, assumptions, and open_questions distinct.
+    let prep_args_1 = json!({
+        "grant_id": grant_id,
+        "request_key": "req-prep-job-1",
+        "summary": "Structure Coworker planning gateway",
+        "confirmed_requirements": ["Expose 5 Paired MCP tools"],
+        "proposed_additions": ["Optional command limit"],
+        "assumptions": ["Sibling threadlane-flow binary is installed"],
+        "open_questions": ["How should dependency blobs be verified?"]
+    });
+    let prep_1: PrepareWorkResponse =
+        invoke_mcp_ok(&mcp, "prepare_work", prep_args_1.clone()).await;
+    assert_eq!(prep_1.binding_id, fixture.binding_id);
+    assert_eq!(prep_1.thread_uuid, THREAD_UUID);
+    assert_eq!(prep_1.grant_id, grant_id);
+    assert_eq!(prep_1.job_revision, 1);
+    assert_eq!(prep_1.phase, CoworkerJobPhase::Planning);
+    assert_eq!(prep_1.kind, WorkBriefKind::NewJob);
+    assert_eq!(prep_1.project_base.base_commit, commit_1);
+    assert_eq!(prep_1.project_base.base_tree_sha, tree_1);
+    assert!(prep_1.ready_for_execution_planning);
+    assert!(!prep_1.ready_for_execution_approval);
+    assert_eq!(
+        prep_1.work_brief.confirmed_requirements,
+        vec!["Expose 5 Paired MCP tools"]
+    );
+    assert_eq!(
+        prep_1.work_brief.proposed_additions,
+        vec!["Optional command limit"]
+    );
+    assert_eq!(
+        prep_1.work_brief.open_questions,
+        vec!["How should dependency blobs be verified?"]
+    );
+
+    // 2. Advance Git HEAD in the same canonical repository.
+    fs::write(
+        fixture.repo_dir.join("src/lib.rs"),
+        "pub fn gateway_seed() -> u32 { 22 }\n",
+    )
+    .expect("update src/lib.rs");
+    for args in [
+        &["add", "src/lib.rs"][..],
+        &["commit", "-m", "second commit", "--quiet"][..],
+    ] {
+        run_sanitized_git(&fixture.repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("git commit 2");
+    }
+    let commit_2 =
+        resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve commit_2");
+    assert_ne!(commit_1, commit_2);
+
+    // 3. Exact retry of `req-prep-job-1` after HEAD advanced preserves original job and commit_1;
+    //    conflicting body with the same `request_key` is rejected.
+    let retry_1: PrepareWorkResponse = invoke_mcp_ok(&mcp, "prepare_work", prep_args_1).await;
+    assert_eq!(retry_1.job_id, prep_1.job_id);
+    assert_eq!(retry_1.work_brief_digest, prep_1.work_brief_digest);
+    assert_eq!(retry_1.project_base.base_commit, commit_1);
+
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-prep-job-1",
+                "summary": "Changed summary with same request_key",
+                "confirmed_requirements": ["Expose 5 Paired MCP tools"]
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    // 4. New `prepare_work` request under the same standing grant resolves the new current HEAD `commit_2`.
+    let prep_2: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-job-2",
+            "summary": "Second job at advanced HEAD commit",
+            "confirmed_requirements": ["Track current HEAD commit for new work brief"]
+        }),
+    )
+    .await;
+    assert_ne!(prep_2.job_id, prep_1.job_id);
+    assert_eq!(prep_2.project_base.base_commit, commit_2);
+    assert!(prep_2.ready_for_execution_planning);
+    assert!(prep_2.ready_for_execution_approval);
+
+    // 5. Amendment CAS on `target_job_revision` and active hold placement on superseded job.
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-amend-wrong-rev",
+                "summary": "Amended summary",
+                "confirmed_requirements": ["Updated requirement"],
+                "target_job_id": prep_2.job_id,
+                "target_job_revision": 99,
+                "amendment_reason": "Wrong revision"
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    let amended: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-amend-job-2",
+            "summary": "Amended job 2 summary",
+            "confirmed_requirements": ["Track current HEAD commit for new work brief", "Enforce CAS"],
+            "amendment": {
+                "target_job_id": prep_2.job_id,
+                "target_job_revision": prep_2.job_revision,
+                "amendment_reason": "Add CAS requirement",
+                "amended_write_paths": ["src/lib.rs"]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        amended.supersedes_job_id.as_deref(),
+        Some(prep_2.job_id.as_str())
+    );
+    assert_eq!(amended.target_job_active_hold_count, 1);
+
+    // 6. Expired grant and revoked grant both refuse `prepare_work`.
+    let expired_grant_id = fixture.create_grant(
+        "req-grant-expired",
+        now_ms.saturating_sub(60_000),
+        now_ms.saturating_sub(1_000),
+    );
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": expired_grant_id,
+                "request_key": "req-after-expiry",
+                "summary": "Expired grant",
+                "confirmed_requirements": ["Must reject expired grant"]
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    wf_store
+        .revoke_planning_grant(&RevokePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            grant_id: grant_id.clone(),
+            expected_ledger_revision: None,
+            revoked_at_ms: current_wall_clock_ms().expect("clock"),
+            reason: "Revoked in test".to_string(),
+        })
+        .expect("revoke grant");
+
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-after-revoke",
+                "summary": "Revoked grant",
+                "confirmed_requirements": ["Must reject revoked grant"]
+            })
+        )
+        .await,
+        "validation_failed"
+    );
+
+    fixture.shutdown().await;
+}
+
+async fn wait_for_command_completion(
+    mcp: &PairedMcpServer,
+    command_id: &str,
+) -> PlanningCommandDetailResponse {
+    for _ in 0..100 {
+        let detail: PlanningCommandDetailResponse =
+            invoke_mcp_ok(mcp, "planning_command", json!({ "command_id": command_id })).await;
+        if detail.status != PlanningCommandStatus::Queued
+            && detail.status != PlanningCommandStatus::Running
+        {
+            return detail;
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    panic!("timed out waiting for planning command `{command_id}` to reach terminal status");
+}
+
+#[tokio::test]
+async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_and_unknown_reconciliation(
+) {
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let grant_id = fixture.create_grant(
+        "req-grant-e2e-1",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+
+    let prep: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-e2e-1",
+            "summary": "Build Paired MCP Coworker planning bridge",
+            "confirmed_requirements": ["Use canonical sibling threadlane-flow start-command"],
+            "proposed_additions": ["Expose recent commands in coworker_status"],
+            "open_questions": ["How should dependency blobs be verified?"]
+        }),
+    )
+    .await;
+    assert!(prep.ready_for_execution_planning);
+    assert!(!prep.ready_for_execution_approval);
+
+    // 1. Hold fake AGY worker via `release_path` before calling `consult_architect` to prove detached return.
+    fs::remove_file(&fixture.release_path).expect("hold fake worker before consult_architect");
+    let consult_args = json!({
+        "grant_id": grant_id,
+        "job_id": prep.job_id,
+        "request_key": "req-consult-arch-1",
+        "question": format!("How should dependency blobs be verified? {SECRET_SENTINEL}"),
+        "dependency_files": ["src/lib.rs"],
+        "difficulty": "hard"
+    });
+    let submit_arch: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", consult_args.clone()).await;
+    assert_eq!(submit_arch.binding_id, fixture.binding_id);
+    assert_eq!(submit_arch.role, WorkflowRole::Architect);
+    assert_eq!(
+        submit_arch.submission_status,
+        PlanningCommandStartStatus::SubmissionRequested
+    );
+    assert!(submit_arch.submission_requested);
+    assert!(submit_arch.launched);
+    assert!(matches!(
+        submit_arch.status,
+        PlanningCommandStatus::Queued | PlanningCommandStatus::Running
+    ));
+
+    // Release the held fake worker and wait for completion.
+    fs::write(&fixture.release_path, b"release\n").expect("release held worker");
+    let arch_detail = wait_for_command_completion(&mcp, &submit_arch.command_id).await;
+    assert_eq!(arch_detail.status, PlanningCommandStatus::Completed);
+    assert!(!arch_detail.pending_reconciliation);
+    assert_eq!(
+        arch_detail
+            .structured_architect_advice
+            .as_ref()
+            .expect("structured_architect_advice")
+            .decision_summary,
+        "Keep strict planning command boundary"
+    );
+
+    // 2. Reopen / repeat `consult_architect` with the same `request_key`: idempotent with invocation counter == 1.
+    let repeat_arch: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "consult_architect", consult_args).await;
+    assert_eq!(repeat_arch.command_id, submit_arch.command_id);
+    assert_eq!(repeat_arch.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        repeat_arch.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!repeat_arch.launched);
+    let arch_calls = fs::read_to_string(&fixture.worker_marker)
+        .expect("read worker_marker")
+        .lines()
+        .count();
+    assert_eq!(arch_calls, 1);
+
+    let status_after_arch: CoworkerStatusResponse =
+        invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    assert_eq!(status_after_arch.architect_advice.len(), 1);
+    let advice_id = status_after_arch.architect_advice[0].advice_id.clone();
+
+    // 3. Typed Orchestrator outcome 1: `RequiresHumanClarification`.
+    fs::write(&fixture.mode_path, b"orch_clarify\n").expect("set mode orch_clarify");
+    let clarify_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": prep.job_id,
+            "request_key": "req-tech-plan-clarify-1",
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let clarify_detail = wait_for_command_completion(&mcp, &clarify_submit.command_id).await;
+    assert_eq!(clarify_detail.status, PlanningCommandStatus::Completed);
+    assert!(matches!(
+        clarify_detail.result_ref,
+        Some(PlanningCommandResultRef::OrchestratorRequiresHumanClarification { .. })
+    ));
+    assert_eq!(
+        clarify_detail
+            .clarification
+            .as_ref()
+            .expect("clarification")
+            .questions,
+        vec!["Should we support multiple commands per batch?"]
+    );
+
+    // 4. Typed Orchestrator outcome 2: `Plan` while open_questions and proposed_additions remain open.
+    fs::write(&fixture.mode_path, b"orch_plan\n").expect("set mode orch_plan");
+    let plan_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": prep.job_id,
+            "request_key": "req-tech-plan-publish-1",
+            "architect_advice_ids": [advice_id],
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let plan_detail = wait_for_command_completion(&mcp, &plan_submit.command_id).await;
+    assert_eq!(plan_detail.status, PlanningCommandStatus::Completed);
+    let orch_summary = plan_detail
+        .orchestrator_plan_summary
+        .as_ref()
+        .expect("orchestrator_plan_summary");
+    assert_eq!(orch_summary.plan_revision, 1);
+    assert_eq!(orch_summary.plan_status, PlanStatus::Published);
+    assert_eq!(orch_summary.task_count, 1);
+
+    let status_after_plan: CoworkerStatusResponse =
+        invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    let job_summary = status_after_plan
+        .jobs
+        .iter()
+        .find(|j| j.job_id == prep.job_id)
+        .expect("job in status");
+    assert_eq!(job_summary.phase, CoworkerJobPhase::AwaitingApproval);
+    assert!(job_summary.planning_result.is_some());
+    assert!(job_summary.ready_for_execution_planning);
+    assert!(!job_summary.ready_for_execution_approval);
+
+    // 5. Simulate interrupted `Running` command -> reopens as `Unknown` (`pending_reconciliation == true`)
+    //    and blocks a new `request_key` from bypassing reconciliation.
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let wf_ledger = wf_store
+        .read_binding_ledger(&fixture.binding_id)
+        .expect("read wf_ledger");
+    let stored_grant = wf_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant");
+    let commands_dir = planning_commands_dir(&fixture.plans_dir);
+    let ownership_store =
+        CoworkerJobOwnershipStore::new(&commands_dir).expect("open CoworkerJobOwnershipStore");
+    let cmd_store = PlanningCommandStore::new(
+        &commands_dir,
+        wf_store,
+        &fixture.registry_dir,
+        ownership_store.clone(),
+    )
+    .expect("open PlanningCommandStore");
+    let dep_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+        &prep.project_base,
+        &["src/lib.rs".to_string()],
+    )
+    .expect("dep blobs");
+    let enqueued_unknown = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+            RunArchitectAdviceRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.to_string(),
+                grant_id: grant_id.clone(),
+                request_key: "req-unknown-sim-1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                context_dependencies: ArchitectContextDependencies {
+                    project_base: prep.project_base.clone(),
+                    work_brief_digest: prep.work_brief_digest.clone(),
+                    plan_digest: None,
+                    policy_digest: stored_grant.policy_digest.clone(),
+                    dependency_file_blobs: dep_blobs,
+                    interface_ownership_digests: BTreeMap::new(),
+                    accepted_predecessor_trees: BTreeMap::new(),
+                },
+                question_summary: "Simulate interrupted Running command".to_string(),
+                prior_advice_context: Vec::new(),
+                accept_into_brief: false,
+                current_time_ms: current_wall_clock_ms().expect("clock"),
+            },
+        ))
+        .expect("enqueue command for unknown simulation");
+    let guard = ownership_store
+        .try_acquire_job(
+            &enqueued_unknown.ownership_key().expect("ownership key"),
+            current_wall_clock_ms().expect("clock"),
+        )
+        .expect("try_acquire_job")
+        .into_guard()
+        .expect("guard");
+    cmd_store
+        .claim_running(
+            &guard,
+            &fixture.binding_id,
+            THREAD_UUID,
+            &enqueued_unknown.command_id,
+            None,
+        )
+        .expect("claim_running");
+    drop(guard);
+
+    let unknown_detail: PlanningCommandDetailResponse = invoke_mcp_ok(
+        &mcp,
+        "planning_command",
+        json!({ "command_id": enqueued_unknown.command_id }),
+    )
+    .await;
+    assert_eq!(unknown_detail.status, PlanningCommandStatus::Unknown);
+    assert!(unknown_detail.pending_reconciliation);
+
+    assert_eq!(
+        invoke_mcp_err_code(
+            &mcp,
+            "consult_architect",
+            json!({
+                "grant_id": grant_id,
+                "job_id": prep.job_id,
+                "request_key": "req-bypass-unknown-must-fail",
+                "question": "Attempt to bypass Unknown command with a new key",
+                "dependency_files": ["src/lib.rs"]
+            })
+        )
+        .await,
+        "ambiguous_wakeup_pending_reconciliation"
+    );
+
+    let gw_err = fixture
+        .gateway()
+        .consult_architect(&ConsultArchitectParams {
+            grant_id,
+            job_id: prep.job_id,
+            request_key: "req-bypass-unknown-gw".to_string(),
+            expected_ledger_revision: None,
+            question: "Attempt via gateway".to_string(),
+            dependency_files: vec!["src/lib.rs".to_string()],
+            prior_advice_ids: Vec::new(),
+            difficulty: Some(Difficulty::Hard),
+        })
+        .await
+        .expect_err("gateway must reject new key while Unknown is pending reconciliation");
+    assert_eq!(
+        gw_err.error_code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation
+    );
+
+    fixture.shutdown().await;
+}

@@ -15,20 +15,42 @@ Version: `2026-11-03.v3`
   are omitted from active catalog availability.
 - After connecting and reading `operating_guide`, read the configured profile via
   `catalog` (when workflow stores are configured) and refresh live scoped state and
-  revisions (`status`, `list_plans`, `get_plan`, `list_approvals`,
-  `approved_session`, `approved_task`).
-- Practice proactive requirements collaboration: gather human requirements, suggest
-  concrete improvements, and explicitly ask whether to add a suggestion to scope.
-  Keep confirmed requirements, proposals, assumptions, and open questions clearly
+  revisions (`status`, `coworker_status`, `list_plans`, `get_plan`,
+  `list_approvals`, `approved_session`, `approved_task`).
+- The human talks only to native Codex and is never forced to pick internal
+  workflow roles or manually assemble task DAGs. Practice proactive requirements
+  collaboration: gather human requirements, suggest concrete improvements, and
+  explicitly ask whether to add a suggestion to scope. Keep
+  confirmed requirements, proposals, assumptions, and open questions clearly
   separate.
 - Clear human intent to produce or revise a technical plan—not every message,
   status check, idea, or question—is the handoff trigger. Questions and ideas alone
   do not mutate work or expand scope. Model names and role labels are not magic
   words the user must type.
-- `Coworker` may seek `Architect` advice before orchestration when supported by
-  connected tools and an existing exact standing planning grant. `Orchestrator`
-  owns the technical task DAG and decomposition and can consult `Architect` for
-  high-impact design or cross-cutting architectural decisions.
+- Under an active operator-attested standing planning grant (visible in
+  `coworker_status`), use the paired Coworker planning tools naturally:
+  - Call `prepare_work` to create a Coworker job or record a revision-checked
+    amendment separating `confirmed_requirements`, `proposed_additions`,
+    `assumptions`, `open_questions`, and `accepted_architect_decisions`.
+  - Optionally call `consult_architect` before or between planning rounds with
+    explicit repository-relative `dependency_files`. Architect output is
+    advisory-only (`untrusted_data: true`) until explicitly accepted into the work
+    brief via `prepare_work`.
+  - Call `request_technical_plan` to run `Orchestrator` decomposition under the
+    active standing planning grant without constructing a caller task DAG. Open
+    technical questions and `proposed_additions` are allowed into technical
+    planning, while execution approval remains blocked until open questions and
+    unconfirmed proposals are resolved.
+  - Inspect detached planning commands with `planning_command` without polling
+    loops. If the `Orchestrator` returns `RequiresHumanClarification`
+    (`requires_human_clarification`), ask the human to clarify and amend the brief
+    via `prepare_work`. If it returns `RequiresArchitectAdvice`
+    (`requires_architect_advice`), run `consult_architect` and amend the brief via
+    `prepare_work` when accepted. When a plan is produced, present the plan summary
+    and check suggestions clearly to the human and stop for explicit operator
+    approval before execution or `start_approved_task`. Do not claim that native
+    planning wake-ups or an autonomous code-execution pipeline are already
+    implemented over MCP.
 - Coding (`coder`), review (`reviewer`), and `closure` are distinct execution
   roles. Do not silently perform worker role execution or substitute models.
   Active human scope, model, effort, and quota restrictions always override saved

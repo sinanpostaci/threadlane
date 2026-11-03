@@ -58,6 +58,8 @@ pub mod pairing;
 pub mod planning_commands;
 /// Single-command execution runner for durable planning commands (`Milestone 10`).
 pub mod planning_driver;
+/// Scoped Coworker consultation and planning gateway bridging MCP tool parameters to workflow, command, and `threadlane-flow` execution.
+pub mod planning_gateway;
 /// Pure profile selection, role/difficulty preflight, and deny-by-default execution policy admission core.
 pub mod profile_flow;
 /// Durable profile-driven role handoffs and package closure reservations.
@@ -166,7 +168,23 @@ pub use planning_commands::{
     PLANNING_COMMAND_SCHEMA_VERSION, PLANNING_COMMAND_SERVICE_KEY_DOMAIN,
 };
 pub use planning_driver::{
-    execute_planning_command, PlanningCommandDriver, PlanningCommandExecutionOutcome,
+    enqueue_planning_command_summary, execute_planning_command,
+    get_planning_command_summary_readonly, list_planning_command_summaries_readonly,
+    open_planning_driver_for_plans_dir, planning_artifacts_dir, planning_commands_dir,
+    start_planning_command_detached, PlanningCommandDriver, PlanningCommandExecutionOutcome,
+    PlanningCommandExecutionSummary, PlanningCommandPage, PlanningCommandStartOutcome,
+    PlanningCommandStartStatus, PlanningCommandSummary, PLANNING_ARTIFACTS_DIR_NAME,
+    PLANNING_COMMANDS_DIR_NAME,
+};
+pub use planning_gateway::{
+    resolve_sibling_flow_executable, resolve_sibling_flow_executable_from, ConsultArchitectParams,
+    CoworkerArchitectAdviceSummary, CoworkerJobSummary, CoworkerOrchestratorPlanDetail,
+    CoworkerPlanningGateway, CoworkerStatusParams, CoworkerStatusResponse,
+    CoworkerWorkBriefSummary, GatewayDifficulty, PlanningCommandDetailResponse,
+    PlanningCommandParams, PlanningCommandSubmissionResponse, PrepareWorkAmendmentParams,
+    PrepareWorkParams, PrepareWorkResponse, RequestTechnicalPlanParams,
+    DEFAULT_COWORKER_STATUS_LIMIT, DEFAULT_FLOW_EXECUTABLE_NAME,
+    DEFAULT_FLOW_START_COMMAND_TIMEOUT_MS, MAX_COWORKER_STATUS_LIMIT,
 };
 pub use profile_flow::{
     preflight, preflight_from_store, resolve_choice, ExecutionPolicy, PolicyAllowRule,
@@ -956,9 +974,9 @@ fi
         let mcp_a = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp A");
         let mcp_b = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("create mcp B");
 
-        // Two connection tools, sixteen runtime tools, five workflow tools and eight approved-task tools.
+        // Two connection tools, sixteen runtime tools, five workflow tools, eight approved-task tools, and five Coworker planning tools.
         let tools = mcp_a.list_tools();
-        assert_eq!(tools.len(), 31, "PairedMcpServer must expose 31 tools");
+        assert_eq!(tools.len(), 36, "PairedMcpServer must expose 36 tools");
         let list_activity_tool = tools
             .iter()
             .find(|tool| tool.name == "list_activity")
@@ -1293,7 +1311,7 @@ fi
         let mcp = PairedMcpServer::new(&state_dir, pairing_store).expect("create mcp");
 
         let tools = mcp.list_tools();
-        assert_eq!(tools.len(), 31);
+        assert_eq!(tools.len(), 36);
 
         for (tool_name, expected_read_only, expected_props) in [
             ("catalog", true, &["cursor", "limit"][..]),
