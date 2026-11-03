@@ -27,8 +27,11 @@
 
 /// Serializable data contracts, validation rules, deterministic digests, and independence proofs.
 pub mod contracts;
+/// Private per-job OS file-lock ownership, CSPRNG instance/challenge identity, and pre-effect validation.
+pub mod ownership;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.
 pub mod store;
 
 pub use contracts::*;
+pub use ownership::*;
 pub use store::*;
