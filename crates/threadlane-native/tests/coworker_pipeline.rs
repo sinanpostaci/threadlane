@@ -23,14 +23,15 @@ use threadlane_host::{
     ApprovedHost, ApprovedHostClient, ApprovedHostConfig, HostPhase, TaskExecutionStatus,
 };
 use threadlane_native::coworker_workflow::{
-    derive_final_job_integration_identifiers, derive_job_aggregation_receipt_id, sha256_hex,
-    ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
-    ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
-    ControllerRoleExecutionBudget, CoworkerControllerService, CoworkerJobCompletionStatus,
-    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerPipelineInFlightStageKind, CoworkerPipelineService, CoworkerPipelineStatus,
-    CoworkerPlanningService, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
-    CreatePlanningGrantRequest, DeclaredIndependenceCompletenessReceipt,
+    derive_final_job_integration_identifiers, derive_job_aggregation_receipt_id,
+    read_persisted_derived_task_execution_report, sha256_hex, ApplyWorkflowHoldRequest,
+    BindJobApprovalRequest, CanonicalProjectBaseRef, ControllerConfigurationPreview,
+    ControllerJobRuntimeState, ControllerPolicyStore, ControllerRoleExecutionBudget,
+    CoworkerControllerService, CoworkerJobCompletionStatus, CoworkerJobOwnershipStore,
+    CoworkerJobPhase, CoworkerJobRecord, CoworkerPipelineInFlightStageKind,
+    CoworkerPipelineService, CoworkerPipelineStatus, CoworkerPlanningService,
+    CoworkerTaskCorrectionExecuteStatus, CoworkerTaskStage, CoworkerWorkflowStore,
+    CreateCoworkerJobRequest, CreatePlanningGrantRequest, DeclaredIndependenceCompletenessReceipt,
     FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckKind,
     FrozenControllerCapabilityEnvelope, OrchestrateWorkBriefPlanRequest, PendingControllerEffect,
     PendingControllerEffectKind, PendingControllerEffectStatus, PlannedCheckSuggestion,
@@ -546,6 +547,42 @@ async fn create_planned_approved_and_frozen_job(
     default_integration_strategy: IntegrationStrategy,
     include_completeness_receipt: bool,
 ) -> (CoworkerJobRecord, String) {
+    create_planned_approved_and_frozen_job_with_correction_caps(
+        fixture,
+        brief_id,
+        plan_id,
+        tasks,
+        task_interfaces,
+        approved_write_paths,
+        max_parallel,
+        approval_budgets,
+        coder_budget,
+        default_integration_strategy,
+        include_completeness_receipt,
+        1,
+        1,
+        2,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_job_with_correction_caps(
+    fixture: &PipelineTestFixture,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+    default_integration_strategy: IntegrationStrategy,
+    include_completeness_receipt: bool,
+    max_in_scope_correction_attempts: u32,
+    max_in_scope_corrections_per_task: u32,
+    max_total_corrections_per_job: u32,
+) -> (CoworkerJobRecord, String) {
     Box::pin(async move {
         let pb = project_base(fixture);
         let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
@@ -704,7 +741,7 @@ async fn create_planned_approved_and_frozen_job(
         let cap_env = FrozenControllerCapabilityEnvelope {
             allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
             allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
-            max_in_scope_correction_attempts: 1,
+            max_in_scope_correction_attempts,
             allowed_check_ids: vec!["cargo_test".to_string()],
             local_git_integration_allowed: true,
             allow_check_failure_corrections: false,
@@ -735,7 +772,7 @@ async fn create_planned_approved_and_frozen_job(
         role_budgets.insert(WorkflowRole::Coder, coder_budget);
         role_budgets.insert(
             WorkflowRole::Reviewer,
-            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 4),
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 6),
         );
         role_budgets.insert(
             WorkflowRole::Closure,
@@ -751,8 +788,8 @@ async fn create_planned_approved_and_frozen_job(
             reviewer_choice: headless_argon_choice(Difficulty::Hard),
             closure_choice: headless_argon_choice(Difficulty::Extreme),
             role_budgets,
-            max_in_scope_corrections_per_task: 1,
-            max_total_corrections_per_job: 2,
+            max_in_scope_corrections_per_task,
+            max_total_corrections_per_job,
             max_total_task_attempts_per_job: 6,
             check_commands: default_check_commands(fixture),
             allow_task_worktree_commits: true,
@@ -1287,20 +1324,24 @@ async fn automatic_pipeline_stops_at_awaiting_correction_execution_on_correct_in
             },
         );
 
-        let (fix_job, fix_approval_id) = create_planned_approved_and_frozen_job(
-            &fixture,
-            "brf_pipe_fix",
-            "plan-pipe-fix",
-            fix_tasks,
-            fix_ifaces,
-            vec!["src/a.rs".to_string()],
-            1,
-            ExecutionBudgets::default(),
-            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
-            IntegrationStrategy::FastForwardOnly,
-            true,
-        )
-        .await;
+        let (fix_job, fix_approval_id) =
+            create_planned_approved_and_frozen_job_with_correction_caps(
+                &fixture,
+                "brf_pipe_fix",
+                "plan-pipe-fix",
+                fix_tasks,
+                fix_ifaces,
+                vec!["src/a.rs".to_string()],
+                1,
+                ExecutionBudgets::default(),
+                ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+                IntegrationStrategy::FastForwardOnly,
+                true,
+                0,
+                0,
+                0,
+            )
+            .await;
 
         let host_handle = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
             &fixture.registry_dir,
@@ -1365,7 +1406,7 @@ async fn automatic_pipeline_stops_at_awaiting_correction_execution_on_correct_in
         );
         assert!(snap_fix.integration_receipt_id.is_none());
 
-        // Verify no second Coder attempt was reserved or dispatched.
+        // Verify no second Coder attempt was reserved or dispatched when frozen correction cap is 0.
         assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 1);
         assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 1);
         assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
@@ -1399,6 +1440,417 @@ async fn automatic_pipeline_stops_at_awaiting_correction_execution_on_correct_in
 
         fix_session.release().expect("release fix_session");
         host_handle.shutdown().await.expect("shutdown host_handle");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn automatic_pipeline_executes_derived_in_scope_correction_verifies_reviews_integrates_and_runs_dependent_to_completion(
+) {
+    Box::pin(async {
+        let fixture = setup_fixture();
+
+        let tasks = vec![
+            PlanTask {
+                id: "task-root-a".to_string(),
+                title: "Root task A with in-scope correction".to_string(),
+                instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-root-b".to_string(),
+                title: "Root task B independent".to_string(),
+                instruction: "CTRL_TASK_B implement src/b.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-dep-c".to_string(),
+                title: "Dependent task C requiring corrected A101 and B200".to_string(),
+                instruction:
+                    "CTRL_TASK_C_REQUIRES_A101 implement src/c.rs after verifying corrected 101 in src/a.rs and 200 in src/b.rs"
+                        .to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: vec!["task-root-a".to_string(), "task-root-b".to_string()],
+                allowed_write_paths: vec!["src/c.rs".to_string()],
+            },
+        ];
+
+        let mut ifaces = BTreeMap::new();
+        ifaces.insert(
+            "task-root-a".to_string(),
+            TaskInterfaceOwnershipSpec {
+                owned_interfaces: vec!["iface_a".to_string()],
+                consumed_interfaces: Vec::new(),
+            },
+        );
+        ifaces.insert(
+            "task-root-b".to_string(),
+            TaskInterfaceOwnershipSpec {
+                owned_interfaces: vec!["iface_b".to_string()],
+                consumed_interfaces: Vec::new(),
+            },
+        );
+        ifaces.insert(
+            "task-dep-c".to_string(),
+            TaskInterfaceOwnershipSpec {
+                owned_interfaces: vec!["iface_c".to_string()],
+                consumed_interfaces: vec!["iface_a".to_string(), "iface_b".to_string()],
+            },
+        );
+
+        let (job, approval_id) = create_planned_approved_and_frozen_job(
+            &fixture,
+            "brf_pipe_corr_dag_3",
+            "plan-pipe-corr-dag-3",
+            tasks,
+            ifaces,
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/c.rs".to_string(),
+            ],
+            2, // max_parallel = 2
+            ExecutionBudgets::default(),
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 5),
+            IntegrationStrategy::MergeNoFf,
+            true,
+        )
+        .await;
+
+        let host_handle = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        )))
+        .await
+        .expect("start ApprovedHost session");
+        assert_eq!(host_handle.summary().phase, HostPhase::Ready);
+
+        // Configure attempt 1 of `task-root-a` to receive a strict 9-field `correct_in_scope`
+        // verdict, while attempt 2 of `task-root-a` receives `accept`.
+        let attempt_1_override_path = fixture
+            .root
+            .join("reviewer_override_task-root-a_attempt_1.json");
+        fs::write(
+            &attempt_1_override_path,
+            serde_json::to_string(&serde_json::json!({
+                "outcome": "correct_in_scope",
+                "findings": ["a() in src/a.rs returns 100 instead of 101"],
+                "required_in_scope_fixes": ["Update pub fn a() in src/a.rs to return 101"],
+                "summary": "Attempt 1 requires in-scope correction in src/a.rs from 100 to 101."
+            }))
+            .expect("serialize attempt 1 reviewer override"),
+        )
+        .expect("write reviewer_override_task-root-a_attempt_1.json");
+
+        let session = fixture
+            .pipeline
+            .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+            .expect("open owned pipeline session");
+        let final_report = session
+            .drive_until_settled(20_000)
+            .await
+            .expect("drive pipeline with derived correction until settled");
+
+        assert_eq!(final_report.status, CoworkerPipelineStatus::Completed);
+        assert_eq!(final_report.job_phase, CoworkerJobPhase::Completed);
+        assert!(final_report.in_flight_stages.is_empty());
+        assert!(final_report.awaiting_correction_task_ids.is_empty());
+        assert!(final_report.failed_check_task_ids.is_empty());
+        assert!(final_report.unknown_effect_task_ids.is_empty());
+        assert!(final_report.blocked_or_failed_task_ids.is_empty());
+
+        // Genuine role and check counts:
+        // - 1 Orchestrator planning call
+        // - 4 Coder executions: A1, B1, derived A2, dependent C1
+        // - 4 Reviewer invocations: A1 (`CorrectInScope`), B1 (`Accept`), A2 (`Accept`), C1 (`Accept`)
+        // - 1 Closure invocation (`Accepted`)
+        // - 5 frozen check runs: A1, B1, A2, C1, + 1 combined candidate check
+        assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+        assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 4);
+        assert_eq!(
+            read_invocation_count(&fixture.root.join("agy_derived_coder_count.txt")),
+            1
+        );
+        assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 4);
+        assert_eq!(
+            read_invocation_count(&fixture.root.join("reviewer_count_task-root-a.txt")),
+            2
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.root.join("reviewer_count_task-root-a_attempt_1.txt")),
+            1
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.root.join("reviewer_count_task-root-a_attempt_2.txt")),
+            1
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.root.join("reviewer_count_task-root-b.txt")),
+            1
+        );
+        assert_eq!(
+            read_invocation_count(&fixture.root.join("reviewer_count_task-dep-c.txt")),
+            1
+        );
+        assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+        assert_eq!(read_invocation_count(&fixture.check_count_file), 5);
+
+        // Verify task snapshots in `final_report`.
+        let snap_a = final_report
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-root-a")
+            .expect("task-root-a snapshot");
+        assert_eq!(snap_a.stage, CoworkerTaskStage::Integrated);
+        assert_eq!(snap_a.attempt_no, 2);
+        assert!(!snap_a.fenced);
+        assert!(snap_a.in_flight_stage.is_none());
+        assert!(snap_a.review_subject_promoted);
+        assert_eq!(
+            snap_a.review_verdict_outcome,
+            Some(ReviewVerdictOutcome::Accept)
+        );
+        assert!(snap_a.review_receipt_id.is_some());
+        assert!(snap_a.integration_receipt_id.is_some());
+        assert!(!snap_a.awaiting_correction_execution);
+
+        for tid in ["task-root-b", "task-dep-c"] {
+            let snap = final_report
+                .tasks
+                .iter()
+                .find(|t| t.task_id == tid)
+                .expect("task snapshot");
+            assert_eq!(snap.stage, CoworkerTaskStage::Integrated);
+            assert_eq!(snap.attempt_no, 1);
+            assert!(!snap.fenced);
+            assert!(snap.in_flight_stage.is_none());
+            assert!(snap.review_subject_promoted);
+            assert_eq!(
+                snap.review_verdict_outcome,
+                Some(ReviewVerdictOutcome::Accept)
+            );
+            assert!(snap.review_receipt_id.is_some());
+            assert!(snap.integration_receipt_id.is_some());
+            assert!(!snap.awaiting_correction_execution);
+        }
+
+        // Verify persisted runtime_state derived attempt receipt, role usage, and attempt 1 vs 2 artifacts.
+        let runtime_state = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .expect("read job runtime")
+            .expect("job runtime exists");
+        assert_eq!(runtime_state.total_corrections_reserved, 1);
+        assert_eq!(runtime_state.total_task_attempts_reserved, 4);
+        assert_eq!(runtime_state.derived_attempts.len(), 1);
+        let derived_receipt = &runtime_state.derived_attempts[0];
+        assert_eq!(derived_receipt.task_id, "task-root-a");
+        assert_eq!(derived_receipt.attempt_no, 2);
+
+        let coder_usage = runtime_state
+            .role_usage
+            .get(&WorkflowRole::Coder)
+            .expect("Coder usage");
+        assert_eq!(coder_usage.calls_reserved, 4);
+        assert_eq!(coder_usage.calls_completed, 4);
+        let reviewer_usage = runtime_state
+            .role_usage
+            .get(&WorkflowRole::Reviewer)
+            .expect("Reviewer usage");
+        assert_eq!(reviewer_usage.calls_reserved, 4);
+        assert_eq!(reviewer_usage.calls_completed, 4);
+        let closure_usage = runtime_state
+            .role_usage
+            .get(&WorkflowRole::Closure)
+            .expect("Closure usage");
+        assert_eq!(closure_usage.calls_reserved, 1);
+        assert_eq!(closure_usage.calls_completed, 1);
+
+        let art_a1 = runtime_state
+            .attempt_artifacts
+            .get(&ControllerJobRuntimeState::artifact_key("task-root-a", 1))
+            .expect("task-root-a attempt 1 artifacts");
+        let art_a2 = runtime_state
+            .attempt_artifacts
+            .get(&ControllerJobRuntimeState::artifact_key("task-root-a", 2))
+            .expect("task-root-a attempt 2 artifacts");
+        assert!(!art_a1.is_derived_attempt);
+        assert!(art_a2.is_derived_attempt);
+        assert_eq!(art_a1.task_worktree_id, art_a2.task_worktree_id);
+        assert_ne!(art_a1.committed_head_commit, art_a2.committed_head_commit);
+        assert_ne!(art_a1.committed_tree_sha, art_a2.committed_tree_sha);
+        assert_ne!(art_a1.candidate_id, art_a2.candidate_id);
+        assert!(art_a1.review_receipt.is_none());
+        assert!(art_a1.integration_receipt.is_none());
+        assert!(art_a2.review_receipt.is_some());
+        assert!(art_a2.integration_receipt.is_some());
+
+        let ledger = fixture
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .expect("read binding ledger");
+        let persisted_job = ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == job.job_id)
+            .expect("persisted job");
+        let persisted_task_a = persisted_job
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-root-a")
+            .expect("persisted task-root-a");
+        assert_eq!(persisted_task_a.candidates.len(), 2);
+        let cand_a1 = persisted_task_a
+            .candidates
+            .iter()
+            .find(|c| c.attempt_no == 1)
+            .expect("task-root-a attempt 1 candidate");
+        let cand_a2 = persisted_task_a
+            .candidates
+            .iter()
+            .find(|c| c.attempt_no == 2)
+            .expect("task-root-a attempt 2 candidate");
+        assert_eq!(art_a1.candidate_id.as_deref(), Some(cand_a1.candidate_id.as_str()));
+        assert_eq!(art_a2.candidate_id.as_deref(), Some(cand_a2.candidate_id.as_str()));
+        let verdict_a1 = cand_a1
+            .review_verdict
+            .as_ref()
+            .expect("attempt 1 review verdict");
+        assert_eq!(verdict_a1.outcome, ReviewVerdictOutcome::CorrectInScope);
+        assert!(!verdict_a1.required_in_scope_fixes.is_empty());
+        assert!(cand_a1.review_receipt_id.is_none());
+        assert!(cand_a1.integration_receipt_id.is_none());
+        let verdict_a2 = cand_a2
+            .review_verdict
+            .as_ref()
+            .expect("attempt 2 review verdict");
+        assert_eq!(verdict_a2.outcome, ReviewVerdictOutcome::Accept);
+        assert!(cand_a2.review_receipt_id.is_some());
+        assert!(cand_a2.integration_receipt_id.is_some());
+        assert_eq!(derived_receipt.attempt_no - 1, cand_a1.attempt_no);
+        assert_eq!(
+            derived_receipt.prior_rejected_candidate_id.as_deref(),
+            Some(cand_a1.candidate_id.as_str())
+        );
+        assert_eq!(
+            derived_receipt.prior_review_verdict_id.as_deref(),
+            Some(verdict_a1.verdict_id.as_str())
+        );
+
+        // Verify persisted private 0600 PersistedDerivedTaskExecutionArtifact on disk for attempt 2.
+        let derived_coder_eff = runtime_state
+            .pending_effects
+            .values()
+            .find(|e| {
+                e.kind == PendingControllerEffectKind::CoderDispatch
+                    && e.task_id.as_deref() == Some("task-root-a")
+                    && e.attempt_no == Some(2)
+            })
+            .expect("derived CoderDispatch effect for task-root-a attempt 2");
+        assert_eq!(
+            derived_coder_eff.status,
+            PendingControllerEffectStatus::EffectConfirmed
+        );
+        let derived_report = read_persisted_derived_task_execution_report(
+            &fixture.plans_dir,
+            &derived_coder_eff.effect_id,
+        )
+        .expect("read persisted derived execution report")
+        .expect("persisted derived execution report must exist");
+        assert_eq!(
+            derived_report.status,
+            CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
+        );
+        assert_eq!(derived_report.task_id, "task-root-a");
+        assert_eq!(derived_report.prior_attempt_no, 1);
+        assert_eq!(derived_report.attempt_no, 2);
+        assert_ne!(derived_report.original_run_id, derived_report.manifest_run_id);
+        assert_ne!("task-root-a", derived_report.manifest_task_id);
+        assert!(derived_report.has_changes_from_prior_head);
+
+        // Verify original per-task integration receipts remain distinct from final job aggregation receipts.
+        let completion = final_report
+            .completion_outcome
+            .as_ref()
+            .expect("completion_outcome must be present");
+        assert_eq!(completion.status, CoworkerJobCompletionStatus::Completed);
+        let (expected_run_id, _expected_token, expected_wt_id, _expected_branch) =
+            derive_final_job_integration_identifiers(
+                &job.job_id,
+                &approval_id,
+                &runtime_state.envelope.approval_subject_digest,
+            );
+        for (tid, accepted_att) in [("task-root-a", 2u32), ("task-root-b", 1u32), ("task-dep-c", 1u32)] {
+            let art = runtime_state
+                .attempt_artifacts
+                .get(&ControllerJobRuntimeState::artifact_key(tid, accepted_att))
+                .expect("accepted attempt artifacts");
+            let orig_receipt: &IntegrationReceipt = art
+                .integration_receipt
+                .as_ref()
+                .expect("original per-task IntegrationReceipt");
+            assert!(orig_receipt.job_aggregation.is_none());
+            let expected_agg_rcp_id = derive_job_aggregation_receipt_id(
+                &job.job_id,
+                &expected_run_id,
+                &expected_wt_id,
+                tid,
+                &orig_receipt.review_receipt_id,
+            );
+            let agg_receipt =
+                load_integration_receipt(host_handle.work_area_dir(), &expected_agg_rcp_id)
+                    .expect("load aggregated IntegrationReceipt");
+            assert!(agg_receipt.job_aggregation.is_some());
+            assert_ne!(orig_receipt.receipt_id, agg_receipt.receipt_id);
+        }
+
+        // Verify final RunIntegration worktree contains corrected 101 in src/a.rs, 200 in src/b.rs, and 300 in src/c.rs.
+        let final_wt = &completion.aggregation.integration_checkout_path;
+        assert_eq!(
+            fs::read_to_string(final_wt.join("src/a.rs")).expect("read aggregated src/a.rs"),
+            "pub fn a() -> u32 { 101 }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(final_wt.join("src/b.rs")).expect("read aggregated src/b.rs"),
+            "pub fn b() -> u32 { 200 }\n"
+        );
+        assert_eq!(
+            fs::read_to_string(final_wt.join("src/c.rs")).expect("read aggregated src/c.rs"),
+            "pub fn c() -> u32 { 300 }\n"
+        );
+
+        let completed_revision = final_report.job_revision;
+        session.release().expect("release session");
+
+        // Reopen completed job session and verify driving is a clean idempotent no-op with zero extra calls/charges.
+        let reopened = fixture
+            .pipeline
+            .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 50_000)
+            .expect("reopen owned pipeline session on Completed job");
+        let rerun_report = reopened
+            .drive_until_settled(50_000)
+            .await
+            .expect("drive reopened Completed job");
+        assert_eq!(rerun_report.status, CoworkerPipelineStatus::Completed);
+        assert_eq!(rerun_report.job_phase, CoworkerJobPhase::Completed);
+        assert_eq!(rerun_report.job_revision, completed_revision);
+        assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 4);
+        assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 4);
+        assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+        assert_eq!(read_invocation_count(&fixture.check_count_file), 5);
+        reopened.release().expect("release reopened session");
+
+        host_handle.shutdown().await.expect("shutdown host");
     })
     .await;
 }

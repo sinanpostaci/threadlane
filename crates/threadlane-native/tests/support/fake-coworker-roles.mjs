@@ -145,6 +145,9 @@ if (mode === "plan") {
     withStateLock(() => {
       incrementCounterUnlocked("agy_reviewer_count.txt");
       incrementCounterUnlocked(`reviewer_count_${expectedIdentity.task_id}.txt`);
+      incrementCounterUnlocked(
+        `reviewer_count_${expectedIdentity.task_id}_attempt_${expectedIdentity.attempt_no}.txt`,
+      );
       const recordLine = JSON.stringify({
         task_id: expectedIdentity.task_id,
         attempt_no: expectedIdentity.attempt_no,
@@ -209,10 +212,30 @@ if (mode === "plan") {
       );
     }
 
+    const attemptOverridePath = path.join(
+      stateDir,
+      `reviewer_override_${expectedIdentity.task_id}_attempt_${expectedIdentity.attempt_no}.json`,
+    );
     const overridePath = path.join(stateDir, `reviewer_override_${expectedIdentity.task_id}.json`);
+    let overrideSpec = null;
+    if (fs.existsSync(attemptOverridePath)) {
+      overrideSpec = JSON.parse(fs.readFileSync(attemptOverridePath, "utf8"));
+    } else if (fs.existsSync(overridePath)) {
+      const rawSpec = JSON.parse(fs.readFileSync(overridePath, "utf8"));
+      if (rawSpec.attempts && typeof rawSpec.attempts === "object") {
+        overrideSpec = rawSpec.attempts[String(expectedIdentity.attempt_no)] || null;
+      } else if (
+        typeof rawSpec.only_attempt_no === "number" &&
+        rawSpec.only_attempt_no !== expectedIdentity.attempt_no
+      ) {
+        overrideSpec = null;
+      } else {
+        overrideSpec = rawSpec;
+      }
+    }
+
     let responseText;
-    if (fs.existsSync(overridePath)) {
-      const overrideSpec = JSON.parse(fs.readFileSync(overridePath, "utf8"));
+    if (overrideSpec) {
       if (typeof overrideSpec.raw_response === "string") {
         responseText = overrideSpec.raw_response;
       } else {
@@ -330,7 +353,21 @@ const worktreeDir = process.cwd();
 const srcDir = path.join(worktreeDir, "src");
 fs.mkdirSync(srcDir, { recursive: true });
 
-if (prompt.includes("CTRL_TASK_A")) {
+if (prompt.includes("THREADLANE IN-SCOPE CORRECTION DIRECTIVE")) {
+  withStateLock(() => {
+    incrementCounterUnlocked("agy_derived_coder_count.txt");
+  });
+  if (prompt.includes("CTRL_TASK_A")) {
+    const aPath = path.join(srcDir, "a.rs");
+    if (!fs.existsSync(aPath) || fs.readFileSync(aPath, "utf8") !== "pub fn a() -> u32 { 100 }\n") {
+      process.stderr.write(
+        "derived Coder expected prior committed 100 in src/a.rs before writing 101\n",
+      );
+      process.exit(44);
+    }
+    fs.writeFileSync(aPath, "pub fn a() -> u32 { 101 }\n", "utf8");
+  }
+} else if (prompt.includes("CTRL_TASK_A")) {
   fs.writeFileSync(path.join(srcDir, "a.rs"), "pub fn a() -> u32 { 100 }\n", "utf8");
 } else if (prompt.includes("CTRL_TASK_B")) {
   fs.writeFileSync(path.join(srcDir, "b.rs"), "pub fn b() -> u32 { 200 }\n", "utf8");
@@ -339,6 +376,18 @@ if (prompt.includes("CTRL_TASK_A")) {
   if (!fs.existsSync(aPath) || !fs.readFileSync(aPath, "utf8").includes("100")) {
     process.stderr.write("missing predecessor src/a.rs in dependent task worktree\n");
     process.exit(41);
+  }
+  fs.writeFileSync(path.join(srcDir, "c.rs"), "pub fn c() -> u32 { 300 }\n", "utf8");
+} else if (prompt.includes("CTRL_TASK_C_REQUIRES_A101")) {
+  const aPath = path.join(srcDir, "a.rs");
+  const bPath = path.join(srcDir, "b.rs");
+  if (!fs.existsSync(aPath) || !fs.readFileSync(aPath, "utf8").includes("101")) {
+    process.stderr.write("dependent task expected corrected 101 in predecessor src/a.rs\n");
+    process.exit(45);
+  }
+  if (!fs.existsSync(bPath) || !fs.readFileSync(bPath, "utf8").includes("200")) {
+    process.stderr.write("dependent task expected 200 in predecessor src/b.rs\n");
+    process.exit(46);
   }
   fs.writeFileSync(path.join(srcDir, "c.rs"), "pub fn c() -> u32 { 300 }\n", "utf8");
 } else if (prompt.includes("CTRL_TASK_C")) {

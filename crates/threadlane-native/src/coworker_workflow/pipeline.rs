@@ -15,6 +15,7 @@ use threadlane_workers::{
     is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
+use threadlane_workflow::WorkflowRole;
 
 use crate::conversation_change::ConversationChangeStore;
 use crate::error::{NativeError, NativeErrorCode};
@@ -24,7 +25,7 @@ use crate::fs_safety::{
 
 use super::contracts::{
     CoworkerJobPhase, CoworkerJobRecord, CoworkerTaskRecord, CoworkerTaskStage, OutboxDispatchKind,
-    OutboxDispatchStatus, ReviewVerdictOutcome, MAX_COWORKER_ID_LEN,
+    OutboxDispatchStatus, ReviewVerdictOutcome, MAX_ATTEMPTS_PER_TASK, MAX_COWORKER_ID_LEN,
 };
 use super::controller::{
     count_active_coder_executions, is_task_coder_execution_active,
@@ -35,12 +36,18 @@ use super::controller::{
 use super::controller_policy::{
     deterministic_controller_instance_id, ControllerJobRuntimeState, PendingControllerEffectKind,
     PendingControllerEffectStatus, DEFAULT_CONTROLLER_LEASE_TTL_MS,
+    MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
 };
 use super::job_completion::{
     CoworkerJobCompletionOutcome, CoworkerJobCompletionRequest, CoworkerJobCompletionService,
     CoworkerJobCompletionStatus,
 };
 use super::ownership::CoworkerJobOwnershipGuard;
+use super::task_correction_execution::{
+    read_persisted_derived_task_execution_report, CoworkerTaskCorrectionExecuteOutcome,
+    CoworkerTaskCorrectionExecuteRequest, CoworkerTaskCorrectionExecuteStatus,
+    CoworkerTaskCorrectionExecutionService,
+};
 use super::task_integration::{
     CoworkerTaskIntegrationOutcome, CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService,
     CoworkerTaskIntegrationStatus,
@@ -91,8 +98,8 @@ pub enum CoworkerPipelineStatus {
     /// to advance on the next tick.
     Running,
     /// One or more tasks received a verified `Reviewer` `CorrectInScope` verdict
-    /// (`CoworkerTaskStage::CorrectInScopeRequired`) and no other independent tasks can advance.
-    /// Does not reserve or launch unsupported derived correction execution in this baseline slice.
+    /// (`CoworkerTaskStage::CorrectInScopeRequired`), cannot dispatch another derived correction
+    /// under the frozen correction caps/budgets, and no other independent tasks can advance.
     AwaitingCorrectionExecution,
     /// One or more tasks failed required frozen task-review checks, or final combined candidate
     /// checks failed, and no other independent tasks can advance.
@@ -115,6 +122,9 @@ pub enum CoworkerPipelineStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoworkerPipelineInFlightStageKind {
+    /// Derived in-scope `Coder` correction execution in the reused owned task worktree
+    /// (`CoworkerTaskCorrectionExecutionService`).
+    TaskCorrection,
     /// Per-task deterministic git commit, scope validation, frozen check execution, and review
     /// subject promotion (`CoworkerTaskVerificationService`).
     TaskVerification,
@@ -244,6 +254,11 @@ pub struct CoworkerPipelineTickReport {
 
 #[derive(Debug)]
 enum InFlightStageCompletion {
+    TaskCorrection {
+        task_id: String,
+        attempt_no: u32,
+        result: Result<Box<CoworkerTaskCorrectionExecuteOutcome>, NativeError>,
+    },
     TaskVerification {
         task_id: String,
         attempt_no: u32,
@@ -267,12 +282,14 @@ enum InFlightStageCompletion {
 type BoxStageFuture<'g> = Pin<Box<dyn Future<Output = InFlightStageCompletion> + Send + 'g>>;
 
 /// Automatic Coworker workflow pipeline service connecting Phase 1 host reconciliation/dispatch,
-/// frozen task verification, supervised read-only `Reviewer` evaluation, original per-task
-/// `RunIntegration`, downstream dependency input seal preparation, and final job aggregation +
-/// combined candidate checks + single `Closure` evaluation.
+/// derived in-scope `Coder` correction execution, frozen task verification, supervised read-only
+/// `Reviewer` evaluation, original per-task `RunIntegration`, downstream dependency input seal
+/// preparation, and final job aggregation + combined candidate checks + single `Closure`
+/// evaluation.
 #[derive(Clone)]
 pub struct CoworkerPipelineService {
     controller: CoworkerControllerService,
+    correction_service: CoworkerTaskCorrectionExecutionService,
     verification_service: CoworkerTaskVerificationService,
     review_service: CoworkerTaskReviewStageService,
     integration_service: CoworkerTaskIntegrationService,
@@ -290,12 +307,14 @@ impl std::fmt::Debug for CoworkerPipelineService {
 impl CoworkerPipelineService {
     /// Constructs a [`CoworkerPipelineService`] from an existing [`CoworkerControllerService`].
     pub fn new(controller: CoworkerControllerService) -> Result<Self, NativeError> {
+        let correction_service = CoworkerTaskCorrectionExecutionService::new(controller.clone());
         let verification_service = CoworkerTaskVerificationService::new(controller.clone());
         let review_service = CoworkerTaskReviewStageService::new(controller.clone());
         let integration_service = CoworkerTaskIntegrationService::new(controller.clone());
         let completion_service = CoworkerJobCompletionService::from_controller(controller.clone())?;
         Ok(Self {
             controller,
+            correction_service,
             verification_service,
             review_service,
             integration_service,
@@ -311,6 +330,11 @@ impl CoworkerPipelineService {
     /// Returns a reference to the underlying [`CoworkerControllerService`].
     pub fn controller(&self) -> &CoworkerControllerService {
         &self.controller
+    }
+
+    /// Returns a reference to the underlying [`CoworkerTaskCorrectionExecutionService`].
+    pub fn correction_service(&self) -> &CoworkerTaskCorrectionExecutionService {
+        &self.correction_service
     }
 
     /// Returns a reference to the underlying [`CoworkerTaskVerificationService`].
@@ -533,6 +557,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
         }
 
         let mut acc = TickAccumulator::default();
+        let mut attempted_corrections: BTreeSet<(String, u32)> = BTreeSet::new();
         let mut attempted_verifications: BTreeSet<(String, u32)> = BTreeSet::new();
         let mut attempted_reviews: BTreeSet<(String, u32)> = BTreeSet::new();
         let mut attempted_integrations: BTreeSet<(String, u32)> = BTreeSet::new();
@@ -578,10 +603,11 @@ impl<'g> CoworkerPipelineDriver<'g> {
 
         // 4. Iteratively schedule eligible per-task stages into `self.in_flight` and drain any
         //    stage futures that finish within the bounded tick drain window.
-        let max_inner_rounds = task_count.saturating_mul(6).max(8);
+        let max_inner_rounds = task_count.saturating_mul(10).max(16);
         for _round in 0..max_inner_rounds {
             let scheduled = match Box::pin(self.schedule_eligible_stages(
                 now_ms,
+                &mut attempted_corrections,
                 &mut attempted_verifications,
                 &mut attempted_reviews,
                 &mut attempted_integrations,
@@ -1029,9 +1055,35 @@ impl<'g> CoworkerPipelineDriver<'g> {
         Ok(())
     }
 
+    fn has_active_stage_for_task(&self, task_id: &str) -> bool {
+        self.active_task_stages
+            .keys()
+            .any(|(tid, _)| tid == task_id)
+    }
+
+    fn other_active_coder_count(
+        &self,
+        adm: &VerifiedControllerAdmission,
+        candidate_task_id: &str,
+    ) -> usize {
+        adm.job
+            .tasks
+            .iter()
+            .filter(|t| {
+                t.task_id != candidate_task_id
+                    && (is_task_coder_execution_active(t, &adm.job, &adm.runtime_state)
+                        || self.active_task_stages.iter().any(|((tid, _), kind)| {
+                            tid == &t.task_id
+                                && *kind == CoworkerPipelineInFlightStageKind::TaskCorrection
+                        }))
+            })
+            .count()
+    }
+
     async fn schedule_eligible_stages(
         &mut self,
         now_ms: u64,
+        attempted_corrections: &mut BTreeSet<(String, u32)>,
         attempted_verifications: &mut BTreeSet<(String, u32)>,
         attempted_reviews: &mut BTreeSet<(String, u32)>,
         attempted_integrations: &mut BTreeSet<(String, u32)>,
@@ -1055,7 +1107,8 @@ impl<'g> CoworkerPipelineDriver<'g> {
             for ((active_tid, _), active_kind) in &self.active_task_stages {
                 if matches!(
                     active_kind,
-                    CoworkerPipelineInFlightStageKind::TaskReview
+                    CoworkerPipelineInFlightStageKind::TaskCorrection
+                        | CoworkerPipelineInFlightStageKind::TaskReview
                         | CoworkerPipelineInFlightStageKind::TaskIntegration
                 ) {
                     if let Some(t) = simulated_job
@@ -1074,8 +1127,8 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 let attempt_no = task.current_attempt_no.max(1);
                 let key = (task.task_id.clone(), attempt_no);
 
-                // Never schedule more than one stage future per (task_id, attempt_no).
-                if self.active_task_stages.contains_key(&key) {
+                // Never schedule more than one stage future per task at a time.
+                if self.has_active_stage_for_task(&task.task_id) {
                     continue;
                 }
 
@@ -1093,6 +1146,72 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 let artifacts_opt = adm.runtime_state.attempt_artifacts.get(&art_key);
 
                 match task.stage {
+                    CoworkerTaskStage::CorrectInScopeRequired => {
+                        let next_attempt_no = attempt_no.saturating_add(1);
+                        let corr_key = (task.task_id.clone(), next_attempt_no);
+                        if !attempted_corrections.contains(&corr_key)
+                            && can_task_dispatch_derived_correction(&adm, task, attempt_no)
+                            && self.other_active_coder_count(&adm, &task.task_id)
+                                < adm.approval.max_parallel
+                        {
+                            attempted_corrections.insert(corr_key);
+                            self.spawn_task_correction_future(
+                                task.task_id.clone(),
+                                attempt_no,
+                                next_attempt_no,
+                                now_ms,
+                            );
+                            if let Some(t) = simulated_job
+                                .tasks
+                                .iter_mut()
+                                .find(|t| t.task_id == task.task_id)
+                            {
+                                t.unresolved_outbox_id = Some("in_flight_outbox".to_string());
+                            }
+                            scheduled_any = true;
+                        }
+                    }
+                    CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                        if attempt_no >= 2 =>
+                    {
+                        let prior_attempt_no = attempt_no - 1;
+                        let corr_key = (task.task_id.clone(), attempt_no);
+                        let has_derived_receipt = adm
+                            .runtime_state
+                            .derived_attempts
+                            .iter()
+                            .any(|d| d.task_id == task.task_id && d.attempt_no == attempt_no);
+                        let is_fenced_late = has_fenced_late_derived_report(
+                            &plans_dir,
+                            &adm.runtime_state,
+                            &task.task_id,
+                            attempt_no,
+                        )?;
+                        let capacity_ok = task.stage == CoworkerTaskStage::Running
+                            || self.other_active_coder_count(&adm, &task.task_id)
+                                < adm.approval.max_parallel;
+                        if has_derived_receipt
+                            && !is_fenced_late
+                            && capacity_ok
+                            && !attempted_corrections.contains(&corr_key)
+                        {
+                            attempted_corrections.insert(corr_key);
+                            self.spawn_task_correction_future(
+                                task.task_id.clone(),
+                                prior_attempt_no,
+                                attempt_no,
+                                now_ms,
+                            );
+                            if let Some(t) = simulated_job
+                                .tasks
+                                .iter_mut()
+                                .find(|t| t.task_id == task.task_id)
+                            {
+                                t.unresolved_outbox_id = Some("in_flight_outbox".to_string());
+                            }
+                            scheduled_any = true;
+                        }
+                    }
                     CoworkerTaskStage::ReadyForReview => {
                         let has_review_subject =
                             artifacts_opt.is_some_and(|a| a.review_subject.is_some());
@@ -1249,6 +1368,39 @@ impl<'g> CoworkerPipelineDriver<'g> {
         Ok(scheduled_any)
     }
 
+    fn spawn_task_correction_future(
+        &mut self,
+        task_id: String,
+        prior_attempt_no: u32,
+        next_attempt_no: u32,
+        now_ms: u64,
+    ) {
+        let correction_service = self.service.correction_service.clone();
+        let guard = self.guard;
+        let req = CoworkerTaskCorrectionExecuteRequest {
+            binding_id: self.binding_id.clone(),
+            thread_uuid: self.thread_uuid.clone(),
+            job_id: self.job_id.clone(),
+            task_id: task_id.clone(),
+            prior_attempt_no,
+            now_ms,
+        };
+        self.active_task_stages.insert(
+            (task_id.clone(), next_attempt_no),
+            CoworkerPipelineInFlightStageKind::TaskCorrection,
+        );
+        self.in_flight.push(Box::pin(async move {
+            let result = Box::pin(correction_service.execute_task_correction(guard, &req))
+                .await
+                .map(Box::new);
+            InFlightStageCompletion::TaskCorrection {
+                task_id,
+                attempt_no: next_attempt_no,
+                result,
+            }
+        }));
+    }
+
     fn spawn_task_verification_future(&mut self, task_id: String, attempt_no: u32, now_ms: u64) {
         let verification_service = self.service.verification_service.clone();
         let guard = self.guard;
@@ -1387,6 +1539,39 @@ impl<'g> CoworkerPipelineDriver<'g> {
         )?;
 
         match completion {
+            InFlightStageCompletion::TaskCorrection {
+                task_id,
+                attempt_no,
+                result,
+            } => {
+                self.active_task_stages
+                    .remove(&(task_id.clone(), attempt_no));
+                self.active_task_stages
+                    .retain(|(tid, _), _| tid != &task_id);
+                match result {
+                    Ok(outcome) => match outcome.status {
+                        CoworkerTaskCorrectionExecuteStatus::ReadyForVerification => {
+                            acc.awaiting_correction_task_ids.retain(|id| id != &task_id);
+                            push_unique(&mut acc.dispatched_task_ids, &task_id);
+                            push_unique(&mut acc.reconciled_ready_for_review_task_ids, &task_id);
+                        }
+                        CoworkerTaskCorrectionExecuteStatus::WaitingForParallelCapacity => {}
+                        CoworkerTaskCorrectionExecuteStatus::FailedTerminal
+                        | CoworkerTaskCorrectionExecuteStatus::CancelledTerminal => {
+                            push_unique(&mut acc.blocked_or_failed_task_ids, &task_id);
+                        }
+                        CoworkerTaskCorrectionExecuteStatus::FencedLateOutputPreserved => {
+                            push_unique(&mut acc.fenced_task_ids, &task_id);
+                        }
+                    },
+                    Err(err) => {
+                        Box::pin(
+                            self.classify_task_stage_error(&task_id, attempt_no, now_ms, err, acc),
+                        )
+                        .await?;
+                    }
+                }
+            }
             InFlightStageCompletion::TaskVerification {
                 task_id,
                 attempt_no,
@@ -1433,11 +1618,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                         push_unique(&mut acc.reviewed_task_ids, &task_id);
                         match outcome.status {
                             CoworkerTaskReviewStageStatus::Accepted => {}
-                            CoworkerTaskReviewStageStatus::CorrectInScopeRequired => {
-                                // Truthful boundary: record AwaitingCorrectionExecution without
-                                // reserving or launching unsupported correction execution.
-                                push_unique(&mut acc.awaiting_correction_task_ids, &task_id);
-                            }
+                            CoworkerTaskReviewStageStatus::CorrectInScopeRequired => {}
                             CoworkerTaskReviewStageStatus::HeldByScopeConflict => {
                                 push_unique(&mut acc.fenced_task_ids, &task_id);
                             }
@@ -1617,10 +1798,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
 
         let mut job_for_fence = Box::new(adm.job.clone());
         for t in &mut job_for_fence.tasks {
-            let att = t.current_attempt_no.max(1);
-            if self
-                .active_task_stages
-                .contains_key(&(t.task_id.clone(), att))
+            if self.has_active_stage_for_task(&t.task_id)
                 && t.stage != CoworkerTaskStage::EffectUnknown
             {
                 t.unresolved_outbox_id = None;
@@ -1650,14 +1828,32 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 &self.job_id,
             )?;
 
-            let attempt_no = task.current_attempt_no.max(1);
+            let ledger_attempt_no = task.current_attempt_no.max(1);
+            let (in_flight_stage, active_stage_attempt_no) = self
+                .active_task_stages
+                .get(&(task.task_id.clone(), ledger_attempt_no))
+                .map(|&k| (Some(k), Some(ledger_attempt_no)))
+                .or_else(|| {
+                    self.active_task_stages
+                        .iter()
+                        .find(|((tid, _), _)| tid == &task.task_id)
+                        .map(|((_, att), &k)| (Some(k), Some(*att)))
+                })
+                .unwrap_or((None, None));
+            let attempt_no = active_stage_attempt_no.unwrap_or(ledger_attempt_no);
             let key = (task.task_id.clone(), attempt_no);
-            let in_flight_stage = self.active_task_stages.get(&key).copied();
 
             let has_task_unknown_eff = adm.runtime_state.pending_effects.values().any(|e| {
                 e.task_id.as_deref() == Some(task.task_id.as_str())
                     && e.status == PendingControllerEffectStatus::EffectUnknown
             });
+
+            let has_fenced_late_derived = has_fenced_late_derived_report(
+                &plans_dir,
+                &adm.runtime_state,
+                &task.task_id,
+                attempt_no,
+            )?;
 
             let fenced = if task.stage == CoworkerTaskStage::Integrated {
                 adm.runtime_state.stop_requested
@@ -1671,13 +1867,14 @@ impl<'g> CoworkerPipelineDriver<'g> {
                                 || h.directly_affected_task_ids.contains(&task.task_id))
                     })
             } else {
-                is_task_fenced_in_pipeline(
-                    task,
-                    &job_for_fence,
-                    &adm.runtime_state,
-                    &adm.approval.approval_id,
-                    &plans_dir,
-                )?
+                has_fenced_late_derived
+                    || is_task_fenced_in_pipeline(
+                        task,
+                        &job_for_fence,
+                        &adm.runtime_state,
+                        &adm.approval.approval_id,
+                        &plans_dir,
+                    )?
             };
             if fenced && task.stage != CoworkerTaskStage::Integrated {
                 push_unique(&mut acc.fenced_task_ids, &task.task_id);
@@ -1690,7 +1887,11 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 push_unique(&mut acc.unknown_effect_task_ids, &task.task_id);
             }
 
-            if task.stage == CoworkerTaskStage::CorrectInScopeRequired {
+            let awaiting_correction_execution = task.stage
+                == CoworkerTaskStage::CorrectInScopeRequired
+                && in_flight_stage != Some(CoworkerPipelineInFlightStageKind::TaskCorrection)
+                && !can_task_dispatch_derived_correction(&adm, task, attempt_no);
+            if awaiting_correction_execution {
                 push_unique(&mut acc.awaiting_correction_task_ids, &task.task_id);
             }
 
@@ -1725,9 +1926,9 @@ impl<'g> CoworkerPipelineDriver<'g> {
 
             let has_derived_state =
                 task_has_derived_attempt_or_post_initial_state(task, &adm.runtime_state);
-            if is_task_coder_execution_active(task, &adm.job, &adm.runtime_state)
-                || (!has_derived_state
-                    && matches!(
+            if !has_derived_state
+                && (is_task_coder_execution_active(task, &adm.job, &adm.runtime_state)
+                    || matches!(
                         snap.status,
                         TaskExecutionStatus::Queued
                             | TaskExecutionStatus::Claimed
@@ -1788,8 +1989,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 review_verdict_outcome,
                 review_receipt_id,
                 integration_receipt_id,
-                awaiting_correction_execution: task.stage
-                    == CoworkerTaskStage::CorrectInScopeRequired,
+                awaiting_correction_execution,
                 failed_check_ids,
                 blocking_diagnostic,
             });
@@ -2408,6 +2608,135 @@ fn can_reconcile_effect_unknown_integration(
     Ok(false)
 }
 
+fn can_task_dispatch_derived_correction(
+    adm: &VerifiedControllerAdmission,
+    task: &CoworkerTaskRecord,
+    prior_attempt_no: u32,
+) -> bool {
+    if task.stage != CoworkerTaskStage::CorrectInScopeRequired {
+        return false;
+    }
+    let Some(ref cap_env) = adm.linkage.controller_envelope else {
+        return false;
+    };
+    if cap_env.max_in_scope_correction_attempts == 0
+        || adm.runtime_state.envelope.max_in_scope_corrections_per_task == 0
+        || adm.runtime_state.envelope.max_total_corrections_per_job == 0
+    {
+        return false;
+    }
+    let Some(next_attempt_no) = prior_attempt_no.checked_add(1) else {
+        return false;
+    };
+    if prior_attempt_no == 0
+        || prior_attempt_no > MAX_IN_SCOPE_CORRECTION_ATTEMPTS
+        || usize::try_from(next_attempt_no)
+            .map(|n| n > MAX_ATTEMPTS_PER_TASK)
+            .unwrap_or(true)
+        || prior_attempt_no > cap_env.max_in_scope_correction_attempts
+        || prior_attempt_no > adm.runtime_state.envelope.max_in_scope_corrections_per_task
+        || !adm.linkage.authorizes_in_scope_correction(next_attempt_no)
+    {
+        return false;
+    }
+
+    let Some(prior_cand) = task
+        .candidates
+        .iter()
+        .find(|c| c.attempt_no == prior_attempt_no)
+    else {
+        return false;
+    };
+    let Some(ref verdict) = prior_cand.review_verdict else {
+        return false;
+    };
+    if verdict.outcome != ReviewVerdictOutcome::CorrectInScope
+        || verdict.required_in_scope_fixes.is_empty()
+        || prior_cand.review_receipt_id.is_some()
+        || prior_cand.integration_receipt_id.is_some()
+        || task.accepted_candidate_id.is_some()
+    {
+        return false;
+    }
+    let art_key = ControllerJobRuntimeState::artifact_key(&task.task_id, prior_attempt_no);
+    let Some(prior_artifacts) = adm.runtime_state.attempt_artifacts.get(&art_key) else {
+        return false;
+    };
+    if prior_artifacts.review_subject.is_none()
+        || prior_artifacts.reviewer_response_digest.is_none()
+        || prior_artifacts.review_receipt.is_some()
+        || prior_artifacts.integration_receipt.is_some()
+    {
+        return false;
+    }
+
+    let already_reserved = adm
+        .runtime_state
+        .derived_attempts
+        .iter()
+        .any(|d| d.task_id == task.task_id && d.attempt_no == next_attempt_no);
+    if !already_reserved {
+        let task_corrections_reserved = adm
+            .runtime_state
+            .derived_attempts
+            .iter()
+            .filter(|d| d.task_id == task.task_id && d.attempt_no >= 2)
+            .count() as u32;
+        if task_corrections_reserved >= MAX_IN_SCOPE_CORRECTION_ATTEMPTS
+            || task_corrections_reserved >= cap_env.max_in_scope_correction_attempts
+            || task_corrections_reserved
+                >= adm.runtime_state.envelope.max_in_scope_corrections_per_task
+        {
+            return false;
+        }
+        if adm.runtime_state.total_corrections_reserved
+            >= adm.runtime_state.envelope.max_total_corrections_per_job
+        {
+            return false;
+        }
+        if adm.runtime_state.total_task_attempts_reserved
+            >= adm.runtime_state.envelope.max_total_task_attempts_per_job
+        {
+            return false;
+        }
+        if adm
+            .runtime_state
+            .ensure_role_budget_available(WorkflowRole::Coder)
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn has_fenced_late_derived_report(
+    plans_dir: &Path,
+    runtime_state: &ControllerJobRuntimeState,
+    task_id: &str,
+    attempt_no: u32,
+) -> Result<bool, NativeError> {
+    if attempt_no < 2 {
+        return Ok(false);
+    }
+    for eff in runtime_state.pending_effects.values() {
+        if eff.kind == PendingControllerEffectKind::CoderDispatch
+            && eff.task_id.as_deref() == Some(task_id)
+            && eff.attempt_no == Some(attempt_no)
+        {
+            if let Some(report) =
+                read_persisted_derived_task_execution_report(plans_dir, &eff.effect_id)?
+            {
+                if report.status == CoworkerTaskCorrectionExecuteStatus::FencedLateOutputPreserved {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn extract_task_blocking_diagnostic(
     task: &CoworkerTaskRecord,
     job: &CoworkerJobRecord,
@@ -2505,6 +2834,14 @@ fn classify_pipeline_status(
             | CoworkerTaskStage::UnderReview
             | CoworkerTaskStage::Accepted
             | CoworkerTaskStage::IntegrationReserved => true,
+            CoworkerTaskStage::CorrectInScopeRequired => {
+                if let Some(job_task) = adm.job.tasks.iter().find(|t| t.task_id == snap.task_id) {
+                    active_in_flight_coders < adm.approval.max_parallel
+                        && can_task_dispatch_derived_correction(adm, job_task, snap.attempt_no)
+                } else {
+                    false
+                }
+            }
             CoworkerTaskStage::PendingDependencies => {
                 if let Some(job_task) = adm.job.tasks.iter().find(|t| t.task_id == snap.task_id) {
                     collect_integrated_predecessor_selections(job_task, &adm.job).is_some()
