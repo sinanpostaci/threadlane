@@ -1,7 +1,20 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
-//! Trusted local operator CLI for durable Threadlane role-flow cycles.
+//! Trusted local operator CLI for durable Threadlane role-flow cycles, standing read-only
+//! planning grants, and frozen Coworker controller execution envelopes (`coworker-execution
+//! preview|record|inspect`).
+//!
+//! - `coworker-execution preview`: pure validation of [`FreezeControllerExecutionEnvelopeRequest`]
+//!   against the live [`CoworkerJobRecord`], [`AuthorityStore`], [`PlanStore`], and [`RegistryStore`]
+//!   without mutating controller state, starting workers, or running Git effects.
+//! - `coworker-execution record`: requires explicit CLI `--operator-approved`, `--confirm-approval`,
+//!   and `--confirm-envelope` flags matching the previewed `approval_subject_digest` and full
+//!   `envelope_digest`; never trusts JSON self-attestation or MCP prose, and local operator
+//!   attestation is not cryptographic proof of human intent or per-call native chat identity.
+//! - `coworker-execution inspect`: read-only lookup of the stored [`ControllerJobRuntimeState`]
+//!   without creating files, ACKs, or dispatches. Automatic controller scheduling/driving and
+//!   paired MCP wiring are separate downstream owners.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -24,7 +37,11 @@ use threadlane_native::coworker_grants::{
     LocalOperatorGrantAttestation, PlanningGrantPreview, PlanningGrantSummary,
     PreparePlanningGrantRequest, RecordPlanningGrantRequest, TrustedGrantScope,
 };
-use threadlane_native::coworker_workflow::{CoworkerWorkflowStore, RevokePlanningGrantRequest};
+use threadlane_native::coworker_workflow::{
+    ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
+    CoworkerJobRecord, CoworkerWorkflowStore, FreezeControllerExecutionEnvelopeRequest,
+    FrozenControllerExecutionEnvelope, RevokePlanningGrantRequest,
+};
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
 };
@@ -191,6 +208,55 @@ enum FlowCommand {
         /// Planning grant identifier (`pgr_<32hex>`).
         #[arg(long = "grant-id", value_name = "ID")]
         grant_id: String,
+    },
+    /// Preview, record, or inspect a frozen Coworker controller execution envelope (preview | record | inspect).
+    #[command(
+        subcommand,
+        name = "coworker-execution",
+        visible_alias = "execution-envelope"
+    )]
+    CoworkerExecution(CoworkerExecutionCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum CoworkerExecutionCommand {
+    /// Preview a read-only frozen controller execution envelope without mutating state.
+    Preview {
+        /// Absolute path to the private (`0600`) JSON [`FreezeControllerExecutionEnvelopeRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+    },
+    /// Record an operator-attested frozen controller execution envelope for an approved Coworker job.
+    Record {
+        /// Absolute path to the private (`0600`) JSON [`FreezeControllerExecutionEnvelopeRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+
+        /// Lowercase 64-character SHA-256 `approval_subject_digest` confirmed by the operator.
+        #[arg(
+            long = "confirm-approval",
+            visible_alias = "confirm-approval-subject-digest",
+            value_name = "SHA256"
+        )]
+        confirm_approval: Option<String>,
+
+        /// Lowercase 64-character SHA-256 preview `envelope_digest` confirmed by the operator.
+        #[arg(
+            long = "confirm-envelope",
+            visible_alias = "confirm-envelope-digest",
+            value_name = "SHA256"
+        )]
+        confirm_envelope: Option<String>,
+
+        /// Explicit local operator attestation flag required to record the execution envelope.
+        #[arg(long = "operator-approved", visible_alias = "operator-attested")]
+        operator_approved: bool,
+    },
+    /// Read the stored controller execution envelope and runtime configuration for a job without mutating state.
+    Inspect {
+        /// Coworker job identifier (`job_<32hex>`).
+        #[arg(long = "job-id", value_name = "ID")]
+        job_id: String,
     },
 }
 
@@ -360,6 +426,46 @@ impl FlowScoped for RevokePlanningGrantRequest {
     }
 }
 
+impl FlowScoped for FreezeControllerExecutionEnvelopeRequest {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for FrozenControllerExecutionEnvelope {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for ControllerConfigurationPreview {
+    fn binding_id(&self) -> &str {
+        &self.envelope.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.envelope.thread_uuid
+    }
+}
+
+impl FlowScoped for CoworkerJobRecord {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
 /// Deserialized private JSON body for `grant-record` before CLI flag enforcement.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -464,6 +570,17 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
         FlowCommand::GrantRevoke { .. } => ("flow.grant-revoke", true, true),
         FlowCommand::GrantList => ("flow.grant-list", false, false),
         FlowCommand::GrantGet { .. } => ("flow.grant-get", false, false),
+        FlowCommand::CoworkerExecution(sub) => match sub {
+            CoworkerExecutionCommand::Preview { .. } => {
+                ("flow.coworker-execution.preview", false, false)
+            }
+            CoworkerExecutionCommand::Record { .. } => {
+                ("flow.coworker-execution.record", true, true)
+            }
+            CoworkerExecutionCommand::Inspect { .. } => {
+                ("flow.coworker-execution.inspect", false, false)
+            }
+        },
     };
     let parent_req = read_env_parent_request_id();
     let should_journal = is_mutating || (allow_parent_journal && parent_req.is_some());
@@ -803,6 +920,17 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 )?;
                 write_result(&binding, &summary, false)
             }
+            FlowCommand::CoworkerExecution(subcommand) => run_coworker_execution(
+                subcommand,
+                &registry_dir,
+                &plans_dir,
+                &authority_dir,
+                &binding,
+                &thread,
+                &mut verified_job_id,
+                &mut resolved_plan_id,
+                &mut resolved_approval_id,
+            ),
         }
     }
     .await;
@@ -1118,6 +1246,237 @@ fn open_flow_store(plans_dir: &Path) -> Result<RoleFlowStore, OperatorCliError> 
 
 fn open_grant_store(plans_dir: &Path) -> Result<CoworkerWorkflowStore, OperatorCliError> {
     CoworkerWorkflowStore::new(plans_dir).map_err(|error| map_native_error(&error, false))
+}
+
+fn open_controller_policy_store(
+    plans_dir: &Path,
+) -> Result<ControllerPolicyStore, OperatorCliError> {
+    ControllerPolicyStore::new(plans_dir).map_err(|error| map_native_error(&error, false))
+}
+
+fn validate_job_id(value: &str) -> Result<(), OperatorCliError> {
+    validate_identifier("job_id", value)
+        .map(|_| ())
+        .map_err(|_| OperatorCliError::invalid_input("Invalid `--job-id` syntax."))
+}
+
+fn validate_confirm_envelope(value: &str) -> Result<String, OperatorCliError> {
+    validate_sha256_hex("confirm_envelope", value).map_err(|_| {
+        OperatorCliError::invalid_input(
+            "`--confirm-envelope` must be a 64-character lowercase hexadecimal SHA-256 digest.",
+        )
+    })
+}
+
+fn apply_execution_record_confirmations(
+    request: &mut FreezeControllerExecutionEnvelopeRequest,
+    operator_approved: bool,
+    confirm_approval: Option<String>,
+    confirm_envelope: Option<String>,
+) -> Result<(), OperatorCliError> {
+    // Attestation and confirmation digests in the JSON body are attacker-controlled.
+    // Require explicit CLI flags and reject any disagreement with non-empty JSON fields.
+    let checked_approval = match confirm_approval {
+        Some(ref raw) => Some(validate_confirm_approval(raw)?),
+        None => None,
+    };
+    let checked_envelope = match confirm_envelope {
+        Some(ref raw) => Some(validate_confirm_envelope(raw)?),
+        None => None,
+    };
+    if !operator_approved {
+        request.operator_attested = false;
+        request.confirm_approval_subject_digest = None;
+        request.confirm_envelope_digest = None;
+        return Err(OperatorCliError::new(
+            NativeErrorCode::UnauthorizedOperator.as_str(),
+            "Role-flow or planning-grant operation requires explicit operator authorization.",
+        ));
+    }
+    let Some(checked_approval) = checked_approval else {
+        request.operator_attested = false;
+        request.confirm_approval_subject_digest = None;
+        request.confirm_envelope_digest = None;
+        return Err(OperatorCliError::new(
+            NativeErrorCode::UnauthorizedOperator.as_str(),
+            "Role-flow or planning-grant operation requires explicit operator authorization.",
+        ));
+    };
+    let Some(checked_envelope) = checked_envelope else {
+        request.operator_attested = false;
+        request.confirm_approval_subject_digest = None;
+        request.confirm_envelope_digest = None;
+        return Err(OperatorCliError::new(
+            NativeErrorCode::UnauthorizedOperator.as_str(),
+            "Role-flow or planning-grant operation requires explicit operator authorization.",
+        ));
+    };
+    if let Some(ref file_approval) = request.confirm_approval_subject_digest {
+        if !file_approval.is_empty() && file_approval != &checked_approval {
+            return Err(OperatorCliError::new(
+                NativeErrorCode::UnauthorizedOperator.as_str(),
+                "Role-flow or planning-grant operation requires explicit operator authorization.",
+            ));
+        }
+    }
+    if let Some(ref file_envelope) = request.confirm_envelope_digest {
+        if !file_envelope.is_empty() && file_envelope != &checked_envelope {
+            return Err(OperatorCliError::new(
+                NativeErrorCode::UnauthorizedOperator.as_str(),
+                "Role-flow or planning-grant operation requires explicit operator authorization.",
+            ));
+        }
+    }
+    request.operator_attested = true;
+    request.confirm_approval_subject_digest = Some(checked_approval);
+    request.confirm_envelope_digest = Some(checked_envelope);
+    Ok(())
+}
+
+fn load_scoped_job(
+    store: &CoworkerWorkflowStore,
+    expected_binding_id: &str,
+    expected_thread_uuid: &str,
+    job_id: &str,
+) -> Result<CoworkerJobRecord, OperatorCliError> {
+    validate_job_id(job_id)?;
+    let ledger = store
+        .read_binding_ledger(expected_binding_id)
+        .map_err(|error| map_native_error(&error, false))?;
+    if let Some(ref pinned_thread) = ledger.thread_uuid {
+        if pinned_thread != expected_thread_uuid {
+            return Err(OperatorCliError::new(
+                "scope_mismatch",
+                STORED_SCOPE_MISMATCH,
+            ));
+        }
+    }
+    let Some(job) = ledger.jobs.into_iter().find(|item| item.job_id == job_id) else {
+        return Err(OperatorCliError::new(
+            NativeErrorCode::ValidationFailed.as_str(),
+            "Role-flow request or persisted state failed validation.",
+        ));
+    };
+    ensure_scope(
+        &job,
+        expected_binding_id,
+        expected_thread_uuid,
+        "scope_mismatch",
+        STORED_SCOPE_MISMATCH,
+    )?;
+    Ok(job)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_coworker_execution(
+    subcommand: CoworkerExecutionCommand,
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    binding: &str,
+    thread: &str,
+    verified_job_id: &mut Option<String>,
+    resolved_plan_id: &mut Option<String>,
+    resolved_approval_id: &mut Option<String>,
+) -> Result<(), OperatorCliError> {
+    match subcommand {
+        CoworkerExecutionCommand::Preview { request } => {
+            let mut execution_request: FreezeControllerExecutionEnvelopeRequest =
+                read_request(&request)?;
+            ensure_scope(
+                &execution_request,
+                binding,
+                thread,
+                "scope_mismatch",
+                REQUEST_SCOPE_MISMATCH,
+            )?;
+            execution_request.operator_attested = false;
+            execution_request.confirm_approval_subject_digest = None;
+            execution_request.confirm_envelope_digest = None;
+            let workflow_store = open_grant_store(plans_dir)?;
+            let job = load_scoped_job(&workflow_store, binding, thread, &execution_request.job_id)?;
+            let authority = open_authority(registry_dir, plans_dir, authority_dir)?;
+            let policy_store = open_controller_policy_store(plans_dir)?;
+            let preview: ControllerConfigurationPreview = policy_store
+                .preview_execution_envelope(&execution_request, &job, &authority)
+                .map_err(|error| map_native_error(&error, false))?;
+            ensure_scope(
+                &preview,
+                binding,
+                thread,
+                "scope_mismatch",
+                STORED_SCOPE_MISMATCH,
+            )?;
+            write_result(binding, &preview, false)
+        }
+        CoworkerExecutionCommand::Record {
+            request,
+            confirm_approval,
+            confirm_envelope,
+            operator_approved,
+        } => {
+            let mut execution_request: FreezeControllerExecutionEnvelopeRequest =
+                read_request(&request)?;
+            ensure_scope(
+                &execution_request,
+                binding,
+                thread,
+                "scope_mismatch",
+                REQUEST_SCOPE_MISMATCH,
+            )?;
+            apply_execution_record_confirmations(
+                &mut execution_request,
+                operator_approved,
+                confirm_approval,
+                confirm_envelope,
+            )?;
+            let workflow_store = open_grant_store(plans_dir)?;
+            let job = load_scoped_job(&workflow_store, binding, thread, &execution_request.job_id)?;
+            let authority = open_authority(registry_dir, plans_dir, authority_dir)?;
+            let policy_store = open_controller_policy_store(plans_dir)?;
+            let state: ControllerJobRuntimeState = policy_store
+                .record_execution_envelope(&execution_request, &job, &authority)
+                .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &state.envelope,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            *verified_job_id = Some(state.job_id.clone());
+            *resolved_plan_id = Some(state.envelope.plan_id.clone());
+            *resolved_approval_id = Some(state.envelope.approval_id.clone());
+            write_result(binding, &state, true)
+        }
+        CoworkerExecutionCommand::Inspect { job_id } => {
+            validate_job_id(&job_id)?;
+            let workflow_store = open_grant_store(plans_dir)?;
+            let policy_store = open_controller_policy_store(plans_dir)?;
+            let state: Option<ControllerJobRuntimeState> = policy_store
+                .get_job_runtime_readonly(binding, &job_id)
+                .map_err(|error| map_native_error(&error, false))?;
+            let Some(state) = state else {
+                return Err(OperatorCliError::new(
+                    "not_configured",
+                    "No frozen controller execution envelope is recorded for this job in this binding scope.",
+                ));
+            };
+            ensure_scope(
+                &state.envelope,
+                binding,
+                thread,
+                "scope_mismatch",
+                STORED_SCOPE_MISMATCH,
+            )?;
+            let job = load_scoped_job(&workflow_store, binding, thread, &job_id)?;
+            state
+                .envelope
+                .verify_matches_job(&job)
+                .map_err(|error| map_native_error(&error, false))?;
+            write_result(binding, &state, false)
+        }
+    }
 }
 
 fn open_authority(
@@ -1458,6 +1817,59 @@ mod tests {
             let globals = GlobalArgs::from_cli(&parsed).expect("extract globals");
             assert_eq!(globals.binding, BINDING);
             assert_eq!(globals.thread, THREAD);
+        }
+    }
+
+    #[test]
+    fn cli_parses_coworker_execution_subcommands_with_global_flags() {
+        for sub in [
+            vec![
+                "coworker-execution",
+                "preview",
+                "--request",
+                "/tmp/preview.json",
+            ],
+            vec![
+                "coworker-execution",
+                "record",
+                "--request",
+                "/tmp/record.json",
+                "--confirm-approval",
+                DIGEST,
+                "--confirm-envelope",
+                DIGEST,
+                "--operator-approved",
+            ],
+            vec![
+                "coworker-execution",
+                "inspect",
+                "--job-id",
+                "job_0123456789abcdef0123456789abcdef",
+            ],
+        ] {
+            let mut argv = vec![
+                "threadlane-flow",
+                "--state-dir",
+                "/tmp/state",
+                "--registry-dir",
+                "/tmp/registry",
+                "--plans-dir",
+                "/tmp/plans",
+                "--authority-dir",
+                "/tmp/authority",
+                "--sessions-dir",
+                "/tmp/sessions",
+                "--binding",
+                BINDING,
+                "--thread",
+                THREAD,
+            ];
+            argv.extend(sub);
+            let parsed = Cli::try_parse_from(argv).expect("parse coworker-execution subcommand");
+            let globals = GlobalArgs::from_cli(&parsed).expect("extract globals");
+            assert_eq!(globals.binding, BINDING);
+            assert_eq!(globals.thread, THREAD);
+            assert!(matches!(parsed.command, FlowCommand::CoworkerExecution(_)));
         }
     }
 }

@@ -31,7 +31,8 @@ pub mod candidate;
 /// Serializable data contracts, validation rules, deterministic digests, and independence proofs.
 pub mod contracts;
 /// Typed controller execution configuration/envelope, frozen check command specifications,
-/// budgets, completeness/correction receipts, and per-job driver lease state.
+/// per-task and job-wide correction/attempt/role budgets, declared interface-independence
+/// completeness receipts, derived correction attempt receipts, and per-job driver lease state.
 pub mod controller_policy;
 /// Private per-job OS file-lock ownership, CSPRNG instance/challenge identity, and pre-effect validation.
 pub mod ownership;
@@ -39,5 +40,6 @@ pub mod ownership;
 pub mod store;
 
 pub use contracts::*;
+pub use controller_policy::*;
 pub use ownership::*;
 pub use store::*;
