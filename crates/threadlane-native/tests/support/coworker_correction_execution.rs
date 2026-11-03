@@ -29,6 +29,25 @@ async fn prepare_task_for_derived_correction(
     task_id: &str,
     required_fixes: Vec<String>,
 ) -> PreparedCorrectionFixtureTask {
+    prepare_task_for_derived_correction_with_budgets(
+        fixture,
+        brief_id,
+        plan_id,
+        task_id,
+        required_fixes,
+        ExecutionBudgets::default(),
+    )
+    .await
+}
+
+async fn prepare_task_for_derived_correction_with_budgets(
+    fixture: &ControllerTestFixture,
+    brief_id: &str,
+    plan_id: &str,
+    task_id: &str,
+    required_fixes: Vec<String>,
+    approval_budgets: ExecutionBudgets,
+) -> PreparedCorrectionFixtureTask {
     write_executable_script(
         &fixture.fake_cargo_exe,
         "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
@@ -58,7 +77,7 @@ async fn prepare_task_for_derived_correction(
         task_interfaces,
         vec!["src/a.rs".to_string()],
         1,
-        ExecutionBudgets::default(),
+        approval_budgets,
         ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
     )
     .await;
@@ -1537,5 +1556,440 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     assert_eq!(approval_after, approval_before);
 
     session.release().expect("release session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_correction_large_persisted_report_exceeds_one_mib_while_policy_ledger_stays_bounded_reopens_and_verifies(
+) {
+    let fixture = setup_fixture();
+    let required_fixes = vec![
+        "Update src/a.rs::a() so it returns 101 instead of 100".to_string(),
+        "Emit full structured progress stream during bounded correction".to_string(),
+    ];
+    let default_budgets = ExecutionBudgets::default();
+    let PreparedCorrectionFixtureTask {
+        job,
+        approval_id,
+        approval_before,
+        approved_task_before: _,
+        host_handle,
+        session,
+        step_ts,
+        verify_1,
+        review_subject_1,
+        policy_digest: _,
+        review_1: _,
+        art_key_1,
+        art_1_before,
+        task_manifest,
+        prep_outcome: _,
+        receipt,
+        expected_req_key,
+        expected_eff_id,
+        expected_report_id,
+    } = prepare_task_for_derived_correction_with_budgets(
+        &fixture,
+        "brf_corr_large",
+        "plan-corr-large",
+        "task-corr-large",
+        required_fixes,
+        ExecutionBudgets {
+            max_events: threadlane_workers::MAX_EVENTS,
+            ..default_budgets.clone()
+        },
+    )
+    .await;
+
+    // Configure only this disposable test's fake executable before the derived attempt so the
+    // actual derived Coder process generates a ~1.4 MiB valid NDJSON event stream (2,402 lines,
+    // each line ~615 bytes << max_line_bytes = 256 KiB, total stdout < default 4 MiB budget)
+    // and writes valid single-brace Rust contents `pub fn a() -> u32 { 101 }\n` to src/a.rs.
+    let expected_summary_chunk = format!(
+        "derived_coder_large_report_progress_payload_chunk_{}",
+        "x".repeat(190)
+    );
+    let padding_chunk = "p".repeat(250);
+    let large_corr_header = format!(
+        r#"#!/bin/sh
+set -eu
+CODER_COUNT_FILE="{coder_count_file}"
+PLANNING_COUNT_FILE="{planning_count_file}"
+PROMPT_FILE="{prompt_file}"
+PLAN_RESPONSE_FILE="{plan_response_file}"
+SUMMARY_CHUNK="{expected_summary_chunk}"
+PADDING_CHUNK="{padding_chunk}"
+"#,
+        coder_count_file = fixture.agy_count_file.display(),
+        planning_count_file = fixture.agy_planning_count_file.display(),
+        prompt_file = fixture.agy_prompt_file.display(),
+        plan_response_file = fixture.agy_plan_response_file.display(),
+    );
+    let large_corr_body = r#"
+MODEL=""
+EFFORT=""
+AGY_MODE=""
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --effort)
+            EFFORT="$2"
+            shift 2
+            ;;
+        --mode)
+            AGY_MODE="$2"
+            shift 2
+            ;;
+        --print|--prompt|-p)
+            PROMPT="$2"
+            shift 2
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
+done
+
+if [ "$AGY_MODE" = "plan" ]; then
+    pc=0
+    if [ -f "$PLANNING_COUNT_FILE" ]; then
+        pc=$(cat "$PLANNING_COUNT_FILE")
+    fi
+    pc=$((pc + 1))
+    printf "%s" "$pc" > "$PLANNING_COUNT_FILE"
+    printf '{"event":"init","init":{"session_id":"sess-agy-plan-%s","model":"%s"}}\n' "$pc" "$MODEL"
+    esc=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$PLAN_RESPONSE_FILE" | tr '\n' ' ')
+    printf '{"event":"result","result":{"status":"SUCCESS","response":"%s"}}\n' "$esc"
+    exit 0
+fi
+
+c=0
+if [ -f "$CODER_COUNT_FILE" ]; then
+    c=$(cat "$CODER_COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$CODER_COUNT_FILE"
+printf "%s" "$PROMPT" > "$PROMPT_FILE"
+printf '{"type":"init","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+
+if ! grep -q "100" "src/a.rs"; then
+    echo "expected prior attempt 1 contents in src/a.rs before large-report correction" >&2
+    exit 3
+fi
+printf "pub fn a() -> u32 { 101 }\n" > "src/a.rs"
+
+nl='
+'
+line=$(printf '{"type":"assistant","subtype":"progress_chunk_detail_stream_item","session_id":"sess-agy-ctrl","model":"%s","effort":"%s","summary":"%s","detail_padding":"%s"}' "$MODEL" "$EFFORT" "$SUMMARY_CHUNK" "$PADDING_CHUNK")
+blk10="${line}${nl}${line}${nl}${line}${nl}${line}${nl}${line}${nl}${line}${nl}${line}${nl}${line}${nl}${line}${nl}${line}${nl}"
+i=0
+while [ "$i" -lt 240 ]; do
+    printf "%s" "$blk10"
+    i=$((i + 1))
+done
+
+printf '{"type":"result","subtype":"success","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
+exit 0
+"#;
+    write_executable_script(
+        &fixture.fake_agy_exe,
+        &format!("{large_corr_header}{large_corr_body}"),
+    );
+
+    let correction_exec_service =
+        CoworkerTaskCorrectionExecutionService::new(fixture.controller.clone());
+    let exec_req = CoworkerTaskCorrectionExecuteRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        task_id: "task-corr-large".to_string(),
+        prior_attempt_no: 1,
+        now_ms: step_ts + 300,
+    };
+    let exec_outcome = correction_exec_service
+        .execute_task_correction(session.guard(), &exec_req)
+        .await
+        .expect("execute_task_correction with >1MiB persisted execution report");
+
+    assert_eq!(
+        exec_outcome.status,
+        CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
+    );
+    assert_eq!(exec_outcome.task_stage, CoworkerTaskStage::ReadyForReview);
+    assert_eq!(exec_outcome.attempt_no, 2);
+    assert!(!exec_outcome.reused_existing);
+    assert_eq!(
+        exec_outcome.request_key.as_deref(),
+        Some(expected_req_key.as_str())
+    );
+    assert_eq!(
+        exec_outcome.effect_id.as_deref(),
+        Some(expected_eff_id.as_str())
+    );
+    assert_eq!(
+        exec_outcome.report_artifact_id.as_deref(),
+        Some(expected_report_id.as_str())
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let report = exec_outcome
+        .report
+        .as_ref()
+        .expect("PersistedDerivedTaskExecutionArtifact present");
+    report
+        .validate_integrity()
+        .expect("validate large PersistedDerivedTaskExecutionArtifact integrity");
+    assert_eq!(
+        report.execution_report.worker_report.status,
+        WorkerRunStatus::Succeeded
+    );
+    assert_eq!(report.execution_report.worker_report.overflow, None);
+    assert!(report
+        .execution_report
+        .worker_report
+        .has_complete_natural_completion_evidence());
+    assert!(
+        report.execution_report.worker_report.stdout_bytes_captured >= 1_258_291,
+        "expected >= 1.2 MiB captured stdout from real derived Coder process, got {}",
+        report.execution_report.worker_report.stdout_bytes_captured
+    );
+    assert!(
+        report.execution_report.worker_report.stdout_bytes_captured
+            < default_budgets.max_stdout_bytes
+    );
+    assert_eq!(
+        report.execution_report.worker_report.evidence.total_lines,
+        2_402
+    );
+    assert_eq!(
+        report
+            .execution_report
+            .worker_report
+            .evidence
+            .valid_json_events,
+        2_402
+    );
+    assert_eq!(
+        report
+            .execution_report
+            .worker_report
+            .evidence
+            .malformed_lines_count,
+        0
+    );
+    assert_eq!(
+        report
+            .execution_report
+            .worker_report
+            .evidence
+            .retained_events
+            .len(),
+        2_402
+    );
+    assert_eq!(
+        report
+            .execution_report
+            .worker_report
+            .evidence
+            .dropped_events_count,
+        0
+    );
+    assert_eq!(
+        report
+            .execution_report
+            .worker_report
+            .evidence
+            .retained_events[1]
+            .summary
+            .as_deref(),
+        Some(expected_summary_chunk.as_str())
+    );
+    assert_eq!(
+        report
+            .execution_report
+            .worker_report
+            .evidence
+            .retained_events[2_400]
+            .summary
+            .as_deref(),
+        Some(expected_summary_chunk.as_str())
+    );
+
+    // Persisted private 0600 report artifact exceeds 1 MiB on disk while controller policy and
+    // workflow ledgers remain compact and well below the 1 MiB ledger bound.
+    let one_mib: u64 = 1_048_576;
+    let expected_report_path =
+        derived_execution_report_file_path(&fixture.plans_dir, &expected_eff_id);
+    let report_meta =
+        fs::symlink_metadata(&expected_report_path).expect("large derived report metadata");
+    assert!(report_meta.file_type().is_file());
+    assert_eq!(report_meta.permissions().mode() & 0o777, 0o600);
+    assert!(
+        report_meta.len() > one_mib,
+        "expected persisted derived execution report file > 1 MiB ({one_mib} bytes), got {} bytes",
+        report_meta.len()
+    );
+
+    let policy_ledger_path = fixture
+        .policy_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("policy ledger path");
+    let policy_ledger_meta =
+        fs::symlink_metadata(&policy_ledger_path).expect("policy ledger metadata");
+    assert!(
+        policy_ledger_meta.len() < one_mib && policy_ledger_meta.len() < 128 * 1024,
+        "controller policy ledger must remain well within its 1 MiB bound, got {} bytes",
+        policy_ledger_meta.len()
+    );
+    let workflow_ledger_path = fixture
+        .workflow_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("workflow ledger path");
+    let workflow_ledger_meta =
+        fs::symlink_metadata(&workflow_ledger_path).expect("workflow ledger metadata");
+    assert!(
+        workflow_ledger_meta.len() < one_mib && workflow_ledger_meta.len() < 128 * 1024,
+        "workflow binding ledger must remain well within its 1 MiB bound, got {} bytes",
+        workflow_ledger_meta.len()
+    );
+
+    // Reopen session and verify no new provider invocation, no duplicate budget charge, and full
+    // >1MiB output retained through the real immutable report loader.
+    session.release().expect("release session");
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 400)
+        .expect("reopen session");
+    let reopened_exec = correction_exec_service
+        .execute_task_correction(
+            reopened_session.guard(),
+            &CoworkerTaskCorrectionExecuteRequest {
+                now_ms: step_ts + 500,
+                ..exec_req
+            },
+        )
+        .await
+        .expect("reopen execute_task_correction with >1MiB report");
+    assert_eq!(
+        reopened_exec.status,
+        CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
+    );
+    assert!(reopened_exec.reused_existing);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let loaded_report =
+        read_persisted_derived_task_execution_report(&fixture.plans_dir, &expected_eff_id)
+            .expect("load >1MiB persisted derived report via immutable loader")
+            .expect("persisted derived report exists");
+    assert_eq!(&loaded_report, report);
+    assert_eq!(
+        reopened_exec.report.as_ref(),
+        Some(&loaded_report),
+        "reopen must return the full persisted >1MiB report"
+    );
+
+    let rt_after_reopen = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read runtime after reopen")
+        .expect("runtime exists");
+    let coder_usage = rt_after_reopen
+        .role_usage
+        .get(&WorkflowRole::Coder)
+        .expect("Coder usage");
+    assert_eq!(coder_usage.calls_reserved, 2);
+    assert_eq!(coder_usage.calls_completed, 2);
+    assert_eq!(rt_after_reopen.total_task_attempts_reserved, 2);
+    assert_eq!(rt_after_reopen.total_corrections_reserved, 1);
+    assert_eq!(rt_after_reopen.derived_attempts, vec![receipt]);
+
+    // Verify attempt 2 consumes the actual derived report and worktree (`101`) rather than stale
+    // original-host attempt 1 output (`100`).
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_2 = verifier
+        .verify_and_prepare_task_attempt(
+            reopened_session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-large".to_string(),
+                attempt_no: 2,
+                now_ms: step_ts + 600,
+            },
+        )
+        .await
+        .expect("verify_and_prepare_task_attempt attempt 2 from >1MiB derived report");
+    assert_eq!(
+        verify_2.status,
+        CoworkerTaskVerificationStatus::ReadyForReviewer
+    );
+    assert_eq!(verify_2.attempt_no, 2);
+    assert_ne!(
+        verify_2.committed_head_commit,
+        verify_1.committed_head_commit
+    );
+    assert_ne!(verify_2.committed_tree_sha, verify_1.committed_tree_sha);
+    assert_ne!(verify_2.candidate_id, verify_1.candidate_id);
+    let review_subject_2 = verify_2
+        .review_subject
+        .as_ref()
+        .expect("promoted ReviewSubject for attempt 2");
+    assert_ne!(
+        review_subject_2.subject_digest,
+        review_subject_1.subject_digest
+    );
+    assert_eq!(
+        review_subject_2.task_head_commit,
+        verify_2.committed_head_commit
+    );
+    assert_eq!(review_subject_2.task_tree_sha, verify_2.committed_tree_sha);
+    assert_eq!(
+        fs::read_to_string(task_manifest.checkout_path.join("src/a.rs"))
+            .expect("read verified attempt 2 src/a.rs"),
+        "pub fn a() -> u32 { 101 }\n"
+    );
+
+    let rt_after_verify = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read runtime after verify")
+        .expect("runtime exists");
+    let art_key_2 = ControllerJobRuntimeState::artifact_key("task-corr-large", 2);
+    assert_eq!(
+        rt_after_verify.attempt_artifacts.get(&art_key_1),
+        Some(&art_1_before)
+    );
+    let art_2 = rt_after_verify
+        .attempt_artifacts
+        .get(&art_key_2)
+        .expect("attempt 2 artifacts");
+    assert!(art_2.is_derived_attempt);
+    assert_eq!(
+        art_2.committed_head_commit.as_deref(),
+        Some(verify_2.committed_head_commit.as_str())
+    );
+    assert_eq!(
+        art_2.candidate_id.as_deref(),
+        Some(verify_2.candidate_id.as_str())
+    );
+
+    let policy_ledger_after_verify =
+        fs::symlink_metadata(&policy_ledger_path).expect("policy ledger metadata after verify");
+    assert!(policy_ledger_after_verify.len() < one_mib);
+
+    let approval_after = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("load ApprovalRecord");
+    assert_eq!(approval_after, approval_before);
+
+    reopened_session
+        .release()
+        .expect("release reopened session");
     host_handle.shutdown().await.expect("shutdown host");
 }
