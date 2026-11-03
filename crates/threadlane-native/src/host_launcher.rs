@@ -131,6 +131,83 @@ pub struct NativeMcpCli {
         ]
     )]
     pub host_executable: Option<PathBuf>,
+
+    /// Explicit operator-only opt-in (disabled by default) allowing `start_execution` to configure
+    /// scoped native coworker milestone notices for the verified MCP parent session. Requires
+    /// `--registry-dir`, `--plans-dir`, `--authority-dir`, and `--sessions-dir`.
+    #[arg(
+        long = "coworker-native-notices",
+        default_value_t = false,
+        requires_all = ["registry_dir", "plans_dir", "authority_dir", "sessions_dir"]
+    )]
+    pub coworker_native_notices: bool,
+}
+
+#[cfg(test)]
+mod native_notice_cli_flag_tests {
+    use super::*;
+
+    fn base_args() -> Vec<&'static str> {
+        vec![
+            "threadlane-native-mcp",
+            "--state-dir",
+            "/tmp/state",
+            "--pairing-dir",
+            "/tmp/pairing",
+        ]
+    }
+
+    fn store_args() -> [(&'static str, &'static str); 4] {
+        [
+            ("--registry-dir", "/tmp/registry"),
+            ("--plans-dir", "/tmp/plans"),
+            ("--authority-dir", "/tmp/authority"),
+            ("--sessions-dir", "/tmp/sessions"),
+        ]
+    }
+
+    #[test]
+    fn coworker_native_notices_requires_all_stores_and_is_not_enabled_by_auto_start() {
+        assert!(
+            !NativeMcpCli::try_parse_from(base_args())
+                .unwrap()
+                .coworker_native_notices
+        );
+
+        for omitted in 0..4 {
+            let mut args = base_args();
+            for (index, (flag, value)) in store_args().into_iter().enumerate() {
+                if index != omitted {
+                    args.push(flag);
+                    args.push(value);
+                }
+            }
+            args.push("--coworker-native-notices");
+            assert!(NativeMcpCli::try_parse_from(args).is_err());
+        }
+
+        let mut auto_start_args = base_args();
+        for (flag, value) in store_args() {
+            auto_start_args.push(flag);
+            auto_start_args.push(value);
+        }
+        auto_start_args.push("--auto-start-approved-hosts");
+        let auto_start = NativeMcpCli::try_parse_from(auto_start_args).unwrap();
+        assert!(auto_start.auto_start_approved_hosts);
+        assert!(!auto_start.coworker_native_notices);
+
+        let mut enabled_args = base_args();
+        for (flag, value) in store_args() {
+            enabled_args.push(flag);
+            enabled_args.push(value);
+        }
+        enabled_args.push("--coworker-native-notices");
+        assert!(
+            NativeMcpCli::try_parse_from(enabled_args)
+                .unwrap()
+                .coworker_native_notices
+        );
+    }
 }
 
 impl NativeMcpCli {
@@ -153,6 +230,17 @@ impl NativeMcpCli {
             return Err(NativeError::new(
                 NativeErrorCode::InvalidConfig,
                 "--auto-start-approved-hosts requires --registry-dir, --plans-dir, --authority-dir, and --sessions-dir",
+            ));
+        }
+        if self.coworker_native_notices
+            && (self.registry_dir.is_none()
+                || self.plans_dir.is_none()
+                || self.authority_dir.is_none()
+                || self.sessions_dir.is_none())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "--coworker-native-notices requires --registry-dir, --plans-dir, --authority-dir, and --sessions-dir",
             ));
         }
 
@@ -184,6 +272,9 @@ impl NativeMcpCli {
             self.host_executable.as_deref(),
         )? {
             server = server.with_host_launcher_policy(policy)?;
+        }
+        if self.coworker_native_notices {
+            server = server.with_coworker_native_notices(true);
         }
 
         Ok(server)

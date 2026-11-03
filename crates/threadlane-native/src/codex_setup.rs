@@ -657,7 +657,7 @@ pub fn resolve_native_mcp_executable_with(
     ))
 }
 
-/// Builds the exact 12-element argument vector for the unbound paired `threadlane-native-mcp` entry.
+/// Builds the exact 13-element argument vector for the unbound paired `threadlane-native-mcp` entry.
 pub fn build_desired_mcp_args(
     state_dir: &str,
     pairing_dir: &str,
@@ -679,6 +679,7 @@ pub fn build_desired_mcp_args(
         authority_dir.to_string(),
         "--sessions-dir".to_string(),
         sessions_dir.to_string(),
+        "--coworker-native-notices".to_string(),
     ]
 }
 
@@ -1151,8 +1152,14 @@ fn matches_unbound_paired_args_shape(args: &[String]) -> bool {
         "--authority-dir",
         "--sessions-dir",
     ];
+    const COWORKER_NATIVE_NOTICES_FLAG: &str = "--coworker-native-notices";
 
-    if args.len() != EXPECTED_FLAGS.len() * 2 {
+    let legacy_len = EXPECTED_FLAGS.len() * 2;
+    let current_len = legacy_len + 1;
+    if args.len() != legacy_len && args.len() != current_len {
+        return false;
+    }
+    if args.len() == current_len && args[current_len - 1].as_str() != COWORKER_NATIVE_NOTICES_FLAG {
         return false;
     }
     for (idx, expected_flag) in EXPECTED_FLAGS.iter().enumerate() {
@@ -1802,6 +1809,42 @@ mod tests {
     }
 
     #[test]
+    fn recognizer_accepts_legacy_and_current_args_but_rejects_wrong_final_flag() {
+        let legacy = vec![
+            "--state-dir".to_string(),
+            "/tmp/threadlane/state".to_string(),
+            "--pairing-dir".to_string(),
+            "/tmp/threadlane/pairing".to_string(),
+            "--registry-dir".to_string(),
+            "/tmp/threadlane/registry".to_string(),
+            "--plans-dir".to_string(),
+            "/tmp/threadlane/plans".to_string(),
+            "--authority-dir".to_string(),
+            "/tmp/threadlane/authority".to_string(),
+            "--sessions-dir".to_string(),
+            "/tmp/threadlane/sessions".to_string(),
+        ];
+        assert!(matches_unbound_paired_args_shape(&legacy));
+
+        let mut current = legacy.clone();
+        current.push("--coworker-native-notices".to_string());
+        assert!(matches_unbound_paired_args_shape(&current));
+
+        let mut wrong_value = legacy.clone();
+        wrong_value.push("--coworker-native-notices=false".to_string());
+        assert!(!matches_unbound_paired_args_shape(&wrong_value));
+
+        let mut wrong_flag = legacy.clone();
+        wrong_flag.push("--notify".to_string());
+        assert!(!matches_unbound_paired_args_shape(&wrong_flag));
+
+        let mut extra_arg = legacy;
+        extra_arg.push("--coworker-native-notices".to_string());
+        extra_arg.push("--unexpected".to_string());
+        assert!(!matches_unbound_paired_args_shape(&extra_arg));
+    }
+
+    #[test]
     fn first_absent_table_creates_managed_entry_and_receipt_without_authority_args() {
         let tmp = TempDir::new().expect("tempdir");
         let req = build_fixture_request(tmp.path());
@@ -1855,6 +1898,7 @@ mod tests {
                 req.authority_dir.to_str().unwrap(),
                 "--sessions-dir",
                 req.sessions_dir.to_str().unwrap(),
+                "--coworker-native-notices",
             ]
         );
         for forbidden in [

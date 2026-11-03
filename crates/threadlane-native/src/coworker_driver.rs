@@ -57,12 +57,12 @@ use crate::coworker_workflow::{
     CoworkerControllerService, CoworkerControllerStepReport, CoworkerControllerTaskObservation,
     CoworkerJobCompletionOutcome, CoworkerJobCompletionRequest, CoworkerJobCompletionStatus,
     CoworkerJobLockState, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase,
-    CoworkerJobRecord, CoworkerLockFileIdentity, CoworkerOwnershipSummary, CoworkerPipelineDriver,
-    CoworkerPipelineInFlightStageRef, CoworkerPipelineService, CoworkerPipelineStatus,
-    CoworkerPipelineTaskSnapshot, CoworkerPipelineTickReport, CoworkerTaskRecord,
-    CoworkerTaskStage, CoworkerWorkflowStore, OutboxDispatchKind, OutboxDispatchRecord,
-    OutboxDispatchStatus, OwnedCoworkerControllerSession, PendingControllerEffectKind,
-    PendingControllerEffectStatus, VerifiedControllerAdmission,
+    CoworkerJobRecord, CoworkerLockFileIdentity, CoworkerOwnershipAcquireOutcome,
+    CoworkerOwnershipSummary, CoworkerPipelineDriver, CoworkerPipelineInFlightStageRef,
+    CoworkerPipelineService, CoworkerPipelineStatus, CoworkerPipelineTaskSnapshot,
+    CoworkerPipelineTickReport, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
+    OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus, OwnedCoworkerControllerSession,
+    PendingControllerEffectKind, PendingControllerEffectStatus, VerifiedControllerAdmission,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -2278,9 +2278,10 @@ impl CoworkerCodeDriver {
             }
         }
 
-        // STEP 3: If the lock is now free, open a short-lived owned session to verify full admission
-        // under the guard, cancel any active original host tasks (when a Ready host is active),
-        // reconcile snapshots, and release the lease.
+        // STEP 3: If the lock is now free, acquire the physical ownership guard directly, verify
+        // immutable job/envelope/approval identity under the held guard, release any stale logical
+        // lease, and cancel any remaining active original host tasks without opening execution
+        // admission or running a new controller step.
         if !owner_draining_in_flight
             && !matches!(
                 self.controller.ownership_store().inspect_job_lock(&key)?,
@@ -2288,121 +2289,116 @@ impl CoworkerCodeDriver {
             )
         {
             let cancel_now_ms = current_time_ms();
-            let session = self.controller.open_owned_session(
-                binding_id,
-                thread_uuid,
-                job_id,
-                cancel_now_ms,
-            )?;
-            let step_and_cancel_res: Result<Option<CoworkerControllerStepReport>, NativeError> =
-                async {
-                    let admission = session.verify_admission()?;
-                    if self
-                        .is_verified_ready_host_active(&admission.approval)
-                        .await?
-                    {
-                        narrow_host_cancellation_attempted = true;
-                        let newly_cancelled = self
-                            .cancel_active_original_host_tasks(
-                                binding_id,
-                                thread_uuid,
-                                &admission.job,
-                                &admission.approval.approval_id,
-                                &sanitized_reason,
-                            )
-                            .await?;
-                        for item in newly_cancelled {
-                            if !cancelled_host_tasks
-                                .iter()
-                                .any(|existing| existing.task_id == item.task_id)
-                            {
-                                cancelled_host_tasks.push(item);
-                            }
+            if let CoworkerOwnershipAcquireOutcome::Acquired(guard) = self
+                .controller
+                .ownership_store()
+                .try_acquire_job(&key, cancel_now_ms)?
+            {
+                self.controller.verify_physical_ownership(
+                    &guard,
+                    binding_id,
+                    thread_uuid,
+                    job_id,
+                )?;
+                let owner_summary = guard.validate_before_effect(&key)?.clone();
+                let verified_inspection = self.inspect_scoped_job_readonly(&key)?;
+                self.controller
+                    .reconcile_stale_logical_lease_under_physical_guard(
+                        &guard,
+                        binding_id,
+                        thread_uuid,
+                        job_id,
+                    )?;
+                if self
+                    .is_verified_ready_host_active(&verified_inspection.approval)
+                    .await?
+                {
+                    narrow_host_cancellation_attempted = true;
+                    let newly_cancelled = self
+                        .cancel_active_original_host_tasks(
+                            binding_id,
+                            thread_uuid,
+                            &verified_inspection.job,
+                            &verified_inspection.approval.approval_id,
+                            &sanitized_reason,
+                        )
+                        .await?;
+                    for item in newly_cancelled {
+                        if !cancelled_host_tasks
+                            .iter()
+                            .any(|existing| existing.task_id == item.task_id)
+                        {
+                            cancelled_host_tasks.push(item);
                         }
-                        let report = session.step(current_time_ms()).await?;
-                        Ok(Some(report))
-                    } else {
-                        Ok(None)
                     }
                 }
-                .await;
 
-            let maybe_step_report = match step_and_cancel_res {
-                Ok(report) => report,
-                Err(err) => {
-                    let _ = session.release();
-                    return Err(err);
-                }
-            };
-
-            let owner_summary = session.guard().validate_before_effect(&key)?.clone();
-            let previous_state = self.read_driver_state_optional(&key)?;
-            let effective_mode = resolve_effective_execution_mode(
-                None,
-                previous_state.as_ref(),
-                &inspection.job,
-                &inspection.runtime_state,
-            )
-            .unwrap_or(CoworkerDriverExecutionMode::FullAutomaticPipeline);
-            let effective_host_mode = if narrow_host_cancellation_attempted {
-                CoworkerDriverHostMode::ReusedVerifiedReadyHost
-            } else {
-                previous_state
-                    .as_ref()
-                    .map_or(CoworkerDriverHostMode::NotRunningOrInspectedReadonly, |s| {
-                        s.host_mode
-                    })
-            };
-            let effective_step_report = maybe_step_report.or_else(|| {
-                previous_state
-                    .as_ref()
-                    .and_then(|s| s.last_step_report.clone())
-            });
-            let mut updated_pipe_report = previous_state
-                .as_ref()
-                .and_then(|s| s.last_pipeline_report.clone());
-            if let Some(ref mut pipe_rep) = updated_pipe_report {
-                pipe_rep.status = CoworkerPipelineStatus::Stopped;
-                pipe_rep.draining_in_flight_after_stop = false;
-                pipe_rep.in_flight_stages.clear();
-            }
-            let updated_state = CoworkerDriverStateRecord {
-                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
-                binding_id: key.binding_id.clone(),
-                thread_uuid: key.thread_uuid.clone(),
-                job_id: key.job_id.clone(),
-                owner_instance_id: owner_summary.instance_id.clone(),
-                owner_challenge_digest: owner_summary.challenge_digest.clone(),
-                owner_pid_hint: owner_summary.pid_hint,
-                owner_uid: current_effective_uid(),
-                lock_file_identity: owner_summary.lock_file_identity,
-                socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
-                host_mode: effective_host_mode,
-                owner_active: false,
-                graceful_exit_completed: true,
-                owner_quiescent_host_shutdown_updated_at_ms: previous_state
-                    .as_ref()
-                    .and_then(|state| state.owner_quiescent_host_shutdown_updated_at_ms),
-                owner_quiescent_host_instance_id: previous_state
-                    .and_then(|state| state.owner_quiescent_host_instance_id),
-                steps_completed: 1,
-                last_overall_status: CoworkerControllerPhase1Status::Stopped,
-                last_step_report: effective_step_report,
-                execution_mode: Some(effective_mode),
-                last_pipeline_status: if effective_mode
-                    == CoworkerDriverExecutionMode::FullAutomaticPipeline
-                {
-                    Some(CoworkerPipelineStatus::Stopped)
+                let previous_state = self.read_driver_state_optional(&key)?;
+                let effective_mode = resolve_effective_execution_mode(
+                    None,
+                    previous_state.as_ref(),
+                    &verified_inspection.job,
+                    &verified_inspection.runtime_state,
+                )
+                .unwrap_or(CoworkerDriverExecutionMode::FullAutomaticPipeline);
+                let effective_host_mode = if narrow_host_cancellation_attempted {
+                    CoworkerDriverHostMode::ReusedVerifiedReadyHost
                 } else {
-                    None
-                },
-                last_pipeline_report: updated_pipe_report,
-                pipeline_boundary: boundary_for_mode(effective_mode),
-                started_at_ms: cancel_now_ms,
-                updated_at_ms: current_time_ms(),
-            };
-            self.write_driver_state(&key, &updated_state)?;
-            session.release()?;
+                    previous_state
+                        .as_ref()
+                        .map_or(CoworkerDriverHostMode::NotRunningOrInspectedReadonly, |s| {
+                            s.host_mode
+                        })
+                };
+                let effective_step_report = previous_state
+                    .as_ref()
+                    .and_then(|s| s.last_step_report.clone());
+                let mut updated_pipe_report = previous_state
+                    .as_ref()
+                    .and_then(|s| s.last_pipeline_report.clone());
+                if let Some(ref mut pipe_rep) = updated_pipe_report {
+                    pipe_rep.status = CoworkerPipelineStatus::Stopped;
+                    pipe_rep.draining_in_flight_after_stop = false;
+                    pipe_rep.in_flight_stages.clear();
+                }
+                let updated_state = CoworkerDriverStateRecord {
+                    schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                    binding_id: key.binding_id.clone(),
+                    thread_uuid: key.thread_uuid.clone(),
+                    job_id: key.job_id.clone(),
+                    owner_instance_id: owner_summary.instance_id.clone(),
+                    owner_challenge_digest: owner_summary.challenge_digest.clone(),
+                    owner_pid_hint: owner_summary.pid_hint,
+                    owner_uid: current_effective_uid(),
+                    lock_file_identity: owner_summary.lock_file_identity,
+                    socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
+                    host_mode: effective_host_mode,
+                    owner_active: false,
+                    graceful_exit_completed: true,
+                    owner_quiescent_host_shutdown_updated_at_ms: previous_state
+                        .as_ref()
+                        .and_then(|state| state.owner_quiescent_host_shutdown_updated_at_ms),
+                    owner_quiescent_host_instance_id: previous_state
+                        .and_then(|state| state.owner_quiescent_host_instance_id),
+                    steps_completed: 1,
+                    last_overall_status: CoworkerControllerPhase1Status::Stopped,
+                    last_step_report: effective_step_report,
+                    execution_mode: Some(effective_mode),
+                    last_pipeline_status: if effective_mode
+                        == CoworkerDriverExecutionMode::FullAutomaticPipeline
+                    {
+                        Some(CoworkerPipelineStatus::Stopped)
+                    } else {
+                        None
+                    },
+                    last_pipeline_report: updated_pipe_report,
+                    pipeline_boundary: boundary_for_mode(effective_mode),
+                    started_at_ms: cancel_now_ms,
+                    updated_at_ms: current_time_ms(),
+                };
+                self.write_driver_state(&key, &updated_state)?;
+                drop(guard);
+            }
         }
 
         let status = self.status(binding_id, thread_uuid, job_id).await?;
@@ -2685,6 +2681,28 @@ impl CoworkerCodeDriver {
             updated_at_ms: current_time_ms(),
         };
         self.write_driver_state(key, &state_record)?;
+        if let Some(notice_kind) = match last_pipeline_report.as_ref().map(|r| r.status) {
+            Some(CoworkerPipelineStatus::Completed) => {
+                Some(crate::coworker_notice::NoticeKind::Complete)
+            }
+            Some(CoworkerPipelineStatus::Stopped) => {
+                Some(crate::coworker_notice::NoticeKind::Stopped)
+            }
+            Some(
+                CoworkerPipelineStatus::Held
+                | CoworkerPipelineStatus::BlockedOnUnknownEffect
+                | CoworkerPipelineStatus::BlockedOrFailed,
+            ) => Some(crate::coworker_notice::NoticeKind::Attention),
+            _ => None,
+        } {
+            if let Ok(store) = crate::coworker_notice::CoworkerNoticeStore::new(
+                crate::coworker_notice::coworker_notice_dir(
+                    self.controller.workflow_store().plans_dir(),
+                ),
+            ) {
+                let _ = store.notify(session, notice_kind).await;
+            }
+        }
         Ok((
             next_steps_completed,
             step_report,
@@ -2805,26 +2823,38 @@ impl CoworkerCodeDriver {
                             Ok(())
                         },
                     );
+                let admission_valid = session.verify_admission().is_ok();
                 *draining_after_stop = true;
-                *immediate_step_requested = true;
-                if let Ok(admission) = session.verify_admission() {
-                    if self
-                        .is_verified_ready_host_active(&admission.approval)
-                        .await
-                        .unwrap_or(false)
-                    {
-                        narrow_host_cancellation_attempted = true;
-                        if let Ok(cancelled) = self
-                            .cancel_active_original_host_tasks(
-                                &key.binding_id,
-                                &key.thread_uuid,
-                                &admission.job,
-                                &admission.approval.approval_id,
-                                &reason,
-                            )
+                *immediate_step_requested = admission_valid;
+                if self
+                    .controller
+                    .verify_physical_ownership(
+                        session.guard(),
+                        &key.binding_id,
+                        &key.thread_uuid,
+                        &key.job_id,
+                    )
+                    .is_ok()
+                {
+                    if let Ok(inspection) = self.inspect_scoped_job_readonly(key) {
+                        if self
+                            .is_verified_ready_host_active(&inspection.approval)
                             .await
+                            .unwrap_or(false)
                         {
-                            cancelled_host_tasks = cancelled;
+                            narrow_host_cancellation_attempted = true;
+                            if let Ok(cancelled) = self
+                                .cancel_active_original_host_tasks(
+                                    &key.binding_id,
+                                    &key.thread_uuid,
+                                    &inspection.job,
+                                    &inspection.approval.approval_id,
+                                    &reason,
+                                )
+                                .await
+                            {
+                                cancelled_host_tasks = cancelled;
+                            }
                         }
                     }
                 }
@@ -4653,7 +4683,7 @@ fn boundary_note_for_mode(mode: CoworkerDriverExecutionMode) -> String {
     }
 }
 
-fn envelope_authorizes_full_pipeline(
+pub(crate) fn envelope_authorizes_full_pipeline(
     job: &CoworkerJobRecord,
     runtime_state: &ControllerJobRuntimeState,
 ) -> bool {

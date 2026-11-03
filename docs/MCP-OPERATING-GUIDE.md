@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-03.v3`
+Version: `2026-11-03.v4`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -55,14 +55,48 @@ Version: `2026-11-03.v3`
     under the remaining grant budget or policy, run `consult_architect` and amend
     the brief via `prepare_work` when accepted. When a plan is produced, present
     the plan summary and check suggestions clearly to the human and stop for
-    explicit operator approval before execution or `start_approved_task`. Do not
-    claim that native planning wake-ups or an autonomous code-execution pipeline
-    are already implemented over MCP.
+    explicit operator approval before execution or `start_approved_task`. Native
+    asynchronous planning-command wake-ups are not implemented over MCP; do not
+    claim them. Authorized execution can drive the full automatic pipeline described
+    below.
 - Coding (`coder`), review (`reviewer`), and `closure` are distinct execution
   roles. Do not silently perform worker role execution or substitute models.
   Active human scope, model, effort, and quota restrictions always override saved
   profiles. Reading a profile, `catalog`, or guide grants no execution authority,
   approval, host startup, or model permission.
+
+## Execute, monitor, and stop
+
+- With current frozen authorization, `start_execution` drives the full automatic
+  pipeline: checks, `Reviewer`, bounded corrections, integration, and exactly one
+  accepted `Closure`. `AllTasksIntegrated` is not completion; completion requires
+  the required combined checks and exactly one accepted `Closure`. Older scopes may
+  expose only the diagnostic Phase 1 fallback.
+- Use the exact frozen `expected_envelope_digest`; MCP never self-approves, freezes,
+  or expands authority. `overall_status` is legacy/diagnostic; use
+  `execution_mode`, `pipeline_status`, `pipeline_report`, and
+  `stopping_draining_in_flight` for authoritative pipeline state. The Phase 1
+  fallback's `ReadyForReview` / `AwaitingChecksOrReview` is never acceptance,
+  integration, or completion.
+- `stop_execution` records durable stop first, signals original and derived Coder
+  tasks, drains finite `Reviewer`/check/`Closure` calls, and fences late outputs.
+  A superseded job, or a change to its profile or registry revision, still
+  permits immutable-scoped status and narrow stop, but never new dispatch. The
+  current amendment fences and halts the superseded job as a whole; do not
+  promise that unaffected tasks keep advancing. It does not prove remote
+  inference termination and performs no broad process kills.
+- Native notices are operator-only via `--coworker-native-notices`, off by default
+  on the raw CLI. Trusted managed setup enables them as transport configuration
+  only. They require an actually verified enrolled origin and parent endpoint
+  before start. Only execution terminal/held milestones are supported; native
+  asynchronous planning-command wake-ups and automatic `BlockedByFailedChecks`
+  notices are not implemented.
+- `Submitted` means backend acceptance, not a read receipt or user acknowledgement.
+  The private native-notices outbox is immutable: it reserves intent before send,
+  never retries an unknown possible-send, and bounds counts to 16.
+  `execution_status` exposes `native_notice` / `latest` and `native_notice_error`
+  metadata. Missing notices or endpoint are not new execution authority or model
+  permission. Never poll; when an event arrives, read status, not a new dispatch.
 
 ## Start and recover context
 

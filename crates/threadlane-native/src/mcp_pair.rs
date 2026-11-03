@@ -347,6 +347,7 @@ pub struct PairedMcpServer {
     host_stores: Option<HostStores>,
     host_launcher: Option<Arc<ApprovedHostLauncher>>,
     sibling_anchor_exe: Option<PathBuf>,
+    coworker_native_notices: bool,
     cached_workflow: Arc<Mutex<Option<CachedScopedWorkflow>>>,
     automatic_pairing: AutomaticPairing,
     tool_router: ToolRouter<Self>,
@@ -384,10 +385,17 @@ impl PairedMcpServer {
             host_stores: None,
             host_launcher: None,
             sibling_anchor_exe: None,
+            coworker_native_notices: false,
             cached_workflow: Arc::new(Mutex::new(None)),
             automatic_pairing: AutomaticPairing::default(),
             tool_router: Self::tool_router(),
         })
+    }
+
+    /// Enables or disables operator-opted-in native coworker milestone notices for `start_execution`.
+    pub fn with_coworker_native_notices(mut self, enabled: bool) -> Self {
+        self.coworker_native_notices = enabled;
+        self
     }
 
     /// Overrides the anchor executable path whose parent directory is searched for the canonical
@@ -1515,6 +1523,23 @@ impl PairedMcpServer {
 
         if let Some(ref anchor) = self.sibling_anchor_exe {
             gateway = gateway.with_sibling_anchor_exe(anchor.clone());
+        }
+        if self.coworker_native_notices && tool_name == "start_execution" {
+            let Some((reconnect_cfg, backend_pid)) = self
+                .matched_observation_context(&trusted_binding_id, &trusted_thread_uuid)
+                .and_then(|_| {
+                    threadlane::native_endpoint::NativeReconnectConfig::discover_for_mcp_parent()
+                        .ok()
+                })
+            else {
+                return Err(Self::format_scoped_error(
+                    &trusted_binding_id,
+                    tool_name,
+                    NativeErrorCode::NotConfigured.as_str(),
+                    "coworker native notices require a verified managed native MCP session",
+                ));
+            };
+            gateway = gateway.with_managed_native_notice(reconnect_cfg, backend_pid);
         }
 
         Ok((trusted_binding_id, trusted_thread_uuid, gateway))
@@ -2805,7 +2830,7 @@ impl PairedMcpServer {
     /// Starts or reuses the single verified physical `CoworkerCodeDriver` owner for an approved, envelope-frozen Coworker job (requires verified operator enrollment).
     #[tool(
         name = "start_execution",
-        description = "Start or reuse the single verified physical CoworkerCodeDriver owner for (job_id, expected_envelope_digest) in the enrolled (binding_id, thread_uuid) via the canonical sibling threadlane-flow binary. Refuses unapproved jobs or mismatched expected_envelope_digest before spawning any process or worker. Preserves the truthful Phase 1 pipeline boundary (completed Coder tasks reach ReadyForReview / AwaitingChecksOrReview).",
+        description = "Start or reuse the single verified physical CoworkerCodeDriver owner for (job_id, expected_envelope_digest) in the enrolled (binding_id, thread_uuid) via the canonical sibling threadlane-flow binary. Refuses unapproved jobs or any expected_envelope_digest other than the exact frozen digest before spawning any process or worker; MCP never self-approves. When frozen authorization permits, runs the full automatic verification-check, Reviewer, bounded-correction, RunIntegration, and Closure pipeline; older scopes may use the diagnostic Phase 1 fallback. Completion requires the required combined checks and exactly one accepted Closure. Native notices, if enabled, require an actually verified enrolled origin and parent endpoint before start.",
         annotations(
             title = "Start Approved Coworker Execution",
             read_only_hint = false,
@@ -2855,7 +2880,7 @@ impl PairedMcpServer {
     /// Reads the current verified `CoworkerCodeDriver` status for an approved Coworker job (requires verified operator enrollment).
     #[tool(
         name = "execution_status",
-        description = "Read the current verified CoworkerCodeDriver execution status for job_id in the enrolled (binding_id, thread_uuid), including live physical owner verification, task stages, unknown-effect blocking flags, and the truthful Phase 1 pipeline boundary. Completed Coder runs report ReadyForReview / AwaitingChecksOrReview and are never inferred as accepted or integrated.",
+        description = "Read the current verified CoworkerCodeDriver execution status for job_id in the enrolled (binding_id, thread_uuid), including live physical owner verification, task stages, unknown-effect blocking flags, legacy/diagnostic overall_status, execution_mode, pipeline_status, pipeline_report, stopping_draining_in_flight, and native_notice/latest plus native_notice_error metadata. AllTasksIntegrated is not completion; completion requires the required combined checks and exactly one accepted Closure. Older scopes may report the diagnostic Phase 1 fallback; completed Coder runs are never inferred as accepted or integrated. A status read after an event is not a new dispatch.",
         annotations(
             title = "Get Coworker Execution Status",
             read_only_hint = true,
@@ -2905,7 +2930,7 @@ impl PairedMcpServer {
     /// Records durable operator stop first and performs narrow `CoworkerCodeDriver` task cancellation for an approved Coworker job (requires verified operator enrollment).
     #[tool(
         name = "stop_execution",
-        description = "Record durable stop_requested state first and perform narrow CoworkerCodeDriver cancellation for job_id in the enrolled (binding_id, thread_uuid) with an optional bounded reason. Preserves the explicit Phase 1 cancellation boundary without broad process kills.",
+        description = "Record durable stop_requested state first and perform narrow CoworkerCodeDriver cancellation for job_id in the enrolled (binding_id, thread_uuid) with an optional bounded reason. Signals original and derived Coder tasks, drains finite Reviewer/check/Closure calls, and fences late outputs without broad process kills; remote inference termination is not proven.",
         annotations(
             title = "Stop Coworker Execution",
             read_only_hint = false,

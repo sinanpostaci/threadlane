@@ -22,21 +22,35 @@ This document describes the scoped execution handoff from native Coworker MCP (`
 - **Redaction guarantees**: Never leaks raw task prompt instructions, secret tokens, full host executable paths (`FrozenCheckCommandSpec::executable`), registry tool executable paths, or private logs.
 
 ### 2. `start_execution { job_id, expected_envelope_digest }`
-- Verifies that `job_id` belongs to the enrolled `(binding_id, thread_uuid)`, is not superseded, has a verified `ApprovalRecord`, `FrozenApprovalLinkage`, `FrozenControllerCapabilityEnvelope`, and operator-attested `FrozenControllerExecutionEnvelope`, and that `expected_envelope_digest` matches the frozen `envelope_digest` in constant time **before** opening `CoworkerCodeDriver` or spawning any process.
-- Unapproved jobs return `unauthorized_operator` (`needs_approval`); jobs missing capability or execution envelopes return `unauthorized_operator` or `not_configured` (`missing_execution_envelope`); mismatched digests return `validation_failed` (`envelope_digest_mismatch`) with zero process spawns and zero provider invocations.
+- Verifies that `job_id` belongs to the enrolled `(binding_id, thread_uuid)`, is not superseded, has a verified `ApprovalRecord`, `FrozenApprovalLinkage`, `FrozenControllerCapabilityEnvelope`, and operator-attested `FrozenControllerExecutionEnvelope`, and that `expected_envelope_digest` matches the exact frozen `envelope_digest` in constant time **before** opening `CoworkerCodeDriver` or spawning any process.
+- Unapproved jobs return `unauthorized_operator` (`needs_approval`); jobs missing capability or execution envelopes return `unauthorized_operator` or `not_configured` (`missing_execution_envelope`); mismatched digests return `validation_failed` (`envelope_digest_mismatch`) with zero process spawns and zero provider invocations. No alias, prefix, recomputation, or self-approval is accepted.
+- When native notices are enabled, start also requires an actually verified enrolled origin and parent endpoint; this is transport configuration only and grants no execution or model authority.
 - Resolves and validates the canonical same-package sibling `threadlane-flow` binary and invokes `CoworkerCodeDriver::ensure_owner`.
 - **Single physical owner & idempotent duplicate calls**: Spawns a detached `threadlane-flow ... code-driver run-owner` process (returning once the owner's local Unix socket RPC is verified, without blocking MCP until the entire job finishes) or reuses the existing verified live owner (`disposition: "reused_live_owner"`) without duplicating provider calls.
 
 ### 3. `execution_status { job_id }`
 - Verifies scoped job/approval/envelope admission and delegates to `CoworkerCodeDriver::status`.
-- Reports `owner_state` (`live_verified_owner`, `no_active_owner`, `stale_crash_artifact_detected`, etc.), `job_phase`, `overall_status`, `stop_requested`, `blocked_on_unknown_effect`, per-task stages and host observations, and `pipeline_boundary`.
+- Reports `owner_state` (`live_verified_owner`, `no_active_owner`, `stale_crash_artifact_detected`, etc.), `job_phase`, legacy/diagnostic `overall_status`, `execution_mode`, `pipeline_status`, `pipeline_report`, `stopping_draining_in_flight`, `stop_requested`, `blocked_on_unknown_effect`, per-task stages, host observations, `native_notice` (including `latest`), and `native_notice_error` metadata.
+- `overall_status` is not completion. `AllTasksIntegrated` is not completion; completion requires the required combined checks and exactly one accepted `Closure`. Older scopes may report only the diagnostic Phase 1 fallback.
+- A status read after a notice/event is not a new dispatch; callers must not poll.
 
 ### 4. `stop_execution { job_id, reason? }`
 - Verifies scoped job/approval/envelope admission and delegates to `CoworkerCodeDriver::cancel`.
-- Persists durable `stop_requested = true` in `ControllerPolicyStore` **before** notifying any live owner over authenticated local Unix socket RPC or attempting narrow `ApprovedHostClient::cancel_task` cancellation (`durable_stop_recorded_before_host_cancel: true`). Never performs broad PID or process-name kills.
+- Persists durable `stop_requested = true` in `ControllerPolicyStore` **before** notifying any live owner over authenticated local Unix socket RPC or attempting narrow `ApprovedHostClient::cancel_task` cancellation (`durable_stop_recorded_before_host_cancel: true`).
+- Signals original and derived Coder tasks, drains finite `Reviewer`/check/`Closure` calls, and fences late outputs. Remote inference termination is not proven. Never performs broad PID or process-name kills.
 
-## Current Staged Pipeline and Cancellation Boundaries
+## Native notices (operator opt-in)
 
-- **Pipeline boundary (`phase1_initial_dispatch_and_reconcile_only`)**: `CoworkerCodeDriver` currently runs Phase 1 initial `Coder` task dispatch and receipt reconciliation. Completed `Coder` runs transition to `ReadyForReview` (`overall_status: "awaiting_checks_or_review"`, `job_phase: "executing"`) and are never reported as accepted or integrated. Automatic verification check execution, `Reviewer` evaluation, in-scope corrections, per-task `RunIntegration`, and final job `Closure` are wired in separate independent branches.
-- **Cancellation boundary (`original_host_tasks_only_derived_integrated_later`)**: `stop_execution` records durable job stop state first and cancels active original `ApprovedHostClient` tasks (`task_id -> run_id`); cancellation of running derived correction attempts is integrated with the full automatic pipeline milestone.
+- `--coworker-native-notices` is operator-only and off by default on the raw CLI. Trusted managed setup enables it as transport configuration only.
+- Native notice delivery requires an actually verified enrolled origin and parent endpoint before start. Missing notices or endpoint are not new execution authority or model permission.
+- Only execution terminal/held milestones are supported. Native asynchronous planning-command wake-ups are not implemented. Automatic `BlockedByFailedChecks` notices are not yet supported.
+- `Submitted` means backend acceptance, not a read receipt or user acknowledgement.
+- The private native-notices outbox is immutable: it reserves intent before send, does not retry an unknown possible-send, and bounds counts to 16. `execution_status` exposes `native_notice` / `latest` and `native_notice_error` metadata.
+- Callers must not poll. When an event arrives, read `execution_status`; the read is not a new dispatch.
+
+## Full automatic pipeline and cancellation boundaries
+
+- **Full automatic pipeline**: When current frozen authorization permits, `CoworkerCodeDriver` runs automatic checks, `Reviewer` evaluation, bounded in-scope corrections, per-task `RunIntegration`, and final `Closure`. `AllTasksIntegrated` is not completion; completion requires the required combined checks and exactly one accepted `Closure`. `start_execution` requires the exact frozen `expected_envelope_digest`; no MCP path approves, freezes, or self-approves authority.
+- **Diagnostic Phase 1 fallback**: Older scopes may expose only initial `Coder` dispatch and receipt reconciliation. Completed `Coder` runs report `ReadyForReview` / `AwaitingChecksOrReview` and are never accepted or integrated. Use `execution_mode`, `pipeline_status`, and `pipeline_report` to distinguish this fallback; `overall_status` is legacy/diagnostic and does not prove completion.
+- **Stop and drain**: `stop_execution` records durable `stop_requested = true` first, signals original and derived Coder tasks, drains finite `Reviewer`/check/`Closure` calls, and fences late outputs (`durable_stop_recorded_before_host_cancel: true`). Remote inference termination is not proven. It never performs broad PID or process-name kills. `stopping_draining_in_flight` reports drain state.
 - **Unknown post-launch outcomes**: Tasks or effects in `EffectUnknown` (`blocked_on_unknown_effect: true`) block automatic replay and require receipt reconciliation rather than blind retry.

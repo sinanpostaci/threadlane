@@ -262,14 +262,27 @@ async fn cli_code_driver_ensure_reuses_live_owner_survives_default_hold_reconcil
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
     // Status while held shows the actual owned instance and the running task.
-    let status_running = run_flow_cli(
-        &state_dir,
-        &fixture,
-        &binding_id,
-        &thread_uuid,
-        &["code-driver", "status", "--job-id", &job.job_id],
-    )
-    .await;
+    // The owner can answer status while the first pipeline step is still pending,
+    // so wait for the actual step report snapshot to become visible.
+    let readiness_deadline = Instant::now() + Duration::from_secs(5);
+    let status_running = loop {
+        let status = run_flow_cli(
+            &state_dir,
+            &fixture,
+            &binding_id,
+            &thread_uuid,
+            &["code-driver", "status", "--job-id", &job.job_id],
+        )
+        .await;
+        if !status["step_report"].is_null() && status["step_report"]["active_running_count"] == 1 {
+            break status;
+        }
+        assert!(
+            Instant::now() < readiness_deadline,
+            "timed out after 5s waiting for non-null step_report with active_running_count == 1; last status: {status}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(status_running["owner_state"], "live_verified_owner");
     assert_eq!(
         status_running["verified_owner_summary"]["instance_id"],

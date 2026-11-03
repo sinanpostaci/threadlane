@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use threadlane::coworker_wakeup::{CoworkerJobWakeupAttempt, CoworkerJobWakeupContext};
 use threadlane::native_tool_output::NativeToolOutputConfig;
-use threadlane::WakeupOutcome;
+use threadlane_core::WakeupOutcome;
 use tokio::sync::watch;
 
 use crate::coworker_workflow::{
     sha256_hex, CombinedCandidateStatus, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
-    CoworkerJobPhase, OwnedCoworkerControllerSession, VerifiedControllerAdmission,
+    CoworkerJobPhase, OwnedCoworkerControllerSession, PendingControllerEffectStatus,
+    VerifiedControllerAdmission,
 };
 use crate::fs_safety::{
     acquire_cross_process_lock, prepare_private_dir, read_private_file_bounded,
@@ -16,19 +17,26 @@ use crate::fs_safety::{
 };
 use crate::{NativeError, NativeErrorCode};
 
+/// Maximum number of persisted notice delivery attempts allowed per job scope.
 pub const MAX_NOTICE_ATTEMPTS: usize = 16;
+/// Timeout in milliseconds applied when invoking a coworker notice wakeup.
 pub const NOTICE_TIMEOUT_MS: u64 = 2_000;
 const MAX_NOTICE_STATE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Classifies the coworker milestone notification being delivered.
 pub enum NoticeKind {
+    /// Signals completion of a job with an accepted closure candidate.
     Complete,
+    /// Signals that the job was cancelled or a stop was requested.
     Stopped,
+    /// Signals that the job is held, has a rejected closure candidate, or has a failed, blocked, or effect-unknown task or runtime effect.
     Attention,
 }
 
 impl NoticeKind {
+    /// Returns the stable snake_case string representation of this notice kind.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Complete => "complete",
@@ -40,31 +48,46 @@ impl NoticeKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Durable status of a persisted notice delivery attempt.
 pub enum PersistedAttemptStatus {
+    /// Marks an attempt reserved before transport, which becomes unknown on reopen and is never retried automatically.
     Intent,
+    /// Records that the transport accepted the wakeup, not that the notification was read.
     Submitted,
+    /// Records that the wakeup transport reported a failure.
     Failed,
+    /// Records an indeterminate delivery outcome that is not retried automatically.
     Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+/// Delivery status exposed by notice reservation and finalization reports.
 pub enum NoticeDeliveryStatus {
+    /// Indicates transport acceptance only, not proof that the notification was read.
     Submitted,
+    /// Indicates that the wakeup transport reported a failure.
     Failed,
+    /// Indicates an indeterminate delivery outcome that is not retried automatically.
     Unknown,
+    /// Indicates that the maximum persisted attempt count prevented a new attempt.
     CapReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Immutable validated configuration binding a job to its notice envelope and native wakeup target.
 pub struct CoworkerNoticeConfig {
+    /// Ownership key identifying the binding, thread, and coworker job for this notice.
     pub key: CoworkerJobOwnershipKey,
+    /// Lowercase 64-character SHA-256 digest of the verified notice envelope.
     pub envelope_digest: String,
+    /// Native tool output target bound to the ownership thread and repository root.
     pub target: NativeToolOutputConfig,
 }
 
 impl CoworkerNoticeConfig {
+    /// Creates a validated configuration for trusted native callers only, never for MCP self-approval.
     pub fn new(
         key: CoworkerJobOwnershipKey,
         envelope_digest: impl Into<String>,
@@ -79,15 +102,26 @@ impl CoworkerNoticeConfig {
         Ok(cfg)
     }
 
+    /// Validates the ownership key, envelope digest, target compatibility, and derived wakeup context.
     pub fn validate(&self) -> Result<(), NativeError> {
         self.key.validate()?;
         validate_bounded_identifier(&self.envelope_digest, "envelope_digest", 128)?;
-        threadlane_workers::validate_sha256_hex_digest(&self.envelope_digest).map_err(|_| {
+        let normalized_envelope_digest = threadlane_workers::validate_sha256_hex_digest(
+            &self.envelope_digest,
+            "envelope_digest",
+        )
+        .map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "envelope_digest must be 64 lowercase hex characters",
             )
         })?;
+        if normalized_envelope_digest != self.envelope_digest {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "envelope_digest must be 64 lowercase hex characters",
+            ));
+        }
         if self.target.has_legacy_model_metadata() {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -112,11 +146,17 @@ impl CoworkerNoticeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// A durable record of one reserved notice delivery attempt.
 pub struct PersistedNoticeAttempt {
+    /// Unique identifier assigned to the persisted attempt.
     pub attempt_id: String,
+    /// Milestone kind that this attempt intends to deliver.
     pub kind: NoticeKind,
+    /// Job revision captured when the attempt was reserved.
     pub job_revision: u64,
+    /// Deterministic fingerprint used to detect duplicate notices.
     pub fingerprint: String,
+    /// Current durable status of the attempted delivery.
     pub status: PersistedAttemptStatus,
 }
 
@@ -128,26 +168,62 @@ struct StoredNoticeState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Report returned when a notice attempt is reserved, finalized, or deduplicated.
 pub struct NoticeReport {
+    /// Persisted attempt identifier when an attempt exists, or None when the cap was reached.
     pub attempt_id: Option<String>,
+    /// Milestone kind associated with this report.
     pub kind: NoticeKind,
+    /// Job revision associated with this report.
     pub job_revision: u64,
+    /// Deterministic fingerprint identifying this notice.
     pub fingerprint: String,
+    /// Delivery status reported for this notice attempt.
     pub status: NoticeDeliveryStatus,
+    /// Indicates whether an existing attempt was found instead of a new reservation.
     pub was_duplicate: bool,
+    /// Indicates whether the maximum persisted attempt count was reached.
     pub cap_reached: bool,
+    /// Total number of persisted attempts for the job scope.
     pub attempt_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Read-only inspection summary of persisted coworker notice state for a job scope.
+pub struct NoticeMetadata {
+    /// Indicates whether a notice configuration is persisted for the job scope.
+    pub configured: bool,
+    /// Total number of persisted notice delivery attempts for the job scope.
+    pub attempt_count: usize,
+    /// Report describing the latest persisted notice delivery attempt, if any.
+    pub latest: Option<NoticeReport>,
+}
+
+/// Returns the private coworker native notice store directory inside the driver directory.
+pub fn coworker_notice_dir(plans_dir: &Path) -> PathBuf {
+    crate::coworker_driver::coworker_driver_dir(plans_dir).join("native-notices")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Snapshot of job state used to decide whether a milestone notice is eligible.
 pub struct NoticeMilestoneSnapshot {
+    /// Current lifecycle phase of the coworker job.
     pub phase: CoworkerJobPhase,
+    /// Indicates whether any combined candidate has an accepted closure.
     pub has_closure_accepted: bool,
+    /// Indicates whether any combined candidate has a rejected closure.
+    pub has_rejected_closure: bool,
+    /// Indicates whether the job currently has an active hold.
     pub has_active_hold: bool,
+    /// Indicates whether any task is failed, blocked, or has an unknown effect.
     pub has_attention_task: bool,
+    /// Indicates whether the controller runtime has any pending effect with unknown status.
+    pub has_unknown_effect: bool,
+    /// Indicates whether a stop has been requested for the job runtime.
     pub stop_requested: bool,
 }
 
+/// Returns whether the snapshot satisfies the eligibility milestone for the given notice kind.
 pub fn satisfies_notice_milestone(kind: NoticeKind, snapshot: NoticeMilestoneSnapshot) -> bool {
     match kind {
         NoticeKind::Complete => {
@@ -160,6 +236,8 @@ pub fn satisfies_notice_milestone(kind: NoticeKind, snapshot: NoticeMilestoneSna
             snapshot.phase == CoworkerJobPhase::Held
                 || snapshot.has_active_hold
                 || snapshot.has_attention_task
+                || snapshot.has_rejected_closure
+                || snapshot.has_unknown_effect
         }
     }
 }
@@ -172,6 +250,11 @@ fn snapshot_from_admission(admission: &VerifiedControllerAdmission) -> NoticeMil
             .combined_candidates
             .iter()
             .any(|c| c.status == CombinedCandidateStatus::ClosureAccepted),
+        has_rejected_closure: admission
+            .job
+            .combined_candidates
+            .iter()
+            .any(|c| c.status == CombinedCandidateStatus::Rejected),
         has_active_hold: admission.job.holds.iter().any(|h| h.active),
         has_attention_task: admission.job.tasks.iter().any(|t| {
             matches!(
@@ -181,10 +264,16 @@ fn snapshot_from_admission(admission: &VerifiedControllerAdmission) -> NoticeMil
                     | crate::coworker_workflow::CoworkerTaskStage::EffectUnknown
             )
         }),
+        has_unknown_effect: admission
+            .runtime_state
+            .pending_effects
+            .values()
+            .any(|e| e.status == PendingControllerEffectStatus::EffectUnknown),
         stop_requested: admission.runtime_state.stop_requested,
     }
 }
 
+/// Derives the deterministic SHA-256 fingerprint for a validated key, notice kind, and nonzero job revision.
 pub fn derive_notice_fingerprint(
     key: &CoworkerJobOwnershipKey,
     kind: NoticeKind,
@@ -210,6 +299,7 @@ pub fn derive_notice_fingerprint(
     ))
 }
 
+/// Verifies that a notice configuration matches the verified key, envelope digest, and repository path.
 pub fn validate_config_identity(
     config: &CoworkerNoticeConfig,
     key: &CoworkerJobOwnershipKey,
@@ -234,7 +324,7 @@ enum ReserveOutcome {
     MissingConfig,
     Completed(NoticeReport),
     Reserved {
-        context: CoworkerJobWakeupContext,
+        context: Box<CoworkerJobWakeupContext>,
         attempt: CoworkerJobWakeupAttempt,
         fingerprint: String,
         job_revision: u64,
@@ -242,17 +332,77 @@ enum ReserveOutcome {
 }
 
 #[derive(Debug, Clone)]
+/// Durable, cross-process-locked store for pending and completed notice delivery attempts.
 pub struct CoworkerNoticeStore {
     root_dir: PathBuf,
 }
 
 impl CoworkerNoticeStore {
+    /// Creates the store root as a private directory and returns a store handle.
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self, NativeError> {
         let root_dir = root_dir.into();
         prepare_private_dir(&root_dir, "coworker_notice_dir")?;
         Ok(Self { root_dir })
     }
 
+    /// Inspects persisted notice metadata for `key` and `envelope_digest` without creating directories or locks.
+    pub fn inspect(
+        root_dir: &Path,
+        key: &CoworkerJobOwnershipKey,
+        envelope_digest: &str,
+    ) -> Result<NoticeMetadata, NativeError> {
+        let (_, state_name) = scope_filenames(key)?;
+        validate_bounded_identifier(envelope_digest, "envelope_digest", 128)?;
+        let normalized_digest =
+            threadlane_workers::validate_sha256_hex_digest(envelope_digest, "envelope_digest")
+                .map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "envelope_digest must be 64 lowercase hex characters",
+                    )
+                })?;
+        if normalized_digest != envelope_digest {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "envelope_digest must be 64 lowercase hex characters",
+            ));
+        }
+        let store = Self {
+            root_dir: root_dir.to_path_buf(),
+        };
+        let Some(state) = store.read_state_locked(&state_name)? else {
+            return Ok(NoticeMetadata::default());
+        };
+        state.config.key.validate()?;
+        if &state.config.key != key
+            || state.config.envelope_digest != envelope_digest
+            || state.config.target.thread_id != key.thread_uuid
+            || state.config.target.has_legacy_model_metadata()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "coworker notice config identity does not match inspected job scope",
+            ));
+        }
+        let attempt_count = state.attempts.len();
+        let latest = state.attempts.last().map(|attempt| NoticeReport {
+            attempt_id: Some(attempt.attempt_id.clone()),
+            kind: attempt.kind,
+            job_revision: attempt.job_revision,
+            fingerprint: attempt.fingerprint.clone(),
+            status: map_persisted_status(attempt.status),
+            was_duplicate: false,
+            cap_reached: false,
+            attempt_count,
+        });
+        Ok(NoticeMetadata {
+            configured: true,
+            attempt_count,
+            latest,
+        })
+    }
+
+    /// Persists an immutable notice configuration for its ownership scope.
     pub fn configure(&self, config: CoworkerNoticeConfig) -> Result<(), NativeError> {
         config.validate()?;
         let (lock_name, state_name) = scope_filenames(&config.key)?;
@@ -275,6 +425,7 @@ impl CoworkerNoticeStore {
         )
     }
 
+    /// Reserves and submits one milestone notice, returning None when no configuration is stored.
     pub async fn notify(
         &self,
         session: &OwnedCoworkerControllerSession,
@@ -386,7 +537,7 @@ impl CoworkerNoticeStore {
         });
         self.write_state_locked(&state_name, &state)?;
         Ok(ReserveOutcome::Reserved {
-            context,
+            context: Box::new(context),
             attempt,
             fingerprint,
             job_revision,
@@ -527,8 +678,10 @@ mod tests {
         let snap = NoticeMilestoneSnapshot {
             phase: CoworkerJobPhase::Completed,
             has_closure_accepted: true,
+            has_rejected_closure: false,
             has_active_hold: false,
             has_attention_task: false,
+            has_unknown_effect: false,
             stop_requested: false,
         };
         (store, cfg, snap)
@@ -539,8 +692,10 @@ mod tests {
         let accepted_only = NoticeMilestoneSnapshot {
             phase: CoworkerJobPhase::Executing,
             has_closure_accepted: true,
+            has_rejected_closure: false,
             has_active_hold: false,
             has_attention_task: false,
+            has_unknown_effect: false,
             stop_requested: false,
         };
         assert!(!satisfies_notice_milestone(
@@ -554,6 +709,142 @@ mod tests {
                 ..accepted_only
             }
         ));
+    }
+
+    #[test]
+    fn milestone_predicate_rejected_closure_and_unknown_effect_attention_with_negative_controls() {
+        let closure_review_clean = NoticeMilestoneSnapshot {
+            phase: CoworkerJobPhase::ClosureReview,
+            has_closure_accepted: false,
+            has_rejected_closure: false,
+            has_active_hold: false,
+            has_attention_task: false,
+            has_unknown_effect: false,
+            stop_requested: false,
+        };
+        assert!(!satisfies_notice_milestone(
+            NoticeKind::Attention,
+            closure_review_clean
+        ));
+        assert!(!satisfies_notice_milestone(
+            NoticeKind::Complete,
+            closure_review_clean
+        ));
+
+        let rejected_closure = NoticeMilestoneSnapshot {
+            has_rejected_closure: true,
+            ..closure_review_clean
+        };
+        assert!(satisfies_notice_milestone(
+            NoticeKind::Attention,
+            rejected_closure
+        ));
+        assert!(!satisfies_notice_milestone(
+            NoticeKind::Complete,
+            rejected_closure
+        ));
+        assert!(!satisfies_notice_milestone(
+            NoticeKind::Complete,
+            NoticeMilestoneSnapshot {
+                phase: CoworkerJobPhase::Completed,
+                ..rejected_closure
+            }
+        ));
+
+        let unknown_effect = NoticeMilestoneSnapshot {
+            phase: CoworkerJobPhase::Executing,
+            has_unknown_effect: true,
+            ..closure_review_clean
+        };
+        assert!(satisfies_notice_milestone(
+            NoticeKind::Attention,
+            unknown_effect
+        ));
+        assert!(!satisfies_notice_milestone(
+            NoticeKind::Complete,
+            unknown_effect
+        ));
+        assert!(!satisfies_notice_milestone(
+            NoticeKind::Complete,
+            NoticeMilestoneSnapshot {
+                phase: CoworkerJobPhase::Completed,
+                ..unknown_effect
+            }
+        ));
+    }
+
+    #[test]
+    fn reserve_attention_for_rejected_closure_and_unknown_effect_deduplicates_on_reopen() {
+        let clean_closure_review = NoticeMilestoneSnapshot {
+            phase: CoworkerJobPhase::ClosureReview,
+            has_closure_accepted: false,
+            has_rejected_closure: false,
+            has_active_hold: false,
+            has_attention_task: false,
+            has_unknown_effect: false,
+            stop_requested: false,
+        };
+        let rejected_closure = NoticeMilestoneSnapshot {
+            has_rejected_closure: true,
+            ..clean_closure_review
+        };
+        let unknown_effect = NoticeMilestoneSnapshot {
+            phase: CoworkerJobPhase::Executing,
+            has_unknown_effect: true,
+            ..clean_closure_review
+        };
+
+        for eligible_snap in [rejected_closure, unknown_effect] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (store, cfg, _) = fixture(tmp.path());
+            assert!(store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Attention,
+                    1,
+                    clean_closure_review,
+                    None,
+                )
+                .is_err());
+            let reserved = store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Attention,
+                    1,
+                    eligible_snap,
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(reserved, ReserveOutcome::Reserved { .. }));
+
+            let reopened = CoworkerNoticeStore::new(tmp.path().join("store")).unwrap();
+            let dup = reopened
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Attention,
+                    1,
+                    eligible_snap,
+                    None,
+                )
+                .unwrap();
+            assert!(matches!(
+                dup,
+                ReserveOutcome::Completed(NoticeReport {
+                    kind: NoticeKind::Attention,
+                    status: NoticeDeliveryStatus::Unknown,
+                    was_duplicate: true,
+                    cap_reached: false,
+                    attempt_count: 1,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
@@ -689,5 +980,109 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn inspect_missing_root_returns_default_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("missing");
+        let key = CoworkerJobOwnershipKey::new(
+            "binding_1",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "job_0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let digest = "c".repeat(64);
+        assert_eq!(
+            CoworkerNoticeStore::inspect(&root, &key, &digest).unwrap(),
+            NoticeMetadata::default()
+        );
+        assert!(!root.exists());
+    }
+
+    #[test]
+    fn inspect_reserved_intent_unknown_and_bytes_mtime_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, snap) = fixture(tmp.path());
+        let root = tmp.path().join("store");
+        assert!(matches!(
+            store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Complete,
+                    1,
+                    snap,
+                    None,
+                )
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+        let (_, state_name) = scope_filenames(&cfg.key).unwrap();
+        let state_path = root.join(state_name);
+        let bytes = std::fs::read(&state_path).unwrap();
+        let mtime = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        for _ in 0..2 {
+            let meta = CoworkerNoticeStore::inspect(&root, &cfg.key, &cfg.envelope_digest).unwrap();
+            assert!(meta.configured);
+            assert_eq!(meta.attempt_count, 1);
+            assert_eq!(
+                meta.latest.map(|report| report.status),
+                Some(NoticeDeliveryStatus::Unknown)
+            );
+        }
+        assert_eq!(std::fs::read(&state_path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            mtime
+        );
+    }
+
+    #[test]
+    fn inspect_digest_and_reserve_scope_mismatch_are_security_violations_without_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, snap) = fixture(tmp.path());
+        let root = tmp.path().join("store");
+        store
+            .reserve_attempt(
+                &cfg.key,
+                &cfg.envelope_digest,
+                &cfg.target.project_root,
+                NoticeKind::Complete,
+                1,
+                snap,
+                None,
+            )
+            .unwrap();
+        let (_, state_name) = scope_filenames(&cfg.key).unwrap();
+        let state_path = root.join(state_name);
+        let bytes = std::fs::read(&state_path).unwrap();
+        let mtime = std::fs::metadata(&state_path).unwrap().modified().unwrap();
+        let wrong_digest = "d".repeat(64);
+        let inspect_err = match CoworkerNoticeStore::inspect(&root, &cfg.key, &wrong_digest) {
+            Err(err) => err,
+            Ok(_) => panic!("expected digest mismatch"),
+        };
+        assert!(format!("{inspect_err:?}").contains("SecurityViolation"));
+        let wrong_root = tmp.path().join("wrong-root");
+        let reserve_err = match store.reserve_attempt(
+            &cfg.key,
+            &cfg.envelope_digest,
+            &wrong_root,
+            NoticeKind::Complete,
+            2,
+            snap,
+            None,
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("expected scope mismatch"),
+        };
+        assert!(format!("{reserve_err:?}").contains("SecurityViolation"));
+        assert_eq!(std::fs::read(&state_path).unwrap(), bytes);
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            mtime
+        );
     }
 }

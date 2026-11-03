@@ -57,10 +57,10 @@ use crate::coworker_workflow::{
     compute_capability_envelope_digest, verify_live_approval_and_registry, CanonicalProjectBaseRef,
     ControllerJobLeaseRecord, ControllerJobRuntimeState, ControllerPolicyStore,
     ControllerRoleExecutionBudget, CoworkerBindingLedger, CoworkerControllerPhase1Status,
-    CoworkerControllerStepReport, CoworkerControllerTaskObservation, CoworkerJobPhase,
-    CoworkerJobRecord, CoworkerOwnershipSummary, CoworkerTaskRecord, CoworkerTaskStage,
-    CoworkerWorkflowStore, FrozenApprovalLinkage, FrozenCheckCommandSpec, FrozenCheckKind,
-    MAX_COWORKER_ID_LEN, MAX_COWORKER_SUMMARY_BYTES,
+    CoworkerControllerStepReport, CoworkerControllerTaskObservation, CoworkerJobOwnershipKey,
+    CoworkerJobPhase, CoworkerJobRecord, CoworkerOwnershipSummary, CoworkerTaskRecord,
+    CoworkerTaskStage, CoworkerWorkflowStore, FrozenApprovalLinkage, FrozenCheckCommandSpec,
+    FrozenCheckKind, MAX_COWORKER_ID_LEN, MAX_COWORKER_SUMMARY_BYTES,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -469,8 +469,26 @@ pub struct ExecutionStatusResponse {
     pub host_mode: CoworkerDriverHostMode,
     /// Current persisted job phase in [`CoworkerWorkflowStore`].
     pub job_phase: CoworkerJobPhase,
-    /// Current overall Phase 1 controller status (`running_tasks`, `awaiting_checks_or_review`, etc.).
+    /// Legacy Phase 1 controller status (`running_tasks`, `awaiting_checks_or_review`, etc.).
+    /// Distinct from the full-pipeline `pipeline_status`.
     pub overall_status: CoworkerControllerPhase1Status,
+    /// Effective driver execution mode (`full_automatic_pipeline` or `phase1_initial_dispatch_only`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<crate::coworker_driver::CoworkerDriverExecutionMode>,
+    /// Truthful full-pipeline status (`running`, `completed`, `stopped`, `held`, etc.) when operating in
+    /// `full_automatic_pipeline` mode; distinct from the legacy `overall_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_status: Option<crate::coworker_workflow::CoworkerPipelineStatus>,
+    /// Whether `stop_requested` is set and the live owner is gracefully draining finite in-flight
+    /// stage futures before exiting.
+    #[serde(default)]
+    pub stopping_draining_in_flight: bool,
+    /// Stage futures currently retained in-flight by the live owner's pipeline driver.
+    #[serde(default)]
+    pub in_flight_stages: Vec<crate::coworker_workflow::CoworkerPipelineInFlightStageRef>,
+    /// Compact pipeline report when operating in `full_automatic_pipeline` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_report: Option<crate::coworker_driver::CoworkerDriverPipelineReport>,
     /// Whether durable operator stop (`stop_requested`) is set on the job runtime state.
     pub stop_requested: bool,
     /// Whether the job has unresolved pending effects or unknown outbox state blocking replay.
@@ -491,6 +509,12 @@ pub struct ExecutionStatusResponse {
     pub pipeline_boundary: CoworkerDriverPipelineBoundary,
     /// Human-readable boundary explanation.
     pub boundary_note: String,
+    /// Read-only coworker native notice metadata when inspection succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice: Option<crate::coworker_notice::NoticeMetadata>,
+    /// Stable error code when coworker native notice inspection fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice_error: Option<String>,
 }
 
 impl ExecutionStatusResponse {
@@ -516,6 +540,11 @@ impl ExecutionStatusResponse {
             host_mode: report.host_mode,
             job_phase: report.job_phase,
             overall_status: report.overall_status,
+            execution_mode: Some(report.execution_mode),
+            pipeline_status: report.pipeline_status,
+            stopping_draining_in_flight: report.stopping_draining_in_flight,
+            in_flight_stages: report.in_flight_stages,
+            pipeline_report: report.pipeline_report,
             stop_requested: report.stop_requested,
             blocked_on_unknown_effect: report.blocked_on_unknown_effect,
             stop_or_block_reason: report.stop_or_block_reason,
@@ -525,6 +554,8 @@ impl ExecutionStatusResponse {
             step_report: report.step_report,
             pipeline_boundary: report.pipeline_boundary,
             boundary_note: report.boundary_note,
+            native_notice: None,
+            native_notice_error: None,
         }
     }
 }
@@ -620,6 +651,7 @@ pub struct CoworkerExecutionGateway {
     binding_id: String,
     thread_uuid: String,
     sibling_anchor_exe: Option<PathBuf>,
+    managed_native_notice: Option<(threadlane::native_endpoint::NativeReconnectConfig, u32)>,
 }
 
 impl CoworkerExecutionGateway {
@@ -665,6 +697,7 @@ impl CoworkerExecutionGateway {
             binding_id,
             thread_uuid,
             sibling_anchor_exe: None,
+            managed_native_notice: None,
         })
     }
 
@@ -672,6 +705,17 @@ impl CoworkerExecutionGateway {
     /// `threadlane-flow` binary during integration tests.
     pub fn with_sibling_anchor_exe(mut self, anchor_exe: impl Into<PathBuf>) -> Self {
         self.sibling_anchor_exe = Some(anchor_exe.into());
+        self
+    }
+
+    /// Attaches a verified managed native reconnect configuration and MCP parent backend PID for
+    /// configuring coworker milestone notices during `start_execution`.
+    pub fn with_managed_native_notice(
+        mut self,
+        reconnect_config: threadlane::native_endpoint::NativeReconnectConfig,
+        backend_pid: u32,
+    ) -> Self {
+        self.managed_native_notice = Some((reconnect_config, backend_pid));
         self
     }
 
@@ -852,7 +896,7 @@ impl CoworkerExecutionGateway {
                     );
                 } else {
                     verify_job_planning_and_envelope_consistency(
-                        job, linkage, rt, &approval, &authority,
+                        job, linkage, rt, &approval, &authority, true,
                     )?;
                     loaded_approval = Some(approval);
                     approved = true;
@@ -1049,6 +1093,16 @@ impl CoworkerExecutionGateway {
         let operator_attested = runtime_state
             .as_ref()
             .is_some_and(|rt| rt.envelope.operator_attested);
+        let pipeline_boundary = match runtime_state.as_ref() {
+            Some(rt) => {
+                if crate::coworker_driver::envelope_authorizes_full_pipeline(job, rt) {
+                    CoworkerDriverPipelineBoundary::FullAutomaticPipelineThroughSingleClosure
+                } else {
+                    CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly
+                }
+            }
+            None => CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+        };
 
         Ok(ExecutionPreviewResponse {
             binding_id: self.binding_id.clone(),
@@ -1095,8 +1149,7 @@ impl CoworkerExecutionGateway {
             saved_profiles_grant_execution_authority: false,
             cryptographic_human_identity_proven: false,
             human_approval_route: TRUSTED_LOCAL_HUMAN_APPROVAL_ROUTE.to_string(),
-            pipeline_boundary:
-                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+            pipeline_boundary,
         })
     }
 
@@ -1132,6 +1185,66 @@ impl CoworkerExecutionGateway {
             ));
         }
 
+        if let Some((ref reconnect_cfg, backend_pid)) = self.managed_native_notice {
+            let notice_key = CoworkerJobOwnershipKey::new(
+                self.binding_id.clone(),
+                self.thread_uuid.clone(),
+                params.job_id.clone(),
+            )?;
+            let notice_dir = crate::coworker_notice::coworker_notice_dir(&self.plans_dir);
+            if !crate::coworker_notice::CoworkerNoticeStore::inspect(
+                &notice_dir,
+                &notice_key,
+                actual_digest,
+            )?
+            .configured
+            {
+                let stream = reconnect_cfg
+                    .connect_verified_stream_for_backend(Some(backend_pid))
+                    .await
+                    .map_err(|err| {
+                        let code = match err {
+                            threadlane::Error::SecurityViolation(_) => {
+                                NativeErrorCode::SecurityViolation
+                            }
+                            _ => NativeErrorCode::NotConfigured,
+                        };
+                        NativeError::new(code, "failed to verify managed native notice endpoint")
+                    })?;
+                let socket_path = stream
+                    .peer_addr()
+                    .map_err(|_| {
+                        NativeError::new(
+                            NativeErrorCode::IoError,
+                            "failed to inspect verified native notice peer address",
+                        )
+                    })?
+                    .as_pathname()
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "verified native notice endpoint socket must have a pathname",
+                        )
+                    })?
+                    .to_path_buf();
+                drop(stream);
+                let target =
+                    threadlane::native_tool_output::NativeToolOutputConfig::new_user_message_steer(
+                        socket_path,
+                        self.thread_uuid.clone(),
+                        ctx.approval.repository_path.clone(),
+                    )
+                    .with_reconnect(Some(reconnect_cfg.clone()));
+                let notice_cfg = crate::coworker_notice::CoworkerNoticeConfig::new(
+                    notice_key,
+                    actual_digest.clone(),
+                    target,
+                )?;
+                crate::coworker_notice::CoworkerNoticeStore::new(&notice_dir)?
+                    .configure(notice_cfg)?;
+            }
+        }
+
         let flow_exe = self.resolve_sibling_flow_executable()?;
         let driver = CoworkerCodeDriver::open_from_dirs(
             &self.state_dir,
@@ -1142,9 +1255,30 @@ impl CoworkerExecutionGateway {
         )?
         .with_flow_binary_path(flow_exe);
 
-        let report = driver
-            .ensure_owner(&self.binding_id, &self.thread_uuid, &params.job_id, None)
-            .await?;
+        let owned_binding = self.binding_id.clone();
+        let owned_thread = self.thread_uuid.clone();
+        let owned_job = params.job_id.clone();
+        // Isolate `ensure_owner` on a dedicated blocking thread with a current-thread runtime
+        // because `CoworkerPipelineDriver` holds `!Sync` futures across `.await`, making it `!Send`.
+        let report = tokio::task::spawn_blocking(move || -> Result<_, NativeError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::IoError,
+                        "failed to build local execution runtime",
+                    )
+                })?;
+            runtime.block_on(driver.ensure_owner(&owned_binding, &owned_thread, &owned_job, None))
+        })
+        .await
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "failed to join local execution task",
+            )
+        })??;
 
         Ok(StartExecutionResponse::from_ensure_report(
             ctx.runtime_state.envelope.envelope_id,
@@ -1154,13 +1288,14 @@ impl CoworkerExecutionGateway {
     }
 
     /// Reads the current verified [`CoworkerCodeDriver`] execution status for `params.job_id` in
-    /// the enrolled `(binding_id, thread_uuid)` scope.
+    /// the enrolled `(binding_id, thread_uuid)` scope, including jobs superseded by a newer
+    /// amendment so operators can still observe and drain them safely.
     pub async fn execution_status(
         &self,
         params: &ExecutionStatusParams,
     ) -> Result<ExecutionStatusResponse, NativeError> {
         validate_bounded_identifier(&params.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
-        let ctx = self.require_verified_approved_job(&params.job_id)?;
+        let ctx = self.require_verified_approved_job_for_status_or_stop(&params.job_id)?;
 
         let driver = CoworkerCodeDriver::open_from_dirs(
             &self.state_dir,
@@ -1173,15 +1308,30 @@ impl CoworkerExecutionGateway {
             .status(&self.binding_id, &self.thread_uuid, &params.job_id)
             .await?;
 
-        Ok(ExecutionStatusResponse::from_status_report(
+        let mut response = ExecutionStatusResponse::from_status_report(
             ctx.runtime_state.envelope.envelope_id,
             ctx.runtime_state.envelope.envelope_digest,
             report,
-        ))
+        );
+        let notice_key = CoworkerJobOwnershipKey::new(
+            self.binding_id.clone(),
+            self.thread_uuid.clone(),
+            params.job_id.clone(),
+        )?;
+        match crate::coworker_notice::CoworkerNoticeStore::inspect(
+            &crate::coworker_notice::coworker_notice_dir(&self.plans_dir),
+            &notice_key,
+            &response.envelope_digest,
+        ) {
+            Ok(metadata) => response.native_notice = Some(metadata),
+            Err(err) => response.native_notice_error = Some(err.code().to_string()),
+        }
+        Ok(response)
     }
 
     /// Records a durable operator stop request first and performs narrow [`CoworkerCodeDriver::cancel`]
-    /// cancellation for `params.job_id` in the enrolled `(binding_id, thread_uuid)` scope.
+    /// cancellation for `params.job_id` in the enrolled `(binding_id, thread_uuid)` scope,
+    /// including jobs superseded by a newer amendment while refusing any new execution dispatch.
     pub async fn stop_execution(
         &self,
         params: &StopExecutionParams,
@@ -1202,7 +1352,7 @@ impl CoworkerExecutionGateway {
             }
         }
 
-        let ctx = self.require_verified_approved_job(&params.job_id)?;
+        let ctx = self.require_verified_approved_job_for_status_or_stop(&params.job_id)?;
         let driver = CoworkerCodeDriver::open_from_dirs(
             &self.state_dir,
             &self.registry_dir,
@@ -1230,6 +1380,21 @@ impl CoworkerExecutionGateway {
         &self,
         job_id: &str,
     ) -> Result<VerifiedScopedExecutionContext, NativeError> {
+        self.verify_approved_job_scope(job_id, true)
+    }
+
+    fn require_verified_approved_job_for_status_or_stop(
+        &self,
+        job_id: &str,
+    ) -> Result<VerifiedScopedExecutionContext, NativeError> {
+        self.verify_approved_job_scope(job_id, false)
+    }
+
+    fn verify_approved_job_scope(
+        &self,
+        job_id: &str,
+        require_not_superseded: bool,
+    ) -> Result<VerifiedScopedExecutionContext, NativeError> {
         let workflow_store = CoworkerWorkflowStore::new(&self.plans_dir)?;
         let wf_ledger = workflow_store.read_binding_ledger(&self.binding_id)?;
         wf_ledger.validate(&self.binding_id)?;
@@ -1237,7 +1402,9 @@ impl CoworkerExecutionGateway {
 
         let job =
             require_scoped_job(&wf_ledger, &self.binding_id, &self.thread_uuid, job_id)?.clone();
-        ensure_job_not_superseded(&wf_ledger, &job)?;
+        if require_not_superseded {
+            ensure_job_not_superseded(&wf_ledger, &job)?;
+        }
 
         let Some(ref linkage) = job.approval_linkage else {
             return Err(NativeError::new(
@@ -1308,6 +1475,7 @@ impl CoworkerExecutionGateway {
             &runtime_state,
             &approval,
             &authority,
+            require_not_superseded,
         )?;
 
         Ok(VerifiedScopedExecutionContext {
@@ -1407,6 +1575,7 @@ fn verify_job_planning_and_envelope_consistency(
     runtime_state: &ControllerJobRuntimeState,
     approval: &ApprovalRecord,
     authority: &AuthorityStore,
+    require_live_launch_eligibility: bool,
 ) -> Result<(), NativeError> {
     let Some(ref planning_result) = job.planning_result else {
         return Err(NativeError::new(
@@ -1454,7 +1623,15 @@ fn verify_job_planning_and_envelope_consistency(
 
     runtime_state.envelope.policy.validate()?;
     runtime_state.envelope.verify_matches_job(job)?;
-    verify_live_approval_and_registry(approval, job, &runtime_state.envelope.policy, authority)?;
+    verify_immutable_approval_and_policy_linkage(approval, job, linkage, runtime_state)?;
+    if require_live_launch_eligibility {
+        verify_live_approval_and_registry(
+            approval,
+            job,
+            &runtime_state.envelope.policy,
+            authority,
+        )?;
+    }
 
     let coder_budget = runtime_state.envelope.coder_budget()?;
     if approval.budgets.timeout_ms > coder_budget.max_timeout_ms_per_call
@@ -1470,6 +1647,42 @@ fn verify_job_planning_and_envelope_consistency(
         ));
     }
 
+    Ok(())
+}
+
+fn verify_immutable_approval_and_policy_linkage(
+    approval: &ApprovalRecord,
+    job: &CoworkerJobRecord,
+    linkage: &FrozenApprovalLinkage,
+    runtime_state: &ControllerJobRuntimeState,
+) -> Result<(), NativeError> {
+    let policy = &runtime_state.envelope.policy;
+    let computed_policy_digest = policy.digest()?;
+    if policy.policy_id != linkage.policy_id
+        || !constant_time_str_eq(&computed_policy_digest, &linkage.policy_digest)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ExecutionPolicy does not match the job's FrozenApprovalLinkage policy_id or policy_digest.",
+        ));
+    }
+    if approval.approval_id != linkage.approval_id
+        || approval.subject_digest != linkage.approval_subject_digest
+        || approval.binding_id != job.binding_id
+        || approval.thread_uuid != job.thread_uuid
+        || approval.plan_id != linkage.plan_id
+        || approval.plan_revision != linkage.plan_revision
+        || approval.plan_digest != linkage.plan_digest
+        || approval.profile_id != linkage.profile_id
+        || approval.registry_revision != linkage.registry_revision
+        || approval.repository_path != job.work_brief.project_base.repository_path
+        || approval.base_commit != job.work_brief.project_base.base_commit
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord metadata drifted from the job's FrozenApprovalLinkage.",
+        ));
+    }
     Ok(())
 }
 

@@ -1,9 +1,20 @@
 use super::*;
-use serde_json::Value;
-use threadlane::{Supervisor, SupervisorClient, SupervisorConfig};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use threadlane::{
+    format_coworker_job_wakeup_message, NativeToolOutputConfig, Supervisor, SupervisorClient,
+    SupervisorConfig,
+};
 use threadlane_native::coworker_driver::{CoworkerCodeDriver, CoworkerDriverEnsureDisposition};
+use threadlane_native::coworker_notice::{
+    coworker_notice_dir, CoworkerNoticeConfig, CoworkerNoticeStore, NoticeDeliveryStatus,
+};
 use threadlane_native::coworker_workflow::{CoworkerJobLockState, CoworkerJobOwnershipKey};
 use threadlane_native::planning_driver::planning_artifacts_dir;
+use tokio::net::UnixListener;
+use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 async fn run_flow_cli_pipeline(
     state_dir: &Path,
@@ -51,6 +62,117 @@ async fn run_flow_cli_pipeline(
         Value::String(binding_id.to_string())
     );
     envelope["data"].clone()
+}
+
+async fn read_ws_json<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Value
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let msg = ws
+        .next()
+        .await
+        .expect("expected ws frame")
+        .expect("ws frame ok");
+    match msg {
+        Message::Text(text) => serde_json::from_str(&text).expect("valid json frame"),
+        other => panic!("expected text frame, got {other:?}"),
+    }
+}
+
+fn spawn_single_coworker_notice_ws_server(
+    fixture: &PipelineTestFixture,
+    thread_uuid: &str,
+) -> (PathBuf, Arc<AtomicUsize>, tokio::task::JoinHandle<Value>) {
+    let sock_dir = fixture.root.join("sock");
+    fs::create_dir_all(&sock_dir).expect("create sock_dir");
+    fs::set_permissions(&sock_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700 sock_dir");
+    let socket_path = sock_dir.join("notice.sock");
+    assert!(
+        socket_path.as_os_str().len() < 108,
+        "socket path must be < 108 bytes"
+    );
+    let listener = UnixListener::bind(&socket_path).expect("bind notice socket");
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 notice socket");
+
+    let expected_cwd = fs::canonicalize(&fixture.repo_dir)
+        .expect("canonical repo_dir")
+        .to_string_lossy()
+        .to_string();
+    let expected_thread = thread_uuid.to_string();
+    let effect_count = Arc::new(AtomicUsize::new(0));
+    let effect_count_srv = Arc::clone(&effect_count);
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept notice ws");
+        drop(listener);
+        let mut ws = accept_async(stream).await.expect("ws handshake");
+
+        let init = read_ws_json(&mut ws).await;
+        assert_eq!(init["id"], json!(1));
+        assert_eq!(init["method"], json!("initialize"));
+        assert_eq!(
+            init["params"]["capabilities"]["experimentalApi"],
+            json!(true)
+        );
+        ws.send(Message::Text(
+            json!({ "id": 1, "result": { "serverInfo": { "name": "codex" } } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("send init resp");
+
+        let initialized = read_ws_json(&mut ws).await;
+        assert_eq!(initialized, json!({ "method": "initialized" }));
+
+        let read_req = read_ws_json(&mut ws).await;
+        assert_eq!(read_req["id"], json!(2));
+        assert_eq!(read_req["method"], json!("thread/read"));
+        assert_eq!(
+            read_req["params"],
+            json!({ "threadId": expected_thread, "includeTurns": false })
+        );
+        let idle_thread = json!({
+            "thread": { "id": expected_thread, "cwd": expected_cwd, "status": { "type": "idle" } }
+        });
+        ws.send(Message::Text(
+            json!({ "id": 2, "result": idle_thread }).to_string().into(),
+        ))
+        .await
+        .expect("send read resp");
+
+        let resume_req = read_ws_json(&mut ws).await;
+        assert_eq!(resume_req["id"], json!(3));
+        assert_eq!(resume_req["method"], json!("thread/resume"));
+        assert_eq!(
+            resume_req["params"],
+            json!({ "threadId": expected_thread, "excludeTurns": true })
+        );
+        assert!(resume_req["params"].get("model").is_none());
+        assert!(resume_req["params"].get("effort").is_none());
+        ws.send(Message::Text(
+            json!({ "id": 3, "result": idle_thread }).to_string().into(),
+        ))
+        .await
+        .expect("send resume resp");
+
+        let turn_req = read_ws_json(&mut ws).await;
+        effect_count_srv.fetch_add(1, Ordering::SeqCst);
+        ws.send(Message::Text(
+            json!({
+                "id": 4,
+                "result": { "turn": { "id": "01968f52-9999-7d51-9914-79d2bc48eb5b", "status": "inProgress" } }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send turn/start resp");
+        turn_req
+    });
+
+    (socket_path, effect_count, server)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -426,6 +548,34 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
         )
         .await;
 
+        let (notice_socket_path, notice_effect_count, notice_server) =
+            spawn_single_coworker_notice_ws_server(&fixture, &thread_uuid);
+        let notice_root = coworker_notice_dir(&fixture.plans_dir);
+        assert_eq!(notice_root, fixture.plans_dir.join("coworker-code-driver/native-notices"));
+        let ownership_key = CoworkerJobOwnershipKey::new(&binding_id, &thread_uuid, &job.job_id)
+            .expect("construct ownership key");
+        let envelope_digest = fixture
+            .policy_store
+            .get_job_runtime_readonly(&binding_id, &job.job_id)
+            .expect("read job runtime readonly")
+            .expect("frozen job runtime present")
+            .envelope
+            .envelope_digest;
+        let notice_config = CoworkerNoticeConfig::new(
+            ownership_key.clone(),
+            envelope_digest.clone(),
+            NativeToolOutputConfig::new_user_message_steer(
+                notice_socket_path,
+                thread_uuid.clone(),
+                fixture.repo_dir.clone(),
+            ),
+        )
+        .expect("build scoped coworker notice config");
+        CoworkerNoticeStore::new(notice_root.clone())
+            .expect("open coworker notice store")
+            .configure(notice_config)
+            .expect("configure coworker notice target");
+
         assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
         assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 0);
         assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 0);
@@ -705,8 +855,6 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
             threadlane_native::coworker_driver::coworker_driver_dir(&fixture.plans_dir),
         )
         .expect("open actual CLI code-driver ownership store");
-        let ownership_key = CoworkerJobOwnershipKey::new(&binding_id, &thread_uuid, &job.job_id)
-            .expect("construct ownership key");
         assert!(
             !matches!(
                 actual_driver_ownership_store
@@ -720,6 +868,45 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
             !threadlane_host::is_host_lock_held(&fixture.sessions_dir.join(&approval_id))
                 .expect("inspect host lock after completion"),
             "disposable host lock must be released after completion"
+        );
+
+        let turn_req = tokio::time::timeout(Duration::from_secs(20), notice_server)
+            .await
+            .expect("wait for coworker completion notice ws callback")
+            .expect("join coworker notice ws server");
+        assert_eq!(notice_effect_count.load(Ordering::SeqCst), 1);
+        let expected_notice =
+            format_coworker_job_wakeup_message(&job.job_id).expect("expected notice");
+        assert_eq!(turn_req["id"], json!(4));
+        assert_eq!(turn_req["method"], json!("turn/start"));
+        assert_eq!(
+            turn_req["params"],
+            json!({
+                "threadId": thread_uuid,
+                "input": [{ "type": "text", "text": expected_notice }]
+            })
+        );
+        assert!(turn_req["params"].get("toolOutput").is_none());
+        assert!(turn_req["params"].get("model").is_none());
+        assert!(turn_req["params"].get("effort").is_none());
+        let serialized_turn = turn_req.to_string();
+        assert!(serialized_turn.contains(&job.job_id));
+        assert!(serialized_turn.contains("execution_status"));
+        assert!(serialized_turn.contains("untrusted"));
+        assert!(!serialized_turn.contains("Full code-driver pipeline test brief"));
+        assert!(!serialized_turn.contains("CTRL_TASK_A"));
+        assert!(!serialized_turn.contains("apr_"));
+        assert!(!serialized_turn.contains("wcl_"));
+        assert!(!serialized_turn.to_ascii_lowercase().contains("batch"));
+
+        let notice_inspected =
+            CoworkerNoticeStore::inspect(&notice_root, &ownership_key, &envelope_digest)
+                .expect("inspect coworker notice after completion");
+        assert!(notice_inspected.configured);
+        assert_eq!(notice_inspected.attempt_count, 1);
+        assert_eq!(
+            notice_inspected.latest.as_ref().expect("latest notice").status,
+            NoticeDeliveryStatus::Submitted
         );
 
         // Verify final integrated checkout has corrected 101 in src/a.rs, 200 in src/b.rs, and 300 in src/c.rs,
@@ -806,6 +993,20 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
         assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 4);
         assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
         assert_eq!(read_invocation_count(&fixture.check_count_file), 5);
+        let notice_after_reconcile =
+            CoworkerNoticeStore::inspect(&notice_root, &ownership_key, &envelope_digest)
+                .expect("inspect coworker notice after post-completion ensure/reconcile");
+        assert!(notice_after_reconcile.configured);
+        assert_eq!(notice_after_reconcile.attempt_count, 1);
+        assert_eq!(
+            notice_after_reconcile
+                .latest
+                .as_ref()
+                .expect("latest notice after reconcile")
+                .status,
+            NoticeDeliveryStatus::Submitted
+        );
+        assert_eq!(notice_effect_count.load(Ordering::SeqCst), 1);
 
         supervisor.shutdown().await;
     })
