@@ -36,10 +36,13 @@ pub mod contracts;
 pub mod controller_policy;
 /// Private per-job OS file-lock ownership, CSPRNG instance/challenge identity, and pre-effect validation.
 pub mod ownership;
+/// Asynchronous read-only Coworker planning and architectural advice service.
+pub mod planning;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.
 pub mod store;
 
 pub use contracts::*;
 pub use controller_policy::*;
 pub use ownership::*;
+pub use planning::*;
 pub use store::*;

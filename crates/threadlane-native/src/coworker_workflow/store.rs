@@ -26,13 +26,13 @@ use crate::coworker_workflow::contracts::{
     FrozenControllerCapabilityEnvelope, OutboxDispatchKind, OutboxDispatchRecord,
     OutboxDispatchStatus, PlanningAdviceGrant, PlanningCallBudget, PlanningCallReservation,
     PlanningGrantStatus, PlanningGrantUsage, PlanningReadOnlyCapabilities,
-    PlanningReservationStatus, ReviewVerdictOutcome, StructuredReviewVerdict, TaskAttemptRef,
-    TaskCandidateRef, WorkBrief, WorkBriefKind, WorkflowHoldReason, WorkflowHoldRecord,
-    COWORKER_WORKFLOW_SCHEMA_VERSION, MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING,
-    MAX_ATTEMPTS_PER_TASK, MAX_CANDIDATES_PER_TASK, MAX_COMBINED_CANDIDATES_PER_JOB,
-    MAX_COWORKER_ID_LEN, MAX_COWORKER_LEDGER_BYTES, MAX_GRANT_RESERVATIONS, MAX_HOLDS_PER_JOB,
-    MAX_JOBS_PER_BINDING, MAX_OUTBOX_RECORDS_PER_JOB, MAX_PLANNING_GRANTS_PER_BINDING,
-    MAX_WORK_BRIEF_ITEMS,
+    PlanningReservationStatus, PlanningResultRef, ReviewVerdictOutcome, StructuredReviewVerdict,
+    TaskAttemptRef, TaskCandidateRef, TaskInterfaceOwnershipSpec, WorkBrief, WorkBriefKind,
+    WorkflowHoldReason, WorkflowHoldRecord, COWORKER_WORKFLOW_SCHEMA_VERSION,
+    MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_ATTEMPTS_PER_TASK, MAX_CANDIDATES_PER_TASK,
+    MAX_COMBINED_CANDIDATES_PER_JOB, MAX_COWORKER_ID_LEN, MAX_COWORKER_LEDGER_BYTES,
+    MAX_GRANT_RESERVATIONS, MAX_HOLDS_PER_JOB, MAX_JOBS_PER_BINDING, MAX_OUTBOX_RECORDS_PER_JOB,
+    MAX_PLANNING_GRANTS_PER_BINDING, MAX_WORK_BRIEF_ITEMS,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -235,6 +235,7 @@ impl CoworkerBindingLedger {
 
         let mut job_ids = BTreeSet::new();
         let mut job_keys = BTreeSet::new();
+        let mut planned_plan_owners = BTreeMap::<&str, &str>::new();
         for job in &self.jobs {
             job.validate()?;
             if job.binding_id != expected_binding_id || job.thread_uuid != pinned_thread {
@@ -250,6 +251,95 @@ impl CoworkerBindingLedger {
                     NativeErrorCode::ProtocolError,
                     "duplicate job_id or create_request_key in jobs",
                 ));
+            }
+            if let Some(ref pr) = job.planning_result {
+                if let Some(existing_owner) =
+                    planned_plan_owners.insert(pr.plan_id.as_str(), job.job_id.as_str())
+                {
+                    if existing_owner != job.job_id {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "multiple jobs in the same binding ledger reference the same planned plan_id",
+                        ));
+                    }
+                }
+                let grant = self
+                    .planning_grants
+                    .iter()
+                    .find(|g| g.grant_id == pr.grant_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "PlanningResultRef references a missing grant_id",
+                        )
+                    })?;
+                if grant.project_base.repository_path != pr.project_base.repository_path {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "PlanningResultRef project_base.repository_path does not match the standing grant's canonical repository_path",
+                    ));
+                }
+                if grant.profile_id != pr.profile_id
+                    || grant.registry_revision != pr.registry_revision
+                    || grant.policy_digest != pr.policy_digest
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "PlanningResultRef profile_id, registry_revision, or policy_digest does not match the referenced grant",
+                    ));
+                }
+                let reservation = grant
+                    .reservations
+                    .iter()
+                    .find(|r| r.reservation_id == pr.reservation_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "PlanningResultRef references a missing reservation_id on the grant",
+                        )
+                    })?;
+                if reservation.role != WorkflowRole::Orchestrator
+                    || reservation.status != PlanningReservationStatus::Completed
+                    || reservation.request_key != pr.request_key
+                    || reservation.selected_choice != pr.selected_choice
+                    || reservation.run_id.as_deref() != Some(pr.run_id.as_str())
+                    || reservation.report_artifact_id.as_deref()
+                        != Some(pr.report_artifact_id.as_str())
+                    || reservation.output_digest.as_deref() != Some(pr.output_digest.as_str())
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "PlanningResultRef must bind a completed Orchestrator reservation with matching run_id, report_artifact_id, and output_digest",
+                    ));
+                }
+                if let Some(ref call_base) = reservation.call_project_base {
+                    if call_base != &pr.project_base {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "PlanningResultRef project_base does not match the reservation's call_project_base",
+                        ));
+                    }
+                }
+                for adv_id in &pr.architect_advice_ids {
+                    if !self.architect_advice.iter().any(|a| &a.advice_id == adv_id) {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "PlanningResultRef references an unknown architect_advice_id",
+                        ));
+                    }
+                }
+            }
+        }
+        for job in &self.jobs {
+            if let Some(ref linkage) = job.approval_linkage {
+                if let Some(&owner_job_id) = planned_plan_owners.get(linkage.plan_id.as_str()) {
+                    if owner_job_id != job.job_id {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ProtocolError,
+                            "FrozenApprovalLinkage references a plan_id produced for a different job in this binding",
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -283,6 +373,26 @@ pub enum CoworkerLedgerMutationOutcome<T> {
     IdempotentExisting(T),
     /// Ledger was mutated; validate, check `expected_ledger_revision`, increment `ledger_revision`, and persist atomically.
     Mutated(T),
+}
+
+/// Outcome of acquiring a [`PlanningCallReservation`] under the per-binding cross-process lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanningCallReservationAcquisition {
+    /// A new [`PlanningReservationStatus::ReservedBeforeEffect`] reservation was durably created by this call.
+    FreshlyReserved(PlanningCallReservation),
+    /// An existing terminal reservation (`Completed`, `FailedAfterEffect`, or `RefusedBeforeEffect`)
+    /// with the same `request_key` and identical parameters already exists on the grant.
+    ExistingTerminal(PlanningCallReservation),
+}
+
+impl PlanningCallReservationAcquisition {
+    /// Returns the underlying [`PlanningCallReservation`] regardless of whether it was newly
+    /// reserved or replayed from a terminal record.
+    pub fn into_reservation(self) -> PlanningCallReservation {
+        match self {
+            Self::FreshlyReserved(res) | Self::ExistingTerminal(res) => res,
+        }
+    }
 }
 
 /// Request to create a new read-only [`PlanningAdviceGrant`].
@@ -453,16 +563,22 @@ pub struct CreateCoworkerJobRequest {
     pub amended_interfaces: Vec<String>,
 }
 
-/// Interface ownership metadata assigned to a task when binding an [`ApprovalRecord`] to a job.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Request to record a verified [`PlanningResultRef`] on a [`CoworkerJobRecord`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TaskInterfaceOwnershipSpec {
-    /// Logical interface identifiers owned/defined by the task.
-    #[serde(default)]
-    pub owned_interfaces: Vec<String>,
-    /// Logical interface identifiers consumed by the task.
-    #[serde(default)]
-    pub consumed_interfaces: Vec<String>,
+pub struct RecordJobPlanningResultRequest {
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Target [`CoworkerJobRecord::job_id`].
+    pub job_id: String,
+    /// Optional expected current `job_revision` of `job_id` (`>= 1`).
+    pub expected_job_revision: Option<u64>,
+    /// Optional expected current ledger revision (CAS check).
+    pub expected_ledger_revision: Option<u64>,
+    /// Durable planning linkage tying the published plan revision to the verified Orchestrator call.
+    pub planning_result: PlanningResultRef,
 }
 
 /// Request to bind an immutable operator [`ApprovalRecord`] and [`ExecutionPolicy`] to a [`CoworkerJobRecord`].
@@ -897,6 +1013,18 @@ impl CoworkerWorkflowStore {
         &self,
         request: &ReservePlanningCallRequest,
     ) -> Result<PlanningCallReservation, NativeError> {
+        Ok(self
+            .acquire_planning_call_reservation(request)?
+            .into_reservation())
+    }
+
+    /// Acquires a single planning/advice call reservation under the cross-process ledger lock,
+    /// distinguishing a newly created [`PlanningReservationStatus::ReservedBeforeEffect`]
+    /// reservation from an existing terminal reservation with the same `request_key`.
+    pub fn acquire_planning_call_reservation(
+        &self,
+        request: &ReservePlanningCallRequest,
+    ) -> Result<PlanningCallReservationAcquisition, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.request_key, "request_key", MAX_COWORKER_ID_LEN)?;
@@ -920,15 +1048,15 @@ impl CoworkerWorkflowStore {
             call_base.verify_live_repository()?;
         }
 
-        let (_, reservation) = self.transact_binding_ledger(
+        let (_, acquisition) = self.transact_binding_ledger(
             &request.binding_id,
             request.expected_ledger_revision,
             |ledger| {
                 ledger.ensure_thread_scope(&request.thread_uuid)?;
-                let grant = ledger
+                let grant_idx = ledger
                     .planning_grants
-                    .iter_mut()
-                    .find(|g| g.grant_id == request.grant_id)
+                    .iter()
+                    .position(|g| g.grant_id == request.grant_id)
                     .ok_or_else(|| {
                         NativeError::new(
                             NativeErrorCode::ValidationFailed,
@@ -937,7 +1065,9 @@ impl CoworkerWorkflowStore {
                     })?;
 
                 if let Some(ref call_base) = request.call_project_base {
-                    if call_base.repository_path != grant.project_base.repository_path {
+                    if call_base.repository_path
+                        != ledger.planning_grants[grant_idx].project_base.repository_path
+                    {
                         return Err(NativeError::new(
                             NativeErrorCode::SecurityViolation,
                             "ReservePlanningCallRequest.call_project_base.repository_path does not match the standing grant's canonical repository_path",
@@ -945,7 +1075,7 @@ impl CoworkerWorkflowStore {
                     }
                 }
 
-                if let Some(existing) = grant
+                if let Some(existing) = ledger.planning_grants[grant_idx]
                     .reservations
                     .iter()
                     .find(|r| r.request_key == request.request_key)
@@ -968,20 +1098,24 @@ impl CoworkerWorkflowStore {
                         ));
                     }
                     return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting(
-                        existing.clone(),
+                        PlanningCallReservationAcquisition::ExistingTerminal(existing.clone()),
                     ));
                 }
 
-                if grant
-                    .reservations
-                    .iter()
-                    .any(|r| r.role == request.role && r.context_digest == request.context_digest && r.status.is_ambiguous())
-                {
+                if ledger.planning_grants.iter().any(|g| {
+                    g.reservations.iter().any(|r| {
+                        r.role == request.role
+                            && r.context_digest == request.context_digest
+                            && r.status.is_ambiguous()
+                    })
+                }) {
                     return Err(NativeError::new(
                         NativeErrorCode::AmbiguousWakeupPendingReconciliation,
                         "another planning call for this role and context_digest has an uncertain outcome pending reconciliation",
                     ));
                 }
+
+                let grant = &mut ledger.planning_grants[grant_idx];
 
                 if grant.status == PlanningGrantStatus::Revoked {
                     return Err(NativeError::new(
@@ -1078,10 +1212,12 @@ impl CoworkerWorkflowStore {
                     grant.status = PlanningGrantStatus::Exhausted;
                 }
                 grant.reservations.push(reservation.clone());
-                Ok(CoworkerLedgerMutationOutcome::Mutated(reservation))
+                Ok(CoworkerLedgerMutationOutcome::Mutated(
+                    PlanningCallReservationAcquisition::FreshlyReserved(reservation),
+                ))
             },
         )?;
-        Ok(reservation)
+        Ok(acquisition)
     }
 
     /// Finalizes or reconciles a [`PlanningCallReservation`] after provider execution or refusal.
@@ -1155,6 +1291,12 @@ impl CoworkerWorkflowStore {
                     }
                     (
                         PlanningReservationStatus::ReservedBeforeEffect,
+                        PlanningReservationStatus::FailedAfterEffect,
+                    ) => {
+                        grant.usage.failed_calls += 1;
+                    }
+                    (
+                        PlanningReservationStatus::ReservedBeforeEffect,
                         PlanningReservationStatus::EffectUnknown,
                     ) => {
                         grant.usage.unknown_effect_calls += 1;
@@ -1192,6 +1334,14 @@ impl CoworkerWorkflowStore {
                         grant.usage.unknown_effect_calls =
                             grant.usage.unknown_effect_calls.saturating_sub(1);
                         grant.usage.completed_calls += 1;
+                    }
+                    (
+                        PlanningReservationStatus::EffectUnknown,
+                        PlanningReservationStatus::FailedAfterEffect,
+                    ) => {
+                        grant.usage.unknown_effect_calls =
+                            grant.usage.unknown_effect_calls.saturating_sub(1);
+                        grant.usage.failed_calls += 1;
                     }
                     _ => {
                         return Err(NativeError::new(
@@ -1556,6 +1706,7 @@ impl CoworkerWorkflowStore {
                     work_brief: request.work_brief.clone(),
                     work_brief_digest: brief_digest,
                     supersedes_job_id,
+                    planning_result: None,
                     approval_linkage: None,
                     tasks: Vec::new(),
                     holds: Vec::new(),
@@ -1570,8 +1721,144 @@ impl CoworkerWorkflowStore {
         Ok(created)
     }
 
+    /// Records or reconciles a verified [`PlanningResultRef`] on a [`CoworkerJobRecord`] and
+    /// transitions the job to [`CoworkerJobPhase::AwaitingApproval`] without granting execution
+    /// approval.
+    pub fn record_job_planning_result(
+        &self,
+        request: &RecordJobPlanningResultRequest,
+    ) -> Result<CoworkerJobRecord, NativeError> {
+        validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        if let Some(exp_rev) = request.expected_job_revision {
+            if exp_rev == 0 {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "expected_job_revision must be >= 1",
+                ));
+            }
+        }
+        request.planning_result.validate()?;
+        request
+            .planning_result
+            .project_base
+            .verify_live_repository()?;
+
+        let (_, updated) = self.transact_binding_ledger(
+            &request.binding_id,
+            request.expected_ledger_revision,
+            |ledger| {
+                ledger.ensure_thread_scope(&request.thread_uuid)?;
+                if ledger.jobs.iter().any(|j| {
+                    j.job_id != request.job_id
+                        && j.planning_result
+                            .as_ref()
+                            .map(|pr| pr.plan_id == request.planning_result.plan_id)
+                            .unwrap_or(false)
+                }) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "PlanningResultRef.plan_id is already bound to another job in this binding",
+                    ));
+                }
+
+                if ledger
+                    .jobs
+                    .iter()
+                    .any(|j| j.supersedes_job_id.as_deref() == Some(request.job_id.as_str()))
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "job has been superseded by an amendment job and cannot record a planning result",
+                    ));
+                }
+
+                let job = ledger
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.job_id == request.job_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "requested job_id was not found in this binding ledger",
+                        )
+                    })?;
+
+                if job.holds.iter().any(|h| h.active) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "job has an active hold and cannot record a planning result until resolved",
+                    ));
+                }
+                if job.work_brief_digest != request.planning_result.work_brief_digest
+                    || job.work_brief.project_base != request.planning_result.project_base
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "PlanningResultRef work_brief_digest or project_base does not match the target job",
+                    ));
+                }
+
+                if let Some(ref existing) = job.planning_result {
+                    if existing == &request.planning_result {
+                        return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting(
+                            job.clone(),
+                        ));
+                    }
+                    if existing.request_key == request.planning_result.request_key {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "planning_result request_key was already recorded on this job with different parameters",
+                        ));
+                    }
+                }
+
+                if let Some(exp_rev) = request.expected_job_revision {
+                    if job.job_revision != exp_rev {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "expected_job_revision does not match current job_revision",
+                        ));
+                    }
+                }
+                if job.approval_linkage.is_some() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "cannot overwrite planning_result after FrozenApprovalLinkage is bound",
+                    ));
+                }
+                if !matches!(
+                    job.phase,
+                    CoworkerJobPhase::Briefing
+                        | CoworkerJobPhase::Planning
+                        | CoworkerJobPhase::AwaitingApproval
+                ) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "job must be in Briefing, Planning, or AwaitingApproval phase to record a planning result",
+                    ));
+                }
+
+                let next_rev = job.job_revision.checked_add(1).ok_or_else(|| {
+                    NativeError::new(NativeErrorCode::ValidationFailed, "job_revision overflow")
+                })?;
+                job.job_revision = next_rev;
+                job.phase = CoworkerJobPhase::AwaitingApproval;
+                job.planning_result = Some(request.planning_result.clone());
+                job.validate()?;
+                Ok(CoworkerLedgerMutationOutcome::Mutated(job.clone()))
+            },
+        )?;
+        Ok(updated)
+    }
+
     /// Binds an immutable operator [`ApprovalRecord`] and [`ExecutionPolicy`] to a [`CoworkerJobRecord`],
     /// initializing per-task records and verifying A1 preflight admission.
+    ///
+    /// This is the shared store-level manual approval-binding API (verifying [`PlanningResultRef`]
+    /// consistency when present on the job while remaining compatible with explicitly approved
+    /// manual jobs that have `planning_result == None`). Automatic controller admission must
+    /// separately require a current-job [`PlanningResultRef`].
     ///
     /// Once bound, `approval_linkage` is immutable; any attempt to bind a different approval,
     /// plan revision, base commit, write scope, or policy on the same job fails closed.
@@ -1766,6 +2053,36 @@ impl CoworkerWorkflowStore {
             request.expected_ledger_revision,
             |ledger| {
                 ledger.ensure_thread_scope(&request.thread_uuid)?;
+                if ledger.jobs.iter().any(|other| {
+                    other.job_id != request.job_id
+                        && (other
+                            .planning_result
+                            .as_ref()
+                            .map(|pr| pr.plan_id == approval.plan_id)
+                            .unwrap_or(false)
+                            || other
+                                .approval_linkage
+                                .as_ref()
+                                .map(|al| al.plan_id == approval.plan_id)
+                                .unwrap_or(false))
+                }) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ApprovalRecord plan_id belongs to a different job in this binding",
+                    ));
+                }
+
+                if ledger
+                    .jobs
+                    .iter()
+                    .any(|other| other.supersedes_job_id.as_deref() == Some(request.job_id.as_str()))
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "job has been superseded by an amendment job and cannot bind execution approval",
+                    ));
+                }
+
                 let job = ledger
                     .jobs
                     .iter_mut()
@@ -1795,7 +2112,10 @@ impl CoworkerWorkflowStore {
                         "expected_job_revision does not match current job_revision",
                     ));
                 }
-                if !job.work_brief.is_ready_for_execution_approval() {
+                if !job
+                    .work_brief
+                    .is_ready_for_execution_approval_with_planning(job.planning_result.as_ref())
+                {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
                         "WorkBrief has open_questions or unconfirmed proposed_additions and cannot bind execution approval",
@@ -1814,13 +2134,51 @@ impl CoworkerWorkflowStore {
                     ));
                 }
 
+                let mut resolved_tasks = task_records.clone();
+                if let Some(ref planning_result) = job.planning_result {
+                    if approval.plan_id != planning_result.plan_id
+                        || approval.plan_revision != planning_result.plan_revision
+                        || approval.plan_digest != planning_result.plan_digest
+                        || approval.profile_id != planning_result.profile_id
+                        || approval.registry_revision != planning_result.registry_revision
+                        || live_base != planning_result.project_base
+                        || job.work_brief_digest != planning_result.work_brief_digest
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "ApprovalRecord does not match the job's recorded PlanningResultRef plan id, revision, digest, profile, brief digest, or base",
+                        ));
+                    }
+                    if !request.task_interfaces.is_empty()
+                        && !planning_result.task_interfaces.is_empty()
+                        && request.task_interfaces != planning_result.task_interfaces
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "BindJobApprovalRequest.task_interfaces drifted from the job's recorded PlanningResultRef.task_interfaces",
+                        ));
+                    }
+                    if request.task_interfaces.is_empty()
+                        && !planning_result.task_interfaces.is_empty()
+                    {
+                        for task_rec in &mut resolved_tasks {
+                            if let Some(iface) =
+                                planning_result.task_interfaces.get(&task_rec.task_id)
+                            {
+                                task_rec.owned_interfaces = iface.owned_interfaces.clone();
+                                task_rec.consumed_interfaces = iface.consumed_interfaces.clone();
+                            }
+                        }
+                    }
+                }
+
                 let next_job_rev = job.job_revision.checked_add(1).ok_or_else(|| {
                     NativeError::new(NativeErrorCode::ValidationFailed, "job_revision overflow")
                 })?;
                 job.job_revision = next_job_rev;
                 job.phase = CoworkerJobPhase::Executing;
                 job.approval_linkage = Some(linkage);
-                job.tasks = task_records;
+                job.tasks = resolved_tasks;
                 Ok(CoworkerLedgerMutationOutcome::Mutated(job.clone()))
             },
         )?;

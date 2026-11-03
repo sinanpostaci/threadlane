@@ -3257,3 +3257,242 @@ fn frozen_approval_linkage_requires_explicit_controller_capability_envelope_for_
     assert!(!linkage.authorizes_check_command("arbitrary_shell_cmd"));
     assert!(linkage.authorizes_local_git_integration());
 }
+
+#[test]
+fn orchestrator_reservation_in_binding_allows_independent_manual_job_approval() {
+    let fixture = setup_fixture();
+    let pb = project_base(&fixture);
+
+    // 1. Create planning job A and record a completed Orchestrator grant/reservation in BINDING_A.
+    let job_a = fixture
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-job-planned-a".to_string(),
+            expected_ledger_revision: Some(0),
+            work_brief: sample_ready_brief(&fixture, "brf_planned_a", BINDING_A, THREAD_UUID_A),
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create planning job A");
+
+    let grant = fixture
+        .store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-grant-orch-compat".to_string(),
+            expected_ledger_revision: None,
+            project_base: pb.clone(),
+            profile_id: "profile-coworker".to_string(),
+            registry_revision: 5,
+            policy: planning_only_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 2,
+                max_orchestrator_calls: 1,
+                max_architect_calls: 1,
+                max_timeout_ms_per_call: 30_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: 1_000,
+            expires_at_ms: 60_000,
+            operator_attested: true,
+        })
+        .expect("create planning grant");
+
+    let orch_res = fixture
+        .store
+        .reserve_planning_call(&ReservePlanningCallRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            grant_id: grant.grant_id.clone(),
+            request_key: "req-orch-job-a".to_string(),
+            expected_ledger_revision: None,
+            role: WorkflowRole::Orchestrator,
+            difficulty: Some(Difficulty::Hard),
+            selected_choice: headless_argon_choice(),
+            context_digest: job_a.work_brief_digest.clone(),
+            call_project_base: Some(pb.clone()),
+            current_time_ms: 2_000,
+        })
+        .expect("reserve orchestrator call for job A");
+    fixture
+        .store
+        .finalize_planning_call(&FinalizePlanningCallRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            grant_id: grant.grant_id,
+            reservation_id: orch_res.reservation_id,
+            expected_ledger_revision: None,
+            status: PlanningReservationStatus::Completed,
+            updated_at_ms: 2_500,
+            run_id: Some("run_orch_job_a".to_string()),
+            report_artifact_id: Some("art_orch_job_a".to_string()),
+            output_digest: Some(sha256_hex(b"orch-plan-job-a")),
+            diagnostic: None,
+        })
+        .expect("complete orchestrator reservation for job A");
+
+    // 2. An independent legacy/manual job B in the same binding with its own explicit immutable
+    // human approval (`planning_result == None`) must still bind normally.
+    let job_b = fixture
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-job-manual-b".to_string(),
+            expected_ledger_revision: None,
+            work_brief: sample_ready_brief(&fixture, "brf_manual_b", BINDING_A, THREAD_UUID_A),
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create independent manual job B");
+    assert!(job_b.planning_result.is_none());
+
+    let tasks_b = vec![PlanTask {
+        id: "task-manual-b".to_string(),
+        title: "Manual task B".to_string(),
+        instruction: "Edit src/lib.rs".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Hard,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/lib.rs".to_string()],
+    }];
+    let approval_b = publish_and_approve_plan(
+        &fixture,
+        "plan-manual-b",
+        BINDING_A,
+        THREAD_UUID_A,
+        tasks_b.clone(),
+        vec!["src/".to_string()],
+    );
+
+    let bound_b = fixture
+        .store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_b.job_id.clone(),
+                expected_job_revision: job_b.job_revision,
+                expected_ledger_revision: None,
+                approval_id: approval_b.clone(),
+                policy: execution_policy(),
+                controller_envelope: None,
+                task_interfaces: BTreeMap::new(),
+            },
+            &fixture.authority,
+        )
+        .expect("bind independent manual job B approval");
+    assert_eq!(bound_b.phase, CoworkerJobPhase::Executing);
+    assert_eq!(bound_b.tasks.len(), 1);
+
+    // 3. Preserve wrong-job plan ownership, stale revision, and superseded-job refusals.
+    let wrong_job_err = fixture
+        .store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_a.job_id.clone(),
+                expected_job_revision: job_a.job_revision,
+                expected_ledger_revision: None,
+                approval_id: approval_b,
+                policy: execution_policy(),
+                controller_envelope: None,
+                task_interfaces: BTreeMap::new(),
+            },
+            &fixture.authority,
+        )
+        .expect_err("plan_id owned by a different job must fail");
+    assert_eq!(
+        wrong_job_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let approval_a = publish_and_approve_plan(
+        &fixture,
+        "plan-job-a",
+        BINDING_A,
+        THREAD_UUID_A,
+        tasks_b,
+        vec!["src/".to_string()],
+    );
+    let stale_rev_err = fixture
+        .store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_a.job_id.clone(),
+                expected_job_revision: job_a.job_revision + 1,
+                expected_ledger_revision: None,
+                approval_id: approval_a.clone(),
+                policy: execution_policy(),
+                controller_envelope: None,
+                task_interfaces: BTreeMap::new(),
+            },
+            &fixture.authority,
+        )
+        .expect_err("stale expected_job_revision must fail closed");
+    assert_eq!(
+        stale_rev_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    fixture
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-job-a-supersede".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_planned_a_v2".to_string(),
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                project_base: pb,
+                kind: WorkBriefKind::Amendment {
+                    target_job_id: job_a.job_id.clone(),
+                    target_job_revision: job_a.job_revision,
+                    amendment_reason: "Supersede job A before approval".to_string(),
+                },
+                summary: "Amended job A".to_string(),
+                confirmed_requirements: vec!["Updated requirement".to_string()],
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("supersede job A");
+
+    let superseded_err = fixture
+        .store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_a.job_id,
+                expected_job_revision: 2,
+                expected_ledger_revision: None,
+                approval_id: approval_a,
+                policy: execution_policy(),
+                controller_envelope: None,
+                task_interfaces: BTreeMap::new(),
+            },
+            &fixture.authority,
+        )
+        .expect_err("superseded job must not bind execution approval");
+    assert_eq!(
+        superseded_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+}

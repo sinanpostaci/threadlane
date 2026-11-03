@@ -45,7 +45,7 @@ use threadlane_workers::{
     resolve_exact_tree_sha, validate_exact_40_hex_sha, validate_repo_relative_path,
     validate_sha256_hex_digest, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
-use threadlane_workflow::{Difficulty, ToolAdapter, WorkflowRole};
+use threadlane_workflow::{Difficulty, PlanStatus, ToolAdapter, WorkflowRole};
 
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -369,12 +369,46 @@ impl WorkBrief {
     /// Returns `true` only when the brief is valid, has confirmed requirements, and has no
     /// unresolved `open_questions` or unconfirmed `proposed_additions`.
     ///
-    /// Execution approval (`bind_job_approval`) strictly requires this gate so unapproved
-    /// proposals or unresolved questions can never authorize file writes or worker execution.
+    /// Execution approval (`bind_job_approval`) strictly requires either this gate or explicit
+    /// resolution/deferment in the job's recorded [`PlanningResultRef`] via
+    /// [`Self::is_ready_for_execution_approval_with_planning`] so unapproved proposals or
+    /// unresolved questions can never authorize file writes or worker execution.
     pub fn is_ready_for_execution_approval(&self) -> bool {
         self.is_ready_for_execution_planning()
             && self.open_questions.is_empty()
             && self.proposed_additions.is_empty()
+    }
+
+    /// Returns `true` when the brief is structurally valid, has confirmed requirements, and every
+    /// technical `open_questions` entry and unapproved `proposed_additions` entry is either absent
+    /// from the brief or explicitly resolved/deferred in `planning_result`.
+    ///
+    /// Unapproved `proposed_additions` are never silently promoted into `confirmed_requirements`
+    /// or executable scope; any `proposed_additions` present on the brief must be explicitly
+    /// listed in `planning_result.deferred_proposals` (confirming they remain excluded from the
+    /// planned scope), and any `open_questions` present on the brief must be explicitly listed in
+    /// `planning_result.resolved_open_questions`. If any question remains unresolved or any
+    /// proposal remains unaddressed, execution approval is blocked.
+    pub fn is_ready_for_execution_approval_with_planning(
+        &self,
+        planning_result: Option<&PlanningResultRef>,
+    ) -> bool {
+        if !self.is_ready_for_execution_planning() {
+            return false;
+        }
+        if self.open_questions.is_empty() && self.proposed_additions.is_empty() {
+            return true;
+        }
+        let Some(planning) = planning_result else {
+            return false;
+        };
+        self.open_questions
+            .iter()
+            .all(|q| planning.resolved_open_questions.iter().any(|rq| rq == q))
+            && self
+                .proposed_additions
+                .iter()
+                .all(|p| planning.deferred_proposals.iter().any(|dp| dp == p))
     }
 }
 
@@ -521,10 +555,13 @@ impl PlanningCallBudget {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanningGrantUsage {
-    /// Total calls currently reserved or consumed (`ReservedBeforeEffect + Completed + EffectUnknown`).
+    /// Total calls currently reserved or consumed (`ReservedBeforeEffect + Completed + FailedAfterEffect + EffectUnknown`).
     pub reserved_total_calls: u32,
     /// Total calls proven completed.
     pub completed_calls: u32,
+    /// Total calls proven to have terminated in a known provider, timeout, or output validation failure after effect (`FailedAfterEffect`; budget remains consumed).
+    #[serde(default)]
+    pub failed_calls: u32,
     /// Total calls whose effect is uncertain (`EffectUnknown`; budget remains consumed).
     pub unknown_effect_calls: u32,
     /// Total calls proven refused before any provider effect.
@@ -559,6 +596,10 @@ pub enum PlanningReservationStatus {
     RefusedBeforeEffect,
     /// Call completed and returned a verified read-only output digest.
     Completed,
+    /// Call crossed the provider execution boundary and terminated in a known provider, timeout,
+    /// output, or structured-schema validation failure; budget remains consumed as a known paid
+    /// failed call (never `EffectUnknown` and never an invented valid plan).
+    FailedAfterEffect,
     /// Call outcome is uncertain; budget stays consumed and automatic replay is forbidden.
     EffectUnknown,
 }
@@ -743,6 +784,7 @@ impl PlanningAdviceGrant {
 
         let mut calc_reserved = 0u32;
         let mut calc_completed = 0u32;
+        let mut calc_failed = 0u32;
         let mut calc_unknown = 0u32;
         let mut calc_refused = 0u32;
         let mut calc_orch = 0u32;
@@ -835,6 +877,15 @@ impl PlanningAdviceGrant {
                         calc_arch += 1;
                     }
                 }
+                PlanningReservationStatus::FailedAfterEffect => {
+                    calc_reserved += 1;
+                    calc_failed += 1;
+                    if res.role == WorkflowRole::Orchestrator {
+                        calc_orch += 1;
+                    } else {
+                        calc_arch += 1;
+                    }
+                }
                 PlanningReservationStatus::EffectUnknown => {
                     calc_reserved += 1;
                     calc_unknown += 1;
@@ -849,6 +900,7 @@ impl PlanningAdviceGrant {
 
         if self.usage.reserved_total_calls != calc_reserved
             || self.usage.completed_calls != calc_completed
+            || self.usage.failed_calls != calc_failed
             || self.usage.unknown_effect_calls != calc_unknown
             || self.usage.refused_before_effect_calls != calc_refused
             || self.usage.reserved_orchestrator_calls != calc_orch
@@ -2780,6 +2832,194 @@ impl CombinedCandidateIdentity {
     }
 }
 
+/// Interface ownership metadata assigned to a task during planning or when binding an
+/// [`ApprovalRecord`] to a job.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskInterfaceOwnershipSpec {
+    /// Logical interface identifiers owned/defined by the task.
+    #[serde(default)]
+    pub owned_interfaces: Vec<String>,
+    /// Logical interface identifiers consumed by the task.
+    #[serde(default)]
+    pub consumed_interfaces: Vec<String>,
+}
+
+impl TaskInterfaceOwnershipSpec {
+    /// Validates bounded unique interface identifiers and requires `owned_interfaces` and
+    /// `consumed_interfaces` on the same task to be disjoint.
+    pub fn validate(&self) -> Result<(), NativeError> {
+        validate_unique_id_list(
+            &self.owned_interfaces,
+            "owned_interfaces",
+            MAX_WORK_BRIEF_ITEMS,
+        )?;
+        validate_unique_id_list(
+            &self.consumed_interfaces,
+            "consumed_interfaces",
+            MAX_WORK_BRIEF_ITEMS,
+        )?;
+        for owned in &self.owned_interfaces {
+            if self.consumed_interfaces.iter().any(|c| c == owned) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "a task cannot both own and consume the same interface identifier",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Durable linkage on a [`CoworkerJobRecord`] binding a published plan revision to the exact
+/// verified Orchestrator planning reservation, report/output artifacts, [`WorkBrief`] digest,
+/// immutable call base, and profile/registry/policy provenance that produced it.
+///
+/// Recording a [`PlanningResultRef`] transitions a job to [`CoworkerJobPhase::AwaitingApproval`]
+/// and never grants execution approval; subsequent [`crate::coworker_workflow::CoworkerWorkflowStore::bind_job_approval`]
+/// enforces that the human-approved plan revision, digest, base, and task interface declarations
+/// match this exact planned result rather than an unrelated plan sharing the same base.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningResultRef {
+    /// Standing [`PlanningAdviceGrant::grant_id`] under which the plan was produced.
+    pub grant_id: String,
+    /// Completed Orchestrator [`PlanningCallReservation::reservation_id`].
+    pub reservation_id: String,
+    /// Idempotent Orchestrator planning `request_key`.
+    pub request_key: String,
+    /// Supervised read-only worker `run_id` that produced the plan.
+    pub run_id: String,
+    /// Private bounded report artifact identifier persisted for this planning call.
+    pub report_artifact_id: String,
+    /// 64-character lowercase hex SHA-256 digest of the verified structured Orchestrator output.
+    pub output_digest: String,
+    /// 64-character lowercase hex SHA-256 digest of the [`WorkBrief`] planned by this call.
+    pub work_brief_digest: String,
+    /// Canonical repository and exact immutable base commit/tree SHA inspected during planning.
+    pub project_base: CanonicalProjectBaseRef,
+    /// Pinned workflow profile identifier from the standing grant.
+    pub profile_id: String,
+    /// Pinned workflow registry revision (`>= 1`) from the standing grant.
+    pub registry_revision: u64,
+    /// 64-character lowercase hex SHA-256 digest of the standing grant's [`ExecutionPolicy`].
+    pub policy_digest: String,
+    /// Exact resolved Orchestrator worker choice that produced the plan.
+    pub selected_choice: SelectedRoleChoice,
+    /// Published [`threadlane_workflow::PlanSummary::plan_id`] in [`threadlane_workflow::PlanStore`].
+    pub plan_id: String,
+    /// Published [`threadlane_workflow::PlanSummary::revision`] (`>= 1`) in [`threadlane_workflow::PlanStore`].
+    pub plan_revision: u64,
+    /// 64-character lowercase hex SHA-256 `plan_digest` of the published plan revision.
+    pub plan_digest: String,
+    /// Published plan status (`PlanStatus::Published`).
+    pub plan_status: PlanStatus,
+    /// Per-task interface ownership declarations produced by the Orchestrator (`task_id -> TaskInterfaceOwnershipSpec`).
+    #[serde(default)]
+    pub task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    /// Optional [`ArchitectAdviceRecord::advice_id`] records consulted while producing this plan.
+    #[serde(default)]
+    pub architect_advice_ids: Vec<String>,
+    /// Technical `WorkBrief.open_questions` entries explicitly resolved by this published plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolved_open_questions: Vec<String>,
+    /// Unapproved `WorkBrief.proposed_additions` entries explicitly deferred and excluded from
+    /// executable scope by this published plan (never promoted into confirmed requirements).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_proposals: Vec<String>,
+    /// Timestamp (ms since Unix epoch) when the planning result was recorded.
+    pub recorded_at_ms: u64,
+}
+
+impl PlanningResultRef {
+    /// Validates all identifiers, SHA-256 digests, choice route, published plan status, and
+    /// per-task interface metadata.
+    pub fn validate(&self) -> Result<(), NativeError> {
+        validate_bounded_identifier(&self.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&self.reservation_id, "reservation_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&self.request_key, "request_key", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&self.run_id, "run_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(
+            &self.report_artifact_id,
+            "report_artifact_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_sha256_hex_digest(&self.output_digest, "planning_result.output_digest").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "planning_result.output_digest must be a 64-character lowercase hex SHA-256",
+                )
+            },
+        )?;
+        validate_sha256_hex_digest(&self.work_brief_digest, "planning_result.work_brief_digest")
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "planning_result.work_brief_digest must be a 64-character lowercase hex SHA-256",
+                )
+            })?;
+        self.project_base.validate_syntax()?;
+        validate_bounded_identifier(&self.profile_id, "profile_id", MAX_COWORKER_ID_LEN)?;
+        if self.registry_revision == 0 || self.plan_revision == 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "planning_result.registry_revision and plan_revision must be >= 1",
+            ));
+        }
+        validate_sha256_hex_digest(&self.policy_digest, "planning_result.policy_digest").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "planning_result.policy_digest must be a 64-character lowercase hex SHA-256",
+                )
+            },
+        )?;
+        validate_non_native_worker_choice(WorkflowRole::Orchestrator, &self.selected_choice)?;
+        validate_bounded_identifier(&self.plan_id, "plan_id", MAX_COWORKER_ID_LEN)?;
+        validate_sha256_hex_digest(&self.plan_digest, "planning_result.plan_digest").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "planning_result.plan_digest must be a 64-character lowercase hex SHA-256",
+                )
+            },
+        )?;
+        if !self.plan_status.is_active_published() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PlanningResultRef.plan_status must be an active published revision",
+            ));
+        }
+        if self.task_interfaces.len() > MAX_TASKS_PER_JOB {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PlanningResultRef.task_interfaces exceeds maximum task capacity",
+            ));
+        }
+        for (task_id, iface_spec) in &self.task_interfaces {
+            validate_bounded_identifier(task_id, "task_id", MAX_COWORKER_ID_LEN)?;
+            iface_spec.validate()?;
+        }
+        validate_unique_id_list(
+            &self.architect_advice_ids,
+            "architect_advice_ids",
+            MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING,
+        )?;
+        validate_unique_text_list(
+            &self.resolved_open_questions,
+            "planning_result.resolved_open_questions",
+            MAX_WORK_BRIEF_ITEMS,
+        )?;
+        validate_unique_text_list(
+            &self.deferred_proposals,
+            "planning_result.deferred_proposals",
+            MAX_WORK_BRIEF_ITEMS,
+        )?;
+        Ok(())
+    }
+}
+
 /// High-level lifecycle phase of a [`CoworkerJobRecord`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2826,6 +3066,9 @@ pub struct CoworkerJobRecord {
     pub work_brief_digest: String,
     /// Optional prior `job_id` amended/superseded by this job.
     pub supersedes_job_id: Option<String>,
+    /// Optional durable linkage to the verified Orchestrator planning run and published plan revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planning_result: Option<PlanningResultRef>,
     /// Immutable linkage to the operator [`ApprovalRecord`], once bound.
     pub approval_linkage: Option<FrozenApprovalLinkage>,
     /// Per-task state, attempts, candidates, dependencies, and holds.
@@ -2843,8 +3086,8 @@ pub struct CoworkerJobRecord {
 }
 
 impl CoworkerJobRecord {
-    /// Validates the job record, brief digest, immutable approval linkage, tasks, holds, outbox,
-    /// and combined candidates.
+    /// Validates the job record, brief digest, planning result linkage, immutable approval linkage,
+    /// tasks, holds, outbox, and combined candidates.
     pub fn validate(&self) -> Result<(), NativeError> {
         validate_bounded_identifier(&self.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
         if self.job_revision == 0 {
@@ -2892,6 +3135,42 @@ impl CoworkerJobRecord {
             }
         }
 
+        if let Some(ref planning_result) = self.planning_result {
+            planning_result.validate()?;
+            if planning_result.work_brief_digest != self.work_brief_digest {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PlanningResultRef.work_brief_digest does not match CoworkerJobRecord.work_brief_digest",
+                ));
+            }
+            if planning_result.project_base != self.work_brief.project_base {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PlanningResultRef.project_base does not match WorkBrief.project_base",
+                ));
+            }
+            if planning_result
+                .resolved_open_questions
+                .iter()
+                .any(|rq| !self.work_brief.open_questions.iter().any(|q| q == rq))
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PlanningResultRef.resolved_open_questions contains an entry not present in WorkBrief.open_questions",
+                ));
+            }
+            if planning_result
+                .deferred_proposals
+                .iter()
+                .any(|dp| !self.work_brief.proposed_additions.iter().any(|p| p == dp))
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PlanningResultRef.deferred_proposals contains an entry not present in WorkBrief.proposed_additions",
+                ));
+            }
+        }
+
         if let Some(ref linkage) = self.approval_linkage {
             linkage.validate()?;
             if linkage.project_base != self.work_brief.project_base {
@@ -2899,6 +3178,20 @@ impl CoworkerJobRecord {
                     NativeErrorCode::ValidationFailed,
                     "FrozenApprovalLinkage.project_base does not match WorkBrief.project_base",
                 ));
+            }
+            if let Some(ref planning_result) = self.planning_result {
+                if linkage.plan_id != planning_result.plan_id
+                    || linkage.plan_revision != planning_result.plan_revision
+                    || linkage.plan_digest != planning_result.plan_digest
+                    || linkage.profile_id != planning_result.profile_id
+                    || linkage.registry_revision != planning_result.registry_revision
+                    || linkage.project_base != planning_result.project_base
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "FrozenApprovalLinkage does not match the job's recorded PlanningResultRef plan id, revision, digest, profile, or base",
+                    ));
+                }
             }
         } else if !self.tasks.is_empty()
             || !self.outbox.is_empty()
