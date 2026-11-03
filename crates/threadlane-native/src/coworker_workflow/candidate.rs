@@ -1,7 +1,7 @@
 //! Verified combined-candidate assembly, check evidence verification, and single-closure
 //! reservation/execution over [`threadlane_operations`] and [`CoworkerWorkflowStore`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -9,33 +9,36 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_authority::AuthorityStore;
 use threadlane_operations::{
-    inspect_final_candidate_readonly, load_integration_receipt, load_review_receipt,
-    verify_final_candidate_subject_readonly, verify_legacy_base_closure_insufficient,
-    ClosureAttemptRecord, ClosureExecutionEvidence, ClosureReservationOutcome,
-    ClosureTerminalFailure, ClosureVerdict, ClosureVerdictKind, FinalCandidateClosureStore,
-    FinalCandidatePolicyBinding, FinalCandidateSubject, FinalCandidateTaskInput,
-    InspectFinalCandidateRequest, MarkClosureSubmittedRequest, MarkClosureUnknownRequest,
-    OperationsError, ReconcileClosureAttemptRequest, RecordClosureFailureRequest,
-    RecordClosureVerdictRequest, ReserveClosureAttemptRequest, TestEvidenceSummary,
+    inspect_final_candidate_readonly, inspect_job_integration_intent_readonly,
+    load_integration_receipt, load_review_receipt, verify_final_candidate_subject_readonly,
+    verify_legacy_base_closure_insufficient, ClosureAttemptRecord, ClosureExecutionEvidence,
+    ClosureReservationOutcome, ClosureTerminalFailure, ClosureVerdict, ClosureVerdictKind,
+    FinalCandidateClosureStore, FinalCandidatePolicyBinding, FinalCandidateSubject,
+    FinalCandidateTaskInput, InspectFinalCandidateRequest, IntegrationReceipt,
+    JobIntegrationIntentState, JobIntegrationReport, MarkClosureSubmittedRequest,
+    MarkClosureUnknownRequest, OperationsError, ReconcileClosureAttemptRequest,
+    RecordClosureFailureRequest, RecordClosureVerdictRequest, ReserveClosureAttemptRequest,
+    ReviewReceipt, TestEvidenceSummary,
 };
 use threadlane_workers::{
-    resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target,
-    run_advisory_worker_with_structured_result, validate_exact_40_hex_sha,
+    load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    resolve_model_target, run_advisory_worker_with_structured_result, validate_exact_40_hex_sha,
     validate_executable_file, validate_sha256_hex_digest, AdvisoryResponseBudget,
     AdvisoryStructuredExecution, AdvisoryWorkerSpec, ExecutionBudgets, WorkerFilePermissions,
-    WorkerProvider, WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    WorkerProvider, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, validate_non_native_worker_choice, AcceptedPredecessorReceiptRef,
     CandidateCheckEvidence, CombinedCandidateIdentity, CombinedCandidateStatus, CoworkerJobPhase,
-    CoworkerJobRecord, CoworkerTaskStage, MAX_COWORKER_ID_LEN,
+    CoworkerJobRecord, CoworkerTaskRecord, CoworkerTaskStage, FrozenApprovalLinkage,
+    TaskCandidateRef, MAX_COWORKER_ID_LEN,
 };
 use crate::coworker_workflow::controller_policy::{
-    verify_live_approval_and_registry, ClosureExecutionArtifactRecord, ControllerPolicyStore,
-    FrozenControllerExecutionEnvelope, PendingControllerEffect, PendingControllerEffectKind,
-    PendingControllerEffectStatus,
+    verify_live_approval_and_registry, ClosureExecutionArtifactRecord, ControllerJobRuntimeState,
+    ControllerPolicyStore, FrozenControllerExecutionEnvelope, PendingControllerEffect,
+    PendingControllerEffectKind, PendingControllerEffectStatus,
 };
 use crate::coworker_workflow::store::{
     CoworkerLedgerMutationOutcome, CoworkerWorkflowStore, RecordCombinedCandidateRequest,
@@ -129,6 +132,27 @@ pub struct AssembleOperationsFinalCandidateRequest {
     pub reserve_closure_attempt: bool,
     /// Wall-clock timestamp (milliseconds since Unix epoch).
     pub reserved_at_ms: i64,
+}
+
+/// Request to inspect and assemble a verified combined candidate from an owned
+/// `WorktreeKind::RunIntegration` checkout populated by
+/// [`threadlane_operations::execute_job_integration`].
+///
+/// Wraps [`AssembleOperationsFinalCandidateRequest`] together with the [`JobIntegrationReport`]
+/// from the multi-worker job integration step. Caller-supplied `job_integration_report` status,
+/// hashes, and receipt IDs are not trusted on their own: the assembler independently loads and
+/// verifies the persisted `Completed` [`threadlane_operations::JobIntegrationIntent`] and every
+/// persisted job-aggregated [`IntegrationReceipt`] on disk, while preserving original per-worker
+/// `integration_receipt_id` values on task candidates and [`CombinedCandidateIdentity`] for
+/// downstream dependency seals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssembleJobAggregateCandidateRequest {
+    /// Underlying operations candidate assembly and optional closure reservation request.
+    pub candidate: AssembleOperationsFinalCandidateRequest,
+    /// Job-scoped multi-worker integration report whose persisted intent and receipts on disk
+    /// must match the live job, frozen approval, and target `RunIntegration` worktree.
+    pub job_integration_report: JobIntegrationReport,
 }
 
 /// Outcome of assembling and inspecting a final candidate via [`threadlane_operations`].
@@ -664,6 +688,45 @@ impl CoworkerCandidateService {
         policy_store: &ControllerPolicyStore,
         request: &AssembleOperationsFinalCandidateRequest,
     ) -> Result<AssembleOperationsFinalCandidateOutcome, NativeError> {
+        self.assemble_and_inspect_operations_candidate_internal(
+            authority,
+            policy_store,
+            request,
+            None,
+        )
+    }
+
+    /// Inspects and assembles a verified combined candidate from a target
+    /// `WorktreeKind::RunIntegration` worktree populated by
+    /// [`threadlane_operations::execute_job_integration`].
+    ///
+    /// Independently loads and verifies the persisted `Completed`
+    /// [`threadlane_operations::JobIntegrationIntent`] and every persisted job-aggregated
+    /// [`IntegrationReceipt`] on disk, binds `FinalCandidateTaskInput` to the logical job task IDs
+    /// and verified aggregate receipts, and preserves the original per-worker
+    /// `integration_receipt_id` values on task candidate records and [`CombinedCandidateIdentity`]
+    /// for downstream dependency seals.
+    pub fn assemble_and_inspect_job_aggregate_candidate(
+        &self,
+        authority: &AuthorityStore,
+        policy_store: &ControllerPolicyStore,
+        request: &AssembleJobAggregateCandidateRequest,
+    ) -> Result<AssembleOperationsFinalCandidateOutcome, NativeError> {
+        self.assemble_and_inspect_operations_candidate_internal(
+            authority,
+            policy_store,
+            &request.candidate,
+            Some(&request.job_integration_report),
+        )
+    }
+
+    fn assemble_and_inspect_operations_candidate_internal(
+        &self,
+        authority: &AuthorityStore,
+        policy_store: &ControllerPolicyStore,
+        request: &AssembleOperationsFinalCandidateRequest,
+        job_integration_report: Option<&JobIntegrationReport>,
+    ) -> Result<AssembleOperationsFinalCandidateOutcome, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.request_key, "request_key", MAX_COWORKER_ID_LEN)?;
@@ -694,6 +757,17 @@ impl CoworkerCandidateService {
                 )
             })?;
 
+        let is_idempotent_request_key = job
+            .combined_candidates
+            .iter()
+            .any(|c| c.request_key == request.request_key);
+        if !is_idempotent_request_key && job.job_revision != request.expected_job_revision {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "expected_job_revision does not match current job_revision",
+            ));
+        }
+
         let runtime = policy_store
             .read_job_runtime(&request.binding_id, &request.job_id)?
             .ok_or_else(|| {
@@ -702,6 +776,12 @@ impl CoworkerCandidateService {
                     "ControllerJobRuntimeState with frozen execution envelope is required before assembling operations candidate",
                 )
             })?;
+        if runtime.stop_requested {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "cannot assemble operations candidate while controller stop_requested is active",
+            ));
+        }
         runtime.envelope.verify_matches_job(job)?;
         let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
             NativeError::new(
@@ -718,6 +798,7 @@ impl CoworkerCandidateService {
                 )
             })?;
         verify_live_approval_and_registry(&approval, job, &runtime.envelope.policy, authority)?;
+        verify_approval_tasks_match_job(&approval, job)?;
 
         if !runtime.envelope.allow_run_integration_execution {
             return Err(NativeError::new(
@@ -731,8 +812,25 @@ impl CoworkerCandidateService {
 
         let predecessor_receipts = self.verify_task_candidates_for_job(job)?;
 
+        let repo_path = PathBuf::from(&linkage.project_base.repository_path);
+        let expected_aggregate_write_paths: BTreeSet<String> = job
+            .tasks
+            .iter()
+            .flat_map(|t| t.write_paths.iter().cloned())
+            .collect();
+        let verified_agg_receipts = match job_integration_report {
+            Some(report) => Some(verify_persisted_job_aggregation_for_candidate(
+                job,
+                linkage,
+                request,
+                &repo_path,
+                &expected_aggregate_write_paths,
+                report,
+            )?),
+            None => None,
+        };
+
         let mut ops_predecessors = Vec::with_capacity(job.tasks.len());
-        let mut expected_aggregate_write_paths = BTreeSet::new();
         for task in &job.tasks {
             let acc_id = task.accepted_candidate_id.as_ref().ok_or_else(|| {
                 NativeError::new(
@@ -768,17 +866,48 @@ impl CoworkerCandidateService {
             let integration_receipt =
                 load_integration_receipt(&request.work_area_root, integration_receipt_id)
                     .map_err(map_operations_error)?;
+            verify_original_task_proofs(
+                &repo_path,
+                &request.work_area_root,
+                task,
+                cand,
+                &review_receipt,
+                &integration_receipt,
+                &runtime,
+            )?;
 
-            for p in &task.write_paths {
-                expected_aggregate_write_paths.insert(p.clone());
-            }
+            let (ops_task_id, ops_integration_receipt_id) =
+                if let Some(ref agg_map) = verified_agg_receipts {
+                    let agg_receipt = agg_map.get(&task.task_id).ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            format!(
+                                "job integration report is missing receipt for logical task `{}`",
+                                task.task_id
+                            ),
+                        )
+                    })?;
+                    verify_task_matches_aggregate_receipt(
+                        task,
+                        cand,
+                        &review_receipt,
+                        &integration_receipt,
+                        agg_receipt,
+                    )?;
+                    (task.task_id.clone(), agg_receipt.receipt_id.clone())
+                } else {
+                    (
+                        review_receipt.task_id.clone(),
+                        integration_receipt.receipt_id.clone(),
+                    )
+                };
 
             ops_predecessors.push(FinalCandidateTaskInput {
-                task_id: review_receipt.task_id.clone(),
+                task_id: ops_task_id,
                 task_digest: task.task_digest.clone(),
                 task_worktree_id: review_receipt.task_worktree_id.clone(),
                 review_receipt_id: review_receipt.receipt_id.clone(),
-                integration_receipt_id: integration_receipt.receipt_id.clone(),
+                integration_receipt_id: ops_integration_receipt_id,
                 expected_execution_base_commit: Some(review_receipt.base_commit.clone()),
                 expected_allowed_write_paths: Some(
                     task.write_paths.iter().cloned().collect::<BTreeSet<_>>(),
@@ -819,7 +948,14 @@ impl CoworkerCandidateService {
             require_passing_checks: true,
         };
 
-        let repo_path = PathBuf::from(&linkage.project_base.repository_path);
+        let (expected_candidate_head_commit, expected_candidate_tree_sha) =
+            match job_integration_report {
+                Some(report) => (
+                    Some(report.final_integrated_target_commit.clone()),
+                    Some(report.final_integrated_tree_sha.clone()),
+                ),
+                None => (None, None),
+            };
         let final_subject = inspect_final_candidate_readonly(&InspectFinalCandidateRequest {
             repository_path: repo_path.clone(),
             work_area_root: request.work_area_root.clone(),
@@ -827,8 +963,8 @@ impl CoworkerCandidateService {
             integration_worktree_id: request.integration_worktree_id.clone(),
             approved_base_commit: linkage.project_base.base_commit.clone(),
             expected_source_head_commit: linkage.project_base.base_commit.clone(),
-            expected_candidate_head_commit: None,
-            expected_candidate_tree_sha: None,
+            expected_candidate_head_commit,
+            expected_candidate_tree_sha,
             predecessor_tasks: ops_predecessors,
             expected_aggregate_write_paths: Some(expected_aggregate_write_paths),
             policy: policy_binding,
@@ -933,6 +1069,7 @@ impl CoworkerCandidateService {
 
         verify_final_candidate_subject_readonly(&request.final_subject)
             .map_err(map_operations_error)?;
+        verify_subject_job_aggregation_intent_if_present(&request.final_subject)?;
 
         let ledger = self.store.read_binding_ledger(&request.binding_id)?;
         ensure_ledger_thread_scope(&ledger.thread_uuid, &request.thread_uuid)?;
@@ -1578,6 +1715,8 @@ impl CoworkerCandidateService {
         work_area_root: &Path,
         request: &ReconcileClosureAttemptRequest,
     ) -> Result<(u64, ClosureAttemptRecord, ClosureVerdict), NativeError> {
+        verify_final_candidate_subject_readonly(&request.subject).map_err(map_operations_error)?;
+        verify_subject_job_aggregation_intent_if_present(&request.subject)?;
         let closure_store = FinalCandidateClosureStore::open(repository_path, work_area_root)
             .map_err(map_operations_error)?;
         closure_store
@@ -1673,6 +1812,12 @@ impl CoworkerCandidateService {
         if let Err(err) = verify_final_candidate_subject_readonly(&request.final_subject) {
             return Err(format!(
                 "candidate subject drifted during closure execution: {err}"
+            ));
+        }
+        if let Err(err) = verify_subject_job_aggregation_intent_if_present(&request.final_subject) {
+            return Err(format!(
+                "job aggregation intent drifted during closure execution: {}",
+                err.message
             ));
         }
         let ledger = self
@@ -2169,6 +2314,391 @@ fn classify_local_closure_worker_failure(
             structured_exec.execution.status.as_str()
         ),
     )
+}
+
+fn verify_approval_tasks_match_job(
+    approval: &threadlane_authority::ApprovalRecord,
+    job: &CoworkerJobRecord,
+) -> Result<(), NativeError> {
+    if approval.tasks.len() != job.tasks.len() {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord task count does not match job.tasks length",
+        ));
+    }
+    for (approved_task, job_task) in approval.tasks.iter().zip(job.tasks.iter()) {
+        if approved_task.task_id != job_task.task_id
+            || !constant_time_str_eq(&approved_task.task_digest, &job_task.task_digest)
+            || approved_task.allowed_write_paths != job_task.write_paths
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "ApprovalRecord task `{}` drifted from job task",
+                    job_task.task_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_original_task_proofs(
+    repo_path: &Path,
+    work_area_root: &Path,
+    task: &CoworkerTaskRecord,
+    cand: &TaskCandidateRef,
+    review_receipt: &ReviewReceipt,
+    orig_int: &IntegrationReceipt,
+    runtime: &ControllerJobRuntimeState,
+) -> Result<(), NativeError> {
+    if orig_int.job_aggregation.is_some() {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "accepted task candidate integration_receipt_id must reference its original per-worker IntegrationReceipt",
+        ));
+    }
+    let manifest = load_and_verify_manifest(work_area_root, &review_receipt.task_worktree_id)
+        .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+    if manifest.repository_path != repo_path
+        || manifest.kind != WorktreeKind::Task
+        || manifest.task_id.as_deref() != Some(review_receipt.task_id.as_str())
+        || manifest.task_id.as_deref() != Some(orig_int.task_id.as_str())
+        || manifest.run_id != review_receipt.run_id
+        || orig_int.run_id != review_receipt.run_id
+        || orig_int.task_worktree_id != review_receipt.task_worktree_id
+        || orig_int.review_receipt_id != review_receipt.receipt_id
+        || !constant_time_str_eq(
+            &orig_int.review_receipt_digest,
+            &review_receipt.receipt_digest,
+        )
+        || !constant_time_str_eq(
+            &orig_int.review_subject_digest,
+            &review_receipt.subject_digest,
+        )
+        || !constant_time_str_eq(&review_receipt.task_head_commit, &cand.head_commit)
+        || !constant_time_str_eq(&orig_int.accepted_task_head_commit, &cand.head_commit)
+        || !constant_time_str_eq(&review_receipt.task_tree_sha, &cand.tree_sha)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "task `{}` original review/integration receipts or manifest do not match candidate",
+                task.task_id
+            ),
+        ));
+    }
+    if let Some(art) = runtime.get_attempt_artifacts(&task.task_id, cand.attempt_no) {
+        if art
+            .review_receipt
+            .as_ref()
+            .is_some_and(|r| r != review_receipt)
+            || art
+                .integration_receipt
+                .as_ref()
+                .is_some_and(|i| i != orig_int || i.job_aggregation.is_some())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "runtime attempt_artifacts receipts drifted or were overwritten",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_persisted_job_aggregation_for_candidate(
+    job: &CoworkerJobRecord,
+    linkage: &FrozenApprovalLinkage,
+    request: &AssembleOperationsFinalCandidateRequest,
+    repo_path: &Path,
+    expected_aggregate_write_paths: &BTreeSet<String>,
+    report: &JobIntegrationReport,
+) -> Result<BTreeMap<String, IntegrationReceipt>, NativeError> {
+    if report.job_scope.job_id != job.job_id
+        || report.job_scope.approval_id != linkage.approval_id
+        || !constant_time_str_eq(
+            &report.job_scope.approval_subject_digest,
+            &linkage.approval_subject_digest,
+        )
+        || report.job_scope.target_integration_run_id != request.run_id
+        || &report.job_scope.aggregate_allowed_write_paths != expected_aggregate_write_paths
+        || report.integration_worktree_id != request.integration_worktree_id
+        || report.repository_path != repo_path
+        || report.work_area_root != request.work_area_root
+        || !constant_time_str_eq(
+            &report.approved_base_commit,
+            &linkage.project_base.base_commit,
+        )
+        || !constant_time_str_eq(
+            &report.source_head_commit,
+            &linkage.project_base.base_commit,
+        )
+        || !constant_time_str_eq(
+            &report.initial_integration_head_commit,
+            &linkage.project_base.base_commit,
+        )
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "JobIntegrationReport scope or target paths do not match live job, approval linkage, or RunIntegration worktree",
+        ));
+    }
+    let persisted_intent = inspect_job_integration_intent_readonly(
+        &request.work_area_root,
+        &request.integration_worktree_id,
+    )
+    .map_err(map_operations_error)?
+    .ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "persisted JobIntegrationIntent was not found on disk for target integration_worktree_id",
+        )
+    })?;
+    persisted_intent
+        .verify_integrity()
+        .map_err(map_operations_error)?;
+    report
+        .intent
+        .verify_integrity()
+        .map_err(map_operations_error)?;
+    if persisted_intent.state != JobIntegrationIntentState::Completed {
+        return Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "persisted JobIntegrationIntent is not in Completed state",
+        ));
+    }
+    if persisted_intent != report.intent
+        || persisted_intent.job_scope != report.job_scope
+        || persisted_intent.integration_worktree_id != request.integration_worktree_id
+        || persisted_intent.repository_path != repo_path
+        || persisted_intent.work_area_root != request.work_area_root
+        || !constant_time_str_eq(
+            &persisted_intent.approved_base_commit,
+            &linkage.project_base.base_commit,
+        )
+        || !constant_time_str_eq(
+            &persisted_intent.expected_source_head_commit,
+            &linkage.project_base.base_commit,
+        )
+        || !constant_time_str_eq(
+            &persisted_intent.initial_integration_head_commit,
+            &linkage.project_base.base_commit,
+        )
+        || persisted_intent.final_integrated_target_commit.as_deref()
+            != Some(report.final_integrated_target_commit.as_str())
+        || persisted_intent.final_integrated_tree_sha.as_deref()
+            != Some(report.final_integrated_tree_sha.as_str())
+        || persisted_intent.tasks.len() != job.tasks.len()
+        || report.receipts.len() != job.tasks.len()
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "JobIntegrationReport does not match persisted Completed JobIntegrationIntent or job task count",
+        ));
+    }
+
+    let mut expected_prev_commit = persisted_intent.initial_integration_head_commit.clone();
+    let mut by_logical_task = BTreeMap::new();
+    for (planned, report_receipt) in persisted_intent.tasks.iter().zip(report.receipts.iter()) {
+        let disk_receipt =
+            load_integration_receipt(&request.work_area_root, &planned.planned_receipt_id)
+                .map_err(map_operations_error)?;
+        let Some(ref agg) = disk_receipt.job_aggregation else {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "persisted job integration receipt is missing job_aggregation provenance",
+            ));
+        };
+        if &disk_receipt != report_receipt
+            || !constant_time_str_eq(
+                &disk_receipt.previous_integration_head_commit,
+                &expected_prev_commit,
+            )
+            || disk_receipt.integration_worktree_id != request.integration_worktree_id
+            || disk_receipt.run_id != planned.original_run_id
+            || disk_receipt.task_worktree_id != planned.task_worktree_id
+            || disk_receipt.review_receipt_id != planned.review_receipt_id
+            || !constant_time_str_eq(
+                &disk_receipt.review_receipt_digest,
+                &planned.review_receipt_digest,
+            )
+            || !constant_time_str_eq(
+                &disk_receipt.review_subject_digest,
+                &planned.review_subject_digest,
+            )
+            || !constant_time_str_eq(
+                &disk_receipt.accepted_task_head_commit,
+                &planned.accepted_task_head_commit,
+            )
+            || !constant_time_str_eq(&agg.accepted_task_tree_sha, &planned.accepted_task_tree_sha)
+            || !constant_time_str_eq(
+                &agg.accepted_task_diff_digest,
+                &planned.accepted_task_diff_digest,
+            )
+            || !constant_time_str_eq(&agg.proposal_digest, &planned.proposal_digest)
+            || agg.job_id != job.job_id
+            || agg.approval_id != linkage.approval_id
+            || !constant_time_str_eq(
+                &agg.approval_subject_digest,
+                &linkage.approval_subject_digest,
+            )
+            || !constant_time_str_eq(&agg.intent_id, &persisted_intent.intent_id)
+            || agg.command_key != persisted_intent.command_key
+            || agg.logical_task_id != planned.task_id
+            || !constant_time_str_eq(&agg.task_digest, &planned.task_digest)
+            || agg.original_task_run_id != planned.original_run_id
+            || agg.target_integration_run_id != request.run_id
+            || !constant_time_str_eq(&agg.approved_base_commit, &linkage.project_base.base_commit)
+            || &agg.job_aggregate_allowed_write_paths != expected_aggregate_write_paths
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "persisted job-aggregated IntegrationReceipt or provenance does not match JobIntegrationIntent",
+            ));
+        }
+        expected_prev_commit = disk_receipt.integrated_target_commit.clone();
+        if by_logical_task
+            .insert(agg.logical_task_id.clone(), disk_receipt)
+            .is_some()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "duplicate logical_task_id in JobIntegrationReport receipts",
+            ));
+        }
+    }
+    if !constant_time_str_eq(
+        &expected_prev_commit,
+        &report.final_integrated_target_commit,
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "job integration receipt commit chain does not terminate at final_integrated_target_commit",
+        ));
+    }
+    Ok(by_logical_task)
+}
+
+fn verify_task_matches_aggregate_receipt(
+    task: &CoworkerTaskRecord,
+    cand: &TaskCandidateRef,
+    review_receipt: &ReviewReceipt,
+    orig_int: &IntegrationReceipt,
+    agg_receipt: &IntegrationReceipt,
+) -> Result<(), NativeError> {
+    if agg_receipt.receipt_id == orig_int.receipt_id {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "job-aggregated IntegrationReceipt must not overwrite or reuse original integration_receipt_id",
+        ));
+    }
+    let Some(ref agg) = agg_receipt.job_aggregation else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "aggregate receipt is missing job_aggregation provenance",
+        ));
+    };
+    let expected_writes: BTreeSet<String> = task.write_paths.iter().cloned().collect();
+    if agg.logical_task_id != task.task_id
+        || !constant_time_str_eq(&agg.task_digest, &task.task_digest)
+        || agg.original_task_run_id != review_receipt.run_id
+        || agg_receipt.run_id != review_receipt.run_id
+        || agg_receipt.task_id != review_receipt.task_id
+        || agg_receipt.task_worktree_id != review_receipt.task_worktree_id
+        || agg_receipt.review_receipt_id != review_receipt.receipt_id
+        || !constant_time_str_eq(
+            &agg_receipt.review_receipt_digest,
+            &review_receipt.receipt_digest,
+        )
+        || !constant_time_str_eq(
+            &agg_receipt.review_subject_digest,
+            &review_receipt.subject_digest,
+        )
+        || !constant_time_str_eq(&agg_receipt.accepted_task_head_commit, &cand.head_commit)
+        || !constant_time_str_eq(&agg.accepted_task_tree_sha, &cand.tree_sha)
+        || !constant_time_str_eq(&agg.accepted_task_diff_digest, &review_receipt.diff_digest)
+        || agg.task_allowed_write_paths != expected_writes
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "job-aggregated receipt for `{}` does not match original review receipt",
+                task.task_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_subject_job_aggregation_intent_if_present(
+    subject: &FinalCandidateSubject,
+) -> Result<(), NativeError> {
+    let mut agg_count = 0usize;
+    for pred in &subject.predecessors {
+        let receipt =
+            load_integration_receipt(&subject.work_area_root, &pred.integration_receipt_id)
+                .map_err(map_operations_error)?;
+        if receipt.job_aggregation.is_some() {
+            agg_count += 1;
+        }
+    }
+    if agg_count == 0 {
+        return Ok(());
+    }
+    if agg_count != subject.predecessors.len() {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "FinalCandidateSubject mixes legacy same-run and job-aggregated integration receipts",
+        ));
+    }
+    let intent = inspect_job_integration_intent_readonly(
+        &subject.work_area_root,
+        &subject.integration_worktree_id,
+    )
+    .map_err(map_operations_error)?
+    .ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "persisted JobIntegrationIntent missing for job-aggregated FinalCandidateSubject",
+        )
+    })?;
+    intent.verify_integrity().map_err(map_operations_error)?;
+    let planned_by_task: BTreeMap<&str, _> = intent
+        .tasks
+        .iter()
+        .map(|t| (t.task_id.as_str(), t))
+        .collect();
+    if intent.state != JobIntegrationIntentState::Completed
+        || intent.job_scope.target_integration_run_id != subject.run_id
+        || intent.integration_worktree_id != subject.integration_worktree_id
+        || intent.repository_path != subject.repository_path
+        || intent.work_area_root != subject.work_area_root
+        || intent.job_scope.approval_id != subject.policy.approval_id
+        || !constant_time_str_eq(
+            &intent.job_scope.approval_subject_digest,
+            &subject.policy.approval_subject_digest,
+        )
+        || !constant_time_str_eq(&intent.approved_base_commit, &subject.approved_base_commit)
+        || intent.job_scope.aggregate_allowed_write_paths != subject.aggregate_allowed_write_paths
+        || intent.final_integrated_target_commit.as_deref()
+            != Some(subject.candidate_head_commit.as_str())
+        || intent.final_integrated_tree_sha.as_deref() != Some(subject.candidate_tree_sha.as_str())
+        || planned_by_task.len() != subject.predecessors.len()
+        || !subject.predecessors.iter().all(|pred| {
+            planned_by_task.get(pred.task_id.as_str()).is_some_and(|p| {
+                p.planned_receipt_id == pred.integration_receipt_id
+                    && p.review_receipt_id == pred.review_receipt_id
+                    && constant_time_str_eq(&p.task_digest, &pred.task_digest)
+            })
+        })
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "persisted JobIntegrationIntent does not match job-aggregated FinalCandidateSubject",
+        ));
+    }
+    Ok(())
 }
 
 fn now_epoch_ms() -> i64 {

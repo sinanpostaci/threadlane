@@ -9,8 +9,9 @@ use std::time::Duration;
 use tempfile::TempDir;
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
 use threadlane_native::coworker_workflow::candidate::{
-    AssembleOperationsFinalCandidateRequest, AssembleVerifiedCandidateRequest,
-    CoworkerCandidateService, ExecuteFinalCandidateClosureRequest, StructuredClosureModelResponse,
+    AssembleJobAggregateCandidateRequest, AssembleOperationsFinalCandidateRequest,
+    AssembleVerifiedCandidateRequest, CoworkerCandidateService,
+    ExecuteFinalCandidateClosureRequest, StructuredClosureModelResponse,
     STRUCTURED_CLOSURE_RESPONSE_SCHEMA_VERSION,
 };
 use threadlane_native::coworker_workflow::controller_policy::{
@@ -34,11 +35,13 @@ use threadlane_native::{
 };
 use threadlane_operations::{
     accept_review_subject, commit_task_worktree_changes, execute_integration,
-    inspect_review_subject, verify_final_candidate_subject_readonly, ClosureAttemptState,
-    ClosureVerdictKind, CommitTaskChangesRequest, ExecuteIntegrationRequest,
+    execute_job_integration, inspect_review_subject, load_integration_receipt,
+    verify_final_candidate_subject_readonly, ClosureAttemptState, ClosureVerdictKind,
+    CommitTaskChangesRequest, ExecuteIntegrationRequest, ExecuteJobIntegrationRequest,
     FinalCandidateClosureStore, FinalCandidateSubject, InspectReviewSubjectRequest,
-    IntegrationReceipt, IntegrationStrategy, MarkClosureSubmittedRequest,
-    ReserveClosureAttemptRequest, ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt,
+    IntegrationReceipt, IntegrationStrategy, JobIntegrationScopeProvenance,
+    JobIntegrationTaskInput, MarkClosureSubmittedRequest, ReserveClosureAttemptRequest,
+    ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt, ReviewSubject,
     TestEvidenceSummary,
 };
 use threadlane_workers::{
@@ -1975,5 +1978,426 @@ async fn verify_candidate_worktree_drift_during_closure_run() {
     assert_eq!(tf.failure_code, "post_completion_fenced");
     assert!(tf.fenced_late_output);
     assert_ne!(drift_outcome.job.phase, CoworkerJobPhase::Completed);
+    assert_primary_checkout_untouched(&fixture);
+}
+
+struct WorkerRunPredecessorTask {
+    logical_task_id: String,
+    worker_run_id: String,
+    task_manifest: WorktreeManifest,
+    subject: ReviewSubject,
+    review_receipt: ReviewReceipt,
+    orig_integration_receipt: IntegrationReceipt,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_review_and_integrate_worker_run_task(
+    fixture: &CandidateServiceFixture,
+    logical_task_id: &str,
+    manifest_task_id: &str,
+    worker_run_id: &str,
+    token: &str,
+    rel_file: &str,
+    new_contents: &str,
+    timestamp_ms: i64,
+) -> WorkerRunPredecessorTask {
+    let manager = WorktreeManager::new(
+        &fixture.repo_dir,
+        &fixture.work_area_root,
+        &fixture.base_commit,
+    )
+    .expect("WorktreeManager::new");
+    let mut allowed = BTreeSet::new();
+    allowed.insert(rel_file.to_string());
+
+    let worker_int_manifest = manager
+        .create_run_worktree_with_token(worker_run_id, &format!("wint_{token}"))
+        .expect("create per-worker RunIntegration worktree");
+    let task_manifest = manager
+        .create_task_worktree_with_token(worker_run_id, manifest_task_id, token, &allowed)
+        .expect("create per-worker Task worktree");
+    fs::write(task_manifest.checkout_path.join(rel_file), new_contents)
+        .expect("write task modification");
+
+    commit_task_worktree_changes(&CommitTaskChangesRequest {
+        work_area_root: fixture.work_area_root.clone(),
+        task_worktree_id: task_manifest.worktree_id.clone(),
+        commit_message: format!("Implement {logical_task_id} ({manifest_task_id})"),
+        worker_status: Some(WorkerRunStatus::Succeeded),
+        allow_missing_effort_evidence: false,
+    })
+    .expect("commit task changes");
+
+    let policy = ReviewPolicyBinding {
+        policy_id: "policy-coworker-exec".to_string(),
+        requested_provider: Some("antigravity".to_string()),
+        requested_model: Some("gemini-4-argon-high".to_string()),
+        requested_effort: Some("high".to_string()),
+        observed_model: Some("gemini-4-argon-high".to_string()),
+        observed_effort: Some("high".to_string()),
+        file_permissions: WorkerFilePermissions::TaskFiles,
+        require_effort_evidence: true,
+        require_passing_tests: true,
+    };
+    let test_evidence = TestEvidenceSummary {
+        formatting_passed: true,
+        clippy_passed: true,
+        tests_passed: true,
+        passed_test_count: 8,
+        failed_test_count: 0,
+        evidence_summary: "cargo fmt and cargo test passed".to_string(),
+    };
+    let subject = inspect_review_subject(&InspectReviewSubjectRequest {
+        work_area_root: fixture.work_area_root.clone(),
+        task_worktree_id: task_manifest.worktree_id.clone(),
+        policy,
+        test_evidence,
+        worker_status: Some(WorkerRunStatus::Succeeded),
+    })
+    .expect("inspect review subject");
+
+    let review_receipt = accept_review_subject(&ReviewAcceptanceRequest {
+        subject: subject.clone(),
+        expected_subject_digest: subject.subject_digest.clone(),
+        reviewer_id: "op_controller".to_string(),
+        review_note: format!("Approved {logical_task_id}"),
+        approved_at_ms: timestamp_ms,
+        receipt_id: Some(format!("rev_orig_{token}")),
+    })
+    .expect("accept review subject");
+
+    let orig_integration_receipt = execute_integration(&ExecuteIntegrationRequest {
+        work_area_root: fixture.work_area_root.clone(),
+        integration_worktree_id: worker_int_manifest.worktree_id.clone(),
+        task_worktree_id: task_manifest.worktree_id.clone(),
+        subject: subject.clone(),
+        review_receipt: review_receipt.clone(),
+        strategy: IntegrationStrategy::FastForwardOnly,
+        expected_integration_head_commit: fixture.base_commit.clone(),
+        expected_task_head_commit: review_receipt.task_head_commit.clone(),
+        expected_source_head_commit: fixture.base_commit.clone(),
+        operator_id: "op_controller".to_string(),
+        integrated_at_ms: timestamp_ms + 10,
+        receipt_id: Some(format!("int_orig_{token}")),
+    })
+    .expect("execute original per-worker integration");
+    assert!(orig_integration_receipt.job_aggregation.is_none());
+
+    WorkerRunPredecessorTask {
+        logical_task_id: logical_task_id.to_string(),
+        worker_run_id: worker_run_id.to_string(),
+        task_manifest,
+        subject,
+        review_receipt,
+        orig_integration_receipt,
+    }
+}
+
+#[tokio::test]
+async fn test_5_job_aggregated_candidate_assembly_preserves_original_receipts_and_rejects_tampered_reports(
+) {
+    let fixture = setup_fixture();
+    let job = create_job_and_freeze_envelope(
+        &fixture,
+        "brf_cand_5",
+        "plan-cand-5",
+        2,
+        threadlane_workers::DEFAULT_MAX_ADVISORY_RESPONSE_BYTES,
+    );
+
+    let worker_a = commit_review_and_integrate_worker_run_task(
+        &fixture,
+        "task-alpha",
+        "t_alpha",
+        "run_worker_alpha_01",
+        "tok5a",
+        "src/alpha.rs",
+        "pub fn alpha() -> u32 {\n    501\n}\n",
+        1_700_000_500_000,
+    );
+    let worker_b = commit_review_and_integrate_worker_run_task(
+        &fixture,
+        "task-beta",
+        "t_beta",
+        "run_worker_beta_02",
+        "tok5b",
+        "src/beta.rs",
+        "pub fn beta() -> u32 {\n    502\n}\n",
+        1_700_000_501_000,
+    );
+
+    let pred_a = IntegratedPredecessorTask {
+        task_id: worker_a.logical_task_id.clone(),
+        task_manifest: worker_a.task_manifest.clone(),
+        review_receipt: worker_a.review_receipt.clone(),
+        integration_receipt: worker_a.orig_integration_receipt.clone(),
+    };
+    let pred_b = IntegratedPredecessorTask {
+        task_id: worker_b.logical_task_id.clone(),
+        task_manifest: worker_b.task_manifest.clone(),
+        review_receipt: worker_b.review_receipt.clone(),
+        integration_receipt: worker_b.orig_integration_receipt.clone(),
+    };
+    let job = record_integrated_task_on_job(&fixture, job, &pred_a, "src/alpha.rs");
+    let job = record_integrated_task_on_job(&fixture, job, &pred_b, "src/beta.rs");
+    assert_eq!(job.phase, CoworkerJobPhase::Executing);
+    assert!(job
+        .tasks
+        .iter()
+        .all(|t| t.stage == CoworkerTaskStage::Integrated));
+
+    let linkage = job.approval_linkage.as_ref().expect("approval linkage");
+    let mut aggregate_write_paths = BTreeSet::new();
+    aggregate_write_paths.insert("src/alpha.rs".to_string());
+    aggregate_write_paths.insert("src/beta.rs".to_string());
+
+    let job_report = execute_job_integration(&ExecuteJobIntegrationRequest {
+        repository_path: fixture.repo_dir.clone(),
+        work_area_root: fixture.work_area_root.clone(),
+        integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+        approved_base_commit: fixture.base_commit.clone(),
+        expected_source_head_commit: fixture.base_commit.clone(),
+        expected_integration_head_commit: fixture.base_commit.clone(),
+        job_scope: JobIntegrationScopeProvenance {
+            job_id: job.job_id.clone(),
+            job_revision: job.job_revision,
+            approval_id: linkage.approval_id.clone(),
+            approval_subject_digest: linkage.approval_subject_digest.clone(),
+            target_integration_run_id: fixture.run_id.clone(),
+            aggregate_allowed_write_paths: aggregate_write_paths,
+        },
+        tasks: vec![
+            JobIntegrationTaskInput {
+                original_run_id: worker_a.worker_run_id.clone(),
+                task_id: "task-alpha".to_string(),
+                task_digest: job.tasks[0].task_digest.clone(),
+                task_worktree_id: worker_a.task_manifest.worktree_id.clone(),
+                subject: worker_a.subject.clone(),
+                review_receipt: worker_a.review_receipt.clone(),
+                expected_task_head_commit: worker_a.review_receipt.task_head_commit.clone(),
+                strategy: IntegrationStrategy::FastForwardOnly,
+                receipt_id: Some("int_agg_tok5a".to_string()),
+                dependency_input: None,
+            },
+            JobIntegrationTaskInput {
+                original_run_id: worker_b.worker_run_id.clone(),
+                task_id: "task-beta".to_string(),
+                task_digest: job.tasks[1].task_digest.clone(),
+                task_worktree_id: worker_b.task_manifest.worktree_id.clone(),
+                subject: worker_b.subject.clone(),
+                review_receipt: worker_b.review_receipt.clone(),
+                expected_task_head_commit: worker_b.review_receipt.task_head_commit.clone(),
+                strategy: IntegrationStrategy::MergeNoFf,
+                receipt_id: Some("int_agg_tok5b".to_string()),
+                dependency_input: None,
+            },
+        ],
+        command_key: "cmd_job_int_5".to_string(),
+        intent_id: Some("jint_cand_test_5".to_string()),
+        operator_id: "op_controller".to_string(),
+        integrated_at_ms: 1_700_000_510_000,
+    })
+    .expect("execute_job_integration across distinct worker runs");
+
+    let base_candidate_req = AssembleOperationsFinalCandidateRequest {
+        binding_id: BINDING_ID.to_string(),
+        thread_uuid: THREAD_UUID.to_string(),
+        job_id: job.job_id.clone(),
+        expected_job_revision: job.job_revision,
+        expected_ledger_revision: None,
+        request_key: "req_cand_5_agg".to_string(),
+        work_area_root: fixture.work_area_root.clone(),
+        run_id: fixture.run_id.clone(),
+        integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+        check_evidence: default_check_evidence(),
+        closure_task_id: "task-closure".to_string(),
+        reserve_closure_attempt: true,
+        reserved_at_ms: 1_700_000_520_000,
+    };
+
+    // 1. Negative: partial report (missing second task receipt) is rejected without advancing job.
+    let mut partial_report = job_report.clone();
+    partial_report.receipts.pop();
+    let partial_err = fixture
+        .candidate_service
+        .assemble_and_inspect_job_aggregate_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleJobAggregateCandidateRequest {
+                candidate: base_candidate_req.clone(),
+                job_integration_report: partial_report,
+            },
+        )
+        .expect_err("partial job integration report must be refused");
+    assert_eq!(
+        partial_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    // 2. Negative: relabeled logical_task_id in report receipt is rejected.
+    let mut relabeled_report = job_report.clone();
+    relabeled_report.receipts[0]
+        .job_aggregation
+        .as_mut()
+        .expect("agg provenance")
+        .logical_task_id = "task-beta".to_string();
+    let relabeled_err = fixture
+        .candidate_service
+        .assemble_and_inspect_job_aggregate_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleJobAggregateCandidateRequest {
+                candidate: base_candidate_req.clone(),
+                job_integration_report: relabeled_report,
+            },
+        )
+        .expect_err("relabeled logical_task_id must be refused");
+    assert_eq!(
+        relabeled_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    // 3. Negative: mutated receipt field in caller report vs persisted receipt on disk is rejected.
+    let mut mutated_report = job_report.clone();
+    mutated_report.receipts[1].operator_id = "op_forged".to_string();
+    let mutated_err = fixture
+        .candidate_service
+        .assemble_and_inspect_job_aggregate_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleJobAggregateCandidateRequest {
+                candidate: base_candidate_req.clone(),
+                job_integration_report: mutated_report,
+            },
+        )
+        .expect_err("mutated receipt in report must be refused");
+    assert_eq!(
+        mutated_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let after_negatives = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_ID)
+        .expect("read binding ledger after negatives")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("job exists");
+    assert!(after_negatives.combined_candidates.is_empty());
+    assert_eq!(after_negatives.job_revision, job.job_revision);
+
+    // 4. Positive: assemble_and_inspect_job_aggregate_candidate binds aggregate receipts on
+    // FinalCandidateSubject while preserving original per-worker integration_receipt_id on
+    // task candidates and CombinedCandidateIdentity.
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_job_aggregate_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleJobAggregateCandidateRequest {
+                candidate: base_candidate_req,
+                job_integration_report: job_report.clone(),
+            },
+        )
+        .expect("assemble job-aggregated final candidate");
+
+    assert_eq!(
+        assembled.final_subject.candidate_head_commit,
+        job_report.final_integrated_target_commit
+    );
+    assert_eq!(
+        assembled.final_subject.candidate_tree_sha,
+        job_report.final_integrated_tree_sha
+    );
+    assert_eq!(assembled.final_subject.predecessors.len(), 2);
+    assert_eq!(
+        assembled.final_subject.predecessors[0].task_id,
+        "task-alpha"
+    );
+    assert_eq!(
+        assembled.final_subject.predecessors[0].integration_receipt_id,
+        "int_agg_tok5a"
+    );
+    assert_eq!(assembled.final_subject.predecessors[1].task_id, "task-beta");
+    assert_eq!(
+        assembled.final_subject.predecessors[1].integration_receipt_id,
+        "int_agg_tok5b"
+    );
+
+    // Original per-worker integration receipts remain untouched on task candidates,
+    // CombinedCandidateIdentity, and on disk for dependency seals.
+    assert_eq!(
+        assembled.job.tasks[0].candidates[0]
+            .integration_receipt_id
+            .as_deref(),
+        Some("int_orig_tok5a")
+    );
+    assert_eq!(
+        assembled.job.tasks[1].candidates[0]
+            .integration_receipt_id
+            .as_deref(),
+        Some("int_orig_tok5b")
+    );
+    assert_eq!(
+        assembled.combined_candidate.accepted_predecessor_receipts[0].integration_receipt_id,
+        "int_orig_tok5a"
+    );
+    assert_eq!(
+        assembled.combined_candidate.accepted_predecessor_receipts[1].integration_receipt_id,
+        "int_orig_tok5b"
+    );
+    let orig_a_disk = load_integration_receipt(&fixture.work_area_root, "int_orig_tok5a")
+        .expect("load original receipt a");
+    let orig_b_disk = load_integration_receipt(&fixture.work_area_root, "int_orig_tok5b")
+        .expect("load original receipt b");
+    assert!(orig_a_disk.job_aggregation.is_none());
+    assert!(orig_b_disk.job_aggregation.is_none());
+
+    let reserved = assembled
+        .closure_reservation
+        .as_ref()
+        .expect("closure attempt reserved");
+    assert_eq!(
+        reserved.attempt().subject_digest,
+        assembled.final_subject.subject_digest
+    );
+    assert_eq!(
+        reserved.attempt().candidate_tree_sha,
+        job_report.final_integrated_tree_sha
+    );
+
+    // Execute Closure over the job-aggregated FinalCandidateSubject.
+    configure_fake_agy_valid_closure(
+        &fixture,
+        &assembled.final_subject,
+        ClosureVerdictKind::Accepted,
+        "Verified job-aggregated final candidate across two worker runs",
+        Vec::new(),
+    );
+    let closure_outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_5_agg".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_530_000,
+            },
+        )
+        .await
+        .expect("execute_final_candidate_closure on job-aggregated candidate");
+    assert_eq!(closure_outcome.job.phase, CoworkerJobPhase::Completed);
+    assert_eq!(
+        closure_outcome.verdict.expect("verdict").kind,
+        ClosureVerdictKind::Accepted
+    );
     assert_primary_checkout_untouched(&fixture);
 }
