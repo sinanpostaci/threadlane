@@ -2637,6 +2637,7 @@ fn verify_no_conflicting_initial_coder_key(
     for outbox in &job.outbox {
         if outbox.task_id == task_id
             && outbox.kind == OutboxDispatchKind::TaskAttemptDispatch
+            && outbox.attempt_no == 1
             && outbox.request_key != expected_command_key
         {
             return Err(NativeError::new(

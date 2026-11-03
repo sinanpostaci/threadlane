@@ -6,12 +6,17 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
 use threadlane_native::coworker_workflow::controller_policy::{
+    deterministic_controller_instance_id, CheckFailureCorrectionBasis, CheckFailureReportRef,
     ControllerConfigurationPreview, ControllerPolicyStore, ControllerRoleExecutionBudget,
-    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckKind,
+    DerivedTaskAttemptReceipt, FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec,
+    FrozenCheckKind,
 };
 use threadlane_native::coworker_workflow::{
-    BindJobApprovalRequest, CanonicalProjectBaseRef, CoworkerJobRecord, CoworkerWorkflowStore,
-    CreateCoworkerJobRequest, FrozenControllerCapabilityEnvelope, WorkBrief, WorkBriefKind,
+    sha256_hex, BindJobApprovalRequest, CanonicalProjectBaseRef, CoworkerJobRecord,
+    CoworkerLockFileIdentity, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
+    FrozenCheckExecutionReport, FrozenCheckExecutionStatus, FrozenCheckSubject,
+    FrozenCheckTargetKind, FrozenControllerCapabilityEnvelope, WorkBrief, WorkBriefKind,
+    FROZEN_CHECK_EXECUTION_SCHEMA_VERSION,
 };
 use threadlane_native::{
     Difficulty, ExecutionPolicy, NativeErrorCode, PolicyAllowRule, RegistryStore,
@@ -19,8 +24,9 @@ use threadlane_native::{
 };
 use threadlane_operations::IntegrationStrategy;
 use threadlane_workers::{
-    resolve_exact_commit_sha, run_sanitized_git, ExecutionBudgets, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES, DEFAULT_TIMEOUT_MS,
+    resolve_exact_commit_sha, run_sanitized_git, BoundedCommandOverflow, ExecutionBudgets,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_TIMEOUT_MS,
 };
 use threadlane_workflow::{
     compile_plan_revision, ModelChoice, ModelDefinition, PlanChange, PlanStore, PlanTask,
@@ -985,4 +991,669 @@ fn preview_and_record_reject_stale_registry_superseded_plan_and_scope_drift() {
         superseded_err.code(),
         NativeErrorCode::ValidationFailed.as_str()
     );
+}
+
+#[test]
+fn derived_task_attempt_receipt_preserves_v1_digest_and_validates_check_failure_correction_basis_contract(
+) {
+    assert!(CoworkerTaskStage::ReadyForReview
+        .can_transition_to(CoworkerTaskStage::CorrectInScopeRequired));
+    assert!(!CoworkerTaskStage::ReadyForReview.can_transition_to(CoworkerTaskStage::Accepted));
+
+    let fixture = setup_fixture();
+    let job = create_bound_job(
+        &fixture,
+        "brf_check_failure_basis",
+        "plan-check-failure-basis",
+    );
+    let mut preview_req = sample_preview_request(&fixture, &job);
+    preview_req.max_in_scope_corrections_per_task = 2;
+    let preview = fixture
+        .policy_store
+        .preview_execution_envelope(&preview_req, &job, &fixture.authority)
+        .expect("preview envelope");
+    let record_req = attested_record_request_from_preview(&preview_req, &preview);
+    let runtime = fixture
+        .policy_store
+        .record_execution_envelope(&record_req, &job, &fixture.authority)
+        .expect("record envelope");
+    let envelope = &runtime.envelope;
+    let task = &job.tasks[0];
+
+    let task_manifest_id = "w0123456789abcdef";
+    assert_ne!(task.task_id, task_manifest_id);
+
+    let committed_head = "1111111111111111111111111111111111111111";
+    let committed_tree = "2222222222222222222222222222222222222222";
+    let prior_candidate_id = "tcd_0123456789abcdef0123456789abcdef";
+    let prior_verdict_id = "rvd_fedcba9876543210fedcba9876543210";
+    let prior_review_subject_digest = sha256_hex(b"prior-review-subject-v1");
+
+    // 1. Legacy v1 receipt with `prior_check_failure_basis: None` omits the field in JSON
+    //    and preserves the exact v1 SHA-256 formula.
+    let mut legacy_receipt = DerivedTaskAttemptReceipt {
+        receipt_id: "dar_00112233445566778899aabbccddeeff".to_string(),
+        binding_id: envelope.binding_id.clone(),
+        thread_uuid: envelope.thread_uuid.clone(),
+        job_id: envelope.job_id.clone(),
+        approval_id: envelope.approval_id.clone(),
+        approval_subject_digest: envelope.approval_subject_digest.clone(),
+        envelope_id: envelope.envelope_id.clone(),
+        envelope_digest: envelope.envelope_digest.clone(),
+        task_id: task.task_id.clone(),
+        task_digest: task.task_digest.clone(),
+        attempt_no: 2,
+        prior_rejected_candidate_id: Some(prior_candidate_id.to_string()),
+        prior_review_verdict_id: Some(prior_verdict_id.to_string()),
+        prior_check_failure_basis: None,
+        prior_review_subject_digest: Some(prior_review_subject_digest.clone()),
+        required_in_scope_fixes: vec!["Fix off-by-one return value in alpha()".to_string()],
+        frozen_instruction: "Update src/lib.rs".to_string(),
+        derived_prompt: "Update src/lib.rs\nRequired fix: off-by-one in alpha()".to_string(),
+        write_paths: task.write_paths.clone(),
+        coder_choice: task.selected_choice.clone(),
+        execution_base_commit: fixture.base_commit.clone(),
+        run_id: "r0123456789abcdef".to_string(),
+        worker_id: task_manifest_id.to_string(),
+        task_worktree_id: "wt-task-0123456789abcdef".to_string(),
+        integration_worktree_id: "wt-run-0123456789abcdef".to_string(),
+        recorded_at_ms: 1_700_000_200_000,
+        receipt_digest: String::new(),
+    };
+    let expected_v1_seed = (
+        (
+            "threadlane-native:derived_task_attempt_receipt:v1",
+            legacy_receipt.receipt_id.as_str(),
+            legacy_receipt.binding_id.as_str(),
+            legacy_receipt.thread_uuid.as_str(),
+            legacy_receipt.job_id.as_str(),
+            legacy_receipt.approval_id.as_str(),
+            legacy_receipt.approval_subject_digest.as_str(),
+            legacy_receipt.envelope_id.as_str(),
+            legacy_receipt.envelope_digest.as_str(),
+            legacy_receipt.task_id.as_str(),
+            legacy_receipt.task_digest.as_str(),
+            legacy_receipt.attempt_no,
+            legacy_receipt.prior_rejected_candidate_id.as_deref(),
+        ),
+        (
+            legacy_receipt.prior_review_verdict_id.as_deref(),
+            legacy_receipt.prior_review_subject_digest.as_deref(),
+            &legacy_receipt.required_in_scope_fixes,
+            legacy_receipt.frozen_instruction.as_str(),
+            legacy_receipt.derived_prompt.as_str(),
+            &legacy_receipt.write_paths,
+            &legacy_receipt.coder_choice,
+            legacy_receipt.execution_base_commit.as_str(),
+            legacy_receipt.run_id.as_str(),
+            legacy_receipt.worker_id.as_str(),
+            legacy_receipt.task_worktree_id.as_str(),
+            legacy_receipt.integration_worktree_id.as_str(),
+            legacy_receipt.recorded_at_ms,
+        ),
+    );
+    let expected_v1_digest = sha256_hex(&serde_json::to_vec(&expected_v1_seed).expect("v1 bytes"));
+    legacy_receipt.receipt_digest = legacy_receipt.compute_digest().expect("compute v1 digest");
+    assert_eq!(legacy_receipt.receipt_digest, expected_v1_digest);
+
+    let legacy_json = serde_json::to_string(&legacy_receipt).expect("serialize legacy receipt");
+    assert!(!legacy_json.contains("prior_check_failure_basis"));
+    let decoded_legacy: DerivedTaskAttemptReceipt =
+        serde_json::from_str(&legacy_json).expect("deserialize legacy receipt");
+    assert_eq!(decoded_legacy, legacy_receipt);
+    decoded_legacy
+        .validate_against_task(task, envelope)
+        .expect("valid v1 reviewer-based correction receipt must pass");
+
+    // 2. Construct an internally consistent check-failure correction basis contract fixture
+    //    with distinct logical `task_id` ("task-1") and compact `task_manifest_id` ("w0123456789abcdef").
+    let cargo_test_spec = envelope
+        .check_commands
+        .get("cargo_test")
+        .expect("cargo_test spec in envelope");
+    let cargo_test_spec_digest = cargo_test_spec.spec_digest().expect("spec digest");
+    let work_area_root = fixture
+        .repo_dir
+        .parent()
+        .expect("temp root")
+        .join("work-area");
+    fs::create_dir_all(&work_area_root).expect("create work_area_root");
+    let work_area_root = fs::canonicalize(&work_area_root).expect("canonicalize work_area_root");
+    let checkout_path = work_area_root
+        .join("checkouts")
+        .join(&legacy_receipt.task_worktree_id);
+    fs::create_dir_all(&checkout_path).expect("create checkout_path");
+    let checkout_path = fs::canonicalize(&checkout_path).expect("canonicalize checkout_path");
+
+    let check_subject = FrozenCheckSubject {
+        binding_id: envelope.binding_id.clone(),
+        thread_uuid: envelope.thread_uuid.clone(),
+        job_id: envelope.job_id.clone(),
+        target_kind: FrozenCheckTargetKind::TaskWorktree,
+        repository_path: fixture.repo_dir.clone(),
+        work_area_root,
+        worktree_id: legacy_receipt.task_worktree_id.clone(),
+        expected_run_id: legacy_receipt.run_id.clone(),
+        expected_task_id: Some(task_manifest_id.to_string()),
+        expected_base_commit: fixture.base_commit.clone(),
+        expected_head_commit: committed_head.to_string(),
+        expected_tree_sha: committed_tree.to_string(),
+    };
+    let check_subject_digest = check_subject
+        .subject_digest()
+        .expect("check subject digest");
+    let report_path = fixture
+        .policy_store
+        .plans_dir()
+        .join("coworker-check-report-eff_0123456789abcdef0123456789abcdef.json");
+    let stdout_bytes = b"running 1 test\ntest alpha_test ... FAILED\n".to_vec();
+    let stderr_bytes = b"error: test failed, to rerun pass `--lib`\n".to_vec();
+    let mut sample_report = FrozenCheckExecutionReport {
+        schema_version: FROZEN_CHECK_EXECUTION_SCHEMA_VERSION,
+        subject: check_subject.clone(),
+        ownership_instance_id:
+            "cwo_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+        ownership_challenge_digest: sha256_hex(b"ownership-challenge-v1"),
+        ownership_lock_file_identity: CoworkerLockFileIdentity { dev: 1, ino: 42 },
+        ownership_verified_post_run: true,
+        check_id: "cargo_test".to_string(),
+        kind: FrozenCheckKind::Tests,
+        spec_digest: cargo_test_spec_digest.clone(),
+        executable: cargo_test_spec.executable.clone(),
+        argv: cargo_test_spec.argv.clone(),
+        repo_relative_cwd: cargo_test_spec.repo_relative_cwd.clone(),
+        resolved_working_directory: checkout_path.clone(),
+        timeout_ms: cargo_test_spec.timeout_ms,
+        max_stdout_bytes: cargo_test_spec.max_stdout_bytes,
+        max_stderr_bytes: cargo_test_spec.max_stderr_bytes,
+        checkout_path,
+        branch_name: "threadlane/task/w0123456789abcdef".to_string(),
+        status: FrozenCheckExecutionStatus::NonZeroExit,
+        exit_code: Some(101),
+        signal: None,
+        process_group_id: Some(4242),
+        duration_ms: 420,
+        stdout_bytes_captured: stdout_bytes.len(),
+        stderr_bytes_captured: stderr_bytes.len(),
+        stdout_sha256: sha256_hex(&stdout_bytes),
+        stderr_sha256: sha256_hex(&stderr_bytes),
+        stdout_bytes,
+        stderr_bytes,
+        stdout_overflowed: false,
+        stderr_overflowed: false,
+        overflow: None,
+        descendants_terminated_after_exit: false,
+        cleanup_incomplete: false,
+        redacted_stdout_summary: Some("running 1 test; test alpha_test ... FAILED".to_string()),
+        redacted_stderr_summary: Some("error: test failed, to rerun pass `--lib`".to_string()),
+        post_worktree_clean: true,
+        post_head_commit: Some(committed_head.to_string()),
+        post_tree_sha: Some(committed_tree.to_string()),
+        subject_drifted: false,
+        drift_reason: None,
+        command_summary: "cargo_test (tests): fake-cargo test --workspace [cwd=.]".to_string(),
+        evidence_digest: String::new(),
+    };
+    sample_report.evidence_digest = sample_report
+        .compute_evidence_digest()
+        .expect("compute report evidence digest");
+    sample_report
+        .validate_integrity()
+        .expect("sample report passes integrity check");
+
+    let report_ref = CheckFailureReportRef::from_execution_report(
+        "eff_0123456789abcdef0123456789abcdef",
+        &report_path.to_string_lossy(),
+        &sample_report,
+        "cargo_test exited with status 101: test alpha_test FAILED",
+    )
+    .expect("build CheckFailureReportRef");
+    report_ref
+        .verify_against_execution_report(&check_subject_digest, &sample_report)
+        .expect("report_ref matches sample_report");
+
+    let valid_basis = CheckFailureCorrectionBasis {
+        task_id: task.task_id.clone(),
+        task_manifest_id: task_manifest_id.to_string(),
+        prior_attempt_no: 1,
+        prior_candidate_id: prior_candidate_id.to_string(),
+        execution_base_commit: fixture.base_commit.clone(),
+        committed_head_commit: committed_head.to_string(),
+        committed_tree_sha: committed_tree.to_string(),
+        check_subject_digest: check_subject_digest.clone(),
+        prior_review_subject_digest: prior_review_subject_digest.clone(),
+        failed_checks: vec![report_ref.clone()],
+        diagnostic_summary:
+            "Task verification blocked by failed required check `cargo_test` (exit 101)".to_string(),
+    };
+    valid_basis
+        .verify_check_subject(&check_subject)
+        .expect("basis matches check_subject via task_manifest_id");
+
+    // Subject whose expected_task_id uses the logical task_id instead of task_manifest_id must fail verify_check_subject.
+    let mut wrong_manifest_subject = check_subject.clone();
+    wrong_manifest_subject.expected_task_id = Some(task.task_id.clone());
+    assert!(valid_basis
+        .verify_check_subject(&wrong_manifest_subject)
+        .is_err());
+
+    let mut v2_receipt = DerivedTaskAttemptReceipt {
+        prior_review_verdict_id: None,
+        prior_check_failure_basis: Some(valid_basis.clone()),
+        required_in_scope_fixes: vec![
+            "Resolve `cargo_test` failure (exit 101: test alpha_test FAILED) within approved write scope".to_string(),
+        ],
+        receipt_digest: String::new(),
+        ..legacy_receipt.clone()
+    };
+    let v1_without_basis_digest = {
+        let mut clone_none = v2_receipt.clone();
+        clone_none.prior_check_failure_basis = None;
+        clone_none.compute_digest().expect("digest when None")
+    };
+    v2_receipt.receipt_digest = v2_receipt.compute_digest().expect("compute v2 digest");
+    assert_ne!(v2_receipt.receipt_digest, v1_without_basis_digest);
+    assert_ne!(v2_receipt.receipt_digest, legacy_receipt.receipt_digest);
+
+    let v2_json = serde_json::to_string(&v2_receipt).expect("serialize v2 receipt");
+    assert!(v2_json.contains("prior_check_failure_basis"));
+    let decoded_v2: DerivedTaskAttemptReceipt =
+        serde_json::from_str(&v2_json).expect("deserialize v2 receipt");
+    assert_eq!(decoded_v2, v2_receipt);
+    decoded_v2
+        .validate_against_task(task, envelope)
+        .expect("valid v2 check-failure correction receipt (attempt 2) must pass");
+
+    // 3. Clean unchanged candidate (`committed_head_commit == execution_base_commit`) with failing tests is allowed.
+    let mut unchanged_head_subject = check_subject.clone();
+    unchanged_head_subject.expected_head_commit = fixture.base_commit.clone();
+    let unchanged_head_subject_digest = unchanged_head_subject
+        .subject_digest()
+        .expect("unchanged head subject digest");
+    let mut unchanged_head_receipt = v2_receipt.clone();
+    {
+        let basis = unchanged_head_receipt
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis");
+        basis.committed_head_commit = fixture.base_commit.clone();
+        basis.check_subject_digest = unchanged_head_subject_digest;
+        basis
+            .verify_check_subject(&unchanged_head_subject)
+            .expect("unchanged head subject matches");
+    }
+    unchanged_head_receipt.receipt_digest = unchanged_head_receipt
+        .compute_digest()
+        .expect("compute unchanged head digest");
+    unchanged_head_receipt
+        .validate_against_task(task, envelope)
+        .expect("unchanged head commit equal to execution_base_commit must be valid");
+
+    // 4. Under cap 2 (`max_in_scope_corrections_per_task == 2`), both first correction (attempt 2, prior 1)
+    //    and second correction (attempt 3, prior 2) are allowed, while attempt 4 (prior 3) is refused.
+    let mut attempt3_receipt = v2_receipt.clone();
+    attempt3_receipt.attempt_no = 3;
+    attempt3_receipt
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .prior_attempt_no = 2;
+    attempt3_receipt.receipt_digest = attempt3_receipt
+        .compute_digest()
+        .expect("compute attempt 3 digest");
+    attempt3_receipt
+        .validate_against_task(task, envelope)
+        .expect("second correction (attempt 3, prior 2) must be valid when cap == 2");
+
+    let mut attempt4_receipt = v2_receipt.clone();
+    attempt4_receipt.attempt_no = 4;
+    attempt4_receipt
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .prior_attempt_no = 3;
+    attempt4_receipt.receipt_digest = attempt4_receipt
+        .compute_digest()
+        .expect("compute attempt 4 digest");
+    assert_eq!(
+        attempt4_receipt
+            .validate_against_task(task, envelope)
+            .expect_err("third correction (attempt 4, prior 3) must be refused under hard max 2")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    // Under a tighter per-task cap of 1, attempt 2 is allowed but attempt 3 is refused.
+    let mut cap1_envelope = envelope.clone();
+    cap1_envelope.max_in_scope_corrections_per_task = 1;
+    v2_receipt
+        .validate_against_task(task, &cap1_envelope)
+        .expect("attempt 2 allowed under cap 1");
+    assert!(attempt3_receipt
+        .validate_against_task(task, &cap1_envelope)
+        .is_err());
+
+    // Persist and reload via ControllerPolicyStore runtime state to confirm bounded ledger round-trip.
+    let instance_id = deterministic_controller_instance_id(BINDING_A, &job.job_id, "test-driver");
+    let lease = fixture
+        .policy_store
+        .acquire_or_renew_lease(
+            BINDING_A,
+            &job.job_id,
+            &instance_id,
+            1_700_000_200_000,
+            60_000,
+        )
+        .expect("acquire lease");
+    fixture
+        .policy_store
+        .mutate_job_runtime(
+            BINDING_A,
+            &job.job_id,
+            &instance_id,
+            lease.lease_epoch,
+            |state| {
+                state.derived_attempts.push(v2_receipt.clone());
+                state.derived_attempts.push(attempt3_receipt.clone());
+                Ok(())
+            },
+        )
+        .expect("persist v2 receipts in runtime state");
+    let reloaded = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read runtime")
+        .expect("runtime exists");
+    assert_eq!(
+        reloaded.derived_attempts,
+        vec![v2_receipt.clone(), attempt3_receipt]
+    );
+
+    // 5. Rejection cases: attempt_no == 1 cannot carry prior_check_failure_basis.
+    let mut attempt1_with_basis = v2_receipt.clone();
+    attempt1_with_basis.attempt_no = 1;
+    attempt1_with_basis.receipt_digest = attempt1_with_basis.compute_digest().expect("digest");
+    assert_eq!(
+        attempt1_with_basis
+            .validate_against_task(task, envelope)
+            .expect_err("attempt 1 cannot carry check failure basis")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    // 6. Dual verdict + check-failure basis (violating XOR) and missing both must fail.
+    let mut dual_basis = v2_receipt.clone();
+    dual_basis.prior_review_verdict_id = Some(prior_verdict_id.to_string());
+    dual_basis.receipt_digest = dual_basis.compute_digest().expect("digest");
+    assert_eq!(
+        dual_basis
+            .validate_against_task(task, envelope)
+            .expect_err("dual verdict and check failure basis must fail")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut neither_basis = v2_receipt.clone();
+    neither_basis.prior_check_failure_basis = None;
+    neither_basis.prior_review_verdict_id = None;
+    neither_basis.receipt_digest = neither_basis.compute_digest().expect("digest");
+    assert_eq!(
+        neither_basis
+            .validate_against_task(task, envelope)
+            .expect_err("missing both verdict and check failure basis must fail")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    // 7. Wrong task_id, mismatched prior_attempt_no, wrong prior_candidate_id, wrong prior_review_subject_digest,
+    //    or execution_base_commit set to previous attempt head must fail.
+    let mut wrong_task_basis = v2_receipt.clone();
+    wrong_task_basis
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .task_id = "task-other".to_string();
+    wrong_task_basis.receipt_digest = wrong_task_basis.compute_digest().expect("digest");
+    assert!(wrong_task_basis
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut wrong_attempt_basis = v2_receipt.clone();
+    wrong_attempt_basis
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .prior_attempt_no = 2; // receipt.attempt_no is 2, so prior_attempt_no == 2 mismatches attempt_no - 1
+    wrong_attempt_basis.receipt_digest = wrong_attempt_basis.compute_digest().expect("digest");
+    assert!(wrong_attempt_basis
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut wrong_candidate_basis = v2_receipt.clone();
+    wrong_candidate_basis
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .prior_candidate_id = "tcd_ffffffffffffffffffffffffffffffff".to_string();
+    wrong_candidate_basis.receipt_digest = wrong_candidate_basis.compute_digest().expect("digest");
+    assert!(wrong_candidate_basis
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut wrong_subject_basis = v2_receipt.clone();
+    wrong_subject_basis
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .prior_review_subject_digest = sha256_hex(b"different-review-subject");
+    wrong_subject_basis.receipt_digest = wrong_subject_basis.compute_digest().expect("digest");
+    assert!(wrong_subject_basis
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut head_as_base_receipt = v2_receipt.clone();
+    head_as_base_receipt.execution_base_commit = committed_head.to_string();
+    head_as_base_receipt
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .execution_base_commit = committed_head.to_string();
+    head_as_base_receipt.receipt_digest = head_as_base_receipt.compute_digest().expect("digest");
+    assert!(head_as_base_receipt
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    // 8. Non-natural or non-clean check statuses (TimedOut, OutputOverflow, DescendantsTerminatedAfterExit,
+    //    Passed, signal crash, missing/zero exit_code, dirty worktree, subject drift) are rejected both
+    //    at the contract reference level and when constructing/verifying against FrozenCheckExecutionReport.
+    for ineligible_status in [
+        FrozenCheckExecutionStatus::Passed,
+        FrozenCheckExecutionStatus::TimedOut,
+        FrozenCheckExecutionStatus::OutputOverflow,
+        FrozenCheckExecutionStatus::DescendantsTerminatedAfterExit,
+        FrozenCheckExecutionStatus::Cancelled,
+        FrozenCheckExecutionStatus::IncompleteCleanup,
+        FrozenCheckExecutionStatus::SubjectMutatedOrDrifted,
+        FrozenCheckExecutionStatus::OwnershipOrContextDrifted,
+    ] {
+        let mut bad_status_receipt = v2_receipt.clone();
+        bad_status_receipt
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis")
+            .failed_checks[0]
+            .status = ineligible_status;
+        bad_status_receipt.receipt_digest = bad_status_receipt.compute_digest().expect("digest");
+        assert!(
+            bad_status_receipt
+                .validate_against_task(task, envelope)
+                .is_err(),
+            "status {ineligible_status:?} must not be eligible for auto-correction"
+        );
+    }
+
+    // Signalled termination, missing exit_code, or zero exit_code with NonZeroExit status must fail.
+    let mut signalled_ref = v2_receipt.clone();
+    {
+        let fc = &mut signalled_ref
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis")
+            .failed_checks[0];
+        fc.signal = Some(9);
+    }
+    signalled_ref.receipt_digest = signalled_ref.compute_digest().expect("digest");
+    assert!(signalled_ref.validate_against_task(task, envelope).is_err());
+
+    let mut missing_exit_ref = v2_receipt.clone();
+    {
+        let fc = &mut missing_exit_ref
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis")
+            .failed_checks[0];
+        fc.exit_code = None;
+    }
+    missing_exit_ref.receipt_digest = missing_exit_ref.compute_digest().expect("digest");
+    assert!(missing_exit_ref
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut zero_exit_ref = v2_receipt.clone();
+    {
+        let fc = &mut zero_exit_ref
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis")
+            .failed_checks[0];
+        fc.exit_code = Some(0);
+    }
+    zero_exit_ref.receipt_digest = zero_exit_ref.compute_digest().expect("digest");
+    assert!(zero_exit_ref.validate_against_task(task, envelope).is_err());
+
+    // Full FrozenCheckExecutionReport with overflow, forced descendants, incomplete cleanup, or signal
+    // is rejected by CheckFailureReportRef::from_execution_report and verify_against_execution_report.
+    let mut overflow_report = sample_report.clone();
+    overflow_report.stdout_overflowed = true;
+    overflow_report.overflow = Some(BoundedCommandOverflow::StdoutExceeded {
+        max_stdout_bytes: overflow_report.max_stdout_bytes,
+    });
+    overflow_report.evidence_digest = overflow_report
+        .compute_evidence_digest()
+        .expect("overflow digest");
+    assert!(CheckFailureReportRef::from_execution_report(
+        "eff_0123456789abcdef0123456789abcdef",
+        &report_path.to_string_lossy(),
+        &overflow_report,
+        "overflowed",
+    )
+    .is_err());
+
+    let mut forced_descendants_report = sample_report.clone();
+    forced_descendants_report.descendants_terminated_after_exit = true;
+    forced_descendants_report.evidence_digest = forced_descendants_report
+        .compute_evidence_digest()
+        .expect("descendants digest");
+    assert!(CheckFailureReportRef::from_execution_report(
+        "eff_0123456789abcdef0123456789abcdef",
+        &report_path.to_string_lossy(),
+        &forced_descendants_report,
+        "forced descendants",
+    )
+    .is_err());
+
+    let mut incomplete_cleanup_report = sample_report.clone();
+    incomplete_cleanup_report.cleanup_incomplete = true;
+    incomplete_cleanup_report.evidence_digest = incomplete_cleanup_report
+        .compute_evidence_digest()
+        .expect("cleanup digest");
+    assert!(CheckFailureReportRef::from_execution_report(
+        "eff_0123456789abcdef0123456789abcdef",
+        &report_path.to_string_lossy(),
+        &incomplete_cleanup_report,
+        "cleanup incomplete",
+    )
+    .is_err());
+
+    let mut signalled_report = sample_report.clone();
+    signalled_report.signal = Some(15);
+    signalled_report.evidence_digest = signalled_report
+        .compute_evidence_digest()
+        .expect("signal digest");
+    assert!(CheckFailureReportRef::from_execution_report(
+        "eff_0123456789abcdef0123456789abcdef",
+        &report_path.to_string_lossy(),
+        &signalled_report,
+        "signalled",
+    )
+    .is_err());
+
+    // Unknown check_id, wrong spec_digest, dirty worktree, or drifted subject fail.
+    let mut unknown_check = v2_receipt.clone();
+    unknown_check
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .failed_checks[0]
+        .check_id = "undeclared_check".to_string();
+    unknown_check.receipt_digest = unknown_check.compute_digest().expect("digest");
+    assert!(unknown_check.validate_against_task(task, envelope).is_err());
+
+    let mut wrong_spec_digest = v2_receipt.clone();
+    wrong_spec_digest
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .failed_checks[0]
+        .spec_digest = sha256_hex(b"tampered-spec-digest");
+    wrong_spec_digest.receipt_digest = wrong_spec_digest.compute_digest().expect("digest");
+    assert!(wrong_spec_digest
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut dirty_worktree = v2_receipt.clone();
+    dirty_worktree
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .failed_checks[0]
+        .post_worktree_clean = false;
+    dirty_worktree.receipt_digest = dirty_worktree.compute_digest().expect("digest");
+    assert!(dirty_worktree
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    let mut drifted_subject = v2_receipt.clone();
+    drifted_subject
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .failed_checks[0]
+        .subject_drifted = true;
+    drifted_subject.receipt_digest = drifted_subject.compute_digest().expect("digest");
+    assert!(drifted_subject
+        .validate_against_task(task, envelope)
+        .is_err());
+
+    // 9. Non-required task-review check in envelope is rejected as a task check-failure basis.
+    let mut non_required_envelope = envelope.clone();
+    non_required_envelope
+        .check_commands
+        .get_mut("cargo_test")
+        .expect("cargo_test")
+        .required_for_task_review = false;
+    assert!(valid_basis
+        .validate_against_task_and_envelope(task, &non_required_envelope)
+        .is_err());
+
+    // 10. Mutating the basis without recomputing receipt_digest is caught by digest verification.
+    let mut tampered_basis_digest = v2_receipt.clone();
+    tampered_basis_digest
+        .prior_check_failure_basis
+        .as_mut()
+        .expect("basis")
+        .diagnostic_summary = "Tampered summary after sealing".to_string();
+    assert!(tampered_basis_digest
+        .validate_against_task(task, envelope)
+        .is_err());
 }

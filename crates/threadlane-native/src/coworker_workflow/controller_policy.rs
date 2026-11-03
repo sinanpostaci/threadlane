@@ -33,16 +33,20 @@ use crate::profile_flow::{
     SelectedRoleChoice,
 };
 
+use super::checks::{
+    FrozenCheckExecutionReport, FrozenCheckExecutionStatus, FrozenCheckSubject,
+    FrozenCheckTargetKind,
+};
 use super::contracts::{
     deterministic_prefixed_id, sha256_hex, validate_non_native_worker_choice,
     CandidateCheckEvidence, CanonicalProjectBaseRef, CoworkerJobRecord, CoworkerTaskRecord,
-    CoworkerTaskStage, FrozenControllerCapabilityEnvelope, TaskIndependenceProof,
-    WorkflowHoldRecord, MAX_ATTEMPTS_PER_TASK, MAX_CHECK_EVIDENCE_ITEMS, MAX_COWORKER_ID_LEN,
+    CoworkerTaskStage, FrozenControllerCapabilityEnvelope, ReviewVerdictOutcome,
+    TaskIndependenceProof, WorkflowHoldRecord, MAX_CHECK_EVIDENCE_ITEMS, MAX_COWORKER_ID_LEN,
     MAX_COWORKER_TEXT_BYTES,
 };
 
-/// Maximum in-scope correction attempts permitted per task.
-pub const MAX_IN_SCOPE_CORRECTION_ATTEMPTS: u32 = MAX_ATTEMPTS_PER_TASK as u32;
+/// Maximum in-scope correction attempts permitted per task (`2`, allowing attempts `2` and `3`).
+pub const MAX_IN_SCOPE_CORRECTION_ATTEMPTS: u32 = 2;
 
 /// Maximum frozen check command specifications permitted per execution envelope.
 pub const MAX_CHECK_IDS_PER_ENVELOPE: usize = MAX_CHECK_EVIDENCE_ITEMS;
@@ -1616,12 +1620,559 @@ pub struct ControllerConfigurationPreview {
     pub envelope: FrozenControllerExecutionEnvelope,
 }
 
+/// Compact, bounded reference to a private persisted [`FrozenCheckExecutionReport`] artifact
+/// for a required task-review check command that failed cleanly on the task worktree.
+///
+/// This compact reference is stored in the 1 MiB controller runtime ledger instead of embedding
+/// the full multi-megabyte [`FrozenCheckExecutionReport`] stdout/stderr payload. It is a typed
+/// contract, not caller-supplied authority: a later trusted controller must load and validate
+/// the actual private [`FrozenCheckExecutionReport`] artifact from `report_path` and verify its
+/// `evidence_digest` and [`FrozenCheckSubject`] before issuing a derived correction attempt.
+/// A validated report or basis alone is never operator approval, never authorizes a new model or
+/// write scope, and is not by itself proof of a known natural failure without controller verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckFailureReportRef {
+    /// Frozen check command identifier (`check_id`) from [`FrozenControllerExecutionEnvelope::check_commands`].
+    pub check_id: String,
+    /// Frozen check category matching the governing [`FrozenCheckCommandSpec::kind`].
+    pub kind: FrozenCheckKind,
+    /// Canonical 64-character lowercase hex SHA-256 [`FrozenCheckCommandSpec::spec_digest`].
+    pub spec_digest: String,
+    /// Intent-before-effect identifier (`eff_<32hex>`) that produced the persisted report artifact.
+    pub effect_id: String,
+    /// Validated absolute non-symlink path to the private (`0600`) persisted [`FrozenCheckExecutionReport`] JSON file.
+    pub report_path: String,
+    /// Canonical 64-character lowercase hex SHA-256 [`FrozenCheckExecutionReport::evidence_digest`].
+    pub evidence_digest: String,
+    /// Observed clean natural non-zero exit status (must be [`FrozenCheckExecutionStatus::NonZeroExit`]).
+    pub status: FrozenCheckExecutionStatus,
+    /// Process exit code when the check process terminated via normal non-zero exit (`Some(code)` with `code != 0`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating OS signal number (`None` required for a natural non-zero exit correction basis).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signal: Option<i32>,
+    /// 64-character lowercase hex SHA-256 digest of the full captured stdout stream.
+    pub stdout_sha256: String,
+    /// 64-character lowercase hex SHA-256 digest of the full captured stderr stream.
+    pub stderr_sha256: String,
+    /// Whether the task worktree remained clean after the check command completed (must be `true`).
+    pub post_worktree_clean: bool,
+    /// Whether the task worktree head/tree or ownership drifted during execution (must be `false`).
+    pub subject_drifted: bool,
+    /// Bounded, single-line sanitized diagnostic summary (`<= MAX_COWORKER_SUMMARY_BYTES`).
+    pub diagnostic_summary: String,
+}
+
+impl CheckFailureReportRef {
+    /// Constructs a compact [`CheckFailureReportRef`] from a verified [`FrozenCheckExecutionReport`]
+    /// representing a clean natural non-zero exit, its `effect_id`, private `report_path`, and a
+    /// bounded diagnostic summary.
+    pub fn from_execution_report(
+        effect_id: &str,
+        report_path: &str,
+        report: &FrozenCheckExecutionReport,
+        diagnostic_summary: &str,
+    ) -> Result<Self, NativeError> {
+        verify_clean_natural_nonzero_check_report(report)?;
+        let sanitized = sanitize_controller_diagnostic(diagnostic_summary);
+        Ok(Self {
+            check_id: report.check_id.clone(),
+            kind: report.kind,
+            spec_digest: report.spec_digest.clone(),
+            effect_id: effect_id.to_string(),
+            report_path: report_path.to_string(),
+            evidence_digest: report.evidence_digest.clone(),
+            status: report.status,
+            exit_code: report.exit_code,
+            signal: report.signal,
+            stdout_sha256: report.stdout_sha256.clone(),
+            stderr_sha256: report.stderr_sha256.clone(),
+            post_worktree_clean: report.post_worktree_clean,
+            subject_drifted: report.subject_drifted,
+            diagnostic_summary: sanitized,
+        })
+    }
+
+    /// Validates this check failure reference against the governing [`FrozenControllerExecutionEnvelope`].
+    pub fn validate_against_envelope(
+        &self,
+        envelope: &FrozenControllerExecutionEnvelope,
+    ) -> Result<(), NativeError> {
+        validate_bounded_identifier(&self.check_id, "failed_check.check_id", MAX_COWORKER_ID_LEN)?;
+        let Some(spec) = envelope.check_commands.get(&self.check_id) else {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "CheckFailureReportRef.check_id `{}` is not declared in the frozen execution envelope.",
+                    self.check_id
+                ),
+            ));
+        };
+        if !spec.required_for_task_review {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "CheckFailureReportRef.check_id `{}` is not marked required_for_task_review in the frozen execution envelope.",
+                    self.check_id
+                ),
+            ));
+        }
+        if self.kind != spec.kind {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef.kind does not match the frozen check command specification.",
+            ));
+        }
+        validate_sha256_hex_digest(&self.spec_digest, "failed_check.spec_digest").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureReportRef.spec_digest must be a 64-hex SHA-256 digest.",
+                )
+            },
+        )?;
+        let expected_spec_digest = spec.spec_digest()?;
+        if !constant_time_str_eq(&expected_spec_digest, &self.spec_digest) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef.spec_digest does not match the frozen check command specification digest.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.effect_id,
+            "failed_check.effect_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if !self.effect_id.starts_with("eff_") {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef.effect_id must start with `eff_`.",
+            ));
+        }
+        let report_path = Path::new(&self.report_path);
+        validate_absolute_no_symlink_components(report_path, "failed_check.report_path")?;
+        validate_sha256_hex_digest(&self.evidence_digest, "failed_check.evidence_digest").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureReportRef.evidence_digest must be a 64-hex SHA-256 digest.",
+                )
+            },
+        )?;
+        if self.status != FrozenCheckExecutionStatus::NonZeroExit {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef.status must be NonZeroExit; timeouts, output overflows, forced descendants, cancellations, incomplete cleanup, or drift are not eligible for automatic in-scope correction.",
+            ));
+        }
+        if !matches!(self.exit_code, Some(code) if code != 0) || self.signal.is_some() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef requires a natural non-zero exit_code (Some(code != 0)) and signal == None.",
+            ));
+        }
+        if !self.post_worktree_clean || self.subject_drifted {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef requires post_worktree_clean == true and subject_drifted == false.",
+            ));
+        }
+        validate_sha256_hex_digest(&self.stdout_sha256, "failed_check.stdout_sha256").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureReportRef.stdout_sha256 must be a 64-hex SHA-256 digest.",
+                )
+            },
+        )?;
+        validate_sha256_hex_digest(&self.stderr_sha256, "failed_check.stderr_sha256").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureReportRef.stderr_sha256 must be a 64-hex SHA-256 digest.",
+                )
+            },
+        )?;
+        validate_bounded_summary_line(&self.diagnostic_summary, "failed_check.diagnostic_summary")?;
+        Ok(())
+    }
+
+    /// Verifies that this compact reference matches a private [`FrozenCheckExecutionReport`] loaded
+    /// from disk, its expected 64-hex [`FrozenCheckSubject::subject_digest`], and all clean natural
+    /// non-zero exit invariants.
+    pub fn verify_against_execution_report(
+        &self,
+        expected_check_subject_digest: &str,
+        report: &FrozenCheckExecutionReport,
+    ) -> Result<(), NativeError> {
+        verify_clean_natural_nonzero_check_report(report)?;
+        let actual_subject_digest = report.subject.subject_digest()?;
+        if !constant_time_str_eq(&actual_subject_digest, expected_check_subject_digest) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "FrozenCheckExecutionReport subject_digest does not match CheckFailureCorrectionBasis.check_subject_digest.",
+            ));
+        }
+        if self.check_id != report.check_id
+            || self.kind != report.kind
+            || !constant_time_str_eq(&self.spec_digest, &report.spec_digest)
+            || !constant_time_str_eq(&self.evidence_digest, &report.evidence_digest)
+            || self.status != report.status
+            || self.exit_code != report.exit_code
+            || self.signal != report.signal
+            || !constant_time_str_eq(&self.stdout_sha256, &report.stdout_sha256)
+            || !constant_time_str_eq(&self.stderr_sha256, &report.stderr_sha256)
+            || self.post_worktree_clean != report.post_worktree_clean
+            || self.subject_drifted != report.subject_drifted
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef fields do not match the loaded FrozenCheckExecutionReport.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Bounded, serializable contract binding an in-scope follow-up coding attempt (`attempt_no >= 2`)
+/// to a prior task attempt that committed a clean candidate in the task worktree and failed one
+/// or more required frozen task-review checks (`BlockedByFailedChecks`) via clean natural
+/// non-zero exit before Reviewer invocation.
+///
+/// This struct is a contract, not caller authority: a later trusted controller must load and
+/// validate the actual private [`FrozenCheckExecutionReport`] artifacts referenced in
+/// `failed_checks` before issuing a [`DerivedTaskAttemptReceipt`]. A validated
+/// [`CheckFailureCorrectionBasis`] or [`FrozenCheckExecutionReport`] alone is neither operator
+/// approval nor standalone proof of a known natural failure, and never mints a fake
+/// [`ReviewReceipt`] or alters frozen task instructions, write paths, or model choices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckFailureCorrectionBasis {
+    /// Target approved logical task identifier ([`CoworkerTaskRecord::task_id`]).
+    pub task_id: String,
+    /// Compact worktree manifest task identifier (`w...`) recorded in the owned task worktree manifest and [`FrozenCheckSubject::expected_task_id`].
+    pub task_manifest_id: String,
+    /// 1-based attempt number of the prior attempt that failed task-review checks (`receipt.attempt_no - 1`).
+    pub prior_attempt_no: u32,
+    /// Deterministic candidate identifier (`tcd_<32hex>`) of the prior attempt's committed task worktree state.
+    pub prior_candidate_id: String,
+    /// Exact 40-hex Git base commit from the original manifest/approval (`receipt.execution_base_commit`).
+    pub execution_base_commit: String,
+    /// Exact 40-hex Git commit SHA of the prior attempt's committed task worktree `HEAD` (may equal `execution_base_commit` when the prior candidate made no new commit before failing checks).
+    pub committed_head_commit: String,
+    /// Exact 40-hex Git tree SHA of `committed_head_commit`.
+    pub committed_tree_sha: String,
+    /// Canonical 64-character lowercase hex SHA-256 [`FrozenCheckSubject::subject_digest`] of the prior attempt's task worktree check subject.
+    pub check_subject_digest: String,
+    /// Canonical 64-character lowercase hex SHA-256 [`ReviewSubject::subject_digest`] of the prior attempt's committed diff.
+    pub prior_review_subject_digest: String,
+    /// Non-empty (`1..=MAX_CHECK_IDS_PER_ENVELOPE`), deduplicated list of compact references to the failed required task-review check reports.
+    pub failed_checks: Vec<CheckFailureReportRef>,
+    /// Bounded, single-line sanitized diagnostic summary (`<= MAX_COWORKER_SUMMARY_BYTES`) describing the check failure basis.
+    pub diagnostic_summary: String,
+}
+
+impl CheckFailureCorrectionBasis {
+    /// Computes the canonical 64-character lowercase hex SHA-256 digest of this [`CheckFailureCorrectionBasis`].
+    pub fn compute_digest(&self) -> Result<String, NativeError> {
+        let seed = (
+            "threadlane-native:check_failure_correction_basis:v1",
+            self.task_id.as_str(),
+            self.task_manifest_id.as_str(),
+            self.prior_attempt_no,
+            self.prior_candidate_id.as_str(),
+            self.execution_base_commit.as_str(),
+            self.committed_head_commit.as_str(),
+            self.committed_tree_sha.as_str(),
+            self.check_subject_digest.as_str(),
+            self.prior_review_subject_digest.as_str(),
+            &self.failed_checks,
+            self.diagnostic_summary.as_str(),
+        );
+        let bytes = serde_json::to_vec(&seed).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Failed to serialize CheckFailureCorrectionBasis for digest calculation.",
+            )
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Verifies that `subject` is a valid [`FrozenCheckTargetKind::TaskWorktree`] subject matching
+    /// this basis's `task_manifest_id`, `execution_base_commit`, `committed_head_commit`,
+    /// `committed_tree_sha`, and `check_subject_digest`.
+    pub fn verify_check_subject(&self, subject: &FrozenCheckSubject) -> Result<(), NativeError> {
+        subject.validate()?;
+        if subject.target_kind != FrozenCheckTargetKind::TaskWorktree
+            || subject.expected_task_id.as_deref() != Some(self.task_manifest_id.as_str())
+            || subject.expected_base_commit != self.execution_base_commit
+            || subject.expected_head_commit != self.committed_head_commit
+            || subject.expected_tree_sha != self.committed_tree_sha
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "FrozenCheckSubject fields do not match CheckFailureCorrectionBasis.",
+            ));
+        }
+        let digest = subject.subject_digest()?;
+        if !constant_time_str_eq(&digest, &self.check_subject_digest) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "FrozenCheckSubject.subject_digest does not match CheckFailureCorrectionBasis.check_subject_digest.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates this check-failure correction basis against the target [`CoworkerTaskRecord`] and
+    /// governing [`FrozenControllerExecutionEnvelope`].
+    pub fn validate_against_task_and_envelope(
+        &self,
+        task: &CoworkerTaskRecord,
+        envelope: &FrozenControllerExecutionEnvelope,
+    ) -> Result<(), NativeError> {
+        validate_bounded_identifier(
+            &self.task_id,
+            "check_failure_basis.task_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if self.task_id != task.task_id {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.task_id does not match the target CoworkerTaskRecord.task_id.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.task_manifest_id,
+            "check_failure_basis.task_manifest_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if self.prior_attempt_no == 0
+            || self.prior_attempt_no > envelope.max_in_scope_corrections_per_task
+            || self.prior_attempt_no > MAX_IN_SCOPE_CORRECTION_ATTEMPTS
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.prior_attempt_no is out of bounds for the envelope's max_in_scope_corrections_per_task or MAX_IN_SCOPE_CORRECTION_ATTEMPTS.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.prior_candidate_id,
+            "check_failure_basis.prior_candidate_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_exact_40_hex_sha(
+            &self.execution_base_commit,
+            "check_failure_basis.execution_base_commit",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.execution_base_commit must be a 40-hex commit SHA.",
+            )
+        })?;
+        validate_exact_40_hex_sha(
+            &self.committed_head_commit,
+            "check_failure_basis.committed_head_commit",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.committed_head_commit must be a 40-hex commit SHA.",
+            )
+        })?;
+        validate_exact_40_hex_sha(
+            &self.committed_tree_sha,
+            "check_failure_basis.committed_tree_sha",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.committed_tree_sha must be a 40-hex tree SHA.",
+            )
+        })?;
+        if task.depends_on.is_empty()
+            && self.execution_base_commit != envelope.project_base.base_commit
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.execution_base_commit for a root task must equal the frozen manifest base_commit.",
+            ));
+        }
+        if let Some(ref dep_commit) = task.dependency_input_commit {
+            if !task.depends_on.is_empty() && &self.execution_base_commit != dep_commit {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureCorrectionBasis.execution_base_commit must equal the task's prepared dependency_input_commit.",
+                ));
+            }
+        }
+        validate_sha256_hex_digest(
+            &self.check_subject_digest,
+            "check_failure_basis.check_subject_digest",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.check_subject_digest must be a 64-hex SHA-256 digest.",
+            )
+        })?;
+        validate_sha256_hex_digest(
+            &self.prior_review_subject_digest,
+            "check_failure_basis.prior_review_subject_digest",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.prior_review_subject_digest must be a 64-hex SHA-256 digest.",
+            )
+        })?;
+        validate_bounded_summary_line(
+            &self.diagnostic_summary,
+            "check_failure_basis.diagnostic_summary",
+        )?;
+
+        if self.failed_checks.is_empty() || self.failed_checks.len() > MAX_CHECK_IDS_PER_ENVELOPE {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.failed_checks must contain between 1 and MAX_CHECK_IDS_PER_ENVELOPE entries.",
+            ));
+        }
+        let mut seen_check_ids = BTreeSet::new();
+        let mut seen_effect_ids = BTreeSet::new();
+        for report_ref in &self.failed_checks {
+            report_ref.validate_against_envelope(envelope)?;
+            if !seen_check_ids.insert(report_ref.check_id.as_str()) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureCorrectionBasis.failed_checks contains duplicate check_id entries.",
+                ));
+            }
+            if !seen_effect_ids.insert(report_ref.effect_id.as_str()) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureCorrectionBasis.failed_checks contains duplicate effect_id entries.",
+                ));
+            }
+        }
+
+        if let Some(cand) = task.candidates.iter().find(|c| {
+            c.candidate_id == self.prior_candidate_id || c.attempt_no == self.prior_attempt_no
+        }) {
+            if cand.candidate_id != self.prior_candidate_id
+                || cand.task_id != self.task_id
+                || cand.attempt_no != self.prior_attempt_no
+                || cand.base_commit != self.execution_base_commit
+                || cand.head_commit != self.committed_head_commit
+                || cand.tree_sha != self.committed_tree_sha
+                || cand.review_receipt_id.is_some()
+                || cand.review_verdict.is_some()
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureCorrectionBasis does not match the prior TaskCandidateRef recorded on the task.",
+                ));
+            }
+            if let Some(ref subj) = cand.review_subject_digest {
+                if !constant_time_str_eq(subj, &self.prior_review_subject_digest) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "CheckFailureCorrectionBasis.prior_review_subject_digest does not match the prior TaskCandidateRef.",
+                    ));
+                }
+            }
+        }
+
+        if let Some(att) = task
+            .attempts
+            .iter()
+            .find(|a| a.attempt_no == self.prior_attempt_no && a.role == WorkflowRole::Coder)
+        {
+            if att.base_commit != self.execution_base_commit {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureCorrectionBasis.execution_base_commit does not match the prior TaskAttemptRef.base_commit.",
+                ));
+            }
+            if let Some(ref head) = att.head_commit {
+                if head != &self.committed_head_commit {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "CheckFailureCorrectionBasis.committed_head_commit does not match the prior TaskAttemptRef.head_commit.",
+                    ));
+                }
+            }
+            if let Some(ref tree) = att.tree_sha {
+                if tree != &self.committed_tree_sha {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "CheckFailureCorrectionBasis.committed_tree_sha does not match the prior TaskAttemptRef.tree_sha.",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validates this basis against its owning [`DerivedTaskAttemptReceipt`], [`CoworkerTaskRecord`],
+    /// and [`FrozenControllerExecutionEnvelope`].
+    pub fn validate_for_receipt(
+        &self,
+        receipt: &DerivedTaskAttemptReceipt,
+        task: &CoworkerTaskRecord,
+        envelope: &FrozenControllerExecutionEnvelope,
+    ) -> Result<(), NativeError> {
+        self.validate_against_task_and_envelope(task, envelope)?;
+        if receipt.attempt_no < 2 || self.prior_attempt_no + 1 != receipt.attempt_no {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.prior_attempt_no must equal DerivedTaskAttemptReceipt.attempt_no - 1.",
+            ));
+        }
+        if receipt.prior_rejected_candidate_id.as_deref() != Some(self.prior_candidate_id.as_str())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.prior_candidate_id must match DerivedTaskAttemptReceipt.prior_rejected_candidate_id.",
+            ));
+        }
+        if receipt.prior_review_subject_digest.as_deref()
+            != Some(self.prior_review_subject_digest.as_str())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.prior_review_subject_digest must match DerivedTaskAttemptReceipt.prior_review_subject_digest.",
+            ));
+        }
+        if receipt.execution_base_commit != self.execution_base_commit {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.execution_base_commit must match DerivedTaskAttemptReceipt.execution_base_commit.",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Immutable pre-effect receipt authorizing a derived task execution attempt (`attempt_no >= 2`
 /// or a task whose upstream predecessor completed via a derived attempt).
 ///
-/// Preserves the original [`ApprovalRecord`] untouched and binds the prior rejected candidate,
-/// structured [` super::contracts::StructuredReviewVerdict`] findings, unchanged write scope,
-/// and unchanged [`SelectedRoleChoice`].
+/// Preserves the original [`ApprovalRecord`], `frozen_instruction`, `write_paths`, and
+/// [`SelectedRoleChoice`] untouched; never mints a fake accepted [`ReviewReceipt`] or new
+/// operator approval. For `attempt_no >= 2`, requires `prior_rejected_candidate_id`,
+/// `prior_review_subject_digest`, non-empty `required_in_scope_fixes`, and an exact XOR between
+/// `prior_review_verdict_id` (structured Reviewer `correct_in_scope` path) and
+/// `prior_check_failure_basis` (verified check-failure path). `attempt_no == 1` cannot carry
+/// `prior_check_failure_basis`.
+///
+/// `execution_base_commit` remains the original manifest base commit (or prepared upstream
+/// dependency input commit), never the previous attempt's head commit. `run_id` and `worker_id`
+/// remain the original host identifiers owning the same `(task_worktree_id, integration_worktree_id)`
+/// worktree pair; separate derived execution identifiers will be added only when the correction
+/// runner exists.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DerivedTaskAttemptReceipt {
@@ -1650,28 +2201,31 @@ pub struct DerivedTaskAttemptReceipt {
     /// Prior rejected task candidate identifier (`tcd_...`), when `attempt_no >= 2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_rejected_candidate_id: Option<String>,
-    /// Prior structured review verdict identifier (`rvd_...`), when `attempt_no >= 2`.
+    /// Prior structured review verdict identifier (`rvd_...`), when `attempt_no >= 2` is authorized by a Reviewer `correct_in_scope` verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_review_verdict_id: Option<String>,
+    /// Prior verified check-failure correction basis, when `attempt_no >= 2` is triggered by failed required task-review checks without a Reviewer verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_check_failure_basis: Option<CheckFailureCorrectionBasis>,
     /// Prior 64-hex review subject digest, when `attempt_no >= 2`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prior_review_subject_digest: Option<String>,
-    /// Exact required in-scope fixes from the prior [`super::contracts::StructuredReviewVerdict`].
+    /// Exact required in-scope fixes from the prior [`super::contracts::StructuredReviewVerdict`] or verified check failure basis.
     #[serde(default)]
     pub required_in_scope_fixes: Vec<String>,
-    /// Original immutable task instruction from the frozen approval.
+    /// Original immutable task instruction from the frozen approval (unchanged across attempts).
     pub frozen_instruction: String,
-    /// Derived worker prompt combining `frozen_instruction` with structured reviewer findings.
+    /// Derived worker prompt combining `frozen_instruction` with structured reviewer findings or check failure diagnostics.
     pub derived_prompt: String,
     /// Unchanged repository-relative write paths from the frozen approval.
     pub write_paths: Vec<String>,
     /// Unchanged [`SelectedRoleChoice`] from the frozen approval.
     pub coder_choice: SelectedRoleChoice,
-    /// Exact 40-hex Git base commit from which the derived attempt worktree was created.
+    /// Exact 40-hex Git base commit from the original manifest/approval (not the previous attempt's head commit).
     pub execution_base_commit: String,
-    /// Software-generated run identifier (`r...`) owning the derived worktree pair.
+    /// Original host run identifier (`r...`) owning the worktree pair.
     pub run_id: String,
-    /// Software-generated worker identifier (`w...`) owning the derived task worktree.
+    /// Original host worker identifier (`w...`) owning the task worktree.
     pub worker_id: String,
     /// Owned `WorktreeKind::Task` worktree identifier (`wt-task-...`).
     pub task_worktree_id: String,
@@ -1685,8 +2239,12 @@ pub struct DerivedTaskAttemptReceipt {
 
 impl DerivedTaskAttemptReceipt {
     /// Computes the canonical 64-hex SHA-256 digest of this derived-attempt receipt.
+    ///
+    /// Preserves the exact v1 digest formula and bytes when `prior_check_failure_basis` is `None`.
+    /// When `prior_check_failure_basis` is `Some`, computes a domain-separated v2 digest that
+    /// binds the exact v1 digest together with the [`CheckFailureCorrectionBasis`].
     pub fn compute_digest(&self) -> Result<String, NativeError> {
-        let seed = (
+        let v1_seed = (
             (
                 "threadlane-native:derived_task_attempt_receipt:v1",
                 self.receipt_id.as_str(),
@@ -1718,16 +2276,34 @@ impl DerivedTaskAttemptReceipt {
                 self.recorded_at_ms,
             ),
         );
-        let bytes = serde_json::to_vec(&seed).map_err(|_| {
+        let v1_bytes = serde_json::to_vec(&v1_seed).map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ProtocolError,
                 "Failed to serialize DerivedTaskAttemptReceipt for digest calculation.",
             )
         })?;
-        Ok(sha256_hex(&bytes))
+        let v1_digest = sha256_hex(&v1_bytes);
+        let Some(ref basis) = self.prior_check_failure_basis else {
+            return Ok(v1_digest);
+        };
+        let basis_digest = basis.compute_digest()?;
+        let v2_seed = (
+            "threadlane-native:derived_task_attempt_receipt:v2",
+            v1_digest.as_str(),
+            basis_digest.as_str(),
+            basis,
+        );
+        let v2_bytes = serde_json::to_vec(&v2_seed).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Failed to serialize DerivedTaskAttemptReceipt v2 basis for digest calculation.",
+            )
+        })?;
+        Ok(sha256_hex(&v2_bytes))
     }
 
-    /// Validates receipt integrity and ensures write scopes and coder model choice match the frozen task.
+    /// Validates receipt integrity and ensures write scopes, coder model choice, and correction
+    /// basis match the frozen task and execution envelope.
     pub fn validate_against_task(
         &self,
         task: &CoworkerTaskRecord,
@@ -1755,26 +2331,55 @@ impl DerivedTaskAttemptReceipt {
             || self.task_digest != task.task_digest
             || self.write_paths != task.write_paths
             || self.coder_choice != task.selected_choice
+            || envelope.task_coder_choices.get(&task.task_id) != Some(&self.coder_choice)
         {
             return Err(NativeError::new(
                 NativeErrorCode::SecurityViolation,
                 "DerivedTaskAttemptReceipt cannot alter frozen task_id, task_digest, write_paths, or coder_choice.",
             ));
         }
-        if self.attempt_no == 0 {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "DerivedTaskAttemptReceipt.attempt_no must be >= 1.",
-            ));
-        }
-        if self.attempt_no >= 2
-            && (self.prior_rejected_candidate_id.is_none()
-                || self.prior_review_verdict_id.is_none()
-                || self.required_in_scope_fixes.is_empty())
+        if task.accepted_candidate_id.is_some()
+            || matches!(
+                task.stage,
+                CoworkerTaskStage::Accepted
+                    | CoworkerTaskStage::IntegrationReserved
+                    | CoworkerTaskStage::Integrated
+            )
         {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "In-scope correction attempt (attempt_no >= 2) requires prior rejected candidate, review verdict, and non-empty required_in_scope_fixes.",
+                "DerivedTaskAttemptReceipt cannot target a task that already has an accepted candidate.",
+            ));
+        }
+        if self.frozen_instruction.trim().is_empty()
+            || self.frozen_instruction.len() > MAX_COWORKER_TEXT_BYTES
+            || self.derived_prompt.trim().is_empty()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "DerivedTaskAttemptReceipt requires non-empty bounded frozen_instruction and derived_prompt.",
+            ));
+        }
+        validate_bounded_identifier(&self.run_id, "derived_receipt.run_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(
+            &self.worker_id,
+            "derived_receipt.worker_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_bounded_identifier(
+            &self.task_worktree_id,
+            "derived_receipt.task_worktree_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_bounded_identifier(
+            &self.integration_worktree_id,
+            "derived_receipt.integration_worktree_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if self.attempt_no == 0 || self.attempt_no > 1 + MAX_IN_SCOPE_CORRECTION_ATTEMPTS {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "DerivedTaskAttemptReceipt.attempt_no must be within 1..=1 + MAX_IN_SCOPE_CORRECTION_ATTEMPTS.",
             ));
         }
         validate_exact_40_hex_sha(&self.execution_base_commit, "execution_base_commit").map_err(
@@ -1785,6 +2390,136 @@ impl DerivedTaskAttemptReceipt {
                 )
             },
         )?;
+        if task.depends_on.is_empty()
+            && self.execution_base_commit != envelope.project_base.base_commit
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "DerivedTaskAttemptReceipt.execution_base_commit for a root task must equal the frozen manifest base_commit.",
+            ));
+        }
+        if let Some(ref dep_commit) = task.dependency_input_commit {
+            if !task.depends_on.is_empty() && &self.execution_base_commit != dep_commit {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "DerivedTaskAttemptReceipt.execution_base_commit must equal the task's prepared dependency_input_commit.",
+                ));
+            }
+        }
+
+        if self.attempt_no == 1 {
+            if self.prior_check_failure_basis.is_some()
+                || self.prior_rejected_candidate_id.is_some()
+                || self.prior_review_verdict_id.is_some()
+                || self.prior_review_subject_digest.is_some()
+                || !self.required_in_scope_fixes.is_empty()
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Initial attempt (attempt_no == 1) cannot carry prior candidate, review verdict, check-failure basis, or in-scope fixes.",
+                ));
+            }
+        } else {
+            if self.attempt_no > 1 + envelope.max_in_scope_corrections_per_task
+                || self.attempt_no > 1 + MAX_IN_SCOPE_CORRECTION_ATTEMPTS
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "DerivedTaskAttemptReceipt.attempt_no exceeds the envelope's max_in_scope_corrections_per_task.",
+                ));
+            }
+            let Some(ref prior_candidate_id) = self.prior_rejected_candidate_id else {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "In-scope correction attempt (attempt_no >= 2) requires prior_rejected_candidate_id.",
+                ));
+            };
+            validate_bounded_identifier(
+                prior_candidate_id,
+                "derived_receipt.prior_rejected_candidate_id",
+                MAX_COWORKER_ID_LEN,
+            )?;
+            let Some(ref prior_subject_digest) = self.prior_review_subject_digest else {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "In-scope correction attempt (attempt_no >= 2) requires prior_review_subject_digest.",
+                ));
+            };
+            validate_sha256_hex_digest(
+                prior_subject_digest,
+                "derived_receipt.prior_review_subject_digest",
+            )
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "DerivedTaskAttemptReceipt.prior_review_subject_digest must be a 64-hex SHA-256 digest.",
+                )
+            })?;
+            if self.required_in_scope_fixes.is_empty() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "In-scope correction attempt (attempt_no >= 2) requires non-empty required_in_scope_fixes.",
+                ));
+            }
+            for fix in &self.required_in_scope_fixes {
+                validate_bounded_summary_line(fix, "derived_receipt.required_in_scope_fixes")?;
+            }
+
+            match (
+                &self.prior_review_verdict_id,
+                &self.prior_check_failure_basis,
+            ) {
+                (Some(verdict_id), None) => {
+                    validate_bounded_identifier(
+                        verdict_id,
+                        "derived_receipt.prior_review_verdict_id",
+                        MAX_COWORKER_ID_LEN,
+                    )?;
+                    if let Some(cand) = task.candidates.iter().find(|c| {
+                        &c.candidate_id == prior_candidate_id || c.attempt_no == self.attempt_no - 1
+                    }) {
+                        if &cand.candidate_id != prior_candidate_id
+                            || cand.attempt_no != self.attempt_no - 1
+                            || cand.base_commit != self.execution_base_commit
+                            || cand.review_receipt_id.is_some()
+                            || cand.review_subject_digest.as_deref()
+                                != Some(prior_subject_digest.as_str())
+                        {
+                            return Err(NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                "DerivedTaskAttemptReceipt prior candidate or review_subject_digest does not match task.candidates.",
+                            ));
+                        }
+                        if let Some(ref verdict) = cand.review_verdict {
+                            if &verdict.verdict_id != verdict_id
+                                || verdict.outcome != ReviewVerdictOutcome::CorrectInScope
+                            {
+                                return Err(NativeError::new(
+                                    NativeErrorCode::ValidationFailed,
+                                    "DerivedTaskAttemptReceipt prior_review_verdict_id does not match the prior candidate's CorrectInScope verdict.",
+                                ));
+                            }
+                        }
+                    }
+                }
+                (None, Some(basis)) => {
+                    basis.validate_for_receipt(self, task, envelope)?;
+                }
+                (Some(_), Some(_)) => {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "In-scope correction attempt (attempt_no >= 2) cannot carry both prior_review_verdict_id and prior_check_failure_basis.",
+                    ));
+                }
+                (None, None) => {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "In-scope correction attempt (attempt_no >= 2) requires exactly one of prior_review_verdict_id or prior_check_failure_basis.",
+                    ));
+                }
+            }
+        }
+
         let computed = self.compute_digest()?;
         if !constant_time_str_eq(&computed, &self.receipt_digest) {
             return Err(NativeError::new(
@@ -2850,6 +3585,49 @@ pub fn sanitize_controller_diagnostic(raw: &str) -> String {
         }
         clean[..end].to_string()
     }
+}
+
+fn verify_clean_natural_nonzero_check_report(
+    report: &FrozenCheckExecutionReport,
+) -> Result<(), NativeError> {
+    report.validate_integrity()?;
+    if report.status != FrozenCheckExecutionStatus::NonZeroExit
+        || !matches!(report.exit_code, Some(code) if code != 0)
+        || report.signal.is_some()
+        || report.stdout_overflowed
+        || report.stderr_overflowed
+        || report.overflow.is_some()
+        || report.descendants_terminated_after_exit
+        || report.cleanup_incomplete
+        || !report.ownership_verified_post_run
+        || !report.post_worktree_clean
+        || report.subject_drifted
+        || report.drift_reason.is_some()
+        || report.post_head_commit.as_deref() != Some(report.subject.expected_head_commit.as_str())
+        || report.post_tree_sha.as_deref() != Some(report.subject.expected_tree_sha.as_str())
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "FrozenCheckExecutionReport for check-failure correction basis must be a clean natural NonZeroExit with complete cleanup, no signal, no output overflow, no forced descendants, verified ownership, and an unmutated worktree.",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_bounded_summary_line(value: &str, label: &str) -> Result<(), NativeError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || value.len() > MAX_COWORKER_SUMMARY_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "{label} must be a non-empty bounded single-line string without control characters."
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn controller_ledger_filename(binding_id: &str) -> String {

@@ -1484,7 +1484,7 @@ pub enum CoworkerTaskStage {
     ReviewReserved,
     /// Candidate is currently under structured review.
     UnderReview,
-    /// Reviewer returned `correct_in_scope`; requires a follow-up in-scope coding attempt.
+    /// Reviewer returned `correct_in_scope` or task verification recorded a clean check failure; requires a follow-up in-scope coding attempt.
     CorrectInScopeRequired,
     /// Candidate was accepted by a structured `accept` verdict and review receipt.
     Accepted,
@@ -1558,7 +1558,11 @@ impl CoworkerTaskStage {
             ),
             Self::ReadyForReview => matches!(
                 next,
-                Self::ReviewReserved | Self::Held | Self::Blocked | Self::Cancelled
+                Self::ReviewReserved
+                    | Self::CorrectInScopeRequired
+                    | Self::Held
+                    | Self::Blocked
+                    | Self::Cancelled
             ),
             Self::ReviewReserved => matches!(
                 next,
