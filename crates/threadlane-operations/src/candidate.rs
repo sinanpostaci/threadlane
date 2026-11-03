@@ -1553,10 +1553,61 @@ pub struct ClosureAttemptRecord {
     /// Structured terminal verdict when `state == ClosureAttemptState::Terminal`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<ClosureVerdict>,
+    /// Bounded local terminal failure evidence when `state == ClosureAttemptState::Terminal` and `verdict.is_none()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_failure: Option<ClosureTerminalFailure>,
     /// Wall-clock timestamp (ms since Unix epoch) when the attempt was reserved.
     pub reserved_at_ms: i64,
     /// Wall-clock timestamp (ms since Unix epoch) when the attempt was last updated.
     pub updated_at_ms: i64,
+}
+
+/// Bounded terminal failure evidence recorded when a local closure worker or response validation
+/// fails terminally without producing a verified structured [`ClosureVerdict`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosureTerminalFailure {
+    /// Machine-readable terminal failure classification (`validate_simple_identifier`).
+    pub failure_code: String,
+    /// Sanitized diagnostic explaining the local terminal failure.
+    pub reason: String,
+    /// Observed subprocess exit code when the worker exited locally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Observed provider identifier if reported by the local supervisor (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_provider: Option<String>,
+    /// Observed model identifier if reported by the local supervisor (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Observed effort identifier if reported by the local supervisor (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    /// 64-character lowercase hex SHA-256 digest of the raw response payload if captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_sha256_digest: Option<String>,
+    /// Whether valid late worker output was fenced from promotion due to active hold, revision drift, or subject drift.
+    #[serde(default)]
+    pub fenced_late_output: bool,
+    /// Wall-clock timestamp (ms since Unix epoch) when the terminal failure was recorded.
+    pub recorded_at_ms: i64,
+}
+
+/// Request to transition an active (`Reserved` or `Submitted`) closure attempt to
+/// [`ClosureAttemptState::Terminal`] with bounded [`ClosureTerminalFailure`] evidence and `verdict: None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordClosureFailureRequest {
+    /// Expected current `ledger_revision` for compare-and-swap.
+    pub expected_ledger_revision: u64,
+    /// Target `attempt_id`.
+    pub attempt_id: String,
+    /// Bound `command_key` that reserved the attempt.
+    pub command_key: String,
+    /// Expected 64-hex `subject_digest`.
+    pub expected_subject_digest: String,
+    /// Bounded terminal failure evidence.
+    pub failure: ClosureTerminalFailure,
 }
 
 /// Bounded private closure-attempt ledger persisted at `<work_area_root>/manifests/closures/final-candidate-closures.json`.
@@ -1944,31 +1995,40 @@ impl FinalCandidateClosureStore {
                         )));
                     }
                     ClosureAttemptState::Terminal => {
-                        let Some(verdict) = existing.verdict.clone() else {
-                            return Err(OperationsError::ReceiptInvalidated(format!(
-                                "terminal closure attempt `{}` is missing its structured verdict",
-                                existing.attempt_id
-                            )));
-                        };
-                        verdict.verify_against_subject(&request.subject)?;
-                        if verdict.kind == ClosureVerdictKind::Accepted {
-                            if request.expected_ledger_revision != ledger.ledger_revision {
-                                return Err(OperationsError::ReceiptInvalidated(format!(
-                                    "stale expected_ledger_revision {} on cache reuse check (current ledger_revision is {})",
-                                    request.expected_ledger_revision, ledger.ledger_revision
-                                )));
+                        if let Some(verdict) = existing.verdict.clone() {
+                            verdict.verify_against_subject(&request.subject)?;
+                            if verdict.kind == ClosureVerdictKind::Accepted {
+                                if request.expected_ledger_revision != ledger.ledger_revision {
+                                    return Err(OperationsError::ReceiptInvalidated(format!(
+                                        "stale expected_ledger_revision {} on cache reuse check (current ledger_revision is {})",
+                                        request.expected_ledger_revision, ledger.ledger_revision
+                                    )));
+                                }
+                                return Ok(ClosureReservationOutcome::CacheHit {
+                                    ledger_revision: ledger.ledger_revision,
+                                    attempt: existing,
+                                    verdict: Box::new(verdict),
+                                });
                             }
-                            return Ok(ClosureReservationOutcome::CacheHit {
-                                ledger_revision: ledger.ledger_revision,
-                                attempt: existing,
-                                verdict: Box::new(verdict),
-                            });
+                            return Err(OperationsError::UncertainWorkerOutcome(format!(
+                                "subject `{}` already has a terminal non-accepted closure verdict `{}` (`{}`); candidate tree, scope, check evidence, or predecessor receipts must change before a new closure evaluation",
+                                existing.subject_digest,
+                                verdict.verdict_id,
+                                verdict.kind.as_str()
+                            )));
                         }
-                        return Err(OperationsError::UncertainWorkerOutcome(format!(
-                            "subject `{}` already has a terminal non-accepted closure verdict `{}` (`{}`); candidate tree, scope, check evidence, or predecessor receipts must change before a new closure evaluation",
-                            existing.subject_digest,
-                            verdict.verdict_id,
-                            verdict.kind.as_str()
+                        if let Some(ref failure) = existing.terminal_failure {
+                            return Err(OperationsError::UncertainWorkerOutcome(format!(
+                                "subject `{}` already has a terminal failed closure attempt `{}` (`{}`: {}); reconcile with receipt-bound evidence or produce a new candidate subject before retrying",
+                                existing.subject_digest,
+                                existing.attempt_id,
+                                failure.failure_code,
+                                failure.reason
+                            )));
+                        }
+                        return Err(OperationsError::ReceiptInvalidated(format!(
+                            "terminal closure attempt `{}` is missing its structured verdict",
+                            existing.attempt_id
                         )));
                     }
                 }
@@ -2055,6 +2115,7 @@ impl FinalCandidateClosureStore {
                 uncertainty_reason: None,
                 reconciliation_receipt_id: None,
                 verdict: None,
+                terminal_failure: None,
                 reserved_at_ms: request.reserved_at_ms,
                 updated_at_ms: request.reserved_at_ms,
             };
@@ -2365,6 +2426,7 @@ impl FinalCandidateClosureStore {
                     let record = &mut ledger.attempts[idx];
                     record.state = ClosureAttemptState::Terminal;
                     record.uncertainty_reason = None;
+                    record.terminal_failure = None;
                     record.verdict = Some(verdict.clone());
                     record.updated_at_ms = request.recorded_at_ms;
                     record.clone()
@@ -2374,6 +2436,120 @@ impl FinalCandidateClosureStore {
                 Ok((ledger.ledger_revision, updated, verdict))
             })();
 
+        let _ = lock_file.unlock();
+        result
+    }
+
+    /// Transitions an active (`Reserved` or `Submitted`) closure attempt to
+    /// [`ClosureAttemptState::Terminal`] with bounded [`ClosureTerminalFailure`] evidence and `verdict: None`.
+    ///
+    /// Used when a local closure worker exits with a known terminal error or fails structured
+    /// response/subject validation, without fabricating a [`ClosureVerdict`] or marking the
+    /// external outcome as permanently unknown.
+    pub fn record_closure_failure(
+        &self,
+        request: &RecordClosureFailureRequest,
+    ) -> Result<(u64, ClosureAttemptRecord), OperationsError> {
+        validate_simple_identifier(&request.attempt_id, "attempt_id")?;
+        validate_simple_identifier(&request.command_key, "command_key")?;
+        let expected_subject_digest = validate_sha256_hex_digest(
+            &request.expected_subject_digest,
+            "expected_subject_digest",
+        )?;
+        validate_simple_identifier(&request.failure.failure_code, "failure_code")?;
+        let clean_reason = sanitize_and_redact(&request.failure.reason, MAX_REVIEW_NOTE_BYTES);
+        if clean_reason.trim().is_empty() {
+            return Err(OperationsError::InvalidInput(
+                "closure terminal failure reason must not be empty".to_string(),
+            ));
+        }
+        if let Some(ref p) = request.failure.observed_provider {
+            validate_simple_identifier(p, "observed_provider")?;
+        }
+        if let Some(ref m) = request.failure.observed_model {
+            validate_closure_model_identifier(m, "observed_model")?;
+        }
+        if let Some(ref e) = request.failure.observed_effort {
+            validate_simple_identifier(e, "observed_effort")?;
+        }
+        let clean_digest = match request.failure.response_sha256_digest {
+            Some(ref d) => Some(validate_sha256_hex_digest(d, "response_sha256_digest")?),
+            None => None,
+        };
+        let clean_failure = ClosureTerminalFailure {
+            failure_code: request.failure.failure_code.clone(),
+            reason: clean_reason,
+            exit_code: request.failure.exit_code,
+            observed_provider: request.failure.observed_provider.clone(),
+            observed_model: request.failure.observed_model.clone(),
+            observed_effort: request.failure.observed_effort.clone(),
+            response_sha256_digest: clean_digest,
+            fenced_late_output: request.failure.fenced_late_output,
+            recorded_at_ms: request.failure.recorded_at_ms,
+        };
+
+        let lock_file = self.open_exclusive_closure_lock()?;
+        let result = (|| -> Result<(u64, ClosureAttemptRecord), OperationsError> {
+            let mut ledger = self.read_or_default_ledger_unlocked()?;
+            let idx = ledger
+                .attempts
+                .iter()
+                .position(|a| a.attempt_id == request.attempt_id)
+                .ok_or_else(|| {
+                    OperationsError::InvalidInput(format!(
+                        "closure attempt `{}` not found in ledger",
+                        request.attempt_id
+                    ))
+                })?;
+            let existing = &ledger.attempts[idx];
+            if existing.command_key != request.command_key {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure attempt `{}` is bound to command_key `{}`, not `{}`",
+                    existing.attempt_id, existing.command_key, request.command_key
+                )));
+            }
+            if existing.subject_digest != expected_subject_digest {
+                return Err(OperationsError::SubjectMismatch(format!(
+                    "closure attempt `{}` subject_digest `{}` does not match expected `{expected_subject_digest}`",
+                    existing.attempt_id, existing.subject_digest
+                )));
+            }
+            if existing.state == ClosureAttemptState::OutcomeUnknown {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure attempt `{}` is in `outcome_unknown` state; use `reconcile_closure_attempt`",
+                    existing.attempt_id
+                )));
+            }
+            if existing.state == ClosureAttemptState::Terminal {
+                if existing.verdict.is_none()
+                    && existing.terminal_failure.as_ref() == Some(&clean_failure)
+                {
+                    return Ok((ledger.ledger_revision, existing.clone()));
+                }
+                return Err(OperationsError::ReceiptInvalidated(format!(
+                    "closure attempt `{}` is already terminal and cannot be overwritten",
+                    existing.attempt_id
+                )));
+            }
+            if request.expected_ledger_revision != ledger.ledger_revision {
+                return Err(OperationsError::ReceiptInvalidated(format!(
+                    "closure ledger CAS mismatch: expected_ledger_revision {}, actual {}",
+                    request.expected_ledger_revision, ledger.ledger_revision
+                )));
+            }
+            let updated = {
+                let record = &mut ledger.attempts[idx];
+                record.state = ClosureAttemptState::Terminal;
+                record.uncertainty_reason = None;
+                record.verdict = None;
+                record.terminal_failure = Some(clean_failure.clone());
+                record.updated_at_ms = clean_failure.recorded_at_ms;
+                record.clone()
+            };
+            ledger.ledger_revision = ledger.ledger_revision.saturating_add(1);
+            self.write_ledger_unlocked(&ledger)?;
+            Ok((ledger.ledger_revision, updated))
+        })();
         let _ = lock_file.unlock();
         result
     }
@@ -2448,7 +2624,7 @@ impl FinalCandidateClosureStore {
                         existing.attempt_id, existing.subject_digest, request.subject.subject_digest
                     )));
                 }
-                if existing.state == ClosureAttemptState::Terminal {
+                if existing.state == ClosureAttemptState::Terminal && existing.verdict.is_some() {
                     return Err(OperationsError::ReceiptInvalidated(format!(
                         "closure attempt `{}` is already terminal and cannot be reconciled again",
                         existing.attempt_id

@@ -25,8 +25,14 @@
 //! - `candidate.rs`: verified combined-candidate assembly, check evidence verification, and
 //!   single-closure reservation binding over [`RoleFlowStore`].
 
+/// Verified combined-candidate assembly, check evidence verification, and single-closure
+/// reservation/execution over [`threadlane_operations`] and [`CoworkerWorkflowStore`].
+pub mod candidate;
 /// Serializable data contracts, validation rules, deterministic digests, and independence proofs.
 pub mod contracts;
+/// Typed controller execution configuration/envelope, frozen check command specifications,
+/// budgets, completeness/correction receipts, and per-job driver lease state.
+pub mod controller_policy;
 /// Private per-job OS file-lock ownership, CSPRNG instance/challenge identity, and pre-effect validation.
 pub mod ownership;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.

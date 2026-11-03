@@ -2617,6 +2617,7 @@ dependencies = [
  "threadlane-authority",
  "threadlane-core",
  "threadlane-host",
+ "threadlane-operations",
  "threadlane-workers",
  "threadlane-workflow",
  "tokio",

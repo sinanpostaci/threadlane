@@ -54,6 +54,7 @@ threadlane = { path = "../threadlane" }
 threadlane-authority = { path = "../threadlane-authority" }
 threadlane-core = { path = "../threadlane-core" }
 threadlane-host = { path = "../threadlane-host" }
+threadlane-operations = { path = "../threadlane-operations" }
 threadlane-workers = { path = "../threadlane-workers" }
 threadlane-workflow = { path = "../threadlane-workflow" }
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }

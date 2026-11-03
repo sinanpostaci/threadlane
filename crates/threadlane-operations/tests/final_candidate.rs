@@ -7,13 +7,15 @@ use threadlane_operations::{
     accept_review_subject, commit_task_worktree_changes, execute_integration,
     inspect_final_candidate_readonly, inspect_review_subject,
     verify_final_candidate_subject_readonly, verify_legacy_base_closure_insufficient,
-    ClosureAttemptState, ClosureExecutionEvidence, ClosureReservationOutcome, ClosureVerdictKind,
-    CommitTaskChangesRequest, ExecuteIntegrationRequest, FinalCandidateClosureStore,
-    FinalCandidatePolicyBinding, FinalCandidateSubject, FinalCandidateTaskInput,
-    InspectFinalCandidateRequest, InspectReviewSubjectRequest, IntegrationReceipt,
-    IntegrationStrategy, MarkClosureSubmittedRequest, MarkClosureUnknownRequest, OperationsError,
-    ReconcileClosureAttemptRequest, RecordClosureVerdictRequest, ReserveClosureAttemptRequest,
-    ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt, TestEvidenceSummary,
+    ClosureAttemptState, ClosureExecutionEvidence, ClosureReservationOutcome,
+    ClosureTerminalFailure, ClosureVerdictKind, CommitTaskChangesRequest,
+    ExecuteIntegrationRequest, FinalCandidateClosureStore, FinalCandidatePolicyBinding,
+    FinalCandidateSubject, FinalCandidateTaskInput, InspectFinalCandidateRequest,
+    InspectReviewSubjectRequest, IntegrationReceipt, IntegrationStrategy,
+    MarkClosureSubmittedRequest, MarkClosureUnknownRequest, OperationsError,
+    ReconcileClosureAttemptRequest, RecordClosureFailureRequest, RecordClosureVerdictRequest,
+    ReserveClosureAttemptRequest, ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt,
+    TestEvidenceSummary,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, WorkerFilePermissions,
@@ -1270,4 +1272,114 @@ fn final_candidate_legacy_base_tree_reservation_never_satisfies_final_closure_an
     assert!(matches!(sub_err, OperationsError::SecurityViolation(_)));
 
     assert_primary_checkout_untouched(&fixture);
+}
+
+#[test]
+fn known_local_terminal_closure_failure_blocks_blind_retry_and_supports_reconciliation() {
+    let fixture = init_candidate_fixture();
+    let task_a = create_accept_and_integrate_task(
+        &fixture,
+        "task_alpha",
+        "t01",
+        "aa",
+        "src/alpha.rs",
+        "pub fn alpha() -> u32 {\n    42\n}\n",
+        IntegrationStrategy::FastForwardOnly,
+        1_000,
+    );
+    let subject = inspect_final_candidate_readonly(&InspectFinalCandidateRequest {
+        repository_path: fixture.repo_path.clone(),
+        work_area_root: fixture.work_area_root.clone(),
+        run_id: fixture.run_id.clone(),
+        integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+        approved_base_commit: fixture.approved_base_commit.clone(),
+        expected_source_head_commit: fixture.approved_base_commit.clone(),
+        expected_candidate_head_commit: None,
+        expected_candidate_tree_sha: None,
+        predecessor_tasks: vec![to_task_input(&task_a)],
+        expected_aggregate_write_paths: None,
+        policy: default_candidate_policy(),
+        check_evidence: default_test_evidence("passed", 10),
+    })
+    .expect("inspect candidate");
+
+    let store = FinalCandidateClosureStore::open(&fixture.repo_path, &fixture.work_area_root)
+        .expect("open store");
+    store
+        .reserve_closure_attempt(&ReserveClosureAttemptRequest {
+            expected_ledger_revision: 0,
+            command_key: "cmd_fail_1".to_string(),
+            attempt_id: Some("cat_fail_1".to_string()),
+            subject: subject.clone(),
+            legacy_base_tree_digest: Some(fixture.approved_base_tree_sha.clone()),
+            reserved_at_ms: 1_000,
+        })
+        .expect("reserve");
+    store
+        .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
+            expected_ledger_revision: 1,
+            attempt_id: "cat_fail_1".to_string(),
+            command_key: "cmd_fail_1".to_string(),
+            expected_subject_digest: subject.subject_digest.clone(),
+            external_request_id: "req_fail_1".to_string(),
+            submitted_at_ms: 1_050,
+        })
+        .expect("submit");
+    let (rev, failed) = store
+        .record_closure_failure(&RecordClosureFailureRequest {
+            expected_ledger_revision: 2,
+            attempt_id: "cat_fail_1".to_string(),
+            command_key: "cmd_fail_1".to_string(),
+            expected_subject_digest: subject.subject_digest.clone(),
+            failure: ClosureTerminalFailure {
+                failure_code: "response_validation_failed".to_string(),
+                reason: "malformed closure JSON output".to_string(),
+                exit_code: Some(0),
+                observed_provider: Some("gpt".to_string()),
+                observed_model: None,
+                observed_effort: None,
+                response_sha256_digest: Some("ab".repeat(32)),
+                fenced_late_output: false,
+                recorded_at_ms: 1_100,
+            },
+        })
+        .expect("record failure");
+    assert_eq!(rev, 3);
+    assert_eq!(failed.state, ClosureAttemptState::Terminal);
+    assert!(failed.verdict.is_none());
+    assert!(failed.terminal_failure.is_some());
+
+    // New command key cannot bypass the failed terminal record on the same subject.
+    let bypass_err = store
+        .reserve_closure_attempt(&ReserveClosureAttemptRequest {
+            expected_ledger_revision: 3,
+            command_key: "cmd_fail_2".to_string(),
+            attempt_id: Some("cat_fail_2".to_string()),
+            subject: subject.clone(),
+            legacy_base_tree_digest: None,
+            reserved_at_ms: 1_200,
+        })
+        .expect_err("must block new-key bypass on failed subject");
+    assert!(matches!(
+        bypass_err,
+        OperationsError::UncertainWorkerOutcome(_)
+    ));
+
+    // Explicit receipt-bound reconciliation can resolve the terminal failure.
+    let (rec_rev, rec_attempt, rec_verdict) = store
+        .reconcile_closure_attempt(&ReconcileClosureAttemptRequest {
+            expected_ledger_revision: 3,
+            attempt_id: "cat_fail_1".to_string(),
+            reconciliation_receipt_id: "hnd_rec_fail_1".to_string(),
+            reconciliation_receipt_digest: "cd".repeat(32),
+            subject: subject.clone(),
+            resolved_kind: ClosureVerdictKind::Accepted,
+            summary: "Reconciled with receipt".to_string(),
+            execution_evidence: default_execution_evidence("hnd_rec_fail_1"),
+            reconciled_at_ms: 1_300,
+        })
+        .expect("reconcile failed attempt");
+    assert_eq!(rec_rev, 4);
+    assert_eq!(rec_attempt.state, ClosureAttemptState::Terminal);
+    assert_eq!(rec_verdict.kind, ClosureVerdictKind::Accepted);
 }
