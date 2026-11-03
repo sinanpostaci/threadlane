@@ -75,9 +75,13 @@ Coworker workflow package.
      check commands, or local Git integration. Those capabilities require an explicit frozen
      `controller_envelope: Option<FrozenControllerCapabilityEnvelope>` verified via
      `authorizes_reviewer_dispatch`, `authorizes_closure_dispatch`,
-     `authorizes_in_scope_correction`, `authorizes_check_command`, and
-     `authorizes_local_git_integration`. Existing coder-only approvals default to
-     `controller_envelope: None` and are not retrofitted.
+     `authorizes_in_scope_correction`, `authorizes_check_failure_correction`,
+     `authorizes_check_command`, and `authorizes_local_git_integration`. Automatic check-failure
+     corrections default to `allow_check_failure_corrections: false` (omitted on serialization when
+     `false` to preserve exact legacy v1 capability and execution envelope digests) and require
+     explicit opt-in (`allow_check_failure_corrections: true`, `max_in_scope_correction_attempts >= 1`,
+     and non-empty `allowed_check_ids`) before freezing. Existing coder-only or Reviewer-only
+     approvals are never broadened or retrofitted.
    - Once bound on a `CoworkerJobRecord`, `approval_linkage` is immutable; any attempt to rebind a
      different approval, plan revision, base commit, write scope, policy, or controller capability
      envelope on the same job fails closed.

@@ -554,6 +554,7 @@ fn finish_binding_and_freezing_job(
         max_in_scope_correction_attempts: 2,
         allowed_check_ids: vec!["cargo_fmt".to_string(), "cargo_test".to_string()],
         local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
     };
     let mut task_interfaces = BTreeMap::new();
     task_interfaces.insert(

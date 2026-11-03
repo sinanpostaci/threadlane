@@ -1670,6 +1670,20 @@ fn prepare_or_claim_derived_coder_execution(
         ));
     }
 
+    if adm.runtime_state.derived_attempts.iter().any(|d| {
+        d.task_id == request.task_id
+            && d.attempt_no == next_attempt_no
+            && d.prior_check_failure_basis.is_some()
+    }) {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedCapability,
+            format!(
+                "task `{}` derived attempt `{next_attempt_no}` was prepared from a check-failure basis without a Reviewer verdict; execution of check-failure derived correction attempts is not enabled in this slice and refuses to launch a provider worker",
+                request.task_id
+            ),
+        ));
+    }
+
     let prep_request = CoworkerTaskCorrectionPrepareRequest {
         binding_id: request.binding_id.clone(),
         thread_uuid: request.thread_uuid.clone(),

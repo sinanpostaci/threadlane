@@ -3204,6 +3204,7 @@ fn frozen_approval_linkage_requires_explicit_controller_capability_envelope_for_
                     max_in_scope_correction_attempts: 1,
                     allowed_check_ids: vec!["cargo_test".to_string()],
                     local_git_integration_allowed: true,
+                    allow_check_failure_corrections: false,
                 }),
                 task_interfaces: BTreeMap::new(),
             },
@@ -3221,6 +3222,7 @@ fn frozen_approval_linkage_requires_explicit_controller_capability_envelope_for_
         max_in_scope_correction_attempts: 2,
         allowed_check_ids: vec!["cargo_fmt".to_string(), "cargo_test".to_string()],
         local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
     };
     let bound_with_env = fixture
         .store

@@ -61,6 +61,10 @@ pub const MAX_COWORKER_SUMMARY_BYTES: usize = MAX_COWORKER_TEXT_BYTES;
 /// Alias for [`TaskIndependenceProof`] returned by declared branch-independence evaluation.
 pub type IndependenceProof = TaskIndependenceProof;
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Computes the canonical 64-character lowercase hex SHA-256 digest of a [`FrozenControllerCapabilityEnvelope`].
 pub fn compute_capability_envelope_digest(
     cap_env: &FrozenControllerCapabilityEnvelope,
@@ -80,7 +84,22 @@ pub fn compute_capability_envelope_digest(
             "Failed to serialize FrozenControllerCapabilityEnvelope for digest calculation.",
         )
     })?;
-    Ok(sha256_hex(&bytes))
+    let v1_digest = sha256_hex(&bytes);
+    if !cap_env.allow_check_failure_corrections {
+        return Ok(v1_digest);
+    }
+    let v2_seed = (
+        "threadlane-native:frozen_controller_capability_envelope:v2",
+        v1_digest.as_str(),
+        cap_env.allow_check_failure_corrections,
+    );
+    let v2_bytes = serde_json::to_vec(&v2_seed).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "Failed to serialize FrozenControllerCapabilityEnvelope v2 for digest calculation.",
+        )
+    })?;
+    Ok(sha256_hex(&v2_bytes))
 }
 
 /// Current wire and on-disk schema version for controller policy and runtime state ledgers.
@@ -1217,6 +1236,10 @@ pub struct FrozenControllerExecutionEnvelope {
     pub allow_task_worktree_commits: bool,
     /// Whether the controller is authorized to integrate accepted task commits into an owned `RunIntegration` worktree.
     pub allow_run_integration_execution: bool,
+    /// Whether the controller is authorized to prepare/reserve bounded in-scope coding follow-ups
+    /// after clean natural non-zero task-review check failures without a `Reviewer` verdict.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_check_failure_corrections: bool,
     /// Default Git integration strategy for combining accepted task worktrees.
     pub default_integration_strategy: IntegrationStrategy,
     /// Optional explicit semantic completeness receipt for branch continuation under holds.
@@ -1297,7 +1320,22 @@ impl FrozenControllerExecutionEnvelope {
                 "Failed to serialize FrozenControllerExecutionEnvelope for digest calculation.",
             )
         })?;
-        Ok(sha256_hex(&bytes))
+        let v1_digest = sha256_hex(&bytes);
+        if !self.allow_check_failure_corrections {
+            return Ok(v1_digest);
+        }
+        let v2_seed = (
+            "threadlane-native:frozen_controller_execution_envelope:v2",
+            v1_digest.as_str(),
+            self.allow_check_failure_corrections,
+        );
+        let v2_bytes = serde_json::to_vec(&v2_seed).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Failed to serialize FrozenControllerExecutionEnvelope v2 for digest calculation.",
+            )
+        })?;
+        Ok(sha256_hex(&v2_bytes))
     }
 
     /// Validates all structural, policy, model-choice, command-spec, budget, and digest invariants
@@ -1555,6 +1593,21 @@ impl FrozenControllerExecutionEnvelope {
             ));
         }
 
+        let expected_allow_check_failure =
+            cap_env.allow_check_failure_corrections && self.max_in_scope_corrections_per_task > 0;
+        if self.allow_check_failure_corrections && !cap_env.allow_check_failure_corrections {
+            return Err(NativeError::new(
+                NativeErrorCode::UnauthorizedOperator,
+                "allow_check_failure_corrections requires allow_check_failure_corrections = true in FrozenControllerCapabilityEnvelope.",
+            ));
+        }
+        if self.allow_check_failure_corrections != expected_allow_check_failure {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "FrozenControllerExecutionEnvelope.allow_check_failure_corrections does not match capability envelope and max_in_scope_corrections_per_task.",
+            ));
+        }
+
         if let Some(ref receipt) = self.independence_completeness_receipt {
             receipt.validate_for_job(job)?;
         }
@@ -1637,6 +1690,9 @@ pub struct ControllerConfigurationPreview {
     pub capability_envelope_digest: String,
     /// Per-check command digests (`check_id -> 64-hex spec_digest`).
     pub check_spec_digests: BTreeMap<String, String>,
+    /// Whether the previewed envelope authorizes automatic check-failure corrections.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_check_failure_corrections: bool,
     /// Previewed [`FrozenControllerExecutionEnvelope`].
     pub envelope: FrozenControllerExecutionEnvelope,
 }
@@ -4212,6 +4268,8 @@ impl ControllerPolicyStore {
             check_commands: request.check_commands.clone(),
             allow_task_worktree_commits: request.allow_task_worktree_commits,
             allow_run_integration_execution: request.allow_run_integration_execution,
+            allow_check_failure_corrections: cap_env.allow_check_failure_corrections
+                && request.max_in_scope_corrections_per_task > 0,
             default_integration_strategy: request.default_integration_strategy,
             independence_completeness_receipt: request.independence_completeness_receipt.clone(),
             shadow_jev_policy: request.shadow_jev_policy.clone(),
@@ -4233,6 +4291,7 @@ impl ControllerPolicyStore {
             policy_digest: envelope.policy_digest.clone(),
             capability_envelope_digest,
             check_spec_digests,
+            allow_check_failure_corrections: envelope.allow_check_failure_corrections,
             envelope,
         })
     }

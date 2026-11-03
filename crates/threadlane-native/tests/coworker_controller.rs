@@ -632,7 +632,7 @@ async fn create_planned_approved_and_frozen_job(
     approval_budgets: ExecutionBudgets,
     coder_budget: ControllerRoleExecutionBudget,
 ) -> (CoworkerJobRecord, String) {
-    create_planned_approved_and_frozen_job_for_scope(
+    create_planned_approved_and_frozen_job_for_scope_with_options(
         fixture,
         BINDING_A,
         THREAD_UUID_A,
@@ -644,6 +644,10 @@ async fn create_planned_approved_and_frozen_job(
         max_parallel,
         approval_budgets,
         coder_budget,
+        false,
+        1,
+        2,
+        6,
     )
     .await
 }
@@ -661,6 +665,80 @@ async fn create_planned_approved_and_frozen_job_for_scope(
     max_parallel: usize,
     approval_budgets: ExecutionBudgets,
     coder_budget: ControllerRoleExecutionBudget,
+) -> (CoworkerJobRecord, String) {
+    create_planned_approved_and_frozen_job_for_scope_with_options(
+        fixture,
+        binding_id,
+        thread_uuid,
+        brief_id,
+        plan_id,
+        tasks,
+        task_interfaces,
+        approved_write_paths,
+        max_parallel,
+        approval_budgets,
+        coder_budget,
+        false,
+        1,
+        2,
+        6,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_job_with_options(
+    fixture: &ControllerTestFixture,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+    allow_check_failure_corrections: bool,
+    max_in_scope_corrections_per_task: u32,
+    max_total_corrections_per_job: u32,
+    max_total_task_attempts_per_job: u32,
+) -> (CoworkerJobRecord, String) {
+    create_planned_approved_and_frozen_job_for_scope_with_options(
+        fixture,
+        BINDING_A,
+        THREAD_UUID_A,
+        brief_id,
+        plan_id,
+        tasks,
+        task_interfaces,
+        approved_write_paths,
+        max_parallel,
+        approval_budgets,
+        coder_budget,
+        allow_check_failure_corrections,
+        max_in_scope_corrections_per_task,
+        max_total_corrections_per_job,
+        max_total_task_attempts_per_job,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_job_for_scope_with_options(
+    fixture: &ControllerTestFixture,
+    binding_id: &str,
+    thread_uuid: &str,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+    allow_check_failure_corrections: bool,
+    max_in_scope_corrections_per_task: u32,
+    max_total_corrections_per_job: u32,
+    max_total_task_attempts_per_job: u32,
 ) -> (CoworkerJobRecord, String) {
     let pb = project_base(fixture);
     let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
@@ -825,9 +903,10 @@ async fn create_planned_approved_and_frozen_job_for_scope(
     let cap_env = FrozenControllerCapabilityEnvelope {
         allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
         allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
-        max_in_scope_correction_attempts: 1,
+        max_in_scope_correction_attempts: max_in_scope_corrections_per_task,
         allowed_check_ids: vec!["cargo_test".to_string()],
         local_git_integration_allowed: true,
+        allow_check_failure_corrections,
     };
 
     let bound_job = fixture
@@ -868,9 +947,9 @@ async fn create_planned_approved_and_frozen_job_for_scope(
         reviewer_choice: headless_argon_choice(Difficulty::Hard),
         closure_choice: headless_argon_choice(Difficulty::Extreme),
         role_budgets,
-        max_in_scope_corrections_per_task: 1,
-        max_total_corrections_per_job: 2,
-        max_total_task_attempts_per_job: 6,
+        max_in_scope_corrections_per_task,
+        max_total_corrections_per_job,
+        max_total_task_attempts_per_job,
         check_commands: default_check_commands(fixture),
         allow_task_worktree_commits: true,
         allow_run_integration_execution: true,
@@ -886,6 +965,14 @@ async fn create_planned_approved_and_frozen_job_for_scope(
         .policy_store
         .preview_execution_envelope(&preview_req, &bound_job, &fixture.authority)
         .expect("preview execution envelope");
+    assert_eq!(
+        preview.allow_check_failure_corrections,
+        allow_check_failure_corrections && max_in_scope_corrections_per_task > 0
+    );
+    assert_eq!(
+        preview.envelope.allow_check_failure_corrections,
+        allow_check_failure_corrections && max_in_scope_corrections_per_task > 0
+    );
     let mut freeze_req = preview_req;
     freeze_req.operator_attested = true;
     freeze_req.confirm_approval_subject_digest = Some(preview.approval_subject_digest);
@@ -994,6 +1081,7 @@ async fn unlinked_legacy_approval_wrong_owner_and_oversized_task_budgets_refused
                     max_in_scope_correction_attempts: 1,
                     allowed_check_ids: vec!["cargo_test".to_string()],
                     local_git_integration_allowed: true,
+                    allow_check_failure_corrections: false,
                 }),
                 task_interfaces: BTreeMap::new(),
             },
@@ -6067,6 +6155,7 @@ async fn create_planned_approved_and_frozen_job_with_strategy(
         max_in_scope_correction_attempts: 1,
         allowed_check_ids: vec!["cargo_test".to_string()],
         local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
     };
 
     let bound_job = fixture
@@ -7808,3 +7897,6 @@ mod coworker_correction_execution;
 
 #[path = "support/coworker_code_driver.rs"]
 mod coworker_code_driver;
+
+#[path = "support/coworker_check_failure.rs"]
+mod coworker_check_failure;

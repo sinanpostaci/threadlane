@@ -35,8 +35,10 @@ use crate::coworker_workflow::contracts::{
     MAX_PLANNING_GRANTS_PER_BINDING, MAX_WORK_BRIEF_ITEMS,
 };
 use crate::coworker_workflow::controller_policy::{
-    CheckFailureCorrectionBasis, ControllerPolicyStore, MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
+    CheckFailureCorrectionBasis, ControllerPolicyStore, PendingControllerEffectKind,
+    PendingControllerEffectStatus, MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
 };
+use crate::coworker_workflow::task_verification::compute_task_candidate_id;
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     acquire_cross_process_lock, constant_time_str_eq, ensure_platform_supported,
@@ -3171,6 +3173,14 @@ impl CoworkerWorkflowStore {
                         "job has no FrozenControllerCapabilityEnvelope",
                     )
                 })?;
+                if !cap_envelope.allow_check_failure_corrections
+                    || !runtime_state.envelope.allow_check_failure_corrections
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::UnsupportedCapability,
+                        "job FrozenControllerCapabilityEnvelope / FrozenControllerExecutionEnvelope does not authorize automatic check-failure corrections (allow_check_failure_corrections == false)",
+                    ));
+                }
                 if request.candidate.attempt_no > cap_envelope.max_in_scope_correction_attempts
                     || request.candidate.attempt_no
                         > runtime_state.envelope.max_in_scope_corrections_per_task
@@ -3191,11 +3201,6 @@ impl CoworkerWorkflowStore {
                             "candidate.task_id was not found in job.tasks",
                         )
                     })?;
-
-                request.basis.validate_against_task_and_envelope(
-                    &job.tasks[task_idx],
-                    &runtime_state.envelope,
-                )?;
 
                 let expected_base_commit = if job.tasks[task_idx].depends_on.is_empty() {
                     linkage.project_base.base_commit.clone()
@@ -3237,10 +3242,61 @@ impl CoworkerWorkflowStore {
                     ));
                 }
 
+                let prior_artifacts = runtime_state
+                    .get_attempt_artifacts(&request.candidate.task_id, request.candidate.attempt_no)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "missing TaskAttemptExecutionArtifacts in ControllerJobRuntimeState for check-failure candidate",
+                        )
+                    })?;
+                let expected_candidate_id = compute_task_candidate_id(
+                    &job.job_id,
+                    &request.candidate.task_id,
+                    request.candidate.attempt_no,
+                    &request.basis.committed_head_commit,
+                    &request.basis.committed_tree_sha,
+                );
+                if prior_artifacts.task_id != request.candidate.task_id
+                    || prior_artifacts.attempt_no != request.candidate.attempt_no
+                    || prior_artifacts.execution_base_commit != expected_base_commit
+                    || prior_artifacts.committed_head_commit.as_deref()
+                        != Some(request.basis.committed_head_commit.as_str())
+                    || prior_artifacts.committed_tree_sha.as_deref()
+                        != Some(request.basis.committed_tree_sha.as_str())
+                    || prior_artifacts.candidate_id.as_deref()
+                        != Some(request.candidate.candidate_id.as_str())
+                    || request.candidate.candidate_id != expected_candidate_id
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "check-failure candidate or basis does not match sealed TaskAttemptExecutionArtifacts in ControllerJobRuntimeState",
+                    ));
+                }
+                let has_confirmed_task_commit =
+                    runtime_state.pending_effects.values().any(|eff| {
+                        eff.kind == PendingControllerEffectKind::TaskCommit
+                            && eff.job_id == job.job_id
+                            && eff.task_id.as_deref() == Some(request.candidate.task_id.as_str())
+                            && eff.attempt_no == Some(request.candidate.attempt_no)
+                            && eff.status == PendingControllerEffectStatus::EffectConfirmed
+                            && eff.external_correlation_id.as_deref()
+                                == Some(request.basis.committed_head_commit.as_str())
+                    });
+                if !has_confirmed_task_commit {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "missing confirmed TaskCommit PendingControllerEffect for check-failure candidate head_commit",
+                    ));
+                }
+
                 let prior_attempt = job.tasks[task_idx]
                     .attempts
                     .iter()
-                    .find(|a| a.attempt_no == request.candidate.attempt_no)
+                    .find(|a| {
+                        a.attempt_no == request.candidate.attempt_no
+                            && a.role == WorkflowRole::Coder
+                    })
                     .ok_or_else(|| {
                         NativeError::new(
                             NativeErrorCode::ValidationFailed,
@@ -3248,13 +3304,64 @@ impl CoworkerWorkflowStore {
                         )
                     })?;
                 if prior_attempt.base_commit != expected_base_commit
-                    || prior_attempt.run_id.is_none()
-                    || prior_attempt.worker_id.is_none()
-                    || prior_attempt.task_worktree_id.is_none()
+                    || prior_attempt.run_id.as_deref() != Some(prior_artifacts.run_id.as_str())
+                    || prior_attempt.worker_id.as_deref()
+                        != Some(prior_artifacts.worker_id.as_str())
+                    || prior_attempt.task_worktree_id.as_deref()
+                        != Some(prior_artifacts.task_worktree_id.as_str())
                 {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
                         "prior TaskAttemptRef for check-failure candidate is missing sealed run_id, worker_id, task_worktree_id, or matching base_commit",
+                    ));
+                }
+                let (Some(ref att_head), Some(ref att_tree)) =
+                    (&prior_attempt.head_commit, &prior_attempt.tree_sha)
+                else {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "prior TaskAttemptRef for check-failure candidate is missing sealed head_commit or tree_sha",
+                    ));
+                };
+                let attempt_head_valid = (att_head == &request.basis.committed_head_commit
+                    && att_tree == &request.basis.committed_tree_sha)
+                    || (request.candidate.attempt_no == 1 && att_head == &expected_base_commit)
+                    || (request.candidate.attempt_no >= 2
+                        && job.tasks[task_idx].candidates.iter().any(|c| {
+                            c.attempt_no < request.candidate.attempt_no
+                                && &c.head_commit == att_head
+                                && &c.tree_sha == att_tree
+                        }));
+                if !attempt_head_valid {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "prior TaskAttemptRef head_commit/tree_sha does not match either pre-TaskCommit worker execution head or confirmed TaskCommit head",
+                    ));
+                }
+                let attempt_outbox = job
+                    .outbox
+                    .iter()
+                    .find(|o| o.outbox_id == prior_attempt.outbox_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "prior TaskAttemptRef outbox_id was not found in job.outbox",
+                        )
+                    })?;
+                if attempt_outbox.task_id != request.candidate.task_id
+                    || attempt_outbox.attempt_no != request.candidate.attempt_no
+                    || attempt_outbox.kind != OutboxDispatchKind::TaskAttemptDispatch
+                    || attempt_outbox.role != WorkflowRole::Coder
+                    || attempt_outbox.request_key != prior_attempt.request_key
+                    || !matches!(
+                        attempt_outbox.status,
+                        OutboxDispatchStatus::DispatchedEffectConfirmed
+                            | OutboxDispatchStatus::ReconciledConfirmed
+                    )
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "prior TaskAttemptDispatch outbox record does not match TaskAttemptRef or is unconfirmed",
                     ));
                 }
 
@@ -3271,7 +3378,14 @@ impl CoworkerWorkflowStore {
                         && task_ref.active_candidate_id.as_deref()
                             == Some(request.candidate.candidate_id.as_str())
                         && task_ref.accepted_candidate_id.is_none()
+                        && prior_attempt.head_commit.as_deref()
+                            == Some(request.basis.committed_head_commit.as_str())
+                        && prior_attempt.tree_sha.as_deref()
+                            == Some(request.basis.committed_tree_sha.as_str())
                     {
+                        request
+                            .basis
+                            .validate_against_task_and_envelope(task_ref, &runtime_state.envelope)?;
                         return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting((
                             job.clone(),
                             existing_cand,
@@ -3325,6 +3439,16 @@ impl CoworkerWorkflowStore {
                         "task reached maximum candidate capacity",
                     ));
                 }
+
+                if let Some(att_mut) = task.attempts.iter_mut().find(|a| {
+                    a.attempt_no == request.candidate.attempt_no && a.role == WorkflowRole::Coder
+                }) {
+                    att_mut.head_commit = Some(request.basis.committed_head_commit.clone());
+                    att_mut.tree_sha = Some(request.basis.committed_tree_sha.clone());
+                }
+                request
+                    .basis
+                    .validate_against_task_and_envelope(task, &runtime_state.envelope)?;
 
                 task.accepted_candidate_id = None;
                 task.active_candidate_id = Some(request.candidate.candidate_id.clone());

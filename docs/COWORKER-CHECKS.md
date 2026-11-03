@@ -104,6 +104,17 @@ This document describes the bounded verification check execution primitive in
 ## Platform Support and Remaining Coverage
 
 - Validated on **Linux** only; macOS is untested and Windows is unsupported.
-- Full automatic Coworker controller orchestration (consuming these check
-  reports across task review and candidate closure state transitions) remains
-  in the subsequent controller milestone.
+- When `allow_check_failure_corrections` is explicitly enabled (`true`) in both
+  `FrozenControllerCapabilityEnvelope` and `FrozenControllerExecutionEnvelope`,
+  `CoworkerTaskCorrectionService::prepare_task_correction` loads and verifies
+  the persisted private (`0600`) `FrozenCheckExecutionReport` artifacts from a
+  `BlockedByFailedChecks` task verification pass, requires clean natural
+  `NonZeroExit` status (with complete process cleanup, no signal, no output
+  overflow, no forced descendants, clean worktree, and matching committed
+  `HEAD`/tree), records an unreviewed `TaskCandidateRef` (`review_verdict: None`),
+  and reserves a derived `Coder` correction attempt (`DerivedTaskAttemptReceipt`
+  with `prior_check_failure_basis: Some(...)` and `prior_review_verdict_id: None`)
+  sharing the same hard `<= 2` per-task and job-wide correction budgets without
+  pretending a `Reviewer` ran. Actual worker execution of a check-failure-derived
+  correction reservation remains an explicit subsequent slice (`execute_task_correction`
+  returns `UnsupportedCapability` for that basis).

@@ -1167,6 +1167,10 @@ impl ArchitectAdviceRecord {
 /// by itself is not authority to dispatch `Reviewer` or `Closure` workers, run check commands,
 /// or mutate local Git integration worktrees. A later controller must verify an explicit
 /// [`FrozenControllerCapabilityEnvelope`] covering each exact capability before performing it.
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Existing coder-only approvals omit this envelope (`controller_envelope: None`) and are not
 /// retroactively widened.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1187,6 +1191,11 @@ pub struct FrozenControllerCapabilityEnvelope {
     /// Whether the controller is authorized to integrate accepted task candidates into the job's local integration worktree.
     #[serde(default)]
     pub local_git_integration_allowed: bool,
+    /// Whether the controller is explicitly authorized to prepare and reserve bounded in-scope
+    /// coding follow-ups after clean, known failed frozen task-review checks without a `Reviewer`
+    /// verdict. Defaults to `false` so existing approvals are not broadened.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_check_failure_corrections: bool,
 }
 
 impl FrozenControllerCapabilityEnvelope {
@@ -1205,6 +1214,14 @@ impl FrozenControllerCapabilityEnvelope {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 format!("max_in_scope_correction_attempts must not exceed {MAX_ATTEMPTS_PER_TASK}"),
+            ));
+        }
+        if self.allow_check_failure_corrections
+            && (self.max_in_scope_correction_attempts == 0 || self.allowed_check_ids.is_empty())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "allow_check_failure_corrections requires max_in_scope_correction_attempts >= 1 and non-empty allowed_check_ids",
             ));
         }
         validate_unique_id_list(
@@ -1367,6 +1384,20 @@ impl FrozenApprovalLinkage {
         let correction_ordinal = next_attempt_no - 1;
         self.controller_envelope.as_ref().is_some_and(|env| {
             env.max_in_scope_correction_attempts > 0
+                && correction_ordinal <= env.max_in_scope_correction_attempts
+        })
+    }
+
+    /// Returns `true` only if an explicit [`FrozenControllerCapabilityEnvelope`] authorizes an
+    /// automatic check-failure follow-up coding attempt with 1-based `next_attempt_no` (`>= 2`).
+    pub fn authorizes_check_failure_correction(&self, next_attempt_no: u32) -> bool {
+        if next_attempt_no < 2 {
+            return false;
+        }
+        let correction_ordinal = next_attempt_no - 1;
+        self.controller_envelope.as_ref().is_some_and(|env| {
+            env.allow_check_failure_corrections
+                && env.max_in_scope_correction_attempts > 0
                 && correction_ordinal <= env.max_in_scope_correction_attempts
         })
     }

@@ -1939,7 +1939,7 @@ fn compute_worktree_change_set_digest(
     Ok(sha256_hex(&bytes))
 }
 
-fn compute_task_candidate_id(
+pub(crate) fn compute_task_candidate_id(
     job_id: &str,
     task_id: &str,
     attempt_no: u32,
@@ -2016,7 +2016,7 @@ fn check_report_filename(effect_id: &str) -> String {
     format!("coworker-check-report-{effect_id}.json")
 }
 
-fn check_report_file_path(plans_dir: &Path, effect_id: &str) -> PathBuf {
+pub(crate) fn check_report_file_path(plans_dir: &Path, effect_id: &str) -> PathBuf {
     plans_dir.join(check_report_filename(effect_id))
 }
 
