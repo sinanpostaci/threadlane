@@ -30,6 +30,11 @@ use threadlane_core::observation::{
     ObservationJournalRecord, ObservationRecordPhase,
 };
 use threadlane_host::{ApprovedHostClient, HostError};
+use threadlane_native::coworker_driver::{
+    CoworkerCodeDriver, CoworkerDriverCancelReport, CoworkerDriverEnsureReport,
+    CoworkerDriverRequest, CoworkerDriverRunOptions, CoworkerDriverStatusReport,
+    DEFAULT_DRIVER_MAX_STEPS, DEFAULT_DRIVER_POLL_INTERVAL_MS, DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS,
+};
 use threadlane_native::coworker_grants::{
     get_planning_grant_summary, list_planning_grant_summaries,
     prepare_planning_grant_preview_from_dir_readonly, prepare_planning_grant_preview_with_store,
@@ -225,6 +230,96 @@ enum FlowCommand {
     /// Enqueue, inspect, or execute durable Coworker planning commands (enqueue | get | list | execute-command | start-command).
     #[command(subcommand, name = "coworker-planning")]
     CoworkerPlanning(CoworkerPlanningCommand),
+    /// Run, ensure, inspect status, reconcile, or cancel an independent Coworker code controller owner (run-owner | ensure | status | reconcile | cancel).
+    #[command(subcommand, name = "code-driver", visible_alias = "coworker-driver")]
+    CodeDriver(CoworkerDriverCommand),
+}
+
+#[derive(Debug, Subcommand)]
+enum CoworkerDriverCommand {
+    /// Run the exclusive physical owner loop for a Coworker job in the fixed binding and thread scope.
+    #[command(name = "run-owner")]
+    RunOwner {
+        /// Optional absolute path to a private (`0600`) JSON [`CoworkerDriverRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: Option<PathBuf>,
+
+        /// Target Coworker job identifier (`job_<32hex>`).
+        #[arg(long = "job-id", value_name = "ID")]
+        job_id: Option<String>,
+
+        /// Optional maximum controller step iterations (`1..=4096`).
+        #[arg(long = "max-steps", value_name = "N")]
+        max_steps: Option<u32>,
+
+        /// Optional finite cadence interval in milliseconds (`1..=60000`).
+        #[arg(long = "poll-interval-ms", value_name = "MS")]
+        poll_interval_ms: Option<u64>,
+
+        /// Optional bounded linger window in milliseconds after reaching a quiescent state (`0..=60000`).
+        #[arg(long = "idle-linger-ms", value_name = "MS")]
+        idle_linger_ms: Option<u64>,
+    },
+    /// Ensure a single live verified physical owner for a Coworker job, reusing an active owner or spawning detached `run-owner`.
+    #[command(name = "ensure")]
+    Ensure {
+        /// Optional absolute path to a private (`0600`) JSON [`CoworkerDriverRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: Option<PathBuf>,
+
+        /// Target Coworker job identifier (`job_<32hex>`).
+        #[arg(long = "job-id", value_name = "ID")]
+        job_id: Option<String>,
+
+        /// Optional maximum controller step iterations (`1..=4096`).
+        #[arg(long = "max-steps", value_name = "N")]
+        max_steps: Option<u32>,
+
+        /// Optional finite cadence interval in milliseconds (`1..=60000`).
+        #[arg(long = "poll-interval-ms", value_name = "MS")]
+        poll_interval_ms: Option<u64>,
+
+        /// Optional bounded linger window in milliseconds for a spawned owner (`0..=60000`).
+        #[arg(long = "idle-linger-ms", value_name = "MS")]
+        idle_linger_ms: Option<u64>,
+    },
+    /// Inspect verified live owner or persisted status for a Coworker job without mutating state.
+    #[command(name = "status")]
+    Status {
+        /// Optional absolute path to a private (`0600`) JSON [`CoworkerDriverRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: Option<PathBuf>,
+
+        /// Target Coworker job identifier (`job_<32hex>`).
+        #[arg(long = "job-id", value_name = "ID")]
+        job_id: Option<String>,
+    },
+    /// Reconcile existing host receipts and step Phase 1 state for a Coworker job without replaying unknown effects.
+    #[command(name = "reconcile")]
+    Reconcile {
+        /// Optional absolute path to a private (`0600`) JSON [`CoworkerDriverRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: Option<PathBuf>,
+
+        /// Target Coworker job identifier (`job_<32hex>`).
+        #[arg(long = "job-id", value_name = "ID")]
+        job_id: Option<String>,
+    },
+    /// Record durable `stop_requested` first, then perform narrow `ApprovedHostClient` task cancellation and reconcile.
+    #[command(name = "cancel")]
+    Cancel {
+        /// Optional absolute path to a private (`0600`) JSON [`CoworkerDriverRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: Option<PathBuf>,
+
+        /// Target Coworker job identifier (`job_<32hex>`).
+        #[arg(long = "job-id", value_name = "ID")]
+        job_id: Option<String>,
+
+        /// Optional cancellation reason recorded in controller runtime state and host task cancellation.
+        #[arg(long = "reason", value_name = "TEXT")]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -535,6 +630,46 @@ impl FlowScoped for PlanningCommandSummary {
     }
 }
 
+impl FlowScoped for CoworkerDriverRequest {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for CoworkerDriverStatusReport {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for CoworkerDriverEnsureReport {
+    fn binding_id(&self) -> &str {
+        &self.status.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.status.thread_uuid
+    }
+}
+
+impl FlowScoped for CoworkerDriverCancelReport {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
 /// Deserialized private JSON body for `grant-record` before CLI flag enforcement.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -662,6 +797,13 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
             CoworkerPlanningCommand::StartCommand { .. } => {
                 ("flow.coworker-planning.start-command", true, true)
             }
+        },
+        FlowCommand::CodeDriver(sub) => match sub {
+            CoworkerDriverCommand::RunOwner { .. } => ("flow.code-driver.run-owner", true, true),
+            CoworkerDriverCommand::Ensure { .. } => ("flow.code-driver.ensure", true, true),
+            CoworkerDriverCommand::Status { .. } => ("flow.code-driver.status", false, false),
+            CoworkerDriverCommand::Reconcile { .. } => ("flow.code-driver.reconcile", true, true),
+            CoworkerDriverCommand::Cancel { .. } => ("flow.code-driver.cancel", true, true),
         },
     };
     let parent_req = read_env_parent_request_id();
@@ -1027,6 +1169,21 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                     &mut verified_job_id,
                     &mut resolved_plan_id,
                     &mut resolved_executor,
+                )
+                .await
+            }
+            FlowCommand::CodeDriver(subcommand) => {
+                run_coworker_driver(
+                    subcommand,
+                    &state_dir,
+                    &registry_dir,
+                    &plans_dir,
+                    &authority_dir,
+                    &sessions_dir,
+                    &binding,
+                    &thread,
+                    &mut verified_job_id,
+                    &mut resolved_approval_id,
                 )
                 .await
             }
@@ -1764,6 +1921,263 @@ async fn run_coworker_planning(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn resolve_coworker_driver_request(
+    request_path: Option<&Path>,
+    cli_job_id: Option<String>,
+    cli_reason: Option<String>,
+    cli_max_steps: Option<u32>,
+    cli_poll_interval_ms: Option<u64>,
+    cli_idle_linger_ms: Option<u64>,
+    binding: &str,
+    thread: &str,
+) -> Result<CoworkerDriverRequest, OperatorCliError> {
+    let mut req = if let Some(path) = request_path {
+        let loaded: CoworkerDriverRequest = read_request(path)?;
+        ensure_scope(
+            &loaded,
+            binding,
+            thread,
+            "scope_mismatch",
+            REQUEST_SCOPE_MISMATCH,
+        )?;
+        if let Some(ref explicit_job_id) = cli_job_id {
+            if explicit_job_id != &loaded.job_id {
+                return Err(OperatorCliError::invalid_input(
+                    "`--job-id` does not match `job_id` in `--request`.",
+                ));
+            }
+        }
+        loaded
+    } else {
+        let Some(job_id) = cli_job_id else {
+            return Err(OperatorCliError::invalid_input(
+                "Either `--request` or `--job-id` is required for `code-driver` commands.",
+            ));
+        };
+        CoworkerDriverRequest {
+            schema_version: threadlane_native::COWORKER_DRIVER_REQUEST_SCHEMA_VERSION,
+            binding_id: binding.to_owned(),
+            thread_uuid: thread.to_owned(),
+            job_id,
+            reason: None,
+            max_steps: None,
+            poll_interval_ms: None,
+            idle_linger_ms: None,
+        }
+    };
+
+    if let Some(reason) = cli_reason {
+        req.reason = Some(reason);
+    }
+    if let Some(max_steps) = cli_max_steps {
+        req.max_steps = Some(max_steps);
+    }
+    if let Some(poll_interval_ms) = cli_poll_interval_ms {
+        req.poll_interval_ms = Some(poll_interval_ms);
+    }
+    if let Some(idle_linger_ms) = cli_idle_linger_ms {
+        req.idle_linger_ms = Some(idle_linger_ms);
+    }
+
+    req.validate_for_scope(binding, thread)
+        .map_err(|error| map_native_error(&error, false))?;
+    Ok(req)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_coworker_driver(
+    subcommand: CoworkerDriverCommand,
+    state_dir: &Path,
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    sessions_dir: &Path,
+    binding: &str,
+    thread: &str,
+    verified_job_id: &mut Option<String>,
+    resolved_approval_id: &mut Option<String>,
+) -> Result<(), OperatorCliError> {
+    let driver = CoworkerCodeDriver::open_from_dirs(
+        state_dir,
+        registry_dir,
+        plans_dir,
+        authority_dir,
+        sessions_dir,
+    )
+    .map_err(|error| map_native_error(&error, false))?;
+
+    match subcommand {
+        CoworkerDriverCommand::RunOwner {
+            request,
+            job_id,
+            max_steps,
+            poll_interval_ms,
+            idle_linger_ms,
+        } => {
+            let req = resolve_coworker_driver_request(
+                request.as_deref(),
+                job_id,
+                None,
+                max_steps,
+                poll_interval_ms,
+                idle_linger_ms,
+                binding,
+                thread,
+            )?;
+            let options = CoworkerDriverRunOptions {
+                max_steps: req.max_steps.or(DEFAULT_DRIVER_MAX_STEPS),
+                poll_interval_ms: req
+                    .poll_interval_ms
+                    .unwrap_or(DEFAULT_DRIVER_POLL_INTERVAL_MS),
+                idle_linger_ms: req.idle_linger_ms,
+            };
+            let report = driver
+                .run_owner(binding, thread, &req.job_id, options)
+                .await
+                .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &report,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            *verified_job_id = Some(report.job_id.clone());
+            *resolved_approval_id = Some(report.approval_id.clone());
+            write_result(binding, &report, true)
+        }
+        CoworkerDriverCommand::Ensure {
+            request,
+            job_id,
+            max_steps,
+            poll_interval_ms,
+            idle_linger_ms,
+        } => {
+            let req = resolve_coworker_driver_request(
+                request.as_deref(),
+                job_id,
+                None,
+                max_steps,
+                poll_interval_ms,
+                idle_linger_ms,
+                binding,
+                thread,
+            )?;
+            let options = if req.max_steps.is_some()
+                || req.poll_interval_ms.is_some()
+                || req.idle_linger_ms.is_some()
+            {
+                Some(CoworkerDriverRunOptions {
+                    max_steps: req.max_steps.or(DEFAULT_DRIVER_MAX_STEPS),
+                    poll_interval_ms: req
+                        .poll_interval_ms
+                        .unwrap_or(DEFAULT_DRIVER_POLL_INTERVAL_MS),
+                    idle_linger_ms: req.idle_linger_ms.or(DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS),
+                })
+            } else {
+                None
+            };
+            let report = driver
+                .ensure_owner(binding, thread, &req.job_id, options)
+                .await
+                .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &report,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            *verified_job_id = Some(report.status.job_id.clone());
+            *resolved_approval_id = Some(report.status.approval_id.clone());
+            write_result(binding, &report, true)
+        }
+        CoworkerDriverCommand::Status { request, job_id } => {
+            let req = resolve_coworker_driver_request(
+                request.as_deref(),
+                job_id,
+                None,
+                None,
+                None,
+                None,
+                binding,
+                thread,
+            )?;
+            let report = driver
+                .status(binding, thread, &req.job_id)
+                .await
+                .map_err(|error| map_native_error(&error, false))?;
+            ensure_scope(
+                &report,
+                binding,
+                thread,
+                "scope_mismatch",
+                STORED_SCOPE_MISMATCH,
+            )?;
+            *verified_job_id = Some(report.job_id.clone());
+            *resolved_approval_id = Some(report.approval_id.clone());
+            write_result(binding, &report, false)
+        }
+        CoworkerDriverCommand::Reconcile { request, job_id } => {
+            let req = resolve_coworker_driver_request(
+                request.as_deref(),
+                job_id,
+                None,
+                None,
+                None,
+                None,
+                binding,
+                thread,
+            )?;
+            let report = driver
+                .reconcile(binding, thread, &req.job_id)
+                .await
+                .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &report,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            *verified_job_id = Some(report.job_id.clone());
+            *resolved_approval_id = Some(report.approval_id.clone());
+            write_result(binding, &report, true)
+        }
+        CoworkerDriverCommand::Cancel {
+            request,
+            job_id,
+            reason,
+        } => {
+            let req = resolve_coworker_driver_request(
+                request.as_deref(),
+                job_id,
+                reason,
+                None,
+                None,
+                None,
+                binding,
+                thread,
+            )?;
+            let report = driver
+                .cancel(binding, thread, &req.job_id, req.reason)
+                .await
+                .map_err(|error| map_native_error(&error, true))?;
+            ensure_scope(
+                &report,
+                binding,
+                thread,
+                "outcome_unknown",
+                MUTATION_SCOPE_MISMATCH,
+            )?;
+            *verified_job_id = Some(report.job_id.clone());
+            *resolved_approval_id = Some(report.approval_id.clone());
+            write_result(binding, &report, true)
+        }
+    }
+}
+
 fn open_authority(
     registry_dir: &Path,
     plans_dir: &Path,
@@ -2158,6 +2572,74 @@ mod tests {
             assert_eq!(globals.binding, BINDING);
             assert_eq!(globals.thread, THREAD);
             assert!(matches!(parsed.command, FlowCommand::CoworkerExecution(_)));
+        }
+    }
+
+    #[test]
+    fn cli_parses_code_driver_subcommands_and_alias_with_global_flags() {
+        for sub in [
+            vec![
+                "code-driver",
+                "run-owner",
+                "--job-id",
+                "job_0123456789abcdef0123456789abcdef",
+                "--max-steps",
+                "16",
+                "--poll-interval-ms",
+                "50",
+                "--idle-linger-ms",
+                "200",
+            ],
+            vec![
+                "code-driver",
+                "ensure",
+                "--request",
+                "/tmp/driver-ensure.json",
+            ],
+            vec![
+                "code-driver",
+                "status",
+                "--job-id",
+                "job_0123456789abcdef0123456789abcdef",
+            ],
+            vec![
+                "coworker-driver",
+                "reconcile",
+                "--job-id",
+                "job_0123456789abcdef0123456789abcdef",
+            ],
+            vec![
+                "coworker-driver",
+                "cancel",
+                "--job-id",
+                "job_0123456789abcdef0123456789abcdef",
+                "--reason",
+                "operator_stop_test",
+            ],
+        ] {
+            let mut argv = vec![
+                "threadlane-flow",
+                "--state-dir",
+                "/tmp/state",
+                "--registry-dir",
+                "/tmp/registry",
+                "--plans-dir",
+                "/tmp/plans",
+                "--authority-dir",
+                "/tmp/authority",
+                "--sessions-dir",
+                "/tmp/sessions",
+                "--binding",
+                BINDING,
+                "--thread",
+                THREAD,
+            ];
+            argv.extend(sub);
+            let parsed = Cli::try_parse_from(argv).expect("parse code-driver subcommand");
+            let globals = GlobalArgs::from_cli(&parsed).expect("extract globals");
+            assert_eq!(globals.binding, BINDING);
+            assert_eq!(globals.thread, THREAD);
+            assert!(matches!(parsed.command, FlowCommand::CodeDriver(_)));
         }
     }
 }

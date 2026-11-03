@@ -324,8 +324,14 @@ fn setup_fixture() -> ControllerTestFixture {
     let authority_dir = root.join("authority-store");
     let sessions_dir = root.join("sessions-store");
     let ownership_dir = root.join("ownership-store");
-    let planning_artifacts_dir = root.join("planning-artifacts");
-    for private_dir in [&sessions_dir, &ownership_dir, &planning_artifacts_dir] {
+    let planning_artifacts_dir =
+        threadlane_native::planning_driver::planning_artifacts_dir(&plans_dir);
+    for private_dir in [
+        &plans_dir,
+        &sessions_dir,
+        &ownership_dir,
+        &planning_artifacts_dir,
+    ] {
         fs::create_dir_all(private_dir).expect("create private fixture dir");
         fs::set_permissions(private_dir, fs::Permissions::from_mode(0o700))
             .expect("chmod 0700 private fixture dir");
@@ -565,10 +571,19 @@ fn execution_policy() -> ExecutionPolicy {
 }
 
 fn sample_brief(fixture: &ControllerTestFixture, brief_id: &str) -> WorkBrief {
+    sample_brief_for_scope(fixture, BINDING_A, THREAD_UUID_A, brief_id)
+}
+
+fn sample_brief_for_scope(
+    fixture: &ControllerTestFixture,
+    binding_id: &str,
+    thread_uuid: &str,
+    brief_id: &str,
+) -> WorkBrief {
     WorkBrief {
         brief_id: brief_id.to_string(),
-        binding_id: BINDING_A.to_string(),
-        thread_uuid: THREAD_UUID_A.to_string(),
+        binding_id: binding_id.to_string(),
+        thread_uuid: thread_uuid.to_string(),
         project_base: project_base(fixture),
         kind: WorkBriefKind::NewJob,
         summary: format!("Controller test brief {brief_id}"),
@@ -617,15 +632,51 @@ async fn create_planned_approved_and_frozen_job(
     approval_budgets: ExecutionBudgets,
     coder_budget: ControllerRoleExecutionBudget,
 ) -> (CoworkerJobRecord, String) {
+    create_planned_approved_and_frozen_job_for_scope(
+        fixture,
+        BINDING_A,
+        THREAD_UUID_A,
+        brief_id,
+        plan_id,
+        tasks,
+        task_interfaces,
+        approved_write_paths,
+        max_parallel,
+        approval_budgets,
+        coder_budget,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_job_for_scope(
+    fixture: &ControllerTestFixture,
+    binding_id: &str,
+    thread_uuid: &str,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+) -> (CoworkerJobRecord, String) {
     let pb = project_base(fixture);
     let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
-    let brief = sample_brief(fixture, brief_id);
+    let brief = sample_brief_for_scope(fixture, binding_id, thread_uuid, brief_id);
+    let scoped_workflow = ScopedWorkflow::new(
+        Arc::clone(&fixture.registry),
+        Arc::clone(&fixture.plans),
+        binding_id.to_string(),
+    )
+    .expect("create scoped_workflow");
 
     let job = fixture
         .workflow_store
         .create_or_amend_job(&CreateCoworkerJobRequest {
-            binding_id: BINDING_A.to_string(),
-            thread_uuid: THREAD_UUID_A.to_string(),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
             request_key: format!("req_job_{brief_id}"),
             expected_ledger_revision: None,
             work_brief: brief,
@@ -638,8 +689,8 @@ async fn create_planned_approved_and_frozen_job(
     let grant = fixture
         .workflow_store
         .create_planning_grant(&CreatePlanningGrantRequest {
-            binding_id: BINDING_A.to_string(),
-            thread_uuid: THREAD_UUID_A.to_string(),
+            binding_id: binding_id.to_string(),
+            thread_uuid: thread_uuid.to_string(),
             request_key: format!("req_grant_{brief_id}"),
             expected_ledger_revision: None,
             project_base: pb,
@@ -708,10 +759,10 @@ async fn create_planned_approved_and_frozen_job(
     let plan_outcome = fixture
         .planning_service
         .orchestrate_brief_to_plan(
-            &fixture.scoped_workflow,
+            &scoped_workflow,
             &OrchestrateWorkBriefPlanRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
+                binding_id: binding_id.to_string(),
+                thread_uuid: thread_uuid.to_string(),
                 grant_id: grant.grant_id.clone(),
                 job_id: job.job_id.clone(),
                 request_key: orch_req_key,
@@ -741,7 +792,7 @@ async fn create_planned_approved_and_frozen_job(
 
     let job = fixture
         .workflow_store
-        .read_binding_ledger(BINDING_A)
+        .read_binding_ledger(binding_id)
         .expect("read ledger after orchestrate_brief_to_plan")
         .jobs
         .into_iter()
@@ -754,8 +805,8 @@ async fn create_planned_approved_and_frozen_job(
         .authority
         .approve_at(
             OperatorApprovalRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
+                binding_id: binding_id.to_string(),
+                thread_uuid: thread_uuid.to_string(),
                 plan_id: published_outcome.planning_result.plan_id.clone(),
                 plan_revision: published_outcome.planning_result.plan_revision,
                 expected_registry_revision: reg_snap.revision,
@@ -783,8 +834,8 @@ async fn create_planned_approved_and_frozen_job(
         .workflow_store
         .bind_job_approval(
             &BindJobApprovalRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
+                binding_id: binding_id.to_string(),
+                thread_uuid: thread_uuid.to_string(),
                 job_id: job.job_id,
                 expected_job_revision: job.job_revision,
                 expected_ledger_revision: None,
@@ -809,8 +860,8 @@ async fn create_planned_approved_and_frozen_job(
     );
 
     let preview_req = FreezeControllerExecutionEnvelopeRequest {
-        binding_id: BINDING_A.to_string(),
-        thread_uuid: THREAD_UUID_A.to_string(),
+        binding_id: binding_id.to_string(),
+        thread_uuid: thread_uuid.to_string(),
         job_id: bound_job.job_id.clone(),
         expected_job_revision: bound_job.job_revision,
         policy: execution_policy(),
@@ -7754,3 +7805,6 @@ exit 0
 
 #[path = "support/coworker_correction_execution.rs"]
 mod coworker_correction_execution;
+
+#[path = "support/coworker_code_driver.rs"]
+mod coworker_code_driver;

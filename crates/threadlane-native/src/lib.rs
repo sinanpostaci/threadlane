@@ -34,6 +34,8 @@ pub mod codex_setup;
 pub mod control_runtime;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
+/// Independent code controller process lifecycle (`run-owner`, `ensure`, `status`, `reconcile`, `cancel`) and authenticated local RPC.
+pub mod coworker_driver;
 /// Trusted-local standing read-only planning/advice grant preparation, recording, and revocation helpers.
 pub mod coworker_grants;
 /// Shared durable contracts and per-binding ledger store for the end-to-end Coworker workflow.
@@ -120,6 +122,17 @@ pub use conversation_change::{
     MAX_CONVERSATION_CHANGE_CURSOR_LEN, MAX_CONVERSATION_CHANGE_DETAIL_BYTES,
     MAX_CONVERSATION_CHANGE_LIST_LIMIT, MAX_CONVERSATION_CHANGE_RESOLUTION_NOTE_BYTES,
     MAX_CONVERSATION_CHANGE_STORE_BYTES, MAX_CONVERSATION_CHANGE_SUMMARY_BYTES,
+};
+pub use coworker_driver::{
+    coworker_driver_dir, CancelledHostTaskSummary, CoworkerCodeDriver,
+    CoworkerDerivedCancellationBoundary, CoworkerDriverCancelReport,
+    CoworkerDriverEnsureDisposition, CoworkerDriverEnsureReport, CoworkerDriverHostMode,
+    CoworkerDriverOwnerState, CoworkerDriverPipelineBoundary, CoworkerDriverRequest,
+    CoworkerDriverRunOptions, CoworkerDriverStateRecord, CoworkerDriverStatusReport,
+    COWORKER_DRIVER_DIR_NAME, COWORKER_DRIVER_REQUEST_SCHEMA_VERSION,
+    COWORKER_DRIVER_RPC_SCHEMA_VERSION, COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+    DEFAULT_DRIVER_MAX_STEPS, DEFAULT_DRIVER_POLL_INTERVAL_MS, DEFAULT_DRIVER_RPC_TIMEOUT_MS,
+    DEFAULT_DRIVER_STARTUP_TIMEOUT_MS, DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS,
 };
 pub use coworker_grants::{
     get_planning_grant_summary, list_planning_grant_summaries, prepare_planning_grant_preview,

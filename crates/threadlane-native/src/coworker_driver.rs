@@ -1,0 +1,3412 @@
+//! Independent code controller process lifecycle and authenticated local driver RPC.
+//!
+//! This module implements the Phase 1 independent code controller process lifecycle
+//! (`run-owner`, `ensure`, `status`, `reconcile`, and `cancel`) around
+//! [`CoworkerControllerService`] and physical FD job ownership
+//! ([`CoworkerJobOwnershipStore`] / [`CoworkerJobOwnershipGuard`]).
+//!
+//! Key guarantees:
+//! - One live physical FD owner per `(binding_id, thread_uuid, job_id)`.
+//! - Private `0700` driver directory and `0600` state and Unix domain socket files.
+//! - Same-EUID peer credential checks and fresh CSPRNG random nonce handshakes on local RPC.
+//! - Server validates the actual held [`CoworkerJobOwnershipGuard`] and live lockfile identity
+//!   before performing any action or replying; client verifies the live lock summary, instance,
+//!   challenge digest, and peer credentials rather than trusting PID hints or copied metadata alone.
+//! - Reconciles existing receipts without replaying unknown effects and never automatically
+//!   restarts a human-stopped, failed, or uncertain host session.
+//! - Persists durable `stop_requested` state before attempting narrow [`ApprovedHostClient`]
+//!   task cancellation, without PID or process-name kills.
+//! - Normal owner lifetime follows real job terminal/stopped/unknown/checkpoint policy while
+//!   preserving active worker output, staying alive across long frozen approved worker budgets
+//!   and keeping RPC/ownership available at `AwaitingChecksOrReview`,
+//!   `AwaitingDependencyAcceptanceOrSeal`, and `Held` for later pipeline integration.
+
+use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use threadlane_authority::{ApprovalRecord, AuthorityError, AuthorityStore};
+use threadlane_core::WorkerStatus;
+use threadlane_host::{
+    is_host_lock_held, read_host_launch_intent_optional, read_host_manifest_optional,
+    read_session_task_ledger_readonly, ApprovedHost, ApprovedHostClient, ApprovedHostConfig,
+    ApprovedHostHandle, HostError, HostPhase, TaskExecutionStatus,
+};
+use threadlane_workers::validate_sha256_hex_digest;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+
+use crate::coworker_workflow::{
+    sha256_hex, ControllerJobLeaseRecord, ControllerJobRuntimeState, ControllerPolicyStore,
+    CoworkerControllerPhase1Status, CoworkerControllerService, CoworkerControllerStepReport,
+    CoworkerControllerTaskObservation, CoworkerJobLockState, CoworkerJobOwnershipKey,
+    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerLockFileIdentity,
+    CoworkerOwnershipSummary, CoworkerTaskStage, CoworkerWorkflowStore,
+    OwnedCoworkerControllerSession, PendingControllerEffectStatus, VerifiedControllerAdmission,
+};
+use crate::error::{NativeError, NativeErrorCode};
+use crate::fs_safety::{
+    constant_time_str_eq, generate_prefixed_random_id, prepare_private_dir,
+    read_private_file_bounded, write_private_file_atomic,
+};
+use crate::mcp_pair::open_workflow_stores;
+use crate::planning_driver::planning_artifacts_dir;
+
+/// Canonical directory name under `plans_dir` for code-driver lockfiles, sockets, and state.
+pub const COWORKER_DRIVER_DIR_NAME: &str = "coworker-code-driver";
+
+/// Schema version for persisted code-driver state records.
+pub const COWORKER_DRIVER_STATE_SCHEMA_VERSION: u32 = 1;
+
+/// Schema version for local Unix domain socket RPC envelopes.
+pub const COWORKER_DRIVER_RPC_SCHEMA_VERSION: u32 = 1;
+
+/// Schema version for identity-only code-driver CLI request files.
+pub const COWORKER_DRIVER_REQUEST_SCHEMA_VERSION: u32 = 1;
+
+/// Default finite cadence between controller step ticks inside `run-owner`.
+pub const DEFAULT_DRIVER_POLL_INTERVAL_MS: u64 = 50;
+
+/// Default step limit in normal operation (`None`: unbounded step iterations; owner lifetime
+/// follows real job terminal/stopped/unknown/checkpoint policy and frozen worker budgets).
+pub const DEFAULT_DRIVER_MAX_STEPS: Option<u32> = None;
+
+/// Default idle linger limit when `run-owner` is spawned by `ensure` (`None`: owner keeps RPC
+/// and physical ownership available while awaiting checks/review/dependencies/hold).
+pub const DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS: Option<u64> = None;
+
+/// Default finite timeout (in milliseconds) for a single local Unix socket RPC call.
+pub const DEFAULT_DRIVER_RPC_TIMEOUT_MS: u64 = 5_000;
+
+/// Default finite timeout (in milliseconds) waiting for a spawned owner to become ready.
+pub const DEFAULT_DRIVER_STARTUP_TIMEOUT_MS: u64 = 10_000;
+
+/// Maximum byte size for a single local Unix socket RPC message line.
+const MAX_DRIVER_RPC_MESSAGE_BYTES: u64 = 64 * 1024;
+
+/// Maximum byte size for an identity-only code-driver CLI request JSON file.
+const MAX_DRIVER_REQUEST_BYTES: usize = 64 * 1024;
+
+/// Maximum byte size for a persisted code-driver state JSON file.
+const MAX_DRIVER_STATE_BYTES: usize = 256 * 1024;
+
+/// Maximum direct socket path length before using `/proc/self/fd/<dir_fd>/<name>`.
+const MAX_DIRECT_UNIX_SOCKET_PATH_LEN: usize = 96;
+
+/// Lease renewal safety margin (in milliseconds) when the owner is waiting at a pipeline checkpoint.
+const LEASE_RENEWAL_MARGIN_MS: u64 = 10_000;
+
+/// Returns the canonical private directory path under `plans_dir` used by the code driver.
+#[must_use]
+pub fn coworker_driver_dir(plans_dir: &Path) -> PathBuf {
+    plans_dir.join(COWORKER_DRIVER_DIR_NAME)
+}
+
+/// Identity-only request payload for `threadlane-flow coworker-driver` subcommands.
+///
+/// Store directories (`state_dir`, `registry_dir`, `plans_dir`, `authority_dir`,
+/// `sessions_dir`) always come from the trusted CLI context rather than the request payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerDriverRequest {
+    /// Schema version (must equal [`COWORKER_DRIVER_REQUEST_SCHEMA_VERSION`]).
+    #[serde(default = "default_driver_request_schema_version")]
+    pub schema_version: u32,
+    /// Scoped control binding identifier.
+    pub binding_id: String,
+    /// Scoped native thread UUID.
+    pub thread_uuid: String,
+    /// Target coworker job identifier.
+    pub job_id: String,
+    /// Optional explicit reason used by `cancel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Optional diagnostic maximum controller step iterations for `run-owner` / `ensure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+    /// Optional finite cadence interval (in milliseconds) between steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_interval_ms: Option<u64>,
+    /// Optional bounded linger window (in milliseconds) after reaching a pipeline await state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_linger_ms: Option<u64>,
+}
+
+const fn default_driver_request_schema_version() -> u32 {
+    COWORKER_DRIVER_REQUEST_SCHEMA_VERSION
+}
+
+impl CoworkerDriverRequest {
+    /// Loads and validates an identity-only code-driver request from a private `0600` JSON file.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if the file fails private-file checks, cannot be parsed, or
+    /// does not match the caller's `(binding_id, thread_uuid)` scope.
+    pub fn load_from_private_file(
+        path: &Path,
+        expected_binding_id: &str,
+        expected_thread_uuid: &str,
+    ) -> Result<Self, NativeError> {
+        let raw =
+            read_private_file_bounded(path, MAX_DRIVER_REQUEST_BYTES, "coworker_driver_request")?
+                .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "coworker_driver_request file does not exist.",
+                )
+            })?;
+        let request: Self = serde_json::from_slice(&raw)
+            .map_err(|err| map_json_error("coworker_driver_request", err))?;
+        request.validate_for_scope(expected_binding_id, expected_thread_uuid)?;
+        Ok(request)
+    }
+
+    /// Validates this request against the trusted CLI `(binding_id, thread_uuid)` scope.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if the schema version, scope, or job identifier is invalid.
+    pub fn validate_for_scope(
+        &self,
+        expected_binding_id: &str,
+        expected_thread_uuid: &str,
+    ) -> Result<(), NativeError> {
+        if self.schema_version != COWORKER_DRIVER_REQUEST_SCHEMA_VERSION {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "unsupported coworker_driver_request schema_version {}; expected {}",
+                    self.schema_version, COWORKER_DRIVER_REQUEST_SCHEMA_VERSION
+                ),
+            ));
+        }
+        if self.binding_id.trim().is_empty() || self.binding_id != expected_binding_id {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "coworker_driver_request.binding_id does not match expected binding scope.",
+            ));
+        }
+        if self.thread_uuid.trim().is_empty() || self.thread_uuid != expected_thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "coworker_driver_request.thread_uuid does not match expected thread scope.",
+            ));
+        }
+        let _ = CoworkerJobOwnershipKey::new(&self.binding_id, &self.thread_uuid, &self.job_id)?;
+        if let Some(max_steps) = self.max_steps {
+            if max_steps == 0 || max_steps > 4_096 {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "coworker_driver_request.max_steps must be between 1 and 4096.",
+                ));
+            }
+        }
+        if let Some(poll_ms) = self.poll_interval_ms {
+            if poll_ms == 0 || poll_ms > 60_000 {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "coworker_driver_request.poll_interval_ms must be between 1 and 60000.",
+                ));
+            }
+        }
+        if let Some(linger_ms) = self.idle_linger_ms {
+            if linger_ms > 60_000 {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "coworker_driver_request.idle_linger_ms must be <= 60000.",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Host lifecycle mode used by the code controller owner or reconciler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDriverHostMode {
+    /// Reused an already running and verified `Ready` host session.
+    ReusedVerifiedReadyHost,
+    /// Started a brand-new host session via [`ApprovedHost::start_fresh_only`].
+    StartedFreshHost,
+    /// No live host interaction was required because all reachable tasks were already reconciled.
+    QuiescentNoHostRequired,
+    /// Host session was not running during a read-only status inspection or offline cancel.
+    NotRunningOrInspectedReadonly,
+}
+
+/// Live or historical owner state observed for a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDriverOwnerState {
+    /// Physical lock is held by a live owner verified via Unix socket RPC handshake.
+    LiveVerifiedOwner,
+    /// Physical lock is held by a process whose RPC socket is still initializing or unreachable.
+    LockHeldRpcUnavailable,
+    /// No active physical lock holder exists and any previous owner exited cleanly.
+    NoActiveOwner,
+    /// An unlocked lockfile or ungraceful driver state from a crashed owner was detected.
+    /// Stale metadata never authorizes effects.
+    StaleCrashArtifactDetected,
+}
+
+/// Disposition of an `ensure` operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDriverEnsureDisposition {
+    /// Verified and reused an already running live physical owner via local Unix socket RPC.
+    ReusedLiveOwner,
+    /// Spawned a new detached `threadlane-flow` owner process and verified it via RPC or exit state.
+    SpawnedNewOwner,
+    /// Job had already reached a quiescent Phase 1 state and was verified without spawning a worker.
+    AlreadyQuiescentVerified,
+}
+
+/// Explicit Phase 1 pipeline boundary label included on all driver reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDriverPipelineBoundary {
+    /// Phase 1 initial task dispatch and receipt reconciliation only; task checks, reviewer/architect
+    /// cycles, and task/job closure are wired in subsequent slices.
+    Phase1InitialDispatchAndReconcileOnly,
+}
+
+/// Explicit Phase 1 cancellation boundary label included on cancel reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDerivedCancellationBoundary {
+    /// Narrow cancellation targets original `ApprovedHostClient` tasks (`task_id -> run_id`);
+    /// running derived-attempt cancellation will be integrated in a later milestone.
+    OriginalHostTasksOnlyDerivedIntegratedLater,
+}
+
+/// Summary of an individual original host task cancelled via [`ApprovedHostClient::cancel_task`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelledHostTaskSummary {
+    /// Cancelled task identifier.
+    pub task_id: String,
+    /// Sealed host run identifier from the task receipt.
+    pub run_id: String,
+    /// Worker lifecycle state after the narrow cancellation call.
+    pub worker_state: WorkerStatus,
+    /// Worker revision after the narrow cancellation call.
+    pub worker_revision: u64,
+}
+
+/// Persisted private (`0600`) code-driver state record for a single job.
+///
+/// This file is informational and diagnostic only; it never substitutes for holding the live
+/// physical [`crate::coworker_workflow::CoworkerJobOwnershipGuard`] file descriptor or passing
+/// the live RPC handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverStateRecord {
+    /// Schema version (`1`).
+    pub schema_version: u32,
+    /// Scoped control binding identifier.
+    pub binding_id: String,
+    /// Scoped native thread UUID.
+    pub thread_uuid: String,
+    /// Target coworker job identifier.
+    pub job_id: String,
+    /// Ownership instance identifier (`cwo_<64hex>`) of the most recent physical owner.
+    pub owner_instance_id: String,
+    /// Challenge digest (`<64hex>`) of the most recent physical owner.
+    pub owner_challenge_digest: String,
+    /// Diagnostic OS process identifier hint recorded when the owner acquired the lock.
+    pub owner_pid_hint: u32,
+    /// Effective UID recorded when the owner acquired the lock.
+    pub owner_uid: u32,
+    /// Lockfile `(dev, ino)` identity recorded when the owner acquired the lock.
+    pub lock_file_identity: CoworkerLockFileIdentity,
+    /// Unix socket path used while the owner was active.
+    pub socket_path: String,
+    /// Host lifecycle mode used by the owner.
+    pub host_mode: CoworkerDriverHostMode,
+    /// Whether the owner is still marked active in persisted metadata (if the lock is unlocked while
+    /// this flag is `true`, the previous owner crashed without graceful teardown).
+    pub owner_active: bool,
+    /// Whether the owner completed graceful exit and released both lease and FD lock.
+    pub graceful_exit_completed: bool,
+    /// Post-shutdown `HostSessionManifest::updated_at_ms` recorded when the owner cleanly shut down
+    /// a self-started fresh host upon reaching a quiescent Phase 1 state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_quiescent_host_shutdown_updated_at_ms: Option<i64>,
+    /// Post-shutdown `HostSessionManifest::instance_id` recorded when the owner cleanly shut down
+    /// a self-started fresh host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_quiescent_host_instance_id: Option<String>,
+    /// Number of controller step iterations executed by this owner instance.
+    pub steps_completed: u32,
+    /// Last controller overall status observed by this owner.
+    pub last_overall_status: CoworkerControllerPhase1Status,
+    /// Last full controller step report recorded by this owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_step_report: Option<CoworkerControllerStepReport>,
+    /// Explicit Phase 1 pipeline boundary label.
+    pub pipeline_boundary: CoworkerDriverPipelineBoundary,
+    /// Timestamp (milliseconds since Unix epoch) when the owner started.
+    pub started_at_ms: u64,
+    /// Timestamp (milliseconds since Unix epoch) when this record was last updated.
+    pub updated_at_ms: u64,
+}
+
+/// Status and step report returned by `status`, `reconcile`, and `run-owner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverStatusReport {
+    /// Scoped control binding identifier.
+    pub binding_id: String,
+    /// Scoped native thread UUID.
+    pub thread_uuid: String,
+    /// Target coworker job identifier.
+    pub job_id: String,
+    /// Admitted approval identifier from the controller execution envelope.
+    pub approval_id: String,
+    /// Observed owner state (`live_verified_owner`, `no_active_owner`, `stale_crash_artifact_detected`, etc.).
+    pub owner_state: CoworkerDriverOwnerState,
+    /// Verified live ownership summary when a live owner is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Persisted lease record in `ControllerPolicyStore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease: Option<ControllerJobLeaseRecord>,
+    /// Whether the persisted lease in `ControllerPolicyStore` is currently marked active.
+    pub lease_active: bool,
+    /// Persisted lease owner instance identifier in `ControllerPolicyStore`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_owner_instance_id: Option<String>,
+    /// Observed host session phase in `sessions_dir/<approval_id>` if a manifest exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_phase: Option<HostPhase>,
+    /// Whether `sessions_dir/<approval_id>/host.lock` is currently held by a live process.
+    pub host_lock_held: bool,
+    /// Host lifecycle mode used for this operation.
+    pub host_mode: CoworkerDriverHostMode,
+    /// Current coworker job phase in `CoworkerWorkflowStore`.
+    pub job_phase: CoworkerJobPhase,
+    /// Current overall controller status (`AwaitingChecksOrReview`, `RunningTasks`, `Stopped`, etc.).
+    pub overall_status: CoworkerControllerPhase1Status,
+    /// Whether durable operator stop (`stop_requested`) is set on the job runtime state.
+    pub stop_requested: bool,
+    /// Whether the job has unresolved pending effects or unknown outbox state blocking replay.
+    pub blocked_on_unknown_effect: bool,
+    /// Optional stop or block reason recorded in runtime state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_or_block_reason: Option<String>,
+    /// Total task execution attempts reserved across the job in `ControllerJobRuntimeState`.
+    pub total_task_attempts_reserved: u32,
+    /// Maximum total task attempts permitted across the job by `FrozenControllerExecutionEnvelope`.
+    pub max_total_task_attempts_per_job: u32,
+    /// Per-task observations.
+    pub tasks: Vec<CoworkerControllerTaskObservation>,
+    /// Latest step report when a controller step was executed or recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_report: Option<CoworkerControllerStepReport>,
+    /// Explicit Phase 1 pipeline boundary.
+    pub pipeline_boundary: CoworkerDriverPipelineBoundary,
+    /// Human-readable boundary explanation.
+    pub boundary_note: String,
+}
+
+/// Report returned by `ensure`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverEnsureReport {
+    /// Whether `ensure` reused an active verified owner, spawned a new owner, or verified a quiescent job.
+    pub disposition: CoworkerDriverEnsureDisposition,
+    /// Current verified status report for the job.
+    pub status: CoworkerDriverStatusReport,
+}
+
+/// Report returned by `cancel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverCancelReport {
+    /// Scoped control binding identifier.
+    pub binding_id: String,
+    /// Scoped native thread UUID.
+    pub thread_uuid: String,
+    /// Target coworker job identifier.
+    pub job_id: String,
+    /// Admitted approval identifier.
+    pub approval_id: String,
+    /// Reason recorded for the cancellation request.
+    pub reason: String,
+    /// Confirms that durable `stop_requested = true` was persisted in `ControllerPolicyStore`
+    /// before any local owner RPC or `ApprovedHostClient::cancel_task` call.
+    pub durable_stop_recorded_before_host_cancel: bool,
+    /// Whether an active verified owner was notified over local RPC and shut down cleanly.
+    pub notified_live_owner: bool,
+    /// Whether narrow host task cancellation was attempted against an active `Ready` host.
+    pub narrow_host_cancellation_attempted: bool,
+    /// Original host tasks cancelled via `ApprovedHostClient::cancel_task`.
+    pub cancelled_host_tasks: Vec<CancelledHostTaskSummary>,
+    /// Explicit Phase 1 derived-attempt cancellation boundary.
+    pub derived_attempt_cancellation_boundary: CoworkerDerivedCancellationBoundary,
+    /// Human-readable explanation of the cancellation boundary.
+    pub cancellation_boundary_note: String,
+    /// Post-cancellation status report for the job.
+    pub status: CoworkerDriverStatusReport,
+}
+
+/// Options controlling `run-owner` execution cadence and optional diagnostic bounds.
+///
+/// By default (`max_steps: None, idle_linger_ms: None`), the owner lifetime follows real job
+/// terminal/stopped/unknown/checkpoint policy, staying alive across long frozen approved worker
+/// budgets (`RunningTasks`) and keeping RPC/ownership available at `AwaitingChecksOrReview`,
+/// `AwaitingDependencyAcceptanceOrSeal`, and `Held` for later pipeline integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverRunOptions {
+    /// Optional diagnostic maximum number of controller step iterations (`None` = unbounded normal lifetime).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u32>,
+    /// Finite cadence interval (in milliseconds) between steps while tasks are running.
+    pub poll_interval_ms: u64,
+    /// Optional diagnostic linger window (in milliseconds) before exiting a pipeline await state
+    /// (`None` = stay alive keeping RPC/ownership available for later pipeline integration).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_linger_ms: Option<u64>,
+}
+
+impl Default for CoworkerDriverRunOptions {
+    fn default() -> Self {
+        Self {
+            max_steps: DEFAULT_DRIVER_MAX_STEPS,
+            poll_interval_ms: DEFAULT_DRIVER_POLL_INTERVAL_MS,
+            idle_linger_ms: DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS,
+        }
+    }
+}
+
+/// Local Unix socket RPC operation requested by a same-EUID client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum DriverRpcOp {
+    /// Read-only status and live-owner verification handshake.
+    Status,
+    /// Trigger an immediate controller step/reconcile under the owner's held physical guard.
+    Reconcile,
+    /// Record durable stop, cancel active original host tasks, reconcile, and exit owner cleanly.
+    Cancel {
+        /// Cancellation reason.
+        reason: String,
+    },
+}
+
+/// Local Unix socket RPC request message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DriverRpcRequest {
+    schema_version: u32,
+    binding_id: String,
+    thread_uuid: String,
+    job_id: String,
+    expected_instance_id: String,
+    expected_challenge_digest: String,
+    client_nonce: String,
+    op: DriverRpcOp,
+}
+
+/// Local Unix socket RPC response message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DriverRpcResponse {
+    schema_version: u32,
+    echoed_client_nonce: String,
+    server_nonce: String,
+    owner_summary: CoworkerOwnershipSummary,
+    status: Option<CoworkerDriverStatusReport>,
+    cancelled_host_tasks: Vec<CancelledHostTaskSummary>,
+    narrow_host_cancellation_attempted: bool,
+    error: Option<String>,
+}
+
+/// Active host session state resolved before stepping a job.
+struct ActiveHostSession {
+    mode: CoworkerDriverHostMode,
+    owned_handle: Option<ApprovedHostHandle>,
+}
+
+/// Narrow, non-authoritative read-only scoped job inspection bundle used ONLY for read-only
+/// status projection and pre-cancel scope checks when not holding the physical ownership guard.
+///
+/// Authoritative pre-effect validation ALWAYS uses [`OwnedCoworkerControllerSession::verify_admission`]
+/// under the held [`crate::coworker_workflow::CoworkerJobOwnershipGuard`].
+struct ReadonlyScopedJobInspection {
+    job: CoworkerJobRecord,
+    runtime_state: ControllerJobRuntimeState,
+    approval: ApprovalRecord,
+}
+
+/// Independent code controller process lifecycle driver.
+#[derive(Clone)]
+pub struct CoworkerCodeDriver {
+    state_dir: PathBuf,
+    registry_dir: PathBuf,
+    plans_dir: PathBuf,
+    authority_dir: PathBuf,
+    sessions_dir: PathBuf,
+    authority: Arc<AuthorityStore>,
+    controller: CoworkerControllerService,
+    flow_binary_override: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for CoworkerCodeDriver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoworkerCodeDriver")
+            .field("state_dir", &self.state_dir)
+            .field("registry_dir", &self.registry_dir)
+            .field("plans_dir", &self.plans_dir)
+            .field("authority_dir", &self.authority_dir)
+            .field("sessions_dir", &self.sessions_dir)
+            .field(
+                "driver_dir",
+                &self.controller.ownership_store().lock_root_dir(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl CoworkerCodeDriver {
+    /// Opens a [`CoworkerCodeDriver`] from the canonical workspace store directories.
+    ///
+    /// Uses [`coworker_driver_dir`]`(plans_dir)` (`plans_dir/coworker-code-driver`, mode `0700`)
+    /// as the physical ownership and driver state root directory, and attaches
+    /// [`planning_artifacts_dir`]`(plans_dir)` for planner provenance verification.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if any store directory or authority store cannot be opened.
+    pub fn open_from_dirs(
+        state_dir: impl Into<PathBuf>,
+        registry_dir: impl Into<PathBuf>,
+        plans_dir: impl Into<PathBuf>,
+        authority_dir: impl Into<PathBuf>,
+        sessions_dir: impl Into<PathBuf>,
+    ) -> Result<Self, NativeError> {
+        let state_dir = state_dir.into();
+        let registry_dir = registry_dir.into();
+        let plans_dir = plans_dir.into();
+        let authority_dir = authority_dir.into();
+        let sessions_dir = sessions_dir.into();
+
+        prepare_private_dir(&state_dir, "state_dir")?;
+        prepare_private_dir(&registry_dir, "registry_dir")?;
+        prepare_private_dir(&plans_dir, "plans_dir")?;
+        prepare_private_dir(&authority_dir, "authority_dir")?;
+        prepare_private_dir(&sessions_dir, "sessions_dir")?;
+
+        let (registry, plans) = open_workflow_stores(Some(&registry_dir), Some(&plans_dir))?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "coworker code driver requires registry_dir and plans_dir.",
+                )
+            })?;
+        let authority = Arc::new(
+            AuthorityStore::open(&authority_dir, Arc::clone(&registry), Arc::clone(&plans))
+                .map_err(map_authority_error)?,
+        );
+        let workflow_store = CoworkerWorkflowStore::new(&plans_dir)?;
+        let policy_store = ControllerPolicyStore::new(&plans_dir)?;
+        let driver_root = coworker_driver_dir(&plans_dir);
+        prepare_private_dir(&driver_root, "coworker_driver_dir")?;
+        let ownership_store = CoworkerJobOwnershipStore::new(&driver_root)?;
+        let artifacts_dir = planning_artifacts_dir(&plans_dir);
+        let controller = CoworkerControllerService::new(
+            workflow_store,
+            policy_store,
+            ownership_store,
+            Arc::clone(&authority),
+            &sessions_dir,
+        )?
+        .with_planning_artifacts_dir(&artifacts_dir)?;
+
+        Ok(Self {
+            state_dir,
+            registry_dir,
+            plans_dir,
+            authority_dir,
+            sessions_dir,
+            authority,
+            controller,
+            flow_binary_override: None,
+        })
+    }
+
+    /// Constructs a [`CoworkerCodeDriver`] around an already-configured [`CoworkerControllerService`].
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if any directory fails private-directory validation.
+    pub fn from_controller(
+        state_dir: impl Into<PathBuf>,
+        registry_dir: impl Into<PathBuf>,
+        plans_dir: impl Into<PathBuf>,
+        authority_dir: impl Into<PathBuf>,
+        sessions_dir: impl Into<PathBuf>,
+        authority: Arc<AuthorityStore>,
+        controller: CoworkerControllerService,
+    ) -> Result<Self, NativeError> {
+        let state_dir = state_dir.into();
+        let registry_dir = registry_dir.into();
+        let plans_dir = plans_dir.into();
+        let authority_dir = authority_dir.into();
+        let sessions_dir = sessions_dir.into();
+
+        prepare_private_dir(&state_dir, "state_dir")?;
+        prepare_private_dir(&registry_dir, "registry_dir")?;
+        prepare_private_dir(&plans_dir, "plans_dir")?;
+        prepare_private_dir(&authority_dir, "authority_dir")?;
+        prepare_private_dir(&sessions_dir, "sessions_dir")?;
+        prepare_private_dir(
+            controller.ownership_store().lock_root_dir(),
+            "coworker_driver_dir",
+        )?;
+
+        Ok(Self {
+            state_dir,
+            registry_dir,
+            plans_dir,
+            authority_dir,
+            sessions_dir,
+            authority,
+            controller,
+            flow_binary_override: None,
+        })
+    }
+
+    /// Overrides the `threadlane-flow` executable path used when `ensure` spawns a detached owner.
+    #[must_use]
+    pub fn with_flow_binary_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.flow_binary_override = Some(path.into());
+        self
+    }
+
+    /// Returns a reference to the underlying [`CoworkerControllerService`].
+    #[must_use]
+    pub const fn controller(&self) -> &CoworkerControllerService {
+        &self.controller
+    }
+
+    /// Returns the private driver directory used for lockfiles, Unix sockets, and state files.
+    #[must_use]
+    pub fn driver_dir(&self) -> &Path {
+        self.controller.ownership_store().lock_root_dir()
+    }
+
+    /// Returns the deterministic private state file path for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if the ownership key is invalid or the driver directory is unsafe.
+    pub fn state_file_path_for_key(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+    ) -> Result<PathBuf, NativeError> {
+        prepare_private_dir(self.driver_dir(), "coworker_driver_dir")?;
+        Ok(self.driver_dir().join(state_file_name_for_key(key)))
+    }
+
+    /// Returns the deterministic Unix domain socket path for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if the ownership key is invalid or the driver directory is unsafe.
+    pub fn socket_file_path_for_key(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+    ) -> Result<PathBuf, NativeError> {
+        prepare_private_dir(self.driver_dir(), "coworker_driver_dir")?;
+        Ok(self.driver_dir().join(socket_file_name_for_key(key)))
+    }
+
+    /// Reads the persisted [`CoworkerDriverStateRecord`] for `key`, if one exists.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if the file fails `0600` private-file checks or does not match `key`.
+    pub fn read_driver_state_optional(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+    ) -> Result<Option<CoworkerDriverStateRecord>, NativeError> {
+        let path = self.state_file_path_for_key(key)?;
+        let Some(raw) =
+            read_private_file_bounded(&path, MAX_DRIVER_STATE_BYTES, "coworker_driver_state")?
+        else {
+            return Ok(None);
+        };
+        let record: CoworkerDriverStateRecord = serde_json::from_slice(&raw)
+            .map_err(|err| map_json_error("coworker_driver_state", err))?;
+        validate_driver_state_record(&record, key)?;
+        Ok(Some(record))
+    }
+
+    /// Runs the physical owner lifecycle (`run-owner`) for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// Acquires the exclusive physical [`OwnedCoworkerControllerSession`], verifies the full
+    /// planner provenance + approval + controller envelope admission under the held physical
+    /// guard, binds the private `0600` Unix domain socket for same-EUID + fresh-nonce RPCs,
+    /// reuses a verified `Ready` host or starts a fresh host via [`ApprovedHost::start_fresh_only`]
+    /// when permitted, steps the controller on a finite cadence, and upon graceful exit releases
+    /// the logical lease, shuts down any self-started host handle when no worker is actively
+    /// running, unlinks the socket, and drops the physical FD lock.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if another live owner already holds the job, if admission or host
+    /// verification fails, or if stepping fails.
+    pub async fn run_owner(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        options: CoworkerDriverRunOptions,
+    ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+        let max_steps = options.max_steps.filter(|&n| n > 0).map(|n| n.min(4_096));
+        let poll_interval_ms = options.poll_interval_ms.clamp(1, 60_000);
+        let idle_linger_ms = options.idle_linger_ms.map(|ms| ms.min(60_000));
+
+        let started_at_ms = current_time_ms();
+        let session =
+            self.controller
+                .open_owned_session(binding_id, thread_uuid, job_id, started_at_ms)?;
+        let admission = match session.verify_admission() {
+            Ok(adm) => adm,
+            Err(err) => {
+                let _ = session.release();
+                return Err(err);
+            }
+        };
+
+        // Ensure host readiness before entering the step/RPC loop. If host acquisition fails,
+        // release the owned session cleanly before returning the error.
+        let mut host_session = match self.ensure_host_for_admission(&key, &admission).await {
+            Ok(host) => host,
+            Err(err) => {
+                let _ = session.release();
+                return Err(err);
+            }
+        };
+
+        let sock_file_name = socket_file_name_for_key(&key);
+        let canonical_socket_path = self.socket_file_path_for_key(&key)?;
+        let listener = match bind_private_unix_listener(self.driver_dir(), &sock_file_name) {
+            Ok(listener) => listener,
+            Err(err) => {
+                if let Some(handle) = host_session.owned_handle.take() {
+                    let _ = handle.shutdown().await;
+                }
+                let _ = session.release();
+                return Err(err);
+            }
+        };
+
+        let mut steps_completed = 0u32;
+        let mut last_step_report: Option<CoworkerControllerStepReport> = None;
+
+        // Run the initial step under the held physical guard.
+        let initial_step_res = self
+            .execute_owner_step_or_quiescent_check(
+                &key,
+                &session,
+                &mut host_session,
+                &mut steps_completed,
+                &mut last_step_report,
+                started_at_ms,
+                &canonical_socket_path,
+            )
+            .await;
+
+        if let Err(err) = initial_step_res {
+            let _ = remove_socket_if_present(&canonical_socket_path);
+            if let Some(handle) = host_session.owned_handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            let _ = session.release();
+            return Err(err);
+        }
+
+        let mut quiescent_since: Option<Instant> = None;
+        if let Some(report) = &last_step_report {
+            if !report_has_active_work(report) {
+                quiescent_since = Some(Instant::now());
+            }
+        }
+
+        let mut stop_loop = false;
+        while !stop_loop {
+            let active_work = last_step_report
+                .as_ref()
+                .is_some_and(report_has_active_work);
+            let terminal_or_stopped = last_step_report.as_ref().is_some_and(|r| {
+                !report_has_active_work(r) && is_terminal_or_stopped_status(r.status)
+            });
+            let pipeline_await = last_step_report
+                .as_ref()
+                .is_some_and(|r| !report_has_active_work(r) && is_pipeline_await_status(r.status));
+
+            if active_work {
+                quiescent_since = None;
+                // Explicit diagnostic max_steps never cancels or shuts down active work on an owned host.
+                if let Some(limit) = max_steps {
+                    if steps_completed >= limit && host_session.owned_handle.is_none() {
+                        break;
+                    }
+                }
+            } else {
+                let since = *quiescent_since.get_or_insert_with(Instant::now);
+                let elapsed_ms = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let max_steps_reached = max_steps.is_some_and(|limit| steps_completed >= limit);
+
+                let should_exit_now = if terminal_or_stopped {
+                    let linger = idle_linger_ms.unwrap_or(0);
+                    linger == 0 || elapsed_ms >= linger
+                } else if pipeline_await {
+                    // Normal owner lifetime keeps RPC and physical ownership available at
+                    // AwaitingChecksOrReview / AwaitingDependencyAcceptanceOrSeal / Held unless
+                    // an explicit diagnostic max_steps or idle_linger_ms was supplied.
+                    max_steps_reached || idle_linger_ms.is_some_and(|linger| elapsed_ms >= linger)
+                } else {
+                    max_steps_reached
+                };
+
+                if should_exit_now {
+                    while let Ok(Some(Ok((stream, _)))) =
+                        tokio::time::timeout(Duration::from_millis(5), async {
+                            Some(listener.accept().await)
+                        })
+                        .await
+                    {
+                        let _ = self
+                            .handle_owner_rpc_connection(
+                                stream,
+                                &key,
+                                &session,
+                                &mut host_session,
+                                &mut steps_completed,
+                                &mut last_step_report,
+                                &canonical_socket_path,
+                                &mut stop_loop,
+                            )
+                            .await;
+                    }
+                    break;
+                }
+            }
+
+            let wait_ms = if !active_work {
+                if let Some(linger) = idle_linger_ms {
+                    let since = quiescent_since.unwrap_or_else(Instant::now);
+                    let elapsed_ms = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    linger.saturating_sub(elapsed_ms).clamp(1, poll_interval_ms)
+                } else {
+                    poll_interval_ms
+                }
+            } else {
+                poll_interval_ms
+            };
+
+            tokio::select! {
+                accept_res = listener.accept() => {
+                    if let Ok((stream, _)) = accept_res {
+                        self.handle_owner_rpc_connection(
+                            stream,
+                            &key,
+                            &session,
+                            &mut host_session,
+                            &mut steps_completed,
+                            &mut last_step_report,
+                            &canonical_socket_path,
+                            &mut stop_loop,
+                        )
+                        .await?;
+                    }
+                }
+                () = tokio::time::sleep(Duration::from_millis(wait_ms)) => {
+                    let now_ms = current_time_ms();
+                    let should_step_on_tick = if active_work {
+                        true
+                    } else {
+                        self.should_step_while_quiescent(&key, now_ms)?
+                    };
+
+                    if should_step_on_tick {
+                        self.execute_owner_step_or_quiescent_check(
+                            &key,
+                            &session,
+                            &mut host_session,
+                            &mut steps_completed,
+                            &mut last_step_report,
+                            now_ms,
+                            &canonical_socket_path,
+                        )
+                        .await?;
+                        if let Some(report) = &last_step_report {
+                            if !report_has_active_work(report) && quiescent_since.is_none() {
+                                quiescent_since = Some(Instant::now());
+                            } else if report_has_active_work(report) {
+                                quiescent_since = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build final status report while still holding the guard, then perform graceful teardown.
+        let _ = remove_socket_if_present(&canonical_socket_path);
+        drop(listener);
+
+        let mut shutdown_manifest_updated_at_ms: Option<i64> = None;
+        let mut shutdown_host_instance_id: Option<String> = None;
+        if let Some(handle) = host_session.owned_handle.take() {
+            let instance_id = handle.instance_id().to_owned();
+            handle.shutdown().await.map_err(map_host_error)?;
+            let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
+            if let Some(post_manifest) =
+                read_host_manifest_optional(&session_dir, &admission.approval)
+                    .map_err(map_host_error)?
+            {
+                if post_manifest.phase == HostPhase::Stopped
+                    && last_step_report.as_ref().is_some_and(|r| {
+                        matches!(
+                            r.status,
+                            CoworkerControllerPhase1Status::AwaitingChecksOrReview
+                                | CoworkerControllerPhase1Status::AwaitingDependencyAcceptanceOrSeal
+                                | CoworkerControllerPhase1Status::AllTasksIntegrated
+                                | CoworkerControllerPhase1Status::Stopped
+                                | CoworkerControllerPhase1Status::BlockedOrFailed
+                        )
+                    })
+                {
+                    shutdown_manifest_updated_at_ms = Some(post_manifest.updated_at_ms);
+                    shutdown_host_instance_id = post_manifest.instance_id.or(Some(instance_id));
+                }
+            }
+        }
+
+        let finished_at_ms = current_time_ms();
+        let owner_summary = session.guard().validate_before_effect(&key)?.clone();
+        if let Some(report) = &last_step_report {
+            let final_state = CoworkerDriverStateRecord {
+                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                binding_id: key.binding_id.clone(),
+                thread_uuid: key.thread_uuid.clone(),
+                job_id: key.job_id.clone(),
+                owner_instance_id: owner_summary.instance_id.clone(),
+                owner_challenge_digest: owner_summary.challenge_digest.clone(),
+                owner_pid_hint: owner_summary.pid_hint,
+                owner_uid: current_effective_uid(),
+                lock_file_identity: owner_summary.lock_file_identity,
+                socket_path: canonical_socket_path.display().to_string(),
+                host_mode: host_session.mode,
+                owner_active: false,
+                graceful_exit_completed: true,
+                owner_quiescent_host_shutdown_updated_at_ms: shutdown_manifest_updated_at_ms,
+                owner_quiescent_host_instance_id: shutdown_host_instance_id,
+                steps_completed,
+                last_overall_status: report.status,
+                last_step_report: Some(report.clone()),
+                pipeline_boundary:
+                    CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                started_at_ms,
+                updated_at_ms: finished_at_ms,
+            };
+            self.write_driver_state(&key, &final_state)?;
+        }
+
+        session.release()?;
+        self.build_readonly_status_report(&key, Some(host_session.mode), last_step_report)
+    }
+
+    /// Ensures a single verified physical owner for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// - If a live physical owner already holds the job lock, verifies it over the local Unix
+    ///   socket RPC (same-EUID peer credentials + fresh CSPRNG nonces + live lock summary/instance)
+    ///   and reuses it without spawning a second process or making a second model call.
+    /// - Otherwise, validates authoritative admission under a short-lived owned session before
+    ///   spawning a detached `threadlane-flow ... code-driver run-owner` process and waiting for
+    ///   bounded readiness verification.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if admission validation fails, if a live lock holder fails RPC
+    /// verification, or if the spawned owner fails.
+    pub async fn ensure_owner(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        options: Option<CoworkerDriverRunOptions>,
+    ) -> Result<CoworkerDriverEnsureReport, NativeError> {
+        let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+
+        // 1. Check if a live owner is already holding the physical lock.
+        if let Some(status) = self
+            .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Status)
+            .await?
+        {
+            return Ok(CoworkerDriverEnsureReport {
+                disposition: CoworkerDriverEnsureDisposition::ReusedLiveOwner,
+                status,
+            });
+        }
+
+        // 2. Validate authoritative admission and host state under a short-lived physical guard
+        // before spawning a detached owner process. If another `ensure` or `run-owner` process is
+        // concurrently acquiring or initializing the lock, wait for its RPC readiness.
+        {
+            let precheck_deadline =
+                Instant::now() + Duration::from_millis(DEFAULT_DRIVER_STARTUP_TIMEOUT_MS);
+            let session = loop {
+                if let Some(status) = self
+                    .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Status)
+                    .await?
+                {
+                    return Ok(CoworkerDriverEnsureReport {
+                        disposition: CoworkerDriverEnsureDisposition::ReusedLiveOwner,
+                        status,
+                    });
+                }
+                let attempt_now_ms = current_time_ms();
+                match self.controller.open_owned_session(
+                    binding_id,
+                    thread_uuid,
+                    job_id,
+                    attempt_now_ms,
+                ) {
+                    Ok(sess) => break sess,
+                    Err(err) => {
+                        let lock_held = matches!(
+                            self.controller.ownership_store().inspect_job_lock(&key)?,
+                            CoworkerJobLockState::HeldByActiveProcess { .. }
+                        );
+                        if lock_held && Instant::now() < precheck_deadline {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
+            };
+            let precheck_now_ms = current_time_ms();
+            let precheck_res: Result<Option<CoworkerDriverStatusReport>, NativeError> = async {
+                let admission = session.verify_admission()?;
+                if is_terminal_or_stopped_job(&admission.job, &admission.runtime_state) {
+                    if self
+                        .is_verified_ready_host_active(&admission.approval)
+                        .await?
+                    {
+                        let report = session.step(current_time_ms()).await?;
+                        let owner_summary = session.guard().validate_before_effect(&key)?.clone();
+                        let prev_state = self.read_driver_state_optional(&key)?;
+                        let state_record = CoworkerDriverStateRecord {
+                            schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                            binding_id: key.binding_id.clone(),
+                            thread_uuid: key.thread_uuid.clone(),
+                            job_id: key.job_id.clone(),
+                            owner_instance_id: owner_summary.instance_id,
+                            owner_challenge_digest: owner_summary.challenge_digest,
+                            owner_pid_hint: owner_summary.pid_hint,
+                            owner_uid: current_effective_uid(),
+                            lock_file_identity: owner_summary.lock_file_identity,
+                            socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
+                            host_mode: CoworkerDriverHostMode::ReusedVerifiedReadyHost,
+                            owner_active: false,
+                            graceful_exit_completed: true,
+                            owner_quiescent_host_shutdown_updated_at_ms: prev_state
+                                .as_ref()
+                                .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
+                            owner_quiescent_host_instance_id: prev_state
+                                .and_then(|s| s.owner_quiescent_host_instance_id),
+                            steps_completed: 1,
+                            last_overall_status: report.status,
+                            last_step_report: Some(report.clone()),
+                            pipeline_boundary:
+                                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                            started_at_ms: precheck_now_ms,
+                            updated_at_ms: current_time_ms(),
+                        };
+                        self.write_driver_state(&key, &state_record)?;
+                        return Ok(Some(self.build_readonly_status_report(
+                            &key,
+                            Some(CoworkerDriverHostMode::ReusedVerifiedReadyHost),
+                            Some(report),
+                        )?));
+                    } else if self.can_skip_host_for_quiescent_job(&key, &admission)? {
+                        let owner_summary = session.guard().validate_before_effect(&key)?.clone();
+                        let prev_state = self.read_driver_state_optional(&key)?;
+                        let (synth_status, _) = self.synthesize_status_and_tasks(
+                            &self.inspect_scoped_job_readonly(&key)?,
+                        )?;
+                        let prev_report = prev_state.as_ref().and_then(|s| s.last_step_report.clone());
+                        let state_record = CoworkerDriverStateRecord {
+                            schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                            binding_id: key.binding_id.clone(),
+                            thread_uuid: key.thread_uuid.clone(),
+                            job_id: key.job_id.clone(),
+                            owner_instance_id: owner_summary.instance_id,
+                            owner_challenge_digest: owner_summary.challenge_digest,
+                            owner_pid_hint: owner_summary.pid_hint,
+                            owner_uid: current_effective_uid(),
+                            lock_file_identity: owner_summary.lock_file_identity,
+                            socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
+                            host_mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
+                            owner_active: false,
+                            graceful_exit_completed: true,
+                            owner_quiescent_host_shutdown_updated_at_ms: prev_state
+                                .as_ref()
+                                .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
+                            owner_quiescent_host_instance_id: prev_state
+                                .and_then(|s| s.owner_quiescent_host_instance_id),
+                            steps_completed: 1,
+                            last_overall_status: synth_status,
+                            last_step_report: prev_report.clone(),
+                            pipeline_boundary:
+                                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                            started_at_ms: precheck_now_ms,
+                            updated_at_ms: current_time_ms(),
+                        };
+                        self.write_driver_state(&key, &state_record)?;
+                        return Ok(Some(self.build_readonly_status_report(
+                            &key,
+                            Some(CoworkerDriverHostMode::QuiescentNoHostRequired),
+                            prev_report,
+                        )?));
+                    }
+                }
+                self.preflight_host_for_admission(&key, &admission).await?;
+                Ok(None)
+            }
+            .await;
+
+            match precheck_res {
+                Ok(Some(quiescent_status)) => {
+                    session.release()?;
+                    return Ok(CoworkerDriverEnsureReport {
+                        disposition: CoworkerDriverEnsureDisposition::AlreadyQuiescentVerified,
+                        status: quiescent_status,
+                    });
+                }
+                Ok(None) => {
+                    session.release()?;
+                }
+                Err(err) => {
+                    let _ = session.release();
+                    return Err(err);
+                }
+            }
+        }
+
+        // 3. Spawn a detached `threadlane-flow ... code-driver run-owner` process.
+        let run_opts = options.unwrap_or_default();
+        let flow_bin = self.resolve_flow_binary()?;
+        let mut cmd = Command::new(&flow_bin);
+        cmd.arg("--state-dir")
+            .arg(&self.state_dir)
+            .arg("--registry-dir")
+            .arg(&self.registry_dir)
+            .arg("--plans-dir")
+            .arg(&self.plans_dir)
+            .arg("--authority-dir")
+            .arg(&self.authority_dir)
+            .arg("--sessions-dir")
+            .arg(&self.sessions_dir)
+            .arg("--binding")
+            .arg(binding_id)
+            .arg("--thread")
+            .arg(thread_uuid)
+            .arg("code-driver")
+            .arg("run-owner")
+            .arg("--job-id")
+            .arg(job_id)
+            .arg("--poll-interval-ms")
+            .arg(run_opts.poll_interval_ms.clamp(1, 60_000).to_string());
+
+        if let Some(max_steps) = run_opts.max_steps.filter(|&n| n > 0) {
+            cmd.arg("--max-steps").arg(max_steps.min(4_096).to_string());
+        }
+        if let Some(idle_linger_ms) = run_opts.idle_linger_ms {
+            cmd.arg("--idle-linger-ms")
+                .arg(idle_linger_ms.min(60_000).to_string());
+        }
+
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| map_io_error("failed to spawn detached code-driver owner", err))?;
+        let deadline = Instant::now() + Duration::from_millis(DEFAULT_DRIVER_STARTUP_TIMEOUT_MS);
+
+        loop {
+            if let Some(status) = self
+                .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Status)
+                .await?
+            {
+                return Ok(CoworkerDriverEnsureReport {
+                    disposition: CoworkerDriverEnsureDisposition::SpawnedNewOwner,
+                    status,
+                });
+            }
+
+            if let Some(exit_status) = child
+                .try_wait()
+                .map_err(|err| map_io_error("failed to poll spawned code-driver owner", err))?
+            {
+                if exit_status.success() {
+                    let status = self.status(binding_id, thread_uuid, job_id).await?;
+                    return Ok(CoworkerDriverEnsureReport {
+                        disposition: CoworkerDriverEnsureDisposition::SpawnedNewOwner,
+                        status,
+                    });
+                }
+                // If a concurrent `ensure` won the physical lock race, wait for the winning live owner's RPC.
+                while Instant::now() < deadline {
+                    if let Some(status) = self
+                        .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Status)
+                        .await?
+                    {
+                        return Ok(CoworkerDriverEnsureReport {
+                            disposition: CoworkerDriverEnsureDisposition::ReusedLiveOwner,
+                            status,
+                        });
+                    }
+                    if !matches!(
+                        self.controller.ownership_store().inspect_job_lock(&key)?,
+                        CoworkerJobLockState::HeldByActiveProcess { .. }
+                    ) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "spawned code-driver run-owner process exited with non-zero status: {exit_status}"
+                    ),
+                ));
+            }
+
+            if Instant::now() >= deadline {
+                return Err(NativeError::new(
+                    NativeErrorCode::TimedOut,
+                    format!(
+                        "timed out after {DEFAULT_DRIVER_STARTUP_TIMEOUT_MS}ms waiting for code-driver owner for job '{}'",
+                        key.job_id
+                    ),
+                ));
+            }
+
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Returns the current verified status for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// If a live physical owner holds the lock, verifies it via the local Unix socket RPC
+    /// handshake. Otherwise, inspects the persisted workflow, controller policy, lockfile, and
+    /// host session state read-only without mutating state or trusting stale crash metadata.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if scope or store validation fails.
+    pub async fn status(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+    ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+        if let Some(live_report) = self
+            .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Status)
+            .await?
+        {
+            return Ok(live_report);
+        }
+        self.build_readonly_status_report(&key, None, None)
+    }
+
+    /// Reconciles task receipts and advances Phase 1 state for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// - If a live physical owner is active, delegates reconciliation over the authenticated local
+    ///   Unix socket RPC so the live owner steps under its held physical guard.
+    /// - Otherwise, opens a short-lived [`OwnedCoworkerControllerSession`], reconciles any stale
+    ///   lease, ensures host readiness (without restarting a stopped or uncertain host), steps the
+    ///   controller once, and releases the session cleanly.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if admission, host verification, or receipt reconciliation fails.
+    pub async fn reconcile(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+    ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+        if let Some(live_report) = self
+            .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Reconcile)
+            .await?
+        {
+            return Ok(live_report);
+        }
+        self.run_owner(
+            binding_id,
+            thread_uuid,
+            job_id,
+            CoworkerDriverRunOptions {
+                max_steps: Some(1),
+                poll_interval_ms: DEFAULT_DRIVER_POLL_INTERVAL_MS,
+                idle_linger_ms: Some(0),
+            },
+        )
+        .await
+    }
+
+    /// Requests durable stop and narrow host task cancellation for `(binding_id, thread_uuid, job_id)`.
+    ///
+    /// Ordering invariants:
+    /// 1. Validates scope and read-only job/envelope/approval linkage.
+    /// 2. Persists `stop_requested = true` durably in [`ControllerPolicyStore`] BEFORE any local
+    ///    socket RPC or [`ApprovedHostClient::cancel_task`] call.
+    /// 3. If a live physical owner is active, notifies it via authenticated Unix socket RPC so it
+    ///    performs narrow host cancellation, reconciles receipts, and exits gracefully (dropping
+    ///    both its FD lock and logical lease).
+    /// 4. Performs/verifies narrow [`ApprovedHostClient::cancel_task`] on any remaining active
+    ///    original host tasks when a verified `Ready` host is available, reconciles under a
+    ///    short-lived owned session (verifying full admission under the physical guard), and
+    ///    releases the lease and FD lock.
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if scope/admission validation or durable state persistence fails.
+    pub async fn cancel(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        reason: Option<String>,
+    ) -> Result<CoworkerDriverCancelReport, NativeError> {
+        let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
+        let inspection = self.inspect_scoped_job_readonly(&key)?;
+        let sanitized_reason = reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("operator_requested_cancel")
+            .to_owned();
+
+        // STEP 1: Persist durable `stop_requested = true` BEFORE any socket RPC or host cancel call.
+        self.controller
+            .policy_store()
+            .mutate_job_runtime_for_operator(binding_id, job_id, |runtime_state| {
+                if runtime_state.envelope.binding_id != binding_id
+                    || runtime_state.envelope.thread_uuid != thread_uuid
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "controller_runtime_state envelope scope does not match requested binding/thread.",
+                    ));
+                }
+                runtime_state.stop_requested = true;
+                runtime_state.stop_or_block_reason = Some(sanitized_reason.clone());
+                Ok(())
+            })?;
+        let durable_stop_recorded_before_host_cancel = true;
+
+        let mut notified_live_owner = false;
+        let mut narrow_host_cancellation_attempted = false;
+        let mut cancelled_host_tasks = Vec::new();
+
+        // STEP 2: If a live physical owner is holding the lock, notify it over authenticated RPC.
+        if let Some(rpc_resp) = self
+            .try_send_rpc_to_live_owner(
+                &key,
+                DriverRpcOp::Cancel {
+                    reason: sanitized_reason.clone(),
+                },
+            )
+            .await?
+        {
+            notified_live_owner = true;
+            narrow_host_cancellation_attempted = rpc_resp.narrow_host_cancellation_attempted;
+            cancelled_host_tasks = rpc_resp.cancelled_host_tasks;
+
+            // Wait bounded time for the notified live owner to finish graceful teardown and drop FD.
+            let deadline = Instant::now() + Duration::from_millis(5_000);
+            while Instant::now() < deadline {
+                if !matches!(
+                    self.controller.ownership_store().inspect_job_lock(&key)?,
+                    CoworkerJobLockState::HeldByActiveProcess { .. }
+                ) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // STEP 3: If the lock is now free, open a short-lived owned session to verify full admission
+        // under the guard, cancel any active original host tasks (when a Ready host is active),
+        // reconcile snapshots, and release the lease.
+        if !matches!(
+            self.controller.ownership_store().inspect_job_lock(&key)?,
+            CoworkerJobLockState::HeldByActiveProcess { .. }
+        ) {
+            let cancel_now_ms = current_time_ms();
+            let session = self.controller.open_owned_session(
+                binding_id,
+                thread_uuid,
+                job_id,
+                cancel_now_ms,
+            )?;
+            let step_and_cancel_res: Result<Option<CoworkerControllerStepReport>, NativeError> =
+                async {
+                    let admission = session.verify_admission()?;
+                    if self
+                        .is_verified_ready_host_active(&admission.approval)
+                        .await?
+                    {
+                        narrow_host_cancellation_attempted = true;
+                        let newly_cancelled = self
+                            .cancel_active_original_host_tasks(
+                                binding_id,
+                                thread_uuid,
+                                &admission.job,
+                                &admission.approval.approval_id,
+                                &sanitized_reason,
+                            )
+                            .await?;
+                        for item in newly_cancelled {
+                            if !cancelled_host_tasks
+                                .iter()
+                                .any(|existing| existing.task_id == item.task_id)
+                            {
+                                cancelled_host_tasks.push(item);
+                            }
+                        }
+                        let report = session.step(current_time_ms()).await?;
+                        Ok(Some(report))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                .await;
+
+            let maybe_step_report = match step_and_cancel_res {
+                Ok(report) => report,
+                Err(err) => {
+                    let _ = session.release();
+                    return Err(err);
+                }
+            };
+
+            let owner_summary = session.guard().validate_before_effect(&key)?.clone();
+            let previous_state = self.read_driver_state_optional(&key)?;
+            let effective_host_mode = if narrow_host_cancellation_attempted {
+                CoworkerDriverHostMode::ReusedVerifiedReadyHost
+            } else {
+                previous_state
+                    .as_ref()
+                    .map_or(CoworkerDriverHostMode::NotRunningOrInspectedReadonly, |s| {
+                        s.host_mode
+                    })
+            };
+            let effective_step_report = maybe_step_report.or_else(|| {
+                previous_state
+                    .as_ref()
+                    .and_then(|s| s.last_step_report.clone())
+            });
+            let updated_state = CoworkerDriverStateRecord {
+                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                binding_id: key.binding_id.clone(),
+                thread_uuid: key.thread_uuid.clone(),
+                job_id: key.job_id.clone(),
+                owner_instance_id: owner_summary.instance_id.clone(),
+                owner_challenge_digest: owner_summary.challenge_digest.clone(),
+                owner_pid_hint: owner_summary.pid_hint,
+                owner_uid: current_effective_uid(),
+                lock_file_identity: owner_summary.lock_file_identity,
+                socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
+                host_mode: effective_host_mode,
+                owner_active: false,
+                graceful_exit_completed: true,
+                owner_quiescent_host_shutdown_updated_at_ms: previous_state
+                    .as_ref()
+                    .and_then(|state| state.owner_quiescent_host_shutdown_updated_at_ms),
+                owner_quiescent_host_instance_id: previous_state
+                    .and_then(|state| state.owner_quiescent_host_instance_id),
+                steps_completed: 1,
+                last_overall_status: CoworkerControllerPhase1Status::Stopped,
+                last_step_report: effective_step_report,
+                pipeline_boundary:
+                    CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                started_at_ms: cancel_now_ms,
+                updated_at_ms: current_time_ms(),
+            };
+            self.write_driver_state(&key, &updated_state)?;
+            session.release()?;
+        }
+
+        let status = self.build_readonly_status_report(&key, None, None)?;
+        Ok(CoworkerDriverCancelReport {
+            binding_id: binding_id.to_owned(),
+            thread_uuid: thread_uuid.to_owned(),
+            job_id: job_id.to_owned(),
+            approval_id: inspection.approval.approval_id,
+            reason: sanitized_reason,
+            durable_stop_recorded_before_host_cancel,
+            notified_live_owner,
+            narrow_host_cancellation_attempted,
+            cancelled_host_tasks,
+            derived_attempt_cancellation_boundary:
+                CoworkerDerivedCancellationBoundary::OriginalHostTasksOnlyDerivedIntegratedLater,
+            cancellation_boundary_note:
+                "Durable stop_requested persisted before narrow ApprovedHostClient::cancel_task \
+                 calls on original host tasks (task_id -> run_id); no PID or process-name kills \
+                 are used. Running derived-attempt cancellation will be integrated in a later \
+                 milestone."
+                    .to_owned(),
+            status,
+        })
+    }
+
+    fn should_step_while_quiescent(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        now_ms: u64,
+    ) -> Result<bool, NativeError> {
+        let Some(runtime_state) = self
+            .controller
+            .policy_store()
+            .get_job_runtime_readonly(&key.binding_id, &key.job_id)?
+        else {
+            return Ok(true);
+        };
+        if runtime_state.stop_requested {
+            return Ok(true);
+        }
+        let Some(ref lease) = runtime_state.lease else {
+            return Ok(true);
+        };
+        if !lease.active || now_ms.saturating_add(LEASE_RENEWAL_MARGIN_MS) >= lease.expires_at_ms {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_owner_step_or_quiescent_check(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        session: &OwnedCoworkerControllerSession,
+        host_session: &mut ActiveHostSession,
+        steps_completed: &mut u32,
+        last_step_report: &mut Option<CoworkerControllerStepReport>,
+        now_ms: u64,
+        canonical_socket_path: &Path,
+    ) -> Result<(), NativeError> {
+        let owner_summary = session.guard().validate_before_effect(key)?.clone();
+        let verified_summary = self
+            .controller
+            .ownership_store()
+            .verify_live_guard(session.guard(), key)?;
+        if !constant_time_str_eq(&owner_summary.instance_id, &verified_summary.instance_id) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "live ownership guard instance mismatch before controller step.",
+            ));
+        }
+
+        let prev_state = self.read_driver_state_optional(key)?;
+        let step_report = if host_session.mode == CoworkerDriverHostMode::QuiescentNoHostRequired {
+            let admission = session.verify_admission()?;
+            let lease = admission
+                .runtime_state
+                .lease
+                .as_ref()
+                .filter(|l| l.lease_epoch > 0)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "quiescent job is missing a valid persisted controller lease record.",
+                    )
+                })?;
+            let lease_epoch = lease.lease_epoch;
+            let controller_instance_id = lease.instance_id.clone();
+            let inspection = ReadonlyScopedJobInspection {
+                job: admission.job.clone(),
+                runtime_state: admission.runtime_state.clone(),
+                approval: admission.approval.clone(),
+            };
+            let (status, tasks) = self.synthesize_status_and_tasks(&inspection)?;
+            let fenced_task_ids = tasks
+                .iter()
+                .filter(|t| t.fenced)
+                .map(|t| t.task_id.clone())
+                .collect();
+            let unknown_effect_task_ids = tasks
+                .iter()
+                .filter(|t| {
+                    t.stage == CoworkerTaskStage::EffectUnknown
+                        || t.host_status == TaskExecutionStatus::Unknown
+                })
+                .map(|t| t.task_id.clone())
+                .collect();
+            CoworkerControllerStepReport {
+                binding_id: key.binding_id.clone(),
+                thread_uuid: key.thread_uuid.clone(),
+                job_id: key.job_id.clone(),
+                approval_id: admission.approval.approval_id,
+                job_revision: admission.job.job_revision,
+                lease_epoch,
+                controller_instance_id,
+                status,
+                max_parallel: admission.approval.max_parallel,
+                active_running_count: 0,
+                dispatched_task_ids: Vec::new(),
+                reconciled_ready_for_review_task_ids: Vec::new(),
+                promoted_dependency_ready_task_ids: Vec::new(),
+                fenced_task_ids,
+                unknown_effect_task_ids,
+                tasks,
+            }
+        } else {
+            session.step(now_ms).await?
+        };
+        *steps_completed = steps_completed.saturating_add(1);
+        *last_step_report = Some(step_report.clone());
+
+        let state_record = CoworkerDriverStateRecord {
+            schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+            binding_id: key.binding_id.clone(),
+            thread_uuid: key.thread_uuid.clone(),
+            job_id: key.job_id.clone(),
+            owner_instance_id: owner_summary.instance_id,
+            owner_challenge_digest: owner_summary.challenge_digest,
+            owner_pid_hint: owner_summary.pid_hint,
+            owner_uid: current_effective_uid(),
+            lock_file_identity: owner_summary.lock_file_identity,
+            socket_path: canonical_socket_path.display().to_string(),
+            host_mode: host_session.mode,
+            owner_active: true,
+            graceful_exit_completed: false,
+            owner_quiescent_host_shutdown_updated_at_ms: prev_state
+                .as_ref()
+                .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
+            owner_quiescent_host_instance_id: prev_state
+                .and_then(|s| s.owner_quiescent_host_instance_id),
+            steps_completed: *steps_completed,
+            last_overall_status: step_report.status,
+            last_step_report: Some(step_report),
+            pipeline_boundary:
+                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+            started_at_ms: owner_summary.acquired_at_ms,
+            updated_at_ms: current_time_ms(),
+        };
+        self.write_driver_state(key, &state_record)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_owner_rpc_connection(
+        &self,
+        stream: UnixStream,
+        key: &CoworkerJobOwnershipKey,
+        session: &OwnedCoworkerControllerSession,
+        host_session: &mut ActiveHostSession,
+        steps_completed: &mut u32,
+        last_step_report: &mut Option<CoworkerControllerStepReport>,
+        canonical_socket_path: &Path,
+        stop_loop: &mut bool,
+    ) -> Result<(), NativeError> {
+        let peer = stream
+            .peer_cred()
+            .map_err(|err| map_io_error("failed to inspect RPC socket peer credentials", err))?;
+        let expected_uid = current_effective_uid();
+        if peer.uid() != expected_uid {
+            return Ok(());
+        }
+
+        let (reader_half, mut writer_half) = stream.into_split();
+        let mut limited_reader = BufReader::new(reader_half.take(MAX_DRIVER_RPC_MESSAGE_BYTES));
+        let mut line = String::new();
+        let read_res = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_DRIVER_RPC_TIMEOUT_MS),
+            limited_reader.read_line(&mut line),
+        )
+        .await;
+        let Ok(Ok(bytes_read)) = read_res else {
+            return Ok(());
+        };
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        let Ok(request) = serde_json::from_str::<DriverRpcRequest>(line.trim()) else {
+            return Ok(());
+        };
+
+        // Server MUST validate actual held guard, current instance, challenge digest, and scope
+        // BEFORE performing any action or replying.
+        let live_summary = match session.guard().validate_before_effect(key) {
+            Ok(summary) => summary.clone(),
+            Err(_) => return Ok(()),
+        };
+        let verified_summary = match self
+            .controller
+            .ownership_store()
+            .verify_live_guard(session.guard(), key)
+        {
+            Ok(summary) => summary,
+            Err(_) => return Ok(()),
+        };
+        if !constant_time_str_eq(&live_summary.instance_id, &verified_summary.instance_id)
+            || !constant_time_str_eq(
+                &live_summary.challenge_digest,
+                &verified_summary.challenge_digest,
+            )
+            || live_summary.lock_file_identity != verified_summary.lock_file_identity
+        {
+            return Ok(());
+        }
+
+        if request.schema_version != COWORKER_DRIVER_RPC_SCHEMA_VERSION
+            || request.binding_id != key.binding_id
+            || request.thread_uuid != key.thread_uuid
+            || request.job_id != key.job_id
+            || validate_prefixed_random_id(&request.client_nonce, "cdn", "client_nonce").is_err()
+            || !constant_time_str_eq(&live_summary.instance_id, &request.expected_instance_id)
+            || !constant_time_str_eq(
+                &live_summary.challenge_digest,
+                &request.expected_challenge_digest,
+            )
+        {
+            return Ok(());
+        }
+
+        let server_nonce = generate_prefixed_random_id("dsn");
+        let mut cancelled_host_tasks = Vec::new();
+        let mut narrow_host_cancellation_attempted = false;
+        let mut op_error: Option<String> = None;
+
+        match request.op {
+            DriverRpcOp::Status => {}
+            DriverRpcOp::Reconcile => {
+                if let Err(err) = self
+                    .execute_owner_step_or_quiescent_check(
+                        key,
+                        session,
+                        host_session,
+                        steps_completed,
+                        last_step_report,
+                        current_time_ms(),
+                        canonical_socket_path,
+                    )
+                    .await
+                {
+                    op_error = Some(err.to_string());
+                }
+            }
+            DriverRpcOp::Cancel { reason } => {
+                let _ = self
+                    .controller
+                    .policy_store()
+                    .mutate_job_runtime_for_operator(
+                        &key.binding_id,
+                        &key.job_id,
+                        |runtime_state| {
+                            runtime_state.stop_requested = true;
+                            runtime_state.stop_or_block_reason = Some(reason.clone());
+                            Ok(())
+                        },
+                    );
+                if let Ok(admission) = session.verify_admission() {
+                    if self
+                        .is_verified_ready_host_active(&admission.approval)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        narrow_host_cancellation_attempted = true;
+                        if let Ok(cancelled) = self
+                            .cancel_active_original_host_tasks(
+                                &key.binding_id,
+                                &key.thread_uuid,
+                                &admission.job,
+                                &admission.approval.approval_id,
+                                &reason,
+                            )
+                            .await
+                        {
+                            cancelled_host_tasks = cancelled;
+                        }
+                        let _ = self
+                            .execute_owner_step_or_quiescent_check(
+                                key,
+                                session,
+                                host_session,
+                                steps_completed,
+                                last_step_report,
+                                current_time_ms(),
+                                canonical_socket_path,
+                            )
+                            .await;
+                    }
+                }
+                *stop_loop = true;
+            }
+        }
+
+        // Re-validate held guard immediately before serializing response.
+        let post_summary = session.guard().validate_before_effect(key)?.clone();
+        let status_report = self
+            .build_live_owner_status_report(
+                key,
+                &post_summary,
+                host_session.mode,
+                last_step_report.clone(),
+            )
+            .ok();
+
+        let response = DriverRpcResponse {
+            schema_version: COWORKER_DRIVER_RPC_SCHEMA_VERSION,
+            echoed_client_nonce: request.client_nonce,
+            server_nonce,
+            owner_summary: post_summary,
+            status: status_report,
+            cancelled_host_tasks,
+            narrow_host_cancellation_attempted,
+            error: op_error,
+        };
+        let mut encoded = serde_json::to_vec(&response)
+            .map_err(|err| map_json_error("driver_rpc_response", err))?;
+        encoded.push(b'\n');
+        let _ = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_DRIVER_RPC_TIMEOUT_MS),
+            writer_half.write_all(&encoded),
+        )
+        .await;
+        let _ = writer_half.flush().await;
+        Ok(())
+    }
+
+    async fn try_verify_live_owner_via_rpc(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        op: DriverRpcOp,
+    ) -> Result<Option<CoworkerDriverStatusReport>, NativeError> {
+        let Some(resp) = self.try_send_rpc_to_live_owner(key, op).await? else {
+            return Ok(None);
+        };
+        if let Some(err_msg) = resp.error {
+            return Err(NativeError::new(NativeErrorCode::ValidationFailed, err_msg));
+        }
+        resp.status.map(Some).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "live owner RPC response omitted status report.",
+            )
+        })
+    }
+
+    async fn try_send_rpc_to_live_owner(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        op: DriverRpcOp,
+    ) -> Result<Option<DriverRpcResponse>, NativeError> {
+        let lock_state = self.controller.ownership_store().inspect_job_lock(key)?;
+        let CoworkerJobLockState::HeldByActiveProcess {
+            recorded_summary: Some(lock_summary),
+            lock_file_identity,
+            ..
+        } = lock_state
+        else {
+            return Ok(None);
+        };
+
+        lock_summary.validate_for_key(key)?;
+        if lock_summary.lock_file_identity != lock_file_identity {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "active job lock summary lock_file_identity does not match physical lockfile.",
+            ));
+        }
+
+        let sock_file_name = socket_file_name_for_key(key);
+        let canonical_socket_path = self.socket_file_path_for_key(key)?;
+        if !validate_existing_private_socket(&canonical_socket_path)? {
+            return Ok(None);
+        }
+
+        let is_cancel = matches!(op, DriverRpcOp::Cancel { .. });
+        let client_nonce = generate_prefixed_random_id("cdn");
+        let request = DriverRpcRequest {
+            schema_version: COWORKER_DRIVER_RPC_SCHEMA_VERSION,
+            binding_id: key.binding_id.clone(),
+            thread_uuid: key.thread_uuid.clone(),
+            job_id: key.job_id.clone(),
+            expected_instance_id: lock_summary.instance_id.clone(),
+            expected_challenge_digest: lock_summary.challenge_digest.clone(),
+            client_nonce: client_nonce.clone(),
+            op,
+        };
+
+        let Some(stream) = connect_private_unix_socket(self.driver_dir(), &sock_file_name).await?
+        else {
+            return Ok(None);
+        };
+
+        let peer = stream
+            .peer_cred()
+            .map_err(|err| map_io_error("failed to inspect RPC socket peer credentials", err))?;
+        let expected_uid = current_effective_uid();
+        if peer.uid() != expected_uid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!(
+                    "coworker driver socket peer uid {} does not match effective uid {expected_uid}.",
+                    peer.uid()
+                ),
+            ));
+        }
+
+        let (reader_half, mut writer_half) = stream.into_split();
+        let mut encoded_req = serde_json::to_vec(&request)
+            .map_err(|err| map_json_error("driver_rpc_request", err))?;
+        encoded_req.push(b'\n');
+
+        let write_res = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_DRIVER_RPC_TIMEOUT_MS),
+            writer_half.write_all(&encoded_req),
+        )
+        .await;
+        if write_res.is_err() || writer_half.flush().await.is_err() {
+            return Ok(None);
+        }
+
+        let mut limited_reader = BufReader::new(reader_half.take(MAX_DRIVER_RPC_MESSAGE_BYTES));
+        let mut resp_line = String::new();
+        let read_res = tokio::time::timeout(
+            Duration::from_millis(DEFAULT_DRIVER_RPC_TIMEOUT_MS),
+            limited_reader.read_line(&mut resp_line),
+        )
+        .await;
+        let Ok(Ok(bytes_read)) = read_res else {
+            return Ok(None);
+        };
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        let response: DriverRpcResponse = serde_json::from_str(resp_line.trim())
+            .map_err(|err| map_json_error("driver_rpc_response", err))?;
+        if response.schema_version != COWORKER_DRIVER_RPC_SCHEMA_VERSION {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                format!(
+                    "unsupported coworker driver RPC response schema_version {}.",
+                    response.schema_version
+                ),
+            ));
+        }
+        if !constant_time_str_eq(&response.echoed_client_nonce, &client_nonce) {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "coworker driver RPC response client_nonce mismatch.",
+            ));
+        }
+        validate_prefixed_random_id(&response.server_nonce, "dsn", "server_nonce")?;
+        response.owner_summary.validate_for_key(key)?;
+        if !constant_time_str_eq(
+            &response.owner_summary.instance_id,
+            &lock_summary.instance_id,
+        ) || !constant_time_str_eq(
+            &response.owner_summary.challenge_digest,
+            &lock_summary.challenge_digest,
+        ) || response.owner_summary.lock_file_identity != lock_file_identity
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "coworker driver RPC response owner_summary does not match live physical lock.",
+            ));
+        }
+
+        if !is_cancel {
+            // Re-inspect the physical lock to confirm the same instance still holds the lock.
+            let post_lock = self.controller.ownership_store().inspect_job_lock(key)?;
+            match post_lock {
+                CoworkerJobLockState::HeldByActiveProcess {
+                    recorded_summary: Some(post_summary),
+                    lock_file_identity: post_identity,
+                    ..
+                } => {
+                    if !constant_time_str_eq(&post_summary.instance_id, &lock_summary.instance_id)
+                        || post_identity != lock_file_identity
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "coworker job ownership lock changed during RPC verification.",
+                        ));
+                    }
+                }
+                _ => {
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(Some(response))
+    }
+
+    fn inspect_scoped_job_readonly(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+    ) -> Result<ReadonlyScopedJobInspection, NativeError> {
+        let ledger = self
+            .controller
+            .workflow_store()
+            .read_binding_ledger(&key.binding_id)?;
+        if let Some(ref ledger_thread) = ledger.thread_uuid {
+            if ledger_thread != &key.thread_uuid {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "coworker workflow ledger thread_uuid does not match requested thread scope.",
+                ));
+            }
+        }
+        let job = ledger
+            .jobs
+            .into_iter()
+            .find(|item| item.job_id == key.job_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "coworker job '{}' was not found in binding '{}'.",
+                        key.job_id, key.binding_id
+                    ),
+                )
+            })?;
+        if job.binding_id != key.binding_id || job.thread_uuid != key.thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "coworker job scope does not match requested binding/thread.",
+            ));
+        }
+
+        let runtime_state = self
+            .controller
+            .policy_store()
+            .get_job_runtime_readonly(&key.binding_id, &key.job_id)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::NotConfigured,
+                    format!(
+                        "controller runtime state missing for job '{}' in binding '{}'.",
+                        key.job_id, key.binding_id
+                    ),
+                )
+            })?;
+        if runtime_state.envelope.binding_id != key.binding_id
+            || runtime_state.envelope.thread_uuid != key.thread_uuid
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "controller runtime state envelope scope does not match requested binding/thread.",
+            ));
+        }
+        runtime_state.envelope.verify_matches_job(&job)?;
+
+        let approval = self
+            .authority
+            .get_for_operator(&runtime_state.envelope.approval_id)
+            .map_err(map_authority_error)?;
+        if approval.binding_id != key.binding_id || approval.thread_uuid != key.thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "approval record scope does not match requested binding/thread.",
+            ));
+        }
+        if !constant_time_str_eq(
+            &approval.subject_digest,
+            &runtime_state.envelope.approval_subject_digest,
+        ) {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "approval subject_digest does not match frozen controller execution envelope.",
+            ));
+        }
+
+        Ok(ReadonlyScopedJobInspection {
+            job,
+            runtime_state,
+            approval,
+        })
+    }
+
+    fn can_skip_host_for_quiescent_job(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        admission: &VerifiedControllerAdmission,
+    ) -> Result<bool, NativeError> {
+        if !admission.runtime_state.unresolved_effects().is_empty()
+            || admission
+                .job
+                .outbox
+                .iter()
+                .any(|o| o.status.blocks_replay_and_new_dispatch())
+        {
+            return Ok(false);
+        }
+
+        let job_stopped = admission.runtime_state.stop_requested
+            || admission.job.phase == CoworkerJobPhase::Cancelled;
+
+        for task in &admission.job.tasks {
+            match task.stage {
+                CoworkerTaskStage::DispatchReserved
+                | CoworkerTaskStage::Running
+                | CoworkerTaskStage::EffectUnknown => return Ok(false),
+                CoworkerTaskStage::ReadyToDispatch => {
+                    if !job_stopped {
+                        return Ok(false);
+                    }
+                }
+                CoworkerTaskStage::ReadyForReview => {
+                    if task.current_attempt_no == 0
+                        || admission
+                            .runtime_state
+                            .get_attempt_artifacts(&task.task_id, task.current_attempt_no)
+                            .is_none()
+                    {
+                        return Ok(false);
+                    }
+                }
+                CoworkerTaskStage::PendingDependencies
+                | CoworkerTaskStage::ReviewReserved
+                | CoworkerTaskStage::UnderReview
+                | CoworkerTaskStage::CorrectInScopeRequired
+                | CoworkerTaskStage::Accepted
+                | CoworkerTaskStage::IntegrationReserved
+                | CoworkerTaskStage::Integrated
+                | CoworkerTaskStage::Held
+                | CoworkerTaskStage::Blocked
+                | CoworkerTaskStage::Failed
+                | CoworkerTaskStage::Cancelled => {}
+            }
+        }
+
+        if !admission
+            .runtime_state
+            .lease
+            .as_ref()
+            .is_some_and(|l| l.lease_epoch > 0)
+        {
+            return Ok(false);
+        }
+
+        let Some(driver_state) = self.read_driver_state_optional(key)? else {
+            return Ok(false);
+        };
+        if !driver_state.graceful_exit_completed {
+            return Ok(false);
+        }
+        let Some(expected_updated_at_ms) = driver_state.owner_quiescent_host_shutdown_updated_at_ms
+        else {
+            return Ok(false);
+        };
+
+        let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
+        let Some(manifest) = read_host_manifest_optional(&session_dir, &admission.approval)
+            .map_err(map_host_error)?
+        else {
+            return Ok(false);
+        };
+        let instance_matches = match (
+            &driver_state.owner_quiescent_host_instance_id,
+            &manifest.instance_id,
+        ) {
+            (Some(exp), Some(act)) => constant_time_str_eq(exp, act),
+            (None, None) => true,
+            _ => false,
+        };
+        Ok(manifest.phase == HostPhase::Stopped
+            && manifest.updated_at_ms == expected_updated_at_ms
+            && instance_matches)
+    }
+
+    async fn preflight_host_for_admission(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        admission: &VerifiedControllerAdmission,
+    ) -> Result<(), NativeError> {
+        if self.can_skip_host_for_quiescent_job(key, admission)? {
+            return Ok(());
+        }
+        let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
+        match fs::symlink_metadata(&session_dir) {
+            Ok(_) => {
+                let Some(manifest) = read_host_manifest_optional(&session_dir, &admission.approval)
+                    .map_err(map_host_error)?
+                else {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "uncertain host session directory '{}' has no valid host-manifest.json; \
+                             code driver refuses to auto-restart an uncertain host.",
+                            session_dir.display()
+                        ),
+                    ));
+                };
+                if manifest.phase != HostPhase::Ready {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "existing host session for approval '{}' is in phase {:?}; \
+                             code driver never automatically restarts a stopped or non-ready host.",
+                            admission.approval.approval_id, manifest.phase
+                        ),
+                    ));
+                }
+                if !is_host_lock_held(&session_dir).map_err(map_host_error)? {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "existing host session for approval '{}' is marked Ready but host.lock is \
+                             not held; code driver refuses to auto-restart an uncertain host.",
+                            admission.approval.approval_id
+                        ),
+                    ));
+                }
+                let client = ApprovedHostClient::new(
+                    Arc::clone(&self.authority),
+                    &self.sessions_dir,
+                    &key.binding_id,
+                    &key.thread_uuid,
+                )
+                .map_err(map_host_error)?;
+                let summary = client
+                    .session_summary(&admission.approval.approval_id)
+                    .map_err(map_host_error)?;
+                if summary.phase != HostPhase::Ready
+                    || !summary.gates.supervisor_authenticated_ready
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "host session for approval '{}' is not authenticated Ready.",
+                            admission.approval.approval_id
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if read_host_launch_intent_optional(&self.sessions_dir, &admission.approval)
+                    .map_err(map_host_error)?
+                    .is_some()
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "prior host launch intent exists for approval '{}' without an active \
+                             Ready session; code driver refuses to auto-restart an uncertain host.",
+                            admission.approval.approval_id
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            Err(err) => Err(map_io_error(
+                "failed to inspect host session directory",
+                err,
+            )),
+        }
+    }
+
+    async fn ensure_host_for_admission(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        admission: &VerifiedControllerAdmission,
+    ) -> Result<ActiveHostSession, NativeError> {
+        let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
+        match fs::symlink_metadata(&session_dir) {
+            Ok(_) => {
+                let Some(manifest) = read_host_manifest_optional(&session_dir, &admission.approval)
+                    .map_err(map_host_error)?
+                else {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "uncertain host session directory '{}' has no valid host-manifest.json; \
+                             code driver refuses to auto-restart an uncertain host.",
+                            session_dir.display()
+                        ),
+                    ));
+                };
+                if manifest.phase == HostPhase::Ready
+                    && is_host_lock_held(&session_dir).map_err(map_host_error)?
+                {
+                    let client = ApprovedHostClient::new(
+                        Arc::clone(&self.authority),
+                        &self.sessions_dir,
+                        &key.binding_id,
+                        &key.thread_uuid,
+                    )
+                    .map_err(map_host_error)?;
+                    let summary = client
+                        .session_summary(&admission.approval.approval_id)
+                        .map_err(map_host_error)?;
+                    if summary.phase == HostPhase::Ready
+                        && summary.gates.supervisor_authenticated_ready
+                    {
+                        return Ok(ActiveHostSession {
+                            mode: CoworkerDriverHostMode::ReusedVerifiedReadyHost,
+                            owned_handle: None,
+                        });
+                    }
+                }
+                if self.can_skip_host_for_quiescent_job(key, admission)? {
+                    return Ok(ActiveHostSession {
+                        mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
+                        owned_handle: None,
+                    });
+                }
+                Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "existing host session for approval '{}' is in phase {:?} (lock_held={}); \
+                         code driver never automatically restarts a stopped, failed, or uncertain host.",
+                        admission.approval.approval_id,
+                        manifest.phase,
+                        is_host_lock_held(&session_dir).unwrap_or(false)
+                    ),
+                ))
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if read_host_launch_intent_optional(&self.sessions_dir, &admission.approval)
+                    .map_err(map_host_error)?
+                    .is_some()
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "prior host launch intent exists for approval '{}' without a Ready \
+                             session; code driver refuses to auto-restart an uncertain host.",
+                            admission.approval.approval_id
+                        ),
+                    ));
+                }
+                if self.can_skip_host_for_quiescent_job(key, admission)? {
+                    return Ok(ActiveHostSession {
+                        mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
+                        owned_handle: None,
+                    });
+                }
+                let config = ApprovedHostConfig::new(
+                    &self.registry_dir,
+                    &self.plans_dir,
+                    &self.authority_dir,
+                    &self.sessions_dir,
+                    &admission.approval.approval_id,
+                );
+                let handle = ApprovedHost::start_fresh_only(config)
+                    .await
+                    .map_err(map_host_error)?;
+                Ok(ActiveHostSession {
+                    mode: CoworkerDriverHostMode::StartedFreshHost,
+                    owned_handle: Some(handle),
+                })
+            }
+            Err(err) => Err(map_io_error(
+                "failed to inspect host session directory",
+                err,
+            )),
+        }
+    }
+
+    async fn is_verified_ready_host_active(
+        &self,
+        approval: &ApprovalRecord,
+    ) -> Result<bool, NativeError> {
+        let session_dir = self.sessions_dir.join(&approval.approval_id);
+        match fs::symlink_metadata(&session_dir) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(map_io_error(
+                    "failed to inspect host session directory",
+                    err,
+                ))
+            }
+        }
+        let Some(manifest) =
+            read_host_manifest_optional(&session_dir, approval).map_err(map_host_error)?
+        else {
+            return Ok(false);
+        };
+        if manifest.phase != HostPhase::Ready || !manifest.gates.supervisor_authenticated_ready {
+            return Ok(false);
+        }
+        is_host_lock_held(&session_dir).map_err(map_host_error)
+    }
+
+    async fn cancel_active_original_host_tasks(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job: &CoworkerJobRecord,
+        approval_id: &str,
+        reason: &str,
+    ) -> Result<Vec<CancelledHostTaskSummary>, NativeError> {
+        let host_client = ApprovedHostClient::new(
+            Arc::clone(&self.authority),
+            &self.sessions_dir,
+            binding_id,
+            thread_uuid,
+        )
+        .map_err(map_host_error)?;
+        let mut cancelled = Vec::new();
+        for task in &job.tasks {
+            if let Ok(snapshot) = host_client.get_task(approval_id, &task.task_id).await {
+                if let Some(ref worker) = snapshot.worker {
+                    if matches!(
+                        worker.status,
+                        WorkerStatus::Queued
+                            | WorkerStatus::Claimed
+                            | WorkerStatus::Running
+                            | WorkerStatus::CancelRequested
+                    ) {
+                        let initial_updated = if matches!(
+                            worker.status,
+                            WorkerStatus::Queued | WorkerStatus::Claimed | WorkerStatus::Running
+                        ) {
+                            host_client
+                                .cancel_task(
+                                    approval_id,
+                                    &task.task_id,
+                                    worker.revision,
+                                    Some(reason.to_owned()),
+                                )
+                                .await
+                                .ok()
+                        } else {
+                            Some(snapshot.clone())
+                        };
+                        if let Some(mut latest) = initial_updated {
+                            let wait_deadline = Instant::now() + Duration::from_millis(3_000);
+                            while Instant::now() < wait_deadline {
+                                let still_in_flight =
+                                    latest.worker.as_ref().is_some_and(|polled_worker| {
+                                        matches!(
+                                            polled_worker.status,
+                                            WorkerStatus::Queued
+                                                | WorkerStatus::Claimed
+                                                | WorkerStatus::Running
+                                                | WorkerStatus::CancelRequested
+                                        )
+                                    });
+                                if !still_in_flight {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(15)).await;
+                                if let Ok(polled) =
+                                    host_client.get_task(approval_id, &task.task_id).await
+                                {
+                                    latest = polled;
+                                } else {
+                                    break;
+                                }
+                            }
+                            let (updated_state, updated_rev) = latest
+                                .worker
+                                .as_ref()
+                                .map_or((worker.status, worker.revision), |w| {
+                                    (w.status, w.revision)
+                                });
+                            cancelled.push(CancelledHostTaskSummary {
+                                task_id: task.task_id.clone(),
+                                run_id: latest.run_id.unwrap_or_else(|| worker.run_id.clone()),
+                                worker_state: updated_state,
+                                worker_revision: updated_rev,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok(cancelled)
+    }
+
+    fn build_live_owner_status_report(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        verified_owner_summary: &CoworkerOwnershipSummary,
+        host_mode: CoworkerDriverHostMode,
+        step_report: Option<CoworkerControllerStepReport>,
+    ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        let inspection = self.inspect_scoped_job_readonly(key)?;
+        let lease = inspection.runtime_state.lease.clone();
+        let lease_active = lease.as_ref().is_some_and(|l| l.active);
+        let lease_owner_instance_id = lease.as_ref().map(|l| l.instance_id.clone());
+
+        let session_dir = self.sessions_dir.join(&inspection.approval.approval_id);
+        let (host_phase, host_lock_held) =
+            self.inspect_host_phase_and_lock(&session_dir, &inspection.approval)?;
+
+        let (overall_status, tasks) = if let Some(report) = &step_report {
+            (report.status, report.tasks.clone())
+        } else {
+            self.synthesize_status_and_tasks(&inspection)?
+        };
+        let blocked_on_unknown = has_unresolved_or_unknown_effect(
+            &inspection.job,
+            &inspection.runtime_state,
+            overall_status,
+        );
+
+        Ok(CoworkerDriverStatusReport {
+            binding_id: key.binding_id.clone(),
+            thread_uuid: key.thread_uuid.clone(),
+            job_id: key.job_id.clone(),
+            approval_id: inspection.approval.approval_id,
+            owner_state: CoworkerDriverOwnerState::LiveVerifiedOwner,
+            verified_owner_summary: Some(verified_owner_summary.clone()),
+            lease,
+            lease_active,
+            lease_owner_instance_id,
+            host_phase,
+            host_lock_held,
+            host_mode,
+            job_phase: inspection.job.phase,
+            overall_status,
+            stop_requested: inspection.runtime_state.stop_requested,
+            blocked_on_unknown_effect: blocked_on_unknown,
+            stop_or_block_reason: inspection.runtime_state.stop_or_block_reason,
+            total_task_attempts_reserved: inspection.runtime_state.total_task_attempts_reserved,
+            max_total_task_attempts_per_job: inspection
+                .runtime_state
+                .envelope
+                .max_total_task_attempts_per_job,
+            tasks,
+            step_report,
+            pipeline_boundary:
+                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+            boundary_note: phase1_boundary_note(),
+        })
+    }
+
+    fn build_readonly_status_report(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        override_host_mode: Option<CoworkerDriverHostMode>,
+        override_step_report: Option<CoworkerControllerStepReport>,
+    ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        let inspection = self.inspect_scoped_job_readonly(key)?;
+        let lock_state = self.controller.ownership_store().inspect_job_lock(key)?;
+        let persisted_driver_state = self.read_driver_state_optional(key)?;
+        let lease = inspection.runtime_state.lease.clone();
+        let lease_active = lease.as_ref().is_some_and(|l| l.active);
+        let lease_owner_instance_id = lease.as_ref().map(|l| l.instance_id.clone());
+
+        let owner_state = match &lock_state {
+            CoworkerJobLockState::HeldByActiveProcess { .. } => {
+                CoworkerDriverOwnerState::LockHeldRpcUnavailable
+            }
+            CoworkerJobLockState::UnlockedStaleFile { .. } => {
+                CoworkerDriverOwnerState::StaleCrashArtifactDetected
+            }
+            CoworkerJobLockState::Absent => {
+                let stale_driver = persisted_driver_state
+                    .as_ref()
+                    .is_some_and(|s| s.owner_active || !s.graceful_exit_completed);
+                if stale_driver || lease_active {
+                    CoworkerDriverOwnerState::StaleCrashArtifactDetected
+                } else {
+                    CoworkerDriverOwnerState::NoActiveOwner
+                }
+            }
+        };
+
+        let session_dir = self.sessions_dir.join(&inspection.approval.approval_id);
+        let (host_phase, host_lock_held) =
+            self.inspect_host_phase_and_lock(&session_dir, &inspection.approval)?;
+
+        let step_report = override_step_report.or_else(|| {
+            if owner_state == CoworkerDriverOwnerState::NoActiveOwner {
+                persisted_driver_state
+                    .as_ref()
+                    .and_then(|s| s.last_step_report.clone())
+            } else {
+                None
+            }
+        });
+
+        let (overall_status, tasks) = self.synthesize_status_and_tasks(&inspection)?;
+        let blocked_on_unknown = has_unresolved_or_unknown_effect(
+            &inspection.job,
+            &inspection.runtime_state,
+            overall_status,
+        );
+        let host_mode = override_host_mode
+            .or_else(|| {
+                if owner_state == CoworkerDriverOwnerState::NoActiveOwner {
+                    persisted_driver_state.map(|s| s.host_mode)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(CoworkerDriverHostMode::NotRunningOrInspectedReadonly);
+
+        Ok(CoworkerDriverStatusReport {
+            binding_id: key.binding_id.clone(),
+            thread_uuid: key.thread_uuid.clone(),
+            job_id: key.job_id.clone(),
+            approval_id: inspection.approval.approval_id,
+            owner_state,
+            verified_owner_summary: None,
+            lease,
+            lease_active,
+            lease_owner_instance_id,
+            host_phase,
+            host_lock_held,
+            host_mode,
+            job_phase: inspection.job.phase,
+            overall_status,
+            stop_requested: inspection.runtime_state.stop_requested,
+            blocked_on_unknown_effect: blocked_on_unknown,
+            stop_or_block_reason: inspection.runtime_state.stop_or_block_reason,
+            total_task_attempts_reserved: inspection.runtime_state.total_task_attempts_reserved,
+            max_total_task_attempts_per_job: inspection
+                .runtime_state
+                .envelope
+                .max_total_task_attempts_per_job,
+            tasks,
+            step_report,
+            pipeline_boundary:
+                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+            boundary_note: phase1_boundary_note(),
+        })
+    }
+
+    fn inspect_host_phase_and_lock(
+        &self,
+        session_dir: &Path,
+        approval: &ApprovalRecord,
+    ) -> Result<(Option<HostPhase>, bool), NativeError> {
+        match fs::symlink_metadata(session_dir) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok((None, false)),
+            Err(err) => {
+                return Err(map_io_error(
+                    "failed to inspect host session directory",
+                    err,
+                ))
+            }
+        }
+        let manifest =
+            read_host_manifest_optional(session_dir, approval).map_err(map_host_error)?;
+        let lock_held = is_host_lock_held(session_dir).unwrap_or(false);
+        Ok((manifest.map(|m| m.phase), lock_held))
+    }
+
+    fn synthesize_status_and_tasks(
+        &self,
+        inspection: &ReadonlyScopedJobInspection,
+    ) -> Result<
+        (
+            CoworkerControllerPhase1Status,
+            Vec<CoworkerControllerTaskObservation>,
+        ),
+        NativeError,
+    > {
+        let session_dir = self.sessions_dir.join(&inspection.approval.approval_id);
+        let (intents, receipts) = match fs::symlink_metadata(&session_dir) {
+            Ok(_) => {
+                if let Some(manifest) =
+                    read_host_manifest_optional(&session_dir, &inspection.approval)
+                        .map_err(map_host_error)?
+                {
+                    if let Some(ref session_binding_id) = manifest.session_binding_id {
+                        read_session_task_ledger_readonly(
+                            &session_dir,
+                            &inspection.approval,
+                            session_binding_id,
+                        )
+                        .map_err(map_host_error)?
+                        .unwrap_or_default()
+                    } else {
+                        (Vec::new(), Vec::new())
+                    }
+                } else {
+                    (Vec::new(), Vec::new())
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => (Vec::new(), Vec::new()),
+            Err(err) => {
+                return Err(map_io_error(
+                    "failed to inspect host session directory",
+                    err,
+                ))
+            }
+        };
+
+        let mut observations = Vec::with_capacity(inspection.job.tasks.len());
+        let mut active_running_count = 0usize;
+        let mut fenced_task_ids = Vec::new();
+        let mut unknown_effect_task_ids = Vec::new();
+
+        for task in &inspection.job.tasks {
+            let approved_task = inspection
+                .approval
+                .tasks
+                .iter()
+                .find(|t| t.task_id == task.task_id);
+            let command_key = approved_task
+                .and_then(|t| t.command_key.clone())
+                .unwrap_or_default();
+
+            let artifact = if task.current_attempt_no >= 1 {
+                inspection
+                    .runtime_state
+                    .get_attempt_artifacts(&task.task_id, task.current_attempt_no)
+            } else {
+                None
+            };
+            let latest_attempt = task.attempts.last();
+            let receipt = receipts.iter().find(|r| r.task_id == task.task_id);
+            let intent = intents.iter().find(|i| i.task_id == task.task_id);
+
+            let run_id = artifact
+                .map(|a| a.run_id.clone())
+                .or_else(|| latest_attempt.and_then(|a| a.run_id.clone()))
+                .or_else(|| receipt.map(|r| r.run_id.clone()));
+            let worker_id = artifact
+                .map(|a| a.worker_id.clone())
+                .or_else(|| latest_attempt.and_then(|a| a.worker_id.clone()))
+                .or_else(|| receipt.map(|r| r.worker_id.clone()));
+            let task_worktree_id = artifact
+                .map(|a| a.task_worktree_id.clone())
+                .or_else(|| latest_attempt.and_then(|a| a.task_worktree_id.clone()));
+            let observed_model = artifact
+                .map(|a| a.observed_model.clone())
+                .or_else(|| latest_attempt.and_then(|a| a.observed_model.clone()));
+            let observed_effort = artifact
+                .and_then(|a| a.observed_effort.clone())
+                .or_else(|| latest_attempt.and_then(|a| a.observed_effort.clone()));
+
+            let fenced = task.stage == CoworkerTaskStage::Held
+                || !task.active_hold_ids.is_empty()
+                || inspection.job.phase == CoworkerJobPhase::Held;
+            if fenced {
+                fenced_task_ids.push(task.task_id.clone());
+            }
+
+            let host_status = match task.stage {
+                CoworkerTaskStage::PendingDependencies => {
+                    TaskExecutionStatus::DependencyInputsUnverified
+                }
+                CoworkerTaskStage::ReadyToDispatch => {
+                    if !task.depends_on.is_empty() {
+                        TaskExecutionStatus::DependencyInputsReady
+                    } else {
+                        TaskExecutionStatus::NotStarted
+                    }
+                }
+                CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running => {
+                    active_running_count += 1;
+                    TaskExecutionStatus::Running
+                }
+                CoworkerTaskStage::ReadyForReview
+                | CoworkerTaskStage::ReviewReserved
+                | CoworkerTaskStage::UnderReview
+                | CoworkerTaskStage::CorrectInScopeRequired
+                | CoworkerTaskStage::Accepted
+                | CoworkerTaskStage::IntegrationReserved
+                | CoworkerTaskStage::Integrated => TaskExecutionStatus::ReadyForReview,
+                CoworkerTaskStage::Held => {
+                    if run_id.is_some() {
+                        TaskExecutionStatus::ReadyForReview
+                    } else if !task.depends_on.is_empty() {
+                        TaskExecutionStatus::DependencyInputsUnverified
+                    } else {
+                        TaskExecutionStatus::NotStarted
+                    }
+                }
+                CoworkerTaskStage::EffectUnknown => {
+                    unknown_effect_task_ids.push(task.task_id.clone());
+                    TaskExecutionStatus::Unknown
+                }
+                CoworkerTaskStage::Failed | CoworkerTaskStage::Blocked => {
+                    if intent.is_some() && receipt.is_none() {
+                        unknown_effect_task_ids.push(task.task_id.clone());
+                        TaskExecutionStatus::Unknown
+                    } else {
+                        TaskExecutionStatus::Failed
+                    }
+                }
+                CoworkerTaskStage::Cancelled => TaskExecutionStatus::Cancelled,
+            };
+
+            observations.push(CoworkerControllerTaskObservation {
+                task_id: task.task_id.clone(),
+                stage: task.stage,
+                host_status,
+                command_key,
+                run_id,
+                worker_id,
+                task_worktree_id,
+                observed_model,
+                observed_effort,
+                fenced,
+            });
+        }
+
+        let overall = classify_readonly_phase1_status(
+            &inspection.job,
+            &inspection.runtime_state,
+            active_running_count,
+            &fenced_task_ids,
+            &unknown_effect_task_ids,
+        );
+
+        Ok((overall, observations))
+    }
+
+    fn write_driver_state(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        record: &CoworkerDriverStateRecord,
+    ) -> Result<(), NativeError> {
+        validate_driver_state_record(record, key)?;
+        prepare_private_dir(self.driver_dir(), "coworker_driver_dir")?;
+        let filename = state_file_name_for_key(key);
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|err| map_json_error("coworker_driver_state", err))?;
+        let _ = write_private_file_atomic(
+            self.driver_dir(),
+            &filename,
+            &bytes,
+            "coworker_driver_state",
+        )?;
+        Ok(())
+    }
+
+    fn resolve_flow_binary(&self) -> Result<PathBuf, NativeError> {
+        if let Some(override_path) = &self.flow_binary_override {
+            return Ok(override_path.clone());
+        }
+        if let Ok(current_exe) = std::env::current_exe() {
+            if current_exe
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|stem| stem == "threadlane-flow")
+            {
+                return Ok(current_exe);
+            }
+            if let Some(bin_from_env) = std::env::var_os("CARGO_BIN_EXE_threadlane-flow") {
+                let candidate = PathBuf::from(bin_from_env);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+            if let Some(parent) = current_exe.parent() {
+                let direct_sibling = parent.join("threadlane-flow");
+                if direct_sibling.is_file() {
+                    return Ok(direct_sibling);
+                }
+                if let Some(grandparent) = parent.parent() {
+                    let target_bin = grandparent.join("threadlane-flow");
+                    if target_bin.is_file() {
+                        return Ok(target_bin);
+                    }
+                }
+            }
+        }
+        Err(NativeError::new(
+            NativeErrorCode::NotConfigured,
+            "unable to locate same-package threadlane-flow binary for detached owner launch.",
+        ))
+    }
+}
+
+fn validate_driver_state_record(
+    record: &CoworkerDriverStateRecord,
+    expected_key: &CoworkerJobOwnershipKey,
+) -> Result<(), NativeError> {
+    if record.schema_version != COWORKER_DRIVER_STATE_SCHEMA_VERSION {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "unsupported coworker_driver_state schema_version {}.",
+                record.schema_version
+            ),
+        ));
+    }
+    if record.binding_id != expected_key.binding_id {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "coworker_driver_state.binding_id does not match expected binding scope.",
+        ));
+    }
+    if record.thread_uuid != expected_key.thread_uuid {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "coworker_driver_state.thread_uuid does not match expected thread scope.",
+        ));
+    }
+    if record.job_id != expected_key.job_id {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "coworker_driver_state.job_id does not match expected job scope.",
+        ));
+    }
+    validate_prefixed_random_id(
+        &record.owner_instance_id,
+        "cwo",
+        "coworker_driver_state.owner_instance_id",
+    )?;
+    Ok(())
+}
+
+fn key_digest_tag(key: &CoworkerJobOwnershipKey, hex_chars: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"threadlane-coworker-driver-v1\0");
+    hasher.update(key.binding_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key.thread_uuid.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(key.job_id.as_bytes());
+    let full = sha256_hex(&hasher.finalize());
+    full[..hex_chars.min(full.len())].to_owned()
+}
+
+fn state_file_name_for_key(key: &CoworkerJobOwnershipKey) -> String {
+    let tag = key_digest_tag(key, 32);
+    format!("coworker-driver-state-{tag}.json")
+}
+
+fn socket_file_name_for_key(key: &CoworkerJobOwnershipKey) -> String {
+    let short_tag = key_digest_tag(key, 20);
+    format!("drv-{short_tag}.sock")
+}
+
+fn bind_private_unix_listener(
+    driver_dir: &Path,
+    sock_file_name: &str,
+) -> Result<UnixListener, NativeError> {
+    prepare_private_dir(driver_dir, "coworker_driver_dir")?;
+    let canonical_path = driver_dir.join(sock_file_name);
+    remove_socket_if_present(&canonical_path)?;
+
+    let listener = if canonical_path.as_os_str().len() <= MAX_DIRECT_UNIX_SOCKET_PATH_LEN {
+        UnixListener::bind(&canonical_path)
+            .map_err(|err| map_io_error("failed to bind coworker driver Unix socket", err))?
+    } else {
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(driver_dir)
+            .map_err(|err| map_io_error("failed to open coworker driver directory FD", err))?;
+        let proc_fd_path = {
+            use std::os::unix::io::AsRawFd;
+            PathBuf::from(format!(
+                "/proc/self/fd/{}/{sock_file_name}",
+                dir_file.as_raw_fd()
+            ))
+        };
+        UnixListener::bind(&proc_fd_path)
+            .map_err(|err| map_io_error("failed to bind coworker driver Unix socket via fd", err))?
+    };
+
+    fs::set_permissions(&canonical_path, fs::Permissions::from_mode(0o600))
+        .map_err(|err| map_io_error("failed to set 0600 permissions on driver socket", err))?;
+    if !validate_existing_private_socket(&canonical_path)? {
+        let _ = remove_socket_if_present(&canonical_path);
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!(
+                "bound coworker driver socket '{}' failed private 0600 socket verification.",
+                canonical_path.display()
+            ),
+        ));
+    }
+    Ok(listener)
+}
+
+async fn connect_private_unix_socket(
+    driver_dir: &Path,
+    sock_file_name: &str,
+) -> Result<Option<UnixStream>, NativeError> {
+    prepare_private_dir(driver_dir, "coworker_driver_dir")?;
+    let canonical_path = driver_dir.join(sock_file_name);
+    if !validate_existing_private_socket(&canonical_path)? {
+        return Ok(None);
+    }
+
+    let connect_res = if canonical_path.as_os_str().len() <= MAX_DIRECT_UNIX_SOCKET_PATH_LEN {
+        tokio::time::timeout(
+            Duration::from_millis(DEFAULT_DRIVER_RPC_TIMEOUT_MS),
+            UnixStream::connect(&canonical_path),
+        )
+        .await
+    } else {
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(driver_dir)
+            .map_err(|err| map_io_error("failed to open coworker driver directory FD", err))?;
+        let proc_fd_path = {
+            use std::os::unix::io::AsRawFd;
+            PathBuf::from(format!(
+                "/proc/self/fd/{}/{sock_file_name}",
+                dir_file.as_raw_fd()
+            ))
+        };
+        tokio::time::timeout(
+            Duration::from_millis(DEFAULT_DRIVER_RPC_TIMEOUT_MS),
+            UnixStream::connect(&proc_fd_path),
+        )
+        .await
+    };
+
+    match connect_res {
+        Ok(Ok(stream)) => Ok(Some(stream)),
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                ErrorKind::NotFound
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::ConnectionReset
+                    | ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(None)
+        }
+        Ok(Err(err)) => Err(map_io_error(
+            "failed to connect to coworker driver Unix socket",
+            err,
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
+fn validate_existing_private_socket(path: &Path) -> Result<bool, NativeError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(map_io_error(
+                "failed to inspect coworker driver socket",
+                err,
+            ))
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!(
+                "coworker driver socket path '{}' is not a regular Unix domain socket.",
+                path.display()
+            ),
+        ));
+    }
+    let expected_uid = current_effective_uid();
+    if meta.uid() != expected_uid {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!(
+                "coworker driver socket '{}' uid {} does not match effective uid {expected_uid}.",
+                path.display(),
+                meta.uid()
+            ),
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    if mode != 0o600 {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!(
+                "coworker driver socket '{}' must have 0600 permissions, got {:04o}.",
+                path.display(),
+                mode
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn remove_socket_if_present(path: &Path) -> Result<(), NativeError> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    format!("refusing to unlink non-socket path '{}'.", path.display()),
+                ));
+            }
+            match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(map_io_error("failed to remove coworker driver socket", err)),
+            }
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(map_io_error(
+            "failed to inspect coworker driver socket",
+            err,
+        )),
+    }
+}
+
+fn report_has_active_work(report: &CoworkerControllerStepReport) -> bool {
+    if report.status == CoworkerControllerPhase1Status::RunningTasks
+        || report.active_running_count > 0
+    {
+        return true;
+    }
+    report.tasks.iter().any(|obs| {
+        matches!(
+            obs.host_status,
+            TaskExecutionStatus::Queued
+                | TaskExecutionStatus::Claimed
+                | TaskExecutionStatus::Running
+                | TaskExecutionStatus::CancelRequested
+        ) || matches!(
+            obs.stage,
+            CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+        )
+    })
+}
+
+const fn is_terminal_or_stopped_status(status: CoworkerControllerPhase1Status) -> bool {
+    matches!(
+        status,
+        CoworkerControllerPhase1Status::AllTasksIntegrated
+            | CoworkerControllerPhase1Status::BlockedOnUnknownEffect
+            | CoworkerControllerPhase1Status::Stopped
+            | CoworkerControllerPhase1Status::BlockedOrFailed
+    )
+}
+
+const fn is_pipeline_await_status(status: CoworkerControllerPhase1Status) -> bool {
+    matches!(
+        status,
+        CoworkerControllerPhase1Status::AwaitingChecksOrReview
+            | CoworkerControllerPhase1Status::AwaitingDependencyAcceptanceOrSeal
+            | CoworkerControllerPhase1Status::Held
+    )
+}
+
+fn is_terminal_or_stopped_job(
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    if runtime_state.stop_requested
+        || matches!(
+            job.phase,
+            CoworkerJobPhase::Completed | CoworkerJobPhase::Cancelled
+        )
+    {
+        return true;
+    }
+    !job.tasks.is_empty()
+        && job.tasks.iter().all(|t| {
+            matches!(
+                t.stage,
+                CoworkerTaskStage::Accepted | CoworkerTaskStage::Integrated
+            )
+        })
+}
+
+fn has_unresolved_or_unknown_effect(
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    overall_status: CoworkerControllerPhase1Status,
+) -> bool {
+    overall_status == CoworkerControllerPhase1Status::BlockedOnUnknownEffect
+        || !runtime_state.unresolved_effects().is_empty()
+        || job
+            .outbox
+            .iter()
+            .any(|o| o.status.blocks_replay_and_new_dispatch())
+        || job.tasks.iter().any(|t| {
+            t.stage == CoworkerTaskStage::EffectUnknown || t.unresolved_outbox_id.is_some()
+        })
+}
+
+fn classify_readonly_phase1_status(
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    active_running_count: usize,
+    fenced_task_ids: &[String],
+    unknown_effect_task_ids: &[String],
+) -> CoworkerControllerPhase1Status {
+    if runtime_state.stop_requested || job.phase == CoworkerJobPhase::Cancelled {
+        return CoworkerControllerPhase1Status::Stopped;
+    }
+    if !unknown_effect_task_ids.is_empty()
+        || runtime_state
+            .pending_effects
+            .values()
+            .any(|e| e.status == PendingControllerEffectStatus::EffectUnknown)
+    {
+        return CoworkerControllerPhase1Status::BlockedOnUnknownEffect;
+    }
+    if active_running_count > 0
+        || job.tasks.iter().any(|t| {
+            t.stage == CoworkerTaskStage::ReadyToDispatch && !fenced_task_ids.contains(&t.task_id)
+        })
+    {
+        return CoworkerControllerPhase1Status::RunningTasks;
+    }
+    if (!job.tasks.is_empty()
+        && job.tasks.iter().all(|t| {
+            matches!(
+                t.stage,
+                CoworkerTaskStage::Accepted | CoworkerTaskStage::Integrated
+            )
+        }))
+        || job.phase == CoworkerJobPhase::Completed
+    {
+        return CoworkerControllerPhase1Status::AllTasksIntegrated;
+    }
+    if job.tasks.iter().any(|t| {
+        matches!(
+            t.stage,
+            CoworkerTaskStage::Failed | CoworkerTaskStage::Cancelled | CoworkerTaskStage::Blocked
+        )
+    }) && fenced_task_ids.is_empty()
+    {
+        return CoworkerControllerPhase1Status::BlockedOrFailed;
+    }
+    if !fenced_task_ids.is_empty()
+        || job.holds.iter().any(|h| h.active)
+        || job.phase == CoworkerJobPhase::Held
+    {
+        if job.tasks.iter().any(|t| {
+            !fenced_task_ids.contains(&t.task_id) && t.stage == CoworkerTaskStage::ReadyForReview
+        }) {
+            return CoworkerControllerPhase1Status::AwaitingChecksOrReview;
+        }
+        return CoworkerControllerPhase1Status::Held;
+    }
+    if job
+        .tasks
+        .iter()
+        .any(|t| t.stage == CoworkerTaskStage::ReadyForReview)
+    {
+        return CoworkerControllerPhase1Status::AwaitingChecksOrReview;
+    }
+    if job
+        .tasks
+        .iter()
+        .any(|t| t.stage == CoworkerTaskStage::PendingDependencies)
+    {
+        return CoworkerControllerPhase1Status::AwaitingDependencyAcceptanceOrSeal;
+    }
+    CoworkerControllerPhase1Status::AwaitingChecksOrReview
+}
+
+#[cfg(unix)]
+fn current_effective_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(not(unix))]
+fn current_effective_uid() -> u32 {
+    0
+}
+
+fn validate_prefixed_random_id(
+    raw: &str,
+    expected_prefix: &str,
+    field: &'static str,
+) -> Result<(), NativeError> {
+    let clean_prefix = expected_prefix.trim_end_matches('_');
+    let Some(rest) = raw.strip_prefix(clean_prefix) else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("{field} must begin with `{clean_prefix}_`."),
+        ));
+    };
+    let Some(hex_part) = rest.strip_prefix('_') else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("{field} must begin with `{clean_prefix}_`."),
+        ));
+    };
+    validate_sha256_hex_digest(hex_part, field)
+        .map(|_| ())
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "{field} must consist of `{clean_prefix}_` followed by 64 lowercase hex characters."
+                ),
+            )
+        })
+}
+
+fn map_host_error(err: HostError) -> NativeError {
+    let code = match &err {
+        HostError::ScopeMismatch { .. } | HostError::SecurityViolation { .. } => {
+            NativeErrorCode::SecurityViolation
+        }
+        HostError::NativeRouteRequired { .. } => NativeErrorCode::UnsupportedCapability,
+        HostError::MutationOutcomeUncertain { .. } | HostError::StopOutcomeUncertain { .. } => {
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation
+        }
+        _ => NativeErrorCode::ValidationFailed,
+    };
+    NativeError::new(code, sanitize_message(&err.to_string()))
+}
+
+fn map_authority_error(err: AuthorityError) -> NativeError {
+    let code = match &err {
+        AuthorityError::SecurityViolation { .. }
+        | AuthorityError::BindingMismatch { .. }
+        | AuthorityError::ThreadUuidMismatch { .. } => NativeErrorCode::SecurityViolation,
+        AuthorityError::Io { .. } => NativeErrorCode::IoError,
+        _ => NativeErrorCode::ValidationFailed,
+    };
+    NativeError::new(code, sanitize_message(&err.to_string()))
+}
+
+fn map_io_error(context: &str, err: std::io::Error) -> NativeError {
+    let code = match err.kind() {
+        ErrorKind::PermissionDenied => NativeErrorCode::SecurityViolation,
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => NativeErrorCode::TimedOut,
+        _ => NativeErrorCode::IoError,
+    };
+    NativeError::new(code, format!("{context}: {}", err.kind()))
+}
+
+fn map_json_error(context: &str, _err: serde_json::Error) -> NativeError {
+    NativeError::new(
+        NativeErrorCode::ProtocolError,
+        format!("{context}: malformed JSON payload."),
+    )
+}
+
+fn sanitize_message(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(256)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "coworker driver operation failed.".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+fn phase1_boundary_note() -> String {
+    "Phase 1 code controller dispatches initial task attempts and reconciles host receipts to \
+     AwaitingChecksOrReview; automated checks, reviewer/architect cycles, task/job closure, and \
+     running derived-attempt cancellation are wired in subsequent milestones."
+        .to_owned()
+}
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
