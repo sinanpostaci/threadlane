@@ -8,14 +8,15 @@ use threadlane_native::coworker_workflow::{
     sha256_hex, ArchitectContextDependencies, CanonicalProjectBaseRef, CoworkerJobOwnershipKey,
     CoworkerJobOwnershipStore, CoworkerPlanningService, CoworkerWorkflowStore,
     CreateCoworkerJobRequest, CreatePlanningGrantRequest, OrchestrateWorkBriefPlanRequest,
-    PlanningCallBudget, PlanningGrantStatus, PlanningReadOnlyCapabilities,
-    RevokePlanningGrantRequest, RunArchitectAdviceRequest, WorkBrief, WorkBriefKind,
+    PersistedPlanningCallArtifact, PlanningCallBudget, PlanningGrantStatus,
+    PlanningReadOnlyCapabilities, RevokePlanningGrantRequest, RunArchitectAdviceRequest, WorkBrief,
+    WorkBriefKind,
 };
 use threadlane_native::{
-    current_wall_clock_ms, Difficulty, EnqueuePlanningCommandRequest, ExecutionPolicy,
-    NativeErrorCode, PlanningCommandPayload, PlanningCommandResultRef, PlanningCommandStatus,
-    PlanningCommandStore, PolicyAllowRule, RegistryStore, ToolAdapter, WorkflowProfile,
-    WorkflowRole,
+    current_wall_clock_ms, open_workflow_stores, Difficulty, EnqueuePlanningCommandRequest,
+    ExecutionPolicy, NativeErrorCode, PlanStatus, PlanningCommandDriver, PlanningCommandPayload,
+    PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore, PolicyAllowRule,
+    RegistryStore, ScopedWorkflow, ToolAdapter, WorkflowProfile, WorkflowRole,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
@@ -1087,4 +1088,402 @@ async fn record_completed_verifies_real_service_artifact_and_rejects_other_quest
         .as_ref()
         .expect("result_ref")
         .is_artifact_verified());
+}
+
+fn write_orchestrator_plan_stub(path: &Path) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create stub parent");
+    }
+    let script = r#"#!/bin/sh
+set -eu
+printf '{"event":"init","init":{"session_id":"agy-orch-cmd-sess-1","model":"gemini-4-argon-high"}}\n'
+RESPONSE_JSON='{\"outcome\":\"plan\",\"schema_version\":1,\"summary\":\"Implement planning command runner slice\",\"tasks\":[{\"task_id\":\"task_runner_core\",\"title\":\"Implement planning command driver\",\"description\":\"Execute one queued command under live ownership guard.\",\"role\":\"coder\",\"difficulty\":\"hard\",\"depends_on\":[],\"allowed_write_paths\":[\"src/lib.rs\"],\"owned_interfaces\":[\"iface_planning_driver\"],\"consumed_interfaces\":[]}],\"check_suggestions\":[{\"check_id\":\"cargo_test_planning_commands\",\"command_summary\":\"cargo test -p threadlane-native --test planning_commands\",\"required\":true}],\"unconfirmed_proposal_notes\":[],\"resolved_open_questions\":[],\"deferred_proposals\":[]}'
+printf '{"event":"result","result":{"status":"SUCCESS","response":"%s"}}\n' "$RESPONSE_JSON"
+exit 0
+"#;
+    let tmp_path = path.with_extension("tmp");
+    let mut file = fs::File::create(&tmp_path).expect("create orchestrator stub");
+    file.write_all(script.as_bytes())
+        .expect("write orchestrator stub");
+    file.sync_all().expect("sync orchestrator stub");
+    drop(file);
+    fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o755))
+        .expect("chmod 0755 orchestrator stub");
+    fs::rename(&tmp_path, path).expect("replace orchestrator stub atomically");
+}
+
+#[tokio::test]
+async fn driver_executes_queued_architect_command_and_reopen_reexecution_reuses_completed_without_second_call(
+) {
+    let fixture = setup_fixture();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let grant_id = create_grant_in_fixture(
+        &fixture,
+        BINDING_A,
+        THREAD_UUID_A,
+        "req-grant-driver-arch-1",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+    let (_job_id, brief_digest) =
+        create_job_in_fixture(&fixture, BINDING_A, THREAD_UUID_A, "req-job-driver-arch-1");
+
+    let artifacts_dir = fixture._tmp.path().join("planning-artifacts");
+    let service = CoworkerPlanningService::new(
+        fixture.workflow_store.clone(),
+        fixture.registry_dir.clone(),
+        artifacts_dir,
+    )
+    .expect("create planning service");
+    let store_with_artifacts = fixture
+        .command_store
+        .clone()
+        .with_artifacts_dir(service.artifacts_dir())
+        .expect("with_artifacts_dir");
+    let driver = PlanningCommandDriver::new(store_with_artifacts.clone(), service.clone())
+        .expect("create PlanningCommandDriver");
+
+    let arch_cmd = store_with_artifacts
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+            sample_architect_request(
+                &fixture,
+                BINDING_A,
+                THREAD_UUID_A,
+                &grant_id,
+                "cmd-driver-arch-1",
+                &brief_digest,
+                "How should PlanningCommandDriver execute one queued Architect command?",
+            ),
+        ))
+        .expect("enqueue Architect command");
+    assert_eq!(arch_cmd.status, PlanningCommandStatus::Queued);
+
+    let outcome_1 = driver
+        .execute_command(BINDING_A, THREAD_UUID_A, &arch_cmd.command_id)
+        .await
+        .expect("execute queued Architect command");
+    assert!(!outcome_1.was_already_completed);
+    assert!(!outcome_1.reconciled_from_existing);
+    assert_eq!(outcome_1.command.status, PlanningCommandStatus::Completed);
+    assert!(!outcome_1.command.pending_reconciliation);
+
+    let (advice_id, reservation_id, report_artifact_id, context_digest, decision_digest) =
+        match outcome_1.command.result_ref.as_ref().expect("result_ref") {
+            PlanningCommandResultRef::ArchitectAdvice {
+                advice_id,
+                reservation_id,
+                report_artifact_id,
+                context_digest,
+                decision_digest,
+                reused_existing,
+                artifact_verified,
+            } => {
+                assert!(!reused_existing);
+                assert!(artifact_verified);
+                (
+                    advice_id.clone(),
+                    reservation_id.clone(),
+                    report_artifact_id.clone(),
+                    context_digest.clone(),
+                    decision_digest.clone(),
+                )
+            }
+            other => panic!("expected ArchitectAdvice result_ref, got {other:?}"),
+        };
+
+    let wf_ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read workflow ledger");
+    assert_eq!(wf_ledger.architect_advice.len(), 1);
+    let stored_adv = &wf_ledger.architect_advice[0];
+    assert_eq!(stored_adv.advice_id, advice_id);
+    assert_eq!(stored_adv.reservation_id, reservation_id);
+    assert_eq!(
+        stored_adv.report_artifact_id.as_deref(),
+        Some(report_artifact_id.as_str())
+    );
+    assert_eq!(stored_adv.request_key, arch_cmd.service_request_key);
+    assert_eq!(stored_adv.context_digest, context_digest);
+    assert_eq!(stored_adv.decision_digest, decision_digest);
+
+    let grant = wf_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant in ledger");
+    assert_eq!(grant.usage.reserved_total_calls, 1);
+    assert_eq!(grant.usage.reserved_architect_calls, 1);
+    assert_eq!(grant.reservations.len(), 1);
+    assert_eq!(grant.reservations[0].reservation_id, reservation_id);
+    assert_eq!(
+        grant.reservations[0].request_key,
+        arch_cmd.service_request_key
+    );
+
+    let artifact_path = service
+        .artifacts_dir()
+        .join(format!("{report_artifact_id}.json"));
+    let artifact_bytes = fs::read(&artifact_path).expect("read persisted private artifact");
+    let artifact: PersistedPlanningCallArtifact =
+        serde_json::from_slice(&artifact_bytes).expect("parse PersistedPlanningCallArtifact");
+    artifact
+        .validate_against_grant(&report_artifact_id, grant)
+        .expect("validate persisted artifact against grant");
+    assert_eq!(artifact.reservation_id, reservation_id);
+    assert_eq!(artifact.request_key, arch_cmd.service_request_key);
+
+    // Reopen store and driver, then repeat the same command: must return Completed with no second call.
+    let reopened_store = PlanningCommandStore::open_existing(
+        &fixture.commands_dir,
+        fixture.workflow_store.clone(),
+        &fixture.registry_dir,
+    )
+    .expect("reopen PlanningCommandStore")
+    .with_artifacts_dir(service.artifacts_dir())
+    .expect("with_artifacts_dir on reopened store");
+    let reopened_driver = PlanningCommandDriver::new(reopened_store, service)
+        .expect("create reopened PlanningCommandDriver");
+
+    let outcome_2 = reopened_driver
+        .execute_command(BINDING_A, THREAD_UUID_A, &arch_cmd.command_id)
+        .await
+        .expect("re-execute Completed Architect command");
+    assert!(outcome_2.was_already_completed);
+    assert!(!outcome_2.reconciled_from_existing);
+    assert_eq!(outcome_2.command.result_ref, outcome_1.command.result_ref);
+
+    let wf_ledger_after = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read workflow ledger after re-execution");
+    let grant_after = wf_ledger_after
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after re-execution");
+    assert_eq!(grant_after.usage.reserved_total_calls, 1);
+    assert_eq!(grant_after.usage.reserved_architect_calls, 1);
+    assert_eq!(grant_after.reservations.len(), 1);
+    assert_eq!(wf_ledger_after.architect_advice.len(), 1);
+}
+
+#[tokio::test]
+async fn driver_executes_queued_orchestrator_command_publishing_plan_dag_and_reexecution_is_idempotent(
+) {
+    let fixture = setup_fixture();
+    let root = fs::canonicalize(fixture._tmp.path()).expect("canonicalize temp root");
+    write_orchestrator_plan_stub(&root.join("bin/fake-agy"));
+
+    let registry = RegistryStore::open(&fixture.registry_dir).expect("open registry");
+    registry
+        .apply(
+            3,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-coworker".to_string(),
+                    name: "Coworker Headless Profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Orchestrator,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Architect,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("upsert profile-coworker with Coder role assignment at revision 4");
+
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let grant_id = fixture
+        .workflow_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-grant-driver-orch-1".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: "profile-coworker".to_string(),
+            registry_revision: 4,
+            policy: default_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: default_budget(),
+            created_at_ms: now_ms.saturating_sub(5_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create planning grant at registry_revision 4")
+        .grant_id;
+    let (job_id, brief_digest) =
+        create_job_in_fixture(&fixture, BINDING_A, THREAD_UUID_A, "req-job-driver-orch-1");
+
+    let artifacts_dir = fixture._tmp.path().join("planning-artifacts-orch");
+    let service = CoworkerPlanningService::new(
+        fixture.workflow_store.clone(),
+        fixture.registry_dir.clone(),
+        artifacts_dir,
+    )
+    .expect("create planning service");
+    let store_with_artifacts = fixture
+        .command_store
+        .clone()
+        .with_artifacts_dir(service.artifacts_dir())
+        .expect("with_artifacts_dir");
+    let driver = PlanningCommandDriver::new(store_with_artifacts.clone(), service.clone())
+        .expect("create PlanningCommandDriver");
+
+    let orch_cmd = store_with_artifacts
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestrateWorkBriefPlanRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant_id.clone(),
+                job_id: job_id.clone(),
+                request_key: "cmd-driver-orch-1".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                architect_difficulty: None,
+                current_time_ms: now_ms,
+            },
+        ))
+        .expect("enqueue Orchestrator command");
+    assert_eq!(orch_cmd.status, PlanningCommandStatus::Queued);
+
+    let outcome_1 = driver
+        .execute_command(BINDING_A, THREAD_UUID_A, &orch_cmd.command_id)
+        .await
+        .expect("execute queued Orchestrator command");
+    assert!(!outcome_1.was_already_completed);
+    assert!(!outcome_1.reconciled_from_existing);
+    assert!(outcome_1.orchestrator_outcome.is_some());
+    assert_eq!(outcome_1.command.status, PlanningCommandStatus::Completed);
+
+    let planning_result = match outcome_1.command.result_ref.as_ref().expect("result_ref") {
+        PlanningCommandResultRef::OrchestratorPlan {
+            job_id: ref_job_id,
+            planning_result,
+            artifact_verified,
+        } => {
+            assert_eq!(ref_job_id, &job_id);
+            assert!(artifact_verified);
+            planning_result.as_ref().clone()
+        }
+        other => panic!("expected OrchestratorPlan result_ref, got {other:?}"),
+    };
+    assert_eq!(planning_result.grant_id, grant_id);
+    assert_eq!(planning_result.request_key, orch_cmd.service_request_key);
+    assert_eq!(planning_result.work_brief_digest, brief_digest);
+    assert_eq!(planning_result.project_base, fixture.project_base);
+    assert_eq!(planning_result.profile_id, "profile-coworker");
+    assert_eq!(planning_result.registry_revision, 4);
+    assert_eq!(planning_result.plan_revision, 1);
+    assert_eq!(planning_result.plan_status, PlanStatus::Published);
+
+    let wf_ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read workflow ledger");
+    let stored_job = wf_ledger
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job_id)
+        .expect("job in ledger");
+    assert_eq!(stored_job.planning_result.as_ref(), Some(&planning_result));
+    let grant = wf_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant in ledger");
+    assert_eq!(grant.usage.reserved_total_calls, 1);
+    assert_eq!(grant.usage.reserved_orchestrator_calls, 1);
+    assert_eq!(grant.reservations.len(), 1);
+
+    let (reg_arc, plans_arc) = open_workflow_stores(
+        Some(&fixture.registry_dir),
+        Some(fixture.workflow_store.plans_dir()),
+    )
+    .expect("open workflow stores")
+    .expect("workflow stores configured");
+    let scoped =
+        ScopedWorkflow::new(reg_arc, plans_arc, BINDING_A.to_string()).expect("ScopedWorkflow");
+    let plan_page = scoped
+        .get_plan(
+            &planning_result.plan_id,
+            Some(planning_result.plan_revision),
+            None,
+            None,
+        )
+        .expect("get published plan from PlanStore");
+    assert_eq!(plan_page.header.plan_id, planning_result.plan_id);
+    assert_eq!(plan_page.header.binding_id, BINDING_A);
+    assert_eq!(plan_page.header.revision, 1);
+    assert_eq!(plan_page.header.status, PlanStatus::Published);
+    assert_eq!(
+        plan_page.header.plan_digest.as_deref(),
+        Some(planning_result.plan_digest.as_str())
+    );
+    assert_eq!(plan_page.tasks.len(), 1);
+    assert_eq!(plan_page.tasks[0].id, "task_runner_core");
+    assert_eq!(plan_page.tasks[0].role, WorkflowRole::Coder);
+    assert_eq!(plan_page.tasks[0].difficulty, Difficulty::Hard);
+    assert_eq!(
+        plan_page.tasks[0].allowed_write_paths,
+        vec!["src/lib.rs".to_string()]
+    );
+
+    // Re-executing the completed Orchestrator command must not invoke another call or create revision 2.
+    let outcome_2 = driver
+        .execute_command(BINDING_A, THREAD_UUID_A, &orch_cmd.command_id)
+        .await
+        .expect("re-execute Completed Orchestrator command");
+    assert!(outcome_2.was_already_completed);
+    assert!(!outcome_2.reconciled_from_existing);
+    assert!(outcome_2.orchestrator_outcome.is_none());
+    assert_eq!(outcome_2.command.result_ref, outcome_1.command.result_ref);
+
+    let wf_ledger_after = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read workflow ledger after re-execution");
+    let grant_after = wf_ledger_after
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after re-execution");
+    assert_eq!(grant_after.usage.reserved_total_calls, 1);
+    assert_eq!(grant_after.usage.reserved_orchestrator_calls, 1);
+    assert_eq!(grant_after.reservations.len(), 1);
+
+    let latest_page = scoped
+        .get_plan(&planning_result.plan_id, None, None, None)
+        .expect("get latest plan revision");
+    assert_eq!(latest_page.header.revision, 1);
 }

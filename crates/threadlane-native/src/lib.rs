@@ -56,6 +56,8 @@ pub mod operator_cli;
 pub mod pairing;
 /// Durable per-binding planning command ledger, live ownership guard transitions, and read-only status queries.
 pub mod planning_commands;
+/// Single-command execution runner for durable planning commands (`Milestone 10`).
+pub mod planning_driver;
 /// Pure profile selection, role/difficulty preflight, and deny-by-default execution policy admission core.
 pub mod profile_flow;
 /// Durable profile-driven role handoffs and package closure reservations.
@@ -162,6 +164,9 @@ pub use planning_commands::{
     PlanningCommandStore, MAX_PLANNING_COMMANDS_PER_BINDING, MAX_PLANNING_COMMAND_LEDGER_BYTES,
     MAX_PLANNING_COMMAND_PAYLOAD_BYTES, PLANNING_COMMAND_ID_DOMAIN,
     PLANNING_COMMAND_SCHEMA_VERSION, PLANNING_COMMAND_SERVICE_KEY_DOMAIN,
+};
+pub use planning_driver::{
+    execute_planning_command, PlanningCommandDriver, PlanningCommandExecutionOutcome,
 };
 pub use profile_flow::{
     preflight, preflight_from_store, resolve_choice, ExecutionPolicy, PolicyAllowRule,

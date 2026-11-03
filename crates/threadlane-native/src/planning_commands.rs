@@ -899,6 +899,11 @@ impl PlanningCommandStore {
         &self.ownership_store
     }
 
+    /// Returns the configured private (`0700`) planning `artifacts_dir` path, if any.
+    pub fn artifacts_dir(&self) -> Option<&Path> {
+        self.artifacts_dir.as_deref()
+    }
+
     /// Returns the deterministic per-binding JSON state file path (`planning-commands-<tag>.json`).
     pub fn ledger_path_for_binding(&self, binding_id: &str) -> Result<PathBuf, NativeError> {
         validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
@@ -1575,6 +1580,137 @@ impl PlanningCommandStore {
                 cmd_mut.result_ref = None;
                 cmd_mut.diagnostic = Some(diagnostic.to_string());
                 cmd_mut.updated_at_ms = now_ms;
+                cmd_mut.validate()?;
+
+                Ok(CommandLedgerTxOutcome::Mutated(cmd_mut.clone()))
+            })?;
+
+        Ok(updated)
+    }
+
+    /// Re-verifies an already-`Completed` [`PlanningCommandRecord`] against the durable workflow
+    /// store and persisted planning report artifact on disk without mutating state.
+    pub fn verify_completed_command(
+        &self,
+        cmd: &PlanningCommandRecord,
+    ) -> Result<PlanningCommandResultRef, NativeError> {
+        cmd.validate()?;
+        if cmd.status != PlanningCommandStatus::Completed {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "planning command `{}` is not Completed (actual `{:?}`)",
+                    cmd.command_id, cmd.status
+                ),
+            ));
+        }
+        let result_ref = cmd.result_ref.clone().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Completed planning command is missing result_ref",
+            )
+        })?;
+        self.verify_completed_result_against_stores(cmd, result_ref)
+    }
+
+    /// Reconciles an `Unknown` (`pending_reconciliation = true`) command to `Completed` under a
+    /// live [`CoworkerJobOwnershipGuard`] when a complete, store- and artifact-verified service
+    /// outcome produced for this command already exists on disk without executing a new model call.
+    pub fn reconcile_unknown_completed(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        binding_id: &str,
+        thread_uuid: &str,
+        command_id: &str,
+        result_ref: PlanningCommandResultRef,
+        expected_revision: Option<u64>,
+    ) -> Result<PlanningCommandRecord, NativeError> {
+        let expected_key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, command_id)?;
+        let active_summary = self
+            .ownership_store
+            .verify_live_guard(guard, &expected_key)?;
+        result_ref.validate()?;
+        if matches!(
+            result_ref,
+            PlanningCommandResultRef::ArchitectAdvice {
+                reused_existing: true,
+                ..
+            }
+        ) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Unknown planning command reconciliation requires an exact reservation and artifact produced for this command's service_request_key",
+            ));
+        }
+        let now_ms = current_wall_clock_ms()?;
+
+        let (_, updated) =
+            self.transact_binding_ledger(binding_id, expected_revision, |ledger| {
+                let abandoned_mutated = self.promote_abandoned_running_in_ledger(ledger, now_ms)?;
+                ensure_ledger_thread(ledger, thread_uuid)?;
+
+                let cmd_idx = ledger
+                    .commands
+                    .iter()
+                    .position(|c| c.command_id == command_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            format!("planning command `{command_id}` was not found in binding"),
+                        )
+                    })?;
+
+                let cmd = &ledger.commands[cmd_idx];
+                cmd.validate()?;
+                if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "planning command scope does not match reconcile_unknown_completed arguments",
+                    ));
+                }
+                if cmd.status != PlanningCommandStatus::Unknown || !cmd.pending_reconciliation {
+                    let err = NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "planning command `{command_id}` must be Unknown pending reconciliation to reconcile (actual `{:?}`)",
+                            cmd.status
+                        ),
+                    );
+                    return if abandoned_mutated {
+                        Ok(CommandLedgerTxOutcome::MutatedThenErr(err))
+                    } else {
+                        Err(err)
+                    };
+                }
+                if let Err(err) = guard.validate_summary_before_effect(&expected_key, active_summary)
+                {
+                    return if abandoned_mutated {
+                        Ok(CommandLedgerTxOutcome::MutatedThenErr(err))
+                    } else {
+                        Err(err)
+                    };
+                }
+
+                let verified_ref = match self.verify_completed_result_against_stores(cmd, result_ref)
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return if abandoned_mutated {
+                            Ok(CommandLedgerTxOutcome::MutatedThenErr(err))
+                        } else {
+                            Err(err)
+                        };
+                    }
+                };
+
+                let cmd_mut = &mut ledger.commands[cmd_idx];
+                cmd_mut.status = PlanningCommandStatus::Completed;
+                cmd_mut.pending_reconciliation = false;
+                cmd_mut.owner_summary = Some(active_summary.clone());
+                cmd_mut.result_ref = Some(verified_ref);
+                cmd_mut.diagnostic = None;
+                cmd_mut.updated_at_ms = now_ms;
+                cmd_mut.completed_at_ms = Some(now_ms);
                 cmd_mut.validate()?;
 
                 Ok(CommandLedgerTxOutcome::Mutated(cmd_mut.clone()))
