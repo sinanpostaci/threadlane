@@ -38,6 +38,8 @@ pub mod conversation_change;
 pub mod coworker_driver;
 /// Trusted-local standing read-only planning/advice grant preparation, recording, and revocation helpers.
 pub mod coworker_grants;
+/// Coworker notice scheduling and delivery helpers for the native workflow runtime.
+pub mod coworker_notice;
 /// Call-bound Activity journal observation helpers for the native Coworker workflow runtime.
 pub mod coworker_observation;
 /// Shared durable contracts and per-binding ledger store for the end-to-end Coworker workflow.
