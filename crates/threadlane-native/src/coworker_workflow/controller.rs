@@ -2750,6 +2750,31 @@ pub(crate) fn is_task_fenced_by_hold_or_sibling(
     }
 }
 
+pub(crate) fn verify_task_fenced_for_advancement(
+    candidate_task: &CoworkerTaskRecord,
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    approval_id: &str,
+    plans_dir: &Path,
+) -> Result<(), NativeError> {
+    if is_task_fenced_by_hold_or_sibling(
+        candidate_task,
+        job,
+        runtime_state,
+        approval_id,
+        plans_dir,
+    )? {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "task `{}` is fenced by stop_requested, active hold, unresolved conversation change, or non-independent impacted sibling",
+                candidate_task.task_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn verify_predecessors_accepted_and_sealed(
     approval: &ApprovalRecord,
     approved_task: &ApprovedTaskRecord,

@@ -13,26 +13,30 @@ use threadlane_host::{
     HostPhase, PrepareDependencyInputsRequest, TaskExecutionStatus,
 };
 use threadlane_native::coworker_workflow::{
-    compute_task_integration_subject_digest, deterministic_prefixed_id,
+    compute_task_integration_subject_digest, compute_task_review_effect_id,
+    compute_task_review_request_key, deterministic_prefixed_id,
     deterministic_task_integration_receipt_id, deterministic_task_integration_request_key,
-    integrate_accepted_task, read_persisted_check_report, sha256_hex, ApplyWorkflowHoldRequest,
-    BindJobApprovalRequest, CanonicalProjectBaseRef, ControllerConfigurationPreview,
-    ControllerJobRuntimeState, ControllerPolicyStore, ControllerRoleExecutionBudget,
-    CoworkerControllerPhase1Status, CoworkerControllerService, CoworkerControllerStepRequest,
-    CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
-    CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService, CoworkerTaskIntegrationRequest,
-    CoworkerTaskIntegrationService, CoworkerTaskIntegrationStatus, CoworkerTaskStage,
-    CoworkerTaskVerificationOutcome, CoworkerTaskVerificationRequest,
+    integrate_accepted_task, read_persisted_check_report, read_persisted_task_review_report,
+    sha256_hex, ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
+    ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
+    ControllerRoleExecutionBudget, CoworkerControllerPhase1Status, CoworkerControllerService,
+    CoworkerControllerStepRequest, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
+    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
+    CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService, CoworkerTaskIntegrationStatus,
+    CoworkerTaskReviewStageRequest, CoworkerTaskReviewStageService, CoworkerTaskReviewStageStatus,
+    CoworkerTaskStage, CoworkerTaskVerificationOutcome, CoworkerTaskVerificationRequest,
     CoworkerTaskVerificationService, CoworkerTaskVerificationStatus, CoworkerWorkflowStore,
-    CreateCoworkerJobRequest, CreatePlanningGrantRequest, FinalizeTaskOutboxRequest,
-    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckExecutionStatus,
-    FrozenCheckKind, FrozenControllerCapabilityEnvelope, OrchestrateWorkBriefPlanRequest,
-    OutboxDispatchKind, OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
-    PendingControllerEffectStatus, PlannedCheckSuggestion, PlanningCallBudget,
-    PlanningReadOnlyCapabilities, PlanningReservationStatus, RecordTaskReviewVerdictRequest,
-    ReserveTaskOutboxRequest, ResolveWorkflowHoldRequest, ReviewVerdictOutcome,
-    StructuredOrchestratorOutput, StructuredPlannedTask, StructuredReviewVerdict, TaskCandidateRef,
-    TaskInterfaceOwnershipSpec, WorkBrief, WorkBriefKind, WorkflowHoldReason,
+    CreateCoworkerJobRequest, CreatePlanningGrantRequest, ExpectedTaskReviewIdentity,
+    FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec,
+    FrozenCheckExecutionStatus, FrozenCheckKind, FrozenControllerCapabilityEnvelope,
+    OrchestrateWorkBriefPlanRequest, OutboxDispatchKind, OutboxDispatchStatus,
+    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
+    PlannedCheckSuggestion, PlanningCallBudget, PlanningReadOnlyCapabilities,
+    PlanningReservationStatus, RecordTaskReviewVerdictRequest, ReserveTaskOutboxRequest,
+    ResolveWorkflowHoldRequest, ReviewVerdictOutcome, StructuredOrchestratorOutput,
+    StructuredPlannedTask, StructuredReviewVerdict, StructuredTaskReviewModelResponse,
+    TaskCandidateRef, TaskInterfaceOwnershipSpec, TaskReviewExecutionStatus, WorkBrief,
+    WorkBriefKind, WorkflowHoldReason, TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
 };
 use threadlane_native::{
     Difficulty, ExecutionPolicy, NativeErrorCode, PolicyAllowRule, RegistryStore,
@@ -40,14 +44,14 @@ use threadlane_native::{
 };
 use threadlane_operations::{
     accept_review_subject, commit_task_worktree_changes, execute_integration,
-    inspect_review_subject, load_integration_receipt, CommitTaskChangesRequest,
-    ExecuteIntegrationRequest, InspectReviewSubjectRequest, IntegrationStrategy,
-    ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt, ReviewSubject,
-    TestEvidenceSummary,
+    inspect_review_subject, load_integration_receipt, load_review_receipt,
+    verify_review_receipt_readonly, CommitTaskChangesRequest, ExecuteIntegrationRequest,
+    InspectReviewSubjectRequest, IntegrationStrategy, ReviewAcceptanceRequest, ReviewPolicyBinding,
+    ReviewReceipt, ReviewSubject, TestEvidenceSummary, RECEIPTS_SUBDIR,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, ExecutionBudgets,
-    WorkerFilePermissions, WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    WorkerFilePermissions, WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
 };
 use threadlane_workflow::{
     compile_plan_revision, ModelChoice, ModelDefinition, PlanChange, PlanStore, PlanTask,
@@ -3348,6 +3352,828 @@ async fn task_integration_refuses_tampered_proofs_dirty_target_and_blocks_missin
     assert_eq!(
         retry_unknown_err.code(),
         NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+
+    session.release().expect("release session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_review_stage_executes_reviewer_mints_bound_review_receipt_and_reconciles_idempotently(
+) {
+    let fixture = setup_fixture();
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
+    );
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-review-accept".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_review_accept".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_review_accept",
+        "plan-review-accept",
+        vec![PlanTask {
+            id: "task-review-accept".to_string(),
+            title: "Review Accept Task A".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        task_interfaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 60_000)
+        .expect("open controller session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 60_100u64;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-review-accept")
+            .expect("task-review-accept observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-review-accept ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_outcome = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-accept".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts,
+            },
+        )
+        .await
+        .expect("verify_and_prepare_task_attempt");
+    assert_eq!(
+        verify_outcome.status,
+        CoworkerTaskVerificationStatus::ReadyForReviewer
+    );
+    let review_subject = verify_outcome
+        .review_subject
+        .as_ref()
+        .expect("promoted ReviewSubject");
+
+    let policy_digest = job
+        .approval_linkage
+        .as_ref()
+        .expect("approval linkage")
+        .policy_digest
+        .clone();
+    let accept_model_resp = StructuredTaskReviewModelResponse {
+        schema_version: TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+        task_id: "task-review-accept".to_string(),
+        attempt_no: 1,
+        candidate_id: verify_outcome.candidate_id.clone(),
+        review_subject_digest: review_subject.subject_digest.clone(),
+        base_commit: review_subject.base_commit.clone(),
+        task_head_commit: review_subject.task_head_commit.clone(),
+        task_tree_sha: review_subject.task_tree_sha.clone(),
+        diff_digest: review_subject.diff_digest.clone(),
+        policy_digest,
+        outcome: ReviewVerdictOutcome::Accept,
+        findings: Vec::new(),
+        required_in_scope_fixes: Vec::new(),
+        conflicting_paths_or_interfaces: Vec::new(),
+        summary: Some(
+            "Candidate satisfies approved write scope, frozen policy, and passing check evidence."
+                .to_string(),
+        ),
+    };
+    let accept_json = serde_json::to_string(&accept_model_resp)
+        .expect("serialize StructuredTaskReviewModelResponse");
+    fs::write(&fixture.agy_plan_response_file, &accept_json).expect("write reviewer accept json");
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+    let review_outcome = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-accept".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 100,
+                untrusted_candidate_context: Some(
+                    "Implemented pub fn a() -> u32 { 100 }".to_string(),
+                ),
+            },
+        )
+        .await
+        .expect("execute_task_review_stage Accept");
+
+    assert_eq!(
+        review_outcome.status,
+        CoworkerTaskReviewStageStatus::Accepted
+    );
+    assert_eq!(review_outcome.task_stage, CoworkerTaskStage::Accepted);
+    assert!(!review_outcome.reused_existing);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+    assert_eq!(
+        review_outcome.report.status,
+        TaskReviewExecutionStatus::VerifiedVerdict
+    );
+    assert_eq!(
+        review_outcome.report.observed_model.as_deref(),
+        Some("gemini-4-argon-high")
+    );
+    assert_eq!(
+        review_outcome.report.observed_effort.as_deref(),
+        Some("high")
+    );
+
+    let persisted_report =
+        read_persisted_task_review_report(&fixture.plans_dir, &review_outcome.effect_id)
+            .expect("read persisted task review report")
+            .expect("persisted task review report exists");
+    assert_eq!(persisted_report, review_outcome.report);
+
+    let receipt = review_outcome
+        .require_accepted()
+        .expect("require accepted ReviewReceipt");
+    let loaded_receipt = load_review_receipt(&review_subject.work_area_root, &receipt.receipt_id)
+        .expect("load persisted ReviewReceipt");
+    assert_eq!(&loaded_receipt, receipt);
+    verify_review_receipt_readonly(review_subject, &loaded_receipt)
+        .expect("verify ReviewReceipt against live ReviewSubject");
+
+    let runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime")
+        .expect("runtime exists");
+    let coder_usage = runtime
+        .role_usage
+        .get(&WorkflowRole::Coder)
+        .expect("Coder usage");
+    assert_eq!(coder_usage.calls_reserved, 1);
+    assert_eq!(coder_usage.calls_completed, 1);
+    let reviewer_usage = runtime
+        .role_usage
+        .get(&WorkflowRole::Reviewer)
+        .expect("Reviewer usage");
+    assert_eq!(reviewer_usage.calls_reserved, 1);
+    assert_eq!(reviewer_usage.calls_completed, 1);
+
+    let art_key = ControllerJobRuntimeState::artifact_key("task-review-accept", 1);
+    let stored_art = runtime
+        .attempt_artifacts
+        .get(&art_key)
+        .expect("stored attempt artifacts");
+    assert_eq!(stored_art.review_receipt.as_ref(), Some(receipt));
+    assert_eq!(
+        stored_art.reviewer_response_digest.as_deref(),
+        Some(review_outcome.reviewer_response_digest.as_str())
+    );
+    assert!(stored_art.integration_receipt.is_none());
+
+    let primary_head =
+        resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve primary HEAD");
+    assert_eq!(primary_head, fixture.base_commit);
+
+    // Drop and reopen controller session: repeating review_task_attempt must verify the persisted
+    // report and ReviewReceipt and return idempotently without a second Reviewer invocation.
+    session.release().expect("release session");
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 200)
+        .expect("reopen session");
+    let reopened_outcome = review_service
+        .review_task_attempt(
+            reopened_session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-accept".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 300,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect("reopened review_task_attempt");
+    assert!(reopened_outcome.reused_existing);
+    assert_eq!(
+        reopened_outcome.review_receipt,
+        review_outcome.review_receipt
+    );
+    assert_eq!(reopened_outcome.verdict, review_outcome.verdict);
+    assert_eq!(reopened_outcome.report, review_outcome.report);
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+
+    let runtime_after = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime after reopen")
+        .expect("runtime exists");
+    let reviewer_usage_after = runtime_after
+        .role_usage
+        .get(&WorkflowRole::Reviewer)
+        .expect("Reviewer usage after reopen");
+    assert_eq!(reviewer_usage_after.calls_reserved, 1);
+    assert_eq!(reviewer_usage_after.calls_completed, 1);
+
+    reopened_session
+        .release()
+        .expect("release reopened session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_review_stage_rejects_malformed_or_positive_prose_output_and_finalizes_to_blocked() {
+    let fixture = setup_fixture();
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest ok\\n\"\nexit 0\n",
+    );
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-review-bad".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_review_bad".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_review_neg",
+        "plan-review-neg",
+        vec![PlanTask {
+            id: "task-review-bad".to_string(),
+            title: "Review Bad Output Task".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        task_interfaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 70_000)
+        .expect("open controller session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 70_100u64;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-review-bad")
+            .expect("task-review-bad observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-review-bad ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+
+    // 1. Pre-effect refusal: invoking Reviewer before task_verification commits and passes checks
+    // must fail closed before reserving any Reviewer call budget or outbox record.
+    let pre_verify_err = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-bad".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect_err("review before task verification must fail closed");
+    assert_eq!(
+        pre_verify_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_bad = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-bad".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 50,
+            },
+        )
+        .await
+        .expect("verify task-review-bad");
+    let subject_bad = verify_bad.review_subject.as_ref().expect("subject_bad");
+
+    let policy_digest = job
+        .approval_linkage
+        .as_ref()
+        .expect("approval linkage")
+        .policy_digest
+        .clone();
+
+    // 2. Real invalid natural output: Reviewer emits positive prose claiming LGTM/approval while
+    // smuggling an invalid/contradictory schema field (`prose_may_advance_acceptance: true`).
+    let invalid_prose_payload = serde_json::json!({
+        "schema_version": 1,
+        "task_id": "task-review-bad",
+        "attempt_no": 1,
+        "candidate_id": verify_bad.candidate_id,
+        "review_subject_digest": subject_bad.subject_digest,
+        "base_commit": subject_bad.base_commit,
+        "task_head_commit": subject_bad.task_head_commit,
+        "task_tree_sha": subject_bad.task_tree_sha,
+        "diff_digest": subject_bad.diff_digest,
+        "policy_digest": policy_digest,
+        "outcome": "accept",
+        "summary": "LGTM! Approved and ready to integrate immediately!",
+        "prose_may_advance_acceptance": true
+    });
+    fs::write(
+        &fixture.agy_plan_response_file,
+        serde_json::to_string(&invalid_prose_payload).expect("serialize invalid payload"),
+    )
+    .expect("write invalid reviewer response");
+
+    let bad_err = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-bad".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 100,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect_err("invalid Reviewer output must be rejected");
+    assert_eq!(bad_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+
+    let runtime_bad = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime")
+        .expect("runtime exists");
+    let req_key_bad = compute_task_review_request_key(
+        &job.job_id,
+        "task-review-bad",
+        1,
+        &verify_bad.candidate_id,
+        &subject_bad.subject_digest,
+        &policy_digest,
+        &runtime_bad.envelope.envelope_digest,
+        &runtime_bad.envelope.reviewer_choice,
+    );
+    let eff_id_bad = compute_task_review_effect_id(&job.job_id, "task-review-bad", 1, &req_key_bad);
+
+    let retained_report = read_persisted_task_review_report(&fixture.plans_dir, &eff_id_bad)
+        .expect("read retained report")
+        .expect("retained report exists on disk");
+    assert_eq!(
+        retained_report.status,
+        TaskReviewExecutionStatus::KnownTerminalFailure
+    );
+    assert!(retained_report.verified_verdict.is_none());
+
+    let eff_rec = runtime_bad
+        .pending_effects
+        .get(&eff_id_bad)
+        .expect("Reviewer PendingControllerEffect");
+    assert_eq!(
+        eff_rec.status,
+        PendingControllerEffectStatus::EffectFailedTerminal
+    );
+    let reviewer_usage = runtime_bad
+        .role_usage
+        .get(&WorkflowRole::Reviewer)
+        .expect("Reviewer role usage");
+    assert_eq!(reviewer_usage.calls_reserved, 1);
+    assert_eq!(reviewer_usage.calls_completed, 1);
+
+    let art_key_bad = ControllerJobRuntimeState::artifact_key("task-review-bad", 1);
+    assert!(
+        runtime_bad
+            .attempt_artifacts
+            .get(&art_key_bad)
+            .expect("artifacts bad")
+            .review_receipt
+            .is_none(),
+        "no ReviewReceipt may be minted on invalid Reviewer output"
+    );
+
+    let ledger_after_bad = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after bad review");
+    let job_after_bad = ledger_after_bad
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("job after bad review");
+    let task_bad = job_after_bad
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-review-bad")
+        .expect("task-review-bad record");
+    assert_eq!(
+        task_bad.stage,
+        CoworkerTaskStage::Blocked,
+        "KnownTerminalFailure must finalize TaskReviewDispatch outbox to terminal Blocked stage"
+    );
+    assert!(
+        task_bad.unresolved_outbox_id.is_none(),
+        "KnownTerminalFailure must not leave ReviewReserved unresolved"
+    );
+    assert!(task_bad.accepted_candidate_id.is_none());
+    assert!(task_bad.candidates.is_empty());
+    let outbox_bad = job_after_bad
+        .outbox
+        .iter()
+        .find(|o| {
+            o.task_id == "task-review-bad" && o.kind == OutboxDispatchKind::TaskReviewDispatch
+        })
+        .expect("TaskReviewDispatch outbox");
+    assert_eq!(
+        outbox_bad.status,
+        OutboxDispatchStatus::DispatchedEffectConfirmed
+    );
+    assert!(outbox_bad.run_id.is_none());
+    assert!(outbox_bad.worker_id.is_none());
+
+    // Repeating review_task_attempt on the failed task must not auto-retry or consume another call.
+    let repeat_bad_err = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-bad".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 200,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect_err("repeat call after terminal failure must not auto-retry");
+    assert_eq!(
+        repeat_bad_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+
+    session.release().expect("release session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_review_stage_fails_closed_on_corrupt_existing_review_receipt_without_overwriting() {
+    let fixture = setup_fixture();
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest ok\\n\"\nexit 0\n",
+    );
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-review-corrupt".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_review_corrupt".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_review_corrupt",
+        "plan-review-corrupt",
+        vec![PlanTask {
+            id: "task-review-corrupt".to_string(),
+            title: "Review Corrupt Receipt Task".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        task_interfaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 80_000)
+        .expect("open controller session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 80_100u64;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-review-corrupt")
+            .expect("task-review-corrupt observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-review-corrupt ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_corrupt = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-corrupt".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 50,
+            },
+        )
+        .await
+        .expect("verify task-review-corrupt");
+    let subject_corrupt = verify_corrupt
+        .review_subject
+        .as_ref()
+        .expect("subject_corrupt");
+
+    let policy_digest = job
+        .approval_linkage
+        .as_ref()
+        .expect("approval linkage")
+        .policy_digest
+        .clone();
+
+    let valid_corrupt_resp = StructuredTaskReviewModelResponse {
+        schema_version: TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+        task_id: "task-review-corrupt".to_string(),
+        attempt_no: 1,
+        candidate_id: verify_corrupt.candidate_id.clone(),
+        review_subject_digest: subject_corrupt.subject_digest.clone(),
+        base_commit: subject_corrupt.base_commit.clone(),
+        task_head_commit: subject_corrupt.task_head_commit.clone(),
+        task_tree_sha: subject_corrupt.task_tree_sha.clone(),
+        diff_digest: subject_corrupt.diff_digest.clone(),
+        policy_digest: policy_digest.clone(),
+        outcome: ReviewVerdictOutcome::Accept,
+        findings: Vec::new(),
+        required_in_scope_fixes: Vec::new(),
+        conflicting_paths_or_interfaces: Vec::new(),
+        summary: Some("Valid accept response for corrupt receipt check.".to_string()),
+    };
+    let expected_identity_corrupt = ExpectedTaskReviewIdentity::from_subject(
+        subject_corrupt,
+        "task-review-corrupt",
+        1,
+        &verify_corrupt.candidate_id,
+        &policy_digest,
+    );
+    let expected_verdict = valid_corrupt_resp
+        .clone()
+        .into_verified_verdict(&expected_identity_corrupt)
+        .expect("derive expected verdict");
+    let expected_receipt_id = deterministic_prefixed_id(
+        "threadlane-native:coworker-review-receipt:v1",
+        "rev",
+        &[
+            &job.job_id,
+            "task-review-corrupt",
+            "1",
+            &verify_corrupt.candidate_id,
+            &expected_verdict.verdict_id,
+            &subject_corrupt.subject_digest,
+        ],
+    );
+    let receipts_dir = subject_corrupt
+        .work_area_root
+        .join(MANIFESTS_SUBDIR)
+        .join(RECEIPTS_SUBDIR);
+    fs::create_dir_all(&receipts_dir).expect("create receipts_dir");
+    fs::set_permissions(&receipts_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 receipts_dir");
+    let corrupt_receipt_path = receipts_dir.join(format!("review-{expected_receipt_id}.json"));
+    let corrupt_bytes = b"{corrupt-existing-review-receipt-json";
+    fs::write(&corrupt_receipt_path, corrupt_bytes).expect("write corrupt receipt");
+    fs::set_permissions(&corrupt_receipt_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 corrupt receipt");
+
+    fs::write(
+        &fixture.agy_plan_response_file,
+        serde_json::to_string(&valid_corrupt_resp).expect("serialize valid_corrupt_resp"),
+    )
+    .expect("write valid_corrupt_resp");
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+    let corrupt_err = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-corrupt".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 100,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect_err("corrupt existing ReviewReceipt must fail closed");
+    assert_eq!(corrupt_err.code(), NativeErrorCode::ProtocolError.as_str());
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+    assert_eq!(
+        fs::read(&corrupt_receipt_path).expect("read corrupt receipt after failure"),
+        corrupt_bytes,
+        "corrupt ReviewReceipt file must never be overwritten"
+    );
+
+    let runtime_corrupt = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime")
+        .expect("runtime exists");
+    let req_key_corrupt = compute_task_review_request_key(
+        &job.job_id,
+        "task-review-corrupt",
+        1,
+        &verify_corrupt.candidate_id,
+        &subject_corrupt.subject_digest,
+        &policy_digest,
+        &runtime_corrupt.envelope.envelope_digest,
+        &runtime_corrupt.envelope.reviewer_choice,
+    );
+    let eff_id_corrupt =
+        compute_task_review_effect_id(&job.job_id, "task-review-corrupt", 1, &req_key_corrupt);
+    let persisted_report = read_persisted_task_review_report(&fixture.plans_dir, &eff_id_corrupt)
+        .expect("read persisted report for corrupt receipt case")
+        .expect("persisted report exists");
+    assert_eq!(
+        persisted_report.status,
+        TaskReviewExecutionStatus::VerifiedVerdict
+    );
+
+    let reviewer_usage = runtime_corrupt
+        .role_usage
+        .get(&WorkflowRole::Reviewer)
+        .expect("Reviewer role usage");
+    assert_eq!(reviewer_usage.calls_reserved, 1);
+    assert_eq!(reviewer_usage.calls_completed, 1);
+
+    let art_key_corrupt = ControllerJobRuntimeState::artifact_key("task-review-corrupt", 1);
+    assert!(
+        runtime_corrupt
+            .attempt_artifacts
+            .get(&art_key_corrupt)
+            .expect("artifacts corrupt")
+            .review_receipt
+            .is_none(),
+        "corrupt receipt must not be promoted into TaskAttemptExecutionArtifacts"
+    );
+
+    let ledger_corrupt = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after corrupt receipt failure");
+    let job_corrupt = ledger_corrupt
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("job after corrupt receipt failure");
+    let task_corrupt = job_corrupt
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-review-corrupt")
+        .expect("task-review-corrupt record");
+    assert!(task_corrupt.accepted_candidate_id.is_none());
+    assert!(task_corrupt.candidates.is_empty());
+
+    // Repeating review_task_attempt must reuse the persisted report without invoking Reviewer again
+    // and still fail closed on the corrupt receipt.
+    let repeat_corrupt_err = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-review-corrupt".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 200,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect_err("repeat call with corrupt receipt must fail closed");
+    assert_eq!(
+        repeat_corrupt_err.code(),
+        NativeErrorCode::ProtocolError.as_str()
+    );
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+    assert_eq!(
+        fs::read(&corrupt_receipt_path).expect("read corrupt receipt after repeat"),
+        corrupt_bytes
     );
 
     session.release().expect("release session");

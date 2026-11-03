@@ -53,6 +53,9 @@ pub mod store;
 /// Per-task original `RunIntegration` controller stage over accepted task candidates and owned
 /// `RunIntegration` worktrees.
 pub mod task_integration;
+/// Supervised read-only task `Reviewer` controller stage: verified candidate -> durable verdict
+/// and real [`threadlane_operations::ReviewReceipt`] on `Accept`.
+pub mod task_review_stage;
 /// Completed coder task worktree commit, frozen verification check execution, and
 /// [`threadlane_operations::ReviewSubject`] preparation before `Reviewer` dispatch.
 pub mod task_verification;
@@ -67,4 +70,5 @@ pub use review::*;
 pub use review_execution::*;
 pub use store::*;
 pub use task_integration::*;
+pub use task_review_stage::*;
 pub use task_verification::*;
