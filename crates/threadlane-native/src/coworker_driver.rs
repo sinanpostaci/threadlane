@@ -1087,7 +1087,10 @@ impl CoworkerCodeDriver {
                 }
             };
             let precheck_now_ms = current_time_ms();
-            let precheck_res: Result<Option<CoworkerDriverStatusReport>, NativeError> = async {
+            let precheck_res: Result<
+                Option<(CoworkerDriverHostMode, Option<CoworkerControllerStepReport>)>,
+                NativeError,
+            > = async {
                 let admission = session.verify_admission()?;
                 if is_terminal_or_stopped_job(&admission.job, &admission.runtime_state) {
                     if self
@@ -1125,11 +1128,10 @@ impl CoworkerCodeDriver {
                             updated_at_ms: current_time_ms(),
                         };
                         self.write_driver_state(&key, &state_record)?;
-                        return Ok(Some(self.build_readonly_status_report(
-                            &key,
-                            Some(CoworkerDriverHostMode::ReusedVerifiedReadyHost),
+                        return Ok(Some((
+                            CoworkerDriverHostMode::ReusedVerifiedReadyHost,
                             Some(report),
-                        )?));
+                        )));
                     } else if self.can_skip_host_for_quiescent_job(&key, &admission)? {
                         let owner_summary = session.guard().validate_before_effect(&key)?.clone();
                         let prev_state = self.read_driver_state_optional(&key)?;
@@ -1165,11 +1167,10 @@ impl CoworkerCodeDriver {
                             updated_at_ms: current_time_ms(),
                         };
                         self.write_driver_state(&key, &state_record)?;
-                        return Ok(Some(self.build_readonly_status_report(
-                            &key,
-                            Some(CoworkerDriverHostMode::QuiescentNoHostRequired),
+                        return Ok(Some((
+                            CoworkerDriverHostMode::QuiescentNoHostRequired,
                             prev_report,
-                        )?));
+                        )));
                     }
                 }
                 self.preflight_host_for_admission(&key, &admission).await?;
@@ -1178,8 +1179,13 @@ impl CoworkerCodeDriver {
             .await;
 
             match precheck_res {
-                Ok(Some(quiescent_status)) => {
+                Ok(Some((quiescent_host_mode, quiescent_report))) => {
                     session.release()?;
+                    let quiescent_status = self.build_readonly_status_report(
+                        &key,
+                        Some(quiescent_host_mode),
+                        quiescent_report,
+                    )?;
                     return Ok(CoworkerDriverEnsureReport {
                         disposition: CoworkerDriverEnsureDisposition::AlreadyQuiescentVerified,
                         status: quiescent_status,
@@ -2608,8 +2614,21 @@ impl CoworkerCodeDriver {
             CoworkerJobLockState::HeldByActiveProcess { .. } => {
                 CoworkerDriverOwnerState::LockHeldRpcUnavailable
             }
-            CoworkerJobLockState::UnlockedStaleFile { .. } => {
-                CoworkerDriverOwnerState::StaleCrashArtifactDetected
+            CoworkerJobLockState::UnlockedStaleFile {
+                recorded_summary,
+                lock_file_identity,
+            } => {
+                if is_gracefully_released_unlocked_lock(
+                    key,
+                    recorded_summary.as_ref(),
+                    *lock_file_identity,
+                    persisted_driver_state.as_ref(),
+                    lease_active,
+                ) {
+                    CoworkerDriverOwnerState::NoActiveOwner
+                } else {
+                    CoworkerDriverOwnerState::StaleCrashArtifactDetected
+                }
             }
             CoworkerJobLockState::Absent => {
                 let stale_driver = persisted_driver_state
@@ -2962,6 +2981,37 @@ fn validate_driver_state_record(
         "coworker_driver_state.owner_instance_id",
     )?;
     Ok(())
+}
+
+fn is_gracefully_released_unlocked_lock(
+    key: &CoworkerJobOwnershipKey,
+    recorded_summary: Option<&CoworkerOwnershipSummary>,
+    lock_file_identity: CoworkerLockFileIdentity,
+    persisted_driver_state: Option<&CoworkerDriverStateRecord>,
+    lease_active: bool,
+) -> bool {
+    if lease_active {
+        return false;
+    }
+    let Some(summary) = recorded_summary else {
+        return false;
+    };
+    if summary.validate_for_key(key).is_err() || summary.lock_file_identity != lock_file_identity {
+        return false;
+    }
+    let Some(state) = persisted_driver_state else {
+        return false;
+    };
+    if validate_driver_state_record(state, key).is_err() {
+        return false;
+    }
+    !state.owner_active
+        && state.graceful_exit_completed
+        && state.owner_uid == current_effective_uid()
+        && state.lock_file_identity == lock_file_identity
+        && state.owner_pid_hint == summary.pid_hint
+        && constant_time_str_eq(&state.owner_instance_id, &summary.instance_id)
+        && constant_time_str_eq(&state.owner_challenge_digest, &summary.challenge_digest)
 }
 
 fn key_digest_tag(key: &CoworkerJobOwnershipKey, hex_chars: usize) -> String {
