@@ -79,9 +79,10 @@ use super::controller::{
 };
 use super::controller_policy::{
     deterministic_controller_instance_id, sanitize_controller_diagnostic,
-    ControllerJobRuntimeState, DerivedTaskAttemptReceipt, PendingControllerEffect,
-    PendingControllerEffectKind, PendingControllerEffectStatus, TaskAttemptExecutionArtifacts,
-    DEFAULT_CONTROLLER_LEASE_TTL_MS, MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
+    CheckFailureCorrectionBasis, ControllerJobRuntimeState, DerivedTaskAttemptReceipt,
+    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
+    TaskAttemptExecutionArtifacts, DEFAULT_CONTROLLER_LEASE_TTL_MS,
+    MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
 };
 use super::ownership::CoworkerJobOwnershipGuard;
 use super::store::{FinalizeTaskOutboxRequest, ReserveTaskOutboxRequest};
@@ -292,8 +293,13 @@ pub struct PersistedDerivedTaskExecutionArtifact {
     pub attempt_no: u32,
     /// Prior rejected candidate identifier (`cand_<32hex>`).
     pub prior_candidate_id: String,
-    /// Prior verified Reviewer verdict identifier (`vrd_<32hex>`).
-    pub prior_review_verdict_id: String,
+    /// Prior verified Reviewer verdict identifier (`vrd_<32hex>`), or `None` when authorized by
+    /// `prior_check_failure_basis`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_review_verdict_id: Option<String>,
+    /// Prior verified failed-check correction basis when authorized without a Reviewer verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_check_failure_basis: Option<CheckFailureCorrectionBasis>,
     /// Prior verified `ReviewSubject.subject_digest` (64-hex SHA-256).
     pub prior_review_subject_digest: String,
     /// Original frozen host `run_id` UUID from Attempt 1.
@@ -399,60 +405,178 @@ struct PersistedDerivedTaskExecutionArtifactDigestPayload<'a> {
     recorded_at_ms: u64,
 }
 
+#[derive(Serialize)]
+struct PersistedCheckFailureDerivedTaskExecutionArtifactDigestPayload<'a> {
+    domain: &'static str,
+    schema_version: u32,
+    report_artifact_id: &'a str,
+    receipt_id: &'a str,
+    receipt_digest: &'a str,
+    request_key: &'a str,
+    effect_id: &'a str,
+    outbox_id: &'a str,
+    binding_id: &'a str,
+    thread_uuid: &'a str,
+    job_id: &'a str,
+    approval_id: &'a str,
+    envelope_id: &'a str,
+    envelope_digest: &'a str,
+    task_id: &'a str,
+    task_digest: &'a str,
+    prior_attempt_no: u32,
+    attempt_no: u32,
+    prior_candidate_id: &'a str,
+    prior_check_failure_basis: &'a CheckFailureCorrectionBasis,
+    prior_check_failure_basis_digest: &'a str,
+    prior_review_subject_digest: &'a str,
+    original_run_id: &'a str,
+    original_worker_id: &'a str,
+    manifest_run_id: &'a str,
+    manifest_task_id: &'a str,
+    task_worktree_id: &'a str,
+    integration_worktree_id: &'a str,
+    execution_base_commit: &'a str,
+    pre_execution_head_commit: &'a str,
+    pre_execution_tree_sha: &'a str,
+    post_execution_head_commit: &'a str,
+    post_execution_tree_sha: &'a str,
+    worktree_change_set_digest: &'a str,
+    base_diff_digest: &'a str,
+    has_changes_from_prior_head: bool,
+    coder_choice: &'a SelectedRoleChoice,
+    execution_report: &'a TaskExecutionReport,
+    observed_provider: &'a str,
+    observed_model: &'a Option<String>,
+    observed_effort: &'a Option<String>,
+    status: CoworkerTaskCorrectionExecuteStatus,
+    fenced_from_promotion: bool,
+    diagnostic: &'a Option<String>,
+    recorded_at_ms: u64,
+}
+
 impl PersistedDerivedTaskExecutionArtifact {
     /// Computes the canonical 64-character lowercase hexadecimal SHA-256 digest of this artifact.
     pub fn compute_digest(&self) -> Result<String, NativeError> {
-        let payload = PersistedDerivedTaskExecutionArtifactDigestPayload {
-            schema_version: self.schema_version,
-            report_artifact_id: &self.report_artifact_id,
-            receipt_id: &self.receipt_id,
-            receipt_digest: &self.receipt_digest,
-            request_key: &self.request_key,
-            effect_id: &self.effect_id,
-            outbox_id: &self.outbox_id,
-            binding_id: &self.binding_id,
-            thread_uuid: &self.thread_uuid,
-            job_id: &self.job_id,
-            approval_id: &self.approval_id,
-            envelope_id: &self.envelope_id,
-            envelope_digest: &self.envelope_digest,
-            task_id: &self.task_id,
-            task_digest: &self.task_digest,
-            prior_attempt_no: self.prior_attempt_no,
-            attempt_no: self.attempt_no,
-            prior_candidate_id: &self.prior_candidate_id,
-            prior_review_verdict_id: &self.prior_review_verdict_id,
-            prior_review_subject_digest: &self.prior_review_subject_digest,
-            original_run_id: &self.original_run_id,
-            original_worker_id: &self.original_worker_id,
-            manifest_run_id: &self.manifest_run_id,
-            manifest_task_id: &self.manifest_task_id,
-            task_worktree_id: &self.task_worktree_id,
-            integration_worktree_id: &self.integration_worktree_id,
-            execution_base_commit: &self.execution_base_commit,
-            pre_execution_head_commit: &self.pre_execution_head_commit,
-            pre_execution_tree_sha: &self.pre_execution_tree_sha,
-            post_execution_head_commit: &self.post_execution_head_commit,
-            post_execution_tree_sha: &self.post_execution_tree_sha,
-            worktree_change_set_digest: &self.worktree_change_set_digest,
-            base_diff_digest: &self.base_diff_digest,
-            has_changes_from_prior_head: self.has_changes_from_prior_head,
-            coder_choice: &self.coder_choice,
-            execution_report: &self.execution_report,
-            observed_provider: &self.observed_provider,
-            observed_model: &self.observed_model,
-            observed_effort: &self.observed_effort,
-            status: self.status,
-            fenced_from_promotion: self.fenced_from_promotion,
-            diagnostic: &self.diagnostic,
-            recorded_at_ms: self.recorded_at_ms,
+        let encoded = match (
+            &self.prior_review_verdict_id,
+            &self.prior_check_failure_basis,
+        ) {
+            (Some(verdict_id), None) => {
+                let payload = PersistedDerivedTaskExecutionArtifactDigestPayload {
+                    schema_version: self.schema_version,
+                    report_artifact_id: &self.report_artifact_id,
+                    receipt_id: &self.receipt_id,
+                    receipt_digest: &self.receipt_digest,
+                    request_key: &self.request_key,
+                    effect_id: &self.effect_id,
+                    outbox_id: &self.outbox_id,
+                    binding_id: &self.binding_id,
+                    thread_uuid: &self.thread_uuid,
+                    job_id: &self.job_id,
+                    approval_id: &self.approval_id,
+                    envelope_id: &self.envelope_id,
+                    envelope_digest: &self.envelope_digest,
+                    task_id: &self.task_id,
+                    task_digest: &self.task_digest,
+                    prior_attempt_no: self.prior_attempt_no,
+                    attempt_no: self.attempt_no,
+                    prior_candidate_id: &self.prior_candidate_id,
+                    prior_review_verdict_id: verdict_id.as_str(),
+                    prior_review_subject_digest: &self.prior_review_subject_digest,
+                    original_run_id: &self.original_run_id,
+                    original_worker_id: &self.original_worker_id,
+                    manifest_run_id: &self.manifest_run_id,
+                    manifest_task_id: &self.manifest_task_id,
+                    task_worktree_id: &self.task_worktree_id,
+                    integration_worktree_id: &self.integration_worktree_id,
+                    execution_base_commit: &self.execution_base_commit,
+                    pre_execution_head_commit: &self.pre_execution_head_commit,
+                    pre_execution_tree_sha: &self.pre_execution_tree_sha,
+                    post_execution_head_commit: &self.post_execution_head_commit,
+                    post_execution_tree_sha: &self.post_execution_tree_sha,
+                    worktree_change_set_digest: &self.worktree_change_set_digest,
+                    base_diff_digest: &self.base_diff_digest,
+                    has_changes_from_prior_head: self.has_changes_from_prior_head,
+                    coder_choice: &self.coder_choice,
+                    execution_report: &self.execution_report,
+                    observed_provider: &self.observed_provider,
+                    observed_model: &self.observed_model,
+                    observed_effort: &self.observed_effort,
+                    status: self.status,
+                    fenced_from_promotion: self.fenced_from_promotion,
+                    diagnostic: &self.diagnostic,
+                    recorded_at_ms: self.recorded_at_ms,
+                };
+                serde_json::to_vec(&payload).map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "failed to serialize PersistedDerivedTaskExecutionArtifact digest payload",
+                    )
+                })?
+            }
+            (None, Some(basis)) => {
+                let basis_digest = basis.compute_digest()?;
+                let payload = PersistedCheckFailureDerivedTaskExecutionArtifactDigestPayload {
+                    domain: "threadlane-native:derived_task_execution_artifact:check_failure:v2",
+                    schema_version: self.schema_version,
+                    report_artifact_id: &self.report_artifact_id,
+                    receipt_id: &self.receipt_id,
+                    receipt_digest: &self.receipt_digest,
+                    request_key: &self.request_key,
+                    effect_id: &self.effect_id,
+                    outbox_id: &self.outbox_id,
+                    binding_id: &self.binding_id,
+                    thread_uuid: &self.thread_uuid,
+                    job_id: &self.job_id,
+                    approval_id: &self.approval_id,
+                    envelope_id: &self.envelope_id,
+                    envelope_digest: &self.envelope_digest,
+                    task_id: &self.task_id,
+                    task_digest: &self.task_digest,
+                    prior_attempt_no: self.prior_attempt_no,
+                    attempt_no: self.attempt_no,
+                    prior_candidate_id: &self.prior_candidate_id,
+                    prior_check_failure_basis: basis,
+                    prior_check_failure_basis_digest: &basis_digest,
+                    prior_review_subject_digest: &self.prior_review_subject_digest,
+                    original_run_id: &self.original_run_id,
+                    original_worker_id: &self.original_worker_id,
+                    manifest_run_id: &self.manifest_run_id,
+                    manifest_task_id: &self.manifest_task_id,
+                    task_worktree_id: &self.task_worktree_id,
+                    integration_worktree_id: &self.integration_worktree_id,
+                    execution_base_commit: &self.execution_base_commit,
+                    pre_execution_head_commit: &self.pre_execution_head_commit,
+                    pre_execution_tree_sha: &self.pre_execution_tree_sha,
+                    post_execution_head_commit: &self.post_execution_head_commit,
+                    post_execution_tree_sha: &self.post_execution_tree_sha,
+                    worktree_change_set_digest: &self.worktree_change_set_digest,
+                    base_diff_digest: &self.base_diff_digest,
+                    has_changes_from_prior_head: self.has_changes_from_prior_head,
+                    coder_choice: &self.coder_choice,
+                    execution_report: &self.execution_report,
+                    observed_provider: &self.observed_provider,
+                    observed_model: &self.observed_model,
+                    observed_effort: &self.observed_effort,
+                    status: self.status,
+                    fenced_from_promotion: self.fenced_from_promotion,
+                    diagnostic: &self.diagnostic,
+                    recorded_at_ms: self.recorded_at_ms,
+                };
+                serde_json::to_vec(&payload).map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "failed to serialize PersistedCheckFailureDerivedTaskExecutionArtifact digest payload",
+                    )
+                })?
+            }
+            _ => {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "PersistedDerivedTaskExecutionArtifact must have either prior_review_verdict_id (without prior_check_failure_basis) or prior_check_failure_basis (without prior_review_verdict_id)",
+                ));
+            }
         };
-        let encoded = serde_json::to_vec(&payload).map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::ProtocolError,
-                "failed to serialize PersistedDerivedTaskExecutionArtifact digest payload",
-            )
-        })?;
         Ok(sha256_hex(&encoded))
     }
 
@@ -520,11 +644,44 @@ impl PersistedDerivedTaskExecutionArtifact {
             "prior_candidate_id",
             MAX_COWORKER_ID_LEN,
         )?;
-        validate_bounded_identifier(
+        match (
             &self.prior_review_verdict_id,
-            "prior_review_verdict_id",
-            MAX_COWORKER_ID_LEN,
-        )?;
+            &self.prior_check_failure_basis,
+        ) {
+            (Some(verdict_id), None) => {
+                validate_bounded_identifier(
+                    verdict_id,
+                    "prior_review_verdict_id",
+                    MAX_COWORKER_ID_LEN,
+                )?;
+            }
+            (None, Some(basis)) => {
+                basis.validate()?;
+                if basis.task_id != self.task_id
+                    || basis.task_manifest_id != self.manifest_task_id
+                    || basis.prior_attempt_no != self.prior_attempt_no
+                    || basis.prior_candidate_id != self.prior_candidate_id
+                    || basis.execution_base_commit != self.execution_base_commit
+                    || basis.committed_head_commit != self.pre_execution_head_commit
+                    || basis.committed_tree_sha != self.pre_execution_tree_sha
+                    || !constant_time_str_eq(
+                        &basis.prior_review_subject_digest,
+                        &self.prior_review_subject_digest,
+                    )
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "PersistedDerivedTaskExecutionArtifact.prior_check_failure_basis does not match artifact lineage",
+                    ));
+                }
+            }
+            _ => {
+                return Err(NativeError::new(
+                    NativeErrorCode::ProtocolError,
+                    "PersistedDerivedTaskExecutionArtifact must have either prior_review_verdict_id or prior_check_failure_basis (not both or neither)",
+                ));
+            }
+        }
         validate_sha256_hex_digest(
             &self.prior_review_subject_digest,
             "prior_review_subject_digest",
@@ -681,8 +838,8 @@ impl PersistedDerivedTaskExecutionArtifact {
             || self.attempt_no != receipt.attempt_no
             || Some(self.prior_candidate_id.as_str())
                 != receipt.prior_rejected_candidate_id.as_deref()
-            || Some(self.prior_review_verdict_id.as_str())
-                != receipt.prior_review_verdict_id.as_deref()
+            || self.prior_review_verdict_id != receipt.prior_review_verdict_id
+            || self.prior_check_failure_basis != receipt.prior_check_failure_basis
             || Some(self.prior_review_subject_digest.as_str())
                 != receipt.prior_review_subject_digest.as_deref()
             || self.original_run_id != receipt.run_id
@@ -875,8 +1032,13 @@ pub struct CoworkerTaskCorrectionExecuteOutcome {
     pub active_coder_executions: usize,
     /// Prior rejected candidate identifier (`cand_<32hex>`).
     pub prior_candidate_id: String,
-    /// Prior verified Reviewer verdict identifier (`vrd_<32hex>`).
-    pub prior_review_verdict_id: String,
+    /// Prior verified Reviewer verdict identifier (`vrd_<32hex>`), or `None` when authorized by
+    /// `prior_check_failure_basis`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_review_verdict_id: Option<String>,
+    /// Prior verified failed-check correction basis when authorized without a Reviewer verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_check_failure_basis: Option<CheckFailureCorrectionBasis>,
     /// Prior verified `ReviewSubject.subject_digest`.
     pub prior_review_subject_digest: String,
     /// Deterministic derived `Coder` request key (`None` when `WaitingForParallelCapacity` before reservation).
@@ -1865,7 +2027,8 @@ fn prepare_or_claim_derived_coder_execution(
                     max_parallel: adm.approval.max_parallel,
                     active_coder_executions: reopened.active_coder_executions,
                     prior_candidate_id: prior_candidate.candidate_id,
-                    prior_review_verdict_id: recorded_verdict.verdict_id,
+                    prior_review_verdict_id: Some(recorded_verdict.verdict_id),
+                    prior_check_failure_basis: None,
                     prior_review_subject_digest: review_subject.subject_digest,
                     request_key: reopened.request_key,
                     effect_id: reopened.effect_id,
@@ -2021,7 +2184,8 @@ fn prepare_or_claim_derived_coder_execution(
                     max_parallel: adm.approval.max_parallel,
                     active_coder_executions: total_active_coder_executions,
                     prior_candidate_id: prior_candidate.candidate_id,
-                    prior_review_verdict_id: recorded_verdict.verdict_id,
+                    prior_review_verdict_id: Some(recorded_verdict.verdict_id),
+                    prior_check_failure_basis: None,
                     prior_review_subject_digest: review_subject.subject_digest,
                     request_key: None,
                     effect_id: None,
@@ -3036,7 +3200,8 @@ fn finalize_claimed_derived_coder_execution(
         prior_attempt_no: request.prior_attempt_no,
         attempt_no: ctx.next_attempt_no,
         prior_candidate_id: ctx.prior_candidate.candidate_id.clone(),
-        prior_review_verdict_id: ctx.recorded_verdict.verdict_id.clone(),
+        prior_review_verdict_id: Some(ctx.recorded_verdict.verdict_id.clone()),
+        prior_check_failure_basis: None,
         prior_review_subject_digest: ctx.review_subject.subject_digest.clone(),
         original_run_id: ctx.receipt.run_id.clone(),
         original_worker_id: ctx.receipt.worker_id.clone(),
@@ -3349,6 +3514,7 @@ fn apply_persisted_derived_report_to_stores(
                 active_coder_executions: active_count,
                 prior_candidate_id: artifact.prior_candidate_id.clone(),
                 prior_review_verdict_id: artifact.prior_review_verdict_id.clone(),
+                prior_check_failure_basis: artifact.prior_check_failure_basis.clone(),
                 prior_review_subject_digest: artifact.prior_review_subject_digest.clone(),
                 request_key: Some(artifact.request_key.clone()),
                 effect_id: Some(artifact.effect_id.clone()),
@@ -3478,6 +3644,7 @@ fn apply_persisted_derived_report_to_stores(
                 active_coder_executions: active_count,
                 prior_candidate_id: artifact.prior_candidate_id.clone(),
                 prior_review_verdict_id: artifact.prior_review_verdict_id.clone(),
+                prior_check_failure_basis: artifact.prior_check_failure_basis.clone(),
                 prior_review_subject_digest: artifact.prior_review_subject_digest.clone(),
                 request_key: Some(artifact.request_key.clone()),
                 effect_id: Some(artifact.effect_id.clone()),
@@ -3755,6 +3922,7 @@ fn apply_persisted_derived_report_to_stores(
         active_coder_executions: active_count,
         prior_candidate_id: artifact.prior_candidate_id.clone(),
         prior_review_verdict_id: artifact.prior_review_verdict_id.clone(),
+        prior_check_failure_basis: artifact.prior_check_failure_basis.clone(),
         prior_review_subject_digest: artifact.prior_review_subject_digest.clone(),
         request_key: Some(artifact.request_key.clone()),
         effect_id: Some(artifact.effect_id.clone()),

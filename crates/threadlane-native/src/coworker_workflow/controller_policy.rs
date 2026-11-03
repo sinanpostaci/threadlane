@@ -1772,36 +1772,10 @@ impl CheckFailureReportRef {
         })
     }
 
-    /// Validates this check failure reference against the governing [`FrozenControllerExecutionEnvelope`].
-    pub fn validate_against_envelope(
-        &self,
-        envelope: &FrozenControllerExecutionEnvelope,
-    ) -> Result<(), NativeError> {
+    /// Validates the standalone structural invariants of this check failure reference without
+    /// requiring a [`FrozenControllerExecutionEnvelope`].
+    pub fn validate(&self) -> Result<(), NativeError> {
         validate_bounded_identifier(&self.check_id, "failed_check.check_id", MAX_COWORKER_ID_LEN)?;
-        let Some(spec) = envelope.check_commands.get(&self.check_id) else {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "CheckFailureReportRef.check_id `{}` is not declared in the frozen execution envelope.",
-                    self.check_id
-                ),
-            ));
-        };
-        if !spec.required_for_task_review {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "CheckFailureReportRef.check_id `{}` is not marked required_for_task_review in the frozen execution envelope.",
-                    self.check_id
-                ),
-            ));
-        }
-        if self.kind != spec.kind {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "CheckFailureReportRef.kind does not match the frozen check command specification.",
-            ));
-        }
         validate_sha256_hex_digest(&self.spec_digest, "failed_check.spec_digest").map_err(
             |_| {
                 NativeError::new(
@@ -1810,13 +1784,6 @@ impl CheckFailureReportRef {
                 )
             },
         )?;
-        let expected_spec_digest = spec.spec_digest()?;
-        if !constant_time_str_eq(&expected_spec_digest, &self.spec_digest) {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "CheckFailureReportRef.spec_digest does not match the frozen check command specification digest.",
-            ));
-        }
         validate_bounded_identifier(
             &self.effect_id,
             "failed_check.effect_id",
@@ -1873,6 +1840,51 @@ impl CheckFailureReportRef {
             },
         )?;
         validate_bounded_summary_line(&self.diagnostic_summary, "failed_check.diagnostic_summary")?;
+        Ok(())
+    }
+
+    /// Alias for [`Self::validate`].
+    pub fn validate_structure(&self) -> Result<(), NativeError> {
+        self.validate()
+    }
+
+    /// Validates this check failure reference against the governing [`FrozenControllerExecutionEnvelope`].
+    pub fn validate_against_envelope(
+        &self,
+        envelope: &FrozenControllerExecutionEnvelope,
+    ) -> Result<(), NativeError> {
+        self.validate()?;
+        let Some(spec) = envelope.check_commands.get(&self.check_id) else {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "CheckFailureReportRef.check_id `{}` is not declared in the frozen execution envelope.",
+                    self.check_id
+                ),
+            ));
+        };
+        if !spec.required_for_task_review {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "CheckFailureReportRef.check_id `{}` is not marked required_for_task_review in the frozen execution envelope.",
+                    self.check_id
+                ),
+            ));
+        }
+        if self.kind != spec.kind {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef.kind does not match the frozen check command specification.",
+            ));
+        }
+        let expected_spec_digest = spec.spec_digest()?;
+        if !constant_time_str_eq(&expected_spec_digest, &self.spec_digest) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureReportRef.spec_digest does not match the frozen check command specification digest.",
+            ));
+        }
         Ok(())
     }
 
@@ -2003,36 +2015,23 @@ impl CheckFailureCorrectionBasis {
         Ok(())
     }
 
-    /// Validates this check-failure correction basis against the target [`CoworkerTaskRecord`] and
-    /// governing [`FrozenControllerExecutionEnvelope`].
-    pub fn validate_against_task_and_envelope(
-        &self,
-        task: &CoworkerTaskRecord,
-        envelope: &FrozenControllerExecutionEnvelope,
-    ) -> Result<(), NativeError> {
+    /// Validates the standalone structural invariants of this check-failure correction basis
+    /// without requiring a [`CoworkerTaskRecord`] or [`FrozenControllerExecutionEnvelope`].
+    pub fn validate(&self) -> Result<(), NativeError> {
         validate_bounded_identifier(
             &self.task_id,
             "check_failure_basis.task_id",
             MAX_COWORKER_ID_LEN,
         )?;
-        if self.task_id != task.task_id {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "CheckFailureCorrectionBasis.task_id does not match the target CoworkerTaskRecord.task_id.",
-            ));
-        }
         validate_bounded_identifier(
             &self.task_manifest_id,
             "check_failure_basis.task_manifest_id",
             MAX_COWORKER_ID_LEN,
         )?;
-        if self.prior_attempt_no == 0
-            || self.prior_attempt_no > envelope.max_in_scope_corrections_per_task
-            || self.prior_attempt_no > MAX_IN_SCOPE_CORRECTION_ATTEMPTS
-        {
+        if self.prior_attempt_no == 0 || self.prior_attempt_no > MAX_IN_SCOPE_CORRECTION_ATTEMPTS {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                "CheckFailureCorrectionBasis.prior_attempt_no is out of bounds for the envelope's max_in_scope_corrections_per_task or MAX_IN_SCOPE_CORRECTION_ATTEMPTS.",
+                "CheckFailureCorrectionBasis.prior_attempt_no is out of bounds for MAX_IN_SCOPE_CORRECTION_ATTEMPTS.",
             ));
         }
         validate_bounded_identifier(
@@ -2070,22 +2069,6 @@ impl CheckFailureCorrectionBasis {
                 "CheckFailureCorrectionBasis.committed_tree_sha must be a 40-hex tree SHA.",
             )
         })?;
-        if task.depends_on.is_empty()
-            && self.execution_base_commit != envelope.project_base.base_commit
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "CheckFailureCorrectionBasis.execution_base_commit for a root task must equal the frozen manifest base_commit.",
-            ));
-        }
-        if let Some(ref dep_commit) = task.dependency_input_commit {
-            if !task.depends_on.is_empty() && &self.execution_base_commit != dep_commit {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "CheckFailureCorrectionBasis.execution_base_commit must equal the task's prepared dependency_input_commit.",
-                ));
-            }
-        }
         validate_sha256_hex_digest(
             &self.check_subject_digest,
             "check_failure_basis.check_subject_digest",
@@ -2120,7 +2103,7 @@ impl CheckFailureCorrectionBasis {
         let mut seen_check_ids = BTreeSet::new();
         let mut seen_effect_ids = BTreeSet::new();
         for report_ref in &self.failed_checks {
-            report_ref.validate_against_envelope(envelope)?;
+            report_ref.validate()?;
             if !seen_check_ids.insert(report_ref.check_id.as_str()) {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
@@ -2133,6 +2116,53 @@ impl CheckFailureCorrectionBasis {
                     "CheckFailureCorrectionBasis.failed_checks contains duplicate effect_id entries.",
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Alias for [`Self::validate`].
+    pub fn validate_structure(&self) -> Result<(), NativeError> {
+        self.validate()
+    }
+
+    /// Validates this check-failure correction basis against the target [`CoworkerTaskRecord`] and
+    /// governing [`FrozenControllerExecutionEnvelope`].
+    pub fn validate_against_task_and_envelope(
+        &self,
+        task: &CoworkerTaskRecord,
+        envelope: &FrozenControllerExecutionEnvelope,
+    ) -> Result<(), NativeError> {
+        self.validate()?;
+        if self.task_id != task.task_id {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.task_id does not match the target CoworkerTaskRecord.task_id.",
+            ));
+        }
+        if self.prior_attempt_no > envelope.max_in_scope_corrections_per_task {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.prior_attempt_no is out of bounds for the envelope's max_in_scope_corrections_per_task or MAX_IN_SCOPE_CORRECTION_ATTEMPTS.",
+            ));
+        }
+        if task.depends_on.is_empty()
+            && self.execution_base_commit != envelope.project_base.base_commit
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CheckFailureCorrectionBasis.execution_base_commit for a root task must equal the frozen manifest base_commit.",
+            ));
+        }
+        if let Some(ref dep_commit) = task.dependency_input_commit {
+            if !task.depends_on.is_empty() && &self.execution_base_commit != dep_commit {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "CheckFailureCorrectionBasis.execution_base_commit must equal the task's prepared dependency_input_commit.",
+                ));
+            }
+        }
+        for report_ref in &self.failed_checks {
+            report_ref.validate_against_envelope(envelope)?;
         }
 
         if let Some(cand) = task.candidates.iter().find(|c| {

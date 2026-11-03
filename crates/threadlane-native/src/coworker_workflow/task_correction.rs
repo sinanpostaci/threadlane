@@ -2799,7 +2799,7 @@ fn validate_single_line_fix(fix: &str) -> Result<(), NativeError> {
     Ok(())
 }
 
-fn is_check_failure_correction_candidate(
+pub(crate) fn is_check_failure_correction_candidate(
     adm: &VerifiedControllerAdmission,
     candidate_task: &CoworkerTaskRecord,
     prior_attempt_no: u32,
@@ -2869,7 +2869,7 @@ fn prepare_check_failure_task_correction_reservation(
         ));
     }
 
-    let (prior_artifacts, unreviewed_candidate, prior_review_subject, basis, required_fixes) =
+    let (prior_artifacts, unreviewed_candidate, prior_review_subject_digest, basis, required_fixes) =
         verify_prior_attempt_and_persisted_failed_check_reports(
             controller,
             plans_dir,
@@ -2886,7 +2886,7 @@ fn prepare_check_failure_task_correction_reservation(
         next_attempt_no,
         &unreviewed_candidate.candidate_id,
         &basis_digest,
-        &prior_review_subject.subject_digest,
+        &prior_review_subject_digest,
         &adm.runtime_state.envelope.envelope_digest,
     );
     let request_key = compute_check_failure_derived_coder_request_key(
@@ -2895,7 +2895,7 @@ fn prepare_check_failure_task_correction_reservation(
         next_attempt_no,
         &unreviewed_candidate.candidate_id,
         &basis_digest,
-        &prior_review_subject.subject_digest,
+        &prior_review_subject_digest,
         &adm.runtime_state.envelope.envelope_digest,
         &candidate_task.selected_choice,
     );
@@ -2927,7 +2927,7 @@ fn prepare_check_failure_task_correction_reservation(
         approved_task,
         &prior_artifacts,
         &unreviewed_candidate,
-        &prior_review_subject,
+        &prior_review_subject_digest,
         &basis,
         &basis_digest,
         &required_fixes,
@@ -3082,7 +3082,7 @@ fn prepare_check_failure_task_correction_reservation(
         approved_task,
         &prior_artifacts,
         &unreviewed_candidate,
-        &prior_review_subject,
+        &prior_review_subject_digest,
         &basis,
         &basis_digest,
         &required_fixes,
@@ -3113,7 +3113,7 @@ fn prepare_check_failure_task_correction_reservation(
             prior_candidate_id: unreviewed_candidate.candidate_id,
             prior_review_verdict_id: None,
             prior_check_failure_basis: Some(basis),
-            prior_review_subject_digest: prior_review_subject.subject_digest,
+            prior_review_subject_digest,
             request_key: None,
             effect_id: None,
             outbox_id: None,
@@ -3311,7 +3311,7 @@ fn prepare_check_failure_task_correction_reservation(
         prior_candidate_id: unreviewed_candidate.candidate_id,
         prior_review_verdict_id: None,
         prior_check_failure_basis: Some(basis),
-        prior_review_subject_digest: prior_review_subject.subject_digest,
+        prior_review_subject_digest,
         request_key: Some(request_key),
         effect_id: Some(effect_id),
         outbox_id: Some(outbox_record.outbox_id),
@@ -3321,7 +3321,7 @@ fn prepare_check_failure_task_correction_reservation(
 }
 
 #[allow(clippy::type_complexity)]
-fn verify_prior_attempt_and_persisted_failed_check_reports(
+pub(crate) fn verify_prior_attempt_and_persisted_failed_check_reports(
     controller: &CoworkerControllerService,
     plans_dir: &Path,
     request: &CoworkerTaskCorrectionPrepareRequest,
@@ -3332,7 +3332,37 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
     (
         TaskAttemptExecutionArtifacts,
         TaskCandidateRef,
-        ReviewSubject,
+        String,
+        CheckFailureCorrectionBasis,
+        Vec<String>,
+    ),
+    NativeError,
+> {
+    verify_prior_attempt_and_persisted_failed_check_reports_with_live_check(
+        controller,
+        plans_dir,
+        request,
+        adm,
+        candidate_task,
+        approved_task,
+        true,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn verify_prior_attempt_and_persisted_failed_check_reports_with_live_check(
+    controller: &CoworkerControllerService,
+    plans_dir: &Path,
+    request: &CoworkerTaskCorrectionPrepareRequest,
+    adm: &VerifiedControllerAdmission,
+    candidate_task: &CoworkerTaskRecord,
+    approved_task: &ApprovedTaskRecord,
+    require_unmodified_live_subject: bool,
+) -> Result<
+    (
+        TaskAttemptExecutionArtifacts,
+        TaskCandidateRef,
+        String,
         CheckFailureCorrectionBasis,
         Vec<String>,
     ),
@@ -3635,7 +3665,7 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
         ));
     }
 
-    // Verify live repository cleanliness, owned worktree manifests, and live worktree state.
+    // Verify live repository cleanliness, owned worktree manifests, and (when required) live worktree state.
     adm.linkage.project_base.verify_live_repository()?;
     let primary_repo = Path::new(&adm.linkage.project_base.repository_path);
     let primary_clean =
@@ -3708,65 +3738,6 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             "owned RunIntegration WorktreeManifest does not match task WorktreeManifest ownership/run scope",
-        ));
-    }
-
-    let task_wt_clean = is_worktree_clean(
-        &task_manifest.checkout_path,
-        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    )
-    .map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "failed to inspect task worktree cleanliness during check-failure correction preparation",
-        )
-    })?;
-    if !task_wt_clean {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "task worktree has uncommitted or untracked changes; refusing check-failure correction preparation",
-        ));
-    }
-    let live_head = resolve_exact_commit_sha(
-        &task_manifest.checkout_path,
-        "HEAD",
-        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    )
-    .map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "failed to resolve live HEAD commit on task worktree",
-        )
-    })?;
-    let live_tree = resolve_exact_tree_sha(
-        &task_manifest.checkout_path,
-        &live_head,
-        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    )
-    .map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "failed to resolve live HEAD^{tree} SHA on task worktree",
-        )
-    })?;
-    if &live_head != committed_head || &live_tree != committed_tree {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "live task worktree HEAD commit or tree SHA drifted from committed candidate",
-        ));
-    }
-
-    let diff_report = evaluate_diff_gate(&task_manifest.work_area_root, &task_manifest.worktree_id)
-        .map_err(|err| {
-            NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!("failed to evaluate diff gate on task worktree: {err}"),
-            )
-        })?;
-    if !diff_report.passed || !diff_report.evidence_complete || !diff_report.violations.is_empty() {
-        return Err(NativeError::new(
-            NativeErrorCode::SecurityViolation,
-            "prior candidate failed diff gate scope validation on task worktree",
         ));
     }
 
@@ -4004,7 +3975,201 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
         ));
     }
 
-    // Build an honest read-only prior diff ReviewSubject with require_passing_tests = false and failed test evidence.
+    let existing_recorded_cand = candidate_task
+        .candidates
+        .iter()
+        .find(|c| c.attempt_no == prior_attempt_no)
+        .cloned();
+    let reusable_existing_cand = existing_recorded_cand
+        .as_ref()
+        .filter(|_| !require_unmodified_live_subject);
+
+    let (unreviewed_candidate, prior_review_subject_digest) = if let Some(existing_cand) =
+        reusable_existing_cand
+    {
+        existing_cand.validate()?;
+        if existing_cand.candidate_id != expected_candidate_id
+            || existing_cand.task_id != request.task_id
+            || existing_cand.attempt_no != prior_attempt_no
+            || existing_cand.base_commit != expected_base_commit
+            || &existing_cand.head_commit != committed_head
+            || &existing_cand.tree_sha != committed_tree
+            || existing_cand.write_paths != candidate_task.write_paths
+            || !existing_cand.check_evidence_digests.is_empty()
+            || existing_cand.review_verdict.is_some()
+            || existing_cand.review_receipt_id.is_some()
+            || existing_cand.integration_receipt_id.is_some()
+        {
+            return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "existing TaskCandidateRef on task does not match confirmed prior check-failure candidate lineage",
+                ));
+        }
+        let subject_digest = existing_cand.review_subject_digest.clone().ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "existing unreviewed check-failure TaskCandidateRef is missing review_subject_digest",
+                )
+            })?;
+        (existing_cand.clone(), subject_digest)
+    } else {
+        let task_wt_clean = is_worktree_clean(
+                &task_manifest.checkout_path,
+                DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+            )
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "failed to inspect task worktree cleanliness during check-failure correction preparation",
+                )
+            })?;
+        if !task_wt_clean {
+            return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "task worktree has uncommitted or untracked changes; refusing check-failure correction preparation",
+                ));
+        }
+        let live_head = resolve_exact_commit_sha(
+            &task_manifest.checkout_path,
+            "HEAD",
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "failed to resolve live HEAD commit on task worktree",
+            )
+        })?;
+        let live_tree = resolve_exact_tree_sha(
+            &task_manifest.checkout_path,
+            &live_head,
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "failed to resolve live HEAD^{tree} SHA on task worktree",
+            )
+        })?;
+        if &live_head != committed_head || &live_tree != committed_tree {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "live task worktree HEAD commit or tree SHA drifted from committed candidate",
+            ));
+        }
+
+        let diff_report =
+            evaluate_diff_gate(&task_manifest.work_area_root, &task_manifest.worktree_id).map_err(
+                |err| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!("failed to evaluate diff gate on task worktree: {err}"),
+                    )
+                },
+            )?;
+        if !diff_report.passed
+            || !diff_report.evidence_complete
+            || !diff_report.violations.is_empty()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "prior candidate failed diff gate scope validation on task worktree",
+            ));
+        }
+
+        // Build an honest read-only prior diff ReviewSubject with require_passing_tests = false and failed test evidence.
+        let failed_summary_parts_local: Vec<String> = failed_checks
+            .iter()
+            .map(|fc| {
+                format!(
+                    "{}:exit={}:digest={}",
+                    fc.check_id,
+                    fc.exit_code.unwrap_or_default(),
+                    &fc.evidence_digest[..16]
+                )
+            })
+            .collect();
+        let failed_test_evidence = TestEvidenceSummary {
+            formatting_passed: false,
+            clippy_passed: false,
+            tests_passed: false,
+            passed_test_count: passed_check_count,
+            failed_test_count: failed_checks.len() as u32,
+            evidence_summary: sanitize_controller_diagnostic(&format!(
+                "candidate={expected_candidate_id} check_subject={} failed_checks=[{}]",
+                &check_subject_digest[..16],
+                failed_summary_parts_local.join(", ")
+            )),
+        };
+        let readonly_policy = ReviewPolicyBinding {
+            policy_id: adm.runtime_state.envelope.policy.policy_id.clone(),
+            requested_provider: approved_task.provider.map(|p| p.as_str().to_string()),
+            requested_model: Some(approved_task.base_model.clone()),
+            requested_effort: candidate_task.selected_choice.effort.clone(),
+            observed_model: Some(prior_artifacts.observed_model.clone()),
+            observed_effort: prior_artifacts.observed_effort.clone(),
+            file_permissions: approved_task
+                .file_permissions
+                .unwrap_or(WorkerFilePermissions::TaskFiles),
+            require_effort_evidence: candidate_task.selected_choice.effort.is_some(),
+            require_passing_tests: false,
+        };
+        let prior_review_subject =
+                inspect_review_subject_readonly(&InspectReviewSubjectRequest {
+                    work_area_root: task_manifest.work_area_root.clone(),
+                    task_worktree_id: task_manifest.worktree_id.clone(),
+                    policy: readonly_policy,
+                    test_evidence: failed_test_evidence,
+                    worker_status: Some(WorkerRunStatus::Succeeded),
+                })
+                .map_err(|err| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "failed to inspect read-only prior diff subject for check-failure candidate: {err}"
+                        ),
+                    )
+                })?;
+        if prior_review_subject.run_id != expected_manifest_run_id
+            || prior_review_subject.task_id != expected_manifest_task_id
+            || prior_review_subject.base_commit != expected_base_commit
+            || &prior_review_subject.task_head_commit != committed_head
+            || &prior_review_subject.task_tree_sha != committed_tree
+        {
+            return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "read-only prior diff ReviewSubject commit/tree lineage does not match committed candidate",
+                ));
+        }
+
+        let built_cand = TaskCandidateRef {
+            candidate_id: expected_candidate_id.clone(),
+            task_id: request.task_id.clone(),
+            attempt_no: prior_attempt_no,
+            base_commit: expected_base_commit.clone(),
+            head_commit: committed_head.clone(),
+            tree_sha: committed_tree.clone(),
+            diff_digest: prior_review_subject.diff_digest.clone(),
+            write_paths: candidate_task.write_paths.clone(),
+            check_evidence_digests: Vec::new(),
+            review_subject_digest: Some(prior_review_subject.subject_digest.clone()),
+            review_verdict: None,
+            review_receipt_id: None,
+            integration_receipt_id: None,
+        };
+        built_cand.validate()?;
+
+        if let Some(ref existing_cand) = existing_recorded_cand {
+            if existing_cand != &built_cand {
+                return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "existing TaskCandidateRef on task does not match reconstructed unreviewed check-failure candidate",
+                    ));
+            }
+        }
+        (built_cand, prior_review_subject.subject_digest)
+    };
+
     let failed_summary_parts: Vec<String> = failed_checks
         .iter()
         .map(|fc| {
@@ -4016,88 +4181,6 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
             )
         })
         .collect();
-    let failed_test_evidence = TestEvidenceSummary {
-        formatting_passed: false,
-        clippy_passed: false,
-        tests_passed: false,
-        passed_test_count: passed_check_count,
-        failed_test_count: failed_checks.len() as u32,
-        evidence_summary: sanitize_controller_diagnostic(&format!(
-            "candidate={expected_candidate_id} check_subject={} failed_checks=[{}]",
-            &check_subject_digest[..16],
-            failed_summary_parts.join(", ")
-        )),
-    };
-    let readonly_policy = ReviewPolicyBinding {
-        policy_id: adm.runtime_state.envelope.policy.policy_id.clone(),
-        requested_provider: approved_task.provider.map(|p| p.as_str().to_string()),
-        requested_model: Some(approved_task.base_model.clone()),
-        requested_effort: candidate_task.selected_choice.effort.clone(),
-        observed_model: Some(prior_artifacts.observed_model.clone()),
-        observed_effort: prior_artifacts.observed_effort.clone(),
-        file_permissions: approved_task
-            .file_permissions
-            .unwrap_or(WorkerFilePermissions::TaskFiles),
-        require_effort_evidence: candidate_task.selected_choice.effort.is_some(),
-        require_passing_tests: false,
-    };
-    let prior_review_subject = inspect_review_subject_readonly(&InspectReviewSubjectRequest {
-        work_area_root: task_manifest.work_area_root.clone(),
-        task_worktree_id: task_manifest.worktree_id.clone(),
-        policy: readonly_policy,
-        test_evidence: failed_test_evidence,
-        worker_status: Some(WorkerRunStatus::Succeeded),
-    })
-    .map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!(
-                "failed to inspect read-only prior diff subject for check-failure candidate: {err}"
-            ),
-        )
-    })?;
-    if prior_review_subject.run_id != expected_manifest_run_id
-        || prior_review_subject.task_id != expected_manifest_task_id
-        || prior_review_subject.base_commit != expected_base_commit
-        || &prior_review_subject.task_head_commit != committed_head
-        || &prior_review_subject.task_tree_sha != committed_tree
-    {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "read-only prior diff ReviewSubject commit/tree lineage does not match committed candidate",
-        ));
-    }
-
-    let unreviewed_candidate = TaskCandidateRef {
-        candidate_id: expected_candidate_id.clone(),
-        task_id: request.task_id.clone(),
-        attempt_no: prior_attempt_no,
-        base_commit: expected_base_commit.clone(),
-        head_commit: committed_head.clone(),
-        tree_sha: committed_tree.clone(),
-        diff_digest: prior_review_subject.diff_digest.clone(),
-        write_paths: candidate_task.write_paths.clone(),
-        check_evidence_digests: Vec::new(),
-        review_subject_digest: Some(prior_review_subject.subject_digest.clone()),
-        review_verdict: None,
-        review_receipt_id: None,
-        integration_receipt_id: None,
-    };
-    unreviewed_candidate.validate()?;
-
-    if let Some(existing_cand) = candidate_task
-        .candidates
-        .iter()
-        .find(|c| c.attempt_no == prior_attempt_no)
-    {
-        if existing_cand != &unreviewed_candidate {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "existing TaskCandidateRef on task does not match reconstructed unreviewed check-failure candidate",
-            ));
-        }
-    }
-
     let task_manifest_id = task_manifest
         .task_id
         .clone()
@@ -4116,7 +4199,7 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
         committed_head_commit: committed_head.clone(),
         committed_tree_sha: committed_tree.clone(),
         check_subject_digest,
-        prior_review_subject_digest: prior_review_subject.subject_digest.clone(),
+        prior_review_subject_digest: prior_review_subject_digest.clone(),
         failed_checks,
         diagnostic_summary: basis_diag_summary,
     };
@@ -4145,14 +4228,14 @@ fn verify_prior_attempt_and_persisted_failed_check_reports(
     Ok((
         prior_artifacts,
         unreviewed_candidate,
-        prior_review_subject,
+        prior_review_subject_digest,
         basis,
         required_fixes,
     ))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_reopen_existing_check_failure_correction_reservation(
+pub(crate) fn try_reopen_existing_check_failure_correction_reservation(
     controller: &CoworkerControllerService,
     guard: &CoworkerJobOwnershipGuard,
     request: &CoworkerTaskCorrectionPrepareRequest,
@@ -4163,7 +4246,7 @@ fn try_reopen_existing_check_failure_correction_reservation(
     approved_task: &ApprovedTaskRecord,
     prior_artifacts: &TaskAttemptExecutionArtifacts,
     unreviewed_candidate: &TaskCandidateRef,
-    prior_review_subject: &ReviewSubject,
+    prior_review_subject_digest: &str,
     basis: &CheckFailureCorrectionBasis,
     basis_digest: &str,
     required_fixes: &[String],
@@ -4209,7 +4292,7 @@ fn try_reopen_existing_check_failure_correction_reservation(
         approved_task,
         prior_artifacts,
         unreviewed_candidate,
-        prior_review_subject,
+        prior_review_subject_digest,
         basis,
         basis_digest,
         required_fixes,
@@ -4350,7 +4433,7 @@ fn try_reopen_existing_check_failure_correction_reservation(
         prior_candidate_id: unreviewed_candidate.candidate_id.clone(),
         prior_review_verdict_id: None,
         prior_check_failure_basis: Some(basis.clone()),
-        prior_review_subject_digest: prior_review_subject.subject_digest.clone(),
+        prior_review_subject_digest: prior_review_subject_digest.to_string(),
         request_key: Some(request_key.to_string()),
         effect_id: Some(effect_id.to_string()),
         outbox_id: Some(verified_outbox.outbox_id),
@@ -4360,13 +4443,13 @@ fn try_reopen_existing_check_failure_correction_reservation(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn construct_verified_check_failure_derived_attempt_receipt(
+pub(crate) fn construct_verified_check_failure_derived_attempt_receipt(
     adm: &VerifiedControllerAdmission,
     candidate_task: &CoworkerTaskRecord,
     approved_task: &ApprovedTaskRecord,
     prior_artifacts: &TaskAttemptExecutionArtifacts,
     unreviewed_candidate: &TaskCandidateRef,
-    prior_review_subject: &ReviewSubject,
+    prior_review_subject_digest: &str,
     basis: &CheckFailureCorrectionBasis,
     basis_digest: &str,
     required_fixes: &[String],
@@ -4403,7 +4486,7 @@ fn construct_verified_check_failure_derived_attempt_receipt(
         next_attempt_no,
         &unreviewed_candidate.candidate_id,
         basis_digest,
-        &prior_review_subject.subject_digest,
+        prior_review_subject_digest,
         &candidate_task.write_paths,
         &basis.failed_checks,
         &sanitized_fixes,
@@ -4424,7 +4507,7 @@ fn construct_verified_check_failure_derived_attempt_receipt(
         prior_rejected_candidate_id: Some(unreviewed_candidate.candidate_id.clone()),
         prior_review_verdict_id: None,
         prior_check_failure_basis: Some(basis.clone()),
-        prior_review_subject_digest: Some(prior_review_subject.subject_digest.clone()),
+        prior_review_subject_digest: Some(prior_review_subject_digest.to_string()),
         required_in_scope_fixes: sanitized_fixes,
         frozen_instruction: approved_task.instruction.clone(),
         derived_prompt,

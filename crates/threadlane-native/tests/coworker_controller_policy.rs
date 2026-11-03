@@ -1657,4 +1657,119 @@ fn derived_task_attempt_receipt_preserves_v1_digest_and_validates_check_failure_
     assert!(tampered_basis_digest
         .validate_against_task(task, envelope)
         .is_err());
+
+    // 11. Standalone structural validation (`validate` / `validate_structure`) on CheckFailureReportRef
+    //     and CheckFailureCorrectionBasis accepts valid fixtures and rejects malformed identifiers,
+    //     attempt bounds, SHAs/digests, failed_checks bounds/deduplication, and diagnostics without
+    //     requiring a Task or FrozenControllerExecutionEnvelope.
+    report_ref
+        .validate()
+        .expect("valid CheckFailureReportRef passes standalone validate");
+    report_ref
+        .validate_structure()
+        .expect("valid CheckFailureReportRef passes standalone validate_structure");
+    valid_basis
+        .validate()
+        .expect("valid CheckFailureCorrectionBasis passes standalone validate");
+    valid_basis
+        .validate_structure()
+        .expect("valid CheckFailureCorrectionBasis passes standalone validate_structure");
+
+    let mut bad_task_id_basis = valid_basis.clone();
+    bad_task_id_basis.task_id.clear();
+    assert_eq!(
+        bad_task_id_basis
+            .validate()
+            .expect_err("empty task_id must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut bad_manifest_id_basis = valid_basis.clone();
+    bad_manifest_id_basis.task_manifest_id = "bad/manifest/id".to_string();
+    assert!(bad_manifest_id_basis.validate().is_err());
+
+    for out_of_bounds_attempt in [0, 3] {
+        let mut bad_attempt_basis = valid_basis.clone();
+        bad_attempt_basis.prior_attempt_no = out_of_bounds_attempt;
+        assert_eq!(
+            bad_attempt_basis
+                .validate()
+                .expect_err("out-of-bounds prior_attempt_no must fail standalone validate")
+                .code(),
+            NativeErrorCode::ValidationFailed.as_str()
+        );
+    }
+
+    let mut bad_sha_basis = valid_basis.clone();
+    bad_sha_basis.committed_head_commit = "not-a-40-hex-sha".to_string();
+    assert_eq!(
+        bad_sha_basis
+            .validate()
+            .expect_err("non-40-hex commit SHA must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut bad_digest_basis = valid_basis.clone();
+    bad_digest_basis.check_subject_digest = "not-a-64-hex-sha256".to_string();
+    assert_eq!(
+        bad_digest_basis
+            .validate()
+            .expect_err("non-64-hex check_subject_digest must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut empty_checks_basis = valid_basis.clone();
+    empty_checks_basis.failed_checks.clear();
+    assert_eq!(
+        empty_checks_basis
+            .validate()
+            .expect_err("empty failed_checks must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut dup_check_id_basis = valid_basis.clone();
+    let mut second_ref = report_ref.clone();
+    second_ref.effect_id = "eff_fedcba9876543210fedcba9876543210".to_string();
+    dup_check_id_basis.failed_checks.push(second_ref);
+    assert_eq!(
+        dup_check_id_basis
+            .validate()
+            .expect_err("duplicate check_id in failed_checks must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut dup_effect_id_basis = valid_basis.clone();
+    let mut second_ref_same_eff = report_ref.clone();
+    second_ref_same_eff.check_id = "cargo_clippy".to_string();
+    dup_effect_id_basis.failed_checks.push(second_ref_same_eff);
+    assert_eq!(
+        dup_effect_id_basis
+            .validate()
+            .expect_err("duplicate effect_id in failed_checks must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut bad_eff_prefix_ref = report_ref.clone();
+    bad_eff_prefix_ref.effect_id = "obx_0123456789abcdef0123456789abcdef".to_string();
+    assert_eq!(
+        bad_eff_prefix_ref
+            .validate()
+            .expect_err("effect_id without eff_ prefix must fail standalone validate")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut relative_path_ref = report_ref.clone();
+    relative_path_ref.report_path = "relative/check-report.json".to_string();
+    assert!(relative_path_ref.validate().is_err());
+
+    let mut multiline_diag_basis = valid_basis.clone();
+    multiline_diag_basis.diagnostic_summary = "line one\nline two".to_string();
+    assert!(multiline_diag_basis.validate().is_err());
 }

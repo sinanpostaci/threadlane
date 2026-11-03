@@ -1,4 +1,7 @@
 use super::*;
+use threadlane_native::coworker_workflow::controller_policy::{
+    CheckFailureCorrectionBasis, CheckFailureReportRef,
+};
 
 struct PreparedCorrectionFixtureTask {
     job: CoworkerJobRecord,
@@ -365,8 +368,8 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     assert!(!exec_outcome.reused_existing);
     assert_eq!(exec_outcome.prior_candidate_id, verify_1.candidate_id);
     assert_eq!(
-        exec_outcome.prior_review_verdict_id,
-        review_1.verdict.verdict_id
+        exec_outcome.prior_review_verdict_id.as_deref(),
+        Some(review_1.verdict.verdict_id.as_str())
     );
     assert_eq!(
         exec_outcome.prior_review_subject_digest,
@@ -999,8 +1002,8 @@ async fn task_correction_held_provider_rejects_duplicate_claim_without_marking_u
     assert!(!cancelled_outcome.reused_existing);
     assert_eq!(cancelled_outcome.prior_candidate_id, verify_1.candidate_id);
     assert_eq!(
-        cancelled_outcome.prior_review_verdict_id,
-        review_1.verdict.verdict_id
+        cancelled_outcome.prior_review_verdict_id.as_deref(),
+        Some(review_1.verdict.verdict_id.as_str())
     );
     assert_eq!(
         cancelled_outcome.prior_review_subject_digest,
@@ -1332,6 +1335,119 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
     let valid_report_bytes = fs::read(&report_path).expect("read valid persisted report bytes");
+
+    // 3b. Verify PersistedDerivedTaskExecutionArtifact preserves v1 Reviewer digest byte identity,
+    // enforces XOR between `prior_review_verdict_id` and `prior_check_failure_basis`, and validates
+    // standalone `CheckFailureCorrectionBasis` structural + lineage invariants at the artifact boundary.
+    {
+        let valid_report = exec_outcome
+            .report
+            .as_ref()
+            .expect("PersistedDerivedTaskExecutionArtifact from execution")
+            .clone();
+        assert!(valid_report.prior_review_verdict_id.is_some());
+        assert!(valid_report.prior_check_failure_basis.is_none());
+        let valid_report_str =
+            String::from_utf8(valid_report_bytes.clone()).expect("UTF-8 report JSON");
+        assert!(!valid_report_str.contains("prior_check_failure_basis"));
+
+        let mut neither_basis_report = valid_report.clone();
+        neither_basis_report.prior_review_verdict_id = None;
+        neither_basis_report.prior_check_failure_basis = None;
+        assert!(neither_basis_report.compute_digest().is_err());
+        assert!(neither_basis_report.validate_integrity().is_err());
+
+        let sample_check_ref = CheckFailureReportRef {
+            check_id: "cargo_test".to_string(),
+            kind: FrozenCheckKind::Tests,
+            spec_digest: sha256_hex(b"sample-spec-digest-v1"),
+            effect_id: "eff_0123456789abcdef0123456789abcdef".to_string(),
+            report_path: fixture
+                .plans_dir
+                .join("coworker-check-report-eff_0123456789abcdef0123456789abcdef.json")
+                .to_string_lossy()
+                .to_string(),
+            evidence_digest: sha256_hex(b"sample-evidence-digest-v1"),
+            status: FrozenCheckExecutionStatus::NonZeroExit,
+            exit_code: Some(101),
+            signal: None,
+            stdout_sha256: sha256_hex(b"sample-stdout-v1"),
+            stderr_sha256: sha256_hex(b"sample-stderr-v1"),
+            post_worktree_clean: true,
+            subject_drifted: false,
+            diagnostic_summary: "cargo_test exited with status 101".to_string(),
+        };
+        let valid_check_basis = CheckFailureCorrectionBasis {
+            task_id: valid_report.task_id.clone(),
+            task_manifest_id: valid_report.manifest_task_id.clone(),
+            prior_attempt_no: valid_report.prior_attempt_no,
+            prior_candidate_id: valid_report.prior_candidate_id.clone(),
+            execution_base_commit: valid_report.execution_base_commit.clone(),
+            committed_head_commit: valid_report.pre_execution_head_commit.clone(),
+            committed_tree_sha: valid_report.pre_execution_tree_sha.clone(),
+            check_subject_digest: sha256_hex(b"sample-check-subject-digest-v1"),
+            prior_review_subject_digest: valid_report.prior_review_subject_digest.clone(),
+            failed_checks: vec![sample_check_ref],
+            diagnostic_summary: "Blocked by failed required task-review check `cargo_test`"
+                .to_string(),
+        };
+
+        let mut both_basis_report = valid_report.clone();
+        both_basis_report.prior_check_failure_basis = Some(valid_check_basis.clone());
+        assert!(both_basis_report.compute_digest().is_err());
+        assert!(both_basis_report.validate_integrity().is_err());
+
+        let mut check_basis_report = valid_report.clone();
+        check_basis_report.prior_review_verdict_id = None;
+        check_basis_report.prior_check_failure_basis = Some(valid_check_basis);
+        check_basis_report.artifact_digest = check_basis_report
+            .compute_digest()
+            .expect("compute v2 check-failure artifact digest");
+        assert_ne!(
+            check_basis_report.artifact_digest,
+            valid_report.artifact_digest
+        );
+        check_basis_report
+            .validate_integrity()
+            .expect("valid check-failure artifact passes validate_integrity");
+
+        let mut malformed_basis_report = check_basis_report.clone();
+        malformed_basis_report
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis")
+            .failed_checks[0]
+            .status = FrozenCheckExecutionStatus::TimedOut;
+        malformed_basis_report.artifact_digest = malformed_basis_report
+            .compute_digest()
+            .expect("recompute digest on malformed basis");
+        assert_eq!(
+            malformed_basis_report
+                .validate_integrity()
+                .expect_err(
+                    "malformed check-failure basis in artifact must fail validate_integrity"
+                )
+                .code(),
+            NativeErrorCode::ValidationFailed.as_str()
+        );
+
+        let mut mismatched_lineage_report = check_basis_report;
+        mismatched_lineage_report
+            .prior_check_failure_basis
+            .as_mut()
+            .expect("basis")
+            .task_manifest_id = "w_mismatched_manifest_id".to_string();
+        mismatched_lineage_report.artifact_digest = mismatched_lineage_report
+            .compute_digest()
+            .expect("recompute digest on lineage-mismatched basis");
+        assert_eq!(
+            mismatched_lineage_report
+                .validate_integrity()
+                .expect_err("lineage-mismatched check-failure basis must fail validate_integrity")
+                .code(),
+            NativeErrorCode::ProtocolError.as_str()
+        );
+    }
 
     // 4. Corrupt the persisted report on disk with conflicting bytes: repeated execution and
     // verification requests must fail closed, preserve the conflicting bytes, and retain budgets
