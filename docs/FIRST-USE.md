@@ -4,6 +4,9 @@ Keep the conversation in Codex. Threadlane records approved work, runs the
 selected workers in isolated worktrees and returns bounded events to that
 conversation. The desktop is an optional observer and configuration surface.
 
+New to the vocabulary? The [Coworker terms](COWORKER-TERMS.md) glossary explains
+statuses and evidence labels.
+
 ## Check local setup
 
 Open **Settings → Connections → Getting started**. This checklist reads the local registry and
