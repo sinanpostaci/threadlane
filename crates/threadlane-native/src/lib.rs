@@ -54,6 +54,8 @@ pub mod mcp_pair;
 pub mod operator_cli;
 /// Private operator connection-epoch pairing store and verification gate types.
 pub mod pairing;
+/// Durable per-binding planning command ledger, live ownership guard transitions, and read-only status queries.
+pub mod planning_commands;
 /// Pure profile selection, role/difficulty preflight, and deny-by-default execution policy admission core.
 pub mod profile_flow;
 /// Durable profile-driven role handoffs and package closure reservations.
@@ -153,6 +155,13 @@ pub use mcp_pair::{
 pub use pairing::{
     ConnectionEpochState, ConnectionIdentity, EnrollmentRecord, NativeVerificationStatus,
     OperatorEnrollRequest, PairingStore, CONNECTION_IDENTITY_TOOL, MCP_SERVER_NAME,
+};
+pub use planning_commands::{
+    current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandBindingLedger,
+    PlanningCommandPayload, PlanningCommandRecord, PlanningCommandResultRef, PlanningCommandStatus,
+    PlanningCommandStore, MAX_PLANNING_COMMANDS_PER_BINDING, MAX_PLANNING_COMMAND_LEDGER_BYTES,
+    MAX_PLANNING_COMMAND_PAYLOAD_BYTES, PLANNING_COMMAND_ID_DOMAIN,
+    PLANNING_COMMAND_SCHEMA_VERSION, PLANNING_COMMAND_SERVICE_KEY_DOMAIN,
 };
 pub use profile_flow::{
     preflight, preflight_from_store, resolve_choice, ExecutionPolicy, PolicyAllowRule,
