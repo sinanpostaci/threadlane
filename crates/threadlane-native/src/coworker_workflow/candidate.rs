@@ -1004,9 +1004,44 @@ impl CoworkerCandidateService {
             closure_reservation = Some(outcome);
         }
 
-        let closure_reservation_id = closure_reservation
+        let expected_combined_candidate_id = deterministic_prefixed_id(
+            "threadlane-native:coworker-combined-candidate:v1",
+            "cmb",
+            &[
+                &job.job_id,
+                &final_subject.candidate_tree_sha,
+                &request.request_key,
+            ],
+        );
+        let closure_reservation_id = match closure_reservation
             .as_ref()
-            .map(|o| o.attempt().attempt_id.clone());
+            .map(|o| o.attempt().attempt_id.clone())
+        {
+            Some(reserved_id) => Some(reserved_id),
+            None => job
+                .combined_candidates
+                .iter()
+                .find(|c| {
+                    c.request_key == request.request_key
+                        && c.combined_candidate_id == expected_combined_candidate_id
+                        && c.job_id == job.job_id
+                        && c.project_base == linkage.project_base
+                        && c.final_commit_sha.as_deref()
+                            == Some(final_subject.candidate_head_commit.as_str())
+                        && c.final_tree_sha == final_subject.candidate_tree_sha
+                        && c.plan_id == linkage.plan_id
+                        && c.plan_revision == linkage.plan_revision
+                        && c.plan_digest == linkage.plan_digest
+                        && c.approval_id == linkage.approval_id
+                        && c.approval_subject_digest == linkage.approval_subject_digest
+                        && c.scope_policy_revision == linkage.registry_revision
+                        && c.policy_id == linkage.policy_id
+                        && c.policy_digest == linkage.policy_digest
+                        && c.accepted_predecessor_receipts == predecessor_receipts
+                        && c.check_evidence == request.check_evidence
+                })
+                .and_then(|c| c.closure_reservation_id.clone()),
+        };
 
         let (updated_job, combined_candidate) =
             self.store

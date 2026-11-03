@@ -40,6 +40,8 @@ pub mod controller;
 /// per-task and job-wide correction/attempt/role budgets, declared interface-independence
 /// completeness receipts, derived correction attempt receipts, and per-job driver lease state.
 pub mod controller_policy;
+/// Final multi-worker job Git aggregation, candidate check execution, candidate assembly, and Closure stage.
+pub mod job_completion;
 /// Private per-job OS file-lock ownership, CSPRNG instance/challenge identity, and pre-effect validation.
 pub mod ownership;
 /// Asynchronous read-only Coworker planning and architectural advice service.
@@ -66,6 +68,7 @@ pub use checks::*;
 pub use contracts::*;
 pub use controller::*;
 pub use controller_policy::*;
+pub use job_completion::*;
 pub use ownership::*;
 pub use planning::*;
 pub use review::*;

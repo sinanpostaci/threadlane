@@ -3544,13 +3544,26 @@ impl CoworkerWorkflowStore {
 
                 // Restore tasks whose active_hold_ids are now empty and that are proven independent
                 // of any remaining active holds.
+                let linkage_policy_digest = job
+                    .approval_linkage
+                    .as_ref()
+                    .map(|l| l.policy_digest.clone());
+                let job_outbox = job.outbox.clone();
                 let mut snapshot_tasks = job.tasks.clone();
                 for candidate in &mut snapshot_tasks {
                     if candidate.stage == CoworkerTaskStage::Held
                         && candidate.active_hold_ids.is_empty()
                     {
                         if let Some(prev_stage) = candidate.stage_before_hold {
-                            candidate.stage = prev_stage;
+                            if candidate.stage.can_transition_to(prev_stage)
+                                || can_restore_held_integrated_task(
+                                    candidate,
+                                    &job_outbox,
+                                    linkage_policy_digest.as_deref(),
+                                )
+                            {
+                                candidate.stage = prev_stage;
+                            }
                         }
                     }
                 }
@@ -3569,7 +3582,13 @@ impl CoworkerWorkflowStore {
                                     CoworkerTaskStage::PendingDependencies
                                 }
                             });
-                            if task.stage.can_transition_to(prev) {
+                            if task.stage.can_transition_to(prev)
+                                || can_restore_held_integrated_task(
+                                    task,
+                                    &job_outbox,
+                                    linkage_policy_digest.as_deref(),
+                                )
+                            {
                                 task.stage = prev;
                                 task.stage_before_hold = None;
                             }
@@ -3905,6 +3924,94 @@ fn apply_hold_to_job_tasks(
     }
     job.job_revision = next_job_rev;
     Ok(())
+}
+
+fn can_restore_held_integrated_task(
+    task: &CoworkerTaskRecord,
+    outbox: &[OutboxDispatchRecord],
+    expected_policy_digest: Option<&str>,
+) -> bool {
+    if task.stage != CoworkerTaskStage::Held
+        || task.stage_before_hold != Some(CoworkerTaskStage::Integrated)
+        || !task.active_hold_ids.is_empty()
+        || task.unresolved_outbox_id.is_some()
+        || task.current_attempt_no == 0
+    {
+        return false;
+    }
+    if outbox
+        .iter()
+        .any(|o| o.task_id == task.task_id && o.status.blocks_replay_and_new_dispatch())
+    {
+        return false;
+    }
+    let Some(ref accepted_id) = task.accepted_candidate_id else {
+        return false;
+    };
+    if task.active_candidate_id.as_ref() != Some(accepted_id) {
+        return false;
+    }
+    let Some(cand) = task
+        .candidates
+        .iter()
+        .find(|c| &c.candidate_id == accepted_id)
+    else {
+        return false;
+    };
+    if cand.validate().is_err()
+        || cand.task_id != task.task_id
+        || cand.attempt_no != task.current_attempt_no
+    {
+        return false;
+    }
+    let Some(ref verdict) = cand.review_verdict else {
+        return false;
+    };
+    if !verdict.allows_acceptance() {
+        return false;
+    }
+    let Some(policy_digest) = expected_policy_digest else {
+        return false;
+    };
+    if !constant_time_str_eq(&verdict.policy_digest, policy_digest) {
+        return false;
+    }
+    let (Some(ref rev_receipt_id), Some(ref rev_subj_digest), Some(ref int_receipt_id)) = (
+        &cand.review_receipt_id,
+        &cand.review_subject_digest,
+        &cand.integration_receipt_id,
+    ) else {
+        return false;
+    };
+    if rev_receipt_id.trim().is_empty()
+        || rev_subj_digest.trim().is_empty()
+        || int_receipt_id.trim().is_empty()
+        || !constant_time_str_eq(&verdict.review_subject_digest, rev_subj_digest)
+    {
+        return false;
+    }
+    if !task.depends_on.is_empty()
+        && (task.dependency_input_commit.is_none()
+            || task.dependency_input_tree_sha.is_none()
+            || verify_direct_predecessor_receipts(
+                &task.depends_on,
+                &task.accepted_predecessor_receipts,
+            )
+            .is_err())
+    {
+        return false;
+    }
+    outbox.iter().any(|o| {
+        o.task_id == task.task_id
+            && o.attempt_no == cand.attempt_no
+            && o.kind == OutboxDispatchKind::TaskIntegration
+            && matches!(
+                o.status,
+                OutboxDispatchStatus::DispatchedEffectConfirmed
+                    | OutboxDispatchStatus::ReconciledConfirmed
+            )
+            && o.receipt_id.as_deref() == Some(int_receipt_id.as_str())
+    })
 }
 
 fn verify_direct_predecessor_receipts(

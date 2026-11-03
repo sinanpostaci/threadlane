@@ -2597,6 +2597,8 @@ pub enum PendingControllerEffectKind {
     ReviewerInvocation,
     /// Task worktree integration into an owned `RunIntegration` worktree.
     TaskIntegration,
+    /// Multi-worker job aggregation into the final owned `RunIntegration` worktree.
+    JobAggregation,
     /// Structured read-only Closure worker invocation.
     ClosureInvocation,
 }
@@ -2610,6 +2612,7 @@ impl PendingControllerEffectKind {
             Self::CheckExecution => "check_execution",
             Self::ReviewerInvocation => "reviewer_invocation",
             Self::TaskIntegration => "task_integration",
+            Self::JobAggregation => "job_aggregation",
             Self::ClosureInvocation => "closure_invocation",
         }
     }

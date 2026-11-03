@@ -15,31 +15,37 @@ use threadlane_host::{
 use threadlane_native::coworker_workflow::{
     compute_derived_coder_effect_id, compute_derived_coder_request_key,
     compute_derived_task_attempt_receipt_id, compute_task_integration_subject_digest,
-    compute_task_review_effect_id, compute_task_review_request_key, deterministic_prefixed_id,
-    deterministic_task_integration_receipt_id, deterministic_task_integration_request_key,
-    integrate_accepted_task, read_persisted_check_report, read_persisted_task_review_report,
-    sha256_hex, ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
-    ControllerConfigurationPreview, ControllerJobRuntimeState, ControllerPolicyStore,
-    ControllerRoleExecutionBudget, CoworkerControllerPhase1Status, CoworkerControllerService,
-    CoworkerControllerStepRequest, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
-    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
+    compute_task_review_effect_id, compute_task_review_request_key,
+    derive_final_job_integration_identifiers, derive_job_aggregation_receipt_id,
+    deterministic_prefixed_id, deterministic_task_integration_receipt_id,
+    deterministic_task_integration_request_key, integrate_accepted_task,
+    read_persisted_candidate_check_report, read_persisted_check_report,
+    read_persisted_job_integration_report, read_persisted_task_review_report, sha256_hex,
+    ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
+    ClosureExecutionArtifactRecord, CombinedCandidateStatus, ControllerConfigurationPreview,
+    ControllerJobRuntimeState, ControllerPolicyStore, ControllerRoleExecutionBudget,
+    CoworkerControllerPhase1Status, CoworkerControllerService, CoworkerControllerStepRequest,
+    CoworkerJobCompletionRequest, CoworkerJobCompletionService, CoworkerJobCompletionStatus,
+    CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
+    CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
     CoworkerTaskCorrectionDisposition, CoworkerTaskCorrectionPrepareRequest,
     CoworkerTaskCorrectionPrepareStatus, CoworkerTaskCorrectionService,
-    CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService, CoworkerTaskIntegrationStatus,
-    CoworkerTaskReviewStageRequest, CoworkerTaskReviewStageService, CoworkerTaskReviewStageStatus,
-    CoworkerTaskStage, CoworkerTaskVerificationOutcome, CoworkerTaskVerificationRequest,
-    CoworkerTaskVerificationService, CoworkerTaskVerificationStatus, CoworkerWorkflowStore,
-    CreateCoworkerJobRequest, CreatePlanningGrantRequest, ExpectedTaskReviewIdentity,
-    FinalizeTaskOutboxRequest, FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec,
-    FrozenCheckExecutionStatus, FrozenCheckKind, FrozenControllerCapabilityEnvelope,
-    OrchestrateWorkBriefPlanRequest, OutboxDispatchKind, OutboxDispatchStatus,
-    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
-    PlannedCheckSuggestion, PlanningCallBudget, PlanningReadOnlyCapabilities,
-    PlanningReservationStatus, RecordTaskReviewVerdictRequest, ReserveTaskOutboxRequest,
-    ResolveWorkflowHoldRequest, ReviewVerdictOutcome, StructuredOrchestratorOutput,
-    StructuredPlannedTask, StructuredReviewVerdict, StructuredTaskReviewModelResponse,
-    TaskCandidateRef, TaskInterfaceOwnershipSpec, TaskReviewExecutionStatus, WorkBrief,
-    WorkBriefKind, WorkflowHoldReason, TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+    CoworkerTaskIntegrationOutcome, CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService,
+    CoworkerTaskIntegrationStatus, CoworkerTaskReviewStageRequest, CoworkerTaskReviewStageService,
+    CoworkerTaskReviewStageStatus, CoworkerTaskStage, CoworkerTaskVerificationOutcome,
+    CoworkerTaskVerificationRequest, CoworkerTaskVerificationService,
+    CoworkerTaskVerificationStatus, CoworkerWorkflowStore, CreateCoworkerJobRequest,
+    CreatePlanningGrantRequest, ExpectedTaskReviewIdentity, FinalizeTaskOutboxRequest,
+    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckExecutionStatus,
+    FrozenCheckKind, FrozenControllerCapabilityEnvelope, OrchestrateWorkBriefPlanRequest,
+    OutboxDispatchKind, OutboxDispatchStatus, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, PlannedCheckSuggestion, PlanningCallBudget,
+    PlanningReadOnlyCapabilities, PlanningReservationStatus, RecordTaskReviewVerdictRequest,
+    ReserveTaskOutboxRequest, ResolveWorkflowHoldRequest, ReviewVerdictOutcome,
+    StructuredOrchestratorOutput, StructuredPlannedTask, StructuredReviewVerdict,
+    StructuredTaskReviewModelResponse, TaskCandidateRef, TaskInterfaceOwnershipSpec,
+    TaskReviewExecutionStatus, WorkBrief, WorkBriefKind, WorkflowHoldReason,
+    TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
 };
 use threadlane_native::{
     Difficulty, ExecutionPolicy, NativeErrorCode, PolicyAllowRule, RegistryStore,
@@ -47,14 +53,16 @@ use threadlane_native::{
 };
 use threadlane_operations::{
     accept_review_subject, commit_task_worktree_changes, execute_integration,
-    inspect_review_subject, load_integration_receipt, load_review_receipt,
-    verify_review_receipt_readonly, CommitTaskChangesRequest, ExecuteIntegrationRequest,
-    InspectReviewSubjectRequest, IntegrationStrategy, ReviewAcceptanceRequest, ReviewPolicyBinding,
+    inspect_job_integration_intent_readonly, inspect_review_subject, load_integration_receipt,
+    load_review_receipt, verify_review_receipt_readonly, ClosureVerdictKind,
+    CommitTaskChangesRequest, ExecuteIntegrationRequest, InspectReviewSubjectRequest,
+    IntegrationStrategy, JobIntegrationIntentState, ReviewAcceptanceRequest, ReviewPolicyBinding,
     ReviewReceipt, ReviewSubject, TestEvidenceSummary, RECEIPTS_SUBDIR,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, ExecutionBudgets,
-    WorkerFilePermissions, WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MANIFESTS_SUBDIR,
+    WorkerFilePermissions, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    MANIFESTS_SUBDIR,
 };
 use threadlane_workflow::{
     compile_plan_revision, ModelChoice, ModelDefinition, PlanChange, PlanStore, PlanTask,
@@ -134,13 +142,18 @@ fn write_fake_agy_script(
     prompt_file: &Path,
     plan_response_file: &Path,
 ) {
+    let root_dir = planning_count_file.parent().expect("fixture root dir");
+    let closure_count_file = root_dir.join("agy_closure_count.txt");
+    let closure_response_file = root_dir.join("agy_closure_response.json");
     let script = format!(
         r#"#!/bin/sh
 set -eu
 CODER_COUNT_FILE="{coder_count_file}"
 PLANNING_COUNT_FILE="{planning_count_file}"
+CLOSURE_COUNT_FILE="{closure_count_file}"
 PROMPT_FILE="{prompt_file}"
 PLAN_RESPONSE_FILE="{plan_response_file}"
+CLOSURE_RESPONSE_FILE="{closure_response_file}"
 
 MODEL=""
 EFFORT=""
@@ -171,6 +184,28 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ "$AGY_MODE" = "plan" ]; then
+    case "$PROMPT" in
+        *StructuredClosureModelResponse*)
+            cc=0
+            if [ -f "$CLOSURE_COUNT_FILE" ]; then
+                cc=$(cat "$CLOSURE_COUNT_FILE")
+            fi
+            cc=$((cc + 1))
+            printf "%s" "$cc" > "$CLOSURE_COUNT_FILE"
+            printf "%s" "$PROMPT" > "$PROMPT_FILE"
+            SUBJ_DIGEST=$(printf "%s\n" "$PROMPT" | sed -n 's/^subject_digest: //p' | head -n 1 | tr -d '\r ')
+            CAND_TREE=$(printf "%s\n" "$PROMPT" | sed -n 's/^candidate_tree_sha: //p' | head -n 1 | tr -d '\r ')
+            if [ -f "$CLOSURE_RESPONSE_FILE" ]; then
+                raw_resp=$(sed "s/__SUBJECT_DIGEST__/$SUBJ_DIGEST/g; s/__CANDIDATE_TREE_SHA__/$CAND_TREE/g" "$CLOSURE_RESPONSE_FILE")
+            else
+                raw_resp=$(printf '{{"schema_version":1,"subject_digest":"%s","candidate_tree_sha":"%s","outcome":"accepted","summary":"Final combined candidate verified and accepted.","findings":[]}}' "$SUBJ_DIGEST" "$CAND_TREE")
+            fi
+            printf '{{"event":"init","init":{{"session_id":"sess-agy-closure-%s","model":"%s"}}}}\n' "$cc" "$MODEL"
+            esc=$(printf "%s" "$raw_resp" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr '\n' ' ')
+            printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$esc"
+            exit 0
+            ;;
+    esac
     pc=0
     if [ -f "$PLANNING_COUNT_FILE" ]; then
         pc=$(cat "$PLANNING_COUNT_FILE")
@@ -181,7 +216,15 @@ if [ "$AGY_MODE" = "plan" ]; then
     esc=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$PLAN_RESPONSE_FILE" | tr '\n' ' ')
     printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$esc"
     exit 0
-fi
+fi"#,
+        coder_count_file = coder_count_file.display(),
+        planning_count_file = planning_count_file.display(),
+        closure_count_file = closure_count_file.display(),
+        prompt_file = prompt_file.display(),
+        plan_response_file = plan_response_file.display(),
+        closure_response_file = closure_response_file.display(),
+    );
+    let tail = r#"
 
 c=0
 if [ -f "$CODER_COUNT_FILE" ]; then
@@ -191,45 +234,41 @@ c=$((c + 1))
 printf "%s" "$c" > "$CODER_COUNT_FILE"
 
 printf "%s" "$PROMPT" > "$PROMPT_FILE"
-printf '{{"type":"init","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
+printf '{"type":"init","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
 
 if [ -d "src" ]; then
     case "$PROMPT" in
         *CTRL_TASK_A*)
-            printf "pub fn a() -> u32 {{ 100 }}\n" > "src/a.rs"
+            printf "pub fn a() -> u32 { 100 }\n" > "src/a.rs"
             ;;
         *CTRL_TASK_B*)
-            printf "pub fn b() -> u32 {{ 200 }}\n" > "src/b.rs"
+            printf "pub fn b() -> u32 { 200 }\n" > "src/b.rs"
             ;;
         *CTRL_TASK_C_ONLY_A*)
             if ! grep -q "100" "src/a.rs"; then
                 echo "expected integrated predecessor contents in src/a.rs" >&2
                 exit 3
             fi
-            printf "pub fn c() -> u32 {{ 300 }}\n" > "src/c.rs"
+            printf "pub fn c() -> u32 { 300 }\n" > "src/c.rs"
             ;;
         *CTRL_TASK_C*)
             if ! grep -q "100" "src/a.rs" || ! grep -q "200" "src/b.rs"; then
                 echo "expected integrated predecessor contents in src/a.rs and src/b.rs" >&2
                 exit 3
             fi
-            printf "pub fn c() -> u32 {{ 300 }}\n" > "src/c.rs"
+            printf "pub fn c() -> u32 { 300 }\n" > "src/c.rs"
             ;;
         *)
-            printf "pub fn a() -> u32 {{ 42 }}\n" > "src/a.rs"
+            printf "pub fn a() -> u32 { 42 }\n" > "src/a.rs"
             ;;
     esac
 fi
 
-printf '{{"type":"result","subtype":"success","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
+printf '{"type":"result","subtype":"success","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}\n' "$MODEL" "$EFFORT"
 exit 0
-"#,
-        coder_count_file = coder_count_file.display(),
-        planning_count_file = planning_count_file.display(),
-        prompt_file = prompt_file.display(),
-        plan_response_file = plan_response_file.display(),
-    );
-    write_executable_script(script_path, &script);
+"#;
+    let full_script = format!("{script}{tail}");
+    write_executable_script(script_path, &full_script);
 }
 
 fn read_invocation_count(path: &Path) -> u32 {
@@ -5785,4 +5824,1913 @@ exit 0
 
     session.release().expect("release session");
     host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_planned_approved_and_frozen_job_with_strategy(
+    fixture: &ControllerTestFixture,
+    brief_id: &str,
+    plan_id: &str,
+    tasks: Vec<PlanTask>,
+    task_interfaces: BTreeMap<String, TaskInterfaceOwnershipSpec>,
+    approved_write_paths: Vec<String>,
+    max_parallel: usize,
+    approval_budgets: ExecutionBudgets,
+    coder_budget: ControllerRoleExecutionBudget,
+    default_integration_strategy: IntegrationStrategy,
+) -> (CoworkerJobRecord, String) {
+    let pb = project_base(fixture);
+    let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+    let brief = sample_brief(fixture, brief_id);
+
+    let job = fixture
+        .workflow_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: format!("req_job_{brief_id}"),
+            expected_ledger_revision: None,
+            work_brief: brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job");
+
+    let grant = fixture
+        .workflow_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: format!("req_grant_{brief_id}"),
+            expected_ledger_revision: None,
+            project_base: pb,
+            profile_id: "profile-coworker".to_string(),
+            registry_revision: reg_snap.revision,
+            policy: planning_only_policy(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 4,
+                max_orchestrator_calls: 2,
+                max_architect_calls: 2,
+                max_timeout_ms_per_call: 30_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: 1_000,
+            expires_at_ms: 60_000,
+            operator_attested: true,
+        })
+        .expect("create planning grant");
+
+    let planned_tasks: Vec<StructuredPlannedTask> = tasks
+        .iter()
+        .map(|t| {
+            let iface = task_interfaces
+                .get(&t.id)
+                .cloned()
+                .unwrap_or(TaskInterfaceOwnershipSpec {
+                    owned_interfaces: Vec::new(),
+                    consumed_interfaces: Vec::new(),
+                });
+            StructuredPlannedTask {
+                task_id: t.id.clone(),
+                title: t.title.clone(),
+                description: t.instruction.clone(),
+                role: t.role,
+                difficulty: t.difficulty,
+                depends_on: t.depends_on.clone(),
+                allowed_write_paths: t.allowed_write_paths.clone(),
+                owned_interfaces: iface.owned_interfaces,
+                consumed_interfaces: iface.consumed_interfaces,
+                model_override: None,
+                tool_override: None,
+            }
+        })
+        .collect();
+    let structured_plan = StructuredOrchestratorOutput::Plan {
+        schema_version: 1,
+        summary: format!(
+            "Orchestrator technical implementation plan `{plan_id}` for brief `{brief_id}` with verified read-only supervision and structured task DAG."
+        ),
+        tasks: planned_tasks,
+        check_suggestions: vec![PlannedCheckSuggestion {
+            check_id: "cargo_test".to_string(),
+            command_summary: "cargo test --workspace".to_string(),
+            required: true,
+        }],
+        unconfirmed_proposal_notes: Vec::new(),
+        resolved_open_questions: Vec::new(),
+        deferred_proposals: Vec::new(),
+    };
+    let plan_json = serde_json::to_string(&structured_plan)
+        .expect("serialize StructuredOrchestratorOutput::Plan");
+    fs::write(&fixture.agy_plan_response_file, &plan_json).expect("write agy_plan_response_file");
+
+    let orch_req_key = format!("req_orch_{brief_id}");
+    let plan_outcome = fixture
+        .planning_service
+        .orchestrate_brief_to_plan(
+            &fixture.scoped_workflow,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant.grant_id.clone(),
+                job_id: job.job_id.clone(),
+                request_key: orch_req_key,
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                architect_difficulty: Some(Difficulty::Hard),
+                plan_id: Some(plan_id.to_string()),
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                current_time_ms: 2_000,
+            },
+        )
+        .await
+        .expect("orchestrate_brief_to_plan via real planning service");
+    assert_eq!(
+        plan_outcome.reservation.status,
+        PlanningReservationStatus::Completed
+    );
+    let published_outcome = plan_outcome
+        .require_published_plan()
+        .expect("require published plan from Orchestrator");
+    let _verified_artifact = fixture
+        .planning_service
+        .read_planning_artifact(&published_outcome.planning_result.report_artifact_id)
+        .expect("verify persisted planning artifact on disk");
+
+    let job = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after orchestrate_brief_to_plan")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("find job after orchestrate_brief_to_plan");
+    assert_eq!(job.phase, CoworkerJobPhase::AwaitingApproval);
+
+    let approved_task_ids = tasks.iter().map(|t| t.id.clone()).collect();
+    let approval_summary = fixture
+        .authority
+        .approve_at(
+            OperatorApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: published_outcome.planning_result.plan_id.clone(),
+                plan_revision: published_outcome.planning_result.plan_revision,
+                expected_registry_revision: reg_snap.revision,
+                expected_plan_digest: published_outcome.planning_result.plan_digest.clone(),
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids,
+                approved_write_paths,
+                max_parallel,
+                budgets: approval_budgets,
+            },
+            1_700_000_001_000,
+        )
+        .expect("approve plan");
+
+    let cap_env = FrozenControllerCapabilityEnvelope {
+        allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
+        allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
+        max_in_scope_correction_attempts: 1,
+        allowed_check_ids: vec!["cargo_test".to_string()],
+        local_git_integration_allowed: true,
+    };
+
+    let bound_job = fixture
+        .workflow_store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id,
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                approval_id: approval_summary.approval_id.clone(),
+                policy: execution_policy(),
+                controller_envelope: Some(cap_env),
+                task_interfaces,
+            },
+            &fixture.authority,
+        )
+        .expect("bind job approval");
+
+    let mut role_budgets = BTreeMap::new();
+    role_budgets.insert(WorkflowRole::Coder, coder_budget);
+    role_budgets.insert(
+        WorkflowRole::Reviewer,
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 4),
+    );
+    role_budgets.insert(
+        WorkflowRole::Closure,
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Closure, 2),
+    );
+
+    let preview_req = FreezeControllerExecutionEnvelopeRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: bound_job.job_id.clone(),
+        expected_job_revision: bound_job.job_revision,
+        policy: execution_policy(),
+        reviewer_choice: headless_argon_choice(Difficulty::Hard),
+        closure_choice: headless_argon_choice(Difficulty::Extreme),
+        role_budgets,
+        max_in_scope_corrections_per_task: 1,
+        max_total_corrections_per_job: 2,
+        max_total_task_attempts_per_job: 6,
+        check_commands: default_check_commands(fixture),
+        allow_task_worktree_commits: true,
+        allow_run_integration_execution: true,
+        default_integration_strategy,
+        independence_completeness_receipt: None,
+        shadow_jev_policy: None,
+        created_at_ms: 1_700_000_100_000,
+        operator_attested: false,
+        confirm_approval_subject_digest: None,
+        confirm_envelope_digest: None,
+    };
+    let preview: ControllerConfigurationPreview = fixture
+        .policy_store
+        .preview_execution_envelope(&preview_req, &bound_job, &fixture.authority)
+        .expect("preview execution envelope");
+    let mut freeze_req = preview_req;
+    freeze_req.operator_attested = true;
+    freeze_req.confirm_approval_subject_digest = Some(preview.approval_subject_digest);
+    freeze_req.confirm_envelope_digest = Some(preview.envelope_digest);
+    fixture
+        .policy_store
+        .record_execution_envelope(&freeze_req, &bound_job, &fixture.authority)
+        .expect("record execution envelope");
+
+    (bound_job, approval_summary.approval_id)
+}
+
+async fn run_verify_accept_and_integrate_two_roots(
+    fixture: &ControllerTestFixture,
+    integration_service: &CoworkerTaskIntegrationService,
+    session: &threadlane_native::coworker_workflow::OwnedCoworkerControllerSession,
+    job_id: &str,
+    task_a_id: &str,
+    task_b_id: &str,
+    base_time_ms: u64,
+) -> (
+    CoworkerTaskIntegrationOutcome,
+    CoworkerTaskIntegrationOutcome,
+) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut step_ts = base_time_ms;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs_a = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_a_id)
+            .expect("task A observation");
+        let obs_b = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_b_id)
+            .expect("task B observation");
+        if obs_a.stage == CoworkerTaskStage::ReadyForReview
+            && obs_b.stage == CoworkerTaskStage::ReadyForReview
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for two root tasks ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let _ = verify_and_accept_task_without_integrating(
+        fixture,
+        session.guard(),
+        job_id,
+        task_a_id,
+        "src/a.rs",
+        step_ts,
+        i64::try_from(step_ts + 1_000).expect("fixture approved_at_ms fits in i64"),
+    )
+    .await;
+
+    let int_out_a = integration_service
+        .integrate_accepted_task(
+            session.guard(),
+            &CoworkerTaskIntegrationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_id.to_string(),
+                task_id: task_a_id.to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 2_000,
+            },
+        )
+        .expect("integrate_accepted_task for task A");
+    assert_eq!(int_out_a.status, CoworkerTaskIntegrationStatus::Integrated);
+
+    let _ = verify_and_accept_task_without_integrating(
+        fixture,
+        session.guard(),
+        job_id,
+        task_b_id,
+        "src/b.rs",
+        step_ts + 3_000,
+        i64::try_from(step_ts + 4_000).expect("fixture approved_at_ms fits in i64"),
+    )
+    .await;
+
+    let int_out_b = integration_service
+        .integrate_accepted_task(
+            session.guard(),
+            &CoworkerTaskIntegrationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_id.to_string(),
+                task_id: task_b_id.to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 5_000,
+            },
+        )
+        .expect("integrate_accepted_task for task B");
+    assert_eq!(int_out_b.status, CoworkerTaskIntegrationStatus::Integrated);
+
+    (int_out_a, int_out_b)
+}
+
+#[tokio::test]
+async fn job_completion_aggregates_two_integrated_root_tasks_preserves_original_receipts_and_reopens_idempotently(
+) {
+    let fixture = setup_fixture();
+    let tmp_root = fs::canonicalize(fixture._tmp.path()).expect("canonicalize tmp root");
+    let integration_service = CoworkerTaskIntegrationService::new(fixture.controller.clone());
+    let completion_service =
+        CoworkerJobCompletionService::from_controller(fixture.controller.clone())
+            .expect("construct CoworkerJobCompletionService from controller");
+
+    // 1. First verify that two divergent root tasks frozen with `FastForwardOnly` are refused
+    // pre-effect without silent strategy fallback or second-task Git mutation.
+    let ff_tasks = vec![
+        PlanTask {
+            id: "task-ff-a".to_string(),
+            title: "Task FF A".to_string(),
+            instruction: "CTRL_TASK_A update src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-ff-b".to_string(),
+            title: "Task FF B".to_string(),
+            instruction: "CTRL_TASK_B update src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let mut ff_ifaces = BTreeMap::new();
+    ff_ifaces.insert(
+        "task-ff-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_a::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    ff_ifaces.insert(
+        "task-ff-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_b::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (ff_job, ff_approval_id) = create_planned_approved_and_frozen_job_with_strategy(
+        &fixture,
+        "brf_job_agg_ff_refusal",
+        "plan-job-agg-ff-refusal",
+        ff_tasks,
+        ff_ifaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        IntegrationStrategy::FastForwardOnly,
+    )
+    .await;
+
+    let ff_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &ff_approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for ff_job");
+
+    let ff_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &ff_job.job_id, 1_700_005_000_000)
+        .expect("open controller session for ff_job");
+    let _ = run_verify_accept_and_integrate_two_roots(
+        &fixture,
+        &integration_service,
+        &ff_session,
+        &ff_job.job_id,
+        "task-ff-a",
+        "task-ff-b",
+        1_700_005_001_000,
+    )
+    .await;
+
+    let ff_err = completion_service
+        .aggregate_integrated_job(
+            ff_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: ff_job.job_id.clone(),
+                now_ms: 1_700_005_020_000,
+            },
+        )
+        .await
+        .expect_err("FastForwardOnly on two divergent root commits must fail closed without strategy fallback");
+    assert_eq!(ff_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    drop(ff_session);
+    ff_host.shutdown().await.expect("shutdown ff_host");
+
+    // 2. Now create the two-root job frozen with `IntegrationStrategy::MergeNoFf`.
+    let tasks = vec![
+        PlanTask {
+            id: "task-agg-a".to_string(),
+            title: "Task Agg A".to_string(),
+            instruction: "CTRL_TASK_A update src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-agg-b".to_string(),
+            title: "Task Agg B".to_string(),
+            instruction: "CTRL_TASK_B update src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let mut ifaces = BTreeMap::new();
+    ifaces.insert(
+        "task-agg-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_a::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    ifaces.insert(
+        "task-agg-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_b::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job_with_strategy(
+        &fixture,
+        "brf_job_agg_two_roots",
+        "plan-job-agg-two-roots",
+        tasks,
+        ifaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        IntegrationStrategy::MergeNoFf,
+    )
+    .await;
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for job");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_005_100_000)
+        .expect("open owner session");
+
+    let (int_out_a, int_out_b) = run_verify_accept_and_integrate_two_roots(
+        &fixture,
+        &integration_service,
+        &session,
+        &job.job_id,
+        "task-agg-a",
+        "task-agg-b",
+        1_700_005_101_000,
+    )
+    .await;
+    assert_ne!(
+        int_out_a.integration_worktree_id, int_out_b.integration_worktree_id,
+        "two root tasks must have distinct per-worker integration worktrees"
+    );
+
+    let orig_receipt_id_a = int_out_a.integration_receipt.receipt_id.clone();
+    let orig_receipt_id_b = int_out_b.integration_receipt.receipt_id.clone();
+    let orig_receipt_a_disk =
+        load_integration_receipt(host_handle.work_area_dir(), &orig_receipt_id_a)
+            .expect("load orig receipt A");
+    let orig_receipt_b_disk =
+        load_integration_receipt(host_handle.work_area_dir(), &orig_receipt_id_b)
+            .expect("load orig receipt B");
+    assert!(orig_receipt_a_disk.job_aggregation.is_none());
+    assert!(orig_receipt_b_disk.job_aggregation.is_none());
+
+    let closure_count_file = tmp_root.join("agy_closure_count.txt");
+    let closure_calls_before = read_invocation_count(&closure_count_file);
+
+    // 3. Run real multi-worker Git aggregation (`aggregate_integrated_job`).
+    let agg_req = CoworkerJobCompletionRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        now_ms: 1_700_005_120_000,
+    };
+    let agg_outcome = completion_service
+        .aggregate_integrated_job(session.guard(), &agg_req)
+        .await
+        .expect("aggregate_integrated_job on two integrated root tasks");
+
+    assert!(!agg_outcome.reused_existing_receipts);
+    assert_eq!(agg_outcome.approved_base_commit, fixture.base_commit);
+    assert_ne!(
+        agg_outcome.final_integrated_target_commit,
+        fixture.base_commit
+    );
+    assert_ne!(
+        agg_outcome.final_integrated_target_commit,
+        int_out_a.integrated_target_commit
+    );
+    assert_ne!(
+        agg_outcome.final_integrated_target_commit,
+        int_out_b.integrated_target_commit
+    );
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_calls_before,
+        "aggregate_integrated_job must not invoke Closure"
+    );
+
+    // Verify deterministic target identifiers match `derive_final_job_integration_identifiers`.
+    let runtime_state = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read runtime")
+        .expect("runtime exists");
+    let (expected_run_id, expected_token, expected_wt_id, expected_branch) =
+        derive_final_job_integration_identifiers(
+            &job.job_id,
+            &approval_id,
+            &runtime_state.envelope.approval_subject_digest,
+        );
+    assert_eq!(agg_outcome.target_integration_run_id, expected_run_id);
+    assert_eq!(agg_outcome.target_integration_token, expected_token);
+    assert_eq!(agg_outcome.integration_worktree_id, expected_wt_id);
+    assert_eq!(agg_outcome.integration_branch_name, expected_branch);
+
+    // Verify the final owned `RunIntegration` checkout contains both worker changes and unmodified `src/c.rs`.
+    let final_wt_path = &agg_outcome.integration_checkout_path;
+    assert_eq!(
+        fs::read_to_string(final_wt_path.join("src/a.rs")).expect("read final src/a.rs"),
+        "pub fn a() -> u32 { 100 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(final_wt_path.join("src/b.rs")).expect("read final src/b.rs"),
+        "pub fn b() -> u32 { 200 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(final_wt_path.join("src/c.rs")).expect("read final src/c.rs"),
+        "pub fn c() -> u32 { 3 }\n"
+    );
+    let actual_final_head =
+        resolve_exact_commit_sha(final_wt_path, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve final wt HEAD");
+    let actual_final_tree =
+        resolve_exact_tree_sha(final_wt_path, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve final wt tree");
+    assert_eq!(
+        actual_final_head,
+        agg_outcome.final_integrated_target_commit
+    );
+    assert_eq!(actual_final_tree, agg_outcome.final_integrated_tree_sha);
+
+    // Primary user source checkout remains untouched at `fixture.base_commit`.
+    assert_eq!(
+        resolve_exact_commit_sha(&fixture.repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("primary repo HEAD"),
+        fixture.base_commit
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo_dir.join("src/a.rs")).expect("primary src/a.rs"),
+        "pub fn a() -> u32 { 1 }\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo_dir.join("src/b.rs")).expect("primary src/b.rs"),
+        "pub fn b() -> u32 { 2 }\n"
+    );
+
+    // Verify `WorktreeManifest` ownership and `JobIntegrationIntent` state on disk.
+    let manifest_path = host_handle
+        .work_area_dir()
+        .join("manifests")
+        .join(format!("{expected_wt_id}.json"));
+    let manifest_raw = fs::read_to_string(&manifest_path).expect("read final worktree manifest");
+    let manifest: threadlane_workers::WorktreeManifest =
+        serde_json::from_str(&manifest_raw).expect("parse final worktree manifest");
+    assert_eq!(manifest.kind, WorktreeKind::RunIntegration);
+    assert_eq!(manifest.worktree_id, expected_wt_id);
+    assert_eq!(manifest.run_id, expected_run_id);
+    assert_eq!(manifest.base_commit, fixture.base_commit);
+
+    let intent =
+        inspect_job_integration_intent_readonly(host_handle.work_area_dir(), &expected_wt_id)
+            .expect("inspect job integration intent")
+            .expect("job integration intent exists");
+    assert_eq!(intent.state, JobIntegrationIntentState::Completed);
+    assert_eq!(
+        intent.final_integrated_target_commit.as_deref(),
+        Some(agg_outcome.final_integrated_target_commit.as_str())
+    );
+    assert_eq!(intent.tasks.len(), 2);
+
+    // Verify two additional aggregate `IntegrationReceipt` records exist with `job_aggregation.is_some()`
+    // and that the original per-worker receipts on task candidates and disk are completely unchanged.
+    let expected_agg_rcp_a = derive_job_aggregation_receipt_id(
+        &job.job_id,
+        &expected_run_id,
+        &expected_wt_id,
+        "task-agg-a",
+        &int_out_a.review_receipt_id,
+    );
+    let expected_agg_rcp_b = derive_job_aggregation_receipt_id(
+        &job.job_id,
+        &expected_run_id,
+        &expected_wt_id,
+        "task-agg-b",
+        &int_out_b.review_receipt_id,
+    );
+    assert_eq!(intent.tasks[0].planned_receipt_id, expected_agg_rcp_a);
+    assert_eq!(intent.tasks[1].planned_receipt_id, expected_agg_rcp_b);
+
+    let agg_rcp_a = load_integration_receipt(host_handle.work_area_dir(), &expected_agg_rcp_a)
+        .expect("load agg rcp A");
+    let agg_rcp_b = load_integration_receipt(host_handle.work_area_dir(), &expected_agg_rcp_b)
+        .expect("load agg rcp B");
+    assert!(agg_rcp_a.job_aggregation.is_some());
+    assert!(agg_rcp_b.job_aggregation.is_some());
+    let agg_meta_a = agg_rcp_a
+        .job_aggregation
+        .as_ref()
+        .expect("job_aggregation A");
+    let agg_meta_b = agg_rcp_b
+        .job_aggregation
+        .as_ref()
+        .expect("job_aggregation B");
+    assert_eq!(agg_meta_a.logical_task_id, "task-agg-a");
+    assert_eq!(agg_meta_a.target_integration_run_id, expected_run_id);
+    assert_eq!(agg_meta_a.batch_step_index, 0);
+    assert_eq!(agg_meta_a.batch_total_tasks, 2);
+    assert_eq!(agg_meta_a.approved_base_commit, fixture.base_commit);
+    assert_eq!(agg_meta_b.logical_task_id, "task-agg-b");
+    assert_eq!(agg_meta_b.target_integration_run_id, expected_run_id);
+    assert_eq!(agg_meta_b.batch_step_index, 1);
+    assert_eq!(agg_meta_b.batch_total_tasks, 2);
+    assert_eq!(agg_meta_b.approved_base_commit, fixture.base_commit);
+
+    assert_eq!(
+        agg_rcp_a.previous_integration_head_commit, fixture.base_commit,
+        "first step integrates onto approved base_commit"
+    );
+    assert_eq!(
+        agg_rcp_b.previous_integration_head_commit, agg_rcp_a.integrated_target_commit,
+        "second step integrates onto first step's target commit"
+    );
+    assert_eq!(
+        agg_rcp_b.integrated_target_commit,
+        agg_outcome.final_integrated_target_commit
+    );
+
+    // Original per-worker receipts on disk and in the workflow ledger are untouched.
+    assert_eq!(
+        load_integration_receipt(host_handle.work_area_dir(), &orig_receipt_id_a)
+            .expect("reload orig receipt A"),
+        orig_receipt_a_disk
+    );
+    assert_eq!(
+        load_integration_receipt(host_handle.work_area_dir(), &orig_receipt_id_b)
+            .expect("reload orig receipt B"),
+        orig_receipt_b_disk
+    );
+    let ledger_after = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger after aggregation");
+    let job_after = ledger_after
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("job after aggregation");
+    for (task_id, expected_orig_rcp_id) in [
+        ("task-agg-a", &orig_receipt_id_a),
+        ("task-agg-b", &orig_receipt_id_b),
+    ] {
+        let task_rec = job_after
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .expect("find task");
+        assert_eq!(task_rec.stage, CoworkerTaskStage::Integrated);
+        let cand_id = task_rec
+            .active_candidate_id
+            .as_deref()
+            .expect("active_candidate_id");
+        let cand = task_rec
+            .candidates
+            .iter()
+            .find(|c| c.candidate_id == cand_id)
+            .expect("find candidate");
+        assert_eq!(
+            cand.integration_receipt_id.as_deref(),
+            Some(expected_orig_rcp_id.as_str()),
+            "task candidate must preserve original per-worker integration_receipt_id"
+        );
+    }
+
+    // Verify private (`0600`) persisted `JobIntegrationReport` artifact on disk.
+    let report_meta =
+        fs::symlink_metadata(&agg_outcome.report_artifact_path).expect("stat report_artifact_path");
+    assert_eq!(report_meta.permissions().mode() & 0o777, 0o600);
+    let persisted_report = read_persisted_job_integration_report(
+        &fixture.plans_dir,
+        &agg_outcome.aggregation_effect_id,
+    )
+    .expect("read_persisted_job_integration_report")
+    .expect("persisted job integration report exists");
+    assert_eq!(persisted_report, agg_outcome.job_integration_report);
+
+    // 4. Drop session, reopen controller session, and re-run `aggregate_integrated_job`:
+    // must reuse the existing verified receipt chain and `RunIntegration` worktree idempotently
+    // without creating a new Git commit.
+    drop(session);
+
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_005_129_000)
+        .expect("reopen owner session");
+    let agg_reopen = completion_service
+        .aggregate_integrated_job(
+            reopened_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                now_ms: 1_700_005_130_000,
+            },
+        )
+        .await
+        .expect("re-run aggregate_integrated_job after reopen");
+    assert!(agg_reopen.reused_existing_receipts);
+    assert_eq!(
+        agg_reopen.final_integrated_target_commit,
+        agg_outcome.final_integrated_target_commit
+    );
+    assert_eq!(
+        agg_reopen.final_integrated_tree_sha,
+        agg_outcome.final_integrated_tree_sha
+    );
+    assert_eq!(
+        resolve_exact_commit_sha(final_wt_path, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("final wt HEAD after reopen"),
+        agg_outcome.final_integrated_target_commit
+    );
+
+    drop(reopened_session);
+    host_handle.shutdown().await.expect("shutdown host_handle");
+}
+
+#[tokio::test]
+async fn job_completion_executes_frozen_candidate_checks_assembles_candidate_and_runs_supervised_closure_once(
+) {
+    let fixture = setup_fixture();
+    let tmp_root = fs::canonicalize(fixture._tmp.path()).expect("canonicalize tmp root");
+    let integration_service = CoworkerTaskIntegrationService::new(fixture.controller.clone());
+    let completion_service =
+        CoworkerJobCompletionService::from_controller(fixture.controller.clone())
+            .expect("construct CoworkerJobCompletionService from controller");
+
+    let closure_count_file = tmp_root.join("agy_closure_count.txt");
+    let closure_resp_file = tmp_root.join("agy_closure_response.json");
+    let run_cargo_count_file = tmp_root.join("run_integration_cargo_count.txt");
+    let cargo_invocation_log = tmp_root.join("cargo_invocation.log");
+
+    // Configure `fake_cargo_exe` so that when it runs inside the final `RunIntegration` worktree
+    // (`wt-run-*`), it verifies both `src/a.rs` and `src/b.rs` are present with their integrated
+    // contents and increments `run_integration_cargo_count.txt`.
+    let cargo_script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+echo "cargo $*" >> "{log}"
+if [[ "$PWD" == *"wt-run-"* ]]; then
+  grep -q "100" src/a.rs
+  grep -q "200" src/b.rs
+  grep -q "3" src/c.rs
+  COUNT_FILE="{run_count}"
+  COUNT=0
+  if [ -f "$COUNT_FILE" ]; then
+    COUNT=$(cat "$COUNT_FILE")
+  fi
+  echo $((COUNT + 1)) > "$COUNT_FILE"
+fi
+echo "test result: ok. 3 passed; 0 failed"
+exit 0
+"#,
+        log = cargo_invocation_log.display(),
+        run_count = run_cargo_count_file.display(),
+    );
+    write_executable_script(&fixture.fake_cargo_exe, &cargo_script);
+
+    // 1. First verify on a separate two-root job that a structured non-accepting Closure response
+    // (even with positive-sounding prose in `summary`) returns `ClosureNotAccepted` and does not
+    // transition the job to `Completed`.
+    let na_tasks = vec![
+        PlanTask {
+            id: "task-na-a".to_string(),
+            title: "Task NA A".to_string(),
+            instruction: "CTRL_TASK_A update src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-na-b".to_string(),
+            title: "Task NA B".to_string(),
+            instruction: "CTRL_TASK_B update src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let mut na_ifaces = BTreeMap::new();
+    na_ifaces.insert(
+        "task-na-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_a::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    na_ifaces.insert(
+        "task-na-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_b::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (na_job, na_approval_id) = create_planned_approved_and_frozen_job_with_strategy(
+        &fixture,
+        "brf_job_comp_non_accept",
+        "plan-job-comp-non-accept",
+        na_tasks,
+        na_ifaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        IntegrationStrategy::MergeNoFf,
+    )
+    .await;
+
+    let na_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &na_approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for na_job");
+
+    let na_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &na_job.job_id, 1_700_006_000_000)
+        .expect("open na_session");
+    let _ = run_verify_accept_and_integrate_two_roots(
+        &fixture,
+        &integration_service,
+        &na_session,
+        &na_job.job_id,
+        "task-na-a",
+        "task-na-b",
+        1_700_006_001_000,
+    )
+    .await;
+
+    fs::write(
+        &closure_resp_file,
+        r#"{"schema_version":1,"subject_digest":"__SUBJECT_DIGEST__","candidate_tree_sha":"__CANDIDATE_TREE_SHA__","outcome":"rejected","summary":"Everything looks accepted in prose, but structured outcome is rejected.","findings":["Cross-module boundary mismatch between src/a.rs and src/b.rs."]}"#,
+    )
+    .expect("write rejected agy_closure_response.json");
+
+    let na_outcome = completion_service
+        .complete_job(
+            na_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: na_job.job_id.clone(),
+                now_ms: 1_700_006_020_000,
+            },
+        )
+        .await
+        .expect("complete_job with rejected Closure verdict");
+    assert_eq!(
+        na_outcome.status,
+        CoworkerJobCompletionStatus::ClosureNotAccepted
+    );
+    assert!(!na_outcome.is_completed());
+    assert_ne!(na_outcome.job.phase, CoworkerJobPhase::Completed);
+    assert_eq!(
+        na_outcome
+            .closure_verdict
+            .as_ref()
+            .expect("closure_verdict present")
+            .kind,
+        ClosureVerdictKind::Rejected
+    );
+    drop(na_session);
+    na_host.shutdown().await.expect("shutdown na_host");
+    fs::remove_file(&closure_resp_file).expect("remove rejected agy_closure_response.json");
+
+    // 2. Now run the full happy-path completion flow on a two-root job.
+    let tasks = vec![
+        PlanTask {
+            id: "task-comp-a".to_string(),
+            title: "Task Comp A".to_string(),
+            instruction: "CTRL_TASK_A update src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-comp-b".to_string(),
+            title: "Task Comp B".to_string(),
+            instruction: "CTRL_TASK_B update src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let mut ifaces = BTreeMap::new();
+    ifaces.insert(
+        "task-comp-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_a::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    ifaces.insert(
+        "task-comp-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_b::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job_with_strategy(
+        &fixture,
+        "brf_job_comp_accept",
+        "plan-job-comp-accept",
+        tasks,
+        ifaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        IntegrationStrategy::MergeNoFf,
+    )
+    .await;
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for job");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_006_100_000)
+        .expect("open owner session");
+
+    let _ = run_verify_accept_and_integrate_two_roots(
+        &fixture,
+        &integration_service,
+        &session,
+        &job.job_id,
+        "task-comp-a",
+        "task-comp-b",
+        1_700_006_101_000,
+    )
+    .await;
+
+    let closure_before = read_invocation_count(&closure_count_file);
+    let run_cargo_before = read_invocation_count(&run_cargo_count_file);
+
+    let comp_req = CoworkerJobCompletionRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        now_ms: 1_700_006_120_000,
+    };
+    let outcome = completion_service
+        .complete_job(session.guard(), &comp_req)
+        .await
+        .expect("complete_job happy path");
+
+    assert_eq!(outcome.status, CoworkerJobCompletionStatus::Completed);
+    assert!(outcome.is_completed());
+    assert_eq!(outcome.job.phase, CoworkerJobPhase::Completed);
+    assert!(outcome.failed_check_id.is_none());
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_before + 1,
+        "Closure must be invoked exactly once for the combined candidate"
+    );
+    assert_eq!(
+        read_invocation_count(&run_cargo_count_file),
+        run_cargo_before + 1,
+        "frozen candidate check must execute once on the final RunIntegration worktree"
+    );
+
+    // Verify `CombinedCandidateIdentity`, `FinalCandidateSubject`, and `ClosureVerdict`.
+    let combined_candidate = outcome
+        .combined_candidate
+        .as_ref()
+        .expect("combined_candidate present");
+    assert_eq!(
+        combined_candidate.status,
+        CombinedCandidateStatus::ClosureAccepted
+    );
+    assert_eq!(
+        combined_candidate.final_tree_sha,
+        outcome.aggregation.final_integrated_tree_sha
+    );
+    let final_subject = outcome
+        .final_candidate_subject
+        .as_ref()
+        .expect("final_candidate_subject present");
+    let closure_verdict = outcome
+        .closure_verdict
+        .as_ref()
+        .expect("closure_verdict present");
+    assert_eq!(closure_verdict.kind, ClosureVerdictKind::Accepted);
+    closure_verdict
+        .verify_against_subject(final_subject)
+        .expect("closure_verdict must verify against FinalCandidateSubject");
+
+    // Verify a tampered subject digest is rejected by `ClosureVerdict::verify_against_subject`.
+    let mut tampered_subject = final_subject.clone();
+    tampered_subject.subject_digest = "f".repeat(64);
+    assert!(
+        closure_verdict
+            .verify_against_subject(&tampered_subject)
+            .is_err(),
+        "closure_verdict bound to wrong subject_digest must fail verification"
+    );
+
+    // Verify Closure role budget reservation and completion accounting.
+    let runtime_after = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read runtime")
+        .expect("runtime exists");
+    let closure_usage = runtime_after
+        .role_usage
+        .get(&WorkflowRole::Closure)
+        .expect("Closure role usage");
+    assert_eq!(closure_usage.calls_reserved, 1);
+    assert_eq!(closure_usage.calls_completed, 1);
+
+    // Verify private (`0600`) persisted candidate check report on disk and context binding.
+    assert_eq!(outcome.check_reports.len(), 1);
+    let check_ref = &outcome.check_reports[0];
+    assert_eq!(check_ref.check_id, "cargo_test");
+    let check_meta = fs::symlink_metadata(&check_ref.report_path).expect("stat check report path");
+    assert_eq!(check_meta.permissions().mode() & 0o777, 0o600);
+    let persisted_check_report =
+        read_persisted_candidate_check_report(&fixture.plans_dir, &check_ref.effect_id)
+            .expect("read_persisted_candidate_check_report")
+            .expect("persisted candidate check report exists");
+    assert_eq!(persisted_check_report, check_ref.report);
+    let frozen_check_spec = runtime_after
+        .envelope
+        .check_commands
+        .get(&check_ref.check_id)
+        .expect("frozen check command spec for cargo_test");
+    persisted_check_report
+        .verify_against_context(&outcome.check_subject, frozen_check_spec)
+        .expect("candidate check report must verify against frozen spec and check subject");
+
+    // Verify bounded advisory `closure_artifacts` on the completed runtime state and private full sidecar.
+    let closure_outcome = outcome
+        .closure_outcome
+        .as_ref()
+        .expect("closure_outcome present");
+    assert_eq!(runtime_after.closure_artifacts.len(), 1);
+    let closure_artifact = runtime_after
+        .closure_artifacts
+        .get(&closure_outcome.attempt.attempt_id)
+        .expect("closure artifact keyed by attempt_id");
+    assert_eq!(
+        closure_artifact.attempt_id,
+        closure_outcome.attempt.attempt_id
+    );
+    assert_eq!(
+        closure_artifact.command_key,
+        closure_outcome.attempt.command_key
+    );
+    assert_eq!(
+        closure_artifact.subject_digest,
+        final_subject.subject_digest
+    );
+    assert_eq!(
+        closure_artifact.candidate_tree_sha,
+        final_subject.candidate_tree_sha
+    );
+    assert!(!closure_artifact.fenced_from_promotion);
+    assert!(closure_artifact.diagnostic.is_none());
+    assert!(
+        closure_artifact.artifact_ref.is_some(),
+        "new Closure artifact record must store private full sidecar reference"
+    );
+    assert!(
+        closure_artifact.execution_report.is_none(),
+        "inline execution_report must be None when private full sidecar is used"
+    );
+    assert!(
+        closure_artifact.advisory_response.is_none(),
+        "inline advisory_response must be None when private full sidecar is used"
+    );
+    assert!(
+        closure_artifact.response_error.is_none(),
+        "inline response_error must be None when private full sidecar is used"
+    );
+
+    let loaded_closure_artifact = fixture
+        .policy_store
+        .load_closure_execution_artifact(
+            BINDING_A,
+            THREAD_UUID_A,
+            &job.job_id,
+            &closure_outcome.attempt.attempt_id,
+        )
+        .expect("load closure execution artifact sidecar");
+    let loaded_closure_for_record = fixture
+        .policy_store
+        .load_closure_execution_artifact_for_record(
+            BINDING_A,
+            THREAD_UUID_A,
+            &job.job_id,
+            closure_artifact,
+        )
+        .expect("load closure execution artifact for record");
+    assert_eq!(loaded_closure_artifact, loaded_closure_for_record);
+    assert_eq!(
+        loaded_closure_artifact.execution_report.status,
+        WorkerRunStatus::Succeeded
+    );
+    assert_eq!(loaded_closure_artifact.execution_report.exit_code, Some(0));
+    assert!(!loaded_closure_artifact.execution_report.cleanup_incomplete);
+    assert!(loaded_closure_artifact.response_error.is_none());
+    let closure_role_budget = runtime_after
+        .envelope
+        .role_budgets
+        .get(&WorkflowRole::Closure)
+        .expect("Closure frozen role budget");
+    loaded_closure_artifact
+        .advisory_response
+        .as_ref()
+        .expect("closure advisory_response present in sidecar")
+        .validate_integrity(closure_role_budget.max_structured_response_bytes)
+        .expect("closure advisory_response integrity");
+
+    // 3. Re-invoke `complete_job` on the same session and after releasing/reopening the session:
+    // must reuse the cached `Accepted` verdict and persisted candidate check report without a
+    // second `Closure` model invocation, second check execution, or redundant ledger revision bump.
+    let repeat_same_session = completion_service
+        .complete_job(
+            session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                now_ms: 1_700_006_130_000,
+            },
+        )
+        .await
+        .expect("repeat complete_job on same session");
+    assert_eq!(
+        repeat_same_session.status,
+        CoworkerJobCompletionStatus::Completed
+    );
+    assert!(
+        repeat_same_session
+            .closure_outcome
+            .as_ref()
+            .expect("closure_outcome")
+            .reused_cached_verdict
+    );
+    assert_eq!(
+        repeat_same_session.combined_candidate,
+        outcome.combined_candidate
+    );
+    assert_eq!(
+        repeat_same_session
+            .combined_candidate
+            .as_ref()
+            .expect("repeat_same_session combined_candidate")
+            .closure_reservation_id
+            .as_deref(),
+        Some(closure_outcome.attempt.attempt_id.as_str())
+    );
+    assert_eq!(
+        repeat_same_session.job.job_revision, outcome.job.job_revision,
+        "idempotent completed reopen must not bump job_revision"
+    );
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_before + 1,
+        "repeat complete_job must not invoke Closure a second time"
+    );
+    assert_eq!(
+        read_invocation_count(&run_cargo_count_file),
+        run_cargo_before + 1,
+        "repeat complete_job must not re-run candidate checks"
+    );
+
+    drop(session);
+
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_006_139_000)
+        .expect("reopen session");
+    let repeat_reopen = completion_service
+        .complete_job(
+            reopened_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                now_ms: 1_700_006_140_000,
+            },
+        )
+        .await
+        .expect("repeat complete_job after reopen");
+    assert_eq!(repeat_reopen.status, CoworkerJobCompletionStatus::Completed);
+    assert!(
+        repeat_reopen
+            .closure_outcome
+            .as_ref()
+            .expect("closure_outcome")
+            .reused_cached_verdict
+    );
+    assert_eq!(repeat_reopen.combined_candidate, outcome.combined_candidate);
+    assert_eq!(repeat_reopen.job.job_revision, outcome.job.job_revision);
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_before + 1
+    );
+    assert_eq!(
+        read_invocation_count(&run_cargo_count_file),
+        run_cargo_before + 1
+    );
+
+    drop(reopened_session);
+
+    // 4. Convert the accepted compact sidecar record to a valid historical inline
+    // `ClosureExecutionArtifactRecord` (removing `artifact_ref` and the sidecar file in this
+    // disposable fixture), then reopen and call `complete_job`: must succeed as `Completed`
+    // with the exact same subject, receipt chain, and combined candidate, zero new model/check
+    // budget or invocations, and without rewriting the historical inline record to sidecar format.
+    let attempt_id = closure_outcome.attempt.attempt_id.clone();
+    let sidecar_path = fixture
+        .policy_store
+        .closure_artifact_path_for_attempt(BINDING_A, &job.job_id, &attempt_id)
+        .expect("closure sidecar path");
+    fs::remove_file(&sidecar_path).expect("remove sidecar for legacy inline conversion");
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job.job_id, |state| {
+            state.closure_artifacts.insert(
+                attempt_id.clone(),
+                ClosureExecutionArtifactRecord {
+                    attempt_id: attempt_id.clone(),
+                    command_key: loaded_closure_artifact.command_key.clone(),
+                    subject_digest: loaded_closure_artifact.subject_digest.clone(),
+                    candidate_tree_sha: loaded_closure_artifact.candidate_tree_sha.clone(),
+                    artifact_ref: None,
+                    execution_report: Some(loaded_closure_artifact.execution_report.clone()),
+                    advisory_response: loaded_closure_artifact.advisory_response.clone(),
+                    response_error: None,
+                    observed_model: loaded_closure_artifact.observed_model.clone(),
+                    observed_effort: loaded_closure_artifact.observed_effort.clone(),
+                    fenced_from_promotion: false,
+                    diagnostic: None,
+                    recorded_at_ms: loaded_closure_artifact.recorded_at_ms,
+                },
+            );
+            Ok(())
+        })
+        .expect("write valid legacy inline record");
+
+    let legacy_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_006_149_000)
+        .expect("reopen session for legacy inline closure artifact");
+    let legacy_reopen = completion_service
+        .complete_job(
+            legacy_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                now_ms: 1_700_006_150_000,
+            },
+        )
+        .await
+        .expect("complete_job after converting accepted record to valid legacy inline shape");
+    assert_eq!(legacy_reopen.status, CoworkerJobCompletionStatus::Completed);
+    assert!(
+        legacy_reopen
+            .closure_outcome
+            .as_ref()
+            .expect("closure_outcome")
+            .reused_cached_verdict
+    );
+    assert_eq!(
+        legacy_reopen.final_candidate_subject,
+        outcome.final_candidate_subject
+    );
+    assert!(
+        !outcome
+            .aggregation
+            .job_integration_report
+            .reused_existing_receipts
+    );
+    assert!(
+        legacy_reopen
+            .aggregation
+            .job_integration_report
+            .reused_existing_receipts
+    );
+    let mut expected_cached_report = outcome.aggregation.job_integration_report.clone();
+    expected_cached_report.reused_existing_receipts = true;
+    assert_eq!(
+        legacy_reopen.aggregation.job_integration_report,
+        expected_cached_report
+    );
+    assert_eq!(legacy_reopen.combined_candidate, outcome.combined_candidate);
+    assert_eq!(legacy_reopen.job.job_revision, outcome.job.job_revision);
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_before + 1,
+        "reopening valid legacy inline record must not invoke Closure"
+    );
+    assert_eq!(
+        read_invocation_count(&run_cargo_count_file),
+        run_cargo_before + 1,
+        "reopening valid legacy inline record must not re-run candidate checks"
+    );
+    assert!(
+        !sidecar_path.exists(),
+        "reopening valid legacy inline record must not rewrite it to a sidecar file"
+    );
+    let runtime_after_legacy = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read runtime after legacy reopen")
+        .expect("runtime exists");
+    let closure_usage_after_legacy = runtime_after_legacy
+        .role_usage
+        .get(&WorkflowRole::Closure)
+        .expect("Closure role usage");
+    assert_eq!(closure_usage_after_legacy.calls_reserved, 1);
+    assert_eq!(closure_usage_after_legacy.calls_completed, 1);
+    let legacy_record_after = runtime_after_legacy
+        .closure_artifacts
+        .get(&attempt_id)
+        .expect("legacy inline closure artifact record");
+    assert!(legacy_record_after.artifact_ref.is_none());
+    assert!(legacy_record_after.execution_report.is_some());
+
+    drop(legacy_session);
+    host_handle.shutdown().await.expect("shutdown host_handle");
+}
+
+#[tokio::test]
+async fn job_completion_blocks_closure_on_failed_candidate_check_and_fences_holds_stops_and_corrupt_post_intent_artifacts(
+) {
+    let fixture = setup_fixture();
+    let tmp_root = fs::canonicalize(fixture._tmp.path()).expect("canonicalize tmp root");
+    let integration_service = CoworkerTaskIntegrationService::new(fixture.controller.clone());
+    let completion_service =
+        CoworkerJobCompletionService::from_controller(fixture.controller.clone())
+            .expect("construct CoworkerJobCompletionService from controller");
+    let closure_count_file = tmp_root.join("agy_closure_count.txt");
+    let cargo_invocation_log = tmp_root.join("cargo_invocation.log");
+
+    // 1. Job 1: Per-task checks pass on `wt-task-*`, but the combined candidate check fails on
+    // the final `RunIntegration` worktree (`wt-run-*`). Verify `complete_job` returns
+    // `BlockedByFailedChecks`, persists the failed check report, does NOT assemble a combined
+    // candidate, and never invokes `Closure`.
+    let fail_cargo_script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+echo "cargo $*" >> "{log}"
+if [[ "$PWD" == *"wt-run-"* ]]; then
+  echo "combined integration test failure: src/a.rs and src/b.rs incompatible" >&2
+  exit 1
+fi
+echo "test result: ok. 1 passed; 0 failed"
+exit 0
+"#,
+        log = cargo_invocation_log.display(),
+    );
+    write_executable_script(&fixture.fake_cargo_exe, &fail_cargo_script);
+
+    let fail_tasks = vec![
+        PlanTask {
+            id: "task-chkfail-a".to_string(),
+            title: "Task ChkFail A".to_string(),
+            instruction: "CTRL_TASK_A update src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-chkfail-b".to_string(),
+            title: "Task ChkFail B".to_string(),
+            instruction: "CTRL_TASK_B update src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let mut fail_ifaces = BTreeMap::new();
+    fail_ifaces.insert(
+        "task-chkfail-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_a::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    fail_ifaces.insert(
+        "task-chkfail-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_b::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (fail_job, fail_approval_id) = create_planned_approved_and_frozen_job_with_strategy(
+        &fixture,
+        "brf_job_comp_chkfail",
+        "plan-job-comp-chkfail",
+        fail_tasks,
+        fail_ifaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        IntegrationStrategy::MergeNoFf,
+    )
+    .await;
+
+    let fail_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &fail_approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for fail_job");
+
+    let fail_session = fixture
+        .controller
+        .open_owned_session(
+            BINDING_A,
+            THREAD_UUID_A,
+            &fail_job.job_id,
+            1_700_007_000_000,
+        )
+        .expect("open fail_session");
+
+    let _ = run_verify_accept_and_integrate_two_roots(
+        &fixture,
+        &integration_service,
+        &fail_session,
+        &fail_job.job_id,
+        "task-chkfail-a",
+        "task-chkfail-b",
+        1_700_007_001_000,
+    )
+    .await;
+
+    let closure_before_fail = read_invocation_count(&closure_count_file);
+    let fail_outcome = completion_service
+        .complete_job(
+            fail_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: fail_job.job_id.clone(),
+                now_ms: 1_700_007_020_000,
+            },
+        )
+        .await
+        .expect("complete_job when combined candidate check fails");
+
+    assert_eq!(
+        fail_outcome.status,
+        CoworkerJobCompletionStatus::BlockedByFailedChecks
+    );
+    assert!(!fail_outcome.is_completed());
+    assert_eq!(fail_outcome.failed_check_id.as_deref(), Some("cargo_test"));
+    assert!(fail_outcome.combined_candidate.is_none());
+    assert!(fail_outcome.final_candidate_subject.is_none());
+    assert!(fail_outcome.closure_verdict.is_none());
+    assert_ne!(fail_outcome.job.phase, CoworkerJobPhase::Completed);
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_before_fail,
+        "failed candidate check must block Closure invocation"
+    );
+    assert_eq!(fail_outcome.check_reports.len(), 1);
+    assert_eq!(
+        fail_outcome.check_reports[0].report.status,
+        FrozenCheckExecutionStatus::NonZeroExit
+    );
+    let persisted_failed_report = read_persisted_candidate_check_report(
+        &fixture.plans_dir,
+        &fail_outcome.check_reports[0].effect_id,
+    )
+    .expect("read persisted failed candidate check report")
+    .expect("persisted failed candidate check report exists");
+    assert_eq!(
+        persisted_failed_report.status,
+        FrozenCheckExecutionStatus::NonZeroExit
+    );
+    drop(fail_session);
+    fail_host.shutdown().await.expect("shutdown fail_host");
+
+    // 2. Job 2: Restore passing `fake_cargo_exe`. Verify pre-effect fencing on active workflow
+    // hold and `stop_requested`, then verify post-intent artifact corruption transitions
+    // `JobAggregation` to `EffectUnknown` and fails closed with
+    // `AmbiguousWakeupPendingReconciliation` while preserving the existing `RunIntegration`
+    // worktree on disk without calling `Closure`.
+    write_executable_script(&fixture.fake_cargo_exe, "#!/bin/sh\nexit 0\n");
+
+    let fence_tasks = vec![
+        PlanTask {
+            id: "task-fence-a".to_string(),
+            title: "Task Fence A".to_string(),
+            instruction: "CTRL_TASK_A update src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-fence-b".to_string(),
+            title: "Task Fence B".to_string(),
+            instruction: "CTRL_TASK_B update src/b.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/b.rs".to_string()],
+        },
+    ];
+    let mut fence_ifaces = BTreeMap::new();
+    fence_ifaces.insert(
+        "task-fence-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_a::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    fence_ifaces.insert(
+        "task-fence-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["mod_b::api".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (fence_job, fence_approval_id) = create_planned_approved_and_frozen_job_with_strategy(
+        &fixture,
+        "brf_job_comp_fence",
+        "plan-job-comp-fence",
+        fence_tasks,
+        fence_ifaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        2,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        IntegrationStrategy::MergeNoFf,
+    )
+    .await;
+
+    let fence_host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &fence_approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost for fence_job");
+
+    let fence_session = fixture
+        .controller
+        .open_owned_session(
+            BINDING_A,
+            THREAD_UUID_A,
+            &fence_job.job_id,
+            1_700_007_100_000,
+        )
+        .expect("open fence_session");
+
+    let (fence_out_a, fence_out_b) = run_verify_accept_and_integrate_two_roots(
+        &fixture,
+        &integration_service,
+        &fence_session,
+        &fence_job.job_id,
+        "task-fence-a",
+        "task-fence-b",
+        1_700_007_101_000,
+    )
+    .await;
+
+    let fence_runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &fence_job.job_id)
+        .expect("read fence runtime")
+        .expect("fence runtime exists");
+    let (_, _, expected_fence_wt_id, _) = derive_final_job_integration_identifiers(
+        &fence_job.job_id,
+        &fence_approval_id,
+        &fence_runtime.envelope.approval_subject_digest,
+    );
+    let expected_fence_wt_path = fence_host
+        .work_area_dir()
+        .join("checkouts")
+        .join("runs")
+        .join(&expected_fence_wt_id);
+
+    // 2a. Apply an active workflow hold before any job completion effect.
+    let job_before_hold = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == fence_job.job_id)
+        .expect("find fence_job");
+    let (held_job, hold_rec) = fixture
+        .workflow_store
+        .apply_workflow_hold(&ApplyWorkflowHoldRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fence_job.job_id.clone(),
+            expected_job_revision: job_before_hold.job_revision,
+            expected_ledger_revision: None,
+            request_key: "req_hold_before_job_completion".to_string(),
+            reason: WorkflowHoldReason::ConversationClarificationPending,
+            detail: "Hold before final job completion.".to_string(),
+            directly_affected_task_ids: vec!["task-fence-a".to_string()],
+            affected_write_paths: vec!["src/a.rs".to_string()],
+            affected_interfaces: vec!["mod_a::api".to_string()],
+            holds_entire_job: true,
+        })
+        .expect("apply workflow hold");
+    let held_task_a = held_job
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-fence-a")
+        .expect("find held task-fence-a");
+    assert_eq!(held_task_a.stage, CoworkerTaskStage::Held);
+    assert_eq!(
+        held_task_a.stage_before_hold,
+        Some(CoworkerTaskStage::Integrated)
+    );
+
+    let hold_err = completion_service
+        .complete_job(
+            fence_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: fence_job.job_id.clone(),
+                now_ms: 1_700_007_120_000,
+            },
+        )
+        .await
+        .expect_err("active workflow hold must refuse complete_job pre-effect");
+    assert_eq!(hold_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert!(
+        !expected_fence_wt_path.exists(),
+        "pre-effect hold refusal must not create final RunIntegration checkout"
+    );
+
+    // Resolve hold, then verify that previously Integrated tasks (`task-fence-a` and `task-fence-b`)
+    // are restored to `CoworkerTaskStage::Integrated` with their retained accepted candidate and
+    // integration receipt linkage intact and without any new review or Git effects.
+    let (resumed_job, _) = fixture
+        .workflow_store
+        .resolve_workflow_hold(&ResolveWorkflowHoldRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fence_job.job_id.clone(),
+            expected_job_revision: held_job.job_revision,
+            expected_ledger_revision: None,
+            hold_id: hold_rec.hold_id,
+            resolution_note: "Release hold for stop_requested test.".to_string(),
+        })
+        .expect("resolve workflow hold");
+    assert_eq!(resumed_job.phase, CoworkerJobPhase::Executing);
+    for (tid, orig_int_out) in [
+        ("task-fence-a", &fence_out_a),
+        ("task-fence-b", &fence_out_b),
+    ] {
+        let resumed_task = resumed_job
+            .tasks
+            .iter()
+            .find(|t| t.task_id == tid)
+            .expect("find resumed task");
+        assert_eq!(resumed_task.stage, CoworkerTaskStage::Integrated);
+        assert_eq!(resumed_task.stage_before_hold, None);
+        assert!(resumed_task.active_hold_ids.is_empty());
+        let acc_cid = resumed_task
+            .accepted_candidate_id
+            .as_deref()
+            .expect("retained accepted_candidate_id");
+        let acc_cand = resumed_task
+            .candidates
+            .iter()
+            .find(|c| c.candidate_id == acc_cid)
+            .expect("retained accepted candidate");
+        assert_eq!(
+            acc_cand.integration_receipt_id.as_deref(),
+            Some(orig_int_out.integration_receipt.receipt_id.as_str())
+        );
+    }
+
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &fence_job.job_id, |rt| {
+            rt.stop_requested = true;
+            Ok(())
+        })
+        .expect("set stop_requested = true");
+
+    let stop_err = completion_service
+        .complete_job(
+            fence_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: fence_job.job_id.clone(),
+                now_ms: 1_700_007_122_000,
+            },
+        )
+        .await
+        .expect_err("stop_requested must refuse complete_job pre-effect");
+    assert_eq!(stop_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    assert!(!expected_fence_wt_path.exists());
+
+    // Clear `stop_requested` and run `aggregate_integrated_job` so the real `RunIntegration`
+    // worktree, `JobIntegrationIntent`, and `JobIntegrationReport` exist on disk.
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &fence_job.job_id, |rt| {
+            rt.stop_requested = false;
+            Ok(())
+        })
+        .expect("clear stop_requested");
+
+    let agg_fence = completion_service
+        .aggregate_integrated_job(
+            fence_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: fence_job.job_id.clone(),
+                now_ms: 1_700_007_125_000,
+            },
+        )
+        .await
+        .expect("aggregate_integrated_job on fence_job");
+    assert!(expected_fence_wt_path.exists());
+
+    // 2b. Corrupt the persisted `JobIntegrationReport` artifact on disk after the durable intent
+    // and `EffectConfirmed` record exist. Verify `complete_job` fails closed as `EffectUnknown`
+    // (`AmbiguousWakeupPendingReconciliation`), preserves the existing `RunIntegration` worktree
+    // and HEAD commit without recreating or overwriting it, does NOT invoke `Closure`, and blocks
+    // subsequent retries.
+    fs::write(&agg_fence.report_artifact_path, b"{corrupted_report_json")
+        .expect("corrupt persisted JobIntegrationReport on disk");
+
+    let closure_before_corrupt = read_invocation_count(&closure_count_file);
+    let corrupt_err = completion_service
+        .complete_job(
+            fence_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: fence_job.job_id.clone(),
+                now_ms: 1_700_007_130_000,
+            },
+        )
+        .await
+        .expect_err("corrupted persisted JobIntegrationReport must fail closed with AmbiguousWakeupPendingReconciliation");
+    assert_eq!(
+        corrupt_err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+    assert_eq!(
+        read_invocation_count(&closure_count_file),
+        closure_before_corrupt,
+        "corrupted post-intent artifact must never invoke Closure"
+    );
+    assert_eq!(
+        resolve_exact_commit_sha(
+            &agg_fence.integration_checkout_path,
+            "HEAD",
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS
+        )
+        .expect("final wt HEAD preserved after EffectUnknown"),
+        agg_fence.final_integrated_target_commit
+    );
+
+    let runtime_unknown = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &fence_job.job_id)
+        .expect("read runtime after corrupt report")
+        .expect("runtime exists");
+    assert_eq!(
+        runtime_unknown
+            .pending_effects
+            .get(&agg_fence.aggregation_effect_id)
+            .expect("JobAggregation effect")
+            .status,
+        PendingControllerEffectStatus::EffectUnknown
+    );
+
+    let retry_unknown_err = completion_service
+        .complete_job(
+            fence_session.guard(),
+            &CoworkerJobCompletionRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: fence_job.job_id.clone(),
+                now_ms: 1_700_007_135_000,
+            },
+        )
+        .await
+        .expect_err(
+            "repeat complete_job while JobAggregation is EffectUnknown must remain blocked",
+        );
+    assert_eq!(
+        retry_unknown_err.code(),
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+    );
+
+    drop(fence_session);
+    fence_host.shutdown().await.expect("shutdown fence_host");
 }
