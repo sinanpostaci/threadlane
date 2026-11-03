@@ -26,6 +26,7 @@ use threadlane_workers::{
     validate_executable_file, validate_sha256_hex_digest, AdvisoryResponseBudget,
     AdvisoryStructuredExecution, AdvisoryWorkerSpec, ExecutionBudgets, WorkerFilePermissions,
     WorkerProvider, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    DEFAULT_MAX_LINE_BYTES, MAX_EVENTS, MAX_LINE_BYTES,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
@@ -36,9 +37,11 @@ use crate::coworker_workflow::contracts::{
     TaskCandidateRef, MAX_COWORKER_ID_LEN,
 };
 use crate::coworker_workflow::controller_policy::{
-    verify_live_approval_and_registry, ClosureExecutionArtifactRecord, ControllerJobRuntimeState,
-    ControllerPolicyStore, FrozenControllerExecutionEnvelope, PendingControllerEffect,
+    sanitize_controller_diagnostic, verify_live_approval_and_registry,
+    ClosureExecutionArtifactRecord, ControllerJobRuntimeState, ControllerPolicyStore,
+    FrozenControllerExecutionEnvelope, LoadedClosureExecutionArtifact, PendingControllerEffect,
     PendingControllerEffectKind, PendingControllerEffectStatus,
+    PersistClosureExecutionArtifactRequest,
 };
 use crate::coworker_workflow::store::{
     CoworkerLedgerMutationOutcome, CoworkerWorkflowStore, RecordCombinedCandidateRequest,
@@ -1201,219 +1204,489 @@ impl CoworkerCandidateService {
         let initial_closure_ledger = closure_store
             .inspect_ledger_readonly()
             .map_err(map_operations_error)?;
-        let has_cached_accepted = initial_closure_ledger.attempts.iter().any(|a| {
-            a.subject_digest == request.final_subject.subject_digest
-                && a.state == threadlane_operations::ClosureAttemptState::Terminal
-                && a.verdict
-                    .as_ref()
-                    .is_some_and(|v| v.kind == ClosureVerdictKind::Accepted)
-        });
-        let has_idempotent_reserved = initial_closure_ledger.attempts.iter().any(|a| {
-            a.subject_digest == request.final_subject.subject_digest
-                && a.state == threadlane_operations::ClosureAttemptState::Reserved
-                && a.command_key == request.command_key
-        });
-        if !has_cached_accepted && !has_idempotent_reserved {
-            runtime.ensure_role_budget_available(WorkflowRole::Closure)?;
-        }
 
-        let reservation_outcome = closure_store
-            .reserve_closure_attempt(&ReserveClosureAttemptRequest {
-                expected_ledger_revision: initial_closure_ledger.ledger_revision,
-                command_key: request.command_key.clone(),
-                attempt_id: None,
-                subject: request.final_subject.clone(),
-                legacy_base_tree_digest: Some(request.final_subject.approved_base_tree_sha.clone()),
-                reserved_at_ms: request.current_time_ms,
-            })
-            .map_err(map_operations_error)?;
-
-        if let ClosureReservationOutcome::CacheHit {
-            ledger_revision,
-            attempt,
-            verdict,
-        } = reservation_outcome
+        // Verify any already-recorded closure execution artifact for this subject before
+        // considering cache hits, recovery, or new reservations so missing/tampered sidecars
+        // or malformed legacy inline records fail closed without provider replay.
+        for existing_attempt_id in runtime
+            .closure_artifacts
+            .values()
+            .filter(|rec| rec.subject_digest == request.final_subject.subject_digest)
+            .map(|rec| rec.attempt_id.clone())
         {
-            let updated_job = self.record_closure_outcome_on_job(
+            let _ = policy_store.load_closure_execution_artifact(
                 &request.binding_id,
                 &request.thread_uuid,
                 &request.job_id,
-                request.expected_job_revision,
-                request.expected_ledger_revision,
-                &request.combined_candidate_id,
-                &attempt.attempt_id,
-                Some(&verdict),
-                None,
+                &existing_attempt_id,
             )?;
-            return Ok(ExecuteFinalCandidateClosureOutcome {
-                job: updated_job,
-                closure_ledger_revision: ledger_revision,
-                attempt,
-                verdict: Some(*verdict),
-                reused_cached_verdict: true,
-            });
         }
 
-        let reserved_ledger_rev = reservation_outcome.ledger_revision();
-        let reserved_attempt = reservation_outcome.attempt().clone();
-
-        let effect_id = deterministic_prefixed_id(
-            "threadlane-native:controller-closure-effect:v1",
-            "eff",
-            &[
-                &request.job_id,
-                &reserved_attempt.attempt_id,
-                &request.command_key,
-            ],
-        );
-        let external_request_id = deterministic_prefixed_id(
-            "threadlane-native:closure-req:v1",
-            "crq",
-            &[
-                &request.job_id,
-                &reserved_attempt.attempt_id,
-                &request.final_subject.subject_digest,
-            ],
-        );
-
-        let executable = resolve_tool_executable(authority, &closure_choice.tool_id)?;
-
-        // Record intent-before-effect in ControllerPolicyStore and reserve 1 closure call budget.
-        let () = policy_store.mutate_job_runtime_for_operator(
-            &request.binding_id,
-            &request.job_id,
-            |state| {
-                if !state.pending_effects.contains_key(&effect_id) {
-                    let _ = state.reserve_role_call(WorkflowRole::Closure)?;
-                }
-                state.closure_attempt_id = Some(reserved_attempt.attempt_id.clone());
-                state.pending_effects.insert(
-                    effect_id.clone(),
-                    PendingControllerEffect {
-                        effect_id: effect_id.clone(),
-                        request_key: request.command_key.clone(),
-                        job_id: request.job_id.clone(),
-                        task_id: None,
-                        attempt_no: None,
-                        kind: PendingControllerEffectKind::ClosureInvocation,
-                        status: PendingControllerEffectStatus::ReservedBeforeEffect,
-                        subject_digest: request.final_subject.subject_digest.clone(),
-                        external_correlation_id: Some(reserved_attempt.attempt_id.clone()),
-                        created_at_ms: request.current_time_ms.max(0) as u64,
-                        updated_at_ms: request.current_time_ms.max(0) as u64,
-                        diagnostic: None,
-                    },
-                );
-                Ok(())
-            },
-        )?;
-
-        let (submitted_ledger_rev, _submitted_attempt) = closure_store
-            .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
-                expected_ledger_revision: reserved_ledger_rev,
-                attempt_id: reserved_attempt.attempt_id.clone(),
-                command_key: request.command_key.clone(),
-                expected_subject_digest: request.final_subject.subject_digest.clone(),
-                external_request_id: external_request_id.clone(),
-                submitted_at_ms: request.current_time_ms,
+        // Check whether a Submitted attempt for this subject already persisted its post-effect
+        // execution artifact (either in runtime.closure_artifacts or in the private sidecar file)
+        // before a crash. If so, recover from that verified artifact without re-invoking the
+        // provider or double-charging call/completion counters.
+        let submitted_for_subject = initial_closure_ledger
+            .attempts
+            .iter()
+            .find(|a| {
+                a.subject_digest == request.final_subject.subject_digest
+                    && a.state == threadlane_operations::ClosureAttemptState::Submitted
             })
-            .map_err(map_operations_error)?;
+            .cloned();
 
-        let prompt = build_closure_worker_prompt(&request.final_subject);
+        let (
+            submitted_ledger_rev,
+            reserved_attempt,
+            effect_id,
+            structured_exec,
+            actual_observed_model,
+            actual_observed_effort,
+            recorded_at_ms,
+            cumulative_runtime_ms,
+        ) = if let Some(submitted_attempt) = submitted_for_subject {
+            let effect_id = deterministic_prefixed_id(
+                "threadlane-native:controller-closure-effect:v1",
+                "eff",
+                &[
+                    &request.job_id,
+                    &submitted_attempt.attempt_id,
+                    &submitted_attempt.command_key,
+                ],
+            );
+            let recovered_from_runtime = if runtime
+                .closure_artifacts
+                .contains_key(&submitted_attempt.attempt_id)
+            {
+                let loaded = policy_store.load_closure_execution_artifact(
+                    &request.binding_id,
+                    &request.thread_uuid,
+                    &request.job_id,
+                    &submitted_attempt.attempt_id,
+                )?;
+                Some((
+                    AdvisoryStructuredExecution {
+                        execution: loaded.execution_report,
+                        response: loaded.advisory_response,
+                        response_error: loaded.response_error,
+                    },
+                    loaded.artifact_ref,
+                    loaded.observed_model,
+                    loaded.observed_effort,
+                    loaded.recorded_at_ms as i64,
+                ))
+            } else if let Some((persisted, art_ref)) = policy_store
+                .recover_persisted_closure_sidecar_if_present(
+                    &request.binding_id,
+                    &request.thread_uuid,
+                    &request.job_id,
+                    &effect_id,
+                    &submitted_attempt.attempt_id,
+                    &submitted_attempt.command_key,
+                    &request.final_subject.subject_digest,
+                    &request.final_subject.candidate_tree_sha,
+                )?
+            {
+                Some((
+                    AdvisoryStructuredExecution {
+                        execution: persisted.execution_report,
+                        response: persisted.advisory_response,
+                        response_error: persisted.response_error,
+                    },
+                    Some(art_ref),
+                    persisted.observed_model,
+                    persisted.observed_effort,
+                    persisted.recorded_at_ms as i64,
+                ))
+            } else {
+                None
+            };
+
+            let Some((
+                recovered_exec,
+                recovered_ref,
+                recovered_model,
+                recovered_effort,
+                recovered_recorded_at_ms,
+            )) = recovered_from_runtime
+            else {
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    format!(
+                        "closure attempt `{}` is already in Submitted state without a verified execution artifact; refusing blind replay",
+                        submitted_attempt.attempt_id
+                    ),
+                ));
+            };
+
+            let duration_ms = recovered_exec.execution.duration_ms;
+            let cumulative_ms = policy_store.mutate_job_runtime_for_operator(
+                &request.binding_id,
+                &request.job_id,
+                |state| {
+                    if !state
+                        .closure_artifacts
+                        .contains_key(&submitted_attempt.attempt_id)
+                    {
+                        let Some(ref art_ref) = recovered_ref else {
+                            return Err(NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                "Recovered closure sidecar is missing compact artifact_ref.",
+                            ));
+                        };
+                        state.record_role_completion(WorkflowRole::Closure, duration_ms);
+                        state.closure_artifacts.insert(
+                            submitted_attempt.attempt_id.clone(),
+                            ClosureExecutionArtifactRecord {
+                                attempt_id: submitted_attempt.attempt_id.clone(),
+                                command_key: submitted_attempt.command_key.clone(),
+                                subject_digest: request.final_subject.subject_digest.clone(),
+                                candidate_tree_sha: request
+                                    .final_subject
+                                    .candidate_tree_sha
+                                    .clone(),
+                                artifact_ref: Some(art_ref.clone()),
+                                execution_report: None,
+                                advisory_response: None,
+                                response_error: None,
+                                observed_model: recovered_model.clone(),
+                                observed_effort: recovered_effort.clone(),
+                                fenced_from_promotion: false,
+                                diagnostic: recovered_exec
+                                    .response_error
+                                    .as_ref()
+                                    .map(|e| sanitize_controller_diagnostic(&e.message)),
+                                recorded_at_ms: recovered_recorded_at_ms.max(0) as u64,
+                            },
+                        );
+                    }
+                    Ok(state
+                        .role_usage
+                        .get(&WorkflowRole::Closure)
+                        .map_or(duration_ms, |u| u.total_runtime_ms))
+                },
+            )?;
+
+            (
+                initial_closure_ledger.ledger_revision,
+                submitted_attempt,
+                effect_id,
+                recovered_exec,
+                recovered_model,
+                recovered_effort,
+                recovered_recorded_at_ms,
+                cumulative_ms,
+            )
+        } else {
+            let has_cached_accepted = initial_closure_ledger.attempts.iter().any(|a| {
+                a.subject_digest == request.final_subject.subject_digest
+                    && a.state == threadlane_operations::ClosureAttemptState::Terminal
+                    && a.verdict
+                        .as_ref()
+                        .is_some_and(|v| v.kind == ClosureVerdictKind::Accepted)
+            });
+
+            if !has_cached_accepted
+                && runtime.pending_effects.values().any(|eff| {
+                    eff.kind == PendingControllerEffectKind::ClosureInvocation
+                        && eff.status.blocks_replay()
+                })
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "Unresolved ClosureInvocation PendingControllerEffect blocks blind replay until reconciled.",
+                ));
+            }
+
+            let has_idempotent_reserved = initial_closure_ledger.attempts.iter().any(|a| {
+                a.subject_digest == request.final_subject.subject_digest
+                    && a.state == threadlane_operations::ClosureAttemptState::Reserved
+                    && a.command_key == request.command_key
+            });
+            if !has_cached_accepted && !has_idempotent_reserved {
+                runtime.ensure_role_budget_available(WorkflowRole::Closure)?;
+            }
+
+            let reservation_outcome = closure_store
+                .reserve_closure_attempt(&ReserveClosureAttemptRequest {
+                    expected_ledger_revision: initial_closure_ledger.ledger_revision,
+                    command_key: request.command_key.clone(),
+                    attempt_id: None,
+                    subject: request.final_subject.clone(),
+                    legacy_base_tree_digest: Some(
+                        request.final_subject.approved_base_tree_sha.clone(),
+                    ),
+                    reserved_at_ms: request.current_time_ms,
+                })
+                .map_err(map_operations_error)?;
+
+            if let ClosureReservationOutcome::CacheHit {
+                ledger_revision,
+                attempt,
+                verdict,
+            } = reservation_outcome
+            {
+                if runtime.closure_artifacts.contains_key(&attempt.attempt_id)
+                    || runtime.closure_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+                    || policy_store
+                        .closure_artifact_path_for_attempt(
+                            &request.binding_id,
+                            &request.job_id,
+                            &attempt.attempt_id,
+                        )?
+                        .exists()
+                {
+                    let loaded = policy_store.load_closure_execution_artifact(
+                        &request.binding_id,
+                        &request.thread_uuid,
+                        &request.job_id,
+                        &attempt.attempt_id,
+                    )?;
+                    if loaded.subject_digest != request.final_subject.subject_digest
+                        || loaded.candidate_tree_sha != request.final_subject.candidate_tree_sha
+                        || loaded.fenced_from_promotion
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "Cached closure execution artifact failed subject binding or promotion fence check.",
+                        ));
+                    }
+                }
+                let updated_job = self.record_closure_outcome_on_job(
+                    &request.binding_id,
+                    &request.thread_uuid,
+                    &request.job_id,
+                    request.expected_job_revision,
+                    request.expected_ledger_revision,
+                    &request.combined_candidate_id,
+                    &attempt.attempt_id,
+                    Some(&verdict),
+                    None,
+                )?;
+                return Ok(ExecuteFinalCandidateClosureOutcome {
+                    job: updated_job,
+                    closure_ledger_revision: ledger_revision,
+                    attempt,
+                    verdict: Some(*verdict),
+                    reused_cached_verdict: true,
+                });
+            }
+
+            let reserved_ledger_rev = reservation_outcome.ledger_revision();
+            let reserved_attempt = reservation_outcome.attempt().clone();
+
+            let effect_id = deterministic_prefixed_id(
+                "threadlane-native:controller-closure-effect:v1",
+                "eff",
+                &[
+                    &request.job_id,
+                    &reserved_attempt.attempt_id,
+                    &request.command_key,
+                ],
+            );
+            let external_request_id = deterministic_prefixed_id(
+                "threadlane-native:closure-req:v1",
+                "crq",
+                &[
+                    &request.job_id,
+                    &reserved_attempt.attempt_id,
+                    &request.final_subject.subject_digest,
+                ],
+            );
+
+            let executable = resolve_tool_executable(authority, &closure_choice.tool_id)?;
+            let response_budget =
+                AdvisoryResponseBudget::new(closure_budget.max_structured_response_bytes);
+            response_budget
+                .validate()
+                .map_err(|err| NativeError::new(NativeErrorCode::InvalidConfig, err.to_string()))?;
+
+            // Record intent-before-effect in ControllerPolicyStore and reserve 1 closure call budget.
+            let () = policy_store.mutate_job_runtime_for_operator(
+                &request.binding_id,
+                &request.job_id,
+                |state| {
+                    if state.pending_effects.contains_key(&effect_id) {
+                        return Err(NativeError::new(
+                            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                            "ClosureInvocation PendingControllerEffect already exists; refusing blind replay.",
+                        ));
+                    }
+                    let _ = state.reserve_role_call(WorkflowRole::Closure)?;
+                    state.closure_attempt_id = Some(reserved_attempt.attempt_id.clone());
+                    state.pending_effects.insert(
+                        effect_id.clone(),
+                        PendingControllerEffect {
+                            effect_id: effect_id.clone(),
+                            request_key: request.command_key.clone(),
+                            job_id: request.job_id.clone(),
+                            task_id: None,
+                            attempt_no: None,
+                            kind: PendingControllerEffectKind::ClosureInvocation,
+                            status: PendingControllerEffectStatus::ReservedBeforeEffect,
+                            subject_digest: request.final_subject.subject_digest.clone(),
+                            external_correlation_id: Some(reserved_attempt.attempt_id.clone()),
+                            created_at_ms: request.current_time_ms.max(0) as u64,
+                            updated_at_ms: request.current_time_ms.max(0) as u64,
+                            diagnostic: None,
+                        },
+                    );
+                    Ok(())
+                },
+            )?;
+
+            let (submitted_ledger_rev, _submitted_attempt) = closure_store
+                .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
+                    expected_ledger_revision: reserved_ledger_rev,
+                    attempt_id: reserved_attempt.attempt_id.clone(),
+                    command_key: request.command_key.clone(),
+                    expected_subject_digest: request.final_subject.subject_digest.clone(),
+                    external_request_id: external_request_id.clone(),
+                    submitted_at_ms: request.current_time_ms,
+                })
+                .map_err(map_operations_error)?;
+
+            let prompt = build_closure_worker_prompt(&request.final_subject);
+            let mut allowed_models = BTreeSet::new();
+            allowed_models.insert(closure_choice.model_arg.clone());
+            let advisory_spec = AdvisoryWorkerSpec {
+                provider,
+                executable,
+                model: closure_choice.model_arg.clone(),
+                effort: closure_choice.effort.clone(),
+                allowed_models,
+                session_id: None,
+                standalone: provider == WorkerProvider::OpenCodeV2,
+                working_directory: request.final_subject.integration_checkout_path.clone(),
+                allowed_write_paths: BTreeSet::new(),
+                prompt,
+                file_permissions: WorkerFilePermissions::ReadOnly,
+                budgets: ExecutionBudgets {
+                    timeout_ms: closure_budget.max_timeout_ms_per_call,
+                    max_stdout_bytes: closure_budget.max_stdout_bytes_per_call,
+                    max_stderr_bytes: closure_budget.max_stderr_bytes_per_call,
+                    max_line_bytes: DEFAULT_MAX_LINE_BYTES
+                        .max(
+                            closure_budget
+                                .max_structured_response_bytes
+                                .saturating_mul(2),
+                        )
+                        .min(MAX_LINE_BYTES)
+                        .min(closure_budget.max_stdout_bytes_per_call),
+                    max_events: MAX_EVENTS,
+                },
+            };
+
+            let structured_exec =
+                match run_advisory_worker_with_structured_result(&advisory_spec, response_budget)
+                    .await
+                {
+                    Ok(exec) => exec,
+                    Err(worker_err) => {
+                        let reason = format!(
+                            "closure worker invocation failed with uncertain outcome: {worker_err}"
+                        );
+                        return self.record_unknown_closure_outcome(
+                            policy_store,
+                            &closure_store,
+                            request,
+                            submitted_ledger_rev,
+                            &reserved_attempt.attempt_id,
+                            &effect_id,
+                            &reason,
+                        );
+                    }
+                };
+
+            let duration_ms = structured_exec.execution.duration_ms;
+            let actual_observed_model = structured_exec
+                .execution
+                .effective_observed_model()
+                .map(str::to_string);
+            let actual_observed_effort = structured_exec
+                .execution
+                .effective_observed_effort()
+                .map(str::to_string);
+            let recorded_at_ms = now_epoch_ms().max(request.current_time_ms);
+
+            // Persist the full bounded execution report, structured response, and response error
+            // to a private (0600) sidecar file BEFORE updating terminal role counters or the ledger.
+            let artifact_ref = policy_store.persist_closure_execution_artifact(
+                &PersistClosureExecutionArtifactRequest {
+                    binding_id: request.binding_id.clone(),
+                    thread_uuid: request.thread_uuid.clone(),
+                    job_id: request.job_id.clone(),
+                    effect_id: effect_id.clone(),
+                    attempt_id: reserved_attempt.attempt_id.clone(),
+                    command_key: reserved_attempt.command_key.clone(),
+                    subject_digest: request.final_subject.subject_digest.clone(),
+                    candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
+                    execution_report: structured_exec.execution.clone(),
+                    advisory_response: structured_exec.response.clone(),
+                    response_error: structured_exec.response_error.clone(),
+                    observed_model: actual_observed_model.clone(),
+                    observed_effort: actual_observed_effort.clone(),
+                    recorded_at_ms: recorded_at_ms.max(0) as u64,
+                },
+            )?;
+
+            // Record compact cryptographically bound artifact reference and update completion counters.
+            let cumulative_runtime_ms = policy_store.mutate_job_runtime_for_operator(
+                &request.binding_id,
+                &request.job_id,
+                |state| {
+                    if !state
+                        .closure_artifacts
+                        .contains_key(&reserved_attempt.attempt_id)
+                    {
+                        state.record_role_completion(WorkflowRole::Closure, duration_ms);
+                    }
+                    state.closure_artifacts.insert(
+                        reserved_attempt.attempt_id.clone(),
+                        ClosureExecutionArtifactRecord {
+                            attempt_id: reserved_attempt.attempt_id.clone(),
+                            command_key: reserved_attempt.command_key.clone(),
+                            subject_digest: request.final_subject.subject_digest.clone(),
+                            candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
+                            artifact_ref: Some(artifact_ref),
+                            execution_report: None,
+                            advisory_response: None,
+                            response_error: None,
+                            observed_model: actual_observed_model.clone(),
+                            observed_effort: actual_observed_effort.clone(),
+                            fenced_from_promotion: false,
+                            diagnostic: structured_exec
+                                .response_error
+                                .as_ref()
+                                .map(|e| sanitize_controller_diagnostic(&e.message)),
+                            recorded_at_ms: recorded_at_ms.max(0) as u64,
+                        },
+                    );
+                    Ok(state
+                        .role_usage
+                        .get(&WorkflowRole::Closure)
+                        .map_or(duration_ms, |u| u.total_runtime_ms))
+                },
+            )?;
+
+            (
+                submitted_ledger_rev,
+                reserved_attempt,
+                effect_id,
+                structured_exec,
+                actual_observed_model,
+                actual_observed_effort,
+                recorded_at_ms,
+                cumulative_runtime_ms,
+            )
+        };
+
+        let duration_ms = structured_exec.execution.duration_ms;
         let worker_id = deterministic_prefixed_id(
             "threadlane-native:closure-worker:v1",
             "wrk",
             &[&request.job_id, &reserved_attempt.attempt_id],
         );
-        let mut allowed_models = BTreeSet::new();
-        allowed_models.insert(closure_choice.model_arg.clone());
-        let advisory_spec = AdvisoryWorkerSpec {
-            provider,
-            executable,
-            model: closure_choice.model_arg.clone(),
-            effort: closure_choice.effort.clone(),
-            allowed_models,
-            session_id: None,
-            standalone: provider == WorkerProvider::OpenCodeV2,
-            working_directory: request.final_subject.integration_checkout_path.clone(),
-            allowed_write_paths: BTreeSet::new(),
-            prompt,
-            file_permissions: WorkerFilePermissions::ReadOnly,
-            budgets: ExecutionBudgets {
-                timeout_ms: closure_budget.max_timeout_ms_per_call,
-                max_stdout_bytes: closure_budget.max_stdout_bytes_per_call,
-                max_stderr_bytes: closure_budget.max_stderr_bytes_per_call,
-                ..ExecutionBudgets::default()
-            },
-        };
-        let response_budget =
-            AdvisoryResponseBudget::new(closure_budget.max_structured_response_bytes);
-        response_budget
-            .validate()
-            .map_err(|err| NativeError::new(NativeErrorCode::InvalidConfig, err.to_string()))?;
-
-        let structured_exec =
-            match run_advisory_worker_with_structured_result(&advisory_spec, response_budget).await
-            {
-                Ok(exec) => exec,
-                Err(worker_err) => {
-                    let reason = format!(
-                        "closure worker invocation failed with uncertain outcome: {worker_err}"
-                    );
-                    return self.record_unknown_closure_outcome(
-                        policy_store,
-                        &closure_store,
-                        request,
-                        submitted_ledger_rev,
-                        &reserved_attempt.attempt_id,
-                        &effect_id,
-                        &reason,
-                    );
-                }
-            };
-
-        let duration_ms = structured_exec.execution.duration_ms;
-        let actual_observed_model = structured_exec
-            .execution
-            .effective_observed_model()
-            .map(str::to_string);
-        let actual_observed_effort = structured_exec
-            .execution
-            .effective_observed_effort()
-            .map(str::to_string);
-        let recorded_at_ms = now_epoch_ms().max(request.current_time_ms);
-
-        // Update wall-clock completion counter and persist private execution artifact for recovery.
-        let cumulative_runtime_ms = policy_store.mutate_job_runtime_for_operator(
-            &request.binding_id,
-            &request.job_id,
-            |state| {
-                state.record_role_completion(WorkflowRole::Closure, duration_ms);
-                state.closure_artifacts.insert(
-                    reserved_attempt.attempt_id.clone(),
-                    ClosureExecutionArtifactRecord {
-                        attempt_id: reserved_attempt.attempt_id.clone(),
-                        command_key: request.command_key.clone(),
-                        subject_digest: request.final_subject.subject_digest.clone(),
-                        candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
-                        execution_report: structured_exec.execution.clone(),
-                        advisory_response: structured_exec.response.clone(),
-                        observed_model: actual_observed_model.clone(),
-                        observed_effort: actual_observed_effort.clone(),
-                        fenced_from_promotion: false,
-                        diagnostic: structured_exec
-                            .response_error
-                            .as_ref()
-                            .map(|e| e.message.clone()),
-                        recorded_at_ms: recorded_at_ms.max(0) as u64,
-                    },
-                );
-                Ok(state
-                    .role_usage
-                    .get(&WorkflowRole::Closure)
-                    .map_or(duration_ms, |u| u.total_runtime_ms))
-            },
-        )?;
 
         if structured_exec.execution.cleanup_incomplete
             || structured_exec.execution.status == WorkerRunStatus::IncompleteCleanup
@@ -1447,6 +1720,7 @@ impl CoworkerCandidateService {
                 request,
                 submitted_ledger_rev,
                 &reserved_attempt.attempt_id,
+                &reserved_attempt.command_key,
                 &effect_id,
                 "role_runtime_budget_exceeded",
                 &reason,
@@ -1483,6 +1757,7 @@ impl CoworkerCandidateService {
                     request,
                     submitted_ledger_rev,
                     &reserved_attempt.attempt_id,
+                    &reserved_attempt.command_key,
                     &effect_id,
                     failure_code,
                     &reason,
@@ -1515,6 +1790,7 @@ impl CoworkerCandidateService {
                     request,
                     submitted_ledger_rev,
                     &reserved_attempt.attempt_id,
+                    &reserved_attempt.command_key,
                     &effect_id,
                     "response_validation_failed",
                     &reason,
@@ -1534,6 +1810,7 @@ impl CoworkerCandidateService {
                 request,
                 submitted_ledger_rev,
                 &reserved_attempt.attempt_id,
+                &reserved_attempt.command_key,
                 &effect_id,
                 "model_evidence_failed",
                 "closure worker did not emit verified model evidence",
@@ -1555,6 +1832,7 @@ impl CoworkerCandidateService {
                 request,
                 submitted_ledger_rev,
                 &reserved_attempt.attempt_id,
+                &reserved_attempt.command_key,
                 &effect_id,
                 "model_evidence_failed",
                 &reason,
@@ -1579,6 +1857,7 @@ impl CoworkerCandidateService {
                 request,
                 submitted_ledger_rev,
                 &reserved_attempt.attempt_id,
+                &reserved_attempt.command_key,
                 &effect_id,
                 "effort_evidence_failed",
                 &reason,
@@ -1601,6 +1880,7 @@ impl CoworkerCandidateService {
                 request,
                 submitted_ledger_rev,
                 &reserved_attempt.attempt_id,
+                &reserved_attempt.command_key,
                 &effect_id,
                 "post_completion_fenced",
                 &fence_reason,
@@ -1642,7 +1922,7 @@ impl CoworkerCandidateService {
             match closure_store.record_closure_verdict(&RecordClosureVerdictRequest {
                 expected_ledger_revision: submitted_ledger_rev,
                 attempt_id: reserved_attempt.attempt_id.clone(),
-                command_key: request.command_key.clone(),
+                command_key: reserved_attempt.command_key.clone(),
                 verdict_id: None,
                 subject: request.final_subject.clone(),
                 kind: parsed_response.outcome,
@@ -1659,6 +1939,7 @@ impl CoworkerCandidateService {
                         request,
                         submitted_ledger_rev,
                         &reserved_attempt.attempt_id,
+                        &reserved_attempt.command_key,
                         &effect_id,
                         "execution_evidence_rejected",
                         &reason,
@@ -1704,6 +1985,19 @@ impl CoworkerCandidateService {
             verdict: Some(verdict),
             reused_cached_verdict: false,
         })
+    }
+
+    /// Loads and cryptographically verifies the full closure execution artifact for
+    /// `(binding_id, thread_uuid, job_id, attempt_id)` from `policy_store`.
+    pub fn load_closure_execution_artifact(
+        &self,
+        policy_store: &ControllerPolicyStore,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<LoadedClosureExecutionArtifact, NativeError> {
+        policy_store.load_closure_execution_artifact(binding_id, thread_uuid, job_id, attempt_id)
     }
 
     /// Reconciles an unresolved (`Reserved`, `Submitted`, or `OutcomeUnknown`) final-candidate
@@ -1903,7 +2197,7 @@ impl CoworkerCandidateService {
                 if let Some(eff) = state.pending_effects.get_mut(effect_id) {
                     eff.status = PendingControllerEffectStatus::EffectUnknown;
                     eff.external_correlation_id = Some(attempt_id.to_string());
-                    eff.diagnostic = Some(sanitize_diagnostic_text(reason));
+                    eff.diagnostic = Some(sanitize_controller_diagnostic(reason));
                     eff.updated_at_ms = recorded_at_ms.max(0) as u64;
                 }
                 Ok(())
@@ -1939,6 +2233,7 @@ impl CoworkerCandidateService {
         request: &ExecuteFinalCandidateClosureRequest,
         submitted_ledger_rev: u64,
         attempt_id: &str,
+        attempt_command_key: &str,
         effect_id: &str,
         failure_code: &str,
         reason: &str,
@@ -1956,7 +2251,7 @@ impl CoworkerCandidateService {
             .record_closure_failure(&RecordClosureFailureRequest {
                 expected_ledger_revision: submitted_ledger_rev,
                 attempt_id: attempt_id.to_string(),
-                command_key: request.command_key.clone(),
+                command_key: attempt_command_key.to_string(),
                 expected_subject_digest: request.final_subject.subject_digest.clone(),
                 failure: ClosureTerminalFailure {
                     failure_code: failure_code.to_string(),
@@ -1981,12 +2276,12 @@ impl CoworkerCandidateService {
                 if let Some(eff) = state.pending_effects.get_mut(effect_id) {
                     eff.status = PendingControllerEffectStatus::EffectFailedTerminal;
                     eff.external_correlation_id = Some(attempt_id.to_string());
-                    eff.diagnostic = Some(sanitize_diagnostic_text(reason));
+                    eff.diagnostic = Some(sanitize_controller_diagnostic(reason));
                     eff.updated_at_ms = recorded_at_ms.max(0) as u64;
                 }
                 if let Some(art) = state.closure_artifacts.get_mut(attempt_id) {
                     art.fenced_from_promotion = fenced_late_output;
-                    art.diagnostic = Some(sanitize_diagnostic_text(reason));
+                    art.diagnostic = Some(sanitize_controller_diagnostic(reason));
                 }
                 Ok(())
             },

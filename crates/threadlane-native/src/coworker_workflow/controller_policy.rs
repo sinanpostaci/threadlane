@@ -3,7 +3,8 @@
 //! completeness receipts, derived correction attempt receipts, and per-job driver lease state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -15,9 +16,11 @@ use threadlane_operations::{
 };
 use threadlane_workers::{
     is_control_config_path, validate_exact_40_hex_sha, validate_executable_file,
-    validate_repo_relative_path, validate_sha256_hex_digest, DEFAULT_MAX_ADVISORY_RESPONSE_BYTES,
-    DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES, DEFAULT_TIMEOUT_MS,
-    MAX_ADVISORY_RESPONSE_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
+    validate_repo_relative_path, validate_sha256_hex_digest, AdvisoryResponseError,
+    AdvisoryResponseErrorCode, BoundedAdvisoryResponse, WorkerExecutionReport, WorkerRunStatus,
+    DEFAULT_MAX_ADVISORY_RESPONSE_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
+    DEFAULT_TIMEOUT_MS, MAX_ADVISORY_RESPONSE_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
+    MAX_TIMEOUT_MS,
 };
 use threadlane_workflow::{DecisionAdvisorMode, ToolAdapter, WorkflowRole};
 
@@ -26,7 +29,8 @@ use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     acquire_cross_process_lock, constant_time_str_eq, ensure_platform_supported,
     read_private_file_bounded, sanitize_diagnostic_text, validate_absolute_no_symlink_components,
-    validate_bounded_identifier, write_private_file_atomic, MAX_PRIVATE_STATE_FILE_BYTES,
+    validate_bounded_identifier, validate_private_file_path, write_private_file_atomic,
+    MAX_PRIVATE_STATE_FILE_BYTES,
 };
 use crate::profile_flow::{
     preflight, ExecutionPolicy, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
@@ -111,6 +115,23 @@ pub const MAX_CONTROLLER_LEASE_TTL_MS: u64 = 3_600_000;
 
 /// Maximum number of shadow Jev observations retained per job.
 pub const MAX_SHADOW_JEV_OBSERVATIONS_PER_JOB: usize = 32;
+
+/// Current wire and on-disk schema version for private full closure execution artifact sidecar files.
+pub const CLOSURE_EXECUTION_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+
+/// Bounded serialization expansion headroom (`MAX_STDOUT_BYTES + 8 MiB`) for a private full
+/// closure execution artifact sidecar file, accounting for retained NDJSON event structures
+/// and JSON escaping/formatting overhead.
+pub const MAX_CLOSURE_ARTIFACT_SERIALIZATION_EXPANSION_BYTES: usize =
+    MAX_STDOUT_BYTES + (8 * 1024 * 1024);
+
+/// Hard upper byte ceiling for a private (`0600`) full closure execution artifact sidecar file,
+/// derived from the actual supervisor capture caps (`MAX_STDOUT_BYTES`, `MAX_STDERR_BYTES`,
+/// `MAX_ADVISORY_RESPONSE_BYTES`) plus bounded serialization expansion.
+pub const MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES: usize = MAX_STDOUT_BYTES
+    + MAX_STDERR_BYTES
+    + MAX_ADVISORY_RESPONSE_BYTES
+    + MAX_CLOSURE_ARTIFACT_SERIALIZATION_EXPANSION_BYTES;
 
 /// Disallowed shell/wrapper executable basenames for [`FrozenCheckCommandSpec`].
 const DISALLOWED_CHECK_WRAPPER_BASENAMES: &[&str] = &[
@@ -2617,8 +2638,577 @@ impl PendingControllerEffectStatus {
     }
 }
 
-/// Full bounded closure worker execution artifact retained in private controller runtime state
+/// Computes the deterministic closure execution artifact identifier (`car_<32hex>`) for
+/// `(binding_id, job_id, attempt_id)`.
+pub fn deterministic_closure_artifact_id(
+    binding_id: &str,
+    job_id: &str,
+    attempt_id: &str,
+) -> String {
+    deterministic_prefixed_id(
+        "threadlane-native:closure-execution-artifact:v1",
+        "car",
+        &[binding_id, job_id, attempt_id],
+    )
+}
+
+/// Computes the canonical 64-character lowercase hex SHA-256 digest of a [`WorkerExecutionReport`].
+pub fn compute_worker_execution_report_sha256(
+    report: &WorkerExecutionReport,
+) -> Result<String, NativeError> {
+    let bytes = serde_json::to_vec(report).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "Failed to serialize WorkerExecutionReport for digest calculation.",
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn validate_worker_execution_report_integrity(
+    report: &WorkerExecutionReport,
+) -> Result<(), NativeError> {
+    if report.requested_model.base_model.trim().is_empty()
+        || report.requested_model.cli_model_arg.trim().is_empty()
+        || report.constructed_argv.is_empty()
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "WorkerExecutionReport is missing required model target or constructed_argv.",
+        ));
+    }
+    if report.status != WorkerRunStatus::OutputOverflow
+        && (report.stdout_bytes_captured > MAX_STDOUT_BYTES
+            || report.stderr_bytes_captured > MAX_STDERR_BYTES)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "WorkerExecutionReport captured byte counts exceed supervisor capture caps without OutputOverflow status.",
+        ));
+    }
+    if let Some(ref summary) = report.redacted_stderr_summary {
+        if summary.len() > threadlane_workers::supervisor::MAX_STDERR_SUMMARY_BYTES {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "WorkerExecutionReport.redacted_stderr_summary exceeds MAX_STDERR_SUMMARY_BYTES.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Compact cryptographically bound reference to a private (`0600`) full closure execution
+/// artifact sidecar file stored outside the 1 MiB controller policy ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClosureExecutionArtifactRef {
+    /// Deterministic artifact identifier (`car_<32hex>`).
+    pub artifact_id: String,
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Bound [`CoworkerJobRecord::job_id`].
+    pub job_id: String,
+    /// Bound [`PendingControllerEffect::effect_id`] (`eff_<32hex>`).
+    pub effect_id: String,
+    /// Closure attempt identifier (`cat_...`).
+    pub attempt_id: String,
+    /// Idempotency command key bound to the closure invocation.
+    pub command_key: String,
+    /// Bound 64-hex [`FinalCandidateSubject::subject_digest`].
+    pub subject_digest: String,
+    /// Bound 40-hex [`FinalCandidateSubject::candidate_tree_sha`].
+    pub candidate_tree_sha: String,
+    /// Terminal supervisor run status observed for the worker invocation.
+    pub worker_status: WorkerRunStatus,
+    /// Wall-clock duration in milliseconds observed by the supervisor.
+    pub duration_ms: u64,
+    /// Canonical 64-hex SHA-256 digest of the serialized [`WorkerExecutionReport`].
+    pub execution_report_sha256: String,
+    /// Canonical 64-hex SHA-256 digest of the captured [`BoundedAdvisoryResponse::text`], when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_response_sha256: Option<String>,
+    /// Structured response extraction error code from the supervisor, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_error_code: Option<AdvisoryResponseErrorCode>,
+    /// Canonical 64-hex SHA-256 digest of the [`PersistedClosureExecutionArtifact`] payload.
+    pub artifact_digest: String,
+    /// Canonical 64-hex SHA-256 digest of the exact persisted sidecar file bytes on disk.
+    pub file_sha256: String,
+    /// Exact byte length of the persisted sidecar file on disk.
+    pub byte_len: usize,
+}
+
+impl ClosureExecutionArtifactRef {
+    /// Validates structural and identity consistency against the enclosing job scope and
+    /// [`ClosureExecutionArtifactRecord`].
+    pub fn validate_against_record(
+        &self,
+        expected_binding_id: &str,
+        expected_thread_uuid: &str,
+        expected_job_id: &str,
+        record: &ClosureExecutionArtifactRecord,
+    ) -> Result<(), NativeError> {
+        validate_bounded_identifier(
+            &self.artifact_id,
+            "artifact_ref.artifact_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        let expected_artifact_id = deterministic_closure_artifact_id(
+            expected_binding_id,
+            expected_job_id,
+            &record.attempt_id,
+        );
+        if self.artifact_id != expected_artifact_id {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRef.artifact_id does not match deterministic (binding_id, job_id, attempt_id) derivation.",
+            ));
+        }
+        if self.binding_id != expected_binding_id
+            || self.thread_uuid != expected_thread_uuid
+            || self.job_id != expected_job_id
+            || self.attempt_id != record.attempt_id
+            || self.command_key != record.command_key
+            || !constant_time_str_eq(&self.subject_digest, &record.subject_digest)
+            || !constant_time_str_eq(&self.candidate_tree_sha, &record.candidate_tree_sha)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRef identity fields do not match enclosing record or job scope.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.effect_id,
+            "artifact_ref.effect_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if !self.effect_id.starts_with("eff_") {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRef.effect_id must start with `eff_`.",
+            ));
+        }
+        validate_sha256_hex_digest(
+            &self.execution_report_sha256,
+            "artifact_ref.execution_report_sha256",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRef.execution_report_sha256 must be a 64-hex SHA-256 digest.",
+            )
+        })?;
+        if let Some(ref resp_sha) = self.advisory_response_sha256 {
+            validate_sha256_hex_digest(resp_sha, "artifact_ref.advisory_response_sha256").map_err(
+                |_| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ClosureExecutionArtifactRef.advisory_response_sha256 must be a 64-hex SHA-256 digest.",
+                    )
+                },
+            )?;
+        }
+        if self.advisory_response_sha256.is_some() && self.response_error_code.is_some() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRef cannot carry both advisory_response_sha256 and response_error_code.",
+            ));
+        }
+        validate_sha256_hex_digest(&self.artifact_digest, "artifact_ref.artifact_digest").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ClosureExecutionArtifactRef.artifact_digest must be a 64-hex SHA-256 digest.",
+                )
+            },
+        )?;
+        validate_sha256_hex_digest(&self.file_sha256, "artifact_ref.file_sha256").map_err(
+            |_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ClosureExecutionArtifactRef.file_sha256 must be a 64-hex SHA-256 digest.",
+                )
+            },
+        )?;
+        if self.byte_len == 0 || self.byte_len > MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRef.byte_len is zero or exceeds MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Request to persist a full bounded closure worker execution artifact in a private (`0600`)
+/// sidecar file outside the controller policy ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistClosureExecutionArtifactRequest {
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Bound [`CoworkerJobRecord::job_id`].
+    pub job_id: String,
+    /// Bound [`PendingControllerEffect::effect_id`] (`eff_<32hex>`).
+    pub effect_id: String,
+    /// Closure attempt identifier (`cat_...`).
+    pub attempt_id: String,
+    /// Idempotency command key bound to the closure invocation.
+    pub command_key: String,
+    /// Bound 64-hex [`FinalCandidateSubject::subject_digest`].
+    pub subject_digest: String,
+    /// Bound 40-hex [`FinalCandidateSubject::candidate_tree_sha`].
+    pub candidate_tree_sha: String,
+    /// Full bounded supervisor execution report ([`WorkerExecutionReport`]).
+    pub execution_report: WorkerExecutionReport,
+    /// Full bounded advisory response payload and SHA-256 digest when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_response: Option<BoundedAdvisoryResponse>,
+    /// Structured response extraction or validation error when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_error: Option<AdvisoryResponseError>,
+    /// Observed model identifier from verified stream telemetry, if present (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Observed reasoning effort from verified stream telemetry, if present (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    /// Timestamp (ms since Unix epoch) when this artifact was persisted.
+    pub recorded_at_ms: u64,
+}
+
+/// Full bounded closure worker execution artifact persisted in a private (`0600`) sidecar file
+/// outside the 1 MiB controller policy ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedClosureExecutionArtifact {
+    /// Wire and storage schema version (`1`).
+    pub schema_version: u32,
+    /// Deterministic artifact identifier (`car_<32hex>`).
+    pub artifact_id: String,
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Bound [`CoworkerJobRecord::job_id`].
+    pub job_id: String,
+    /// Bound [`PendingControllerEffect::effect_id`] (`eff_<32hex>`).
+    pub effect_id: String,
+    /// Closure attempt identifier (`cat_...`).
+    pub attempt_id: String,
+    /// Idempotency command key bound to the closure invocation.
+    pub command_key: String,
+    /// Bound 64-hex [`FinalCandidateSubject::subject_digest`].
+    pub subject_digest: String,
+    /// Bound 40-hex [`FinalCandidateSubject::candidate_tree_sha`].
+    pub candidate_tree_sha: String,
+    /// Full bounded supervisor execution report ([`WorkerExecutionReport`]).
+    pub execution_report: WorkerExecutionReport,
+    /// Full bounded advisory response payload and SHA-256 digest when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_response: Option<BoundedAdvisoryResponse>,
+    /// Structured response extraction or validation error when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_error: Option<AdvisoryResponseError>,
+    /// Observed model identifier from verified stream telemetry, if present (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Observed reasoning effort from verified stream telemetry, if present (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    /// Timestamp (ms since Unix epoch) when this artifact was persisted.
+    pub recorded_at_ms: u64,
+    /// Canonical 64-hex SHA-256 digest of this artifact record.
+    pub artifact_digest: String,
+}
+
+impl PersistedClosureExecutionArtifact {
+    /// Computes the canonical 64-character lowercase hex SHA-256 digest of this full artifact.
+    pub fn compute_digest(&self) -> Result<String, NativeError> {
+        let report_sha = compute_worker_execution_report_sha256(&self.execution_report)?;
+        let seed = (
+            (
+                "threadlane-native:persisted_closure_execution_artifact:v1",
+                self.schema_version,
+                self.artifact_id.as_str(),
+                self.binding_id.as_str(),
+                self.thread_uuid.as_str(),
+                self.job_id.as_str(),
+                self.effect_id.as_str(),
+                self.attempt_id.as_str(),
+                self.command_key.as_str(),
+                self.subject_digest.as_str(),
+                self.candidate_tree_sha.as_str(),
+            ),
+            (
+                report_sha.as_str(),
+                &self.advisory_response,
+                &self.response_error,
+                self.observed_model.as_deref(),
+                self.observed_effort.as_deref(),
+                self.recorded_at_ms,
+            ),
+        );
+        let bytes = serde_json::to_vec(&seed).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Failed to serialize PersistedClosureExecutionArtifact for digest calculation.",
+            )
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
+    /// Validates all identity, report, response, error, telemetry, and cryptographic digest invariants.
+    pub fn validate_integrity(&self) -> Result<(), NativeError> {
+        if self.schema_version != CLOSURE_EXECUTION_ARTIFACT_SCHEMA_VERSION {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.schema_version is unsupported.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.artifact_id,
+            "persisted_closure_artifact.artifact_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_bounded_identifier(
+            &self.binding_id,
+            "persisted_closure_artifact.binding_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_canonical_thread_uuid("persisted_closure_artifact.thread_uuid", &self.thread_uuid)
+            .map_err(|_| {
+                NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.thread_uuid must be a canonical thread UUID.",
+            )
+            })?;
+        validate_bounded_identifier(
+            &self.job_id,
+            "persisted_closure_artifact.job_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_bounded_identifier(
+            &self.effect_id,
+            "persisted_closure_artifact.effect_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if !self.effect_id.starts_with("eff_") {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.effect_id must start with `eff_`.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.attempt_id,
+            "persisted_closure_artifact.attempt_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        let expected_artifact_id =
+            deterministic_closure_artifact_id(&self.binding_id, &self.job_id, &self.attempt_id);
+        if self.artifact_id != expected_artifact_id {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.artifact_id does not match deterministic derivation.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.command_key,
+            "persisted_closure_artifact.command_key",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_sha256_hex_digest(
+            &self.subject_digest,
+            "persisted_closure_artifact.subject_digest",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.subject_digest must be a 64-hex SHA-256 digest.",
+            )
+        })?;
+        validate_exact_40_hex_sha(
+            &self.candidate_tree_sha,
+            "persisted_closure_artifact.candidate_tree_sha",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.candidate_tree_sha must be a 40-hex Git tree SHA.",
+            )
+        })?;
+
+        validate_worker_execution_report_integrity(&self.execution_report)?;
+
+        if self.observed_model.as_deref() != self.execution_report.effective_observed_model()
+            || self.observed_effort.as_deref() != self.execution_report.effective_observed_effort()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact observed telemetry does not match execution_report stream evidence.",
+            ));
+        }
+
+        if let Some(ref resp) = self.advisory_response {
+            resp.validate_integrity(MAX_ADVISORY_RESPONSE_BYTES)
+                .map_err(|err| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!("PersistedClosureExecutionArtifact.advisory_response failed integrity verification: {err}"),
+                    )
+                })?;
+            if resp.provider != self.execution_report.provider
+                || resp.framing.terminal_line_number > self.execution_report.evidence.total_lines
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PersistedClosureExecutionArtifact.advisory_response provider or framing conflicts with execution_report.",
+                ));
+            }
+            if self.response_error.is_some() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PersistedClosureExecutionArtifact cannot carry both advisory_response and response_error.",
+                ));
+            }
+        }
+        if let Some(ref err) = self.response_error {
+            if err.message.trim().is_empty()
+                || err.message.len() > MAX_COWORKER_SUMMARY_BYTES
+                || err.message.chars().any(char::is_control)
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PersistedClosureExecutionArtifact.response_error message is empty or exceeds bounds.",
+                ));
+            }
+        }
+
+        validate_sha256_hex_digest(
+            &self.artifact_digest,
+            "persisted_closure_artifact.artifact_digest",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.artifact_digest must be a 64-hex SHA-256 digest.",
+            )
+        })?;
+        let computed = self.compute_digest()?;
+        if !constant_time_str_eq(&computed, &self.artifact_digest) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PersistedClosureExecutionArtifact.artifact_digest mismatch.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches_semantic_payload(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.artifact_id == other.artifact_id
+            && self.binding_id == other.binding_id
+            && self.thread_uuid == other.thread_uuid
+            && self.job_id == other.job_id
+            && self.effect_id == other.effect_id
+            && self.attempt_id == other.attempt_id
+            && self.command_key == other.command_key
+            && constant_time_str_eq(&self.subject_digest, &other.subject_digest)
+            && constant_time_str_eq(&self.candidate_tree_sha, &other.candidate_tree_sha)
+            && self.execution_report == other.execution_report
+            && self.advisory_response == other.advisory_response
+            && self.response_error == other.response_error
+            && self.observed_model == other.observed_model
+            && self.observed_effort == other.observed_effort
+    }
+
+    fn to_artifact_ref(
+        &self,
+        file_bytes: &[u8],
+    ) -> Result<ClosureExecutionArtifactRef, NativeError> {
+        let execution_report_sha256 =
+            compute_worker_execution_report_sha256(&self.execution_report)?;
+        Ok(ClosureExecutionArtifactRef {
+            artifact_id: self.artifact_id.clone(),
+            binding_id: self.binding_id.clone(),
+            thread_uuid: self.thread_uuid.clone(),
+            job_id: self.job_id.clone(),
+            effect_id: self.effect_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            command_key: self.command_key.clone(),
+            subject_digest: self.subject_digest.clone(),
+            candidate_tree_sha: self.candidate_tree_sha.clone(),
+            worker_status: self.execution_report.status,
+            duration_ms: self.execution_report.duration_ms,
+            execution_report_sha256,
+            advisory_response_sha256: self
+                .advisory_response
+                .as_ref()
+                .map(|r| r.sha256_digest.clone()),
+            response_error_code: self.response_error.as_ref().map(|e| e.code),
+            artifact_digest: self.artifact_digest.clone(),
+            file_sha256: sha256_hex(file_bytes),
+            byte_len: file_bytes.len(),
+        })
+    }
+}
+
+/// Verified full closure worker execution artifact loaded from either a compact sidecar
+/// reference (`artifact_ref`) or a valid historical inline ledger record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadedClosureExecutionArtifact {
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Bound [`CoworkerJobRecord::job_id`].
+    pub job_id: String,
+    /// Closure attempt identifier (`cat_...`).
+    pub attempt_id: String,
+    /// Idempotency command key bound to the closure invocation.
+    pub command_key: String,
+    /// Bound 64-hex [`FinalCandidateSubject::subject_digest`].
+    pub subject_digest: String,
+    /// Bound 40-hex [`FinalCandidateSubject::candidate_tree_sha`].
+    pub candidate_tree_sha: String,
+    /// Verified compact sidecar reference when loaded from a private sidecar artifact (`None` for legacy inline records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_ref: Option<ClosureExecutionArtifactRef>,
+    /// Full bounded supervisor execution report ([`WorkerExecutionReport`]).
+    pub execution_report: WorkerExecutionReport,
+    /// Full bounded advisory response payload and SHA-256 digest when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_response: Option<BoundedAdvisoryResponse>,
+    /// Structured response extraction or validation error when captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_error: Option<AdvisoryResponseError>,
+    /// Observed model identifier from verified stream telemetry, if present (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Observed reasoning effort from verified stream telemetry, if present (never fabricated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_effort: Option<String>,
+    /// Whether valid late worker output was fenced from promotion by an active hold, stop, revision drift, or subject drift.
+    pub fenced_from_promotion: bool,
+    /// Sanitized diagnostic when `fenced_from_promotion == true` or when validation failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    /// Timestamp (ms since Unix epoch) when this artifact was persisted.
+    pub recorded_at_ms: u64,
+}
+
+/// Closure worker execution artifact record retained in private controller runtime state
 /// for crash recovery, audit, and fenced late-output preservation.
+///
+/// New records store a compact cryptographically bound [`ClosureExecutionArtifactRef`] pointing
+/// to a private (`0600`) sidecar file outside the 1 MiB policy ledger. Historical inline
+/// records (`execution_report: Some(...)` with `artifact_ref: None`) remain readable for
+/// backward compatibility; mutually inconsistent or malformed records fail closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClosureExecutionArtifactRecord {
@@ -2630,11 +3220,18 @@ pub struct ClosureExecutionArtifactRecord {
     pub subject_digest: String,
     /// Bound 40-hex [`FinalCandidateSubject::candidate_tree_sha`].
     pub candidate_tree_sha: String,
-    /// Full bounded supervisor execution report ([`threadlane_workers::WorkerExecutionReport`]).
-    pub execution_report: threadlane_workers::WorkerExecutionReport,
-    /// Full bounded advisory response payload and SHA-256 digest when captured.
+    /// Compact cryptographically bound reference to the private full-artifact sidecar file (required for all new records).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub advisory_response: Option<threadlane_workers::BoundedAdvisoryResponse>,
+    pub artifact_ref: Option<ClosureExecutionArtifactRef>,
+    /// Historical inline supervisor execution report (`None` on new compact-reference records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_report: Option<WorkerExecutionReport>,
+    /// Historical inline bounded advisory response payload (`None` on new compact-reference records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory_response: Option<BoundedAdvisoryResponse>,
+    /// Historical inline structured response extraction error (`None` on new compact-reference records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_error: Option<AdvisoryResponseError>,
     /// Observed model identifier from verified stream telemetry, if present (never fabricated).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_model: Option<String>,
@@ -2649,6 +3246,145 @@ pub struct ClosureExecutionArtifactRecord {
     pub diagnostic: Option<String>,
     /// Timestamp (ms since Unix epoch) when this artifact was persisted.
     pub recorded_at_ms: u64,
+}
+
+impl ClosureExecutionArtifactRecord {
+    /// Validates structural, exclusivity, and identity invariants of this ledger record.
+    ///
+    /// Exactly one representation is permitted:
+    /// - New compact reference mode: `artifact_ref` is `Some(...)` and inline `execution_report`,
+    ///   `advisory_response`, and `response_error` are all `None`.
+    /// - Historical inline mode: `artifact_ref` is `None` and `execution_report` is `Some(...)`.
+    pub fn validate(
+        &self,
+        expected_binding_id: &str,
+        expected_thread_uuid: &str,
+        expected_job_id: &str,
+        expected_attempt_id: &str,
+    ) -> Result<(), NativeError> {
+        validate_bounded_identifier(
+            &self.attempt_id,
+            "closure_artifact.attempt_id",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        if self.attempt_id != expected_attempt_id {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRecord.attempt_id does not match map key.",
+            ));
+        }
+        validate_bounded_identifier(
+            &self.command_key,
+            "closure_artifact.command_key",
+            MAX_COWORKER_ID_LEN,
+        )?;
+        validate_sha256_hex_digest(&self.subject_digest, "closure_artifact.subject_digest")
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ClosureExecutionArtifactRecord.subject_digest must be a 64-hex SHA-256 digest.",
+                )
+            })?;
+        validate_exact_40_hex_sha(
+            &self.candidate_tree_sha,
+            "closure_artifact.candidate_tree_sha",
+        )
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRecord.candidate_tree_sha must be a 40-hex Git tree SHA.",
+            )
+        })?;
+        if let Some(ref model) = self.observed_model {
+            validate_bounded_summary_line(model, "closure_artifact.observed_model")?;
+        }
+        if let Some(ref effort) = self.observed_effort {
+            validate_bounded_summary_line(effort, "closure_artifact.observed_effort")?;
+        }
+        if let Some(ref diag) = self.diagnostic {
+            if diag.len() > MAX_COWORKER_SUMMARY_BYTES || diag.chars().any(char::is_control) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ClosureExecutionArtifactRecord.diagnostic exceeds bounds or contains control characters.",
+                ));
+            }
+        }
+
+        match (&self.artifact_ref, &self.execution_report) {
+            (Some(art_ref), None) => {
+                if self.advisory_response.is_some() || self.response_error.is_some() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ClosureExecutionArtifactRecord cannot combine compact artifact_ref with inline advisory_response or response_error.",
+                    ));
+                }
+                art_ref.validate_against_record(
+                    expected_binding_id,
+                    expected_thread_uuid,
+                    expected_job_id,
+                    self,
+                )?;
+            }
+            (None, Some(report)) => {
+                validate_worker_execution_report_integrity(report)?;
+                if self.observed_model.as_deref() != report.effective_observed_model()
+                    || self.observed_effort.as_deref() != report.effective_observed_effort()
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Legacy inline ClosureExecutionArtifactRecord observed telemetry does not match execution_report stream evidence.",
+                    ));
+                }
+                if let Some(ref resp) = self.advisory_response {
+                    resp.validate_integrity(MAX_ADVISORY_RESPONSE_BYTES)
+                        .map_err(|err| {
+                            NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                format!("Legacy inline ClosureExecutionArtifactRecord.advisory_response failed integrity verification: {err}"),
+                            )
+                        })?;
+                    if resp.provider != report.provider
+                        || resp.framing.terminal_line_number > report.evidence.total_lines
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "Legacy inline ClosureExecutionArtifactRecord.advisory_response provider or framing conflicts with execution_report.",
+                        ));
+                    }
+                    if self.response_error.is_some() {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "Legacy inline ClosureExecutionArtifactRecord cannot carry both advisory_response and response_error.",
+                        ));
+                    }
+                }
+                if let Some(ref err) = self.response_error {
+                    if err.message.trim().is_empty()
+                        || err.message.len() > MAX_COWORKER_SUMMARY_BYTES
+                        || err.message.chars().any(char::is_control)
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "Legacy inline ClosureExecutionArtifactRecord.response_error message is empty or exceeds bounds.",
+                        ));
+                    }
+                }
+            }
+            (Some(_), Some(_)) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ClosureExecutionArtifactRecord cannot contain both compact artifact_ref and inline execution_report.",
+                ));
+            }
+            (None, None) => {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "ClosureExecutionArtifactRecord requires either compact artifact_ref or legacy inline execution_report.",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Durable intent-before-effect record tracked per job so a restart or reopen inspects pending
@@ -2917,6 +3653,445 @@ impl ControllerPolicyStore {
     pub fn lock_path_for_binding(&self, binding_id: &str) -> Result<PathBuf, NativeError> {
         validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         Ok(self.plans_dir.join(controller_lock_filename(binding_id)))
+    }
+
+    /// Returns the deterministic private sidecar file path for a closure execution artifact
+    /// (`(binding_id, job_id, attempt_id)`). Never trusts caller-supplied file paths.
+    pub fn closure_artifact_path_for_attempt(
+        &self,
+        binding_id: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<PathBuf, NativeError> {
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(attempt_id, "attempt_id", MAX_COWORKER_ID_LEN)?;
+        Ok(self
+            .plans_dir
+            .join(closure_artifact_filename(binding_id, job_id, attempt_id)))
+    }
+
+    /// Atomically and immutably persists a full bounded closure worker execution artifact in a
+    /// private (`0600`) sidecar file outside the 1 MiB controller policy ledger, returning its
+    /// compact cryptographically bound [`ClosureExecutionArtifactRef`].
+    ///
+    /// If the target sidecar file already exists on disk:
+    /// - If it is valid and semantically identical to `request`, its existing bytes on disk are
+    ///   preserved untouched and the corresponding [`ClosureExecutionArtifactRef`] is returned.
+    /// - If it is malformed, tampered, or represents a different artifact, this method fails
+    ///   closed with [`NativeErrorCode::SecurityViolation`] and preserves the existing bytes.
+    pub fn persist_closure_execution_artifact(
+        &self,
+        request: &PersistClosureExecutionArtifactRequest,
+    ) -> Result<ClosureExecutionArtifactRef, NativeError> {
+        ensure_platform_supported()?;
+        let clean_dir = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&request.attempt_id, "attempt_id", MAX_COWORKER_ID_LEN)?;
+
+        let lock_name = controller_lock_filename(&request.binding_id);
+        let _guard = acquire_cross_process_lock(&clean_dir, &lock_name, "controller_policy_lock")?;
+
+        let artifact_id = deterministic_closure_artifact_id(
+            &request.binding_id,
+            &request.job_id,
+            &request.attempt_id,
+        );
+        let mut artifact = PersistedClosureExecutionArtifact {
+            schema_version: CLOSURE_EXECUTION_ARTIFACT_SCHEMA_VERSION,
+            artifact_id,
+            binding_id: request.binding_id.clone(),
+            thread_uuid: request.thread_uuid.clone(),
+            job_id: request.job_id.clone(),
+            effect_id: request.effect_id.clone(),
+            attempt_id: request.attempt_id.clone(),
+            command_key: request.command_key.clone(),
+            subject_digest: request.subject_digest.clone(),
+            candidate_tree_sha: request.candidate_tree_sha.clone(),
+            execution_report: request.execution_report.clone(),
+            advisory_response: request.advisory_response.clone(),
+            response_error: request.response_error.clone(),
+            observed_model: request.observed_model.clone(),
+            observed_effort: request.observed_effort.clone(),
+            recorded_at_ms: request.recorded_at_ms,
+            artifact_digest: String::new(),
+        };
+        artifact.artifact_digest = artifact.compute_digest()?;
+        artifact.validate_integrity()?;
+
+        let filename =
+            closure_artifact_filename(&request.binding_id, &request.job_id, &request.attempt_id);
+        let target_path = clean_dir.join(&filename);
+        validate_private_file_path(&target_path, "closure_execution_artifact")?;
+
+        match fs::symlink_metadata(&target_path) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "Existing closure execution artifact path must be a regular non-symlink file.",
+                    ));
+                }
+                let existing_bytes = read_private_file_bounded(
+                    &target_path,
+                    MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES,
+                    "closure_execution_artifact",
+                )?
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "Existing closure execution artifact disappeared during inspection.",
+                    )
+                })?;
+                let existing: PersistedClosureExecutionArtifact =
+                    serde_json::from_slice(&existing_bytes).map_err(|_| {
+                        NativeError::new(
+                            NativeErrorCode::SecurityViolation,
+                            "Existing closure execution artifact sidecar is malformed JSON; preserving existing bytes.",
+                        )
+                    })?;
+                existing.validate_integrity().map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "Existing closure execution artifact sidecar failed integrity verification; preserving existing bytes.",
+                    )
+                })?;
+                if !existing.matches_semantic_payload(&artifact) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        "An existing different closure execution artifact is already persisted for this attempt; preserving existing bytes.",
+                    ));
+                }
+                existing.to_artifact_ref(&existing_bytes)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let bytes = serde_json::to_vec_pretty(&artifact).map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "Failed to serialize PersistedClosureExecutionArtifact JSON.",
+                    )
+                })?;
+                if bytes.is_empty() || bytes.len() > MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES {
+                    return Err(NativeError::new(
+                        NativeErrorCode::OutputOverflow,
+                        "Serialized closure execution artifact exceeds MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES.",
+                    ));
+                }
+                write_private_closure_artifact_immutable(&clean_dir, &filename, &bytes)?;
+                artifact.to_artifact_ref(&bytes)
+            }
+            Err(_) => Err(NativeError::new(
+                NativeErrorCode::IoError,
+                "Failed to inspect closure execution artifact metadata.",
+            )),
+        }
+    }
+
+    /// Narrowly scoped loader that reads and cryptographically verifies the complete closure
+    /// execution artifact for `(binding_id, thread_uuid, job_id, attempt_id)`.
+    ///
+    /// Supports both new compact-reference records (verifying the private `0600` sidecar file's
+    /// complete identity, digests, and byte size) and valid historical inline records, while
+    /// failing closed on missing/tampered sidecars or mutually inconsistent records. Never trusts
+    /// a caller-supplied artifact path.
+    pub fn load_closure_execution_artifact(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        attempt_id: &str,
+    ) -> Result<LoadedClosureExecutionArtifact, NativeError> {
+        ensure_platform_supported()?;
+        let _ = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_canonical_thread_uuid("thread_uuid", thread_uuid).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "thread_uuid must be a canonical thread UUID.",
+            )
+        })?;
+        validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(attempt_id, "attempt_id", MAX_COWORKER_ID_LEN)?;
+
+        let runtime = self
+            .get_job_runtime_readonly(binding_id, job_id)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::NotConfigured,
+                    "No controller runtime state exists for this job.",
+                )
+            })?;
+        if runtime.job_id != job_id
+            || runtime.envelope.binding_id != binding_id
+            || runtime.envelope.thread_uuid != thread_uuid
+            || runtime.envelope.job_id != job_id
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Controller runtime state binding_id, thread_uuid, or job_id mismatch.",
+            ));
+        }
+        let record = runtime.closure_artifacts.get(attempt_id).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::NotConfigured,
+                format!("No closure execution artifact is recorded for attempt `{attempt_id}`."),
+            )
+        })?;
+        if let Some(ref art_ref) = record.artifact_ref {
+            if let Some(eff) = runtime.pending_effects.get(&art_ref.effect_id) {
+                if eff.kind != PendingControllerEffectKind::ClosureInvocation
+                    || eff.job_id != job_id
+                    || eff.request_key != record.command_key
+                    || !constant_time_str_eq(&eff.subject_digest, &record.subject_digest)
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "ClosureExecutionArtifactRef.effect_id does not match the job's ClosureInvocation PendingControllerEffect.",
+                    ));
+                }
+            }
+        }
+        self.load_closure_execution_artifact_for_record(binding_id, thread_uuid, job_id, record)
+    }
+
+    /// Verifies and loads the full [`LoadedClosureExecutionArtifact`] for a specific
+    /// [`ClosureExecutionArtifactRecord`] under `(binding_id, thread_uuid, job_id)`.
+    pub fn load_closure_execution_artifact_for_record(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        record: &ClosureExecutionArtifactRecord,
+    ) -> Result<LoadedClosureExecutionArtifact, NativeError> {
+        ensure_platform_supported()?;
+        let _ = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_canonical_thread_uuid("thread_uuid", thread_uuid).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "thread_uuid must be a canonical thread UUID.",
+            )
+        })?;
+        validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+
+        record.validate(binding_id, thread_uuid, job_id, &record.attempt_id)?;
+        let sidecar_path =
+            self.closure_artifact_path_for_attempt(binding_id, job_id, &record.attempt_id)?;
+
+        match (&record.artifact_ref, &record.execution_report) {
+            (Some(art_ref), None) => {
+                let bytes = read_private_file_bounded(
+                    &sidecar_path,
+                    MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES,
+                    "closure_execution_artifact",
+                )?
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Referenced closure execution artifact sidecar file is missing.",
+                    )
+                })?;
+                if bytes.len() != art_ref.byte_len {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Closure execution artifact sidecar byte length does not match artifact_ref.byte_len.",
+                    ));
+                }
+                let actual_file_sha = sha256_hex(&bytes);
+                if !constant_time_str_eq(&actual_file_sha, &art_ref.file_sha256) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Closure execution artifact sidecar file_sha256 does not match artifact_ref.file_sha256.",
+                    ));
+                }
+                let persisted: PersistedClosureExecutionArtifact = serde_json::from_slice(&bytes)
+                    .map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Failed to parse closure execution artifact sidecar JSON.",
+                    )
+                })?;
+                persisted.validate_integrity()?;
+
+                if persisted.artifact_id != art_ref.artifact_id
+                    || persisted.binding_id != binding_id
+                    || persisted.binding_id != art_ref.binding_id
+                    || persisted.thread_uuid != thread_uuid
+                    || persisted.thread_uuid != art_ref.thread_uuid
+                    || persisted.job_id != job_id
+                    || persisted.job_id != art_ref.job_id
+                    || persisted.effect_id != art_ref.effect_id
+                    || persisted.attempt_id != record.attempt_id
+                    || persisted.attempt_id != art_ref.attempt_id
+                    || persisted.command_key != record.command_key
+                    || persisted.command_key != art_ref.command_key
+                    || !constant_time_str_eq(&persisted.subject_digest, &record.subject_digest)
+                    || !constant_time_str_eq(&persisted.subject_digest, &art_ref.subject_digest)
+                    || !constant_time_str_eq(
+                        &persisted.candidate_tree_sha,
+                        &record.candidate_tree_sha,
+                    )
+                    || !constant_time_str_eq(
+                        &persisted.candidate_tree_sha,
+                        &art_ref.candidate_tree_sha,
+                    )
+                    || !constant_time_str_eq(&persisted.artifact_digest, &art_ref.artifact_digest)
+                    || persisted.execution_report.status != art_ref.worker_status
+                    || persisted.execution_report.duration_ms != art_ref.duration_ms
+                    || persisted.observed_model != record.observed_model
+                    || persisted.observed_effort != record.observed_effort
+                    || persisted.recorded_at_ms != record.recorded_at_ms
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Persisted closure execution artifact sidecar identity or telemetry does not match artifact_ref/record.",
+                    ));
+                }
+                let report_sha =
+                    compute_worker_execution_report_sha256(&persisted.execution_report)?;
+                if !constant_time_str_eq(&report_sha, &art_ref.execution_report_sha256) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Persisted closure execution artifact execution_report_sha256 mismatch.",
+                    ));
+                }
+                match (
+                    persisted.advisory_response.as_ref(),
+                    art_ref.advisory_response_sha256.as_ref(),
+                ) {
+                    (Some(resp), Some(expected_sha)) => {
+                        if !constant_time_str_eq(&resp.sha256_digest, expected_sha) {
+                            return Err(NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                "Persisted closure execution artifact advisory_response_sha256 mismatch.",
+                            ));
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "Persisted closure execution artifact advisory_response presence does not match artifact_ref.",
+                        ));
+                    }
+                }
+                if persisted.response_error.as_ref().map(|e| e.code) != art_ref.response_error_code
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Persisted closure execution artifact response_error_code does not match artifact_ref.",
+                    ));
+                }
+
+                Ok(LoadedClosureExecutionArtifact {
+                    binding_id: binding_id.to_string(),
+                    thread_uuid: thread_uuid.to_string(),
+                    job_id: job_id.to_string(),
+                    attempt_id: record.attempt_id.clone(),
+                    command_key: record.command_key.clone(),
+                    subject_digest: record.subject_digest.clone(),
+                    candidate_tree_sha: record.candidate_tree_sha.clone(),
+                    artifact_ref: Some(art_ref.clone()),
+                    execution_report: persisted.execution_report,
+                    advisory_response: persisted.advisory_response,
+                    response_error: persisted.response_error,
+                    observed_model: record.observed_model.clone(),
+                    observed_effort: record.observed_effort.clone(),
+                    fenced_from_promotion: record.fenced_from_promotion,
+                    diagnostic: record.diagnostic.clone(),
+                    recorded_at_ms: record.recorded_at_ms,
+                })
+            }
+            (None, Some(report)) => {
+                if fs::symlink_metadata(&sidecar_path).is_ok() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Legacy inline ClosureExecutionArtifactRecord is mutually inconsistent with an existing sidecar file on disk.",
+                    ));
+                }
+                Ok(LoadedClosureExecutionArtifact {
+                    binding_id: binding_id.to_string(),
+                    thread_uuid: thread_uuid.to_string(),
+                    job_id: job_id.to_string(),
+                    attempt_id: record.attempt_id.clone(),
+                    command_key: record.command_key.clone(),
+                    subject_digest: record.subject_digest.clone(),
+                    candidate_tree_sha: record.candidate_tree_sha.clone(),
+                    artifact_ref: None,
+                    execution_report: report.clone(),
+                    advisory_response: record.advisory_response.clone(),
+                    response_error: record.response_error.clone(),
+                    observed_model: record.observed_model.clone(),
+                    observed_effort: record.observed_effort.clone(),
+                    fenced_from_promotion: record.fenced_from_promotion,
+                    diagnostic: record.diagnostic.clone(),
+                    recorded_at_ms: record.recorded_at_ms,
+                })
+            }
+            _ => Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "ClosureExecutionArtifactRecord is malformed or mutually inconsistent.",
+            )),
+        }
+    }
+
+    /// Inspects and verifies a persisted private closure execution artifact sidecar file on disk
+    /// for crash recovery when an attempt was submitted and wrote its sidecar before ledger completion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn recover_persisted_closure_sidecar_if_present(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        effect_id: &str,
+        attempt_id: &str,
+        command_key: &str,
+        subject_digest: &str,
+        candidate_tree_sha: &str,
+    ) -> Result<
+        Option<(
+            PersistedClosureExecutionArtifact,
+            ClosureExecutionArtifactRef,
+        )>,
+        NativeError,
+    > {
+        ensure_platform_supported()?;
+        let _ = validate_existing_private_dir(&self.plans_dir, "plans_dir")?;
+        let sidecar_path =
+            self.closure_artifact_path_for_attempt(binding_id, job_id, attempt_id)?;
+        let Some(bytes) = read_private_file_bounded(
+            &sidecar_path,
+            MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES,
+            "closure_execution_artifact",
+        )?
+        else {
+            return Ok(None);
+        };
+        let persisted: PersistedClosureExecutionArtifact =
+            serde_json::from_slice(&bytes).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Persisted closure execution artifact sidecar JSON is malformed.",
+                )
+            })?;
+        persisted.validate_integrity()?;
+        if persisted.binding_id != binding_id
+            || persisted.thread_uuid != thread_uuid
+            || persisted.job_id != job_id
+            || persisted.effect_id != effect_id
+            || persisted.attempt_id != attempt_id
+            || persisted.command_key != command_key
+            || !constant_time_str_eq(&persisted.subject_digest, subject_digest)
+            || !constant_time_str_eq(&persisted.candidate_tree_sha, candidate_tree_sha)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Persisted closure execution artifact sidecar identity does not match expected recovery context.",
+            ));
+        }
+        let art_ref = persisted.to_artifact_ref(&bytes)?;
+        Ok(Some((persisted, art_ref)))
     }
 
     /// Pure read-only lookup of a job's [`ControllerJobRuntimeState`] without creating files or locks.
@@ -3397,6 +4572,16 @@ impl ControllerPolicyStore {
                 "Controller policy ledger schema_version or binding_id mismatch.",
             ));
         }
+        for (job_id, state) in &ledger.jobs {
+            for (attempt_id, record) in &state.closure_artifacts {
+                record.validate(
+                    expected_binding_id,
+                    &state.envelope.thread_uuid,
+                    job_id,
+                    attempt_id,
+                )?;
+            }
+        }
         Ok(Some(ledger))
     }
 
@@ -3648,6 +4833,99 @@ fn controller_lock_filename(binding_id: &str) -> String {
     );
     let hex_part = tag.strip_prefix("tag_").unwrap_or(&tag);
     format!("coworker-controller-{hex_part}.lock")
+}
+
+fn closure_artifact_filename(binding_id: &str, job_id: &str, attempt_id: &str) -> String {
+    let artifact_id = deterministic_closure_artifact_id(binding_id, job_id, attempt_id);
+    let hex_part = artifact_id.strip_prefix("car_").unwrap_or(&artifact_id);
+    format!("coworker-closure-artifact-{hex_part}.json")
+}
+
+fn write_private_closure_artifact_immutable(
+    dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, NativeError> {
+    ensure_platform_supported()?;
+    if bytes.is_empty() || bytes.len() > MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES {
+        return Err(NativeError::new(
+            NativeErrorCode::OutputOverflow,
+            format!(
+                "closure_execution_artifact payload size ({}) is invalid or exceeds maximum size of {MAX_CLOSURE_EXECUTION_ARTIFACT_BYTES} bytes.",
+                bytes.len()
+            ),
+        ));
+    }
+    let clean_dir = validate_existing_private_dir(dir, "plans_dir")?;
+    let target_path = clean_dir.join(filename);
+    validate_private_file_path(&target_path, "closure_execution_artifact")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_prefix = format!(".{filename}.tmp.");
+        let mut temp = tempfile::Builder::new()
+            .prefix(&temp_prefix)
+            .permissions(fs::Permissions::from_mode(0o600))
+            .tempfile_in(&clean_dir)
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::IoError,
+                    "Failed to create temporary closure_execution_artifact file.",
+                )
+            })?;
+
+        temp.write_all(bytes).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "Failed to write temporary closure_execution_artifact file.",
+            )
+        })?;
+        temp.as_file().sync_all().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "Failed to fsync temporary closure_execution_artifact file.",
+            )
+        })?;
+        temp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::IoError,
+                    "Failed to set 0600 permissions on temporary closure_execution_artifact file.",
+                )
+            })?;
+
+        temp.persist_noclobber(&target_path).map_err(|err| {
+            if err.error.kind() == std::io::ErrorKind::AlreadyExists {
+                NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "Refusing to overwrite existing closure_execution_artifact file.",
+                )
+            } else {
+                NativeError::new(
+                    NativeErrorCode::IoError,
+                    "Failed to atomically publish closure_execution_artifact file.",
+                )
+            }
+        })?;
+
+        let dir_file = File::open(&clean_dir).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "Failed to open plans_dir for directory fsync.",
+            )
+        })?;
+        dir_file.sync_all().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "Failed to fsync plans_dir after publishing closure_execution_artifact.",
+            )
+        })?;
+    }
+
+    Ok(target_path)
 }
 
 fn validate_existing_private_dir(dir: &Path, label: &str) -> Result<PathBuf, NativeError> {

@@ -15,9 +15,10 @@ use threadlane_native::coworker_workflow::candidate::{
     STRUCTURED_CLOSURE_RESPONSE_SCHEMA_VERSION,
 };
 use threadlane_native::coworker_workflow::controller_policy::{
-    ControllerConfigurationPreview, ControllerPolicyStore, ControllerRoleExecutionBudget,
-    FreezeControllerExecutionEnvelopeRequest, FrozenCheckCommandSpec, FrozenCheckKind,
-    PendingControllerEffectStatus,
+    ClosureExecutionArtifactRecord, ControllerConfigurationPreview, ControllerPolicyStore,
+    ControllerRoleExecutionBudget, FreezeControllerExecutionEnvelopeRequest,
+    FrozenCheckCommandSpec, FrozenCheckKind, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, PersistClosureExecutionArtifactRequest,
 };
 use threadlane_native::coworker_workflow::{
     ApplyWorkflowHoldRequest, BindJobApprovalRequest, CandidateCheckEvidence,
@@ -1300,12 +1301,29 @@ async fn finish_test_2_cache_and_artifact_assertions(
         .get(&first_outcome.attempt.attempt_id)
         .expect("persisted closure execution artifact");
     assert!(!artifact.fenced_from_promotion);
+    assert!(artifact.artifact_ref.is_some());
+    assert!(artifact.execution_report.is_none());
+    assert!(artifact.advisory_response.is_none());
     assert_eq!(
         artifact.observed_model.as_deref(),
         Some("gemini-4-argon-high")
     );
     assert_eq!(artifact.observed_effort.as_deref(), Some("high"));
-    let bounded_resp = artifact
+    let loaded_artifact = fixture
+        .policy_store
+        .load_closure_execution_artifact(
+            BINDING_ID,
+            THREAD_UUID,
+            job_id,
+            &first_outcome.attempt.attempt_id,
+        )
+        .expect("load full closure execution artifact");
+    assert!(!loaded_artifact.fenced_from_promotion);
+    assert_eq!(
+        loaded_artifact.execution_report.status,
+        WorkerRunStatus::Succeeded
+    );
+    let bounded_resp = loaded_artifact
         .advisory_response
         .as_ref()
         .expect("persisted bounded advisory response");
@@ -1864,7 +1882,20 @@ async fn finish_test_4_hold_and_drift_assertions(
         .get(&fenced_outcome.attempt.attempt_id)
         .expect("late closure artifact preserved");
     assert!(art.fenced_from_promotion);
-    assert!(art.advisory_response.is_some());
+    assert!(art.artifact_ref.is_some());
+    assert!(art.execution_report.is_none());
+    assert!(art.advisory_response.is_none());
+    let loaded_art = fixture
+        .policy_store
+        .load_closure_execution_artifact(
+            BINDING_ID,
+            THREAD_UUID,
+            job_id,
+            &fenced_outcome.attempt.attempt_id,
+        )
+        .expect("load full fenced closure execution artifact");
+    assert!(loaded_art.fenced_from_promotion);
+    assert!(loaded_art.advisory_response.is_some());
 
     verify_candidate_worktree_drift_during_closure_run().await;
 }
@@ -2400,4 +2431,951 @@ async fn test_5_job_aggregated_candidate_assembly_preserves_original_receipts_an
         ClosureVerdictKind::Accepted
     );
     assert_primary_checkout_untouched(&fixture);
+}
+
+fn configure_fake_agy_large_valid_closure(
+    fixture: &CandidateServiceFixture,
+    subject: &FinalCandidateSubject,
+    stream_file_name: &str,
+    ready_file: Option<&Path>,
+    sleep_ms: Option<u64>,
+) -> usize {
+    let findings: Vec<String> = (0..180)
+        .map(|idx| format!("closure-verification-note-{idx:03}-{}", "x".repeat(6_000)))
+        .collect();
+    let payload = StructuredClosureModelResponse {
+        schema_version: STRUCTURED_CLOSURE_RESPONSE_SCHEMA_VERSION,
+        subject_digest: subject.subject_digest.clone(),
+        candidate_tree_sha: subject.candidate_tree_sha.clone(),
+        outcome: ClosureVerdictKind::Accepted,
+        summary: "Large multi-megabyte closure verification report accepted".to_string(),
+        findings,
+    };
+    let payload_str = serde_json::to_string(&payload).expect("serialize large closure response");
+    assert!(
+        payload_str.len() > 1_048_576,
+        "expected structured closure JSON payload to exceed 1 MiB (got {} bytes)",
+        payload_str.len()
+    );
+
+    let stream_path = fixture.control_dir.join(stream_file_name);
+    let mut stream_file = fs::File::create(&stream_path).expect("create large stream file");
+    let init_line = serde_json::json!({
+        "event": "init",
+        "init": {
+            "conversation_id": "ses_closure_large_1",
+            "model": "gemini-4-argon-high",
+            "effort": "high"
+        }
+    })
+    .to_string();
+    writeln!(stream_file, "{init_line}").expect("write init line");
+
+    for step in 0..250 {
+        let step_line = serde_json::json!({
+            "event": "step_update",
+            "step_update": {
+                "conversation_id": "ses_closure_large_1",
+                "model": "gemini-4-argon-high",
+                "effort": "high",
+                "message": format!("step-{step:04}-{}", "p".repeat(1_024))
+            }
+        })
+        .to_string();
+        writeln!(stream_file, "{step_line}").expect("write step_update line");
+    }
+
+    let result_line = serde_json::json!({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "conversation_id": "ses_closure_large_1",
+            "model": "gemini-4-argon-high",
+            "effort": "high",
+            "response": payload_str
+        }
+    })
+    .to_string();
+    writeln!(stream_file, "{result_line}").expect("write result line");
+    stream_file.sync_all().expect("sync large stream file");
+
+    let ready_cmd = ready_file
+        .map(|p| format!("echo ready > \"{}\"\n", p.display()))
+        .unwrap_or_default();
+    let sleep_cmd = sleep_ms
+        .map(|ms| format!("sleep {:.3}\n", (ms as f64) / 1000.0))
+        .unwrap_or_default();
+    let script = format!(
+        "#!/bin/sh\n\
+         echo 1 >> \"{}\"\n\
+         {}{}\
+         cat \"{}\"\n\
+         exit 0\n",
+        fixture.launch_count_file.display(),
+        ready_cmd,
+        sleep_cmd,
+        stream_path.display(),
+    );
+    write_executable_script(&fixture.fake_agy_exe, &script);
+    payload_str.len()
+}
+
+#[tokio::test]
+async fn large_closure_output_exceeding_one_mib_persists_full_private_sidecar_keeps_policy_ledger_compact_and_reopens_without_reinvocation_or_double_charge(
+) {
+    let max_response_bytes = 2 * 1024 * 1024;
+    let fixture = setup_fixture();
+    let (job, _, _) = prepare_integrated_job_with_receipts(
+        &fixture,
+        "brf_cand_6_large",
+        "plan-cand-6-large",
+        2,
+        max_response_bytes,
+    );
+
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_operations_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleOperationsFinalCandidateRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: "req_cand_6_assemble".to_string(),
+                work_area_root: fixture.work_area_root.clone(),
+                run_id: fixture.run_id.clone(),
+                integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+                check_evidence: default_check_evidence(),
+                closure_task_id: "task-closure".to_string(),
+                reserve_closure_attempt: false,
+                reserved_at_ms: 1_700_000_600_000,
+            },
+        )
+        .expect("assemble candidate 6");
+
+    let expected_payload_len = configure_fake_agy_large_valid_closure(
+        &fixture,
+        &assembled.final_subject,
+        "large_closure_stream_6.ndjson",
+        None,
+        None,
+    );
+
+    let first_outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_6_exec".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_610_000,
+            },
+        )
+        .await
+        .expect("large >1MiB closure output must persist sidecar and succeed");
+
+    assert!(!first_outcome.reused_cached_verdict);
+    assert_eq!(first_outcome.job.phase, CoworkerJobPhase::Completed);
+    assert_eq!(
+        first_outcome.job.combined_candidates[0].status,
+        CombinedCandidateStatus::ClosureAccepted
+    );
+    assert_eq!(
+        first_outcome.verdict.as_ref().expect("verdict").kind,
+        ClosureVerdictKind::Accepted
+    );
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
+
+    let ledger_path = fixture
+        .policy_store
+        .ledger_path_for_binding(BINDING_ID)
+        .expect("ledger path");
+    let ledger_meta = fs::symlink_metadata(&ledger_path).expect("stat policy ledger");
+    assert!(
+        ledger_meta.len() < 64 * 1024,
+        "controller policy ledger must remain compact under its 1 MiB cap (got {} bytes)",
+        ledger_meta.len()
+    );
+
+    let sidecar_path = fixture
+        .policy_store
+        .closure_artifact_path_for_attempt(
+            BINDING_ID,
+            &job.job_id,
+            &first_outcome.attempt.attempt_id,
+        )
+        .expect("sidecar path");
+    let sidecar_meta = fs::symlink_metadata(&sidecar_path).expect("stat sidecar file");
+    assert!(!sidecar_meta.file_type().is_symlink());
+    assert_eq!(sidecar_meta.permissions().mode() & 0o777, 0o600);
+    assert!(
+        sidecar_meta.len() > 1_048_576,
+        "private sidecar must hold >1 MiB full report + response (got {} bytes)",
+        sidecar_meta.len()
+    );
+
+    let runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_ID, &job.job_id)
+        .expect("read runtime")
+        .expect("runtime exists");
+    assert_eq!(runtime.role_usage[&WorkflowRole::Closure].calls_reserved, 1);
+    assert_eq!(
+        runtime.role_usage[&WorkflowRole::Closure].calls_completed,
+        1
+    );
+    let compact_record = runtime
+        .closure_artifacts
+        .get(&first_outcome.attempt.attempt_id)
+        .expect("compact artifact record in ledger");
+    assert!(compact_record.artifact_ref.is_some());
+    assert!(compact_record.execution_report.is_none());
+    assert!(compact_record.advisory_response.is_none());
+
+    let loaded = fixture
+        .candidate_service
+        .load_closure_execution_artifact(
+            &fixture.policy_store,
+            BINDING_ID,
+            THREAD_UUID,
+            &job.job_id,
+            &first_outcome.attempt.attempt_id,
+        )
+        .expect("load verified full closure artifact from sidecar");
+    assert_eq!(loaded.attempt_id, first_outcome.attempt.attempt_id);
+    assert_eq!(loaded.command_key, "req_cand_6_exec");
+    assert_eq!(
+        loaded.subject_digest,
+        assembled.final_subject.subject_digest
+    );
+    assert_eq!(
+        loaded.candidate_tree_sha,
+        assembled.final_subject.candidate_tree_sha
+    );
+    assert_eq!(
+        loaded.observed_model.as_deref(),
+        Some("gemini-4-argon-high")
+    );
+    assert_eq!(loaded.observed_effort.as_deref(), Some("high"));
+    assert!(loaded.execution_report.stdout_bytes_captured > 1_048_576);
+    assert_eq!(loaded.execution_report.evidence.retained_events.len(), 252);
+    let loaded_resp = loaded
+        .advisory_response
+        .as_ref()
+        .expect("full advisory response");
+    assert_eq!(loaded_resp.byte_len(), expected_payload_len);
+    loaded_resp
+        .validate_integrity(max_response_bytes)
+        .expect("validate loaded >1MiB response integrity");
+
+    // Reopening the same subject performs no second provider invocation and no second completion count.
+    let reopen_outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: first_outcome.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_6_reopen".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_620_000,
+            },
+        )
+        .await
+        .expect("reopen accepted >1MiB closure subject");
+    assert!(reopen_outcome.reused_cached_verdict);
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
+    let runtime_after_reopen = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_ID, &job.job_id)
+        .expect("read runtime after reopen")
+        .expect("runtime exists");
+    assert_eq!(
+        runtime_after_reopen.role_usage[&WorkflowRole::Closure].calls_reserved,
+        1
+    );
+    assert_eq!(
+        runtime_after_reopen.role_usage[&WorkflowRole::Closure].calls_completed,
+        1
+    );
+
+    verify_post_sidecar_crash_recovery_without_reinvocation_or_double_charge(
+        &loaded,
+        max_response_bytes,
+    )
+    .await;
+    assert_primary_checkout_untouched(&fixture);
+}
+
+async fn verify_post_sidecar_crash_recovery_without_reinvocation_or_double_charge(
+    template_loaded: &threadlane_native::coworker_workflow::controller_policy::LoadedClosureExecutionArtifact,
+    max_response_bytes: usize,
+) {
+    let fixture = setup_fixture();
+    let (job, _, _) = prepare_integrated_job_with_receipts(
+        &fixture,
+        "brf_cand_6_recover",
+        "plan-cand-6-recover",
+        2,
+        max_response_bytes,
+    );
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_operations_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleOperationsFinalCandidateRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: "req_cand_6_rec_assemble".to_string(),
+                work_area_root: fixture.work_area_root.clone(),
+                run_id: fixture.run_id.clone(),
+                integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+                check_evidence: default_check_evidence(),
+                closure_task_id: "task-closure".to_string(),
+                reserve_closure_attempt: true,
+                reserved_at_ms: 1_700_000_630_000,
+            },
+        )
+        .expect("assemble candidate 6 recover");
+
+    let reserved = assembled
+        .closure_reservation
+        .as_ref()
+        .expect("reserved attempt");
+    let attempt_id = reserved.attempt().attempt_id.clone();
+    let command_key = reserved.attempt().command_key.clone();
+    let effect_id = threadlane_native::coworker_workflow::contracts::deterministic_prefixed_id(
+        "threadlane-native:controller-closure-effect:v1",
+        "eff",
+        &[&job.job_id, &attempt_id, &command_key],
+    );
+
+    // Simulate pre-effect reservation + Submitted state + persisted >1MiB sidecar before crash.
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_ID, &job.job_id, |state| {
+            let _ = state.reserve_role_call(WorkflowRole::Closure)?;
+            state.closure_attempt_id = Some(attempt_id.clone());
+            state.pending_effects.insert(
+                effect_id.clone(),
+                PendingControllerEffect {
+                    effect_id: effect_id.clone(),
+                    request_key: command_key.clone(),
+                    job_id: job.job_id.clone(),
+                    task_id: None,
+                    attempt_no: None,
+                    kind: PendingControllerEffectKind::ClosureInvocation,
+                    status: PendingControllerEffectStatus::ReservedBeforeEffect,
+                    subject_digest: assembled.final_subject.subject_digest.clone(),
+                    external_correlation_id: Some(attempt_id.clone()),
+                    created_at_ms: 1_700_000_631_000,
+                    updated_at_ms: 1_700_000_631_000,
+                    diagnostic: None,
+                },
+            );
+            Ok(())
+        })
+        .expect("reserve intent and role budget before effect");
+
+    let closure_store =
+        FinalCandidateClosureStore::open(&fixture.repo_dir, &fixture.work_area_root)
+            .expect("open closure store");
+    closure_store
+        .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
+            expected_ledger_revision: reserved.ledger_revision(),
+            attempt_id: attempt_id.clone(),
+            command_key: command_key.clone(),
+            expected_subject_digest: assembled.final_subject.subject_digest.clone(),
+            external_request_id: "crq_SimulatedCrashBeforeLedgerUpdate".to_string(),
+            submitted_at_ms: 1_700_000_632_000,
+        })
+        .expect("mark submitted");
+
+    let rec_payload = StructuredClosureModelResponse {
+        schema_version: STRUCTURED_CLOSURE_RESPONSE_SCHEMA_VERSION,
+        subject_digest: assembled.final_subject.subject_digest.clone(),
+        candidate_tree_sha: assembled.final_subject.candidate_tree_sha.clone(),
+        outcome: ClosureVerdictKind::Accepted,
+        summary: "Recovered closure verdict from pre-crash sidecar".to_string(),
+        findings: vec!["note".repeat(260_000)],
+    };
+    let rec_text = serde_json::to_string(&rec_payload).expect("serialize rec_payload");
+    let rec_sha = threadlane_native::coworker_workflow::contracts::sha256_hex(rec_text.as_bytes());
+    let mut rec_resp = template_loaded
+        .advisory_response
+        .clone()
+        .expect("template response");
+    rec_resp.text = rec_text.clone();
+    rec_resp.byte_count = rec_text.len();
+    rec_resp.sha256_digest = rec_sha;
+
+    fixture
+        .policy_store
+        .persist_closure_execution_artifact(&PersistClosureExecutionArtifactRequest {
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            job_id: job.job_id.clone(),
+            effect_id: effect_id.clone(),
+            attempt_id: attempt_id.clone(),
+            command_key: command_key.clone(),
+            subject_digest: assembled.final_subject.subject_digest.clone(),
+            candidate_tree_sha: assembled.final_subject.candidate_tree_sha.clone(),
+            execution_report: template_loaded.execution_report.clone(),
+            advisory_response: Some(rec_resp),
+            response_error: None,
+            observed_model: Some("gemini-4-argon-high".to_string()),
+            observed_effort: Some("high".to_string()),
+            recorded_at_ms: 1_700_000_633_000,
+        })
+        .expect("persist sidecar before simulated crash");
+
+    let recovered_outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: command_key.clone(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_635_000,
+            },
+        )
+        .await
+        .expect("recover from persisted sidecar without provider replay");
+
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 0);
+    assert_eq!(recovered_outcome.job.phase, CoworkerJobPhase::Completed);
+    let runtime_rec = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_ID, &job.job_id)
+        .expect("read recovered runtime")
+        .expect("runtime exists");
+    assert_eq!(
+        runtime_rec.role_usage[&WorkflowRole::Closure].calls_reserved,
+        1
+    );
+    assert_eq!(
+        runtime_rec.role_usage[&WorkflowRole::Closure].calls_completed,
+        1
+    );
+}
+
+#[tokio::test]
+async fn tampered_or_missing_closure_sidecar_and_immutable_conflict_fail_closed_without_provider_replay_and_preserve_large_fenced_output(
+) {
+    let max_response_bytes = 2 * 1024 * 1024;
+    let fixture = setup_fixture();
+    let (job, _, _) = prepare_integrated_job_with_receipts(
+        &fixture,
+        "brf_cand_7_tamper",
+        "plan-cand-7-tamper",
+        2,
+        max_response_bytes,
+    );
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_operations_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleOperationsFinalCandidateRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: "req_cand_7_assemble".to_string(),
+                work_area_root: fixture.work_area_root.clone(),
+                run_id: fixture.run_id.clone(),
+                integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+                check_evidence: default_check_evidence(),
+                closure_task_id: "task-closure".to_string(),
+                reserve_closure_attempt: false,
+                reserved_at_ms: 1_700_000_700_000,
+            },
+        )
+        .expect("assemble candidate 7");
+
+    configure_fake_agy_valid_closure(
+        &fixture,
+        &assembled.final_subject,
+        ClosureVerdictKind::Accepted,
+        "Accepted closure for sidecar immutability and tamper checks",
+        Vec::new(),
+    );
+    let outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_7_exec".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_710_000,
+            },
+        )
+        .await
+        .expect("execute closure 7");
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
+
+    let attempt_id = outcome.attempt.attempt_id.clone();
+    let sidecar_path = fixture
+        .policy_store
+        .closure_artifact_path_for_attempt(BINDING_ID, &job.job_id, &attempt_id)
+        .expect("sidecar path");
+    let original_bytes = fs::read(&sidecar_path).expect("read original sidecar bytes");
+    let loaded = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job.job_id, &attempt_id)
+        .expect("load original sidecar");
+
+    // 1. Attempting to publish a different artifact for the same attempt must fail closed and preserve bytes.
+    let mut conflicting_report = loaded.execution_report.clone();
+    conflicting_report.duration_ms = conflicting_report.duration_ms.saturating_add(999);
+    let conflict_err = fixture
+        .policy_store
+        .persist_closure_execution_artifact(&PersistClosureExecutionArtifactRequest {
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            job_id: job.job_id.clone(),
+            effect_id: loaded.artifact_ref.as_ref().expect("ref").effect_id.clone(),
+            attempt_id: attempt_id.clone(),
+            command_key: loaded.command_key.clone(),
+            subject_digest: loaded.subject_digest.clone(),
+            candidate_tree_sha: loaded.candidate_tree_sha.clone(),
+            execution_report: conflicting_report,
+            advisory_response: loaded.advisory_response.clone(),
+            response_error: None,
+            observed_model: loaded.observed_model.clone(),
+            observed_effort: loaded.observed_effort.clone(),
+            recorded_at_ms: loaded.recorded_at_ms,
+        })
+        .expect_err("conflicting artifact publication must fail closed");
+    assert_eq!(conflict_err.code, NativeErrorCode::SecurityViolation);
+    assert_eq!(
+        fs::read(&sidecar_path).expect("read preserved bytes"),
+        original_bytes,
+        "conflicting publication must preserve existing sidecar bytes untouched"
+    );
+
+    // 2. Tampering with the sidecar file must fail closed on both loader and reopen without provider replay.
+    let mut tampered_bytes = original_bytes.clone();
+    let last_idx = tampered_bytes.len() - 1;
+    tampered_bytes[last_idx] = if tampered_bytes[last_idx] == b' ' {
+        b'\n'
+    } else {
+        b' '
+    };
+    fs::write(&sidecar_path, &tampered_bytes).expect("write tampered sidecar");
+    fs::set_permissions(&sidecar_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 tampered sidecar");
+
+    let tamper_load_err = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job.job_id, &attempt_id)
+        .expect_err("tampered sidecar must fail loader verification");
+    assert_eq!(tamper_load_err.code, NativeErrorCode::ValidationFailed);
+
+    let tamper_reopen_err = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: outcome.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_7_reopen_tampered".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_720_000,
+            },
+        )
+        .await
+        .expect_err("reopening subject with tampered sidecar must fail closed");
+    assert_eq!(tamper_reopen_err.code, NativeErrorCode::ValidationFailed);
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
+
+    // 3. Removing the sidecar file must fail closed on both loader and reopen without provider replay.
+    fs::remove_file(&sidecar_path).expect("remove sidecar file");
+    let missing_load_err = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job.job_id, &attempt_id)
+        .expect_err("missing sidecar must fail loader verification");
+    assert_eq!(missing_load_err.code, NativeErrorCode::ValidationFailed);
+
+    let missing_reopen_err = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: outcome.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_7_reopen_missing".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_730_000,
+            },
+        )
+        .await
+        .expect_err("reopening subject with missing sidecar must fail closed");
+    assert_eq!(missing_reopen_err.code, NativeErrorCode::ValidationFailed);
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
+
+    verify_large_fenced_late_output_preserved(max_response_bytes).await;
+}
+
+async fn verify_large_fenced_late_output_preserved(max_response_bytes: usize) {
+    let fixture = setup_fixture();
+    let (job, _, _) = prepare_integrated_job_with_receipts(
+        &fixture,
+        "brf_cand_7_fenced",
+        "plan-cand-7-fenced",
+        2,
+        max_response_bytes,
+    );
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_operations_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleOperationsFinalCandidateRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: "req_cand_7_fenced_assemble".to_string(),
+                work_area_root: fixture.work_area_root.clone(),
+                run_id: fixture.run_id.clone(),
+                integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+                check_evidence: default_check_evidence(),
+                closure_task_id: "task-closure".to_string(),
+                reserve_closure_attempt: false,
+                reserved_at_ms: 1_700_000_740_000,
+            },
+        )
+        .expect("assemble candidate 7 fenced");
+
+    let ready_file = fixture.control_dir.join("closure_7_fenced_ready.txt");
+    let expected_payload_len = configure_fake_agy_large_valid_closure(
+        &fixture,
+        &assembled.final_subject,
+        "large_closure_stream_7_fenced.ndjson",
+        Some(&ready_file),
+        Some(350),
+    );
+
+    let store_for_hold = fixture.workflow_store.clone();
+    let job_id_for_hold = job.job_id.clone();
+    let rev_for_hold = assembled.job.job_revision;
+    let ready_for_hold = ready_file.clone();
+    let hold_thread = std::thread::spawn(move || {
+        for _ in 0..200 {
+            if ready_for_hold.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        store_for_hold
+            .apply_workflow_hold(&ApplyWorkflowHoldRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job_id_for_hold,
+                expected_job_revision: rev_for_hold,
+                expected_ledger_revision: None,
+                request_key: "req_hold_during_large_closure_7".to_string(),
+                reason: WorkflowHoldReason::ConversationReplanRequired,
+                detail: "Operator hold applied during >1MiB closure worker run".to_string(),
+                directly_affected_task_ids: vec!["task-alpha".to_string()],
+                affected_write_paths: vec!["src/alpha.rs".to_string()],
+                affected_interfaces: vec!["iface_alpha".to_string()],
+                holds_entire_job: true,
+            })
+            .expect("apply mid-flight hold during >1MiB closure");
+    });
+
+    let fenced_outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_7_fenced_exec".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_750_000,
+            },
+        )
+        .await
+        .expect("large fenced closure must persist sidecar and record terminal failure");
+    hold_thread.join().expect("join hold_thread");
+
+    assert!(fenced_outcome.verdict.is_none());
+    assert_eq!(fenced_outcome.job.phase, CoworkerJobPhase::Held);
+    let loaded_fenced = fixture
+        .policy_store
+        .load_closure_execution_artifact(
+            BINDING_ID,
+            THREAD_UUID,
+            &job.job_id,
+            &fenced_outcome.attempt.attempt_id,
+        )
+        .expect("load full >1MiB fenced closure artifact");
+    assert!(loaded_fenced.fenced_from_promotion);
+    assert_eq!(
+        loaded_fenced
+            .advisory_response
+            .as_ref()
+            .expect("fenced response")
+            .byte_len(),
+        expected_payload_len
+    );
+}
+
+#[tokio::test]
+async fn legacy_inline_closure_artifact_remains_readable_without_rewriting_unrelated_records_and_inconsistent_records_fail_closed(
+) {
+    let fixture = setup_fixture();
+    let (job_main, _, _) = prepare_integrated_job_with_receipts(
+        &fixture,
+        "brf_cand_8_main",
+        "plan-cand-8-main",
+        2,
+        threadlane_workers::DEFAULT_MAX_ADVISORY_RESPONSE_BYTES,
+    );
+    let job_unrelated = create_job_and_freeze_envelope(
+        &fixture,
+        "brf_cand_8_other",
+        "plan-cand-8-other",
+        2,
+        threadlane_workers::DEFAULT_MAX_ADVISORY_RESPONSE_BYTES,
+    );
+
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_operations_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleOperationsFinalCandidateRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job_main.job_id.clone(),
+                expected_job_revision: job_main.job_revision,
+                expected_ledger_revision: None,
+                request_key: "req_cand_8_assemble".to_string(),
+                work_area_root: fixture.work_area_root.clone(),
+                run_id: fixture.run_id.clone(),
+                integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+                check_evidence: default_check_evidence(),
+                closure_task_id: "task-closure".to_string(),
+                reserve_closure_attempt: false,
+                reserved_at_ms: 1_700_000_800_000,
+            },
+        )
+        .expect("assemble candidate 8");
+
+    configure_fake_agy_valid_closure(
+        &fixture,
+        &assembled.final_subject,
+        ClosureVerdictKind::Accepted,
+        "Closure output to construct historical inline ledger fixture",
+        Vec::new(),
+    );
+    let outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job_main.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_8_exec".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_810_000,
+            },
+        )
+        .await
+        .expect("execute closure 8");
+
+    let attempt_id = outcome.attempt.attempt_id.clone();
+    let loaded_from_sidecar = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job_main.job_id, &attempt_id)
+        .expect("load sidecar artifact 8");
+    let sidecar_path = fixture
+        .policy_store
+        .closure_artifact_path_for_attempt(BINDING_ID, &job_main.job_id, &attempt_id)
+        .expect("sidecar path 8");
+
+    let unrelated_before = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_ID, &job_unrelated.job_id)
+        .expect("read unrelated runtime before")
+        .expect("unrelated runtime exists");
+
+    // Convert job_main's record to a historical inline record (removing sidecar and artifact_ref).
+    fs::remove_file(&sidecar_path).expect("remove sidecar for legacy inline conversion");
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_ID, &job_main.job_id, |state| {
+            state.closure_artifacts.insert(
+                attempt_id.clone(),
+                ClosureExecutionArtifactRecord {
+                    attempt_id: attempt_id.clone(),
+                    command_key: loaded_from_sidecar.command_key.clone(),
+                    subject_digest: loaded_from_sidecar.subject_digest.clone(),
+                    candidate_tree_sha: loaded_from_sidecar.candidate_tree_sha.clone(),
+                    artifact_ref: None,
+                    execution_report: Some(loaded_from_sidecar.execution_report.clone()),
+                    advisory_response: loaded_from_sidecar.advisory_response.clone(),
+                    response_error: None,
+                    observed_model: loaded_from_sidecar.observed_model.clone(),
+                    observed_effort: loaded_from_sidecar.observed_effort.clone(),
+                    fenced_from_promotion: false,
+                    diagnostic: None,
+                    recorded_at_ms: loaded_from_sidecar.recorded_at_ms,
+                },
+            );
+            Ok(())
+        })
+        .expect("write valid legacy inline record");
+
+    let loaded_legacy = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job_main.job_id, &attempt_id)
+        .expect("load valid legacy inline record");
+    assert!(loaded_legacy.artifact_ref.is_none());
+    assert_eq!(
+        loaded_legacy.execution_report,
+        loaded_from_sidecar.execution_report
+    );
+    assert_eq!(
+        loaded_legacy.advisory_response,
+        loaded_from_sidecar.advisory_response
+    );
+
+    let unrelated_after = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_ID, &job_unrelated.job_id)
+        .expect("read unrelated runtime after")
+        .expect("unrelated runtime exists");
+    assert_eq!(
+        unrelated_after, unrelated_before,
+        "reading legacy inline record must not rewrite unrelated runtime records"
+    );
+
+    // Reopening the same subject with a valid legacy inline record must also succeed without provider replay.
+    let reopen_legacy = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job_main.job_id.clone(),
+                expected_job_revision: outcome.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_cand_8_reopen_legacy".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_820_000,
+            },
+        )
+        .await
+        .expect("reopen valid legacy inline closure record");
+    assert!(reopen_legacy.reused_cached_verdict);
+    assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
+
+    // Mutually inconsistent record (both artifact_ref and inline execution_report) must fail closed.
+    let ledger_path = fixture
+        .policy_store
+        .ledger_path_for_binding(BINDING_ID)
+        .expect("ledger path");
+    let valid_ledger_bytes = fs::read(&ledger_path).expect("read valid ledger bytes");
+    let mut raw_ledger: serde_json::Value =
+        serde_json::from_slice(&valid_ledger_bytes).expect("parse ledger JSON");
+    raw_ledger["jobs"][&job_main.job_id]["closure_artifacts"][&attempt_id]["artifact_ref"] =
+        serde_json::to_value(loaded_from_sidecar.artifact_ref.as_ref().expect("ref"))
+            .expect("serialize artifact_ref");
+    fs::write(
+        &ledger_path,
+        serde_json::to_vec_pretty(&raw_ledger).expect("serialize inconsistent ledger"),
+    )
+    .expect("write inconsistent ledger");
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 inconsistent ledger");
+
+    let both_err = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job_main.job_id, &attempt_id)
+        .expect_err("record with both artifact_ref and inline execution_report must fail closed");
+    assert_eq!(both_err.code, NativeErrorCode::ValidationFailed);
+
+    // Record with neither artifact_ref nor inline execution_report must fail closed.
+    let mut neither_ledger: serde_json::Value =
+        serde_json::from_slice(&valid_ledger_bytes).expect("parse ledger JSON");
+    neither_ledger["jobs"][&job_main.job_id]["closure_artifacts"][&attempt_id]
+        .as_object_mut()
+        .expect("artifact object")
+        .remove("execution_report");
+    fs::write(
+        &ledger_path,
+        serde_json::to_vec_pretty(&neither_ledger).expect("serialize neither ledger"),
+    )
+    .expect("write neither ledger");
+    fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 neither ledger");
+
+    let neither_err = fixture
+        .policy_store
+        .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job_main.job_id, &attempt_id)
+        .expect_err("record with neither artifact_ref nor execution_report must fail closed");
+    assert_eq!(neither_err.code, NativeErrorCode::ValidationFailed);
 }
