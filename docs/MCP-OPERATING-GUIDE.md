@@ -37,20 +37,27 @@ Version: `2026-11-03.v3`
     advisory-only (`untrusted_data: true`) until explicitly accepted into the work
     brief via `prepare_work`.
   - Call `request_technical_plan` to run `Orchestrator` decomposition under the
-    active standing planning grant without constructing a caller task DAG. Open
-    technical questions and `proposed_additions` are allowed into technical
-    planning, while execution approval remains blocked until open questions and
-    unconfirmed proposals are resolved.
+    active standing planning grant without constructing a caller task DAG. When
+    `max_architect_rounds` is omitted and the active standing planning grant's
+    policy and remaining call budget permit a headless `Architect`,
+    `request_technical_plan` defaults to a bounded internal allowance (up to `2`
+    rounds) so the `Orchestrator` consults `Architect` automatically when needed;
+    explicit `0` keeps automatic rounds disabled, and `Coworker` may still call
+    `consult_architect` directly before planning. Open technical questions and
+    `proposed_additions` are allowed into technical planning, while execution
+    approval remains blocked until open questions and unconfirmed proposals are
+    resolved.
   - Inspect detached planning commands with `planning_command` without polling
     loops. If the `Orchestrator` returns `RequiresHumanClarification`
     (`requires_human_clarification`), ask the human to clarify and amend the brief
     via `prepare_work`. If it returns `RequiresArchitectAdvice`
-    (`requires_architect_advice`), run `consult_architect` and amend the brief via
-    `prepare_work` when accepted. When a plan is produced, present the plan summary
-    and check suggestions clearly to the human and stop for explicit operator
-    approval before execution or `start_approved_task`. Do not claim that native
-    planning wake-ups or an autonomous code-execution pipeline are already
-    implemented over MCP.
+    (`requires_architect_advice`) when automatic rounds were `0` or unavailable
+    under the remaining grant budget or policy, run `consult_architect` and amend
+    the brief via `prepare_work` when accepted. When a plan is produced, present
+    the plan summary and check suggestions clearly to the human and stop for
+    explicit operator approval before execution or `start_approved_task`. Do not
+    claim that native planning wake-ups or an autonomous code-execution pipeline
+    are already implemented over MCP.
 - Coding (`coder`), review (`reviewer`), and `closure` are distinct execution
   roles. Do not silently perform worker role execution or substitute models.
   Active human scope, model, effort, and quota restrictions always override saved

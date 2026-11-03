@@ -35,7 +35,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
-use threadlane_workflow::{Difficulty, PlanStatus, WorkflowRole};
+use threadlane_workflow::{Difficulty, PlanStatus, ToolAdapter, WorkflowRole};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
@@ -43,11 +43,11 @@ use crate::coworker_grants::{
     list_planning_grant_summaries, PlanningGrantSummary, TrustedGrantScope,
 };
 use crate::coworker_workflow::{
-    deterministic_prefixed_id, validate_bounded_text, validate_unique_id_list,
-    validate_unique_text_list, ArchitectAdviceRecord, ArchitectConsultationRequestOutcome,
-    ArchitectContextDependencies, ArchitectDecisionStatus, CanonicalProjectBaseRef,
-    CoworkerBindingLedger, CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
-    CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
+    deterministic_prefixed_id, validate_bounded_text, validate_non_native_worker_choice,
+    validate_unique_id_list, validate_unique_text_list, ArchitectAdviceRecord,
+    ArchitectConsultationRequestOutcome, ArchitectContextDependencies, ArchitectDecisionStatus,
+    CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobPhase, CoworkerJobRecord,
+    CoworkerPlanningService, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
     HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
     PersistedPlanningCallArtifact, PlanningAdviceGrant, PlanningArtifactOutcomeKind,
     PlanningGrantStatus, PlanningResultRef, PriorArchitectAdviceContext, RunArchitectAdviceRequest,
@@ -62,15 +62,18 @@ use crate::fs_safety::{
     validate_absolute_no_symlink_components, validate_bounded_identifier,
 };
 use crate::planning_commands::{
-    current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandResultRef,
-    PlanningCommandStatus,
+    current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandPayload,
+    PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
 };
 use crate::planning_driver::{
     enqueue_planning_command_summary, get_planning_command_summary_readonly,
-    list_planning_command_summaries_readonly, planning_artifacts_dir, PlanningCommandStartOutcome,
-    PlanningCommandStartStatus, PlanningCommandSummary,
+    list_planning_command_summaries_readonly, planning_artifacts_dir, planning_commands_dir,
+    PlanningCommandStartOutcome, PlanningCommandStartStatus, PlanningCommandSummary,
 };
-use crate::profile_flow::SelectedRoleChoice;
+use crate::profile_flow::{
+    preflight, PreflightRequest, RoleExecutionRoute, RolePreflightRequest, SelectedRoleChoice,
+};
+use crate::role_flow::read_registry_snapshot_readonly;
 
 /// Canonical binary name of the sibling trusted-local role-flow CLI.
 pub const DEFAULT_FLOW_EXECUTABLE_NAME: &str = "threadlane-flow";
@@ -258,7 +261,7 @@ pub struct RequestTechnicalPlanParams {
     /// Optional list of verified [`ArchitectAdviceRecord::advice_id`]s to attach to the Orchestrator context.
     #[serde(default, alias = "prior_advice_ids")]
     pub architect_advice_ids: Vec<String>,
-    /// Optional bounded maximum automatic Architect consultation rounds (`0..=2`, default `0`).
+    /// Optional bounded maximum automatic Architect consultation rounds (`0..=2`). When omitted, defaults to a bounded internal allowance up to `2` rounds when the active standing grant's policy and remaining call budget permit a headless Architect.
     #[serde(default)]
     pub max_architect_rounds: Option<u32>,
     /// Optional difficulty tier override for automatic Architect consultation rounds.
@@ -1308,14 +1311,15 @@ impl CoworkerPlanningGateway {
             "architect_advice_ids",
             MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING,
         )?;
-        let max_architect_rounds = params.max_architect_rounds.unwrap_or(0);
-        if max_architect_rounds > MAX_ORCHESTRATOR_ARCHITECT_ROUNDS {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "max_architect_rounds cannot exceed {MAX_ORCHESTRATOR_ARCHITECT_ROUNDS} (got {max_architect_rounds})"
-                ),
-            ));
+        if let Some(explicit) = params.max_architect_rounds {
+            if explicit > MAX_ORCHESTRATOR_ARCHITECT_ROUNDS {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "max_architect_rounds cannot exceed {MAX_ORCHESTRATOR_ARCHITECT_ROUNDS} (got {explicit})"
+                    ),
+                ));
+            }
         }
 
         let now_ms = current_wall_clock_ms()?;
@@ -1328,6 +1332,8 @@ impl CoworkerPlanningGateway {
             &params.grant_id,
             now_ms,
         )?;
+        let max_architect_rounds =
+            self.resolve_max_architect_rounds_for_request(&workflow_store, grant, params)?;
         let job = require_scoped_job(
             &wf_ledger,
             &self.binding_id,
@@ -1396,6 +1402,52 @@ impl CoworkerPlanningGateway {
         };
 
         Ok(EnqueuePlanningCommandRequest::from_orchestrator(orch_req))
+    }
+
+    fn resolve_max_architect_rounds_for_request(
+        &self,
+        workflow_store: &CoworkerWorkflowStore,
+        grant: &PlanningAdviceGrant,
+        params: &RequestTechnicalPlanParams,
+    ) -> Result<u32, NativeError> {
+        if let Some(explicit) = params.max_architect_rounds {
+            if explicit > MAX_ORCHESTRATOR_ARCHITECT_ROUNDS {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "max_architect_rounds cannot exceed {MAX_ORCHESTRATOR_ARCHITECT_ROUNDS} (got {explicit})"
+                    ),
+                ));
+            }
+            return Ok(explicit);
+        }
+
+        let commands_dir = planning_commands_dir(workflow_store.plans_dir());
+        if let Ok(command_store) = PlanningCommandStore::open_existing(
+            &commands_dir,
+            workflow_store.clone(),
+            &self.registry_dir,
+        ) {
+            if let Ok(Some(existing)) = command_store.get_command_by_key(
+                &self.binding_id,
+                &self.thread_uuid,
+                &params.request_key,
+            ) {
+                if existing.grant_id == params.grant_id {
+                    if let PlanningCommandPayload::Orchestrator(ref existing_orch) =
+                        existing.payload
+                    {
+                        return Ok(existing_orch.max_architect_rounds);
+                    }
+                }
+            }
+        }
+
+        Ok(compute_default_max_architect_rounds(
+            &self.registry_dir,
+            grant,
+            params.architect_difficulty.or(params.difficulty),
+        ))
     }
 
     async fn enqueue_and_start_with_flow(
@@ -2364,6 +2416,91 @@ fn collect_job_accepted_predecessor_trees(job: &CoworkerJobRecord) -> BTreeMap<S
         }
     }
     trees
+}
+
+fn compute_default_max_architect_rounds(
+    registry_dir: &Path,
+    grant: &PlanningAdviceGrant,
+    architect_difficulty: Option<Difficulty>,
+) -> u32 {
+    let remaining_total = grant
+        .budget
+        .max_total_calls
+        .saturating_sub(grant.usage.reserved_total_calls);
+    let remaining_orchestrator = grant
+        .budget
+        .max_orchestrator_calls
+        .saturating_sub(grant.usage.reserved_orchestrator_calls);
+    let remaining_architect = grant
+        .budget
+        .max_architect_calls
+        .saturating_sub(grant.usage.reserved_architect_calls);
+
+    if remaining_total < 3 || remaining_orchestrator < 2 || remaining_architect < 1 {
+        return 0;
+    }
+    if !can_resolve_headless_architect_for_grant(registry_dir, grant, architect_difficulty) {
+        return 0;
+    }
+
+    let max_by_architect = remaining_architect;
+    let max_by_orchestrator = remaining_orchestrator.saturating_sub(1);
+    let max_by_total = remaining_total.saturating_sub(1) / 2;
+
+    max_by_architect
+        .min(max_by_orchestrator)
+        .min(max_by_total)
+        .min(MAX_ORCHESTRATOR_ARCHITECT_ROUNDS)
+}
+
+fn can_resolve_headless_architect_for_grant(
+    registry_dir: &Path,
+    grant: &PlanningAdviceGrant,
+    difficulty: Option<Difficulty>,
+) -> bool {
+    let Ok(reg_snapshot) = read_registry_snapshot_readonly(registry_dir) else {
+        return false;
+    };
+    if reg_snapshot.revision != grant.registry_revision {
+        return false;
+    }
+    let Ok(report) = preflight(
+        &reg_snapshot,
+        &PreflightRequest {
+            profile_id: Some(grant.profile_id.clone()),
+            roles: vec![RolePreflightRequest::new(
+                WorkflowRole::Architect,
+                difficulty,
+            )],
+        },
+        &grant.policy,
+    ) else {
+        return false;
+    };
+    let Some(outcome) = report.roles.first() else {
+        return false;
+    };
+    if !report.ready || !outcome.ready {
+        return false;
+    }
+    let Some(ref selected) = outcome.selected else {
+        return false;
+    };
+    if selected.route != RoleExecutionRoute::HeadlessWorker
+        || !matches!(
+            selected.adapter,
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+        )
+    {
+        return false;
+    }
+    if validate_non_native_worker_choice(WorkflowRole::Architect, selected).is_err() {
+        return false;
+    }
+    let Some(tool_def) = reg_snapshot.tools.iter().find(|t| t.id == selected.tool_id) else {
+        return false;
+    };
+    tool_def.enabled && tool_def.executable_path.is_some()
 }
 
 fn sha256_hex_bytes(bytes: &[u8]) -> String {

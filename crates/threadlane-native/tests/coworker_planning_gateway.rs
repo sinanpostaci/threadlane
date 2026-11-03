@@ -370,6 +370,14 @@ case "$MODE" in
     orch_clarify)
         RESPONSE_JSON='{{\"outcome\":\"requires_human_clarification\",\"schema_version\":1,\"summary\":\"Need human decision before planning\",\"questions\":[\"Should we support multiple commands per batch?\"],\"referenced_files\":[\"src/lib.rs\"]}}'
         ;;
+    orch_ask_then_plan)
+        printf 'orch_ask_step_arch\n' > '{}'
+        RESPONSE_JSON='{{\"outcome\":\"requires_architect_advice\",\"schema_version\":1,\"summary\":\"Need Architect contract check before finalizing plan\",\"questions\":[{{\"question_id\":\"q_arch_1\",\"question_summary\":\"Confirm boundary contract for src/lib.rs\",\"dependency_files\":[\"src/lib.rs\"],\"interfaces\":[\"iface_gateway\"]}}]}}'
+        ;;
+    orch_ask_step_arch)
+        printf 'orch_plan\n' > '{}'
+        RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_gateway\":\"Stable contract v1\"}},\"open_questions\":[]}}'
+        ;;
     orch_plan)
         RESPONSE_JSON='{{\"outcome\":\"plan\",\"schema_version\":1,\"summary\":\"Implement gateway slice\",\"tasks\":[{{\"task_id\":\"task_gateway_core\",\"title\":\"Implement planning gateway\",\"description\":\"Wire MCP tools to sibling threadlane-flow.\",\"role\":\"coder\",\"difficulty\":\"hard\",\"depends_on\":[],\"allowed_write_paths\":[\"src/lib.rs\"],\"owned_interfaces\":[\"iface_gateway\"],\"consumed_interfaces\":[]}}],\"check_suggestions\":[{{\"check_id\":\"cargo_test_gateway\",\"command_summary\":\"cargo test -p threadlane-native --test coworker_planning_gateway\",\"required\":true}}],\"unconfirmed_proposal_notes\":[\"Proposal stays unconfirmed\"],\"resolved_open_questions\":[],\"deferred_proposals\":[]}}'
         ;;
@@ -383,6 +391,8 @@ exit 0
         counter_path.display(),
         started_path.display(),
         release_path.display(),
+        mode_path.display(),
+        mode_path.display(),
         mode_path.display(),
         mode_path.display(),
     );
@@ -1012,6 +1022,234 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
         gw_err.error_code(),
         NativeErrorCode::AmbiguousWakeupPendingReconciliation
     );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_architect_and_respects_zero_or_budget_limits(
+) {
+    let mut fixture = GatewayFixture::start().await;
+    let mcp = fixture.enrolled_mcp();
+    let now_ms = current_wall_clock_ms().expect("wall clock");
+    let grant_id = fixture.create_grant(
+        "req-grant-auto-arch-1",
+        now_ms.saturating_sub(5_000),
+        now_ms + 3_600_000,
+    );
+
+    let prep: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": grant_id,
+            "request_key": "req-prep-auto-arch-1",
+            "summary": "Verify Orchestrator automatic Architect consultation when max_architect_rounds is omitted",
+            "confirmed_requirements": ["Consult Architect automatically up to bounded grant/policy limits when Orchestrator asks"]
+        }),
+    )
+    .await;
+
+    // 1. Explicit `max_architect_rounds: 0` when Orchestrator asks for advice must NOT call Architect.
+    fs::write(&fixture.mode_path, b"orch_ask_then_plan\n").expect("set mode orch_ask_then_plan");
+    let zero_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": prep.job_id,
+            "request_key": "req-tech-plan-explicit-zero",
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let zero_detail = wait_for_command_completion(&mcp, &zero_submit.command_id).await;
+    assert_eq!(zero_detail.status, PlanningCommandStatus::Completed);
+    assert!(matches!(
+        zero_detail.result_ref,
+        Some(PlanningCommandResultRef::OrchestratorRequiresArchitectAdvice { .. })
+    ));
+    assert_eq!(
+        zero_detail
+            .consultation
+            .as_ref()
+            .expect("consultation")
+            .questions
+            .len(),
+        1
+    );
+
+    let status_after_zero: CoworkerStatusResponse =
+        invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    let grant_after_zero = status_after_zero
+        .grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after explicit zero");
+    assert_eq!(grant_after_zero.usage.reserved_orchestrator_calls, 1);
+    assert_eq!(grant_after_zero.usage.reserved_architect_calls, 0);
+    assert_eq!(grant_after_zero.usage.reserved_total_calls, 1);
+    assert!(status_after_zero.architect_advice.is_empty());
+    let calls_after_zero = fs::read_to_string(&fixture.worker_marker)
+        .expect("read worker_marker")
+        .lines()
+        .count();
+    assert_eq!(calls_after_zero, 1);
+
+    // 2. Omitted `max_architect_rounds` under an active grant that permits Architect defaults to a bounded
+    //    allowance (`2`), runs Orchestrator -> Architect -> Orchestrator via detached `threadlane-flow`,
+    //    and publishes the typed Plan without any coder execution.
+    fs::write(&fixture.mode_path, b"orch_ask_then_plan\n").expect("reset mode orch_ask_then_plan");
+    let omitted_args = json!({
+        "grant_id": grant_id,
+        "job_id": prep.job_id,
+        "request_key": "req-tech-plan-omitted-auto-arch",
+        "difficulty": "hard"
+    });
+    let auto_submit: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", omitted_args.clone()).await;
+    let auto_detail = wait_for_command_completion(&mcp, &auto_submit.command_id).await;
+    assert_eq!(auto_detail.status, PlanningCommandStatus::Completed);
+    assert!(matches!(
+        auto_detail.result_ref,
+        Some(PlanningCommandResultRef::OrchestratorPlan { .. })
+    ));
+    let orch_summary = auto_detail
+        .orchestrator_plan_summary
+        .as_ref()
+        .expect("orchestrator_plan_summary");
+    assert_eq!(orch_summary.plan_revision, 1);
+    assert_eq!(orch_summary.plan_status, PlanStatus::Published);
+    assert_eq!(orch_summary.task_count, 1);
+
+    let status_after_auto: CoworkerStatusResponse =
+        invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    let grant_after_auto = status_after_auto
+        .grants
+        .iter()
+        .find(|g| g.grant_id == grant_id)
+        .expect("grant after omitted auto-arch");
+    assert_eq!(grant_after_auto.usage.reserved_orchestrator_calls, 3);
+    assert_eq!(grant_after_auto.usage.reserved_architect_calls, 1);
+    assert_eq!(grant_after_auto.usage.reserved_total_calls, 4);
+    assert_eq!(status_after_auto.architect_advice.len(), 1);
+    assert_eq!(
+        status_after_auto.architect_advice[0].decision_summary,
+        "Keep strict planning command boundary"
+    );
+    let calls_after_auto = fs::read_to_string(&fixture.worker_marker)
+        .expect("read worker_marker")
+        .lines()
+        .count();
+    assert_eq!(calls_after_auto, 4);
+
+    let job_after_auto = status_after_auto
+        .jobs
+        .iter()
+        .find(|j| j.job_id == prep.job_id)
+        .expect("job after auto-arch");
+    assert_eq!(job_after_auto.phase, CoworkerJobPhase::AwaitingApproval);
+    assert!(job_after_auto.planning_result.is_some());
+    assert!(job_after_auto.approval_id.is_none());
+    assert_eq!(job_after_auto.task_count, 0);
+
+    // Idempotent retry with `max_architect_rounds` omitted after grant usage advanced reuses the completed command.
+    let repeat_auto: PlanningCommandSubmissionResponse =
+        invoke_mcp_ok(&mcp, "request_technical_plan", omitted_args).await;
+    assert_eq!(repeat_auto.command_id, auto_submit.command_id);
+    assert_eq!(
+        repeat_auto.submission_status,
+        PlanningCommandStartStatus::AlreadyCompleted
+    );
+    assert!(!repeat_auto.launched);
+
+    // 3. When the active grant policy or remaining budget does not permit a headless Architect call,
+    //    omitted `max_architect_rounds` defaults to `0` and returns honest `OrchestratorRequiresArchitectAdvice`
+    //    without calling Architect.
+    let wf_store =
+        CoworkerWorkflowStore::new(&fixture.plans_dir).expect("open CoworkerWorkflowStore");
+    let orch_only_grant_id = wf_store
+        .create_planning_grant(&CreatePlanningGrantRequest {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-grant-orch-only-1".to_string(),
+            expected_ledger_revision: None,
+            project_base: fixture.project_base.clone(),
+            profile_id: PROFILE_ID.to_string(),
+            registry_revision: 3,
+            policy: ExecutionPolicy {
+                schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+                policy_id: "policy-orch-only".to_string(),
+                allow_rules: vec![PolicyAllowRule {
+                    tool_id: TOOL_ID.to_string(),
+                    model_id: MODEL_ID.to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                    roles: vec![WorkflowRole::Orchestrator],
+                }],
+            },
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 4,
+                max_orchestrator_calls: 4,
+                max_architect_calls: 2,
+                max_timeout_ms_per_call: 60_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: now_ms.saturating_sub(1_000),
+            expires_at_ms: now_ms + 3_600_000,
+            operator_attested: true,
+        })
+        .expect("create orch-only grant")
+        .grant_id;
+
+    let prep_2: PrepareWorkResponse = invoke_mcp_ok(
+        &mcp,
+        "prepare_work",
+        json!({
+            "grant_id": orch_only_grant_id,
+            "request_key": "req-prep-orch-only-job",
+            "summary": "Job under Orchestrator-only policy",
+            "confirmed_requirements": ["Return honest consultation outcome when Architect is not permitted by grant policy"]
+        }),
+    )
+    .await;
+
+    fs::write(&fixture.mode_path, b"orch_ask_then_plan\n").expect("reset mode orch_ask_then_plan");
+    let no_arch_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": orch_only_grant_id,
+            "job_id": prep_2.job_id,
+            "request_key": "req-tech-plan-no-arch-permission",
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let no_arch_detail = wait_for_command_completion(&mcp, &no_arch_submit.command_id).await;
+    assert_eq!(no_arch_detail.status, PlanningCommandStatus::Completed);
+    assert!(matches!(
+        no_arch_detail.result_ref,
+        Some(PlanningCommandResultRef::OrchestratorRequiresArchitectAdvice { .. })
+    ));
+
+    let status_final: CoworkerStatusResponse =
+        invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    let orch_only_grant = status_final
+        .grants
+        .iter()
+        .find(|g| g.grant_id == orch_only_grant_id)
+        .expect("orch_only_grant");
+    assert_eq!(orch_only_grant.usage.reserved_orchestrator_calls, 1);
+    assert_eq!(orch_only_grant.usage.reserved_architect_calls, 0);
+    assert_eq!(orch_only_grant.usage.reserved_total_calls, 1);
+    let calls_final = fs::read_to_string(&fixture.worker_marker)
+        .expect("read worker_marker")
+        .lines()
+        .count();
+    assert_eq!(calls_final, 5);
 
     fixture.shutdown().await;
 }
