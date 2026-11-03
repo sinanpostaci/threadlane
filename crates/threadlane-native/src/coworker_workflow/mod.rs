@@ -44,6 +44,8 @@ pub mod controller_policy;
 pub mod ownership;
 /// Asynchronous read-only Coworker planning and architectural advice service.
 pub mod planning;
+/// Strict task `Reviewer` JSON response parser and identity verification (parser only; actual supervised runner pending).
+pub mod review;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.
 pub mod store;
 
@@ -53,4 +55,5 @@ pub use controller::*;
 pub use controller_policy::*;
 pub use ownership::*;
 pub use planning::*;
+pub use review::*;
 pub use store::*;
