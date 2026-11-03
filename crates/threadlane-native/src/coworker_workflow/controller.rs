@@ -385,6 +385,11 @@ impl CoworkerControllerService {
         &self.sessions_dir
     }
 
+    /// Returns the shared short-lived controller dispatch/reservation serialization mutex.
+    pub(crate) fn step_mutex(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.step_mutex
+    }
+
     /// Acquires physical OS job ownership, verifies automatic controller admission, and returns an
     /// [`OwnedCoworkerControllerSession`] holding the live [`CoworkerJobOwnershipGuard`].
     pub fn open_owned_session(
@@ -419,7 +424,7 @@ impl CoworkerControllerService {
         })
     }
 
-    fn reconcile_stale_logical_lease_under_physical_guard(
+    pub(crate) fn reconcile_stale_logical_lease_under_physical_guard(
         &self,
         guard: &CoworkerJobOwnershipGuard,
         binding_id: &str,
@@ -1122,20 +1127,9 @@ impl CoworkerControllerService {
                 break;
             }
 
-            // Count currently active/in-flight tasks against `approval.max_parallel`.
-            let active_in_flight = current_adm
-                .job
-                .tasks
-                .iter()
-                .filter(|t| {
-                    matches!(
-                        t.stage,
-                        CoworkerTaskStage::DispatchReserved
-                            | CoworkerTaskStage::Running
-                            | CoworkerTaskStage::EffectUnknown
-                    )
-                })
-                .count();
+            // Count currently active/in-flight Coder tasks (including derived attempts) against `approval.max_parallel`.
+            let active_in_flight =
+                count_active_coder_executions(&current_adm.job, &current_adm.runtime_state);
 
             if active_in_flight >= approval.max_parallel {
                 break;
@@ -1306,6 +1300,14 @@ impl CoworkerControllerService {
             &task.task_id,
             &command_key,
         )?;
+
+        // Once a derived attempt receipt, subsequent attempt, or post-initial candidate/review
+        // artifact exists for this task, initial attempt 1 reconciliation is complete and
+        // immutable. Skip initial host snapshot reconciliation so attempt 1 artifacts and
+        // derived task stages are never overwritten by the old attempt 1 host snapshot.
+        if task_has_derived_attempt_or_post_initial_state(&task, &current_adm.runtime_state) {
+            return Ok(());
+        }
 
         // 1. Check if `PendingDependencies` can be promoted to `ReadyToDispatch`.
         if task.stage == CoworkerTaskStage::PendingDependencies {
@@ -2170,18 +2172,21 @@ impl CoworkerControllerService {
             })?;
             verify_snapshot_matches_approved_task(&snap, approved_task)?;
 
-            // If a newly dispatched task finished during the loop, reconcile it so the final report
+            // If a newly dispatched initial task finished during the loop, reconcile it so the final report
             // reflects its terminal ReadyForReview state.
-            if matches!(
-                task.stage,
-                CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
-            ) && matches!(
-                snap.status,
-                TaskExecutionStatus::ReadyForReview
-                    | TaskExecutionStatus::Failed
-                    | TaskExecutionStatus::Cancelled
-                    | TaskExecutionStatus::TimedOut
-            ) {
+            if !task_has_derived_attempt_or_post_initial_state(task, &final_adm.runtime_state)
+                && matches!(
+                    task.stage,
+                    CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                )
+                && matches!(
+                    snap.status,
+                    TaskExecutionStatus::ReadyForReview
+                        | TaskExecutionStatus::Failed
+                        | TaskExecutionStatus::Cancelled
+                        | TaskExecutionStatus::TimedOut
+                )
+            {
                 self.reconcile_single_task_snapshot(
                     guard,
                     request,
@@ -2229,6 +2234,10 @@ impl CoworkerControllerService {
                         "task disappeared during step report",
                     )
                 })?;
+            let refreshed_runtime = self
+                .policy_store
+                .get_job_runtime_readonly(&request.binding_id, &request.job_id)?
+                .unwrap_or_else(|| final_adm.runtime_state.clone());
 
             let fenced = fenced_task_ids.contains(&task.task_id)
                 || refreshed_task.stage == CoworkerTaskStage::Held
@@ -2244,16 +2253,18 @@ impl CoworkerControllerService {
                 unknown_effect_task_ids.push(task.task_id.clone());
             }
 
-            if matches!(
-                refreshed_task.stage,
-                CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
-            ) || matches!(
-                snap.status,
-                TaskExecutionStatus::Queued
-                    | TaskExecutionStatus::Claimed
-                    | TaskExecutionStatus::Running
-                    | TaskExecutionStatus::CancelRequested
-            ) {
+            let has_derived_state =
+                task_has_derived_attempt_or_post_initial_state(refreshed_task, &refreshed_runtime);
+            if is_task_coder_execution_active(refreshed_task, refreshed_job, &refreshed_runtime)
+                || (!has_derived_state
+                    && matches!(
+                        snap.status,
+                        TaskExecutionStatus::Queued
+                            | TaskExecutionStatus::Claimed
+                            | TaskExecutionStatus::Running
+                            | TaskExecutionStatus::CancelRequested
+                    ))
+            {
                 active_running_count += 1;
             }
 
@@ -2680,6 +2691,98 @@ fn find_task_attempt_outbox(
                 && o.request_key == command_key
         })
         .cloned()
+}
+
+pub(crate) fn task_has_derived_attempt_or_post_initial_state(
+    task: &CoworkerTaskRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    task.current_attempt_no > 1
+        || task.attempts.iter().any(|a| a.attempt_no > 1)
+        || !task.candidates.is_empty()
+        || matches!(
+            task.stage,
+            CoworkerTaskStage::ReviewReserved
+                | CoworkerTaskStage::UnderReview
+                | CoworkerTaskStage::CorrectInScopeRequired
+                | CoworkerTaskStage::Accepted
+                | CoworkerTaskStage::IntegrationReserved
+                | CoworkerTaskStage::Integrated
+                | CoworkerTaskStage::Blocked
+        )
+        || runtime_state
+            .derived_attempts
+            .iter()
+            .any(|d| d.task_id == task.task_id)
+        || runtime_state.attempt_artifacts.values().any(|a| {
+            a.task_id == task.task_id
+                && (a.attempt_no > 1
+                    || a.is_derived_attempt
+                    || a.candidate_id.is_some()
+                    || a.review_subject.is_some())
+        })
+}
+
+pub(crate) fn is_task_coder_execution_active(
+    task: &CoworkerTaskRecord,
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    if matches!(
+        task.stage,
+        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+    ) {
+        return true;
+    }
+    let has_active_coder_outbox = job.outbox.iter().any(|o| {
+        o.task_id == task.task_id
+            && o.kind == OutboxDispatchKind::TaskAttemptDispatch
+            && matches!(
+                o.status,
+                OutboxDispatchStatus::ReservedBeforeEffect | OutboxDispatchStatus::EffectUnknown
+            )
+    });
+    if has_active_coder_outbox {
+        return true;
+    }
+    let has_active_derived_coder_effect = runtime_state.pending_effects.values().any(|eff| {
+        eff.kind == PendingControllerEffectKind::CoderDispatch
+            && eff.task_id.as_deref() == Some(task.task_id.as_str())
+            && eff.attempt_no.is_some_and(|no| no > 1)
+            && matches!(
+                eff.status,
+                PendingControllerEffectStatus::ReservedBeforeEffect
+                    | PendingControllerEffectStatus::EffectUnknown
+            )
+    });
+    if has_active_derived_coder_effect {
+        return true;
+    }
+    if task.stage == CoworkerTaskStage::EffectUnknown {
+        let has_unknown_coder_effect = runtime_state.pending_effects.values().any(|eff| {
+            eff.kind == PendingControllerEffectKind::CoderDispatch
+                && eff.task_id.as_deref() == Some(task.task_id.as_str())
+                && matches!(
+                    eff.status,
+                    PendingControllerEffectStatus::ReservedBeforeEffect
+                        | PendingControllerEffectStatus::EffectUnknown
+                )
+        });
+        if has_unknown_coder_effect {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn count_active_coder_executions(
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> usize {
+    job.tasks
+        .iter()
+        .filter(|task| is_task_coder_execution_active(task, job, runtime_state))
+        .count()
 }
 
 pub(crate) fn is_task_fenced_by_hold_or_sibling(

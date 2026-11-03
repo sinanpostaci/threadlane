@@ -50,6 +50,8 @@ pub mod review;
 pub mod review_execution;
 /// Private per-binding Coworker workflow ledger and compare-and-swap transaction store.
 pub mod store;
+/// Per-task in-scope correction preparation and durable reservation stage (`CorrectInScopeRequired -> DispatchReserved`).
+pub mod task_correction;
 /// Per-task original `RunIntegration` controller stage over accepted task candidates and owned
 /// `RunIntegration` worktrees.
 pub mod task_integration;
@@ -69,6 +71,7 @@ pub use planning::*;
 pub use review::*;
 pub use review_execution::*;
 pub use store::*;
+pub use task_correction::*;
 pub use task_integration::*;
 pub use task_review_stage::*;
 pub use task_verification::*;

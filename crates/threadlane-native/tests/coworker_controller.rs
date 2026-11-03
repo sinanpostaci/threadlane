@@ -13,8 +13,9 @@ use threadlane_host::{
     HostPhase, PrepareDependencyInputsRequest, TaskExecutionStatus,
 };
 use threadlane_native::coworker_workflow::{
-    compute_task_integration_subject_digest, compute_task_review_effect_id,
-    compute_task_review_request_key, deterministic_prefixed_id,
+    compute_derived_coder_effect_id, compute_derived_coder_request_key,
+    compute_derived_task_attempt_receipt_id, compute_task_integration_subject_digest,
+    compute_task_review_effect_id, compute_task_review_request_key, deterministic_prefixed_id,
     deterministic_task_integration_receipt_id, deterministic_task_integration_request_key,
     integrate_accepted_task, read_persisted_check_report, read_persisted_task_review_report,
     sha256_hex, ApplyWorkflowHoldRequest, BindJobApprovalRequest, CanonicalProjectBaseRef,
@@ -22,6 +23,8 @@ use threadlane_native::coworker_workflow::{
     ControllerRoleExecutionBudget, CoworkerControllerPhase1Status, CoworkerControllerService,
     CoworkerControllerStepRequest, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
     CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerPlanningService,
+    CoworkerTaskCorrectionDisposition, CoworkerTaskCorrectionPrepareRequest,
+    CoworkerTaskCorrectionPrepareStatus, CoworkerTaskCorrectionService,
     CoworkerTaskIntegrationRequest, CoworkerTaskIntegrationService, CoworkerTaskIntegrationStatus,
     CoworkerTaskReviewStageRequest, CoworkerTaskReviewStageService, CoworkerTaskReviewStageStatus,
     CoworkerTaskStage, CoworkerTaskVerificationOutcome, CoworkerTaskVerificationRequest,
@@ -4174,6 +4177,1610 @@ async fn task_review_stage_fails_closed_on_corrupt_existing_review_receipt_witho
     assert_eq!(
         fs::read(&corrupt_receipt_path).expect("read corrupt receipt after repeat"),
         corrupt_bytes
+    );
+
+    session.release().expect("release session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_correction_prepares_derived_receipt_reserves_once_reopens_idempotently_and_survives_step(
+) {
+    let fixture = setup_fixture();
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
+    );
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-corr-prep".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_corr_prep".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_corr_prep",
+        "plan-corr-prep",
+        vec![PlanTask {
+            id: "task-corr-prep".to_string(),
+            title: "Correction Prep Task A".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        task_interfaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+
+    let approval_before = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("load original ApprovalRecord");
+    let approved_task_before = approval_before
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-corr-prep")
+        .expect("approved task record")
+        .clone();
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 90_000)
+        .expect("open controller session");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut step_ts = 90_100u64;
+    loop {
+        let rep = session.step(step_ts).await.expect("controller step");
+        step_ts += 100;
+        let obs = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-corr-prep")
+            .expect("task-corr-prep observation");
+        if obs.stage == CoworkerTaskStage::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-corr-prep ReadyForReview: {rep:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_outcome = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-prep".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts,
+            },
+        )
+        .await
+        .expect("verify_and_prepare_task_attempt");
+    assert_eq!(
+        verify_outcome.status,
+        CoworkerTaskVerificationStatus::ReadyForReviewer
+    );
+    let review_subject = verify_outcome
+        .review_subject
+        .as_ref()
+        .expect("promoted ReviewSubject");
+
+    let policy_digest = job
+        .approval_linkage
+        .as_ref()
+        .expect("approval linkage")
+        .policy_digest
+        .clone();
+    let required_fixes = vec![
+        "Handle overflow in src/a.rs::a() without changing function signature".to_string(),
+        "Add boundary check in src/a.rs for zero input".to_string(),
+    ];
+    let correct_in_scope_resp = StructuredTaskReviewModelResponse {
+        schema_version: TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+        task_id: "task-corr-prep".to_string(),
+        attempt_no: 1,
+        candidate_id: verify_outcome.candidate_id.clone(),
+        review_subject_digest: review_subject.subject_digest.clone(),
+        base_commit: review_subject.base_commit.clone(),
+        task_head_commit: review_subject.task_head_commit.clone(),
+        task_tree_sha: review_subject.task_tree_sha.clone(),
+        diff_digest: review_subject.diff_digest.clone(),
+        policy_digest,
+        outcome: ReviewVerdictOutcome::CorrectInScope,
+        findings: vec!["Missing overflow guard in src/a.rs".to_string()],
+        required_in_scope_fixes: required_fixes.clone(),
+        conflicting_paths_or_interfaces: Vec::new(),
+        summary: Some("Requires two bounded in-scope fixes in src/a.rs.".to_string()),
+    };
+    fs::write(
+        &fixture.agy_plan_response_file,
+        serde_json::to_string(&correct_in_scope_resp)
+            .expect("serialize CorrectInScope reviewer response"),
+    )
+    .expect("write CorrectInScope reviewer response");
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+    let review_outcome = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-prep".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts + 100,
+                untrusted_candidate_context: Some(
+                    "Implemented initial src/a.rs candidate".to_string(),
+                ),
+            },
+        )
+        .await
+        .expect("review_task_attempt CorrectInScope");
+    assert_eq!(
+        review_outcome.status,
+        CoworkerTaskReviewStageStatus::CorrectInScopeRequired
+    );
+    assert_eq!(
+        review_outcome.task_stage,
+        CoworkerTaskStage::CorrectInScopeRequired
+    );
+    assert!(review_outcome.review_receipt.is_none());
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+    assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 2);
+
+    let runtime_before_corr = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime before correction")
+        .expect("runtime exists");
+    let art_key_1 = ControllerJobRuntimeState::artifact_key("task-corr-prep", 1);
+    let art_1_before = runtime_before_corr
+        .attempt_artifacts
+        .get(&art_key_1)
+        .expect("attempt 1 artifacts")
+        .clone();
+    let task_manifest = threadlane_workers::load_and_verify_manifest(
+        &review_subject.work_area_root,
+        &art_1_before.task_worktree_id,
+    )
+    .expect("load task manifest");
+    assert_ne!(
+        art_1_before.run_id, task_manifest.run_id,
+        "original host run_id UUID is distinct from compact worktree manifest run_id tag"
+    );
+    assert_eq!(review_subject.run_id, task_manifest.run_id);
+
+    let correction_service = CoworkerTaskCorrectionService::new(fixture.controller.clone());
+    let prep_req = CoworkerTaskCorrectionPrepareRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        task_id: "task-corr-prep".to_string(),
+        prior_attempt_no: 1,
+        now_ms: step_ts + 200,
+    };
+    let prep_outcome = correction_service
+        .prepare_task_correction(session.guard(), &prep_req)
+        .await
+        .expect("prepare_task_correction");
+
+    assert_eq!(
+        prep_outcome.status,
+        CoworkerTaskCorrectionPrepareStatus::Prepared
+    );
+    assert!(!prep_outcome.reused_existing);
+    assert_eq!(prep_outcome.prior_attempt_no, 1);
+    assert_eq!(prep_outcome.next_attempt_no, 2);
+    assert_eq!(prep_outcome.task_stage, CoworkerTaskStage::DispatchReserved);
+    assert_eq!(prep_outcome.prior_candidate_id, verify_outcome.candidate_id);
+    assert_eq!(
+        prep_outcome.prior_review_verdict_id.as_deref(),
+        Some(review_outcome.verdict.verdict_id.as_str())
+    );
+    assert_eq!(
+        prep_outcome.prior_review_subject_digest,
+        review_subject.subject_digest
+    );
+    assert_eq!(
+        read_invocation_count(&fixture.agy_count_file),
+        1,
+        "preparation must only reserve attempt 2 without launching a second Coder process"
+    );
+
+    let receipt = prep_outcome
+        .require_receipt()
+        .expect("require DerivedTaskAttemptReceipt")
+        .clone();
+    let expected_receipt_id = compute_derived_task_attempt_receipt_id(
+        &job.job_id,
+        "task-corr-prep",
+        2,
+        &verify_outcome.candidate_id,
+        &review_outcome.verdict.verdict_id,
+        &review_subject.subject_digest,
+        &runtime_before_corr.envelope.envelope_digest,
+    );
+    let expected_req_key = compute_derived_coder_request_key(
+        &job.job_id,
+        "task-corr-prep",
+        2,
+        &verify_outcome.candidate_id,
+        &review_outcome.verdict.verdict_id,
+        &review_subject.subject_digest,
+        &runtime_before_corr.envelope.envelope_digest,
+        &headless_argon_choice(Difficulty::Hard),
+    );
+    let expected_eff_id =
+        compute_derived_coder_effect_id(&job.job_id, "task-corr-prep", 2, &expected_req_key);
+
+    assert_eq!(receipt.receipt_id, expected_receipt_id);
+    assert_eq!(
+        prep_outcome.request_key.as_deref(),
+        Some(expected_req_key.as_str())
+    );
+    assert_eq!(
+        prep_outcome.effect_id.as_deref(),
+        Some(expected_eff_id.as_str())
+    );
+    assert_eq!(receipt.attempt_no, 2);
+    assert_eq!(
+        receipt.prior_rejected_candidate_id.as_deref(),
+        Some(verify_outcome.candidate_id.as_str())
+    );
+    assert_eq!(
+        receipt.prior_review_verdict_id.as_deref(),
+        Some(review_outcome.verdict.verdict_id.as_str())
+    );
+    assert_eq!(
+        receipt.prior_review_subject_digest.as_deref(),
+        Some(review_subject.subject_digest.as_str())
+    );
+    assert_eq!(receipt.frozen_instruction, approved_task_before.instruction);
+    assert_eq!(receipt.task_digest, approved_task_before.task_digest);
+    assert_eq!(receipt.write_paths, vec!["src/a.rs".to_string()]);
+    assert_eq!(
+        receipt.coder_choice,
+        headless_argon_choice(Difficulty::Hard)
+    );
+    assert_eq!(receipt.execution_base_commit, fixture.base_commit);
+    assert_eq!(receipt.run_id, art_1_before.run_id);
+    assert_eq!(receipt.worker_id, art_1_before.worker_id);
+    assert_eq!(receipt.task_worktree_id, art_1_before.task_worktree_id);
+    assert_eq!(
+        receipt.integration_worktree_id,
+        art_1_before.integration_worktree_id
+    );
+    assert_eq!(receipt.required_in_scope_fixes, required_fixes);
+    assert!(receipt
+        .derived_prompt
+        .contains(&approved_task_before.instruction));
+    assert!(receipt
+        .derived_prompt
+        .contains("<untrusted_required_in_scope_fixes>"));
+    assert!(receipt
+        .derived_prompt
+        .contains("</untrusted_required_in_scope_fixes>"));
+    for fix in &required_fixes {
+        let quoted_fix = serde_json::to_string(fix).expect("quote fix");
+        assert!(receipt.derived_prompt.contains(&quoted_fix));
+    }
+    assert_eq!(
+        receipt.compute_digest().expect("compute receipt digest"),
+        receipt.receipt_digest
+    );
+
+    let approval_after = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("load ApprovalRecord after correction prep");
+    assert_eq!(
+        approval_after, approval_before,
+        "original ApprovalRecord must remain strictly immutable"
+    );
+
+    let runtime_after = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get job runtime after correction prep")
+        .expect("runtime exists");
+    let coder_usage = runtime_after
+        .role_usage
+        .get(&WorkflowRole::Coder)
+        .expect("Coder role usage");
+    assert_eq!(coder_usage.calls_reserved, 2);
+    assert_eq!(coder_usage.calls_completed, 1);
+    assert_eq!(runtime_after.total_task_attempts_reserved, 2);
+    assert_eq!(runtime_after.total_corrections_reserved, 1);
+    assert_eq!(runtime_after.derived_attempts, vec![receipt.clone()]);
+    let derived_eff = runtime_after
+        .pending_effects
+        .get(&expected_eff_id)
+        .expect("derived CoderDispatch PendingControllerEffect");
+    assert_eq!(derived_eff.kind, PendingControllerEffectKind::CoderDispatch);
+    assert_eq!(
+        derived_eff.status,
+        PendingControllerEffectStatus::ReservedBeforeEffect
+    );
+    assert_eq!(derived_eff.attempt_no, Some(2));
+    assert_eq!(derived_eff.request_key, expected_req_key);
+    assert_eq!(derived_eff.subject_digest, receipt.receipt_digest);
+
+    let ledger_after = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read binding ledger after correction prep");
+    let job_after = ledger_after
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("job after correction prep");
+    let task_after = job_after
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-corr-prep")
+        .expect("task after correction prep");
+    assert_eq!(task_after.stage, CoworkerTaskStage::DispatchReserved);
+    assert_eq!(task_after.current_attempt_no, 2);
+    assert_eq!(
+        task_after.unresolved_outbox_id.as_deref(),
+        prep_outcome.outbox_id.as_deref()
+    );
+    let outbox_2 = job_after
+        .outbox
+        .iter()
+        .find(|o| Some(o.outbox_id.as_str()) == prep_outcome.outbox_id.as_deref())
+        .expect("attempt 2 outbox record");
+    assert_eq!(outbox_2.kind, OutboxDispatchKind::TaskAttemptDispatch);
+    assert_eq!(outbox_2.attempt_no, 2);
+    assert_eq!(outbox_2.request_key, expected_req_key);
+    assert_eq!(outbox_2.status, OutboxDispatchStatus::ReservedBeforeEffect);
+    assert_eq!(outbox_2.subject_digest, receipt.receipt_digest);
+
+    // Repeating prepare_task_correction on the same session and after session reopen must return
+    // Reopened with the exact same receipt and zero extra counter/effect/outbox allocations.
+    let repeat_same = correction_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                now_ms: step_ts + 300,
+                ..prep_req.clone()
+            },
+        )
+        .await
+        .expect("repeat prepare_task_correction on same session");
+    assert_eq!(
+        repeat_same.status,
+        CoworkerTaskCorrectionPrepareStatus::Reopened
+    );
+    assert!(repeat_same.reused_existing);
+    assert_eq!(repeat_same.receipt.as_ref(), Some(&receipt));
+    assert_eq!(repeat_same.request_key, prep_outcome.request_key);
+    assert_eq!(repeat_same.effect_id, prep_outcome.effect_id);
+    assert_eq!(repeat_same.outbox_id, prep_outcome.outbox_id);
+
+    session.release().expect("release session");
+    let reopened_session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 400)
+        .expect("reopen controller session");
+    let reopened_outcome = correction_service
+        .prepare_task_correction(
+            reopened_session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                now_ms: step_ts + 500,
+                ..prep_req.clone()
+            },
+        )
+        .await
+        .expect("reopened prepare_task_correction");
+    assert_eq!(
+        reopened_outcome.status,
+        CoworkerTaskCorrectionPrepareStatus::Reopened
+    );
+    assert!(reopened_outcome.reused_existing);
+    assert_eq!(reopened_outcome.receipt.as_ref(), Some(&receipt));
+    assert_eq!(reopened_outcome.outbox_id, prep_outcome.outbox_id);
+
+    // Calling the initial controller step (`reopened_session.step(...)`) afterward must not
+    // overwrite the derived DispatchReserved state or attempt 1 artifacts with the old host snapshot.
+    let post_step_report = reopened_session
+        .step(step_ts + 600)
+        .await
+        .expect("controller step after correction preparation");
+    assert!(post_step_report.dispatched_task_ids.is_empty());
+    assert!(post_step_report
+        .reconciled_ready_for_review_task_ids
+        .is_empty());
+    let obs_after_step = post_step_report
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-corr-prep")
+        .expect("task observation after step");
+    assert_eq!(obs_after_step.stage, CoworkerTaskStage::DispatchReserved);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
+
+    let runtime_after_step = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("get runtime after step")
+        .expect("runtime exists");
+    assert_eq!(
+        runtime_after_step
+            .role_usage
+            .get(&WorkflowRole::Coder)
+            .expect("Coder usage")
+            .calls_reserved,
+        2
+    );
+    assert_eq!(runtime_after_step.total_task_attempts_reserved, 2);
+    assert_eq!(runtime_after_step.total_corrections_reserved, 1);
+    assert_eq!(runtime_after_step.derived_attempts, vec![receipt]);
+    assert_eq!(
+        runtime_after_step.attempt_artifacts.get(&art_key_1),
+        Some(&art_1_before),
+        "attempt 1 TaskAttemptExecutionArtifacts must not be overwritten by initial controller step"
+    );
+
+    reopened_session
+        .release()
+        .expect("release reopened session");
+    host_handle.shutdown().await.expect("shutdown host");
+}
+
+#[tokio::test]
+async fn task_correction_refuses_missing_or_tampered_reviewer_report_fabricated_verdict_drift_holds_and_caps(
+) {
+    let fixture = setup_fixture();
+
+    // Case 1: Unreviewed check-failure task (`BlockedByFailedChecks`) must be rejected with
+    // `UnsupportedCapability` without fabricating a Reviewer verdict or reserving counters.
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\necho \"test src_a ... FAILED\" >&2\nexit 1\n",
+    );
+    let mut check_fail_ifaces = BTreeMap::new();
+    check_fail_ifaces.insert(
+        "task-corr-chkfail".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_corr_chkfail".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job_chkfail, approval_chkfail) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_corr_chkfail",
+        "plan-corr-chkfail",
+        vec![PlanTask {
+            id: "task-corr-chkfail".to_string(),
+            title: "Check Fail Task".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        check_fail_ifaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let host_chkfail = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_chkfail,
+    ))
+    .await
+    .expect("start host_chkfail");
+    let sess_chkfail = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_chkfail.job_id, 100_000)
+        .expect("open sess_chkfail");
+    let mut step_ts = 100_100u64;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rep = sess_chkfail.step(step_ts).await.expect("step chkfail");
+        step_ts += 100;
+        if rep.tasks.iter().any(|t| {
+            t.task_id == "task-corr-chkfail" && t.stage == CoworkerTaskStage::ReadyForReview
+        }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for task-corr-chkfail"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_chkfail = verifier
+        .verify_and_prepare_task_attempt(
+            sess_chkfail.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_chkfail.job_id.clone(),
+                task_id: "task-corr-chkfail".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts,
+            },
+        )
+        .await
+        .expect("verify failing check attempt");
+    assert_eq!(
+        verify_chkfail.status,
+        CoworkerTaskVerificationStatus::BlockedByFailedChecks
+    );
+
+    let correction_service = CoworkerTaskCorrectionService::new(fixture.controller.clone());
+    let chkfail_err = correction_service
+        .prepare_task_correction(
+            sess_chkfail.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_chkfail.job_id.clone(),
+                task_id: "task-corr-chkfail".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts + 50,
+            },
+        )
+        .await
+        .expect_err("check-failure correction must be explicitly unsupported in this slice");
+    assert_eq!(
+        chkfail_err.code(),
+        NativeErrorCode::UnsupportedCapability.as_str()
+    );
+    let rt_chkfail = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_chkfail.job_id)
+        .expect("read rt_chkfail")
+        .expect("rt_chkfail exists");
+    assert_eq!(rt_chkfail.total_corrections_reserved, 0);
+    assert_eq!(rt_chkfail.total_task_attempts_reserved, 1);
+    assert!(rt_chkfail.derived_attempts.is_empty());
+
+    sess_chkfail.release().expect("release sess_chkfail");
+    host_chkfail
+        .shutdown()
+        .await
+        .expect("shutdown host_chkfail");
+
+    // Case 2: Fabricated/caller-created ledger verdict without an actual persisted Reviewer report
+    // must be rejected before any counters or effects are reserved.
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
+    );
+    let mut fab_ifaces = BTreeMap::new();
+    fab_ifaces.insert(
+        "task-corr-fab".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_corr_fab".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job_fab, approval_fab) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_corr_fab",
+        "plan-corr-fab",
+        vec![PlanTask {
+            id: "task-corr-fab".to_string(),
+            title: "Fabricated Verdict Task".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        fab_ifaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let host_fab = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_fab,
+    ))
+    .await
+    .expect("start host_fab");
+    let sess_fab = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_fab.job_id, 110_000)
+        .expect("open sess_fab");
+    let mut step_ts_fab = 110_100u64;
+    let deadline_fab = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rep = sess_fab.step(step_ts_fab).await.expect("step fab");
+        step_ts_fab += 100;
+        if rep
+            .tasks
+            .iter()
+            .any(|t| t.task_id == "task-corr-fab" && t.stage == CoworkerTaskStage::ReadyForReview)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline_fab,
+            "timed out waiting for task-corr-fab"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let verify_fab = verifier
+        .verify_and_prepare_task_attempt(
+            sess_fab.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_fab.job_id.clone(),
+                task_id: "task-corr-fab".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts_fab,
+            },
+        )
+        .await
+        .expect("verify task-corr-fab");
+    let subject_fab = verify_fab.review_subject.as_ref().expect("subject_fab");
+    let policy_digest_fab = job_fab
+        .approval_linkage
+        .as_ref()
+        .expect("linkage fab")
+        .policy_digest
+        .clone();
+
+    // Directly inject a caller-fabricated CorrectInScope verdict into the workflow store without
+    // executing `CoworkerTaskReviewStageService` or persisting a `TaskReviewExecutionReport`.
+    let ledger_fab = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger_fab");
+    let cur_job_fab = ledger_fab
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job_fab.job_id)
+        .expect("cur_job_fab")
+        .clone();
+    let (cur_job_fab, fake_rev_outbox) = fixture
+        .workflow_store
+        .reserve_task_outbox(&ReserveTaskOutboxRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_fab.job_id.clone(),
+            expected_job_revision: cur_job_fab.job_revision,
+            expected_ledger_revision: None,
+            request_key: "req_forged_review_fab".to_string(),
+            kind: OutboxDispatchKind::TaskReviewDispatch,
+            task_id: "task-corr-fab".to_string(),
+            role: WorkflowRole::Reviewer,
+            subject_digest: subject_fab.subject_digest.clone(),
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+        })
+        .expect("reserve fake review outbox");
+    let (cur_job_fab, _) = fixture
+        .workflow_store
+        .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_fab.job_id.clone(),
+            expected_job_revision: cur_job_fab.job_revision,
+            expected_ledger_revision: None,
+            outbox_id: fake_rev_outbox.outbox_id,
+            status: OutboxDispatchStatus::DispatchedEffectConfirmed,
+            next_task_stage: CoworkerTaskStage::UnderReview,
+            run_id: None,
+            worker_id: None,
+            task_worktree_id: Some(subject_fab.task_worktree_id.clone()),
+            head_commit: Some(subject_fab.task_head_commit.clone()),
+            tree_sha: Some(subject_fab.task_tree_sha.clone()),
+            diff_digest: Some(subject_fab.diff_digest.clone()),
+            report_artifact_id: Some("trr_00000000000000000000000000000001".to_string()),
+            observed_model: Some("gemini-4-argon-high".to_string()),
+            observed_effort: Some("high".to_string()),
+            receipt_id: None,
+            diagnostic: None,
+        })
+        .expect("finalize fake review outbox");
+    let fabricated_verdict = StructuredReviewVerdict {
+        verdict_id: "rvd_00000000000000000000000000000001".to_string(),
+        task_id: "task-corr-fab".to_string(),
+        attempt_no: 1,
+        candidate_id: verify_fab.candidate_id.clone(),
+        review_subject_digest: subject_fab.subject_digest.clone(),
+        base_commit: subject_fab.base_commit.clone(),
+        task_head_commit: subject_fab.task_head_commit.clone(),
+        task_tree_sha: subject_fab.task_tree_sha.clone(),
+        diff_digest: subject_fab.diff_digest.clone(),
+        policy_digest: policy_digest_fab,
+        outcome: ReviewVerdictOutcome::CorrectInScope,
+        findings: vec!["Fabricated finding".to_string()],
+        required_in_scope_fixes: vec!["Fabricated fix in src/a.rs".to_string()],
+        conflicting_paths_or_interfaces: Vec::new(),
+        prose_summary: Some("Caller-created verdict without Reviewer report".to_string()),
+        prose_may_advance_acceptance: false,
+    };
+    let fabricated_candidate = TaskCandidateRef {
+        candidate_id: verify_fab.candidate_id.clone(),
+        task_id: "task-corr-fab".to_string(),
+        attempt_no: 1,
+        base_commit: subject_fab.base_commit.clone(),
+        head_commit: subject_fab.task_head_commit.clone(),
+        tree_sha: subject_fab.task_tree_sha.clone(),
+        diff_digest: subject_fab.diff_digest.clone(),
+        write_paths: vec!["src/a.rs".to_string()],
+        check_evidence_digests: verify_fab
+            .check_evidence
+            .iter()
+            .map(|e| e.evidence_digest.clone())
+            .collect(),
+        review_subject_digest: Some(subject_fab.subject_digest.clone()),
+        review_verdict: Some(fabricated_verdict),
+        review_receipt_id: None,
+        integration_receipt_id: None,
+    };
+    fixture
+        .workflow_store
+        .record_task_candidate_and_verdict(&RecordTaskReviewVerdictRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_fab.job_id.clone(),
+            expected_job_revision: cur_job_fab.job_revision,
+            expected_ledger_revision: None,
+            candidate: fabricated_candidate,
+        })
+        .expect("record fabricated verdict");
+
+    let fab_err = correction_service
+        .prepare_task_correction(
+            sess_fab.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_fab.job_id.clone(),
+                task_id: "task-corr-fab".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_fab + 100,
+            },
+        )
+        .await
+        .expect_err(
+            "caller-fabricated verdict without deterministic Reviewer stage/report must fail",
+        );
+    assert_eq!(fab_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    let rt_fab = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_fab.job_id)
+        .expect("read rt_fab")
+        .expect("rt_fab exists");
+    assert_eq!(rt_fab.total_corrections_reserved, 0);
+    assert_eq!(rt_fab.total_task_attempts_reserved, 1);
+    assert!(rt_fab.derived_attempts.is_empty());
+
+    sess_fab.release().expect("release sess_fab");
+    host_fab.shutdown().await.expect("shutdown host_fab");
+
+    // Case 3: Real Reviewer stage -> test tampered/missing Reviewer report, worktree drift,
+    // workflow hold, stop_requested, and exhausted correction/attempt/role caps.
+    let mut neg_ifaces = BTreeMap::new();
+    neg_ifaces.insert(
+        "task-corr-neg".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_corr_neg".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job_neg, approval_neg) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_corr_neg",
+        "plan-corr-neg",
+        vec![PlanTask {
+            id: "task-corr-neg".to_string(),
+            title: "Negative Guards Task".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }],
+        neg_ifaces,
+        vec!["src/a.rs".to_string()],
+        1,
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let host_neg = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_neg,
+    ))
+    .await
+    .expect("start host_neg");
+    let sess_neg = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job_neg.job_id, 120_000)
+        .expect("open sess_neg");
+    let mut step_ts_neg = 120_100u64;
+    let deadline_neg = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rep = sess_neg.step(step_ts_neg).await.expect("step neg");
+        step_ts_neg += 100;
+        if rep
+            .tasks
+            .iter()
+            .any(|t| t.task_id == "task-corr-neg" && t.stage == CoworkerTaskStage::ReadyForReview)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline_neg,
+            "timed out waiting for task-corr-neg"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let verify_neg = verifier
+        .verify_and_prepare_task_attempt(
+            sess_neg.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts_neg,
+            },
+        )
+        .await
+        .expect("verify task-corr-neg");
+    let subject_neg = verify_neg.review_subject.as_ref().expect("subject_neg");
+    let policy_digest_neg = job_neg
+        .approval_linkage
+        .as_ref()
+        .expect("linkage neg")
+        .policy_digest
+        .clone();
+
+    let neg_resp = StructuredTaskReviewModelResponse {
+        schema_version: TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+        task_id: "task-corr-neg".to_string(),
+        attempt_no: 1,
+        candidate_id: verify_neg.candidate_id.clone(),
+        review_subject_digest: subject_neg.subject_digest.clone(),
+        base_commit: subject_neg.base_commit.clone(),
+        task_head_commit: subject_neg.task_head_commit.clone(),
+        task_tree_sha: subject_neg.task_tree_sha.clone(),
+        diff_digest: subject_neg.diff_digest.clone(),
+        policy_digest: policy_digest_neg,
+        outcome: ReviewVerdictOutcome::CorrectInScope,
+        findings: vec!["Fix src/a.rs constant".to_string()],
+        required_in_scope_fixes: vec!["Adjust constant in src/a.rs".to_string()],
+        conflicting_paths_or_interfaces: Vec::new(),
+        summary: Some("CorrectInScope for negative guard verification.".to_string()),
+    };
+    fs::write(
+        &fixture.agy_plan_response_file,
+        serde_json::to_string(&neg_resp).expect("serialize neg_resp"),
+    )
+    .expect("write neg_resp");
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+    let rev_neg = review_service
+        .review_task_attempt(
+            sess_neg.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                attempt_no: 1,
+                now_ms: step_ts_neg + 100,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect("review_task_attempt neg");
+    assert_eq!(
+        rev_neg.status,
+        CoworkerTaskReviewStageStatus::CorrectInScopeRequired
+    );
+
+    let report_path = PathBuf::from(&rev_neg.report_path);
+    let valid_report_bytes = fs::read(&report_path).expect("read valid report bytes");
+    let art_key_neg = ControllerJobRuntimeState::artifact_key("task-corr-neg", 1);
+    let art_neg_before = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_neg.job_id)
+        .expect("read rt")
+        .expect("rt")
+        .attempt_artifacts
+        .get(&art_key_neg)
+        .expect("art_neg_before")
+        .clone();
+
+    // 3a. Tampered/corrupted persisted Reviewer report bytes on disk must fail closed and preserve
+    // the corrupted file bytes and prior attempt artifacts.
+    let corrupt_report_bytes = b"{tampered-task-review-execution-report-json";
+    fs::write(&report_path, corrupt_report_bytes).expect("write corrupt report bytes");
+    fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 corrupt report");
+    let corrupt_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 200,
+            },
+        )
+        .await
+        .expect_err("tampered Reviewer report must be rejected");
+    assert_eq!(corrupt_err.code(), NativeErrorCode::ProtocolError.as_str());
+    assert_eq!(
+        fs::read(&report_path).expect("read corrupt report after rejection"),
+        corrupt_report_bytes,
+        "corrupted Reviewer report bytes must be preserved on disk"
+    );
+
+    // 3b. Missing persisted Reviewer report file on disk must fail closed.
+    fs::remove_file(&report_path).expect("remove report_path");
+    let missing_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 250,
+            },
+        )
+        .await
+        .expect_err("missing persisted Reviewer report must be rejected");
+    assert_eq!(missing_err.code(), NativeErrorCode::ProtocolError.as_str());
+
+    // Restore the valid 0600 Reviewer report bytes.
+    fs::write(&report_path, &valid_report_bytes).expect("restore valid report bytes");
+    fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
+        .expect("chmod 0600 restored report");
+
+    // 3c. Live task worktree drift (uncommitted file change in task worktree after review) must be rejected.
+    let task_manifest_neg = threadlane_workers::load_and_verify_manifest(
+        &subject_neg.work_area_root,
+        &subject_neg.task_worktree_id,
+    )
+    .expect("load task_manifest_neg");
+    let task_file_a = task_manifest_neg.checkout_path.join("src/a.rs");
+    let clean_task_file_a = fs::read_to_string(&task_file_a).expect("read clean task src/a.rs");
+    fs::write(&task_file_a, "pub fn a() -> u32 { 999 }\n").expect("dirty task worktree src/a.rs");
+    let drift_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 300,
+            },
+        )
+        .await
+        .expect_err("drifted task worktree must be rejected");
+    assert_eq!(drift_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    fs::write(&task_file_a, &clean_task_file_a).expect("restore clean task src/a.rs");
+
+    // 3d. Active workflow hold and `stop_requested` fence correction preparation.
+    let cur_job_neg = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read ledger")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == job_neg.job_id)
+        .expect("cur_job_neg");
+    let (held_job_neg, hold_rec) = fixture
+        .workflow_store
+        .apply_workflow_hold(&ApplyWorkflowHoldRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_neg.job_id.clone(),
+            expected_job_revision: cur_job_neg.job_revision,
+            expected_ledger_revision: None,
+            request_key: "req_hold_corr_neg".to_string(),
+            reason: WorkflowHoldReason::ConversationClarificationPending,
+            detail: "Hold before correction".to_string(),
+            directly_affected_task_ids: vec!["task-corr-neg".to_string()],
+            affected_write_paths: vec!["src/a.rs".to_string()],
+            affected_interfaces: vec!["iface_corr_neg".to_string()],
+            holds_entire_job: false,
+        })
+        .expect("apply hold on task-corr-neg");
+    let hold_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 350,
+            },
+        )
+        .await
+        .expect_err("held task must refuse correction preparation");
+    assert_eq!(hold_err.code(), NativeErrorCode::ValidationFailed.as_str());
+
+    fixture
+        .workflow_store
+        .resolve_workflow_hold(&ResolveWorkflowHoldRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job_neg.job_id.clone(),
+            expected_job_revision: held_job_neg.job_revision,
+            expected_ledger_revision: None,
+            hold_id: hold_rec.hold_id,
+            resolution_note: "Resolved hold".to_string(),
+        })
+        .expect("resolve hold on task-corr-neg");
+
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_neg.job_id, |state| {
+            state.stop_requested = true;
+            Ok(())
+        })
+        .expect("set stop_requested");
+    let stop_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 400,
+            },
+        )
+        .await
+        .expect_err("stop_requested must refuse correction preparation");
+    assert_eq!(stop_err.code(), NativeErrorCode::ValidationFailed.as_str());
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_neg.job_id, |state| {
+            state.stop_requested = false;
+            Ok(())
+        })
+        .expect("clear stop_requested");
+
+    // 3e. Exhausted job correction cap (`total_corrections_reserved == max_total_corrections_per_job`)
+    // and exhausted Coder role call budget must refuse preparation before any new receipt or effect.
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_neg.job_id, |state| {
+            state.total_corrections_reserved = state.envelope.max_total_corrections_per_job;
+            Ok(())
+        })
+        .expect("exhaust total_corrections_reserved");
+    let cap_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 450,
+            },
+        )
+        .await
+        .expect_err("exhausted max_total_corrections_per_job must refuse preparation");
+    assert_eq!(cap_err.code(), NativeErrorCode::ValidationFailed.as_str());
+
+    fixture
+        .policy_store
+        .mutate_job_runtime_for_operator(BINDING_A, &job_neg.job_id, |state| {
+            state.total_corrections_reserved = 0;
+            if let Some(usage) = state.role_usage.get_mut(&WorkflowRole::Coder) {
+                usage.calls_reserved = 4;
+            }
+            Ok(())
+        })
+        .expect("exhaust Coder role calls_reserved");
+    let role_cap_err = correction_service
+        .prepare_task_correction(
+            sess_neg.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job_neg.job_id.clone(),
+                task_id: "task-corr-neg".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts_neg + 500,
+            },
+        )
+        .await
+        .expect_err("exhausted Coder role budget must refuse preparation");
+    assert_eq!(
+        role_cap_err.code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let rt_neg_after = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job_neg.job_id)
+        .expect("read rt_neg_after")
+        .expect("rt_neg_after exists");
+    assert_eq!(rt_neg_after.total_corrections_reserved, 0);
+    assert_eq!(rt_neg_after.total_task_attempts_reserved, 1);
+    assert!(rt_neg_after.derived_attempts.is_empty());
+    assert_eq!(
+        rt_neg_after.attempt_artifacts.get(&art_key_neg),
+        Some(&art_neg_before),
+        "prior attempt artifacts must be preserved across all pre-effect refusals"
+    );
+
+    sess_neg.release().expect("release sess_neg");
+    host_neg.shutdown().await.expect("shutdown host_neg");
+}
+
+#[tokio::test]
+async fn task_correction_waits_when_parallel_coder_capacity_is_full_and_prepares_after_slot_frees()
+{
+    let fixture = setup_fixture();
+    write_executable_script(
+        &fixture.fake_cargo_exe,
+        "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
+    );
+
+    let gate_release_file = fixture
+        .plans_dir
+        .parent()
+        .expect("fixture root")
+        .join("release_task_b.flag");
+    let script_with_gate = format!(
+        r#"#!/bin/sh
+set -eu
+CODER_COUNT_FILE="{coder_count_file}"
+PLANNING_COUNT_FILE="{planning_count_file}"
+PROMPT_FILE="{prompt_file}"
+PLAN_RESPONSE_FILE="{plan_response_file}"
+GATE_RELEASE_FILE="{gate_release_file}"
+
+MODEL=""
+EFFORT=""
+AGY_MODE=""
+PROMPT=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --effort)
+            EFFORT="$2"
+            shift 2
+            ;;
+        --mode)
+            AGY_MODE="$2"
+            shift 2
+            ;;
+        --print|--prompt|-p)
+            PROMPT="$2"
+            shift 2
+            ;;
+        *)
+            shift 1
+            ;;
+    esac
+done
+
+if [ "$AGY_MODE" = "plan" ]; then
+    pc=0
+    if [ -f "$PLANNING_COUNT_FILE" ]; then
+        pc=$(cat "$PLANNING_COUNT_FILE")
+    fi
+    pc=$((pc + 1))
+    printf "%s" "$pc" > "$PLANNING_COUNT_FILE"
+    printf '{{"event":"init","init":{{"session_id":"sess-agy-plan-%s","model":"%s"}}}}\n' "$pc" "$MODEL"
+    esc=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$PLAN_RESPONSE_FILE" | tr '\n' ' ')
+    printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$esc"
+    exit 0
+fi
+
+c=0
+if [ -f "$CODER_COUNT_FILE" ]; then
+    c=$(cat "$CODER_COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$CODER_COUNT_FILE"
+
+printf "%s" "$PROMPT" > "$PROMPT_FILE"
+printf '{{"type":"init","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
+
+case "$PROMPT" in
+    *CTRL_HOLD_B*)
+        while [ ! -f "$GATE_RELEASE_FILE" ]; do
+            sleep 0.02
+        done
+        if [ -d "src" ]; then
+            printf "pub fn b() -> u32 {{ 200 }}\n" > "src/b.rs"
+        fi
+        ;;
+    *CTRL_TASK_A*)
+        if [ -d "src" ]; then
+            printf "pub fn a() -> u32 {{ 100 }}\n" > "src/a.rs"
+        fi
+        ;;
+    *)
+        if [ -d "src" ]; then
+            printf "pub fn a() -> u32 {{ 42 }}\n" > "src/a.rs"
+        fi
+        ;;
+esac
+
+printf '{{"type":"result","subtype":"success","session_id":"sess-agy-ctrl","model":"%s","effort":"%s"}}\n' "$MODEL" "$EFFORT"
+exit 0
+"#,
+        coder_count_file = fixture.agy_count_file.display(),
+        planning_count_file = fixture.agy_planning_count_file.display(),
+        prompt_file = fixture.agy_prompt_file.display(),
+        plan_response_file = fixture.agy_plan_response_file.display(),
+        gate_release_file = gate_release_file.display(),
+    );
+    write_executable_script(&fixture.fake_agy_exe, &script_with_gate);
+
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-corr-cap-a".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_cap_a".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    task_interfaces.insert(
+        "task-corr-cap-b".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_cap_b".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let (job, approval_id) = create_planned_approved_and_frozen_job(
+        &fixture,
+        "brf_corr_cap",
+        "plan-corr-cap",
+        vec![
+            PlanTask {
+                id: "task-corr-cap-a".to_string(),
+                title: "Cap Task A".to_string(),
+                instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-corr-cap-b".to_string(),
+                title: "Cap Task B".to_string(),
+                instruction: "CTRL_HOLD_B implement src/b.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+        ],
+        task_interfaces,
+        vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+        1, // max_parallel = 1
+        ExecutionBudgets::default(),
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    )
+    .await;
+
+    let host_handle = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval_id,
+    ))
+    .await
+    .expect("start ApprovedHost");
+
+    let session = fixture
+        .controller
+        .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 130_000)
+        .expect("open controller session");
+
+    // 1. Dispatch task-corr-cap-a (attempt 1) to ReadyForReview while task-corr-cap-b waits at ReadyToDispatch
+    // until task-corr-cap-a finishes its initial Coder run.
+    let host_client = ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        BINDING_A,
+        THREAD_UUID_A,
+    )
+    .expect("create host client");
+    host_client
+        .dispatch_task(&approval_id, "task-corr-cap-a")
+        .await
+        .expect("dispatch task-corr-cap-a");
+    let wait_a = Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap_a = host_client
+            .get_task(&approval_id, "task-corr-cap-a")
+            .await
+            .expect("get_task A");
+        if snap_a.status == TaskExecutionStatus::ReadyForReview {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_a,
+            "timed out waiting for A ReadyForReview"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Reconcile A to ReadyForReview and let step_job dispatch B (which stays Running on the gate).
+    let step_rep = session
+        .step(130_100)
+        .await
+        .expect("step reconciles A and dispatches B");
+    let obs_a = step_rep
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-corr-cap-a")
+        .expect("obs A");
+    let obs_b = step_rep
+        .tasks
+        .iter()
+        .find(|t| t.task_id == "task-corr-cap-b")
+        .expect("obs B");
+    assert_eq!(obs_a.stage, CoworkerTaskStage::ReadyForReview);
+    assert_eq!(obs_b.stage, CoworkerTaskStage::Running);
+    assert_eq!(step_rep.active_running_count, 1);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    // 2. Verify and review task-corr-cap-a -> CorrectInScopeRequired while task-corr-cap-b is Running.
+    let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
+    let verify_a = verifier
+        .verify_and_prepare_task_attempt(
+            session.guard(),
+            &CoworkerTaskVerificationRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-cap-a".to_string(),
+                attempt_no: 1,
+                now_ms: 130_200,
+            },
+        )
+        .await
+        .expect("verify task-corr-cap-a");
+    let subject_a = verify_a.review_subject.as_ref().expect("subject A");
+    let policy_digest = job
+        .approval_linkage
+        .as_ref()
+        .expect("linkage")
+        .policy_digest
+        .clone();
+    let rev_resp_a = StructuredTaskReviewModelResponse {
+        schema_version: TASK_REVIEW_RESPONSE_SCHEMA_VERSION,
+        task_id: "task-corr-cap-a".to_string(),
+        attempt_no: 1,
+        candidate_id: verify_a.candidate_id.clone(),
+        review_subject_digest: subject_a.subject_digest.clone(),
+        base_commit: subject_a.base_commit.clone(),
+        task_head_commit: subject_a.task_head_commit.clone(),
+        task_tree_sha: subject_a.task_tree_sha.clone(),
+        diff_digest: subject_a.diff_digest.clone(),
+        policy_digest,
+        outcome: ReviewVerdictOutcome::CorrectInScope,
+        findings: vec!["Fix return value in src/a.rs".to_string()],
+        required_in_scope_fixes: vec!["Update src/a.rs return value to 101".to_string()],
+        conflicting_paths_or_interfaces: Vec::new(),
+        summary: Some("CorrectInScope for task-corr-cap-a.".to_string()),
+    };
+    fs::write(
+        &fixture.agy_plan_response_file,
+        serde_json::to_string(&rev_resp_a).expect("serialize rev_resp_a"),
+    )
+    .expect("write rev_resp_a");
+
+    let review_service = CoworkerTaskReviewStageService::new(fixture.controller.clone());
+    let rev_out_a = review_service
+        .review_task_attempt(
+            session.guard(),
+            &CoworkerTaskReviewStageRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-cap-a".to_string(),
+                attempt_no: 1,
+                now_ms: 130_300,
+                untrusted_candidate_context: None,
+            },
+        )
+        .await
+        .expect("review task-corr-cap-a");
+    assert_eq!(
+        rev_out_a.status,
+        CoworkerTaskReviewStageStatus::CorrectInScopeRequired
+    );
+
+    // 3. While task-corr-cap-b occupies max_parallel (1), prepare_task_correction for task-corr-cap-a
+    // must return WaitingForParallelCapacity with unchanged counters, no receipt, and no effect/outbox.
+    let correction_service = CoworkerTaskCorrectionService::new(fixture.controller.clone());
+    let waiting_outcome = correction_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-cap-a".to_string(),
+                prior_attempt_no: 1,
+                now_ms: 130_400,
+            },
+        )
+        .await
+        .expect("prepare_task_correction while parallel capacity is full");
+    assert_eq!(
+        waiting_outcome.status,
+        CoworkerTaskCorrectionPrepareStatus::WaitingForParallelCapacity
+    );
+    assert!(waiting_outcome.is_waiting());
+    assert_eq!(
+        waiting_outcome.disposition,
+        CoworkerTaskCorrectionDisposition::Waiting {
+            max_parallel: 1,
+            active_coder_executions: 1,
+        }
+    );
+    assert_eq!(
+        waiting_outcome.task_stage,
+        CoworkerTaskStage::CorrectInScopeRequired
+    );
+    assert!(waiting_outcome.receipt.is_none());
+    assert!(waiting_outcome.request_key.is_none());
+    assert!(waiting_outcome.effect_id.is_none());
+    assert!(waiting_outcome.outbox_id.is_none());
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
+
+    let rt_waiting = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read rt_waiting")
+        .expect("rt_waiting exists");
+    assert_eq!(rt_waiting.total_corrections_reserved, 0);
+    assert_eq!(rt_waiting.total_task_attempts_reserved, 2);
+    assert!(rt_waiting.derived_attempts.is_empty());
+    assert_eq!(
+        rt_waiting
+            .role_usage
+            .get(&WorkflowRole::Coder)
+            .expect("Coder usage")
+            .calls_reserved,
+        2
+    );
+
+    // 4. Release the gate file so task-corr-cap-b finishes and reconciles to ReadyForReview,
+    // freeing the parallel slot.
+    fs::write(&gate_release_file, "release\n").expect("write gate_release_file");
+    let mut step_ts = 130_500u64;
+    let deadline_b = Instant::now() + Duration::from_secs(10);
+    loop {
+        let rep = session.step(step_ts).await.expect("step until B finishes");
+        step_ts += 100;
+        let b_done = rep
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-corr-cap-b")
+            .expect("obs B");
+        if b_done.stage == CoworkerTaskStage::ReadyForReview {
+            assert_eq!(rep.active_running_count, 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline_b,
+            "timed out waiting for B ReadyForReview"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // 5. Now that the parallel slot is free, prepare_task_correction succeeds and reserves attempt 2.
+    let prepared_after_free = correction_service
+        .prepare_task_correction(
+            session.guard(),
+            &CoworkerTaskCorrectionPrepareRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                task_id: "task-corr-cap-a".to_string(),
+                prior_attempt_no: 1,
+                now_ms: step_ts + 100,
+            },
+        )
+        .await
+        .expect("prepare_task_correction after parallel slot frees");
+    assert_eq!(
+        prepared_after_free.status,
+        CoworkerTaskCorrectionPrepareStatus::Prepared
+    );
+    assert_eq!(
+        prepared_after_free.task_stage,
+        CoworkerTaskStage::DispatchReserved
+    );
+    assert_eq!(prepared_after_free.next_attempt_no, 2);
+    assert!(prepared_after_free.receipt.is_some());
+
+    let rt_prepared = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("read rt_prepared")
+        .expect("rt_prepared exists");
+    assert_eq!(rt_prepared.total_corrections_reserved, 1);
+    assert_eq!(rt_prepared.total_task_attempts_reserved, 3);
+    assert_eq!(rt_prepared.derived_attempts.len(), 1);
+    assert_eq!(
+        rt_prepared
+            .role_usage
+            .get(&WorkflowRole::Coder)
+            .expect("Coder usage")
+            .calls_reserved,
+        3
     );
 
     session.release().expect("release session");

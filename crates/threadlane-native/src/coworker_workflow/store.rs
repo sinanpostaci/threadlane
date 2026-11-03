@@ -34,6 +34,9 @@ use crate::coworker_workflow::contracts::{
     MAX_GRANT_RESERVATIONS, MAX_HOLDS_PER_JOB, MAX_JOBS_PER_BINDING, MAX_OUTBOX_RECORDS_PER_JOB,
     MAX_PLANNING_GRANTS_PER_BINDING, MAX_WORK_BRIEF_ITEMS,
 };
+use crate::coworker_workflow::controller_policy::{
+    CheckFailureCorrectionBasis, ControllerPolicyStore, MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
+};
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     acquire_cross_process_lock, constant_time_str_eq, ensure_platform_supported,
@@ -705,6 +708,36 @@ pub struct RecordTaskReviewVerdictRequest {
     /// Committed per-task candidate and structured review verdict.
     pub candidate: TaskCandidateRef,
 }
+
+/// Request to record an unreviewed [`TaskCandidateRef`] (`review_verdict = None`) and transition
+/// a task from [`CoworkerTaskStage::ReadyForReview`] to
+/// [`CoworkerTaskStage::CorrectInScopeRequired`] based on a verified
+/// [`CheckFailureCorrectionBasis`].
+///
+/// This is an internal trusted ledger primitive and is not standalone execution permission;
+/// [`crate::coworker_workflow::CoworkerTaskCorrectionService`] owns full persisted check-report
+/// and worktree artifact verification before invoking this transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordTaskCheckFailureCandidateRequest {
+    /// Control-plane chat binding identifier.
+    pub binding_id: String,
+    /// Canonical lowercase hyphenated non-nil native Codex thread UUID.
+    pub thread_uuid: String,
+    /// Target [`CoworkerJobRecord::job_id`].
+    pub job_id: String,
+    /// Expected current `job_revision` (`>= 1`).
+    pub expected_job_revision: u64,
+    /// Optional expected current ledger revision (CAS check).
+    pub expected_ledger_revision: Option<u64>,
+    /// Committed unreviewed per-task candidate (`review_verdict = None`, `review_receipt_id = None`).
+    pub candidate: TaskCandidateRef,
+    /// Verified check-failure correction basis (`CheckFailureCorrectionBasis`).
+    pub basis: CheckFailureCorrectionBasis,
+}
+
+/// Type alias for [`RecordTaskCheckFailureCandidateRequest`].
+pub type RecordTaskCheckFailureRequest = RecordTaskCheckFailureCandidateRequest;
 
 /// Request to record a [`WorkflowHoldRecord`] and hold all non-independent tasks in a job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3007,6 +3040,317 @@ impl CoworkerWorkflowStore {
             },
         )?;
         Ok(pair)
+    }
+
+    /// Records an unreviewed [`TaskCandidateRef`] (`review_verdict = None`) and transitions the
+    /// task from [`CoworkerTaskStage::ReadyForReview`] to
+    /// [`CoworkerTaskStage::CorrectInScopeRequired`] based on a verified
+    /// [`CheckFailureCorrectionBasis`].
+    ///
+    /// Never mints a fake [`StructuredReviewVerdict`] or [`threadlane_operations::ReviewReceipt`].
+    /// Duplicate submissions for the same recorded candidate and stage return idempotently without
+    /// incrementing `job_revision` or `ledger_revision`.
+    pub fn record_task_check_failure_candidate(
+        &self,
+        request: &RecordTaskCheckFailureCandidateRequest,
+    ) -> Result<(CoworkerJobRecord, TaskCandidateRef), NativeError> {
+        validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        if request.expected_job_revision == 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "expected_job_revision must be >= 1",
+            ));
+        }
+        request.candidate.validate()?;
+        if request.candidate.review_verdict.is_some()
+            || request.candidate.review_receipt_id.is_some()
+            || request.candidate.integration_receipt_id.is_some()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "RecordTaskCheckFailureCandidateRequest.candidate must be unreviewed (`review_verdict = None`, `review_receipt_id = None`, `integration_receipt_id = None`)",
+            ));
+        }
+        let cand_subject_digest = request
+            .candidate
+            .review_subject_digest
+            .as_ref()
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "RecordTaskCheckFailureCandidateRequest.candidate requires a bound review_subject_digest",
+                )
+            })?;
+        if request.candidate.task_id != request.basis.task_id
+            || request.candidate.attempt_no != request.basis.prior_attempt_no
+            || request.candidate.candidate_id != request.basis.prior_candidate_id
+            || request.candidate.base_commit != request.basis.execution_base_commit
+            || request.candidate.head_commit != request.basis.committed_head_commit
+            || request.candidate.tree_sha != request.basis.committed_tree_sha
+            || cand_subject_digest != &request.basis.prior_review_subject_digest
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "RecordTaskCheckFailureCandidateRequest.candidate does not match CheckFailureCorrectionBasis task, attempt, candidate_id, commits, or review_subject_digest",
+            ));
+        }
+        if request.candidate.attempt_no == 0
+            || request.candidate.attempt_no > MAX_IN_SCOPE_CORRECTION_ATTEMPTS
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "check-failure candidate attempt_no {} exceeds maximum correction eligibility {}",
+                    request.candidate.attempt_no, MAX_IN_SCOPE_CORRECTION_ATTEMPTS
+                ),
+            ));
+        }
+
+        let policy_store = ControllerPolicyStore::new(&self.plans_dir)?;
+        let runtime_state = policy_store
+            .get_job_runtime_readonly(&request.binding_id, &request.job_id)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::NotConfigured,
+                    "job has no FrozenControllerExecutionEnvelope in ControllerPolicyStore",
+                )
+            })?;
+
+        let (_, pair) = self.transact_binding_ledger(
+            &request.binding_id,
+            request.expected_ledger_revision,
+            |ledger| {
+                ledger.ensure_thread_scope(&request.thread_uuid)?;
+                if ledger
+                    .jobs
+                    .iter()
+                    .any(|j| j.supersedes_job_id.as_deref() == Some(request.job_id.as_str()))
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "cannot record check-failure candidate on a superseded job",
+                    ));
+                }
+                let job = ledger
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.job_id == request.job_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "requested job_id was not found in this binding ledger",
+                        )
+                    })?;
+                if job.phase != CoworkerJobPhase::Executing {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "job `{}` must be in `executing` phase to record a check-failure candidate (current: `{:?}`)",
+                            job.job_id, job.phase
+                        ),
+                    ));
+                }
+                if job.holds.iter().any(|h| h.active && h.holds_entire_job) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "cannot record check-failure candidate while an active job-wide hold exists",
+                    ));
+                }
+
+                runtime_state.envelope.verify_matches_job(job)?;
+                let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "job has no FrozenApprovalLinkage",
+                    )
+                })?;
+                let cap_envelope = linkage.controller_envelope.as_ref().ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "job has no FrozenControllerCapabilityEnvelope",
+                    )
+                })?;
+                if request.candidate.attempt_no > cap_envelope.max_in_scope_correction_attempts
+                    || request.candidate.attempt_no
+                        > runtime_state.envelope.max_in_scope_corrections_per_task
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "check-failure candidate attempt_no exceeds envelope max_in_scope_corrections_per_task",
+                    ));
+                }
+
+                let task_idx = job
+                    .tasks
+                    .iter()
+                    .position(|t| t.task_id == request.candidate.task_id)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "candidate.task_id was not found in job.tasks",
+                        )
+                    })?;
+
+                request.basis.validate_against_task_and_envelope(
+                    &job.tasks[task_idx],
+                    &runtime_state.envelope,
+                )?;
+
+                let expected_base_commit = if job.tasks[task_idx].depends_on.is_empty() {
+                    linkage.project_base.base_commit.clone()
+                } else {
+                    job.tasks[task_idx]
+                        .dependency_input_commit
+                        .clone()
+                        .ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                "dependent task is missing dependency_input_commit",
+                            )
+                        })?
+                };
+                if request.candidate.base_commit != expected_base_commit
+                    || request.basis.execution_base_commit != expected_base_commit
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "check-failure candidate or basis execution_base_commit does not match task's frozen base commit",
+                    ));
+                }
+
+                let cand_write_paths: BTreeSet<&str> = request
+                    .candidate
+                    .write_paths
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let task_write_paths: BTreeSet<&str> = job.tasks[task_idx]
+                    .write_paths
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                if cand_write_paths != task_write_paths {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "check-failure candidate write_paths do not match task's frozen write_paths",
+                    ));
+                }
+
+                let prior_attempt = job.tasks[task_idx]
+                    .attempts
+                    .iter()
+                    .find(|a| a.attempt_no == request.candidate.attempt_no)
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "check-failure candidate references an attempt_no not present in task.attempts",
+                        )
+                    })?;
+                if prior_attempt.base_commit != expected_base_commit
+                    || prior_attempt.run_id.is_none()
+                    || prior_attempt.worker_id.is_none()
+                    || prior_attempt.task_worktree_id.is_none()
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "prior TaskAttemptRef for check-failure candidate is missing sealed run_id, worker_id, task_worktree_id, or matching base_commit",
+                    ));
+                }
+
+                if let Some(existing_cand) = job.tasks[task_idx]
+                    .candidates
+                    .iter()
+                    .find(|c| c.candidate_id == request.candidate.candidate_id)
+                    .cloned()
+                {
+                    let task_ref = &job.tasks[task_idx];
+                    if existing_cand == request.candidate
+                        && task_ref.stage == CoworkerTaskStage::CorrectInScopeRequired
+                        && task_ref.current_attempt_no == request.candidate.attempt_no
+                        && task_ref.active_candidate_id.as_deref()
+                            == Some(request.candidate.candidate_id.as_str())
+                        && task_ref.accepted_candidate_id.is_none()
+                    {
+                        return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting((
+                            job.clone(),
+                            existing_cand,
+                        )));
+                    }
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "candidate_id was already recorded with different candidate fields or task stage",
+                    ));
+                }
+
+                if job.job_revision != request.expected_job_revision {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "expected_job_revision does not match current job_revision",
+                    ));
+                }
+
+                let task = &mut job.tasks[task_idx];
+                if task.current_attempt_no != request.candidate.attempt_no {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "task `{}` current_attempt_no ({}) does not match check-failure candidate attempt_no ({})",
+                            task.task_id, task.current_attempt_no, request.candidate.attempt_no
+                        ),
+                    ));
+                }
+                if task.stage != CoworkerTaskStage::ReadyForReview
+                    || !task
+                        .stage
+                        .can_transition_to(CoworkerTaskStage::CorrectInScopeRequired)
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "task `{}` must be in `ready_for_review` stage to record a check-failure candidate (current: `{}`)",
+                            task.task_id, task.stage
+                        ),
+                    ));
+                }
+                if task.unresolved_outbox_id.is_some() || !task.active_hold_ids.is_empty() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "cannot record check-failure candidate while task has an unresolved outbox record or active hold",
+                    ));
+                }
+                if task.candidates.len() >= MAX_CANDIDATES_PER_TASK {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "task reached maximum candidate capacity",
+                    ));
+                }
+
+                task.accepted_candidate_id = None;
+                task.active_candidate_id = Some(request.candidate.candidate_id.clone());
+                task.candidates.push(request.candidate.clone());
+                task.stage = CoworkerTaskStage::CorrectInScopeRequired;
+
+                let next_job_rev = job.job_revision.checked_add(1).ok_or_else(|| {
+                    NativeError::new(NativeErrorCode::ValidationFailed, "job_revision overflow")
+                })?;
+                job.job_revision = next_job_rev;
+
+                Ok(CoworkerLedgerMutationOutcome::Mutated((
+                    job.clone(),
+                    request.candidate.clone(),
+                )))
+            },
+        )?;
+        Ok(pair)
+    }
+
+    /// Alias for [`Self::record_task_check_failure_candidate`].
+    pub fn record_task_check_failure(
+        &self,
+        request: &RecordTaskCheckFailureCandidateRequest,
+    ) -> Result<(CoworkerJobRecord, TaskCandidateRef), NativeError> {
+        self.record_task_check_failure_candidate(request)
     }
 
     /// Records a [`WorkflowHoldRecord`] and places all tasks not proven independent via
