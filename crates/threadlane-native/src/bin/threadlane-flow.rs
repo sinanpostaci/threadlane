@@ -17,6 +17,14 @@ use threadlane_core::observation::{
     ObservationRecordPhase,
 };
 use threadlane_host::{ApprovedHostClient, HostError};
+use threadlane_native::coworker_grants::{
+    get_planning_grant_summary, list_planning_grant_summaries,
+    prepare_planning_grant_preview_from_dir_readonly, prepare_planning_grant_preview_with_store,
+    record_planning_grant_from_registry_dir, revoke_planning_grant_scoped,
+    LocalOperatorGrantAttestation, PlanningGrantPreview, PlanningGrantSummary,
+    PreparePlanningGrantRequest, RecordPlanningGrantRequest, TrustedGrantScope,
+};
+use threadlane_native::coworker_workflow::{CoworkerWorkflowStore, RevokePlanningGrantRequest};
 use threadlane_native::operator_cli::{
     emit_error, read_request, validate_dirs, verify_binding, write_result, OperatorCliError,
 };
@@ -150,6 +158,40 @@ enum FlowCommand {
         #[arg(long = "request", value_name = "ABS")]
         request: PathBuf,
     },
+    /// Prepare a read-only planning/advice grant preview without mutating stores or locks.
+    GrantPrepare {
+        /// Absolute path to the private (`0600`) JSON [`PreparePlanningGrantRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+    },
+    /// Record an operator-confirmed planning/advice grant from a prepared preview.
+    GrantRecord {
+        /// Absolute path to the private (`0600`) JSON [`RecordPlanningGrantRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+
+        /// Lowercase 64-character SHA-256 preview digest confirmed by the operator.
+        #[arg(long = "confirm-preview", value_name = "SHA256")]
+        confirm_preview: Option<String>,
+
+        /// Explicit operator approval flag required to record the grant.
+        #[arg(long = "operator-approved")]
+        operator_approved: bool,
+    },
+    /// Revoke an existing planning/advice grant in the fixed binding scope.
+    GrantRevoke {
+        /// Absolute path to the private (`0600`) JSON [`RevokePlanningGrantRequest`] file.
+        #[arg(long = "request", value_name = "ABS")]
+        request: PathBuf,
+    },
+    /// List metadata-only planning/advice grant summaries in the fixed binding scope.
+    GrantList,
+    /// Read one metadata-only planning/advice grant summary in the fixed binding scope.
+    GrantGet {
+        /// Planning grant identifier (`pgr_<32hex>`).
+        #[arg(long = "grant-id", value_name = "ID")]
+        grant_id: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -278,6 +320,60 @@ impl FlowScoped for role_flow::PackageClosureReservation {
     }
 }
 
+impl FlowScoped for PreparePlanningGrantRequest {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for PlanningGrantPreview {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for PlanningGrantSummary {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+impl FlowScoped for RevokePlanningGrantRequest {
+    fn binding_id(&self) -> &str {
+        &self.binding_id
+    }
+
+    fn thread_uuid(&self) -> &str {
+        &self.thread_uuid
+    }
+}
+
+/// Deserialized private JSON body for `grant-record` before CLI flag enforcement.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantRecordInput {
+    request_key: String,
+    #[serde(default)]
+    expected_ledger_revision: Option<u64>,
+    preview: PlanningGrantPreview,
+    #[serde(default)]
+    confirmed_preview_digest: Option<String>,
+    #[serde(default)]
+    attestation: Option<LocalOperatorGrantAttestation>,
+}
+
 /// Bounded read-only cycle summary row. Never includes task instructions or prompt text.
 #[derive(Debug, Clone, serde::Serialize)]
 struct RoleFlowCycleSummary {
@@ -355,17 +451,22 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
     // any workflow, authority, host, or role-flow store.
     verify_binding(&state_dir, &binding, &thread).await?;
 
-    let (op_name, is_mutating) = match &cli.command {
-        FlowCommand::Preflight { .. } => ("flow.preflight", false),
-        FlowCommand::Create { .. } => ("flow.create", true),
-        FlowCommand::Get { .. } => ("flow.get", false),
-        FlowCommand::List { .. } => ("flow.list", false),
-        FlowCommand::Handoff { .. } => ("flow.handoff", true),
-        FlowCommand::Reconcile { .. } => ("flow.reconcile", true),
-        FlowCommand::ReserveClosure { .. } => ("flow.reserve-closure", true),
+    let (op_name, is_mutating, allow_parent_journal) = match &cli.command {
+        FlowCommand::Preflight { .. } => ("flow.preflight", false, true),
+        FlowCommand::Create { .. } => ("flow.create", true, true),
+        FlowCommand::Get { .. } => ("flow.get", false, true),
+        FlowCommand::List { .. } => ("flow.list", false, true),
+        FlowCommand::Handoff { .. } => ("flow.handoff", true, true),
+        FlowCommand::Reconcile { .. } => ("flow.reconcile", true, true),
+        FlowCommand::ReserveClosure { .. } => ("flow.reserve-closure", true, true),
+        FlowCommand::GrantPrepare { .. } => ("flow.grant-prepare", false, false),
+        FlowCommand::GrantRecord { .. } => ("flow.grant-record", true, true),
+        FlowCommand::GrantRevoke { .. } => ("flow.grant-revoke", true, true),
+        FlowCommand::GrantList => ("flow.grant-list", false, false),
+        FlowCommand::GrantGet { .. } => ("flow.grant-get", false, false),
     };
     let parent_req = read_env_parent_request_id();
-    let should_journal = parent_req.is_some() || is_mutating;
+    let should_journal = is_mutating || (allow_parent_journal && parent_req.is_some());
     let (request_id, call_id) = match &parent_req {
         Some(parent) => (parent.clone(), Some(generate_observation_id("obsc"))),
         None => (generate_observation_id("obsreq"), None),
@@ -596,6 +697,112 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 resolved_approval_id = Some(reservation.approval_id.clone());
                 write_result(&binding, &reservation, true)
             }
+            FlowCommand::GrantPrepare { request } => {
+                let prepare_request: PreparePlanningGrantRequest = read_request(&request)?;
+                ensure_scope(
+                    &prepare_request,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
+                let preview = prepare_grant_preview(&registry_dir, &plans_dir, &prepare_request)?;
+                ensure_scope(
+                    &preview,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+                write_result(&binding, &preview, false)
+            }
+            FlowCommand::GrantRecord {
+                request,
+                confirm_preview,
+                operator_approved,
+            } => {
+                let input: GrantRecordInput = read_request(&request)?;
+                ensure_scope(
+                    &input.preview,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
+                let record_request =
+                    apply_grant_record_confirmations(input, operator_approved, confirm_preview)?;
+                let summary = record_grant(&plans_dir, &registry_dir, &record_request)?;
+                ensure_scope(
+                    &summary,
+                    &binding,
+                    &thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                write_result(&binding, &summary, true)
+            }
+            FlowCommand::GrantRevoke { request } => {
+                let revoke_request: RevokePlanningGrantRequest = read_request(&request)?;
+                ensure_scope(
+                    &revoke_request,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    REQUEST_SCOPE_MISMATCH,
+                )?;
+                let scope = TrustedGrantScope::new(&binding, &thread)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let store = open_grant_store(&plans_dir)?;
+                let summary = revoke_planning_grant_scoped(&store, &scope, &revoke_request)
+                    .map_err(|error| map_native_error(&error, true))?;
+                ensure_scope(
+                    &summary,
+                    &binding,
+                    &thread,
+                    "outcome_unknown",
+                    MUTATION_SCOPE_MISMATCH,
+                )?;
+                write_result(&binding, &summary, true)
+            }
+            FlowCommand::GrantList => {
+                let scope = TrustedGrantScope::new(&binding, &thread)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let store = open_grant_store(&plans_dir)?;
+                let summaries = list_planning_grant_summaries(&store, &scope)
+                    .map_err(|error| map_native_error(&error, false))?;
+                for summary in &summaries {
+                    ensure_scope(
+                        summary,
+                        &binding,
+                        &thread,
+                        "scope_mismatch",
+                        STORED_SCOPE_MISMATCH,
+                    )?;
+                }
+                write_result(&binding, &summaries, false)
+            }
+            FlowCommand::GrantGet { grant_id } => {
+                validate_grant_id(&grant_id)?;
+                let scope = TrustedGrantScope::new(&binding, &thread)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let store = open_grant_store(&plans_dir)?;
+                let summary = get_planning_grant_summary(&store, &scope, &grant_id)
+                    .map_err(|error| map_native_error(&error, false))?;
+                let Some(summary) = summary else {
+                    return Err(OperatorCliError::new(
+                        "grant_not_found",
+                        "Requested planning grant was not found in this binding scope.",
+                    ));
+                };
+                ensure_scope(
+                    &summary,
+                    &binding,
+                    &thread,
+                    "scope_mismatch",
+                    STORED_SCOPE_MISMATCH,
+                )?;
+                write_result(&binding, &summary, false)
+            }
         }
     }
     .await;
@@ -680,6 +887,93 @@ fn validate_cycle_id(value: &str) -> Result<(), OperatorCliError> {
     validate_identifier("cycle_id", value)
         .map(|_| ())
         .map_err(|_| OperatorCliError::invalid_input("Invalid `--cycle-id` syntax."))
+}
+
+fn validate_grant_id(value: &str) -> Result<(), OperatorCliError> {
+    validate_identifier("grant_id", value)
+        .map(|_| ())
+        .map_err(|_| OperatorCliError::invalid_input("Invalid `--grant-id` syntax."))
+}
+
+fn validate_confirm_preview(value: &str) -> Result<String, OperatorCliError> {
+    validate_sha256_hex("confirm_preview", value).map_err(|_| {
+        OperatorCliError::invalid_input(
+            "`--confirm-preview` must be a 64-character lowercase hexadecimal SHA-256 digest.",
+        )
+    })
+}
+
+fn apply_grant_record_confirmations(
+    input: GrantRecordInput,
+    operator_approved: bool,
+    confirm_preview: Option<String>,
+) -> Result<RecordPlanningGrantRequest, OperatorCliError> {
+    // Attestation and digest confirmation are attacker-controlled in the JSON body.
+    // Require explicit CLI flags and never honor JSON self-attestation or digest alone.
+    let base_attestation = input
+        .attestation
+        .unwrap_or_else(LocalOperatorGrantAttestation::unattested);
+    let attestation = LocalOperatorGrantAttestation {
+        operator_attested: operator_approved,
+        derived_from_model_or_mcp_prose: base_attestation.derived_from_model_or_mcp_prose,
+        native_per_call_identity_verified: base_attestation.native_per_call_identity_verified,
+        note: base_attestation.note,
+    };
+    attestation
+        .validate()
+        .map_err(|error| map_native_error(&error, false))?;
+
+    let raw_digest = confirm_preview.ok_or_else(|| {
+        OperatorCliError::invalid_input("Missing required `--confirm-preview` argument.")
+    })?;
+    let confirmed_preview_digest = validate_confirm_preview(&raw_digest)?;
+    if let Some(ref file_digest) = input.confirmed_preview_digest {
+        if !file_digest.is_empty() && file_digest != &confirmed_preview_digest {
+            return Err(OperatorCliError::new(
+                NativeErrorCode::ValidationFailed.as_str(),
+                "Role-flow request or persisted state failed validation.",
+            ));
+        }
+    }
+
+    Ok(RecordPlanningGrantRequest {
+        request_key: input.request_key,
+        expected_ledger_revision: input.expected_ledger_revision,
+        preview: input.preview,
+        confirmed_preview_digest,
+        attestation,
+    })
+}
+
+fn prepare_grant_preview(
+    registry_dir: &Path,
+    plans_dir: &Path,
+    req: &PreparePlanningGrantRequest,
+) -> Result<PlanningGrantPreview, OperatorCliError> {
+    let preview = prepare_planning_grant_preview_from_dir_readonly(registry_dir, req)
+        .map_err(|error| map_native_error(&error, false))?;
+    let snapshot = role_flow::read_registry_snapshot_readonly(registry_dir)
+        .map_err(|error| map_native_error(&error, false))?;
+    let store = open_grant_store(plans_dir)?;
+    let verified = prepare_planning_grant_preview_with_store(&store, &snapshot, req)
+        .map_err(|error| map_native_error(&error, false))?;
+    if verified != preview {
+        return Err(OperatorCliError::new(
+            "validation_failed",
+            "Role-flow request or persisted state failed validation.",
+        ));
+    }
+    Ok(verified)
+}
+
+fn record_grant(
+    plans_dir: &Path,
+    registry_dir: &Path,
+    req: &RecordPlanningGrantRequest,
+) -> Result<PlanningGrantSummary, OperatorCliError> {
+    let store = open_grant_store(plans_dir)?;
+    record_planning_grant_from_registry_dir(&store, registry_dir, req)
+        .map_err(|error| map_native_error(&error, true))
 }
 
 fn validate_list_args(
@@ -822,6 +1116,10 @@ fn open_flow_store(plans_dir: &Path) -> Result<RoleFlowStore, OperatorCliError> 
     RoleFlowStore::new(plans_dir).map_err(|error| map_native_error(&error, false))
 }
 
+fn open_grant_store(plans_dir: &Path) -> Result<CoworkerWorkflowStore, OperatorCliError> {
+    CoworkerWorkflowStore::new(plans_dir).map_err(|error| map_native_error(&error, false))
+}
+
 fn open_authority(
     registry_dir: &Path,
     plans_dir: &Path,
@@ -896,6 +1194,12 @@ fn map_native_error(error: &NativeError, mutation: bool) -> OperatorCliError {
             "Role-flow host or provider protocol returned an invalid response."
         }
         NativeErrorCode::ThreadNotFound => "Target native thread was not found.",
+        NativeErrorCode::UnauthorizedOperator => {
+            "Role-flow or planning-grant operation requires explicit operator authorization."
+        }
+        NativeErrorCode::RebindRejected => {
+            "Role-flow or planning-grant request attempted to rebind or cross scope."
+        }
         _ => "Role-flow operation failed with a sanitized native error.",
     };
     OperatorCliError::new(code.as_str(), message)
@@ -1110,5 +1414,50 @@ mod tests {
         };
         let json = serde_json::to_string(&source).expect("serialize closure source");
         assert!(json.contains("approved_cycle_base"));
+    }
+
+    #[test]
+    fn cli_parses_grant_subcommands_with_global_flags() {
+        for sub in [
+            vec!["grant-prepare", "--request", "/tmp/prepare.json"],
+            vec![
+                "grant-record",
+                "--request",
+                "/tmp/record.json",
+                "--confirm-preview",
+                DIGEST,
+                "--operator-approved",
+            ],
+            vec!["grant-revoke", "--request", "/tmp/revoke.json"],
+            vec!["grant-list"],
+            vec![
+                "grant-get",
+                "--grant-id",
+                "pgr_0123456789abcdef0123456789abcdef",
+            ],
+        ] {
+            let mut argv = vec![
+                "threadlane-flow",
+                "--state-dir",
+                "/tmp/state",
+                "--registry-dir",
+                "/tmp/registry",
+                "--plans-dir",
+                "/tmp/plans",
+                "--authority-dir",
+                "/tmp/authority",
+                "--sessions-dir",
+                "/tmp/sessions",
+                "--binding",
+                BINDING,
+                "--thread",
+                THREAD,
+            ];
+            argv.extend(sub);
+            let parsed = Cli::try_parse_from(argv).expect("parse grant subcommand");
+            let globals = GlobalArgs::from_cli(&parsed).expect("extract globals");
+            assert_eq!(globals.binding, BINDING);
+            assert_eq!(globals.thread, THREAD);
+        }
     }
 }
