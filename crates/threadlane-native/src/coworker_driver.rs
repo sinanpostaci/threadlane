@@ -1,9 +1,9 @@
 //! Independent code controller process lifecycle and authenticated local driver RPC.
 //!
-//! This module implements the Phase 1 independent code controller process lifecycle
+//! This module implements the independent code controller process lifecycle
 //! (`run-owner`, `ensure`, `status`, `reconcile`, and `cancel`) around
-//! [`CoworkerControllerService`] and physical FD job ownership
-//! ([`CoworkerJobOwnershipStore`] / [`CoworkerJobOwnershipGuard`]).
+//! [`CoworkerPipelineService`] / [`CoworkerPipelineDriver`], [`CoworkerControllerService`],
+//! and physical FD job ownership ([`CoworkerJobOwnershipStore`] / [`CoworkerJobOwnershipGuard`]).
 //!
 //! Key guarantees:
 //! - One live physical FD owner per `(binding_id, thread_uuid, job_id)`.
@@ -12,14 +12,20 @@
 //! - Server validates the actual held [`CoworkerJobOwnershipGuard`] and live lockfile identity
 //!   before performing any action or replying; client verifies the live lock summary, instance,
 //!   challenge digest, and peer credentials rather than trusting PID hints or copied metadata alone.
+//! - Selects the full automatic workflow (`FullAutomaticPipeline`) by default when the frozen
+//!   controller capability and execution envelopes authorize it, retaining ONE mutable
+//!   [`CoworkerPipelineDriver`] (`FuturesUnordered`) across ticks and RPC connections through
+//!   per-task verification, `Reviewer`, bounded in-scope `Coder` corrections, original per-task
+//!   `RunIntegration`, downstream dependency seals, final multi-worker Git aggregation, combined
+//!   candidate checks, and a single subject-bound `Closure` evaluation.
+//! - Preserves an explicit diagnostic `Phase1InitialDispatchOnly` mode for initial-dispatch-only
+//!   tests and coder-only envelopes without widening capabilities.
 //! - Reconciles existing receipts without replaying unknown effects and never automatically
 //!   restarts a human-stopped, failed, or uncertain host session.
 //! - Persists durable `stop_requested` state before attempting narrow [`ApprovedHostClient`]
-//!   task cancellation, without PID or process-name kills.
-//! - Normal owner lifetime follows real job terminal/stopped/unknown/checkpoint policy while
-//!   preserving active worker output, staying alive across long frozen approved worker budgets
-//!   and keeping RPC/ownership available at `AwaitingChecksOrReview`,
-//!   `AwaitingDependencyAcceptanceOrSeal`, and `Held` for later pipeline integration.
+//!   task cancellation, signals active derived `Coder` correction runs via their `stop_requested`
+//!   process-group watcher, and gracefully drains finite in-flight check/`Reviewer`/`Closure`
+//!   calls under the held physical guard while fencing stage promotion.
 
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
@@ -39,17 +45,24 @@ use threadlane_host::{
     read_session_task_ledger_readonly, ApprovedHost, ApprovedHostClient, ApprovedHostConfig,
     ApprovedHostHandle, HostError, HostPhase, TaskExecutionStatus,
 };
+use threadlane_operations::{ClosureVerdict, ClosureVerdictKind};
 use threadlane_workers::validate_sha256_hex_digest;
+use threadlane_workflow::WorkflowRole;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::coworker_workflow::{
-    sha256_hex, ControllerJobLeaseRecord, ControllerJobRuntimeState, ControllerPolicyStore,
-    CoworkerControllerPhase1Status, CoworkerControllerService, CoworkerControllerStepReport,
-    CoworkerControllerTaskObservation, CoworkerJobLockState, CoworkerJobOwnershipKey,
-    CoworkerJobOwnershipStore, CoworkerJobPhase, CoworkerJobRecord, CoworkerLockFileIdentity,
-    CoworkerOwnershipSummary, CoworkerTaskStage, CoworkerWorkflowStore,
-    OwnedCoworkerControllerSession, PendingControllerEffectStatus, VerifiedControllerAdmission,
+    sha256_hex, CandidateCheckEvidence, CombinedCandidateStatus, ControllerJobLeaseRecord,
+    ControllerJobRuntimeState, ControllerPolicyStore, CoworkerControllerPhase1Status,
+    CoworkerControllerService, CoworkerControllerStepReport, CoworkerControllerTaskObservation,
+    CoworkerJobCompletionOutcome, CoworkerJobCompletionRequest, CoworkerJobCompletionStatus,
+    CoworkerJobLockState, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase,
+    CoworkerJobRecord, CoworkerLockFileIdentity, CoworkerOwnershipSummary, CoworkerPipelineDriver,
+    CoworkerPipelineInFlightStageRef, CoworkerPipelineService, CoworkerPipelineStatus,
+    CoworkerPipelineTaskSnapshot, CoworkerPipelineTickReport, CoworkerTaskRecord,
+    CoworkerTaskStage, CoworkerWorkflowStore, OutboxDispatchKind, OutboxDispatchRecord,
+    OutboxDispatchStatus, OwnedCoworkerControllerSession, PendingControllerEffectKind,
+    PendingControllerEffectStatus, VerifiedControllerAdmission,
 };
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -109,6 +122,47 @@ pub fn coworker_driver_dir(plans_dir: &Path) -> PathBuf {
     plans_dir.join(COWORKER_DRIVER_DIR_NAME)
 }
 
+/// Execution mode for the independent code controller driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDriverExecutionMode {
+    /// Complete automatic workflow: Phase 1 host dispatch/reconcile, per-task verification checks,
+    /// `Reviewer` evaluation, bounded in-scope `Coder` corrections, original per-task
+    /// `RunIntegration`, downstream dependency seal preparation, final multi-worker Git
+    /// aggregation, combined candidate checks, and single candidate-bound `Closure`.
+    #[default]
+    FullAutomaticPipeline,
+    /// Explicit diagnostic mode preserving legacy Phase 1 initial `Coder` dispatch and host
+    /// receipt reconciliation only (`AwaitingChecksOrReview`).
+    Phase1InitialDispatchOnly,
+}
+
+impl CoworkerDriverExecutionMode {
+    /// Returns the canonical `snake_case` wire identifier.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FullAutomaticPipeline => "full_automatic_pipeline",
+            Self::Phase1InitialDispatchOnly => "phase1_initial_dispatch_only",
+        }
+    }
+}
+
+impl std::str::FromStr for CoworkerDriverExecutionMode {
+    type Err = NativeError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "full_automatic_pipeline" => Ok(Self::FullAutomaticPipeline),
+            "phase1_initial_dispatch_only" => Ok(Self::Phase1InitialDispatchOnly),
+            _ => Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("unknown coworker driver execution mode `{value}`"),
+            )),
+        }
+    }
+}
+
 /// Identity-only request payload for `threadlane-flow coworker-driver` subcommands.
 ///
 /// Store directories (`state_dir`, `registry_dir`, `plans_dir`, `authority_dir`,
@@ -137,6 +191,10 @@ pub struct CoworkerDriverRequest {
     /// Optional bounded linger window (in milliseconds) after reaching a pipeline await state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_linger_ms: Option<u64>,
+    /// Optional execution mode (`full_automatic_pipeline` by default when envelope authorizes it,
+    /// or `phase1_initial_dispatch_only` for diagnostic Phase 1 runs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<CoworkerDriverExecutionMode>,
 }
 
 const fn default_driver_request_schema_version() -> u32 {
@@ -264,25 +322,35 @@ pub enum CoworkerDriverEnsureDisposition {
     ReusedLiveOwner,
     /// Spawned a new detached `threadlane-flow` owner process and verified it via RPC or exit state.
     SpawnedNewOwner,
-    /// Job had already reached a quiescent Phase 1 state and was verified without spawning a worker.
+    /// Job had already reached a quiescent state and was verified without spawning a worker.
     AlreadyQuiescentVerified,
 }
 
-/// Explicit Phase 1 pipeline boundary label included on all driver reports.
+/// Explicit pipeline boundary label included on all driver reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoworkerDriverPipelineBoundary {
+    /// Full automatic pipeline through per-task verification, `Reviewer`, bounded in-scope
+    /// corrections, original per-task `RunIntegration`, dependency seal preparation, combined
+    /// candidate checks, and single subject-bound `Closure`.
+    FullAutomaticPipelineThroughSingleClosure,
     /// Phase 1 initial task dispatch and receipt reconciliation only; task checks, reviewer/architect
-    /// cycles, and task/job closure are wired in subsequent slices.
+    /// cycles, and task/job closure are not executed in this diagnostic mode.
     Phase1InitialDispatchAndReconcileOnly,
 }
 
-/// Explicit Phase 1 cancellation boundary label included on cancel reports.
+/// Explicit cancellation boundary label included on cancel reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoworkerDerivedCancellationBoundary {
-    /// Narrow cancellation targets original `ApprovedHostClient` tasks (`task_id -> run_id`);
-    /// running derived-attempt cancellation will be integrated in a later milestone.
+    /// Durable `stop_requested` persisted before effects; active original host tasks cancelled via
+    /// `ApprovedHostClient::cancel_task` and active derived `Coder` correction runs terminated via
+    /// their process-group watcher, while finite in-flight check/`Reviewer`/`TaskIntegration`/`Closure`
+    /// calls drain under the held ownership guard and fence stage promotion without claiming remote
+    /// inference termination.
+    OriginalAndDerivedSignalledDirectCheckReviewerClosureDrainedFenced,
+    /// Narrow cancellation targets original `ApprovedHostClient` tasks (`task_id -> run_id`) in
+    /// diagnostic Phase 1 mode.
     OriginalHostTasksOnlyDerivedIntegratedLater,
 }
 
@@ -297,6 +365,286 @@ pub struct CancelledHostTaskSummary {
     pub worker_state: WorkerStatus,
     /// Worker revision after the narrow cancellation call.
     pub worker_revision: u64,
+}
+
+/// Compact summary of final job aggregation, combined candidate check verification, and single
+/// candidate-bound `Closure` evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverCompletionSummary {
+    /// High-level completion status (`completed`, `blocked_by_failed_checks`, `closure_not_accepted`, etc.).
+    pub status: CoworkerJobCompletionStatus,
+    /// Owned `RunIntegration` worktree identifier (`wt-run-<run_id>-<token>`).
+    pub integration_worktree_id: String,
+    /// Canonical filesystem path of the owned `RunIntegration` checkout.
+    pub integration_checkout_path: PathBuf,
+    /// Software-owned Git branch name (`threadlane/run/<run_id>/<token>`).
+    pub integration_branch_name: String,
+    /// Exact 40-hex approved base commit SHA.
+    pub approved_base_commit: String,
+    /// Exact 40-hex final integrated commit SHA on the `RunIntegration` worktree.
+    pub final_integrated_target_commit: String,
+    /// Exact 40-hex final integrated Git tree SHA on the `RunIntegration` worktree.
+    pub final_integrated_tree_sha: String,
+    /// Whether existing completed job integration receipts were verified and reused.
+    pub reused_existing_receipts: bool,
+    /// Compact check evidence records promoted into the combined candidate when all checks pass.
+    #[serde(default)]
+    pub check_evidence: Vec<CandidateCheckEvidence>,
+    /// Identifier of the first failed check command when `status == BlockedByFailedChecks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_check_id: Option<String>,
+    /// Assembled `CombinedCandidateIdentity::combined_candidate_id` when candidate checks passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combined_candidate_id: Option<String>,
+    /// Assembled `CombinedCandidateIdentity::status` when candidate checks passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combined_candidate_status: Option<CombinedCandidateStatus>,
+    /// Verified `FinalCandidateSubject::subject_digest` when candidate checks passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_candidate_subject_digest: Option<String>,
+    /// Bound `PackageClosureReservation::reservation_id` (`cls_<32hex>`), if reserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_reservation_id: Option<String>,
+    /// Persisted `ClosureAttemptRecord::attempt_id` (`cat_<32hex>`), if executed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_attempt_id: Option<String>,
+    /// Whether an existing verified `Accepted` closure verdict for the identical subject was reused.
+    #[serde(default)]
+    pub reused_cached_closure_verdict: bool,
+    /// Final structured `ClosureVerdictKind` (`accepted`, `rejected`, `blocked`, `unclear`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_verdict_kind: Option<ClosureVerdictKind>,
+    /// Final structured `ClosureVerdict` when `Closure` completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_verdict: Option<ClosureVerdict>,
+}
+
+impl CoworkerDriverCompletionSummary {
+    /// Builds a compact completion summary from a full [`CoworkerJobCompletionOutcome`].
+    #[must_use]
+    pub fn from_outcome(outcome: &CoworkerJobCompletionOutcome) -> Self {
+        Self {
+            status: outcome.status,
+            integration_worktree_id: outcome.aggregation.integration_worktree_id.clone(),
+            integration_checkout_path: outcome.aggregation.integration_checkout_path.clone(),
+            integration_branch_name: outcome.aggregation.integration_branch_name.clone(),
+            approved_base_commit: outcome.aggregation.approved_base_commit.clone(),
+            final_integrated_target_commit: outcome
+                .aggregation
+                .final_integrated_target_commit
+                .clone(),
+            final_integrated_tree_sha: outcome.aggregation.final_integrated_tree_sha.clone(),
+            reused_existing_receipts: outcome.aggregation.reused_existing_receipts,
+            check_evidence: outcome.check_evidence.clone(),
+            failed_check_id: outcome.failed_check_id.clone(),
+            combined_candidate_id: outcome
+                .combined_candidate
+                .as_ref()
+                .map(|c| c.combined_candidate_id.clone()),
+            combined_candidate_status: outcome.combined_candidate.as_ref().map(|c| c.status),
+            final_candidate_subject_digest: outcome
+                .final_candidate_subject
+                .as_ref()
+                .map(|s| s.subject_digest.clone()),
+            closure_reservation_id: outcome
+                .combined_candidate
+                .as_ref()
+                .and_then(|c| c.closure_reservation_id.clone()),
+            closure_attempt_id: outcome
+                .closure_outcome
+                .as_ref()
+                .map(|o| o.attempt.attempt_id.clone()),
+            reused_cached_closure_verdict: outcome
+                .closure_outcome
+                .as_ref()
+                .is_some_and(|o| o.reused_cached_verdict),
+            closure_verdict_kind: outcome.closure_verdict.as_ref().map(|v| v.kind),
+            closure_verdict: outcome.closure_verdict.clone(),
+        }
+    }
+}
+
+/// Compact, cumulative report of the retained [`CoworkerPipelineDriver`] persisted in driver state
+/// and returned over local status RPC.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoworkerDriverPipelineReport {
+    /// Scoped workflow binding identifier.
+    pub binding_id: String,
+    /// Owning native conversation thread UUID.
+    pub thread_uuid: String,
+    /// Admitted Coworker workflow job identifier.
+    pub job_id: String,
+    /// Exact human execution approval identifier governing this job.
+    pub approval_id: String,
+    /// Current durable `CoworkerJobPhase` recorded in the workflow store.
+    pub job_phase: CoworkerJobPhase,
+    /// Current optimistic concurrency revision of the `CoworkerJobRecord`.
+    pub job_revision: u64,
+    /// Current logical controller lease epoch held in `ControllerJobRuntimeState`.
+    pub lease_epoch: u64,
+    /// Deterministic controller instance identifier bound to the held physical ownership guard.
+    pub controller_instance_id: String,
+    /// High-level truthful pipeline status (`running`, `completed`, `stopped`, `held`, etc.).
+    pub status: CoworkerPipelineStatus,
+    /// True when `stop_requested` is recorded and the owner is gracefully draining finite
+    /// in-flight stage futures (`TaskVerification`, `TaskReview`, `TaskIntegration`, `JobCompletion`)
+    /// under the held physical guard before releasing ownership.
+    #[serde(default)]
+    pub draining_in_flight_after_stop: bool,
+    /// Descriptors of stage futures currently retained in-flight by the [`CoworkerPipelineDriver`].
+    #[serde(default)]
+    pub in_flight_stages: Vec<CoworkerPipelineInFlightStageRef>,
+    /// Cumulative task identifiers dispatched to the approved host or derived runner as `Coder` workers.
+    #[serde(default)]
+    pub dispatched_task_ids: Vec<String>,
+    /// Cumulative task identifiers reconciled from completed `Coder` runs into `ReadyForReview`.
+    #[serde(default)]
+    pub reconciled_ready_for_review_task_ids: Vec<String>,
+    /// Cumulative task identifiers whose attempt committed cleanly, passed frozen checks, and promoted a `TaskReviewSubject`.
+    #[serde(default)]
+    pub verified_task_ids: Vec<String>,
+    /// Cumulative task identifiers evaluated by a supervised `Reviewer` with a persisted `ReviewDecisionReceipt`.
+    #[serde(default)]
+    pub reviewed_task_ids: Vec<String>,
+    /// Cumulative task identifiers integrated into the job integration worktree with a persisted `IntegrationReceipt`.
+    #[serde(default)]
+    pub integrated_task_ids: Vec<String>,
+    /// Cumulative downstream task identifiers whose sealed `DependencyInputSeal` was prepared from integrated predecessors.
+    #[serde(default)]
+    pub prepared_dependency_task_ids: Vec<String>,
+    /// Cumulative downstream task identifiers promoted from `PendingDependencies` to `ReadyToDispatch`.
+    #[serde(default)]
+    pub promoted_dependency_ready_task_ids: Vec<String>,
+    /// Task identifiers currently in `CorrectInScopeRequired` awaiting derived correction execution.
+    #[serde(default)]
+    pub awaiting_correction_task_ids: Vec<String>,
+    /// Task identifiers currently blocked by failed required frozen task-review checks.
+    #[serde(default)]
+    pub failed_check_task_ids: Vec<String>,
+    /// Task identifiers currently fenced by an active hold, stop request, blocking conversation change, or unindependent sibling.
+    #[serde(default)]
+    pub fenced_task_ids: Vec<String>,
+    /// Task identifiers currently blocked by an unreconciled `EffectUnknown` stage or pending effect.
+    #[serde(default)]
+    pub unknown_effect_task_ids: Vec<String>,
+    /// Task identifiers currently in a terminal or non-recoverable `Blocked`, `Failed`, or `Cancelled` stage.
+    #[serde(default)]
+    pub blocked_or_failed_task_ids: Vec<String>,
+    /// Per-task truthful state snapshots in job task order.
+    #[serde(default)]
+    pub tasks: Vec<CoworkerPipelineTaskSnapshot>,
+    /// Compact final job completion summary when job aggregation, combined candidate checks, or `Closure` has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<CoworkerDriverCompletionSummary>,
+}
+
+impl CoworkerDriverPipelineReport {
+    /// Creates a new compact pipeline report from a [`CoworkerPipelineTickReport`].
+    #[must_use]
+    pub fn from_tick(tick: &CoworkerPipelineTickReport, draining_after_stop: bool) -> Self {
+        let mut report = Self {
+            binding_id: tick.binding_id.clone(),
+            thread_uuid: tick.thread_uuid.clone(),
+            job_id: tick.job_id.clone(),
+            approval_id: tick.approval_id.clone(),
+            job_phase: tick.job_phase,
+            job_revision: tick.job_revision,
+            lease_epoch: tick.lease_epoch,
+            controller_instance_id: tick.controller_instance_id.clone(),
+            status: tick.status,
+            draining_in_flight_after_stop: draining_after_stop && !tick.in_flight_stages.is_empty(),
+            in_flight_stages: tick.in_flight_stages.clone(),
+            dispatched_task_ids: Vec::new(),
+            reconciled_ready_for_review_task_ids: Vec::new(),
+            verified_task_ids: Vec::new(),
+            reviewed_task_ids: Vec::new(),
+            integrated_task_ids: Vec::new(),
+            prepared_dependency_task_ids: Vec::new(),
+            promoted_dependency_ready_task_ids: Vec::new(),
+            awaiting_correction_task_ids: tick.awaiting_correction_task_ids.clone(),
+            failed_check_task_ids: tick.failed_check_task_ids.clone(),
+            fenced_task_ids: tick.fenced_task_ids.clone(),
+            unknown_effect_task_ids: tick.unknown_effect_task_ids.clone(),
+            blocked_or_failed_task_ids: tick.blocked_or_failed_task_ids.clone(),
+            tasks: tick.tasks.clone(),
+            completion_summary: tick
+                .completion_outcome
+                .as_ref()
+                .map(CoworkerDriverCompletionSummary::from_outcome),
+        };
+        report.merge_from_tick(tick, draining_after_stop);
+        report
+    }
+
+    /// Merges a subsequent [`CoworkerPipelineTickReport`] into this cumulative report while
+    /// preserving cumulative task progression lists across ticks.
+    pub fn merge_from_tick(
+        &mut self,
+        tick: &CoworkerPipelineTickReport,
+        draining_after_stop: bool,
+    ) {
+        self.job_phase = tick.job_phase;
+        self.job_revision = tick.job_revision;
+        self.lease_epoch = tick.lease_epoch;
+        self.controller_instance_id = tick.controller_instance_id.clone();
+        self.status = tick.status;
+        self.draining_in_flight_after_stop =
+            draining_after_stop && !tick.in_flight_stages.is_empty();
+        self.in_flight_stages = tick.in_flight_stages.clone();
+        for id in &tick.dispatched_task_ids {
+            push_unique_id(&mut self.dispatched_task_ids, id);
+        }
+        for id in &tick.reconciled_ready_for_review_task_ids {
+            push_unique_id(&mut self.reconciled_ready_for_review_task_ids, id);
+        }
+        for id in &tick.verified_task_ids {
+            push_unique_id(&mut self.verified_task_ids, id);
+        }
+        for id in &tick.reviewed_task_ids {
+            push_unique_id(&mut self.reviewed_task_ids, id);
+        }
+        for id in &tick.integrated_task_ids {
+            push_unique_id(&mut self.integrated_task_ids, id);
+        }
+        for id in &tick.prepared_dependency_task_ids {
+            push_unique_id(&mut self.prepared_dependency_task_ids, id);
+        }
+        for id in &tick.promoted_dependency_ready_task_ids {
+            push_unique_id(&mut self.promoted_dependency_ready_task_ids, id);
+        }
+        for snap in &tick.tasks {
+            if snap.attempt_no >= 1
+                && !matches!(
+                    snap.stage,
+                    CoworkerTaskStage::PendingDependencies | CoworkerTaskStage::ReadyToDispatch
+                )
+            {
+                push_unique_id(&mut self.dispatched_task_ids, &snap.task_id);
+            }
+            if snap.review_subject_promoted {
+                push_unique_id(
+                    &mut self.reconciled_ready_for_review_task_ids,
+                    &snap.task_id,
+                );
+                push_unique_id(&mut self.verified_task_ids, &snap.task_id);
+            }
+            if snap.review_verdict_outcome.is_some() {
+                push_unique_id(&mut self.reviewed_task_ids, &snap.task_id);
+            }
+            if snap.stage == CoworkerTaskStage::Integrated {
+                push_unique_id(&mut self.integrated_task_ids, &snap.task_id);
+            }
+        }
+        self.awaiting_correction_task_ids = tick.awaiting_correction_task_ids.clone();
+        self.failed_check_task_ids = tick.failed_check_task_ids.clone();
+        self.fenced_task_ids = tick.fenced_task_ids.clone();
+        self.unknown_effect_task_ids = tick.unknown_effect_task_ids.clone();
+        self.blocked_or_failed_task_ids = tick.blocked_or_failed_task_ids.clone();
+        self.tasks = tick.tasks.clone();
+        if let Some(ref outcome) = tick.completion_outcome {
+            self.completion_summary = Some(CoworkerDriverCompletionSummary::from_outcome(outcome));
+        }
+    }
 }
 
 /// Persisted private (`0600`) code-driver state record for a single job.
@@ -334,7 +682,7 @@ pub struct CoworkerDriverStateRecord {
     /// Whether the owner completed graceful exit and released both lease and FD lock.
     pub graceful_exit_completed: bool,
     /// Post-shutdown `HostSessionManifest::updated_at_ms` recorded when the owner cleanly shut down
-    /// a self-started fresh host upon reaching a quiescent Phase 1 state.
+    /// a self-started fresh host upon reaching a quiescent state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_quiescent_host_shutdown_updated_at_ms: Option<i64>,
     /// Post-shutdown `HostSessionManifest::instance_id` recorded when the owner cleanly shut down
@@ -348,12 +696,40 @@ pub struct CoworkerDriverStateRecord {
     /// Last full controller step report recorded by this owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_step_report: Option<CoworkerControllerStepReport>,
-    /// Explicit Phase 1 pipeline boundary label.
+    /// Engine execution mode persisted by the owner.
+    #[serde(default)]
+    pub execution_mode: Option<CoworkerDriverExecutionMode>,
+    /// Last pipeline status observed when running in `FullAutomaticPipeline` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pipeline_status: Option<CoworkerPipelineStatus>,
+    /// Compact last pipeline report recorded when running in `FullAutomaticPipeline` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pipeline_report: Option<CoworkerDriverPipelineReport>,
+    /// Explicit pipeline boundary label.
     pub pipeline_boundary: CoworkerDriverPipelineBoundary,
     /// Timestamp (milliseconds since Unix epoch) when the owner started.
     pub started_at_ms: u64,
     /// Timestamp (milliseconds since Unix epoch) when this record was last updated.
     pub updated_at_ms: u64,
+}
+
+impl CoworkerDriverStateRecord {
+    /// Resolves the effective execution mode recorded in this persisted state record, falling back
+    /// to `pipeline_boundary` for backward compatibility with older state files.
+    #[must_use]
+    pub const fn effective_execution_mode(&self) -> CoworkerDriverExecutionMode {
+        if let Some(mode) = self.execution_mode {
+            return mode;
+        }
+        match self.pipeline_boundary {
+            CoworkerDriverPipelineBoundary::FullAutomaticPipelineThroughSingleClosure => {
+                CoworkerDriverExecutionMode::FullAutomaticPipeline
+            }
+            CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly => {
+                CoworkerDriverExecutionMode::Phase1InitialDispatchOnly
+            }
+        }
+    }
 }
 
 /// Status and step report returned by `status`, `reconcile`, and `run-owner`.
@@ -389,8 +765,27 @@ pub struct CoworkerDriverStatusReport {
     pub host_mode: CoworkerDriverHostMode,
     /// Current coworker job phase in `CoworkerWorkflowStore`.
     pub job_phase: CoworkerJobPhase,
-    /// Current overall controller status (`AwaitingChecksOrReview`, `RunningTasks`, `Stopped`, etc.).
+    /// Legacy Phase 1 controller status observation (`AwaitingChecksOrReview`, `RunningTasks`, `AllTasksIntegrated`, `Stopped`, etc.).
+    /// Kept separate and additive from `pipeline_status`; `AllTasksIntegrated` is NOT job `Completed`
+    /// until `job_phase == CoworkerJobPhase::Completed` and `pipeline_status == Some(CoworkerPipelineStatus::Completed)`.
     pub overall_status: CoworkerControllerPhase1Status,
+    /// Effective driver execution mode (`full_automatic_pipeline` or `phase1_initial_dispatch_only`).
+    #[serde(default)]
+    pub execution_mode: CoworkerDriverExecutionMode,
+    /// Truthful full-pipeline status (`running`, `completed`, `stopped`, `held`, etc.) when operating in
+    /// `FullAutomaticPipeline` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_status: Option<CoworkerPipelineStatus>,
+    /// True when `stop_requested` is set and the live owner is gracefully draining finite in-flight
+    /// stage futures under the held physical guard before exiting.
+    #[serde(default)]
+    pub stopping_draining_in_flight: bool,
+    /// Stage futures currently retained in-flight by the live owner's [`CoworkerPipelineDriver`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub in_flight_stages: Vec<CoworkerPipelineInFlightStageRef>,
+    /// Compact pipeline report when operating in `FullAutomaticPipeline` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_report: Option<CoworkerDriverPipelineReport>,
     /// Whether durable operator stop (`stop_requested`) is set on the job runtime state.
     pub stop_requested: bool,
     /// Whether the job has unresolved pending effects or unknown outbox state blocking replay.
@@ -402,12 +797,12 @@ pub struct CoworkerDriverStatusReport {
     pub total_task_attempts_reserved: u32,
     /// Maximum total task attempts permitted across the job by `FrozenControllerExecutionEnvelope`.
     pub max_total_task_attempts_per_job: u32,
-    /// Per-task observations.
+    /// Per-task Phase 1 observations.
     pub tasks: Vec<CoworkerControllerTaskObservation>,
-    /// Latest step report when a controller step was executed or recorded.
+    /// Latest Phase 1 step report when a controller step was executed or recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_report: Option<CoworkerControllerStepReport>,
-    /// Explicit Phase 1 pipeline boundary.
+    /// Explicit pipeline boundary.
     pub pipeline_boundary: CoworkerDriverPipelineBoundary,
     /// Human-readable boundary explanation.
     pub boundary_note: String,
@@ -438,13 +833,13 @@ pub struct CoworkerDriverCancelReport {
     /// Confirms that durable `stop_requested = true` was persisted in `ControllerPolicyStore`
     /// before any local owner RPC or `ApprovedHostClient::cancel_task` call.
     pub durable_stop_recorded_before_host_cancel: bool,
-    /// Whether an active verified owner was notified over local RPC and shut down cleanly.
+    /// Whether an active verified owner was notified over local RPC and shut down cleanly (or began draining).
     pub notified_live_owner: bool,
     /// Whether narrow host task cancellation was attempted against an active `Ready` host.
     pub narrow_host_cancellation_attempted: bool,
     /// Original host tasks cancelled via `ApprovedHostClient::cancel_task`.
     pub cancelled_host_tasks: Vec<CancelledHostTaskSummary>,
-    /// Explicit Phase 1 derived-attempt cancellation boundary.
+    /// Explicit derived-attempt and in-flight stage cancellation boundary.
     pub derived_attempt_cancellation_boundary: CoworkerDerivedCancellationBoundary,
     /// Human-readable explanation of the cancellation boundary.
     pub cancellation_boundary_note: String,
@@ -452,12 +847,12 @@ pub struct CoworkerDriverCancelReport {
     pub status: CoworkerDriverStatusReport,
 }
 
-/// Options controlling `run-owner` execution cadence and optional diagnostic bounds.
+/// Options controlling `run-owner` execution cadence, mode, and optional diagnostic bounds.
 ///
-/// By default (`max_steps: None, idle_linger_ms: None`), the owner lifetime follows real job
-/// terminal/stopped/unknown/checkpoint policy, staying alive across long frozen approved worker
-/// budgets (`RunningTasks`) and keeping RPC/ownership available at `AwaitingChecksOrReview`,
-/// `AwaitingDependencyAcceptanceOrSeal`, and `Held` for later pipeline integration.
+/// By default (`max_steps: None, idle_linger_ms: None, execution_mode: None`), the owner selects
+/// `FullAutomaticPipeline` when the frozen controller envelope authorizes it and drives the single
+/// retained [`CoworkerPipelineDriver`] through verification, `Reviewer`, bounded corrections,
+/// per-task integration, dependency seals, combined candidate checks, and single `Closure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoworkerDriverRunOptions {
     /// Optional diagnostic maximum number of controller step iterations (`None` = unbounded normal lifetime).
@@ -465,10 +860,13 @@ pub struct CoworkerDriverRunOptions {
     pub max_steps: Option<u32>,
     /// Finite cadence interval (in milliseconds) between steps while tasks are running.
     pub poll_interval_ms: u64,
-    /// Optional diagnostic linger window (in milliseconds) before exiting a pipeline await state
-    /// (`None` = stay alive keeping RPC/ownership available for later pipeline integration).
+    /// Optional diagnostic linger window (in milliseconds) before exiting a pipeline await state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_linger_ms: Option<u64>,
+    /// Optional explicit execution mode (`None` = select `FullAutomaticPipeline` by default when
+    /// the frozen controller envelope authorizes it, preserving persisted diagnostic mode on reopen).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<CoworkerDriverExecutionMode>,
 }
 
 impl Default for CoworkerDriverRunOptions {
@@ -477,6 +875,7 @@ impl Default for CoworkerDriverRunOptions {
             max_steps: DEFAULT_DRIVER_MAX_STEPS,
             poll_interval_ms: DEFAULT_DRIVER_POLL_INTERVAL_MS,
             idle_linger_ms: DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS,
+            execution_mode: None,
         }
     }
 }
@@ -745,9 +1144,10 @@ impl CoworkerCodeDriver {
     /// planner provenance + approval + controller envelope admission under the held physical
     /// guard, binds the private `0600` Unix domain socket for same-EUID + fresh-nonce RPCs,
     /// reuses a verified `Ready` host or starts a fresh host via [`ApprovedHost::start_fresh_only`]
-    /// when permitted, steps the controller on a finite cadence, and upon graceful exit releases
-    /// the logical lease, shuts down any self-started host handle when no worker is actively
-    /// running, unlinks the socket, and drops the physical FD lock.
+    /// when permitted, retains ONE mutable [`CoworkerPipelineDriver`] across ticks and RPCs when
+    /// running in `FullAutomaticPipeline` mode, and upon graceful exit releases the logical lease,
+    /// shuts down any self-started host handle when no worker is actively running, unlinks the
+    /// socket, and drops the physical FD lock.
     ///
     /// # Errors
     /// Returns [`NativeError`] if another live owner already holds the job, if admission or host
@@ -776,9 +1176,32 @@ impl CoworkerCodeDriver {
             }
         };
 
+        let initial_prev_state = match self.read_driver_state_optional(&key) {
+            Ok(st) => st,
+            Err(err) => {
+                let _ = session.release();
+                return Err(err);
+            }
+        };
+        let effective_mode = match resolve_effective_execution_mode(
+            options.execution_mode,
+            initial_prev_state.as_ref(),
+            &admission.job,
+            &admission.runtime_state,
+        ) {
+            Ok(mode) => mode,
+            Err(err) => {
+                let _ = session.release();
+                return Err(err);
+            }
+        };
+
         // Ensure host readiness before entering the step/RPC loop. If host acquisition fails,
         // release the owned session cleanly before returning the error.
-        let mut host_session = match self.ensure_host_for_admission(&key, &admission).await {
+        let mut host_session = match self
+            .ensure_host_for_admission(&key, &admission, effective_mode)
+            .await
+        {
             Ok(host) => host,
             Err(err) => {
                 let _ = session.release();
@@ -799,23 +1222,44 @@ impl CoworkerCodeDriver {
             }
         };
 
-        let mut steps_completed = 0u32;
-        let mut last_step_report: Option<CoworkerControllerStepReport> = None;
+        let pipeline_service =
+            if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+                match CoworkerPipelineService::new(self.controller.clone()) {
+                    Ok(svc) => Some(svc),
+                    Err(err) => {
+                        let _ = remove_socket_if_present(&canonical_socket_path);
+                        if let Some(handle) = host_session.owned_handle.take() {
+                            let _ = handle.shutdown().await;
+                        }
+                        let _ = session.release();
+                        return Err(err);
+                    }
+                }
+            } else {
+                None
+            };
 
-        // Run the initial step under the held physical guard.
-        let initial_step_res = self
-            .execute_owner_step_or_quiescent_check(
-                &key,
-                &session,
-                &mut host_session,
-                &mut steps_completed,
-                &mut last_step_report,
-                started_at_ms,
-                &canonical_socket_path,
-            )
-            .await;
-
-        if let Err(err) = initial_step_res {
+        // Create ONE mutable pipeline driver for the entire held owner session so FuturesUnordered
+        // and its in-flight stage executions are retained across ticks and RPC connections.
+        let mut pipeline_driver: Option<CoworkerPipelineDriver<'_>> = None;
+        let mut pipeline_driver_init_err: Option<NativeError> = None;
+        if let Some(ref svc) = pipeline_service {
+            match svc.driver(
+                session.guard(),
+                key.binding_id.clone(),
+                key.thread_uuid.clone(),
+                key.job_id.clone(),
+            ) {
+                Ok(drv) => {
+                    pipeline_driver = Some(drv);
+                }
+                Err(err) => {
+                    pipeline_driver_init_err = Some(err);
+                }
+            }
+        }
+        if let Some(err) = pipeline_driver_init_err {
+            drop(pipeline_driver);
             let _ = remove_socket_if_present(&canonical_socket_path);
             if let Some(handle) = host_session.owned_handle.take() {
                 let _ = handle.shutdown().await;
@@ -823,35 +1267,114 @@ impl CoworkerCodeDriver {
             let _ = session.release();
             return Err(err);
         }
+        let in_flight_stages_rx = pipeline_driver
+            .as_ref()
+            .map(CoworkerPipelineDriver::subscribe_in_flight_stages);
+
+        let mut steps_completed = 0u32;
+        let mut last_step_report: Option<CoworkerControllerStepReport> = None;
+        let mut last_pipeline_report: Option<CoworkerDriverPipelineReport> = initial_prev_state
+            .as_ref()
+            .and_then(|s| s.last_pipeline_report.clone());
+        let mut draining_after_stop = admission.runtime_state.stop_requested;
+
+        let initial_state_res: Result<CoworkerControllerPhase1Status, NativeError> = (|| {
+            let owner_summary = session.guard().validate_before_effect(&key)?.clone();
+            let inspection = self.inspect_scoped_job_readonly(&key)?;
+            let (initial_overall_status, _) = self.synthesize_status_and_tasks(&inspection)?;
+            let initial_state = CoworkerDriverStateRecord {
+                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                binding_id: key.binding_id.clone(),
+                thread_uuid: key.thread_uuid.clone(),
+                job_id: key.job_id.clone(),
+                owner_instance_id: owner_summary.instance_id,
+                owner_challenge_digest: owner_summary.challenge_digest,
+                owner_pid_hint: owner_summary.pid_hint,
+                owner_uid: current_effective_uid(),
+                lock_file_identity: owner_summary.lock_file_identity,
+                socket_path: canonical_socket_path.display().to_string(),
+                host_mode: host_session.mode,
+                owner_active: true,
+                graceful_exit_completed: false,
+                owner_quiescent_host_shutdown_updated_at_ms: initial_prev_state
+                    .as_ref()
+                    .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
+                owner_quiescent_host_instance_id: initial_prev_state
+                    .as_ref()
+                    .and_then(|s| s.owner_quiescent_host_instance_id.clone()),
+                steps_completed,
+                last_overall_status: initial_overall_status,
+                last_step_report: None,
+                execution_mode: Some(effective_mode),
+                last_pipeline_status: last_pipeline_report.as_ref().map(|r| r.status),
+                last_pipeline_report: last_pipeline_report.clone(),
+                pipeline_boundary: boundary_for_mode(effective_mode),
+                started_at_ms: owner_summary.acquired_at_ms,
+                updated_at_ms: current_time_ms(),
+            };
+            self.write_driver_state(&key, &initial_state)?;
+            Ok(initial_overall_status)
+        })();
+
+        let initial_overall_status = match initial_state_res {
+            Ok(status) => status,
+            Err(err) => {
+                drop(pipeline_driver);
+                let _ = remove_socket_if_present(&canonical_socket_path);
+                if let Some(handle) = host_session.owned_handle.take() {
+                    let _ = handle.shutdown().await;
+                }
+                let _ = session.release();
+                return Err(err);
+            }
+        };
 
         let mut quiescent_since: Option<Instant> = None;
-        if let Some(report) = &last_step_report {
-            if !report_has_active_work(report) {
-                quiescent_since = Some(Instant::now());
-            }
-        }
 
+        let mut last_tick_at = Instant::now();
+        let mut immediate_step_requested = false;
         let mut stop_loop = false;
+        let mut loop_err: Option<NativeError> = None;
         while !stop_loop {
-            let active_work = last_step_report
+            let in_flight_count = pipeline_driver
                 .as_ref()
-                .is_some_and(report_has_active_work);
-            let terminal_or_stopped = last_step_report.as_ref().is_some_and(|r| {
-                !report_has_active_work(r) && is_terminal_or_stopped_status(r.status)
-            });
-            let pipeline_await = last_step_report
-                .as_ref()
-                .is_some_and(|r| !report_has_active_work(r) && is_pipeline_await_status(r.status));
+                .map_or(0, CoworkerPipelineDriver::in_flight_count);
+            let initial_step_pending = steps_completed == 0;
+            let active_work = initial_step_pending
+                || owner_has_active_work(
+                    effective_mode,
+                    last_step_report.as_ref(),
+                    last_pipeline_report.as_ref(),
+                    in_flight_count,
+                );
+            let terminal_or_stopped = !initial_step_pending
+                && owner_is_terminal_or_stopped(
+                    effective_mode,
+                    last_step_report.as_ref(),
+                    last_pipeline_report.as_ref(),
+                    in_flight_count,
+                );
+            let pipeline_await = !initial_step_pending
+                && owner_is_pipeline_await(
+                    effective_mode,
+                    last_step_report.as_ref(),
+                    last_pipeline_report.as_ref(),
+                    in_flight_count,
+                );
 
             if active_work {
                 quiescent_since = None;
-                // Explicit diagnostic max_steps never cancels or shuts down active work on an owned host.
+                // Explicit diagnostic max_steps never cancels or shuts down active work on an owned host
+                // or drops in-flight pipeline stage futures.
                 if let Some(limit) = max_steps {
-                    if steps_completed >= limit && host_session.owned_handle.is_none() {
+                    if steps_completed >= limit
+                        && host_session.owned_handle.is_none()
+                        && in_flight_count == 0
+                    {
                         break;
                     }
                 }
-            } else {
+            } else if !immediate_step_requested {
                 let since = *quiescent_since.get_or_insert_with(Instant::now);
                 let elapsed_ms = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
                 let max_steps_reached = max_steps.is_some_and(|limit| steps_completed >= limit);
@@ -860,7 +1383,7 @@ impl CoworkerCodeDriver {
                     let linger = idle_linger_ms.unwrap_or(0);
                     linger == 0 || elapsed_ms >= linger
                 } else if pipeline_await {
-                    // Normal owner lifetime keeps RPC and physical ownership available at
+                    // Normal Phase 1 owner lifetime keeps RPC and physical ownership available at
                     // AwaitingChecksOrReview / AwaitingDependencyAcceptanceOrSeal / Held unless
                     // an explicit diagnostic max_steps or idle_linger_ms was supplied.
                     max_steps_reached || idle_linger_ms.is_some_and(|linger| elapsed_ms >= linger)
@@ -875,24 +1398,32 @@ impl CoworkerCodeDriver {
                         })
                         .await
                     {
-                        let _ = self
-                            .handle_owner_rpc_connection(
-                                stream,
-                                &key,
-                                &session,
-                                &mut host_session,
-                                &mut steps_completed,
-                                &mut last_step_report,
-                                &canonical_socket_path,
-                                &mut stop_loop,
-                            )
-                            .await;
+                        let _ = Box::pin(self.handle_owner_rpc_connection(
+                            stream,
+                            &key,
+                            &session,
+                            host_session.mode,
+                            effective_mode,
+                            in_flight_stages_rx.as_ref(),
+                            false,
+                            &last_step_report,
+                            &last_pipeline_report,
+                            &mut draining_after_stop,
+                            &mut immediate_step_requested,
+                            &mut stop_loop,
+                        ))
+                        .await;
+                        if immediate_step_requested {
+                            break;
+                        }
                     }
-                    break;
+                    if !immediate_step_requested {
+                        break;
+                    }
                 }
             }
 
-            let wait_ms = if !active_work {
+            let target_wait_ms = if !active_work {
                 if let Some(linger) = idle_linger_ms {
                     let since = quiescent_since.unwrap_or_else(Instant::now);
                     let elapsed_ms = u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -900,63 +1431,222 @@ impl CoworkerCodeDriver {
                 } else {
                     poll_interval_ms
                 }
+            } else if initial_step_pending {
+                poll_interval_ms.clamp(100, 500)
+            } else if in_flight_count > 0 {
+                poll_interval_ms.min(15)
             } else {
                 poll_interval_ms
             };
 
-            tokio::select! {
-                accept_res = listener.accept() => {
-                    if let Ok((stream, _)) = accept_res {
-                        self.handle_owner_rpc_connection(
-                            stream,
-                            &key,
-                            &session,
-                            &mut host_session,
-                            &mut steps_completed,
-                            &mut last_step_report,
-                            &canonical_socket_path,
-                            &mut stop_loop,
-                        )
-                        .await?;
-                    }
-                }
-                () = tokio::time::sleep(Duration::from_millis(wait_ms)) => {
-                    let now_ms = current_time_ms();
-                    let should_step_on_tick = if active_work {
-                        true
-                    } else {
-                        self.should_step_while_quiescent(&key, now_ms)?
-                    };
+            let elapsed_since_tick_ms =
+                u64::try_from(last_tick_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let remaining_wait_ms = if immediate_step_requested {
+                0
+            } else {
+                target_wait_ms.saturating_sub(elapsed_since_tick_ms)
+            };
 
-                    if should_step_on_tick {
-                        self.execute_owner_step_or_quiescent_check(
-                            &key,
-                            &session,
-                            &mut host_session,
-                            &mut steps_completed,
-                            &mut last_step_report,
-                            now_ms,
-                            &canonical_socket_path,
-                        )
-                        .await?;
-                        if let Some(report) = &last_step_report {
-                            if !report_has_active_work(report) && quiescent_since.is_none() {
-                                quiescent_since = Some(Instant::now());
-                            } else if report_has_active_work(report) {
-                                quiescent_since = None;
+            let mut run_periodic_tick = false;
+            if immediate_step_requested {
+                run_periodic_tick = true;
+            } else {
+                tokio::select! {
+                    biased;
+                    accept_res = listener.accept() => {
+                        if let Ok((stream, _)) = accept_res {
+                            if let Err(err) = Box::pin(self.handle_owner_rpc_connection(
+                                stream,
+                                &key,
+                                &session,
+                                host_session.mode,
+                                effective_mode,
+                                in_flight_stages_rx.as_ref(),
+                                false,
+                                &last_step_report,
+                                &last_pipeline_report,
+                                &mut draining_after_stop,
+                                &mut immediate_step_requested,
+                                &mut stop_loop,
+                            ))
+                            .await
+                            {
+                                loop_err = Some(err);
+                                break;
                             }
                         }
+                        if immediate_step_requested
+                            || steps_completed == 0
+                            || u64::try_from(last_tick_at.elapsed().as_millis()).unwrap_or(u64::MAX) >= target_wait_ms
+                        {
+                            run_periodic_tick = true;
+                        }
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(remaining_wait_ms)) => {
+                        run_periodic_tick = true;
+                    }
+                }
+            }
+
+            if run_periodic_tick && !stop_loop {
+                last_tick_at = Instant::now();
+                let now_ms = current_time_ms();
+                let should_step_on_tick =
+                    if steps_completed == 0 || active_work || immediate_step_requested {
+                        true
+                    } else {
+                        match self.should_step_while_quiescent(&key, now_ms) {
+                            Ok(should_step) => should_step,
+                            Err(err) => {
+                                loop_err = Some(err);
+                                break;
+                            }
+                        }
+                    };
+
+                if should_step_on_tick {
+                    immediate_step_requested = false;
+                    let step_prev_pipeline_report = last_pipeline_report.clone();
+                    let mut step_fut = Box::pin(self.execute_owner_step_or_quiescent_check(
+                        &key,
+                        &session,
+                        effective_mode,
+                        pipeline_service.as_ref(),
+                        &mut pipeline_driver,
+                        host_session.mode,
+                        steps_completed,
+                        step_prev_pipeline_report,
+                        now_ms,
+                        &canonical_socket_path,
+                    ));
+                    let step_outcome = loop {
+                        tokio::select! {
+                            biased;
+                            step_res = &mut step_fut => {
+                                break step_res;
+                            }
+                            accept_res = listener.accept() => {
+                                if let Ok((stream, _)) = accept_res {
+                                    if let Err(err) = Box::pin(self.handle_owner_rpc_connection(
+                                        stream,
+                                        &key,
+                                        &session,
+                                        host_session.mode,
+                                        effective_mode,
+                                        in_flight_stages_rx.as_ref(),
+                                        true,
+                                        &last_step_report,
+                                        &last_pipeline_report,
+                                        &mut draining_after_stop,
+                                        &mut immediate_step_requested,
+                                        &mut stop_loop,
+                                    ))
+                                    .await
+                                    {
+                                        let _ = self
+                                            .controller
+                                            .policy_store()
+                                            .mutate_job_runtime_for_operator(
+                                                &key.binding_id,
+                                                &key.job_id,
+                                                |runtime_state| {
+                                                    runtime_state.stop_requested = true;
+                                                    if runtime_state.stop_or_block_reason.is_none() {
+                                                        runtime_state.stop_or_block_reason = Some(
+                                                            format!("owner RPC handler error: {err}"),
+                                                        );
+                                                    }
+                                                    Ok(())
+                                                },
+                                            );
+                                        draining_after_stop = true;
+                                        if loop_err.is_none() {
+                                            loop_err = Some(err);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    drop(step_fut);
+                    match step_outcome {
+                        Ok((
+                            next_steps_completed,
+                            next_step_report,
+                            next_pipeline_report,
+                            next_draining_after_stop,
+                        )) => {
+                            steps_completed = next_steps_completed;
+                            last_step_report = Some(next_step_report);
+                            last_pipeline_report = next_pipeline_report;
+                            draining_after_stop = next_draining_after_stop;
+                        }
+                        Err(err) => {
+                            loop_err = Some(err);
+                            break;
+                        }
+                    }
+                    if loop_err.is_some() {
+                        break;
+                    }
+                    let current_in_flight = pipeline_driver
+                        .as_ref()
+                        .map_or(0, CoworkerPipelineDriver::in_flight_count);
+                    let still_active = owner_has_active_work(
+                        effective_mode,
+                        last_step_report.as_ref(),
+                        last_pipeline_report.as_ref(),
+                        current_in_flight,
+                    );
+                    if !still_active && quiescent_since.is_none() {
+                        quiescent_since = Some(Instant::now());
+                    } else if still_active {
+                        quiescent_since = None;
                     }
                 }
             }
         }
 
+        if let Some(err) = loop_err {
+            if let Some(ref mut drv) = pipeline_driver {
+                if drv.in_flight_count() > 0 {
+                    let _ = self
+                        .controller
+                        .policy_store()
+                        .mutate_job_runtime_for_operator(
+                            &key.binding_id,
+                            &key.job_id,
+                            |runtime_state| {
+                                runtime_state.stop_requested = true;
+                                Ok(())
+                            },
+                        );
+                    let _ = drv.drain_in_flight(current_time_ms().max(1)).await;
+                }
+            }
+            drop(pipeline_driver);
+            let _ = remove_socket_if_present(&canonical_socket_path);
+            if let Some(handle) = host_session.owned_handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            let _ = session.release();
+            return Err(err);
+        }
+
+        // Drop retained pipeline driver before releasing session guard.
+        drop(pipeline_driver);
+
         // Build final status report while still holding the guard, then perform graceful teardown.
         let _ = remove_socket_if_present(&canonical_socket_path);
         drop(listener);
 
-        let mut shutdown_manifest_updated_at_ms: Option<i64> = None;
-        let mut shutdown_host_instance_id: Option<String> = None;
+        let prev_state_before_shutdown = self.read_driver_state_optional(&key)?;
+        let mut shutdown_manifest_updated_at_ms: Option<i64> = prev_state_before_shutdown
+            .as_ref()
+            .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms);
+        let mut shutdown_host_instance_id: Option<String> = prev_state_before_shutdown
+            .as_ref()
+            .and_then(|s| s.owner_quiescent_host_instance_id.clone());
         if let Some(handle) = host_session.owned_handle.take() {
             let instance_id = handle.instance_id().to_owned();
             handle.shutdown().await.map_err(map_host_error)?;
@@ -974,6 +1664,7 @@ impl CoworkerCodeDriver {
                                 | CoworkerControllerPhase1Status::AllTasksIntegrated
                                 | CoworkerControllerPhase1Status::Stopped
                                 | CoworkerControllerPhase1Status::BlockedOrFailed
+                                | CoworkerControllerPhase1Status::Held
                         )
                     })
                 {
@@ -985,33 +1676,40 @@ impl CoworkerCodeDriver {
 
         let finished_at_ms = current_time_ms();
         let owner_summary = session.guard().validate_before_effect(&key)?.clone();
-        if let Some(report) = &last_step_report {
-            let final_state = CoworkerDriverStateRecord {
-                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
-                binding_id: key.binding_id.clone(),
-                thread_uuid: key.thread_uuid.clone(),
-                job_id: key.job_id.clone(),
-                owner_instance_id: owner_summary.instance_id.clone(),
-                owner_challenge_digest: owner_summary.challenge_digest.clone(),
-                owner_pid_hint: owner_summary.pid_hint,
-                owner_uid: current_effective_uid(),
-                lock_file_identity: owner_summary.lock_file_identity,
-                socket_path: canonical_socket_path.display().to_string(),
-                host_mode: host_session.mode,
-                owner_active: false,
-                graceful_exit_completed: true,
-                owner_quiescent_host_shutdown_updated_at_ms: shutdown_manifest_updated_at_ms,
-                owner_quiescent_host_instance_id: shutdown_host_instance_id,
-                steps_completed,
-                last_overall_status: report.status,
-                last_step_report: Some(report.clone()),
-                pipeline_boundary:
-                    CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
-                started_at_ms,
-                updated_at_ms: finished_at_ms,
-            };
-            self.write_driver_state(&key, &final_state)?;
+        if let Some(ref mut pipe_rep) = last_pipeline_report {
+            pipe_rep.draining_in_flight_after_stop = false;
+            pipe_rep.in_flight_stages.clear();
         }
+        let final_overall_status = last_step_report
+            .as_ref()
+            .map_or(initial_overall_status, |r| r.status);
+        let final_state = CoworkerDriverStateRecord {
+            schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+            binding_id: key.binding_id.clone(),
+            thread_uuid: key.thread_uuid.clone(),
+            job_id: key.job_id.clone(),
+            owner_instance_id: owner_summary.instance_id.clone(),
+            owner_challenge_digest: owner_summary.challenge_digest.clone(),
+            owner_pid_hint: owner_summary.pid_hint,
+            owner_uid: current_effective_uid(),
+            lock_file_identity: owner_summary.lock_file_identity,
+            socket_path: canonical_socket_path.display().to_string(),
+            host_mode: host_session.mode,
+            owner_active: false,
+            graceful_exit_completed: true,
+            owner_quiescent_host_shutdown_updated_at_ms: shutdown_manifest_updated_at_ms,
+            owner_quiescent_host_instance_id: shutdown_host_instance_id,
+            steps_completed,
+            last_overall_status: final_overall_status,
+            last_step_report: last_step_report.clone(),
+            execution_mode: Some(effective_mode),
+            last_pipeline_status: last_pipeline_report.as_ref().map(|r| r.status),
+            last_pipeline_report: last_pipeline_report.clone(),
+            pipeline_boundary: boundary_for_mode(effective_mode),
+            started_at_ms,
+            updated_at_ms: finished_at_ms,
+        };
+        self.write_driver_state(&key, &final_state)?;
 
         session.release()?;
         self.build_readonly_status_report(&key, Some(host_session.mode), last_step_report)
@@ -1048,6 +1746,9 @@ impl CoworkerCodeDriver {
                 status,
             });
         }
+
+        let requested_mode = options.and_then(|o| o.execution_mode);
+        let resolved_spawn_mode: CoworkerDriverExecutionMode;
 
         // 2. Validate authoritative admission and host state under a short-lived physical guard
         // before spawning a detached owner process. If another `ensure` or `run-owner` process is
@@ -1087,19 +1788,74 @@ impl CoworkerCodeDriver {
                 }
             };
             let precheck_now_ms = current_time_ms();
-            let precheck_res: Result<
-                Option<(CoworkerDriverHostMode, Option<CoworkerControllerStepReport>)>,
+            type OwnerPrecheckResult = Result<
+                (
+                    CoworkerDriverExecutionMode,
+                    Option<(CoworkerDriverHostMode, Option<CoworkerControllerStepReport>)>,
+                ),
                 NativeError,
-            > = async {
+            >;
+            let precheck_res: OwnerPrecheckResult = async {
                 let admission = session.verify_admission()?;
-                if is_terminal_or_stopped_job(&admission.job, &admission.runtime_state) {
+                let prev_state = self.read_driver_state_optional(&key)?;
+                let effective_mode = resolve_effective_execution_mode(
+                    requested_mode,
+                    prev_state.as_ref(),
+                    &admission.job,
+                    &admission.runtime_state,
+                )?;
+                if is_terminal_or_stopped_job(
+                    &admission.job,
+                    &admission.runtime_state,
+                    effective_mode,
+                ) {
                     if self
                         .is_verified_ready_host_active(&admission.approval)
                         .await?
                     {
-                        let report = session.step(current_time_ms()).await?;
+                        let active_host = ActiveHostSession {
+                            mode: CoworkerDriverHostMode::ReusedVerifiedReadyHost,
+                            owned_handle: None,
+                        };
+                        let pipe_svc = if effective_mode
+                            == CoworkerDriverExecutionMode::FullAutomaticPipeline
+                        {
+                            Some(CoworkerPipelineService::new(self.controller.clone())?)
+                        } else {
+                            None
+                        };
+                        let mut pipe_drv = if let Some(ref svc) = pipe_svc {
+                            Some(svc.driver(
+                                session.guard(),
+                                key.binding_id.clone(),
+                                key.thread_uuid.clone(),
+                                key.job_id.clone(),
+                            )?)
+                        } else {
+                            None
+                        };
+                        let mut last_pipe = prev_state
+                            .as_ref()
+                            .and_then(|s| s.last_pipeline_report.clone());
+                        let sock_path = self.socket_file_path_for_key(&key)?;
+                        let (_, step_report, pipe_report, _) =
+                            Box::pin(self.execute_owner_step_or_quiescent_check(
+                                &key,
+                                &session,
+                                effective_mode,
+                                pipe_svc.as_ref(),
+                                &mut pipe_drv,
+                                active_host.mode,
+                                0u32,
+                                last_pipe,
+                                current_time_ms(),
+                                &sock_path,
+                            ))
+                            .await?;
+                        let last_step = Some(step_report);
+                        last_pipe = pipe_report;
+                        drop(pipe_drv);
                         let owner_summary = session.guard().validate_before_effect(&key)?.clone();
-                        let prev_state = self.read_driver_state_optional(&key)?;
                         let state_record = CoworkerDriverStateRecord {
                             schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
                             binding_id: key.binding_id.clone(),
@@ -1110,7 +1866,7 @@ impl CoworkerCodeDriver {
                             owner_pid_hint: owner_summary.pid_hint,
                             owner_uid: current_effective_uid(),
                             lock_file_identity: owner_summary.lock_file_identity,
-                            socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
+                            socket_path: sock_path.display().to_string(),
                             host_mode: CoworkerDriverHostMode::ReusedVerifiedReadyHost,
                             owner_active: false,
                             graceful_exit_completed: true,
@@ -1120,25 +1876,60 @@ impl CoworkerCodeDriver {
                             owner_quiescent_host_instance_id: prev_state
                                 .and_then(|s| s.owner_quiescent_host_instance_id),
                             steps_completed: 1,
-                            last_overall_status: report.status,
-                            last_step_report: Some(report.clone()),
-                            pipeline_boundary:
-                                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                            last_overall_status: last_step
+                                .as_ref()
+                                .map_or(CoworkerControllerPhase1Status::Stopped, |r| r.status),
+                            last_step_report: last_step.clone(),
+                            execution_mode: Some(effective_mode),
+                            last_pipeline_status: last_pipe.as_ref().map(|r| r.status),
+                            last_pipeline_report: last_pipe,
+                            pipeline_boundary: boundary_for_mode(effective_mode),
                             started_at_ms: precheck_now_ms,
                             updated_at_ms: current_time_ms(),
                         };
                         self.write_driver_state(&key, &state_record)?;
-                        return Ok(Some((
-                            CoworkerDriverHostMode::ReusedVerifiedReadyHost,
-                            Some(report),
-                        )));
-                    } else if self.can_skip_host_for_quiescent_job(&key, &admission)? {
+                        return Ok((
+                            effective_mode,
+                            Some((CoworkerDriverHostMode::ReusedVerifiedReadyHost, last_step)),
+                        ));
+                    } else if self.can_skip_host_for_quiescent_job(
+                        &key,
+                        &admission,
+                        effective_mode,
+                    )? {
+                        let active_host = ActiveHostSession {
+                            mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
+                            owned_handle: None,
+                        };
+                        let pipe_svc = if effective_mode
+                            == CoworkerDriverExecutionMode::FullAutomaticPipeline
+                        {
+                            Some(CoworkerPipelineService::new(self.controller.clone())?)
+                        } else {
+                            None
+                        };
+                        let mut pipe_drv = None;
+                        let mut last_pipe = prev_state
+                            .as_ref()
+                            .and_then(|s| s.last_pipeline_report.clone());
+                        let sock_path = self.socket_file_path_for_key(&key)?;
+                        let (_, step_report, pipe_report, _) =
+                            Box::pin(self.execute_owner_step_or_quiescent_check(
+                                &key,
+                                &session,
+                                effective_mode,
+                                pipe_svc.as_ref(),
+                                &mut pipe_drv,
+                                active_host.mode,
+                                0u32,
+                                last_pipe,
+                                current_time_ms(),
+                                &sock_path,
+                            ))
+                            .await?;
+                        let last_step = Some(step_report);
+                        last_pipe = pipe_report;
                         let owner_summary = session.guard().validate_before_effect(&key)?.clone();
-                        let prev_state = self.read_driver_state_optional(&key)?;
-                        let (synth_status, _) = self.synthesize_status_and_tasks(
-                            &self.inspect_scoped_job_readonly(&key)?,
-                        )?;
-                        let prev_report = prev_state.as_ref().and_then(|s| s.last_step_report.clone());
                         let state_record = CoworkerDriverStateRecord {
                             schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
                             binding_id: key.binding_id.clone(),
@@ -1149,7 +1940,7 @@ impl CoworkerCodeDriver {
                             owner_pid_hint: owner_summary.pid_hint,
                             owner_uid: current_effective_uid(),
                             lock_file_identity: owner_summary.lock_file_identity,
-                            socket_path: self.socket_file_path_for_key(&key)?.display().to_string(),
+                            socket_path: sock_path.display().to_string(),
                             host_mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
                             owner_active: false,
                             graceful_exit_completed: true,
@@ -1159,27 +1950,32 @@ impl CoworkerCodeDriver {
                             owner_quiescent_host_instance_id: prev_state
                                 .and_then(|s| s.owner_quiescent_host_instance_id),
                             steps_completed: 1,
-                            last_overall_status: synth_status,
-                            last_step_report: prev_report.clone(),
-                            pipeline_boundary:
-                                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                            last_overall_status: last_step
+                                .as_ref()
+                                .map_or(CoworkerControllerPhase1Status::Stopped, |r| r.status),
+                            last_step_report: last_step.clone(),
+                            execution_mode: Some(effective_mode),
+                            last_pipeline_status: last_pipe.as_ref().map(|r| r.status),
+                            last_pipeline_report: last_pipe,
+                            pipeline_boundary: boundary_for_mode(effective_mode),
                             started_at_ms: precheck_now_ms,
                             updated_at_ms: current_time_ms(),
                         };
                         self.write_driver_state(&key, &state_record)?;
-                        return Ok(Some((
-                            CoworkerDriverHostMode::QuiescentNoHostRequired,
-                            prev_report,
-                        )));
+                        return Ok((
+                            effective_mode,
+                            Some((CoworkerDriverHostMode::QuiescentNoHostRequired, last_step)),
+                        ));
                     }
                 }
-                self.preflight_host_for_admission(&key, &admission).await?;
-                Ok(None)
+                self.preflight_host_for_admission(&key, &admission, effective_mode)
+                    .await?;
+                Ok((effective_mode, None))
             }
             .await;
 
             match precheck_res {
-                Ok(Some((quiescent_host_mode, quiescent_report))) => {
+                Ok((_mode, Some((quiescent_host_mode, quiescent_report)))) => {
                     session.release()?;
                     let quiescent_status = self.build_readonly_status_report(
                         &key,
@@ -1191,7 +1987,8 @@ impl CoworkerCodeDriver {
                         status: quiescent_status,
                     });
                 }
-                Ok(None) => {
+                Ok((mode, None)) => {
+                    resolved_spawn_mode = mode;
                     session.release()?;
                 }
                 Err(err) => {
@@ -1224,7 +2021,9 @@ impl CoworkerCodeDriver {
             .arg("--job-id")
             .arg(job_id)
             .arg("--poll-interval-ms")
-            .arg(run_opts.poll_interval_ms.clamp(1, 60_000).to_string());
+            .arg(run_opts.poll_interval_ms.clamp(1, 60_000).to_string())
+            .arg("--execution-mode")
+            .arg(resolved_spawn_mode.as_str());
 
         if let Some(max_steps) = run_opts.max_steps.filter(|&n| n > 0) {
             cmd.arg("--max-steps").arg(max_steps.min(4_096).to_string());
@@ -1310,8 +2109,9 @@ impl CoworkerCodeDriver {
     /// Returns the current verified status for `(binding_id, thread_uuid, job_id)`.
     ///
     /// If a live physical owner holds the lock, verifies it via the local Unix socket RPC
-    /// handshake. Otherwise, inspects the persisted workflow, controller policy, lockfile, and
-    /// host session state read-only without mutating state or trusting stale crash metadata.
+    /// handshake without calling models or advancing pipeline state. Otherwise, inspects the
+    /// persisted workflow, controller policy, lockfile, and host session state read-only without
+    /// mutating state or trusting stale crash metadata.
     ///
     /// # Errors
     /// Returns [`NativeError`] if scope or store validation fails.
@@ -1331,13 +2131,13 @@ impl CoworkerCodeDriver {
         self.build_readonly_status_report(&key, None, None)
     }
 
-    /// Reconciles task receipts and advances Phase 1 state for `(binding_id, thread_uuid, job_id)`.
+    /// Reconciles task receipts and advances state for `(binding_id, thread_uuid, job_id)`.
     ///
     /// - If a live physical owner is active, delegates reconciliation over the authenticated local
     ///   Unix socket RPC so the live owner steps under its held physical guard.
     /// - Otherwise, opens a short-lived [`OwnedCoworkerControllerSession`], reconciles any stale
     ///   lease, ensures host readiness (without restarting a stopped or uncertain host), steps the
-    ///   controller once, and releases the session cleanly.
+    ///   controller/pipeline once, and releases the session cleanly.
     ///
     /// # Errors
     /// Returns [`NativeError`] if admission, host verification, or receipt reconciliation fails.
@@ -1347,6 +2147,22 @@ impl CoworkerCodeDriver {
         thread_uuid: &str,
         job_id: &str,
     ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        self.reconcile_with_options(binding_id, thread_uuid, job_id, None)
+            .await
+    }
+
+    /// Reconciles task receipts and advances state for `(binding_id, thread_uuid, job_id)` with
+    /// optional [`CoworkerDriverRunOptions`] (such as an explicit [`CoworkerDriverExecutionMode`]).
+    ///
+    /// # Errors
+    /// Returns [`NativeError`] if admission, host verification, or receipt reconciliation fails.
+    pub async fn reconcile_with_options(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+        options: Option<CoworkerDriverRunOptions>,
+    ) -> Result<CoworkerDriverStatusReport, NativeError> {
         let key = CoworkerJobOwnershipKey::new(binding_id, thread_uuid, job_id)?;
         if let Some(live_report) = self
             .try_verify_live_owner_via_rpc(&key, DriverRpcOp::Reconcile)
@@ -1354,6 +2170,7 @@ impl CoworkerCodeDriver {
         {
             return Ok(live_report);
         }
+        let execution_mode = options.and_then(|o| o.execution_mode);
         self.run_owner(
             binding_id,
             thread_uuid,
@@ -1362,24 +2179,27 @@ impl CoworkerCodeDriver {
                 max_steps: Some(1),
                 poll_interval_ms: DEFAULT_DRIVER_POLL_INTERVAL_MS,
                 idle_linger_ms: Some(0),
+                execution_mode,
             },
         )
         .await
     }
 
-    /// Requests durable stop and narrow host task cancellation for `(binding_id, thread_uuid, job_id)`.
+    /// Requests durable stop, narrow host task cancellation, and in-flight stage draining for
+    /// `(binding_id, thread_uuid, job_id)`.
     ///
     /// Ordering invariants:
     /// 1. Validates scope and read-only job/envelope/approval linkage.
     /// 2. Persists `stop_requested = true` durably in [`ControllerPolicyStore`] BEFORE any local
-    ///    socket RPC or [`ApprovedHostClient::cancel_task`] call.
+    ///    socket RPC or [`ApprovedHostClient::cancel_task`] call (which also signals any active
+    ///    derived `Coder` correction attempt via its process-group `stop_requested` watcher).
     /// 3. If a live physical owner is active, notifies it via authenticated Unix socket RPC so it
-    ///    performs narrow host cancellation, reconciles receipts, and exits gracefully (dropping
-    ///    both its FD lock and logical lease).
-    /// 4. Performs/verifies narrow [`ApprovedHostClient::cancel_task`] on any remaining active
-    ///    original host tasks when a verified `Ready` host is available, reconciles under a
-    ///    short-lived owned session (verifying full admission under the physical guard), and
-    ///    releases the lease and FD lock.
+    ///    performs narrow host cancellation, prevents new dispatches, and either exits immediately
+    ///    or gracefully drains any finite in-flight direct `Reviewer` / check / `Closure` call
+    ///    under its held physical guard while fencing stage promotion.
+    /// 4. If the lock is free, performs/verifies narrow [`ApprovedHostClient::cancel_task`] on any
+    ///    remaining active original host tasks when a verified `Ready` host is available, reconciles
+    ///    under a short-lived owned session, and releases the lease and FD lock.
     ///
     /// # Errors
     /// Returns [`NativeError`] if scope/admission validation or durable state persistence fails.
@@ -1420,6 +2240,7 @@ impl CoworkerCodeDriver {
         let mut notified_live_owner = false;
         let mut narrow_host_cancellation_attempted = false;
         let mut cancelled_host_tasks = Vec::new();
+        let mut owner_draining_in_flight = false;
 
         // STEP 2: If a live physical owner is holding the lock, notify it over authenticated RPC.
         if let Some(rpc_resp) = self
@@ -1434,14 +2255,23 @@ impl CoworkerCodeDriver {
             notified_live_owner = true;
             narrow_host_cancellation_attempted = rpc_resp.narrow_host_cancellation_attempted;
             cancelled_host_tasks = rpc_resp.cancelled_host_tasks;
+            owner_draining_in_flight = rpc_resp
+                .status
+                .as_ref()
+                .is_some_and(|s| s.stopping_draining_in_flight);
 
             // Wait bounded time for the notified live owner to finish graceful teardown and drop FD.
-            let deadline = Instant::now() + Duration::from_millis(5_000);
+            // If the owner is actively draining a finite in-flight direct check/Reviewer/Closure call
+            // that lacks a cancellation API, wait briefly in case it finishes immediately, then
+            // return truthful draining status without blocking RPC callers.
+            let wait_window_ms = if owner_draining_in_flight { 120 } else { 5_000 };
+            let deadline = Instant::now() + Duration::from_millis(wait_window_ms);
             while Instant::now() < deadline {
                 if !matches!(
                     self.controller.ownership_store().inspect_job_lock(&key)?,
                     CoworkerJobLockState::HeldByActiveProcess { .. }
                 ) {
+                    owner_draining_in_flight = false;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1451,10 +2281,12 @@ impl CoworkerCodeDriver {
         // STEP 3: If the lock is now free, open a short-lived owned session to verify full admission
         // under the guard, cancel any active original host tasks (when a Ready host is active),
         // reconcile snapshots, and release the lease.
-        if !matches!(
-            self.controller.ownership_store().inspect_job_lock(&key)?,
-            CoworkerJobLockState::HeldByActiveProcess { .. }
-        ) {
+        if !owner_draining_in_flight
+            && !matches!(
+                self.controller.ownership_store().inspect_job_lock(&key)?,
+                CoworkerJobLockState::HeldByActiveProcess { .. }
+            )
+        {
             let cancel_now_ms = current_time_ms();
             let session = self.controller.open_owned_session(
                 binding_id,
@@ -1505,6 +2337,13 @@ impl CoworkerCodeDriver {
 
             let owner_summary = session.guard().validate_before_effect(&key)?.clone();
             let previous_state = self.read_driver_state_optional(&key)?;
+            let effective_mode = resolve_effective_execution_mode(
+                None,
+                previous_state.as_ref(),
+                &inspection.job,
+                &inspection.runtime_state,
+            )
+            .unwrap_or(CoworkerDriverExecutionMode::FullAutomaticPipeline);
             let effective_host_mode = if narrow_host_cancellation_attempted {
                 CoworkerDriverHostMode::ReusedVerifiedReadyHost
             } else {
@@ -1519,6 +2358,14 @@ impl CoworkerCodeDriver {
                     .as_ref()
                     .and_then(|s| s.last_step_report.clone())
             });
+            let mut updated_pipe_report = previous_state
+                .as_ref()
+                .and_then(|s| s.last_pipeline_report.clone());
+            if let Some(ref mut pipe_rep) = updated_pipe_report {
+                pipe_rep.status = CoworkerPipelineStatus::Stopped;
+                pipe_rep.draining_in_flight_after_stop = false;
+                pipe_rep.in_flight_stages.clear();
+            }
             let updated_state = CoworkerDriverStateRecord {
                 schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
                 binding_id: key.binding_id.clone(),
@@ -1541,8 +2388,16 @@ impl CoworkerCodeDriver {
                 steps_completed: 1,
                 last_overall_status: CoworkerControllerPhase1Status::Stopped,
                 last_step_report: effective_step_report,
-                pipeline_boundary:
-                    CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+                execution_mode: Some(effective_mode),
+                last_pipeline_status: if effective_mode
+                    == CoworkerDriverExecutionMode::FullAutomaticPipeline
+                {
+                    Some(CoworkerPipelineStatus::Stopped)
+                } else {
+                    None
+                },
+                last_pipeline_report: updated_pipe_report,
+                pipeline_boundary: boundary_for_mode(effective_mode),
                 started_at_ms: cancel_now_ms,
                 updated_at_ms: current_time_ms(),
             };
@@ -1550,7 +2405,26 @@ impl CoworkerCodeDriver {
             session.release()?;
         }
 
-        let status = self.build_readonly_status_report(&key, None, None)?;
+        let status = self.status(binding_id, thread_uuid, job_id).await?;
+        let (cancel_boundary, cancel_note) = match status.execution_mode {
+            CoworkerDriverExecutionMode::FullAutomaticPipeline => (
+                CoworkerDerivedCancellationBoundary::OriginalAndDerivedSignalledDirectCheckReviewerClosureDrainedFenced,
+                "Durable stop_requested persisted before narrow ApprovedHostClient::cancel_task \
+                 calls on original host tasks (task_id -> run_id) and process-group stop signalling \
+                 for active derived Coder correction runs; finite in-flight check, Reviewer, \
+                 TaskIntegration, and Closure calls that lack cancellation APIs drain under the held \
+                 ownership guard and fence stage promotion without claiming remote inference termination."
+                    .to_owned(),
+            ),
+            CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => (
+                CoworkerDerivedCancellationBoundary::OriginalHostTasksOnlyDerivedIntegratedLater,
+                "Durable stop_requested persisted before narrow ApprovedHostClient::cancel_task \
+                 calls on original host tasks (task_id -> run_id); no PID or process-name kills \
+                 are used. Running derived-attempt cancellation will be integrated in a later \
+                 milestone."
+                    .to_owned(),
+            ),
+        };
         Ok(CoworkerDriverCancelReport {
             binding_id: binding_id.to_owned(),
             thread_uuid: thread_uuid.to_owned(),
@@ -1561,14 +2435,8 @@ impl CoworkerCodeDriver {
             notified_live_owner,
             narrow_host_cancellation_attempted,
             cancelled_host_tasks,
-            derived_attempt_cancellation_boundary:
-                CoworkerDerivedCancellationBoundary::OriginalHostTasksOnlyDerivedIntegratedLater,
-            cancellation_boundary_note:
-                "Durable stop_requested persisted before narrow ApprovedHostClient::cancel_task \
-                 calls on original host tasks (task_id -> run_id); no PID or process-name kills \
-                 are used. Running derived-attempt cancellation will be integrated in a later \
-                 milestone."
-                    .to_owned(),
+            derived_attempt_cancellation_boundary: cancel_boundary,
+            cancellation_boundary_note: cancel_note,
             status,
         })
     }
@@ -1598,16 +2466,27 @@ impl CoworkerCodeDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn execute_owner_step_or_quiescent_check(
+    async fn execute_owner_step_or_quiescent_check<'a>(
         &self,
         key: &CoworkerJobOwnershipKey,
-        session: &OwnedCoworkerControllerSession,
-        host_session: &mut ActiveHostSession,
-        steps_completed: &mut u32,
-        last_step_report: &mut Option<CoworkerControllerStepReport>,
+        session: &'a OwnedCoworkerControllerSession,
+        effective_mode: CoworkerDriverExecutionMode,
+        pipeline_service: Option<&CoworkerPipelineService>,
+        pipeline_driver: &mut Option<CoworkerPipelineDriver<'a>>,
+        host_mode: CoworkerDriverHostMode,
+        steps_completed: u32,
+        mut last_pipeline_report: Option<CoworkerDriverPipelineReport>,
         now_ms: u64,
         canonical_socket_path: &Path,
-    ) -> Result<(), NativeError> {
+    ) -> Result<
+        (
+            u32,
+            CoworkerControllerStepReport,
+            Option<CoworkerDriverPipelineReport>,
+            bool,
+        ),
+        NativeError,
+    > {
         let owner_summary = session.guard().validate_before_effect(key)?.clone();
         let verified_summary = self
             .controller
@@ -1621,7 +2500,8 @@ impl CoworkerCodeDriver {
         }
 
         let prev_state = self.read_driver_state_optional(key)?;
-        let step_report = if host_session.mode == CoworkerDriverHostMode::QuiescentNoHostRequired {
+        let mut draining_after_stop = false;
+        let step_report = if host_mode == CoworkerDriverHostMode::QuiescentNoHostRequired {
             let admission = session.verify_admission()?;
             let lease = admission
                 .runtime_state
@@ -1636,11 +2516,42 @@ impl CoworkerCodeDriver {
                 })?;
             let lease_epoch = lease.lease_epoch;
             let controller_instance_id = lease.instance_id.clone();
-            let inspection = ReadonlyScopedJobInspection {
-                job: admission.job.clone(),
-                runtime_state: admission.runtime_state.clone(),
-                approval: admission.approval.clone(),
-            };
+
+            if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+                let mut completion_summary = last_pipeline_report
+                    .as_ref()
+                    .and_then(|r| r.completion_summary.clone());
+                if admission.job.phase == CoworkerJobPhase::Completed {
+                    if let Some(svc) = pipeline_service {
+                        let comp_req = CoworkerJobCompletionRequest {
+                            binding_id: key.binding_id.clone(),
+                            thread_uuid: key.thread_uuid.clone(),
+                            job_id: key.job_id.clone(),
+                            now_ms: now_ms.max(1),
+                        };
+                        let comp_outcome = Box::pin(
+                            svc.completion_service()
+                                .complete_job(session.guard(), &comp_req),
+                        )
+                        .await?;
+                        completion_summary =
+                            Some(CoworkerDriverCompletionSummary::from_outcome(&comp_outcome));
+                    }
+                }
+                let post_inspection = self.inspect_scoped_job_readonly(key)?;
+                let (_, mut synth_pipe) = self.synthesize_readonly_pipeline_report(
+                    &post_inspection,
+                    prev_state.as_ref(),
+                    Vec::new(),
+                    false,
+                )?;
+                if let Some(comp) = completion_summary {
+                    synth_pipe.completion_summary = Some(comp);
+                }
+                last_pipeline_report = Some(synth_pipe);
+            }
+
+            let inspection = self.inspect_scoped_job_readonly(key)?;
             let (status, tasks) = self.synthesize_status_and_tasks(&inspection)?;
             let fenced_task_ids = tasks
                 .iter()
@@ -1659,25 +2570,90 @@ impl CoworkerCodeDriver {
                 binding_id: key.binding_id.clone(),
                 thread_uuid: key.thread_uuid.clone(),
                 job_id: key.job_id.clone(),
-                approval_id: admission.approval.approval_id,
-                job_revision: admission.job.job_revision,
+                approval_id: inspection.approval.approval_id,
+                job_revision: inspection.job.job_revision,
                 lease_epoch,
                 controller_instance_id,
                 status,
-                max_parallel: admission.approval.max_parallel,
+                max_parallel: inspection.approval.max_parallel,
                 active_running_count: 0,
-                dispatched_task_ids: Vec::new(),
-                reconciled_ready_for_review_task_ids: Vec::new(),
-                promoted_dependency_ready_task_ids: Vec::new(),
+                dispatched_task_ids: last_pipeline_report
+                    .as_ref()
+                    .map_or_else(Vec::new, |r| r.dispatched_task_ids.clone()),
+                reconciled_ready_for_review_task_ids: last_pipeline_report
+                    .as_ref()
+                    .map_or_else(Vec::new, |r| r.reconciled_ready_for_review_task_ids.clone()),
+                promoted_dependency_ready_task_ids: last_pipeline_report
+                    .as_ref()
+                    .map_or_else(Vec::new, |r| r.promoted_dependency_ready_task_ids.clone()),
                 fenced_task_ids,
                 unknown_effect_task_ids,
+                tasks,
+            }
+        } else if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+            let drv = pipeline_driver.as_mut().ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "FullAutomaticPipeline mode requires an initialized CoworkerPipelineDriver.",
+                )
+            })?;
+            let tick_report = Box::pin(drv.tick(now_ms.max(1))).await?;
+            if tick_report.status == CoworkerPipelineStatus::Stopped {
+                draining_after_stop = !tick_report.in_flight_stages.is_empty();
+            } else {
+                draining_after_stop = false;
+            }
+            if let Some(ref mut existing) = last_pipeline_report {
+                existing.merge_from_tick(&tick_report, draining_after_stop);
+            } else {
+                last_pipeline_report = Some(CoworkerDriverPipelineReport::from_tick(
+                    &tick_report,
+                    draining_after_stop,
+                ));
+            }
+            let inspection = self.inspect_scoped_job_readonly(key)?;
+            let (status, tasks) = self.synthesize_status_and_tasks(&inspection)?;
+            let active_running_count = tasks
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t.stage,
+                        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                    ) || matches!(
+                        t.host_status,
+                        TaskExecutionStatus::Queued
+                            | TaskExecutionStatus::Claimed
+                            | TaskExecutionStatus::Running
+                            | TaskExecutionStatus::CancelRequested
+                    )
+                })
+                .count();
+            let cumulative = last_pipeline_report.as_ref();
+            CoworkerControllerStepReport {
+                binding_id: key.binding_id.clone(),
+                thread_uuid: key.thread_uuid.clone(),
+                job_id: key.job_id.clone(),
+                approval_id: tick_report.approval_id,
+                job_revision: tick_report.job_revision,
+                lease_epoch: tick_report.lease_epoch,
+                controller_instance_id: tick_report.controller_instance_id,
+                status,
+                max_parallel: inspection.approval.max_parallel,
+                active_running_count,
+                dispatched_task_ids: cumulative
+                    .map_or_else(Vec::new, |r| r.dispatched_task_ids.clone()),
+                reconciled_ready_for_review_task_ids: cumulative
+                    .map_or_else(Vec::new, |r| r.reconciled_ready_for_review_task_ids.clone()),
+                promoted_dependency_ready_task_ids: cumulative
+                    .map_or_else(Vec::new, |r| r.promoted_dependency_ready_task_ids.clone()),
+                fenced_task_ids: tick_report.fenced_task_ids,
+                unknown_effect_task_ids: tick_report.unknown_effect_task_ids,
                 tasks,
             }
         } else {
             session.step(now_ms).await?
         };
-        *steps_completed = steps_completed.saturating_add(1);
-        *last_step_report = Some(step_report.clone());
+        let next_steps_completed = steps_completed.saturating_add(1);
 
         let state_record = CoworkerDriverStateRecord {
             schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
@@ -1690,7 +2666,7 @@ impl CoworkerCodeDriver {
             owner_uid: current_effective_uid(),
             lock_file_identity: owner_summary.lock_file_identity,
             socket_path: canonical_socket_path.display().to_string(),
-            host_mode: host_session.mode,
+            host_mode,
             owner_active: true,
             graceful_exit_completed: false,
             owner_quiescent_host_shutdown_updated_at_ms: prev_state
@@ -1698,16 +2674,23 @@ impl CoworkerCodeDriver {
                 .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
             owner_quiescent_host_instance_id: prev_state
                 .and_then(|s| s.owner_quiescent_host_instance_id),
-            steps_completed: *steps_completed,
+            steps_completed: next_steps_completed,
             last_overall_status: step_report.status,
-            last_step_report: Some(step_report),
-            pipeline_boundary:
-                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
+            last_step_report: Some(step_report.clone()),
+            execution_mode: Some(effective_mode),
+            last_pipeline_status: last_pipeline_report.as_ref().map(|r| r.status),
+            last_pipeline_report: last_pipeline_report.clone(),
+            pipeline_boundary: boundary_for_mode(effective_mode),
             started_at_ms: owner_summary.acquired_at_ms,
             updated_at_ms: current_time_ms(),
         };
         self.write_driver_state(key, &state_record)?;
-        Ok(())
+        Ok((
+            next_steps_completed,
+            step_report,
+            last_pipeline_report,
+            draining_after_stop,
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1716,10 +2699,16 @@ impl CoworkerCodeDriver {
         stream: UnixStream,
         key: &CoworkerJobOwnershipKey,
         session: &OwnedCoworkerControllerSession,
-        host_session: &mut ActiveHostSession,
-        steps_completed: &mut u32,
-        last_step_report: &mut Option<CoworkerControllerStepReport>,
-        canonical_socket_path: &Path,
+        host_mode: CoworkerDriverHostMode,
+        effective_mode: CoworkerDriverExecutionMode,
+        in_flight_stages_rx: Option<
+            &tokio::sync::watch::Receiver<Vec<CoworkerPipelineInFlightStageRef>>,
+        >,
+        step_in_progress: bool,
+        last_step_report: &Option<CoworkerControllerStepReport>,
+        last_pipeline_report: &Option<CoworkerDriverPipelineReport>,
+        draining_after_stop: &mut bool,
+        immediate_step_requested: &mut bool,
         stop_loop: &mut bool,
     ) -> Result<(), NativeError> {
         let peer = stream
@@ -1792,21 +2781,15 @@ impl CoworkerCodeDriver {
         let mut op_error: Option<String> = None;
 
         match request.op {
-            DriverRpcOp::Status => {}
+            DriverRpcOp::Status => {
+                // Status RPC never invokes models or advances pipeline state; it returns cached
+                // compact evidence combined with live read-only store/in-flight inspection.
+            }
             DriverRpcOp::Reconcile => {
-                if let Err(err) = self
-                    .execute_owner_step_or_quiescent_check(
-                        key,
-                        session,
-                        host_session,
-                        steps_completed,
-                        last_step_report,
-                        current_time_ms(),
-                        canonical_socket_path,
-                    )
-                    .await
-                {
+                if let Err(err) = session.verify_admission() {
                     op_error = Some(err.to_string());
+                } else if !step_in_progress {
+                    *immediate_step_requested = true;
                 }
             }
             DriverRpcOp::Cancel { reason } => {
@@ -1822,6 +2805,8 @@ impl CoworkerCodeDriver {
                             Ok(())
                         },
                     );
+                *draining_after_stop = true;
+                *immediate_step_requested = true;
                 if let Ok(admission) = session.verify_admission() {
                     if self
                         .is_verified_ready_host_active(&admission.approval)
@@ -1841,31 +2826,30 @@ impl CoworkerCodeDriver {
                         {
                             cancelled_host_tasks = cancelled;
                         }
-                        let _ = self
-                            .execute_owner_step_or_quiescent_check(
-                                key,
-                                session,
-                                host_session,
-                                steps_completed,
-                                last_step_report,
-                                current_time_ms(),
-                                canonical_socket_path,
-                            )
-                            .await;
                     }
                 }
-                *stop_loop = true;
+                let live_in_flight_len = in_flight_stages_rx.map_or(0, |rx| rx.borrow().len());
+                if !step_in_progress && live_in_flight_len == 0 && !*immediate_step_requested {
+                    *draining_after_stop = false;
+                    *stop_loop = true;
+                }
             }
         }
 
         // Re-validate held guard immediately before serializing response.
         let post_summary = session.guard().validate_before_effect(key)?.clone();
+        let live_in_flight_stages =
+            in_flight_stages_rx.map_or_else(Vec::new, |rx| rx.borrow().clone());
         let status_report = self
             .build_live_owner_status_report(
                 key,
                 &post_summary,
-                host_session.mode,
+                host_mode,
+                effective_mode,
                 last_step_report.clone(),
+                last_pipeline_report.clone(),
+                live_in_flight_stages,
+                *draining_after_stop,
             )
             .ok();
 
@@ -2149,13 +3133,17 @@ impl CoworkerCodeDriver {
         &self,
         key: &CoworkerJobOwnershipKey,
         admission: &VerifiedControllerAdmission,
+        execution_mode: CoworkerDriverExecutionMode,
     ) -> Result<bool, NativeError> {
         if !admission.runtime_state.unresolved_effects().is_empty()
-            || admission
-                .job
-                .outbox
-                .iter()
-                .any(|o| o.status.blocks_replay_and_new_dispatch())
+            || admission.job.outbox.iter().any(|o| {
+                o.status.blocks_replay_and_new_dispatch()
+                    && !is_outbox_confirmed_but_fenced_by_stop(
+                        &admission.job,
+                        o,
+                        &admission.runtime_state,
+                    )
+            })
         {
             return Ok(false);
         }
@@ -2163,7 +3151,28 @@ impl CoworkerCodeDriver {
         let job_stopped = admission.runtime_state.stop_requested
             || admission.job.phase == CoworkerJobPhase::Cancelled;
 
+        if execution_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline
+            && !job_stopped
+            && (admission.job.phase != CoworkerJobPhase::Completed
+                || admission
+                    .job
+                    .tasks
+                    .iter()
+                    .any(|t| t.stage != CoworkerTaskStage::Integrated))
+        {
+            return Ok(false);
+        }
+
         for task in &admission.job.tasks {
+            if task.unresolved_outbox_id.is_some()
+                && !is_review_reserved_task_confirmed_but_fenced_by_stop(
+                    &admission.job,
+                    task,
+                    &admission.runtime_state,
+                )
+            {
+                return Ok(false);
+            }
             match task.stage {
                 CoworkerTaskStage::DispatchReserved
                 | CoworkerTaskStage::Running
@@ -2183,8 +3192,18 @@ impl CoworkerCodeDriver {
                         return Ok(false);
                     }
                 }
+                CoworkerTaskStage::ReviewReserved => {
+                    if !job_stopped
+                        || !is_review_reserved_task_confirmed_but_fenced_by_stop(
+                            &admission.job,
+                            task,
+                            &admission.runtime_state,
+                        )
+                    {
+                        return Ok(false);
+                    }
+                }
                 CoworkerTaskStage::PendingDependencies
-                | CoworkerTaskStage::ReviewReserved
                 | CoworkerTaskStage::UnderReview
                 | CoworkerTaskStage::CorrectInScopeRequired
                 | CoworkerTaskStage::Accepted
@@ -2212,15 +3231,21 @@ impl CoworkerCodeDriver {
         if !driver_state.graceful_exit_completed {
             return Ok(false);
         }
-        let Some(expected_updated_at_ms) = driver_state.owner_quiescent_host_shutdown_updated_at_ms
-        else {
-            return Ok(false);
-        };
 
         let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
         let Some(manifest) = read_host_manifest_optional(&session_dir, &admission.approval)
             .map_err(map_host_error)?
         else {
+            return Ok(false);
+        };
+        let Some(expected_updated_at_ms) = driver_state.owner_quiescent_host_shutdown_updated_at_ms
+        else {
+            if admission.job.phase == CoworkerJobPhase::Completed
+                && manifest.phase == HostPhase::Stopped
+                && !is_host_lock_held(&session_dir).unwrap_or(true)
+            {
+                return Ok(true);
+            }
             return Ok(false);
         };
         let instance_matches = match (
@@ -2240,8 +3265,9 @@ impl CoworkerCodeDriver {
         &self,
         key: &CoworkerJobOwnershipKey,
         admission: &VerifiedControllerAdmission,
+        execution_mode: CoworkerDriverExecutionMode,
     ) -> Result<(), NativeError> {
-        if self.can_skip_host_for_quiescent_job(key, admission)? {
+        if self.can_skip_host_for_quiescent_job(key, admission, execution_mode)? {
             return Ok(());
         }
         let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
@@ -2329,6 +3355,7 @@ impl CoworkerCodeDriver {
         &self,
         key: &CoworkerJobOwnershipKey,
         admission: &VerifiedControllerAdmission,
+        execution_mode: CoworkerDriverExecutionMode,
     ) -> Result<ActiveHostSession, NativeError> {
         let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
         match fs::symlink_metadata(&session_dir) {
@@ -2367,7 +3394,7 @@ impl CoworkerCodeDriver {
                         });
                     }
                 }
-                if self.can_skip_host_for_quiescent_job(key, admission)? {
+                if self.can_skip_host_for_quiescent_job(key, admission, execution_mode)? {
                     return Ok(ActiveHostSession {
                         mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
                         owned_handle: None,
@@ -2398,7 +3425,7 @@ impl CoworkerCodeDriver {
                         ),
                     ));
                 }
-                if self.can_skip_host_for_quiescent_job(key, admission)? {
+                if self.can_skip_host_for_quiescent_job(key, admission, execution_mode)? {
                     return Ok(ActiveHostSession {
                         mode: CoworkerDriverHostMode::QuiescentNoHostRequired,
                         owned_handle: None,
@@ -2539,14 +3566,25 @@ impl CoworkerCodeDriver {
         Ok(cancelled)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_live_owner_status_report(
         &self,
         key: &CoworkerJobOwnershipKey,
         verified_owner_summary: &CoworkerOwnershipSummary,
         host_mode: CoworkerDriverHostMode,
+        effective_mode: CoworkerDriverExecutionMode,
         step_report: Option<CoworkerControllerStepReport>,
+        mut pipeline_report: Option<CoworkerDriverPipelineReport>,
+        live_in_flight_stages: Vec<CoworkerPipelineInFlightStageRef>,
+        draining_after_stop: bool,
     ) -> Result<CoworkerDriverStatusReport, NativeError> {
-        let inspection = self.inspect_scoped_job_readonly(key)?;
+        let mut inspection = self.inspect_scoped_job_readonly(key)?;
+        if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+            filter_live_owned_in_flight_review_reservations(
+                &mut inspection,
+                &live_in_flight_stages,
+            );
+        }
         let lease = inspection.runtime_state.lease.clone();
         let lease_active = lease.as_ref().is_some_and(|l| l.active);
         let lease_owner_instance_id = lease.as_ref().map(|l| l.instance_id.clone());
@@ -2555,16 +3593,56 @@ impl CoworkerCodeDriver {
         let (host_phase, host_lock_held) =
             self.inspect_host_phase_and_lock(&session_dir, &inspection.approval)?;
 
-        let (overall_status, tasks) = if let Some(report) = &step_report {
-            (report.status, report.tasks.clone())
-        } else {
-            self.synthesize_status_and_tasks(&inspection)?
+        let (overall_status, tasks) = match (&effective_mode, step_report.as_ref()) {
+            (CoworkerDriverExecutionMode::Phase1InitialDispatchOnly, Some(report)) => {
+                (report.status, report.tasks.clone())
+            }
+            _ => self.synthesize_status_and_tasks(&inspection)?,
         };
         let blocked_on_unknown = has_unresolved_or_unknown_effect(
             &inspection.job,
             &inspection.runtime_state,
             overall_status,
         );
+
+        let stopping_draining = draining_after_stop && !live_in_flight_stages.is_empty();
+        if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+            let persisted_state = self.read_driver_state_optional(key).ok().flatten();
+            let (_, mut synth_rep) = self.synthesize_readonly_pipeline_report(
+                &inspection,
+                persisted_state.as_ref(),
+                live_in_flight_stages.clone(),
+                stopping_draining,
+            )?;
+            if let Some(prev_rep) = pipeline_report {
+                for id in prev_rep.dispatched_task_ids {
+                    push_unique_id(&mut synth_rep.dispatched_task_ids, &id);
+                }
+                for id in prev_rep.reconciled_ready_for_review_task_ids {
+                    push_unique_id(&mut synth_rep.reconciled_ready_for_review_task_ids, &id);
+                }
+                for id in prev_rep.verified_task_ids {
+                    push_unique_id(&mut synth_rep.verified_task_ids, &id);
+                }
+                for id in prev_rep.reviewed_task_ids {
+                    push_unique_id(&mut synth_rep.reviewed_task_ids, &id);
+                }
+                for id in prev_rep.integrated_task_ids {
+                    push_unique_id(&mut synth_rep.integrated_task_ids, &id);
+                }
+                for id in prev_rep.prepared_dependency_task_ids {
+                    push_unique_id(&mut synth_rep.prepared_dependency_task_ids, &id);
+                }
+                for id in prev_rep.promoted_dependency_ready_task_ids {
+                    push_unique_id(&mut synth_rep.promoted_dependency_ready_task_ids, &id);
+                }
+                if synth_rep.completion_summary.is_none() {
+                    synth_rep.completion_summary = prev_rep.completion_summary;
+                }
+            }
+            pipeline_report = Some(synth_rep);
+        }
+        let pipeline_status = pipeline_report.as_ref().map(|r| r.status);
 
         Ok(CoworkerDriverStatusReport {
             binding_id: key.binding_id.clone(),
@@ -2581,6 +3659,11 @@ impl CoworkerCodeDriver {
             host_mode,
             job_phase: inspection.job.phase,
             overall_status,
+            execution_mode: effective_mode,
+            pipeline_status,
+            stopping_draining_in_flight: stopping_draining,
+            in_flight_stages: live_in_flight_stages,
+            pipeline_report,
             stop_requested: inspection.runtime_state.stop_requested,
             blocked_on_unknown_effect: blocked_on_unknown,
             stop_or_block_reason: inspection.runtime_state.stop_or_block_reason,
@@ -2591,9 +3674,8 @@ impl CoworkerCodeDriver {
                 .max_total_task_attempts_per_job,
             tasks,
             step_report,
-            pipeline_boundary:
-                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
-            boundary_note: phase1_boundary_note(),
+            pipeline_boundary: boundary_for_mode(effective_mode),
+            boundary_note: boundary_note_for_mode(effective_mode),
         })
     }
 
@@ -2646,6 +3728,20 @@ impl CoworkerCodeDriver {
         let (host_phase, host_lock_held) =
             self.inspect_host_phase_and_lock(&session_dir, &inspection.approval)?;
 
+        let effective_mode = resolve_effective_execution_mode(
+            None,
+            persisted_driver_state.as_ref(),
+            &inspection.job,
+            &inspection.runtime_state,
+        )
+        .unwrap_or_else(|_| {
+            if envelope_authorizes_full_pipeline(&inspection.job, &inspection.runtime_state) {
+                CoworkerDriverExecutionMode::FullAutomaticPipeline
+            } else {
+                CoworkerDriverExecutionMode::Phase1InitialDispatchOnly
+            }
+        });
+
         let step_report = override_step_report.or_else(|| {
             if owner_state == CoworkerDriverOwnerState::NoActiveOwner {
                 persisted_driver_state
@@ -2662,6 +3758,20 @@ impl CoworkerCodeDriver {
             &inspection.runtime_state,
             overall_status,
         );
+
+        let (pipeline_status, pipeline_report) =
+            if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+                let (pipe_status, pipe_report) = self.synthesize_readonly_pipeline_report(
+                    &inspection,
+                    persisted_driver_state.as_ref(),
+                    Vec::new(),
+                    false,
+                )?;
+                (Some(pipe_status), Some(pipe_report))
+            } else {
+                (None, None)
+            };
+
         let host_mode = override_host_mode
             .or_else(|| {
                 if owner_state == CoworkerDriverOwnerState::NoActiveOwner {
@@ -2687,6 +3797,11 @@ impl CoworkerCodeDriver {
             host_mode,
             job_phase: inspection.job.phase,
             overall_status,
+            execution_mode: effective_mode,
+            pipeline_status,
+            stopping_draining_in_flight: false,
+            in_flight_stages: Vec::new(),
+            pipeline_report,
             stop_requested: inspection.runtime_state.stop_requested,
             blocked_on_unknown_effect: blocked_on_unknown,
             stop_or_block_reason: inspection.runtime_state.stop_or_block_reason,
@@ -2697,10 +3812,311 @@ impl CoworkerCodeDriver {
                 .max_total_task_attempts_per_job,
             tasks,
             step_report,
-            pipeline_boundary:
-                CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly,
-            boundary_note: phase1_boundary_note(),
+            pipeline_boundary: boundary_for_mode(effective_mode),
+            boundary_note: boundary_note_for_mode(effective_mode),
         })
+    }
+
+    fn synthesize_readonly_pipeline_report(
+        &self,
+        inspection: &ReadonlyScopedJobInspection,
+        persisted_driver_state: Option<&CoworkerDriverStateRecord>,
+        in_flight_stages: Vec<CoworkerPipelineInFlightStageRef>,
+        draining_in_flight_after_stop: bool,
+    ) -> Result<(CoworkerPipelineStatus, CoworkerDriverPipelineReport), NativeError> {
+        let (_, phase1_obs) = self.synthesize_status_and_tasks(inspection)?;
+        let lease_epoch = inspection
+            .runtime_state
+            .lease
+            .as_ref()
+            .map_or(0, |l| l.lease_epoch);
+        let controller_instance_id = inspection
+            .runtime_state
+            .lease
+            .as_ref()
+            .map(|l| l.instance_id.clone())
+            .or_else(|| persisted_driver_state.map(|s| s.owner_instance_id.clone()))
+            .unwrap_or_default();
+
+        let mut base = persisted_driver_state
+            .and_then(|s| s.last_pipeline_report.clone())
+            .unwrap_or_else(|| CoworkerDriverPipelineReport {
+                binding_id: inspection.job.binding_id.clone(),
+                thread_uuid: inspection.job.thread_uuid.clone(),
+                job_id: inspection.job.job_id.clone(),
+                approval_id: inspection.approval.approval_id.clone(),
+                job_phase: inspection.job.phase,
+                job_revision: inspection.job.job_revision,
+                lease_epoch,
+                controller_instance_id: controller_instance_id.clone(),
+                status: CoworkerPipelineStatus::Running,
+                draining_in_flight_after_stop: false,
+                in_flight_stages: Vec::new(),
+                dispatched_task_ids: Vec::new(),
+                reconciled_ready_for_review_task_ids: Vec::new(),
+                verified_task_ids: Vec::new(),
+                reviewed_task_ids: Vec::new(),
+                integrated_task_ids: Vec::new(),
+                prepared_dependency_task_ids: Vec::new(),
+                promoted_dependency_ready_task_ids: Vec::new(),
+                awaiting_correction_task_ids: Vec::new(),
+                failed_check_task_ids: Vec::new(),
+                fenced_task_ids: Vec::new(),
+                unknown_effect_task_ids: Vec::new(),
+                blocked_or_failed_task_ids: Vec::new(),
+                tasks: Vec::new(),
+                completion_summary: None,
+            });
+
+        base.job_phase = inspection.job.phase;
+        base.job_revision = inspection.job.job_revision;
+        base.lease_epoch = lease_epoch;
+        if !controller_instance_id.is_empty() {
+            base.controller_instance_id = controller_instance_id;
+        }
+        base.in_flight_stages = in_flight_stages.clone();
+        base.draining_in_flight_after_stop = draining_in_flight_after_stop;
+
+        let mut awaiting_correction_task_ids = Vec::new();
+        let mut fenced_task_ids = Vec::new();
+        let mut unknown_effect_task_ids = Vec::new();
+        let mut blocked_or_failed_task_ids = Vec::new();
+        let mut snapshots = Vec::with_capacity(inspection.job.tasks.len());
+
+        for task in &inspection.job.tasks {
+            let obs = phase1_obs.iter().find(|o| o.task_id == task.task_id);
+            let host_status = obs.map_or(TaskExecutionStatus::NotStarted, |o| o.host_status);
+            let fenced = obs.is_some_and(|o| o.fenced)
+                || inspection.runtime_state.stop_requested
+                || inspection.job.phase == CoworkerJobPhase::Cancelled;
+            if fenced {
+                push_unique_id(&mut fenced_task_ids, &task.task_id);
+            }
+            if task.current_attempt_no >= 1
+                && !matches!(
+                    task.stage,
+                    CoworkerTaskStage::PendingDependencies | CoworkerTaskStage::ReadyToDispatch
+                )
+            {
+                push_unique_id(&mut base.dispatched_task_ids, &task.task_id);
+            }
+            let latest_candidate = task.candidates.last();
+            let review_subject_promoted = task.current_attempt_no >= 1
+                && inspection
+                    .runtime_state
+                    .get_attempt_artifacts(&task.task_id, task.current_attempt_no)
+                    .is_some_and(|a| a.review_subject.is_some());
+            if review_subject_promoted
+                || matches!(
+                    task.stage,
+                    CoworkerTaskStage::ReviewReserved
+                        | CoworkerTaskStage::UnderReview
+                        | CoworkerTaskStage::CorrectInScopeRequired
+                        | CoworkerTaskStage::Accepted
+                        | CoworkerTaskStage::IntegrationReserved
+                        | CoworkerTaskStage::Integrated
+                )
+            {
+                push_unique_id(
+                    &mut base.reconciled_ready_for_review_task_ids,
+                    &task.task_id,
+                );
+                push_unique_id(&mut base.verified_task_ids, &task.task_id);
+            }
+            let review_verdict_outcome = latest_candidate
+                .and_then(|c| c.review_verdict.as_ref())
+                .map(|v| v.outcome);
+            let review_receipt_id = latest_candidate.and_then(|c| c.review_receipt_id.clone());
+            let integration_receipt_id =
+                latest_candidate.and_then(|c| c.integration_receipt_id.clone());
+            if review_verdict_outcome.is_some()
+                || matches!(
+                    task.stage,
+                    CoworkerTaskStage::CorrectInScopeRequired
+                        | CoworkerTaskStage::Accepted
+                        | CoworkerTaskStage::IntegrationReserved
+                        | CoworkerTaskStage::Integrated
+                )
+            {
+                push_unique_id(&mut base.reviewed_task_ids, &task.task_id);
+            }
+            if task.stage == CoworkerTaskStage::Integrated {
+                push_unique_id(&mut base.integrated_task_ids, &task.task_id);
+            }
+            if task.stage == CoworkerTaskStage::CorrectInScopeRequired {
+                push_unique_id(&mut awaiting_correction_task_ids, &task.task_id);
+            }
+            if task.stage == CoworkerTaskStage::EffectUnknown
+                || (task.unresolved_outbox_id.is_some()
+                    && !is_review_reserved_task_confirmed_but_fenced_by_stop(
+                        &inspection.job,
+                        task,
+                        &inspection.runtime_state,
+                    )
+                    && !is_live_owned_in_flight_review_task(
+                        &inspection.job,
+                        task,
+                        &inspection.runtime_state,
+                        &in_flight_stages,
+                    ))
+            {
+                push_unique_id(&mut unknown_effect_task_ids, &task.task_id);
+            }
+            if matches!(
+                task.stage,
+                CoworkerTaskStage::Blocked
+                    | CoworkerTaskStage::Failed
+                    | CoworkerTaskStage::Cancelled
+            ) {
+                push_unique_id(&mut blocked_or_failed_task_ids, &task.task_id);
+            }
+            let in_flight_stage = in_flight_stages
+                .iter()
+                .find(|s| s.task_id.as_deref() == Some(task.task_id.as_str()))
+                .map(|s| s.kind);
+
+            snapshots.push(CoworkerPipelineTaskSnapshot {
+                task_id: task.task_id.clone(),
+                attempt_no: task.current_attempt_no,
+                stage: task.stage,
+                host_status,
+                fenced,
+                in_flight_stage,
+                candidate_id: latest_candidate.map(|c| c.candidate_id.clone()),
+                review_subject_promoted,
+                review_verdict_outcome,
+                review_receipt_id,
+                integration_receipt_id,
+                awaiting_correction_execution: task.stage
+                    == CoworkerTaskStage::CorrectInScopeRequired,
+                failed_check_ids: Vec::new(),
+                blocking_diagnostic: None,
+            });
+        }
+
+        base.awaiting_correction_task_ids = awaiting_correction_task_ids;
+        base.fenced_task_ids = fenced_task_ids;
+        base.unknown_effect_task_ids = unknown_effect_task_ids;
+        base.blocked_or_failed_task_ids = blocked_or_failed_task_ids;
+        base.tasks = snapshots;
+
+        let has_unknown = inspection
+            .runtime_state
+            .unresolved_effects()
+            .into_iter()
+            .any(|eff| {
+                !is_live_owned_in_flight_review_effect(
+                    &inspection.job,
+                    eff,
+                    &inspection.runtime_state,
+                    &in_flight_stages,
+                )
+            })
+            || inspection.job.outbox.iter().any(|o| {
+                o.status.blocks_replay_and_new_dispatch()
+                    && !is_outbox_confirmed_but_fenced_by_stop(
+                        &inspection.job,
+                        o,
+                        &inspection.runtime_state,
+                    )
+                    && !is_live_owned_in_flight_review_outbox(
+                        &inspection.job,
+                        o,
+                        &inspection.runtime_state,
+                        &in_flight_stages,
+                    )
+            })
+            || !base.unknown_effect_task_ids.is_empty();
+
+        let accepted_candidate = inspection
+            .job
+            .combined_candidates
+            .iter()
+            .find(|c| c.status == CombinedCandidateStatus::ClosureAccepted);
+
+        if let Some(cand) = accepted_candidate.or_else(|| inspection.job.combined_candidates.last())
+        {
+            if base.completion_summary.is_none() {
+                base.completion_summary = Some(CoworkerDriverCompletionSummary {
+                    status: if inspection.job.phase == CoworkerJobPhase::Completed
+                        && cand.status == CombinedCandidateStatus::ClosureAccepted
+                    {
+                        CoworkerJobCompletionStatus::Completed
+                    } else {
+                        CoworkerJobCompletionStatus::ClosureNotAccepted
+                    },
+                    integration_worktree_id: String::new(),
+                    integration_checkout_path: PathBuf::new(),
+                    integration_branch_name: String::new(),
+                    approved_base_commit: cand.project_base.base_commit.clone(),
+                    final_integrated_target_commit: cand
+                        .final_commit_sha
+                        .clone()
+                        .unwrap_or_default(),
+                    final_integrated_tree_sha: cand.final_tree_sha.clone(),
+                    reused_existing_receipts: true,
+                    check_evidence: cand.check_evidence.clone(),
+                    failed_check_id: None,
+                    combined_candidate_id: Some(cand.combined_candidate_id.clone()),
+                    combined_candidate_status: Some(cand.status),
+                    final_candidate_subject_digest: None,
+                    closure_reservation_id: cand.closure_reservation_id.clone(),
+                    closure_attempt_id: None,
+                    reused_cached_closure_verdict: true,
+                    closure_verdict_kind: if cand.status == CombinedCandidateStatus::ClosureAccepted
+                    {
+                        Some(ClosureVerdictKind::Accepted)
+                    } else {
+                        None
+                    },
+                    closure_verdict: None,
+                });
+            }
+        }
+
+        // AllTasksIntegrated is NOT Completed until real subject-bound Closure is accepted and
+        // job.phase == CoworkerJobPhase::Completed.
+        let status = if inspection.runtime_state.stop_requested
+            || inspection.job.phase == CoworkerJobPhase::Cancelled
+        {
+            CoworkerPipelineStatus::Stopped
+        } else if has_unknown {
+            CoworkerPipelineStatus::BlockedOnUnknownEffect
+        } else if inspection.job.phase == CoworkerJobPhase::Completed
+            && accepted_candidate.is_some()
+        {
+            CoworkerPipelineStatus::Completed
+        } else if !base.failed_check_task_ids.is_empty()
+            || base
+                .completion_summary
+                .as_ref()
+                .is_some_and(|c| c.status == CoworkerJobCompletionStatus::BlockedByFailedChecks)
+        {
+            CoworkerPipelineStatus::BlockedByFailedChecks
+        } else if inspection.job.phase == CoworkerJobPhase::Held
+            || inspection.job.holds.iter().any(|h| h.active)
+            || inspection
+                .job
+                .tasks
+                .iter()
+                .any(|t| t.stage == CoworkerTaskStage::Held || !t.active_hold_ids.is_empty())
+        {
+            CoworkerPipelineStatus::Held
+        } else if !base.blocked_or_failed_task_ids.is_empty()
+            || base
+                .completion_summary
+                .as_ref()
+                .is_some_and(|c| c.status == CoworkerJobCompletionStatus::ClosureNotAccepted)
+        {
+            CoworkerPipelineStatus::BlockedOrFailed
+        } else if !base.awaiting_correction_task_ids.is_empty() && in_flight_stages.is_empty() {
+            CoworkerPipelineStatus::AwaitingCorrectionExecution
+        } else {
+            CoworkerPipelineStatus::Running
+        };
+
+        base.status = status;
+        Ok((status, base))
     }
 
     fn inspect_host_phase_and_lock(
@@ -3204,6 +4620,185 @@ fn remove_socket_if_present(path: &Path) -> Result<(), NativeError> {
     }
 }
 
+fn push_unique_id(list: &mut Vec<String>, id: &str) {
+    if !list.iter().any(|existing| existing == id) {
+        list.push(id.to_owned());
+    }
+}
+
+const fn boundary_for_mode(mode: CoworkerDriverExecutionMode) -> CoworkerDriverPipelineBoundary {
+    match mode {
+        CoworkerDriverExecutionMode::FullAutomaticPipeline => {
+            CoworkerDriverPipelineBoundary::FullAutomaticPipelineThroughSingleClosure
+        }
+        CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => {
+            CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly
+        }
+    }
+}
+
+fn boundary_note_for_mode(mode: CoworkerDriverExecutionMode) -> String {
+    match mode {
+        CoworkerDriverExecutionMode::FullAutomaticPipeline => {
+            "Full automatic code-driver workflow retains ONE CoworkerPipelineDriver across ticks \
+             and RPCs, running initial/derived Coder attempts, task verification checks, Reviewer \
+             evaluation, bounded in-scope corrections, original per-task RunIntegration, downstream \
+             dependency seals, final combined candidate checks, and ONE Closure evaluation. \
+             Cancellation records stop_requested before effects, signals original/derived workers \
+             where supported, fences late promotion, and drains finite in-flight check/Reviewer/Closure \
+             calls under the held guard without claiming remote inference termination."
+                .to_owned()
+        }
+        CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => phase1_boundary_note(),
+    }
+}
+
+fn envelope_authorizes_full_pipeline(
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    let env = &runtime_state.envelope;
+    if !env.operator_attested
+        || !env.allow_task_worktree_commits
+        || !env.allow_run_integration_execution
+        || env.check_commands.is_empty()
+        || !env.role_budgets.contains_key(&WorkflowRole::Reviewer)
+        || !env.role_budgets.contains_key(&WorkflowRole::Closure)
+    {
+        return false;
+    }
+    job.approval_linkage.as_ref().is_some_and(|linkage| {
+        linkage.authorizes_local_git_integration()
+            && linkage.authorizes_reviewer_dispatch(&env.reviewer_choice)
+            && linkage.authorizes_closure_dispatch(&env.closure_choice)
+    })
+}
+
+fn resolve_effective_execution_mode(
+    requested_mode: Option<CoworkerDriverExecutionMode>,
+    persisted_state: Option<&CoworkerDriverStateRecord>,
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> Result<CoworkerDriverExecutionMode, NativeError> {
+    let envelope_allows_full = envelope_authorizes_full_pipeline(job, runtime_state);
+    match requested_mode {
+        Some(CoworkerDriverExecutionMode::FullAutomaticPipeline) => {
+            if !envelope_allows_full {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "frozen controller execution envelope does not authorize full_automatic_pipeline \
+                     (requires frozen Reviewer/Closure choices and budgets, non-empty check_commands, \
+                      allow_task_worktree_commits, allow_run_integration_execution, and local_git_integration_allowed).",
+                ));
+            }
+            Ok(CoworkerDriverExecutionMode::FullAutomaticPipeline)
+        }
+        Some(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly) => {
+            Ok(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly)
+        }
+        None => {
+            if let Some(prev_mode) = persisted_state.and_then(|s| s.execution_mode) {
+                if prev_mode == CoworkerDriverExecutionMode::Phase1InitialDispatchOnly {
+                    return Ok(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly);
+                }
+                if prev_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline
+                    && envelope_allows_full
+                {
+                    return Ok(CoworkerDriverExecutionMode::FullAutomaticPipeline);
+                }
+            }
+            if persisted_state.is_some_and(|s| {
+                s.execution_mode.is_none()
+                    && s.pipeline_boundary
+                        == CoworkerDriverPipelineBoundary::Phase1InitialDispatchAndReconcileOnly
+            }) {
+                return Ok(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly);
+            }
+            if envelope_allows_full {
+                Ok(CoworkerDriverExecutionMode::FullAutomaticPipeline)
+            } else {
+                Ok(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly)
+            }
+        }
+    }
+}
+
+fn owner_has_active_work(
+    mode: CoworkerDriverExecutionMode,
+    step_report: Option<&CoworkerControllerStepReport>,
+    pipeline_report: Option<&CoworkerDriverPipelineReport>,
+    in_flight_count: usize,
+) -> bool {
+    if in_flight_count > 0 {
+        return true;
+    }
+    match mode {
+        CoworkerDriverExecutionMode::FullAutomaticPipeline => {
+            if let Some(pipe) = pipeline_report {
+                if pipe.status == CoworkerPipelineStatus::Running
+                    || !pipe.in_flight_stages.is_empty()
+                    || pipe.draining_in_flight_after_stop
+                {
+                    return true;
+                }
+                false
+            } else {
+                step_report.is_some_and(report_has_active_work)
+            }
+        }
+        CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => {
+            step_report.is_some_and(report_has_active_work)
+        }
+    }
+}
+
+fn owner_is_terminal_or_stopped(
+    mode: CoworkerDriverExecutionMode,
+    step_report: Option<&CoworkerControllerStepReport>,
+    pipeline_report: Option<&CoworkerDriverPipelineReport>,
+    in_flight_count: usize,
+) -> bool {
+    if in_flight_count > 0 {
+        return false;
+    }
+    match mode {
+        CoworkerDriverExecutionMode::FullAutomaticPipeline => pipeline_report.is_some_and(|pipe| {
+            !pipe.draining_in_flight_after_stop
+                && pipe.in_flight_stages.is_empty()
+                && matches!(
+                    pipe.status,
+                    CoworkerPipelineStatus::Completed
+                        | CoworkerPipelineStatus::AwaitingCorrectionExecution
+                        | CoworkerPipelineStatus::BlockedByFailedChecks
+                        | CoworkerPipelineStatus::Held
+                        | CoworkerPipelineStatus::BlockedOrFailed
+                        | CoworkerPipelineStatus::BlockedOnUnknownEffect
+                        | CoworkerPipelineStatus::Stopped
+                )
+        }),
+        CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => {
+            step_report.is_some_and(|r| is_terminal_or_stopped_status(r.status))
+        }
+    }
+}
+
+fn owner_is_pipeline_await(
+    mode: CoworkerDriverExecutionMode,
+    step_report: Option<&CoworkerControllerStepReport>,
+    _pipeline_report: Option<&CoworkerDriverPipelineReport>,
+    in_flight_count: usize,
+) -> bool {
+    if in_flight_count > 0 {
+        return false;
+    }
+    match mode {
+        CoworkerDriverExecutionMode::FullAutomaticPipeline => false,
+        CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => {
+            step_report.is_some_and(|r| is_pipeline_await_status(r.status))
+        }
+    }
+}
+
 fn report_has_active_work(report: &CoworkerControllerStepReport) -> bool {
     if report.status == CoworkerControllerPhase1Status::RunningTasks
         || report.active_running_count > 0
@@ -3246,6 +4841,7 @@ const fn is_pipeline_await_status(status: CoworkerControllerPhase1Status) -> boo
 fn is_terminal_or_stopped_job(
     job: &CoworkerJobRecord,
     runtime_state: &ControllerJobRuntimeState,
+    mode: CoworkerDriverExecutionMode,
 ) -> bool {
     if runtime_state.stop_requested
         || matches!(
@@ -3255,13 +4851,139 @@ fn is_terminal_or_stopped_job(
     {
         return true;
     }
-    !job.tasks.is_empty()
-        && job.tasks.iter().all(|t| {
-            matches!(
-                t.stage,
-                CoworkerTaskStage::Accepted | CoworkerTaskStage::Integrated
-            )
+    match mode {
+        CoworkerDriverExecutionMode::FullAutomaticPipeline => false,
+        CoworkerDriverExecutionMode::Phase1InitialDispatchOnly => {
+            !job.tasks.is_empty()
+                && job.tasks.iter().all(|t| {
+                    matches!(
+                        t.stage,
+                        CoworkerTaskStage::Accepted | CoworkerTaskStage::Integrated
+                    )
+                })
+        }
+    }
+}
+
+fn is_outbox_confirmed_but_fenced_by_stop(
+    job: &CoworkerJobRecord,
+    outbox: &OutboxDispatchRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    if !runtime_state.stop_requested {
+        return false;
+    }
+    if matches!(
+        outbox.status,
+        OutboxDispatchStatus::DispatchedEffectConfirmed | OutboxDispatchStatus::ReconciledConfirmed
+    ) {
+        return runtime_state
+            .pending_effects
+            .get(&outbox.outbox_id)
+            .is_some_and(|eff| {
+                matches!(
+                    eff.status,
+                    PendingControllerEffectStatus::EffectConfirmed
+                        | PendingControllerEffectStatus::EffectFailedTerminal
+                )
+            });
+    }
+    is_reserved_review_outbox_confirmed_but_fenced_by_stop(job, outbox, runtime_state)
+}
+
+fn is_reserved_review_outbox_confirmed_but_fenced_by_stop(
+    job: &CoworkerJobRecord,
+    outbox: &OutboxDispatchRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    if !runtime_state.stop_requested
+        || runtime_state.job_id != job.job_id
+        || !runtime_state.unresolved_effects().is_empty()
+        || runtime_state
+            .pending_effects
+            .values()
+            .any(|eff| eff.status == PendingControllerEffectStatus::EffectUnknown)
+        || outbox.status != OutboxDispatchStatus::ReservedBeforeEffect
+        || outbox.kind != OutboxDispatchKind::TaskReviewDispatch
+        || outbox.role != WorkflowRole::Reviewer
+        || outbox.attempt_no == 0
+        || outbox.request_key.is_empty()
+        || outbox.subject_digest.is_empty()
+    {
+        return false;
+    }
+    let Some(task) = job.tasks.iter().find(|t| t.task_id == outbox.task_id) else {
+        return false;
+    };
+    if task.stage != CoworkerTaskStage::ReviewReserved
+        || task.current_attempt_no != outbox.attempt_no
+        || task.unresolved_outbox_id.as_deref() != Some(outbox.outbox_id.as_str())
+        || job.outbox.iter().any(|o| {
+            o.kind == OutboxDispatchKind::TaskReviewDispatch
+                && o.task_id == outbox.task_id
+                && o.attempt_no == outbox.attempt_no
+                && (o.outbox_id != outbox.outbox_id
+                    || o.request_key != outbox.request_key
+                    || o.subject_digest != outbox.subject_digest)
         })
+    {
+        return false;
+    }
+    let Some(artifacts) = runtime_state.get_attempt_artifacts(&outbox.task_id, outbox.attempt_no)
+    else {
+        return false;
+    };
+    if artifacts.task_id != outbox.task_id
+        || artifacts.attempt_no != outbox.attempt_no
+        || artifacts
+            .review_subject
+            .as_ref()
+            .is_none_or(|s| s.subject_digest != outbox.subject_digest)
+    {
+        return false;
+    }
+    let mut matched = false;
+    for eff in runtime_state.pending_effects.values() {
+        if eff.kind == PendingControllerEffectKind::ReviewerInvocation
+            && ((eff.task_id.as_deref() == Some(outbox.task_id.as_str())
+                && eff.attempt_no == Some(outbox.attempt_no))
+                || eff.request_key == outbox.request_key)
+        {
+            if eff.job_id != job.job_id
+                || eff.task_id.as_deref() != Some(outbox.task_id.as_str())
+                || eff.attempt_no != Some(outbox.attempt_no)
+                || eff.request_key != outbox.request_key
+                || eff.status != PendingControllerEffectStatus::EffectConfirmed
+                || eff.subject_digest != outbox.subject_digest
+                || matched
+            {
+                return false;
+            }
+            matched = true;
+        }
+    }
+    matched
+}
+
+fn is_review_reserved_task_confirmed_but_fenced_by_stop(
+    job: &CoworkerJobRecord,
+    task: &CoworkerTaskRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    task.stage == CoworkerTaskStage::ReviewReserved
+        && task
+            .unresolved_outbox_id
+            .as_deref()
+            .and_then(|id| job.outbox.iter().find(|o| o.outbox_id == id))
+            .is_some_and(|outbox| {
+                outbox.task_id == task.task_id
+                    && outbox.attempt_no == task.current_attempt_no
+                    && is_reserved_review_outbox_confirmed_but_fenced_by_stop(
+                        job,
+                        outbox,
+                        runtime_state,
+                    )
+            })
 }
 
 fn has_unresolved_or_unknown_effect(
@@ -3271,12 +4993,14 @@ fn has_unresolved_or_unknown_effect(
 ) -> bool {
     overall_status == CoworkerControllerPhase1Status::BlockedOnUnknownEffect
         || !runtime_state.unresolved_effects().is_empty()
-        || job
-            .outbox
-            .iter()
-            .any(|o| o.status.blocks_replay_and_new_dispatch())
+        || job.outbox.iter().any(|o| {
+            o.status.blocks_replay_and_new_dispatch()
+                && !is_outbox_confirmed_but_fenced_by_stop(job, o, runtime_state)
+        })
         || job.tasks.iter().any(|t| {
-            t.stage == CoworkerTaskStage::EffectUnknown || t.unresolved_outbox_id.is_some()
+            t.stage == CoworkerTaskStage::EffectUnknown
+                || (t.unresolved_outbox_id.is_some()
+                    && !is_review_reserved_task_confirmed_but_fenced_by_stop(job, t, runtime_state))
         })
 }
 
@@ -3459,4 +5183,174 @@ fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn filter_live_owned_in_flight_review_reservations(
+    inspection: &mut ReadonlyScopedJobInspection,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) {
+    let matched: Vec<(String, String, String)> = inspection
+        .job
+        .outbox
+        .iter()
+        .filter_map(|o| {
+            live_owned_in_flight_review_effect_id(
+                &inspection.job,
+                o,
+                &inspection.runtime_state,
+                in_flight_stages,
+            )
+            .map(|eff_id| (o.task_id.clone(), o.outbox_id.clone(), eff_id))
+        })
+        .collect();
+    for (task_id, outbox_id, effect_id) in matched {
+        for task in &mut inspection.job.tasks {
+            if task.task_id == task_id
+                && task.unresolved_outbox_id.as_deref() == Some(outbox_id.as_str())
+            {
+                task.unresolved_outbox_id = None;
+            }
+        }
+        inspection.job.outbox.retain(|o| o.outbox_id != outbox_id);
+        inspection
+            .runtime_state
+            .pending_effects
+            .retain(|_, eff| eff.effect_id != effect_id);
+    }
+}
+
+fn live_owned_in_flight_review_effect_id(
+    job: &CoworkerJobRecord,
+    outbox: &OutboxDispatchRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> Option<String> {
+    if runtime_state.job_id != job.job_id
+        || runtime_state
+            .pending_effects
+            .values()
+            .any(|eff| eff.status == PendingControllerEffectStatus::EffectUnknown)
+        || outbox.status != OutboxDispatchStatus::ReservedBeforeEffect
+        || outbox.kind != OutboxDispatchKind::TaskReviewDispatch
+        || outbox.role != WorkflowRole::Reviewer
+        || outbox.attempt_no == 0
+        || outbox.request_key.is_empty()
+        || outbox.subject_digest.is_empty()
+        || !in_flight_stages.iter().any(|s| {
+            s.kind == crate::coworker_workflow::CoworkerPipelineInFlightStageKind::TaskReview
+                && s.task_id.as_deref() == Some(outbox.task_id.as_str())
+                && s.attempt_no == Some(outbox.attempt_no)
+        })
+        || in_flight_stages.iter().any(|s| {
+            s.task_id.as_deref() == Some(outbox.task_id.as_str())
+                && (s.kind
+                    != crate::coworker_workflow::CoworkerPipelineInFlightStageKind::TaskReview
+                    || s.attempt_no != Some(outbox.attempt_no))
+        })
+    {
+        return None;
+    }
+    let task = job.tasks.iter().find(|t| t.task_id == outbox.task_id)?;
+    if task.stage != CoworkerTaskStage::ReviewReserved
+        || task.current_attempt_no != outbox.attempt_no
+        || task.unresolved_outbox_id.as_deref() != Some(outbox.outbox_id.as_str())
+        || job.outbox.iter().any(|o| {
+            o.task_id == outbox.task_id
+                && ((o.kind == OutboxDispatchKind::TaskReviewDispatch
+                    && o.attempt_no == outbox.attempt_no
+                    && (o.outbox_id != outbox.outbox_id
+                        || o.request_key != outbox.request_key
+                        || o.subject_digest != outbox.subject_digest))
+                    || (o.outbox_id != outbox.outbox_id
+                        && o.status.blocks_replay_and_new_dispatch()))
+        })
+    {
+        return None;
+    }
+    let artifacts = runtime_state.get_attempt_artifacts(&outbox.task_id, outbox.attempt_no)?;
+    if artifacts.task_id != outbox.task_id
+        || artifacts.attempt_no != outbox.attempt_no
+        || artifacts
+            .review_subject
+            .as_ref()
+            .is_none_or(|s| s.subject_digest != outbox.subject_digest)
+    {
+        return None;
+    }
+    let mut matched_effect_id = None;
+    for eff in runtime_state.pending_effects.values() {
+        let same_task_or_request = eff.task_id.as_deref() == Some(outbox.task_id.as_str())
+            || eff.request_key == outbox.request_key;
+        if !same_task_or_request {
+            continue;
+        }
+        if eff.kind != PendingControllerEffectKind::ReviewerInvocation
+            || eff.attempt_no != Some(outbox.attempt_no)
+        {
+            if eff.status.blocks_replay() || eff.request_key == outbox.request_key {
+                return None;
+            }
+            continue;
+        }
+        if eff.job_id != job.job_id
+            || eff.task_id.as_deref() != Some(outbox.task_id.as_str())
+            || eff.request_key != outbox.request_key
+            || !matches!(
+                eff.status,
+                PendingControllerEffectStatus::ReservedBeforeEffect
+                    | PendingControllerEffectStatus::EffectConfirmed
+            )
+            || eff.subject_digest != outbox.subject_digest
+            || matched_effect_id.is_some()
+        {
+            return None;
+        }
+        matched_effect_id = Some(eff.effect_id.clone());
+    }
+    matched_effect_id
+}
+
+fn is_live_owned_in_flight_review_outbox(
+    job: &CoworkerJobRecord,
+    outbox: &OutboxDispatchRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    live_owned_in_flight_review_effect_id(job, outbox, runtime_state, in_flight_stages).is_some()
+}
+
+fn is_live_owned_in_flight_review_task(
+    job: &CoworkerJobRecord,
+    task: &CoworkerTaskRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    task.stage == CoworkerTaskStage::ReviewReserved
+        && task
+            .unresolved_outbox_id
+            .as_deref()
+            .and_then(|id| job.outbox.iter().find(|o| o.outbox_id == id))
+            .is_some_and(|outbox| {
+                outbox.task_id == task.task_id
+                    && outbox.attempt_no == task.current_attempt_no
+                    && is_live_owned_in_flight_review_outbox(
+                        job,
+                        outbox,
+                        runtime_state,
+                        in_flight_stages,
+                    )
+            })
+}
+
+fn is_live_owned_in_flight_review_effect(
+    job: &CoworkerJobRecord,
+    effect: &crate::coworker_workflow::PendingControllerEffect,
+    runtime_state: &ControllerJobRuntimeState,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    job.outbox.iter().any(|outbox| {
+        live_owned_in_flight_review_effect_id(job, outbox, runtime_state, in_flight_stages)
+            .as_deref()
+            == Some(effect.effect_id.as_str())
+    })
 }

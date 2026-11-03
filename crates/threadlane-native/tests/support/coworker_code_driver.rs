@@ -218,13 +218,20 @@ async fn cli_code_driver_ensure_reuses_live_owner_survives_default_hold_reconcil
         &gate_release_file,
     );
 
-    // 1. First `code-driver ensure` must return while fake Coder is still held on the private gate.
+    // 1. First `code-driver ensure` in explicit diagnostic Phase 1 mode must return while fake Coder is still held on the private gate.
     let ensure_first = run_flow_cli(
         &state_dir,
         &fixture,
         &binding_id,
         &thread_uuid,
-        &["code-driver", "ensure", "--job-id", &job.job_id],
+        &[
+            "code-driver",
+            "ensure",
+            "--job-id",
+            &job.job_id,
+            "--execution-mode",
+            "phase1_initial_dispatch_only",
+        ],
     )
     .await;
     assert!(
@@ -233,7 +240,11 @@ async fn cli_code_driver_ensure_reuses_live_owner_survives_default_hold_reconcil
     );
     assert_eq!(ensure_first["disposition"], "spawned_new_owner");
     assert_eq!(ensure_first["status"]["owner_state"], "live_verified_owner");
-    assert_eq!(ensure_first["status"]["lease_active"], true);
+    assert_eq!(
+        ensure_first["status"]["execution_mode"],
+        "phase1_initial_dispatch_only"
+    );
+    // Readiness proves physical ownership; the logical lease is checked below once the Coder runs.
     let owner_instance_id = ensure_first["status"]["verified_owner_summary"]["instance_id"]
         .as_str()
         .expect("verified_owner_summary.instance_id string")
@@ -687,17 +698,28 @@ async fn cli_code_driver_cancel_active_held_job_records_durable_stop_releases_lo
         .expect("job_a runtime exists");
     assert_eq!(runtime_a_pre.total_task_attempts_reserved, 0);
 
-    // 2. Launch only `job_a` and wait until its fake Coder is held on the private gate.
+    // 2. Launch only `job_a` in explicit diagnostic Phase 1 mode and wait until its fake Coder is held on the private gate.
     let ensure_a = run_flow_cli(
         &state_dir,
         &fixture,
         &binding_a_id,
         &thread_a_uuid,
-        &["code-driver", "ensure", "--job-id", &job_a.job_id],
+        &[
+            "code-driver",
+            "ensure",
+            "--job-id",
+            &job_a.job_id,
+            "--execution-mode",
+            "phase1_initial_dispatch_only",
+        ],
     )
     .await;
     assert_eq!(ensure_a["disposition"], "spawned_new_owner");
     assert_eq!(ensure_a["status"]["owner_state"], "live_verified_owner");
+    assert_eq!(
+        ensure_a["status"]["execution_mode"],
+        "phase1_initial_dispatch_only"
+    );
 
     let started_deadline = Instant::now() + Duration::from_secs(5);
     while !coder_started_file.exists() {
@@ -926,11 +948,22 @@ async fn cli_code_driver_owner_crash_reports_stale_evidence_refuses_blind_replay
         &fixture,
         &binding_id,
         &thread_uuid,
-        &["code-driver", "ensure", "--job-id", &job.job_id],
+        &[
+            "code-driver",
+            "ensure",
+            "--job-id",
+            &job.job_id,
+            "--execution-mode",
+            "phase1_initial_dispatch_only",
+        ],
     )
     .await;
     assert_eq!(ensure_first["disposition"], "spawned_new_owner");
     assert_eq!(ensure_first["status"]["owner_state"], "live_verified_owner");
+    assert_eq!(
+        ensure_first["status"]["execution_mode"],
+        "phase1_initial_dispatch_only"
+    );
     assert_eq!(
         ensure_first["status"]["host_mode"],
         "reused_verified_ready_host"
@@ -962,6 +995,7 @@ async fn cli_code_driver_owner_crash_reports_stale_evidence_refuses_blind_replay
         .await;
         if current["tasks"][0]["host_status"] == "running"
             && current["tasks"][0]["stage"] == "running"
+            && current["step_report"]["active_running_count"] == 1
         {
             break current;
         }

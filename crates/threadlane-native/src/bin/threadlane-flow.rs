@@ -32,8 +32,9 @@ use threadlane_core::observation::{
 use threadlane_host::{ApprovedHostClient, HostError};
 use threadlane_native::coworker_driver::{
     CoworkerCodeDriver, CoworkerDriverCancelReport, CoworkerDriverEnsureReport,
-    CoworkerDriverRequest, CoworkerDriverRunOptions, CoworkerDriverStatusReport,
-    DEFAULT_DRIVER_MAX_STEPS, DEFAULT_DRIVER_POLL_INTERVAL_MS, DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS,
+    CoworkerDriverExecutionMode, CoworkerDriverRequest, CoworkerDriverRunOptions,
+    CoworkerDriverStatusReport, DEFAULT_DRIVER_MAX_STEPS, DEFAULT_DRIVER_POLL_INTERVAL_MS,
+    DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS,
 };
 use threadlane_native::coworker_grants::{
     get_planning_grant_summary, list_planning_grant_summaries,
@@ -259,6 +260,14 @@ enum CoworkerDriverCommand {
         /// Optional bounded linger window in milliseconds after reaching a quiescent state (`0..=60000`).
         #[arg(long = "idle-linger-ms", value_name = "MS")]
         idle_linger_ms: Option<u64>,
+
+        /// Optional explicit execution mode (`full_automatic_pipeline` or `phase1_initial_dispatch_only`).
+        #[arg(long = "execution-mode", value_name = "MODE")]
+        execution_mode: Option<String>,
+
+        /// Explicit diagnostic flag selecting `phase1_initial_dispatch_only` mode.
+        #[arg(long = "initial-dispatch-only")]
+        initial_dispatch_only: bool,
     },
     /// Ensure a single live verified physical owner for a Coworker job, reusing an active owner or spawning detached `run-owner`.
     #[command(name = "ensure")]
@@ -282,6 +291,14 @@ enum CoworkerDriverCommand {
         /// Optional bounded linger window in milliseconds for a spawned owner (`0..=60000`).
         #[arg(long = "idle-linger-ms", value_name = "MS")]
         idle_linger_ms: Option<u64>,
+
+        /// Optional explicit execution mode (`full_automatic_pipeline` or `phase1_initial_dispatch_only`).
+        #[arg(long = "execution-mode", value_name = "MODE")]
+        execution_mode: Option<String>,
+
+        /// Explicit diagnostic flag selecting `phase1_initial_dispatch_only` mode.
+        #[arg(long = "initial-dispatch-only")]
+        initial_dispatch_only: bool,
     },
     /// Inspect verified live owner or persisted status for a Coworker job without mutating state.
     #[command(name = "status")]
@@ -294,7 +311,7 @@ enum CoworkerDriverCommand {
         #[arg(long = "job-id", value_name = "ID")]
         job_id: Option<String>,
     },
-    /// Reconcile existing host receipts and step Phase 1 state for a Coworker job without replaying unknown effects.
+    /// Reconcile existing host receipts and step state for a Coworker job without replaying unknown effects.
     #[command(name = "reconcile")]
     Reconcile {
         /// Optional absolute path to a private (`0600`) JSON [`CoworkerDriverRequest`] file.
@@ -304,6 +321,14 @@ enum CoworkerDriverCommand {
         /// Target Coworker job identifier (`job_<32hex>`).
         #[arg(long = "job-id", value_name = "ID")]
         job_id: Option<String>,
+
+        /// Optional explicit execution mode (`full_automatic_pipeline` or `phase1_initial_dispatch_only`).
+        #[arg(long = "execution-mode", value_name = "MODE")]
+        execution_mode: Option<String>,
+
+        /// Explicit diagnostic flag selecting `phase1_initial_dispatch_only` mode.
+        #[arg(long = "initial-dispatch-only")]
+        initial_dispatch_only: bool,
     },
     /// Record durable `stop_requested` first, then perform narrow `ApprovedHostClient` task cancellation and reconcile.
     #[command(name = "cancel")]
@@ -1929,6 +1954,8 @@ fn resolve_coworker_driver_request(
     cli_max_steps: Option<u32>,
     cli_poll_interval_ms: Option<u64>,
     cli_idle_linger_ms: Option<u64>,
+    cli_execution_mode: Option<String>,
+    cli_initial_dispatch_only: bool,
     binding: &str,
     thread: &str,
 ) -> Result<CoworkerDriverRequest, OperatorCliError> {
@@ -1964,7 +1991,28 @@ fn resolve_coworker_driver_request(
             max_steps: None,
             poll_interval_ms: None,
             idle_linger_ms: None,
+            execution_mode: None,
         }
+    };
+
+    let parsed_cli_mode = match cli_execution_mode {
+        Some(raw) => {
+            let parsed = raw.parse::<CoworkerDriverExecutionMode>().map_err(|_| {
+                OperatorCliError::invalid_input("Invalid `--execution-mode` value.")
+            })?;
+            if cli_initial_dispatch_only
+                && parsed != CoworkerDriverExecutionMode::Phase1InitialDispatchOnly
+            {
+                return Err(OperatorCliError::invalid_input(
+                    "`--initial-dispatch-only` conflicts with `--execution-mode full_automatic_pipeline`.",
+                ));
+            }
+            Some(parsed)
+        }
+        None if cli_initial_dispatch_only => {
+            Some(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly)
+        }
+        None => None,
     };
 
     if let Some(reason) = cli_reason {
@@ -1978,6 +2026,9 @@ fn resolve_coworker_driver_request(
     }
     if let Some(idle_linger_ms) = cli_idle_linger_ms {
         req.idle_linger_ms = Some(idle_linger_ms);
+    }
+    if let Some(mode) = parsed_cli_mode {
+        req.execution_mode = Some(mode);
     }
 
     req.validate_for_scope(binding, thread)
@@ -2014,6 +2065,8 @@ async fn run_coworker_driver(
             max_steps,
             poll_interval_ms,
             idle_linger_ms,
+            execution_mode,
+            initial_dispatch_only,
         } => {
             let req = resolve_coworker_driver_request(
                 request.as_deref(),
@@ -2022,6 +2075,8 @@ async fn run_coworker_driver(
                 max_steps,
                 poll_interval_ms,
                 idle_linger_ms,
+                execution_mode,
+                initial_dispatch_only,
                 binding,
                 thread,
             )?;
@@ -2031,6 +2086,7 @@ async fn run_coworker_driver(
                     .poll_interval_ms
                     .unwrap_or(DEFAULT_DRIVER_POLL_INTERVAL_MS),
                 idle_linger_ms: req.idle_linger_ms,
+                execution_mode: req.execution_mode,
             };
             let report = driver
                 .run_owner(binding, thread, &req.job_id, options)
@@ -2053,6 +2109,8 @@ async fn run_coworker_driver(
             max_steps,
             poll_interval_ms,
             idle_linger_ms,
+            execution_mode,
+            initial_dispatch_only,
         } => {
             let req = resolve_coworker_driver_request(
                 request.as_deref(),
@@ -2061,12 +2119,15 @@ async fn run_coworker_driver(
                 max_steps,
                 poll_interval_ms,
                 idle_linger_ms,
+                execution_mode,
+                initial_dispatch_only,
                 binding,
                 thread,
             )?;
             let options = if req.max_steps.is_some()
                 || req.poll_interval_ms.is_some()
                 || req.idle_linger_ms.is_some()
+                || req.execution_mode.is_some()
             {
                 Some(CoworkerDriverRunOptions {
                     max_steps: req.max_steps.or(DEFAULT_DRIVER_MAX_STEPS),
@@ -2074,6 +2135,7 @@ async fn run_coworker_driver(
                         .poll_interval_ms
                         .unwrap_or(DEFAULT_DRIVER_POLL_INTERVAL_MS),
                     idle_linger_ms: req.idle_linger_ms.or(DEFAULT_ENSURE_OWNER_IDLE_LINGER_MS),
+                    execution_mode: req.execution_mode,
                 })
             } else {
                 None
@@ -2101,6 +2163,8 @@ async fn run_coworker_driver(
                 None,
                 None,
                 None,
+                None,
+                false,
                 binding,
                 thread,
             )?;
@@ -2119,7 +2183,12 @@ async fn run_coworker_driver(
             *resolved_approval_id = Some(report.approval_id.clone());
             write_result(binding, &report, false)
         }
-        CoworkerDriverCommand::Reconcile { request, job_id } => {
+        CoworkerDriverCommand::Reconcile {
+            request,
+            job_id,
+            execution_mode,
+            initial_dispatch_only,
+        } => {
             let req = resolve_coworker_driver_request(
                 request.as_deref(),
                 job_id,
@@ -2127,11 +2196,17 @@ async fn run_coworker_driver(
                 None,
                 None,
                 None,
+                execution_mode,
+                initial_dispatch_only,
                 binding,
                 thread,
             )?;
+            let options = req.execution_mode.map(|mode| CoworkerDriverRunOptions {
+                execution_mode: Some(mode),
+                ..CoworkerDriverRunOptions::default()
+            });
             let report = driver
-                .reconcile(binding, thread, &req.job_id)
+                .reconcile_with_options(binding, thread, &req.job_id, options)
                 .await
                 .map_err(|error| map_native_error(&error, true))?;
             ensure_scope(
@@ -2157,6 +2232,8 @@ async fn run_coworker_driver(
                 None,
                 None,
                 None,
+                None,
+                false,
                 binding,
                 thread,
             )?;
@@ -2589,12 +2666,15 @@ mod tests {
                 "50",
                 "--idle-linger-ms",
                 "200",
+                "--execution-mode",
+                "full_automatic_pipeline",
             ],
             vec![
                 "code-driver",
                 "ensure",
                 "--request",
                 "/tmp/driver-ensure.json",
+                "--initial-dispatch-only",
             ],
             vec![
                 "code-driver",
@@ -2607,6 +2687,8 @@ mod tests {
                 "reconcile",
                 "--job-id",
                 "job_0123456789abcdef0123456789abcdef",
+                "--execution-mode",
+                "phase1_initial_dispatch_only",
             ],
             vec![
                 "coworker-driver",

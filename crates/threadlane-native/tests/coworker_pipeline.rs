@@ -2065,3 +2065,6 @@ async fn automatic_pipeline_enforces_pre_effect_hold_stop_unknown_and_conflictin
     })
     .await;
 }
+
+#[path = "support/coworker_full_driver.rs"]
+mod coworker_full_driver;

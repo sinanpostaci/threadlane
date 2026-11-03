@@ -16,6 +16,7 @@ use threadlane_workers::{
     DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::WorkflowRole;
+use tokio::sync::watch;
 
 use crate::conversation_change::ConversationChangeStore;
 use crate::error::{NativeError, NativeErrorCode};
@@ -430,6 +431,7 @@ pub struct CoworkerPipelineDriver<'g> {
     in_flight: FuturesUnordered<BoxStageFuture<'g>>,
     active_task_stages: BTreeMap<(String, u32), CoworkerPipelineInFlightStageKind>,
     job_completion_in_flight: bool,
+    in_flight_stages_tx: watch::Sender<Vec<CoworkerPipelineInFlightStageRef>>,
     failed_check_tasks: BTreeMap<(String, u32), Vec<String>>,
     last_completion_outcome: Option<Box<CoworkerJobCompletionOutcome>>,
     drain_window_ms: u64,
@@ -461,6 +463,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
         service
             .controller
             .verify_physical_ownership(guard, &binding_id, &thread_uuid, &job_id)?;
+        let (in_flight_stages_tx, _) = watch::channel(Vec::new());
         Ok(Self {
             service,
             guard,
@@ -470,6 +473,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
             in_flight: FuturesUnordered::new(),
             active_task_stages: BTreeMap::new(),
             job_completion_in_flight: false,
+            in_flight_stages_tx,
             failed_check_tasks: BTreeMap::new(),
             last_completion_outcome: None,
             drain_window_ms: DEFAULT_PIPELINE_TICK_DRAIN_WINDOW_MS,
@@ -516,6 +520,23 @@ impl<'g> CoworkerPipelineDriver<'g> {
         refs
     }
 
+    /// Subscribes to a cloneable read-only live view of currently in-flight stage descriptors.
+    ///
+    /// This snapshot is diagnostic metadata only and carries no execution or lease authority. A
+    /// closed (or open) receiver must never be treated as proof that an owner remains alive or
+    /// holds authority.
+    pub fn subscribe_in_flight_stages(
+        &self,
+    ) -> watch::Receiver<Vec<CoworkerPipelineInFlightStageRef>> {
+        self.in_flight_stages_tx.subscribe()
+    }
+
+    fn publish_in_flight_stages(&self) {
+        let _ = self
+            .in_flight_stages_tx
+            .send_replace(self.in_flight_stages());
+    }
+
     /// Drains all currently in-flight stage futures to completion without starting any new stages
     /// or dispatching new tasks, ensuring every active check, `Reviewer`, or `Closure` subprocess
     /// finishes within its frozen per-call budget and persists its full private `0600` report.
@@ -523,7 +544,9 @@ impl<'g> CoworkerPipelineDriver<'g> {
         &mut self,
         now_ms: u64,
     ) -> Result<CoworkerPipelineTickReport, NativeError> {
-        Box::pin(self.drain_in_flight_inner(now_ms)).await
+        let result = Box::pin(self.drain_in_flight_inner(now_ms)).await;
+        self.publish_in_flight_stages();
+        result
     }
 
     async fn drain_in_flight_inner(
@@ -545,7 +568,9 @@ impl<'g> CoworkerPipelineDriver<'g> {
     /// stage futures that complete within the tick's bounded window while preserving slower stage
     /// futures in `self.in_flight` for subsequent ticks on this same driver instance.
     pub async fn tick(&mut self, now_ms: u64) -> Result<CoworkerPipelineTickReport, NativeError> {
-        Box::pin(self.tick_inner(now_ms)).await
+        let result = Box::pin(self.tick_inner(now_ms)).await;
+        self.publish_in_flight_stages();
+        result
     }
 
     async fn tick_inner(&mut self, now_ms: u64) -> Result<CoworkerPipelineTickReport, NativeError> {
@@ -1399,6 +1424,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 result,
             }
         }));
+        self.publish_in_flight_stages();
     }
 
     fn spawn_task_verification_future(&mut self, task_id: String, attempt_no: u32, now_ms: u64) {
@@ -1427,6 +1453,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 result,
             }
         }));
+        self.publish_in_flight_stages();
     }
 
     fn spawn_task_review_future(&mut self, task_id: String, attempt_no: u32, now_ms: u64) {
@@ -1455,6 +1482,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 result,
             }
         }));
+        self.publish_in_flight_stages();
     }
 
     fn spawn_task_integration_future(&mut self, task_id: String, attempt_no: u32, now_ms: u64) {
@@ -1484,6 +1512,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 result,
             }
         }));
+        self.publish_in_flight_stages();
     }
 
     fn spawn_job_completion_future(&mut self, now_ms: u64) {
@@ -1502,6 +1531,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 .map(Box::new);
             InFlightStageCompletion::JobCompletion { result }
         }));
+        self.publish_in_flight_stages();
     }
 
     async fn drain_ready_in_flight(
@@ -1526,6 +1556,17 @@ impl<'g> CoworkerPipelineDriver<'g> {
     }
 
     async fn handle_stage_completion(
+        &mut self,
+        completion: InFlightStageCompletion,
+        now_ms: u64,
+        acc: &mut TickAccumulator,
+    ) -> Result<(), NativeError> {
+        let result = Box::pin(self.handle_stage_completion_inner(completion, now_ms, acc)).await;
+        self.publish_in_flight_stages();
+        result
+    }
+
+    async fn handle_stage_completion_inner(
         &mut self,
         completion: InFlightStageCompletion,
         now_ms: u64,
