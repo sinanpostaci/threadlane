@@ -2914,6 +2914,33 @@ pub fn is_worktree_clean(checkout_path: &Path, timeout_ms: u64) -> Result<bool, 
     Ok(status_out.bytes.is_empty())
 }
 
+/// Returns `true` if `checkout_path` has no uncommitted, staged, or non-ignored untracked files,
+/// while allowing ignored source caches (such as `target/`, `node_modules/`, or `.local/`).
+pub fn is_source_worktree_clean(
+    checkout_path: &Path,
+    timeout_ms: u64,
+) -> Result<bool, WorkerError> {
+    let status_out = run_git_bytes_bounded_with_timeout(
+        checkout_path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=no",
+        ],
+        DEFAULT_MAX_GIT_OUTPUT_BYTES,
+        timeout_ms,
+    )?;
+    if status_out
+        .failure_reason(DEFAULT_MAX_GIT_OUTPUT_BYTES, timeout_ms)
+        .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(status_out.bytes.is_empty())
+}
+
 /// Removes all inherited `GIT_*` environment variables (case-insensitive) from `cmd`
 /// and installs controlled `GIT_TERMINAL_PROMPT=0`, `GIT_CONFIG_NOSYSTEM=1`,
 /// `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_GLOBAL=/dev/null`, and

@@ -1119,6 +1119,15 @@ exit 0
 async fn driver_executes_queued_architect_command_and_reopen_reexecution_reuses_completed_without_second_call(
 ) {
     let fixture = setup_fixture();
+    let repo_dir = std::path::Path::new(&fixture.project_base.repository_path);
+    let exclude_path = repo_dir.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude_path.parent().expect("exclude parent"))
+        .expect("create .git/info dir");
+    std::fs::write(&exclude_path, "private-cache/\n").expect("write .git/info/exclude");
+    let ignored_marker = repo_dir.join("private-cache/marker");
+    std::fs::create_dir_all(ignored_marker.parent().expect("marker parent"))
+        .expect("create private-cache dir");
+    std::fs::write(&ignored_marker, b"preserved-ignored-cache").expect("write ignored marker");
     let now_ms = current_wall_clock_ms().expect("wall clock");
     let grant_id = create_grant_in_fixture(
         &fixture,
@@ -1168,6 +1177,10 @@ async fn driver_executes_queued_architect_command_and_reopen_reexecution_reuses_
     assert!(!outcome_1.was_already_completed);
     assert!(!outcome_1.reconciled_from_existing);
     assert_eq!(outcome_1.command.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        std::fs::read(&ignored_marker).expect("read ignored marker after planning command"),
+        b"preserved-ignored-cache"
+    );
     assert!(!outcome_1.command.pending_reconciliation);
 
     let (advice_id, reservation_id, report_artifact_id, context_digest, decision_digest) =

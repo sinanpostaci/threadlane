@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_workers::{
-    is_commit_ancestor, is_worktree_clean, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    is_commit_ancestor, is_source_worktree_clean, resolve_exact_commit_sha, resolve_exact_tree_sha,
     validate_sha256_hex_digest, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 use threadlane_workflow::{Difficulty, ToolAdapter, WorkflowRole};
@@ -3043,12 +3043,13 @@ fn verify_call_base_against_grant(
                 "failed to resolve live repository HEAD tree SHA",
             )
         })?;
-    let clean = is_worktree_clean(repo_dir, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "failed to inspect live repository worktree cleanliness",
-        )
-    })?;
+    let clean =
+        is_source_worktree_clean(repo_dir, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "failed to inspect live repository worktree cleanliness",
+            )
+        })?;
     if head_commit != call_base.base_commit || head_tree != call_base.base_tree_sha || !clean {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,

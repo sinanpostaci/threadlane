@@ -46,15 +46,15 @@ use serde::{Deserialize, Serialize};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_core::observation::ObservationCallState;
 use threadlane_workers::{
-    inspect_base_commit_path_kind, is_commit_ancestor, is_worktree_clean, resolve_exact_commit_sha,
-    resolve_exact_tree_sha, resolve_model_target, run_advisory_worker_with_structured_result,
-    run_sanitized_git, run_sanitized_git_bytes, validate_repo_relative_path,
-    validate_sha256_hex_digest, AdvisoryResponseBudget, AdvisoryResponseError,
-    AdvisoryResponseFraming, AdvisoryResponseSource, AdvisoryStructuredExecution,
-    AdvisoryWorkerSpec, BaseCommitPathKind, BoundedAdvisoryResponse, ExecutionBudgets, WorkerError,
-    WorkerExecutionReport, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES, DEFAULT_MAX_LINE_BYTES,
-    MAX_ADVISORY_RESPONSE_BYTES, MAX_PROMPT_BYTES, MAX_STDOUT_BYTES,
+    inspect_base_commit_path_kind, is_commit_ancestor, is_source_worktree_clean, is_worktree_clean,
+    resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target,
+    run_advisory_worker_with_structured_result, run_sanitized_git, run_sanitized_git_bytes,
+    validate_repo_relative_path, validate_sha256_hex_digest, AdvisoryResponseBudget,
+    AdvisoryResponseError, AdvisoryResponseFraming, AdvisoryResponseSource,
+    AdvisoryStructuredExecution, AdvisoryWorkerSpec, BaseCommitPathKind, BoundedAdvisoryResponse,
+    ExecutionBudgets, WorkerError, WorkerExecutionReport, WorkerFilePermissions, WorkerProvider,
+    WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
+    DEFAULT_MAX_LINE_BYTES, MAX_ADVISORY_RESPONSE_BYTES, MAX_PROMPT_BYTES, MAX_STDOUT_BYTES,
 };
 use threadlane_workflow::{
     Difficulty, PlanStatus, PlanSummary, PlanTask, PublishedPlanView, RegistrySnapshot,
@@ -4478,12 +4478,13 @@ fn verify_live_repository_clean_at_base(
             "live repository HEAD tree SHA drifted from call base_tree_sha",
         ));
     }
-    let clean = is_worktree_clean(repo_dir, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "failed to inspect live repository worktree cleanliness",
-        )
-    })?;
+    let clean =
+        is_source_worktree_clean(repo_dir, DEFAULT_GIT_COMMAND_TIMEOUT_MS).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "failed to inspect live repository worktree cleanliness",
+            )
+        })?;
     if !clean {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
@@ -4913,4 +4914,100 @@ fn map_workflow_error(err: WorkflowError) -> NativeError {
         _ => NativeErrorCode::ProtocolError,
     };
     NativeError::new(code, sanitize_diagnostic_text(err.safe_message()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn live_repo_allows_ignored_cache_while_snapshot_excludes_it_and_stays_strict() {
+        let temp = TempDir::new().expect("create temp dir");
+        let repo_dir = temp.path().join("source-repo");
+        let snapshots_root = temp.path().join("snapshots");
+        fs::create_dir_all(&repo_dir).expect("create repo dir");
+
+        run_sanitized_git(&repo_dir, &["init"], DEFAULT_GIT_COMMAND_TIMEOUT_MS).expect("git init");
+        run_sanitized_git(
+            &repo_dir,
+            &["config", "user.name", "Threadlane Test"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git config user.name");
+        run_sanitized_git(
+            &repo_dir,
+            &["config", "user.email", "test@threadlane.local"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git config user.email");
+
+        fs::write(repo_dir.join(".gitignore"), "private-cache/\n").expect("write .gitignore");
+        fs::create_dir_all(repo_dir.join("src")).expect("create src dir");
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn value() -> u32 {\n    1\n}\n",
+        )
+        .expect("write src/lib.rs");
+
+        run_sanitized_git(
+            &repo_dir,
+            &["add", ".gitignore", "src/lib.rs"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git add");
+        run_sanitized_git(
+            &repo_dir,
+            &["commit", "-m", "initial commit"],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("git commit");
+
+        let base_commit =
+            resolve_exact_commit_sha(&repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("resolve HEAD commit");
+        let base_tree_sha =
+            resolve_exact_tree_sha(&repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("resolve HEAD tree");
+        let base = CanonicalProjectBaseRef {
+            repository_path: repo_dir.to_str().expect("utf-8 repo path").to_string(),
+            base_commit,
+            base_tree_sha,
+        };
+
+        let marker_path = repo_dir.join("private-cache/secret-marker");
+        fs::create_dir_all(marker_path.parent().expect("marker parent"))
+            .expect("create private-cache dir");
+        fs::write(&marker_path, b"keep-local-cache").expect("write secret-marker");
+
+        verify_live_repository_clean_at_base(&base)
+            .expect("live repository with ignored cache should pass cleanliness check");
+
+        let snapshot = OwnedReadOnlySnapshot::create(
+            &snapshots_root,
+            "res_0123456789abcdef0123456789abcdef",
+            &base,
+        )
+        .expect("create owned read-only snapshot");
+        assert!(!snapshot.path().join("private-cache/secret-marker").exists());
+
+        let tamper_path = snapshot.path().join("private-cache/tamper");
+        fs::create_dir_all(tamper_path.parent().expect("tamper parent"))
+            .expect("create snapshot private-cache dir");
+        fs::write(&tamper_path, b"tampered").expect("write snapshot tamper file");
+        assert!(snapshot.verify_invariants(&base).is_err());
+
+        assert_eq!(
+            fs::read(&marker_path).expect("read original marker"),
+            b"keep-local-cache"
+        );
+        verify_live_repository_clean_at_base(&base).expect("original repository remains clean");
+
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn value() -> u32 {\n    2\n}\n",
+        )
+        .expect("modify tracked src/lib.rs");
+        assert!(verify_live_repository_clean_at_base(&base).is_err());
+    }
 }

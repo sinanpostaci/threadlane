@@ -10,7 +10,7 @@ This document specifies the implemented runtime boundaries for read-only Coworke
   - Roles and optional difficulty tiers are preflighted against the frozen `RegistrySnapshot` at `grant.registry_revision` and `grant.profile_id` without fallback or model substitution. Native conversational routes (`CodexCli` / `Follower`) and direct API adapters are rejected.
 - **Advancing canonical repository base & isolated read-only snapshots**:
   - Standing grants pin `grant.project_base` (`CanonicalProjectBaseRef`). Individual calls may advance to a descendant commit in the same canonical repository (`is_commit_ancestor`) provided the live checkout is clean at `HEAD == call_project_base.base_commit`.
-  - Each worker invocation runs inside a disposable detached read-only snapshot under `<artifacts_dir>/snapshots/` (`WorkerFilePermissions::ReadOnly`, empty `allowed_write_paths`). Both the snapshot and live repository are verified clean before and after execution; any dirty state or base drift fails closed and records `PlanningReservationStatus::FailedAfterEffect`.
+  - Each worker invocation runs inside a disposable detached read-only snapshot under `<artifacts_dir>/snapshots/` (`WorkerFilePermissions::ReadOnly`, empty `allowed_write_paths`). Both the live source repository (allowing ignored local caches, which are excluded from the snapshot clone) and the snapshot (strict cleanliness, rejecting even ignored additions) are verified clean before and after execution; any dirty state or base drift fails closed and records `PlanningReservationStatus::FailedAfterEffect`.
 
 ## 2. Bounded Output Capture, Private Artifacts, and Typed Schemas
 
