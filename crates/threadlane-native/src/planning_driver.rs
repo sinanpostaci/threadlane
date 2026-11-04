@@ -303,6 +303,111 @@ impl PlanningCommandDriver {
         )
         .await
     }
+
+    /// Inspects the authoritative persisted planning command identified by
+    /// `(binding_id, thread_uuid, command_id)`, verifies any completed artifact and applicable
+    /// published plan identity, and delivers at most one terminal native completion/attention
+    /// notice if configured.
+    ///
+    /// Never calls a model provider, never creates notice directories when unconfigured, and never
+    /// mutates the planning command ledger.
+    pub async fn notify_terminal_command_if_configured(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        command_id: &str,
+    ) -> Result<Option<crate::coworker_notice::PlanningNoticeReport>, NativeError> {
+        notify_terminal_planning_command_if_configured(
+            &self.command_store,
+            &self.service,
+            binding_id,
+            thread_uuid,
+            command_id,
+        )
+        .await
+    }
+}
+
+/// Inspects the authoritative persisted planning command in `command_store`, verifies any
+/// completed artifact and applicable published plan identity against `service`, and delivers at
+/// most one terminal native completion/attention notice when configured under `planning_notice_dir`.
+pub async fn notify_terminal_planning_command_if_configured(
+    command_store: &PlanningCommandStore,
+    service: &CoworkerPlanningService,
+    binding_id: &str,
+    thread_uuid: &str,
+    command_id: &str,
+) -> Result<Option<crate::coworker_notice::PlanningNoticeReport>, NativeError> {
+    verify_store_and_service_alignment(command_store, service)?;
+    let notice_dir =
+        crate::coworker_notice::planning_notice_dir(command_store.workflow_store().plans_dir());
+    if !inspect_existing_private_subdir_readonly(&notice_dir, "planning_notice_dir")? {
+        return Ok(None);
+    }
+
+    let Some(cmd) = command_store.get_command(binding_id, thread_uuid, command_id)? else {
+        return Ok(None);
+    };
+    cmd.validate()?;
+    if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "planning command scope does not match notify_terminal_planning_command_if_configured arguments",
+        ));
+    }
+    let key = cmd.ownership_key()?;
+    if key.binding_id != binding_id || key.thread_uuid != thread_uuid || key.job_id != command_id {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "planning command ownership key does not match requested (binding_id, thread_uuid, command_id)",
+        ));
+    }
+
+    let meta = crate::coworker_notice::PlanningNoticeStore::inspect(
+        &notice_dir,
+        &key,
+        &cmd.command_digest,
+    )?;
+    if !meta.configured {
+        return Ok(None);
+    }
+
+    let has_active_owner_lock = matches!(
+        command_store.ownership_store().inspect_job_lock(&key)?,
+        crate::coworker_workflow::CoworkerJobLockState::HeldByActiveProcess { .. }
+    );
+    if has_active_owner_lock
+        || matches!(
+            cmd.status,
+            PlanningCommandStatus::Queued | PlanningCommandStatus::Running
+        )
+    {
+        return Ok(None);
+    }
+
+    let verified_completed_outcome = if cmd.status == PlanningCommandStatus::Completed {
+        let verified_ref = command_store.verify_completed_command(&cmd)?;
+        verify_published_plan_if_required(command_store, service, &cmd, &verified_ref)?;
+        true
+    } else {
+        false
+    };
+
+    let snapshot = crate::coworker_notice::PlanningNoticeSnapshot {
+        status: cmd.status,
+        pending_reconciliation: cmd.pending_reconciliation,
+        has_active_owner_lock,
+        verified_completed_outcome,
+    };
+    let notice_store = crate::coworker_notice::PlanningNoticeStore::new(&notice_dir)?;
+    notice_store
+        .notify_if_configured(
+            &key,
+            &cmd.command_digest,
+            Path::new(&cmd.call_project_base.repository_path),
+            snapshot,
+        )
+        .await
 }
 
 /// Executes or reconciles a single durable planning command through [`CoworkerPlanningService`]

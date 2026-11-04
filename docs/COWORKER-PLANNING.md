@@ -39,3 +39,27 @@ This document specifies the implemented runtime boundaries for read-only Coworke
 - This module implements library/service-level read-only planning and advice (`CoworkerPlanningService`). It does **not** expose MCP tools, does **not** run an automatic background task/review/fix scheduler (`controller.rs`), and does **not** assemble combined candidates (`candidate.rs`).
 - **Shared manual approval binding vs. automatic controller admission**: `CoworkerWorkflowStore::bind_job_approval` is a shared manual approval-binding helper: when `job.planning_result` is `Some(PlanningResultRef)`, it strictly verifies that the approved plan revision, digest, profile, registry revision, project base, brief digest, and task interfaces match the recorded `PlanningResultRef`; when `job.planning_result` is `None`, it remains compatible with independent explicitly human-approved legacy/manual jobs even if the same chat binding contains `PlanningAdviceGrant` / `Orchestrator` reservations for other planning contexts. Legacy/manual `bind_job_approval` success is **not** automatic controller authority; the next-phase execution controller (`controller.rs`, not yet implemented) must explicitly require a current-job `PlanningResultRef` alongside verified `FrozenApprovalLinkage` and `ExecutionPolicy`.
 - Verification in `crates/threadlane-native/tests/coworker_planning.rs` and `tests/coworker_planning_advice.rs` uses disposable local Git repositories and a local fake CLI script supervised by `threadlane-workers`; live paid-provider execution and live provider-side permission-denial acceptance are not claimed.
+
+
+## Native completion notices
+
+The paired planning gateway adds an operator-only transport extension to this
+service-level boundary. On a verified managed Linux desktop session,
+`--coworker-native-notices` lets `consult_architect` and
+`request_technical_plan` persist an immutable command-scoped native target before
+starting the detached CLI. The CLI verifies the durable terminal command and its
+completed artifacts before attempting a fixed notice to the same Codex thread.
+The Coworker reads the exact command through `planning_command`; a notice never
+accepts advice, grants execution approval, or starts coding.
+
+`planning_command` exposes redacted `native_notice` metadata separately from the
+planning outcome. `submitted` records backend acceptance only. Interrupted intent
+and a possible-send disconnect remain `unknown` and are not automatically replayed,
+including after a duplicate CLI invocation. Status reads never send notices. A
+notification error does not replace the verified planning result. A crash before
+notice reservation can still leave a terminal command without a notice; this is
+not an indefinite background delivery service.
+
+Tests use disposable repositories, local fake providers, and private WebSocket
+peers. Installed managed enrollment and real desktop delivery remain separate
+acceptance gates; no paid-provider or cross-platform acceptance is implied.

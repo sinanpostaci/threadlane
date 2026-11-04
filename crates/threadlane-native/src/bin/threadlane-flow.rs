@@ -1895,10 +1895,11 @@ async fn run_coworker_planning(
             validate_command_id(&command_id)?;
             let driver = open_planning_driver_for_plans_dir(plans_dir, registry_dir)
                 .map_err(|error| map_native_error(&error, false))?;
-            let outcome = driver
-                .execute_command(binding, thread, &command_id)
-                .await
-                .map_err(|error| map_native_error(&error, true))?;
+            let exec_result = driver.execute_command(binding, thread, &command_id).await;
+            let _ = driver
+                .notify_terminal_command_if_configured(binding, thread, &command_id)
+                .await;
+            let outcome = exec_result.map_err(|error| map_native_error(&error, true))?;
             let exec_summary = PlanningCommandExecutionSummary::from_outcome(&outcome);
             ensure_scope(
                 &exec_summary.summary,

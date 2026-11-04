@@ -1481,6 +1481,25 @@ impl PairedMcpServer {
         if let Some(ref anchor) = self.sibling_anchor_exe {
             gateway = gateway.with_sibling_anchor_exe(anchor.clone());
         }
+        if self.coworker_native_notices
+            && matches!(tool_name, "consult_architect" | "request_technical_plan")
+        {
+            let Some((reconnect_cfg, backend_pid)) = self
+                .matched_observation_context(&trusted_binding_id, &trusted_thread_uuid)
+                .and_then(|_| {
+                    threadlane::native_endpoint::NativeReconnectConfig::discover_for_mcp_parent()
+                        .ok()
+                })
+            else {
+                return Err(Self::format_scoped_error(
+                    &trusted_binding_id,
+                    tool_name,
+                    NativeErrorCode::NotConfigured.as_str(),
+                    "coworker native notices require a verified managed native MCP session",
+                ));
+            };
+            gateway = gateway.with_managed_native_notice(reconnect_cfg, backend_pid);
+        }
 
         Ok((trusted_binding_id, trusted_thread_uuid, gateway))
     }
@@ -1731,7 +1750,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-03.v4) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-04.v5) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,

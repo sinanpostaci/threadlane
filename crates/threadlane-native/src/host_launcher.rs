@@ -132,8 +132,9 @@ pub struct NativeMcpCli {
     )]
     pub host_executable: Option<PathBuf>,
 
-    /// Explicit operator-only opt-in (disabled by default) allowing `start_execution` to configure
-    /// scoped native coworker milestone notices for the verified MCP parent session. Requires
+    /// Explicit operator-only opt-in (disabled by default) allowing `consult_architect`,
+    /// `request_technical_plan`, and `start_execution` to configure scoped native coworker
+    /// completion and milestone notices for the verified MCP parent session. Requires
     /// `--registry-dir`, `--plans-dir`, `--authority-dir`, and `--sessions-dir`.
     #[arg(
         long = "coworker-native-notices",

@@ -576,6 +576,12 @@ pub struct PlanningCommandSubmissionResponse {
     pub result_ref: Option<PlanningCommandResultRef>,
     /// Full prompt-redacted [`PlanningCommandSummary`].
     pub command: PlanningCommandSummary,
+    /// Read-only planning native notice metadata when inspection succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice: Option<crate::coworker_notice::PlanningNoticeMetadata>,
+    /// Stable error code when planning native notice inspection fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice_error: Option<String>,
 }
 
 /// Prompt-redacted summary of a published Orchestrator technical plan extracted from a verified artifact.
@@ -653,6 +659,12 @@ pub struct PlanningCommandDetailResponse {
     pub consultation: Option<ArchitectConsultationRequestOutcome>,
     /// Full prompt-redacted [`PlanningCommandSummary`].
     pub command: PlanningCommandSummary,
+    /// Read-only planning native notice metadata when inspection succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice: Option<crate::coworker_notice::PlanningNoticeMetadata>,
+    /// Stable error code when planning native notice inspection fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_notice_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -683,6 +695,7 @@ pub struct CoworkerPlanningGateway {
     binding_id: String,
     thread_uuid: String,
     sibling_anchor_exe: Option<PathBuf>,
+    managed_native_notice: Option<(threadlane::native_endpoint::NativeReconnectConfig, u32)>,
 }
 
 impl CoworkerPlanningGateway {
@@ -725,6 +738,7 @@ impl CoworkerPlanningGateway {
             binding_id,
             thread_uuid,
             sibling_anchor_exe: None,
+            managed_native_notice: None,
         })
     }
 
@@ -734,6 +748,18 @@ impl CoworkerPlanningGateway {
     /// When set, only `<canonical_anchor_parent>/threadlane-flow` is inspected.
     pub fn with_sibling_anchor_exe(mut self, anchor_exe: impl Into<PathBuf>) -> Self {
         self.sibling_anchor_exe = Some(anchor_exe.into());
+        self
+    }
+
+    /// Attaches a verified managed native reconnect configuration and MCP parent backend PID for
+    /// configuring planning command completion notices during `consult_architect` and
+    /// `request_technical_plan`.
+    pub fn with_managed_native_notice(
+        mut self,
+        reconnect_config: threadlane::native_endpoint::NativeReconnectConfig,
+        backend_pid: u32,
+    ) -> Self {
+        self.managed_native_notice = Some((reconnect_config, backend_pid));
         self
     }
 
@@ -1157,6 +1183,13 @@ impl CoworkerPlanningGateway {
             }
         }
 
+        let (native_notice, native_notice_error) = inspect_planning_notice_best_effort(
+            &self.plans_dir,
+            &self.binding_id,
+            &self.thread_uuid,
+            &summary,
+        );
+
         Ok(PlanningCommandDetailResponse {
             binding_id: summary.binding_id.clone(),
             thread_uuid: summary.thread_uuid.clone(),
@@ -1175,6 +1208,8 @@ impl CoworkerPlanningGateway {
             clarification,
             consultation,
             command: summary,
+            native_notice,
+            native_notice_error,
         })
     }
 
@@ -1492,6 +1527,57 @@ impl CoworkerPlanningGateway {
                 )
             })??;
 
+        if let Some((ref reconnect_cfg, backend_pid)) = self.managed_native_notice {
+            let notice_key = crate::coworker_workflow::CoworkerJobOwnershipKey::new(
+                self.binding_id.clone(),
+                self.thread_uuid.clone(),
+                enqueued.command_id.clone(),
+            )?;
+            let stream = reconnect_cfg
+                .connect_verified_stream_for_backend(Some(backend_pid))
+                .await
+                .map_err(|err| {
+                    let code = match err {
+                        threadlane::Error::SecurityViolation(_) => {
+                            NativeErrorCode::SecurityViolation
+                        }
+                        _ => NativeErrorCode::NotConfigured,
+                    };
+                    NativeError::new(code, "failed to verify managed native notice endpoint")
+                })?;
+            let socket_path = stream
+                .peer_addr()
+                .map_err(|_| {
+                    NativeError::new(
+                        NativeErrorCode::IoError,
+                        "failed to inspect verified native notice peer address",
+                    )
+                })?
+                .as_pathname()
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "verified native notice endpoint socket must have a pathname",
+                    )
+                })?
+                .to_path_buf();
+            drop(stream);
+            let target =
+                threadlane::native_tool_output::NativeToolOutputConfig::new_user_message_steer(
+                    socket_path,
+                    self.thread_uuid.clone(),
+                    PathBuf::from(&enqueued.call_project_base.repository_path),
+                )
+                .with_reconnect(Some(reconnect_cfg.clone()));
+            let notice_cfg = crate::coworker_notice::PlanningNoticeConfig::new(
+                notice_key,
+                enqueued.command_digest.clone(),
+                target,
+            )?;
+            let notice_dir = crate::coworker_notice::planning_notice_dir(&plans_dir);
+            crate::coworker_notice::PlanningNoticeStore::new(&notice_dir)?.configure(notice_cfg)?;
+        }
+
         let start_outcome = invoke_sibling_flow_start_command(&FlowStartCommandInvocation {
             flow_exe,
             state_dir: &state_dir,
@@ -1516,6 +1602,13 @@ impl CoworkerPlanningGateway {
             ));
         }
 
+        let (native_notice, native_notice_error) = inspect_planning_notice_best_effort(
+            &plans_dir,
+            &self.binding_id,
+            &self.thread_uuid,
+            &summary,
+        );
+
         Ok(PlanningCommandSubmissionResponse {
             binding_id: summary.binding_id.clone(),
             thread_uuid: summary.thread_uuid.clone(),
@@ -1532,6 +1625,8 @@ impl CoworkerPlanningGateway {
             context_digest: summary.context_digest.clone(),
             result_ref: summary.result_ref.clone(),
             command: summary,
+            native_notice,
+            native_notice_error,
         })
     }
 
@@ -1647,6 +1742,34 @@ impl CoworkerPlanningGateway {
             })?;
         artifact.validate_against_grant(artifact_id, grant)?;
         Ok(artifact)
+    }
+}
+
+fn inspect_planning_notice_best_effort(
+    plans_dir: &Path,
+    binding_id: &str,
+    thread_uuid: &str,
+    summary: &PlanningCommandSummary,
+) -> (
+    Option<crate::coworker_notice::PlanningNoticeMetadata>,
+    Option<String>,
+) {
+    let key = match crate::coworker_workflow::CoworkerJobOwnershipKey::new(
+        binding_id,
+        thread_uuid,
+        &summary.command_id,
+    ) {
+        Ok(k) => k,
+        Err(err) => return (None, Some(err.code().to_string())),
+    };
+    let notice_dir = crate::coworker_notice::planning_notice_dir(plans_dir);
+    match crate::coworker_notice::PlanningNoticeStore::inspect(
+        &notice_dir,
+        &key,
+        &summary.command_digest,
+    ) {
+        Ok(meta) => (Some(meta), None),
+        Err(err) => (None, Some(err.code().to_string())),
     }
 }
 

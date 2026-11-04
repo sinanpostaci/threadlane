@@ -11,7 +11,9 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use threadlane::native_tool_output::NativeNotificationDelivery;
 use threadlane::{
-    invoke_codex_wakeup, ApprovedSessionWakeupContext, CodexWakeupConfig, NativeToolOutputConfig,
+    format_coworker_planning_wakeup_message, invoke_codex_wakeup, invoke_coworker_planning_wakeup,
+    ApprovedSessionWakeupContext, CodexWakeupConfig, CoworkerPlanningWakeupAttempt,
+    CoworkerPlanningWakeupContext, NativeToolOutputConfig,
 };
 use threadlane_core::{WakeupClaim, WakeupOutcome};
 use tokio::net::UnixListener;
@@ -1616,5 +1618,351 @@ async fn wrong_thread_project_or_active_turn_fails_before_effect_independent_of_
             "no effect write permitted for case {label}"
         );
         assert!(!env.queue_marker.exists());
+    }
+}
+
+#[tokio::test]
+async fn coworker_planning_wakeup_supports_idle_start_active_steer_disconnect_unknown_and_scope_rejection(
+) {
+    const TEST_COMMAND_ID: &str = "pcm_0123456789abcdef0123456789abcdef";
+    const TEST_NOTIF_ID: &str = "ntf_0123456789abcdef0123456789abcdef";
+    let expected_notice =
+        format_coworker_planning_wakeup_message(TEST_COMMAND_ID).expect("expected notice");
+
+    // 1. Idle thread -> turn/start with fixed planning notice and omitted model/effort/toolOutput.
+    {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env.coworker_native_config();
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({ "id": 1, "result": { "serverInfo": { "name": "fake" } } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("init");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "idle" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("read");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "idle" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("resume");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({
+                    "id": 4,
+                    "result": {
+                        "turn": {
+                            "id": TEST_TURN_ID,
+                            "status": { "type": "inProgress" },
+                            "error": null
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("turn/start");
+        });
+
+        let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+        let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+            .expect("planning attempt");
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+        assert_eq!(outcome, WakeupOutcome::Submitted);
+        assert!(!env.queue_marker.exists());
+        server.await.expect("server");
+
+        let calls = recorded.lock().await;
+        assert_eq!(calls.len(), 5);
+        assert_eq!(calls[4]["method"], "turn/start");
+        let params = &calls[4]["params"];
+        assert_eq!(params["threadId"], TEST_THREAD_ID);
+        assert_eq!(
+            params["input"],
+            json!([{ "type": "text", "text": expected_notice }])
+        );
+        assert!(params.get("toolOutput").is_none());
+        assert!(params.get("model").is_none());
+        assert!(params.get("effort").is_none());
+    }
+
+    // 2. Active thread -> thread/turns/list + turn/steer with live expectedTurnId.
+    {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env.coworker_native_config();
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let recorded_clone = Arc::clone(&recorded);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({ "id": 1, "result": { "serverInfo": { "name": "fake" } } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("init");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "active" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("read");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "active" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("resume");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({
+                    "id": 4,
+                    "result": {
+                        "data": [{ "id": TEST_TURN_ID, "status": "inProgress", "items": [] }],
+                        "nextCursor": null
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("turns/list");
+            recorded_clone.lock().await.push(read_json(&mut ws).await);
+            ws.send(Message::Text(
+                json!({ "id": 5, "result": { "turnId": TEST_TURN_ID } })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("turn/steer");
+        });
+
+        let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+        let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+            .expect("planning attempt");
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+        assert_eq!(outcome, WakeupOutcome::Submitted);
+        server.await.expect("server");
+
+        let calls = recorded.lock().await;
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[5]["method"], "turn/steer");
+        let params = &calls[5]["params"];
+        assert_eq!(params["threadId"], TEST_THREAD_ID);
+        assert_eq!(params["expectedTurnId"], TEST_TURN_ID);
+        assert_eq!(
+            params["input"],
+            json!([{ "type": "text", "text": expected_notice }])
+        );
+        assert!(params.get("model").is_none());
+        assert!(params.get("effort").is_none());
+    }
+
+    // 3. Disconnect after effect write -> WakeupOutcome::Unknown.
+    {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env.coworker_native_config();
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({ "id": 1, "result": {} }).to_string().into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": TEST_THREAD_ID,
+                                "cwd": expected_cwd,
+                                "status": { "type": "idle" }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 3,
+                        "result": {
+                            "thread": {
+                                "id": TEST_THREAD_ID,
+                                "cwd": expected_cwd,
+                                "status": { "type": "idle" }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            let msg5 = read_json(&mut ws).await;
+            assert_eq!(msg5["method"], "turn/start");
+            let _ = ws.close(None).await;
+        });
+
+        let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+        let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+            .expect("planning attempt");
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+        assert!(
+            matches!(outcome, WakeupOutcome::Unknown { .. }),
+            "expected Unknown on disconnect after turn/start write, got {outcome:?}"
+        );
+        server.await.expect("server");
+    }
+
+    // 4. Mismatched command_id or cross-thread/project rejection -> WakeupOutcome::Failed before effect write.
+    {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env.coworker_native_config();
+        let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+        let mismatched_attempt = CoworkerPlanningWakeupAttempt::new(
+            "pcm_ffffffffffffffffffffffffffffffff",
+            TEST_NOTIF_ID,
+        )
+        .expect("attempt");
+        let (_tx, mut rx) = watch::channel(false);
+        let outcome = invoke_coworker_planning_wakeup(&ctx, &mismatched_attempt, &mut rx).await;
+        assert!(matches!(outcome, WakeupOutcome::Failed { .. }));
+
+        let saw_effect_write = Arc::new(Mutex::new(false));
+        let saw_effect_write_clone = Arc::clone(&saw_effect_write);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, validate_upgrade)
+                .await
+                .expect("ws");
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({ "id": 1, "result": {} }).to_string().into(),
+                ))
+                .await;
+            let _ = read_json(&mut ws).await;
+            let _ = read_json(&mut ws).await;
+            let _ = ws
+                .send(Message::Text(
+                    json!({
+                        "id": 2,
+                        "result": {
+                            "thread": {
+                                "id": "01968f52-0000-7d51-9914-79d2bc48eb5a",
+                                "cwd": "/tmp/wrong-project-root",
+                                "status": { "type": "idle" }
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+            if let Some(Ok(Message::Text(text))) = ws.next().await {
+                let val: Value = serde_json::from_str(&text).expect("json");
+                if matches!(val["method"].as_str(), Some("turn/start" | "turn/steer")) {
+                    *saw_effect_write_clone.lock().await = true;
+                }
+            }
+        });
+
+        let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+            .expect("planning attempt");
+        let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+        assert!(matches!(outcome, WakeupOutcome::Failed { .. }));
+        server.await.expect("server");
+        assert!(!*saw_effect_write.lock().await);
     }
 }

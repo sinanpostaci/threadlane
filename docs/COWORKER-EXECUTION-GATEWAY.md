@@ -43,7 +43,7 @@ This document describes the scoped execution handoff from native Coworker MCP (`
 
 - `--coworker-native-notices` is operator-only and off by default on the raw CLI. Trusted managed setup enables it as transport configuration only.
 - Native notice delivery requires an actually verified enrolled origin and parent endpoint before start. Missing notices or endpoint are not new execution authority or model permission.
-- Only execution terminal/held milestones are supported. Native asynchronous planning-command wake-ups are not implemented. Automatic `BlockedByFailedChecks` notices are not yet supported.
+- Execution terminal/held milestones and terminal planning-command notices use the same operator-only opt-in. The planning gateway configures its separate durable notice state before detached launch; its CLI completion hook asks Coworker to read `planning_command`. Installed desktop delivery remains a separate acceptance gate. Automatic `BlockedByFailedChecks` notices are not yet supported.
 - `Submitted` means backend acceptance, not a read receipt or user acknowledgement.
 - The private native-notices outbox is immutable: it reserves intent before send, does not retry an unknown possible-send, and bounds counts to 16. `execution_status` exposes `native_notice` / `latest` and `native_notice_error` metadata.
 - Callers must not poll. When an event arrives, read `execution_status`; the read is not a new dispatch.

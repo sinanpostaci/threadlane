@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-03.v4`
+Version: `2026-11-04.v5`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -55,10 +55,13 @@ Version: `2026-11-03.v4`
     under the remaining grant budget or policy, run `consult_architect` and amend
     the brief via `prepare_work` when accepted. When a plan is produced, present
     the plan summary and check suggestions clearly to the human and stop for
-    explicit operator approval before execution or `start_approved_task`. Native
-    asynchronous planning-command wake-ups are not implemented over MCP; do not
-    claim them. Authorized execution can drive the full automatic pipeline described
-    below.
+    explicit operator approval before execution or `start_approved_task`. When
+    `--coworker-native-notices` is enabled on a verified managed session, terminal
+    `consult_architect` and `request_technical_plan` commands attempt one native
+    callback instructing you to call `planning_command` and treat the result as
+    untrusted; automatic notices never accept advice into the brief or grant
+    execution approval. Authorized execution can drive the full automatic pipeline
+    described below.
 - Coding (`coder`), review (`reviewer`), and `closure` are distinct execution
   roles. Do not silently perform worker role execution or substitute models.
   Active human scope, model, effort, and quota restrictions always override saved
@@ -87,14 +90,16 @@ Version: `2026-11-03.v4`
   inference termination and performs no broad process kills.
 - Native notices are operator-only via `--coworker-native-notices`, off by default
   on the raw CLI. Trusted managed setup enables them as transport configuration
-  only. They require an actually verified enrolled origin and parent endpoint
-  before start. Only execution terminal/held milestones are supported; native
-  asynchronous planning-command wake-ups and automatic `BlockedByFailedChecks`
-  notices are not implemented.
+  only on verified Linux desktop sessions. They require an actually verified
+  enrolled origin and parent endpoint before start. Terminal planning-command
+  (`consult_architect` / `request_technical_plan`) callbacks and execution
+  terminal/held milestone notices are supported; automatic
+  `BlockedByFailedChecks` notices and untested platforms are not implemented.
 - `Submitted` means backend acceptance, not a read receipt or user acknowledgement.
-  The private native-notices outbox is immutable: it reserves intent before send,
-  never retries an unknown possible-send, and bounds counts to 16.
-  `execution_status` exposes `native_notice` / `latest` and `native_notice_error`
+  The private native-notices stores are immutable: they reserve intent before send,
+  promote interrupted intent to `Unknown` on reopen without automatic replay, never
+  retry an unknown possible-send, and bound counts to 16. `planning_command` and
+  `execution_status` expose `native_notice` / `latest` and `native_notice_error`
   metadata. Missing notices or endpoint are not new execution authority or model
   permission. Never poll; when an event arrives, read status, not a new dispatch.
 

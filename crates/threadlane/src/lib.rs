@@ -11,6 +11,8 @@ pub mod cli;
 pub mod client;
 /// Optional Codex queue wake-up bridge and argument construction.
 pub mod codex;
+/// Typed Coworker planning command wake-up context and bounded native Unix WebSocket notification API.
+pub mod coworker_planning_wakeup;
 /// Typed Coworker job status wake-up context and bounded native Unix WebSocket notification API.
 pub mod coworker_wakeup;
 /// Runtime descriptor, process-lifetime state lock, and filesystem security checks.
@@ -34,6 +36,12 @@ pub use client::{ScopedClient, SupervisorClient, MAX_CLIENT_RESPONSE_BYTES};
 pub use codex::{
     build_codex_queue_args, invoke_codex_wakeup, ApprovedSessionWakeupContext, CodexWakeupConfig,
     DEFAULT_CODEX_TIMEOUT_MS, MAX_CODEX_TIMEOUT_MS,
+};
+pub use coworker_planning_wakeup::{
+    format_coworker_planning_wakeup_message, invoke_coworker_planning_wakeup,
+    validate_coworker_planning_command_id, CoworkerPlanningNotification,
+    CoworkerPlanningWakeupAttempt, CoworkerPlanningWakeupContext,
+    COWORKER_PLANNING_COMMAND_ID_HEX_LEN, COWORKER_PLANNING_COMMAND_ID_PREFIX,
 };
 pub use coworker_wakeup::{
     format_coworker_job_wakeup_message, invoke_coworker_job_wakeup, validate_coworker_job_id,

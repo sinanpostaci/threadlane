@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use threadlane::coworker_planning_wakeup::{
+    validate_coworker_planning_command_id, CoworkerPlanningWakeupAttempt,
+    CoworkerPlanningWakeupContext,
+};
 use threadlane::coworker_wakeup::{CoworkerJobWakeupAttempt, CoworkerJobWakeupContext};
 use threadlane::native_tool_output::NativeToolOutputConfig;
 use threadlane_core::WakeupOutcome;
@@ -12,9 +16,10 @@ use crate::coworker_workflow::{
     VerifiedControllerAdmission,
 };
 use crate::fs_safety::{
-    acquire_cross_process_lock, prepare_private_dir, read_private_file_bounded,
-    validate_bounded_identifier, write_private_file_atomic,
+    acquire_cross_process_lock, constant_time_str_eq, prepare_private_dir,
+    read_private_file_bounded, validate_bounded_identifier, write_private_file_atomic,
 };
+use crate::planning_commands::PlanningCommandStatus;
 use crate::{NativeError, NativeErrorCode};
 
 /// Maximum number of persisted notice delivery attempts allowed per job scope.
@@ -644,6 +649,574 @@ fn scope_filenames(key: &CoworkerJobOwnershipKey) -> Result<(String, String), Na
     ))
 }
 
+fn validate_sha256_digest_str(digest: &str, label: &'static str) -> Result<(), NativeError> {
+    validate_bounded_identifier(digest, label, 128)?;
+    let normalized =
+        threadlane_workers::validate_sha256_hex_digest(digest, label).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("{label} must be 64 lowercase hex characters"),
+            )
+        })?;
+    if normalized != digest {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!("{label} must be 64 lowercase hex characters"),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the private planning command native notice store directory inside the planning commands directory.
+pub fn planning_notice_dir(plans_dir: &Path) -> PathBuf {
+    crate::planning_driver::planning_commands_dir(plans_dir).join("native-notices")
+}
+
+/// Eligible terminal planning command state for a completion or attention native notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningNoticeTerminalKind {
+    /// Command completed with a verified planning artifact and applicable published plan.
+    Completed,
+    /// Command terminated in a known failure.
+    KnownFailed,
+    /// Command terminated with an uncertain provider outcome (`Unknown` / `pending_reconciliation`).
+    Unknown,
+}
+
+impl PlanningNoticeTerminalKind {
+    /// Returns the stable `snake_case` string representation of this terminal kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::KnownFailed => "known_failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Snapshot of persisted planning command state used to verify terminal notice eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlanningNoticeSnapshot {
+    /// Authoritative persisted planning command status.
+    pub status: PlanningCommandStatus,
+    /// Whether the command requires reconciliation due to an uncertain provider outcome.
+    pub pending_reconciliation: bool,
+    /// Whether an active process currently holds the command ownership lock.
+    pub has_active_owner_lock: bool,
+    /// Whether the completed artifact (and published plan, when applicable) has been verified.
+    pub verified_completed_outcome: bool,
+}
+
+/// Validates whether a [`PlanningNoticeSnapshot`] satisfies terminal planning notice eligibility.
+///
+/// Only terminal states (`Completed` with verified artifact outcome and no pending reconciliation,
+/// `KnownFailed` without pending reconciliation, or `Unknown` with `pending_reconciliation`)
+/// without an active ownership lock are eligible. `Queued` and live `Running` commands are rejected.
+pub fn validate_planning_notice_eligibility(
+    snapshot: PlanningNoticeSnapshot,
+) -> Result<PlanningNoticeTerminalKind, NativeError> {
+    if snapshot.has_active_owner_lock {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "planning command still holds an active ownership lock",
+        ));
+    }
+    match snapshot.status {
+        PlanningCommandStatus::Queued | PlanningCommandStatus::Running => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "planning command state does not satisfy terminal notice milestone",
+        )),
+        PlanningCommandStatus::Completed => {
+            if snapshot.pending_reconciliation || !snapshot.verified_completed_outcome {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "completed planning command requires a verified artifact outcome and no pending reconciliation",
+                ));
+            }
+            Ok(PlanningNoticeTerminalKind::Completed)
+        }
+        PlanningCommandStatus::KnownFailed => {
+            if snapshot.pending_reconciliation {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "known_failed planning command must not have pending reconciliation",
+                ));
+            }
+            Ok(PlanningNoticeTerminalKind::KnownFailed)
+        }
+        PlanningCommandStatus::Unknown => {
+            if !snapshot.pending_reconciliation {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "unknown planning command must have pending_reconciliation set",
+                ));
+            }
+            Ok(PlanningNoticeTerminalKind::Unknown)
+        }
+    }
+}
+
+/// Immutable validated configuration binding a planning command to its command digest and native wakeup target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningNoticeConfig {
+    /// Ownership key identifying the binding, thread, and planning command (`pcm_<32 lowercase hex>`).
+    pub key: CoworkerJobOwnershipKey,
+    /// Lowercase 64-character SHA-256 digest of the immutable planning command payload.
+    pub command_digest: String,
+    /// Native tool output target bound to the command thread and repository root.
+    pub target: NativeToolOutputConfig,
+}
+
+impl PlanningNoticeConfig {
+    /// Creates a validated planning notice configuration for trusted native callers only.
+    pub fn new(
+        key: CoworkerJobOwnershipKey,
+        command_digest: impl Into<String>,
+        target: NativeToolOutputConfig,
+    ) -> Result<Self, NativeError> {
+        let cfg = Self {
+            key,
+            command_digest: command_digest.into(),
+            target,
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Validates the ownership key, `pcm_<32hex>` command identifier, command digest, target compatibility, and wakeup context.
+    pub fn validate(&self) -> Result<(), NativeError> {
+        self.key.validate()?;
+        validate_coworker_planning_command_id(&self.key.job_id)
+            .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+        validate_sha256_digest_str(&self.command_digest, "command_digest")?;
+        if self.target.has_legacy_model_metadata() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "planning notice target must not specify model or effort overrides",
+            ));
+        }
+        if self.target.thread_id != self.key.thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "planning notice target thread_id must match ownership thread_uuid",
+            ));
+        }
+        self.build_wakeup_context().map(|_| ())
+    }
+
+    /// Returns whether `other` binds the same immutable command and target identity.
+    pub fn matches_identity(&self, other: &Self) -> bool {
+        self.key == other.key
+            && constant_time_str_eq(&self.command_digest, &other.command_digest)
+            && self.target.delivery == other.target.delivery
+            && self.target.thread_id == other.target.thread_id
+            && self.target.project_root == other.target.project_root
+            && self.target.reconnect == other.target.reconnect
+            && !self.target.has_legacy_model_metadata()
+            && !other.target.has_legacy_model_metadata()
+            && (self.target.socket_path == other.target.socket_path
+                || self.target.reconnect.is_some())
+    }
+
+    fn build_wakeup_context(&self) -> Result<CoworkerPlanningWakeupContext, NativeError> {
+        CoworkerPlanningWakeupContext::new(self.key.job_id.clone(), self.target.clone())
+            .and_then(|ctx| ctx.with_timeout_ms(NOTICE_TIMEOUT_MS))
+            .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))
+    }
+}
+
+/// A durable record of one reserved planning command notice delivery attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedPlanningNoticeAttempt {
+    /// Unique deterministic identifier assigned to the persisted attempt.
+    pub attempt_id: String,
+    /// Terminal planning command state associated with this attempt.
+    pub terminal_kind: PlanningNoticeTerminalKind,
+    /// Deterministic fingerprint used to enforce at-most-once completion/attention notice per command.
+    pub fingerprint: String,
+    /// Current durable status of the attempted delivery.
+    pub status: PersistedAttemptStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPlanningNoticeState {
+    config: PlanningNoticeConfig,
+    attempts: Vec<PersistedPlanningNoticeAttempt>,
+}
+
+/// Report returned when a planning notice attempt is reserved, finalized, or deduplicated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningNoticeReport {
+    /// Persisted attempt identifier when an attempt exists, or `None` when the cap was reached.
+    pub attempt_id: Option<String>,
+    /// Validated planning command identifier (`pcm_<32 lowercase hex>`).
+    pub command_id: String,
+    /// Terminal planning command state associated with this report.
+    pub terminal_kind: PlanningNoticeTerminalKind,
+    /// Deterministic fingerprint identifying this planning command notice.
+    pub fingerprint: String,
+    /// Delivery status reported for this notice attempt.
+    pub status: NoticeDeliveryStatus,
+    /// Indicates whether an existing attempt was found instead of a new reservation.
+    pub was_duplicate: bool,
+    /// Indicates whether the maximum persisted attempt count was reached.
+    pub cap_reached: bool,
+    /// Total number of persisted attempts for the planning command scope.
+    pub attempt_count: usize,
+}
+
+/// Read-only inspection summary of persisted planning command notice state.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanningNoticeMetadata {
+    /// Indicates whether a native notice target is configured for the planning command scope.
+    pub configured: bool,
+    /// Total number of persisted notice delivery attempts for the planning command scope.
+    pub attempt_count: usize,
+    /// Report describing the latest persisted notice delivery attempt, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest: Option<PlanningNoticeReport>,
+}
+
+/// Derives the deterministic SHA-256 fingerprint for a validated planning command key and immutable command digest.
+///
+/// Never keys on evolving timestamps, mutable status revisions, or random retry identifiers.
+pub fn derive_planning_notice_fingerprint(
+    key: &CoworkerJobOwnershipKey,
+    command_digest: &str,
+) -> Result<String, NativeError> {
+    key.validate()?;
+    validate_coworker_planning_command_id(&key.job_id)
+        .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+    validate_sha256_digest_str(command_digest, "command_digest")?;
+    Ok(sha256_hex(
+        format!(
+            "planning_notice_fp\0{}\0{}\0{}\0{}",
+            key.binding_id, key.thread_uuid, key.job_id, command_digest
+        )
+        .as_bytes(),
+    ))
+}
+
+/// Verifies that a [`PlanningNoticeConfig`] matches the verified ownership key, command digest, and repository path.
+pub fn validate_planning_config_identity(
+    config: &PlanningNoticeConfig,
+    key: &CoworkerJobOwnershipKey,
+    command_digest: &str,
+    repository_path: &Path,
+) -> Result<(), NativeError> {
+    config.validate()?;
+    if &config.key != key
+        || config.target.thread_id != key.thread_uuid
+        || !constant_time_str_eq(&config.command_digest, command_digest)
+        || config.target.project_root.as_path() != repository_path
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "planning notice config identity does not match verified command scope",
+        ));
+    }
+    Ok(())
+}
+
+enum PlanningReserveOutcome {
+    MissingConfig,
+    Completed(PlanningNoticeReport),
+    Reserved {
+        context: Box<CoworkerPlanningWakeupContext>,
+        attempt: CoworkerPlanningWakeupAttempt,
+        fingerprint: String,
+        terminal_kind: PlanningNoticeTerminalKind,
+    },
+}
+
+/// Durable, cross-process-locked store for planning command native notice configuration and attempts.
+#[derive(Debug, Clone)]
+pub struct PlanningNoticeStore {
+    root_dir: PathBuf,
+}
+
+impl PlanningNoticeStore {
+    /// Creates the store root as a private `0700` directory and returns a store handle.
+    pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self, NativeError> {
+        let root_dir = root_dir.into();
+        prepare_private_dir(&root_dir, "planning_notice_dir")?;
+        Ok(Self { root_dir })
+    }
+
+    /// Inspects persisted planning notice metadata for `key` and `command_digest` without creating directories or locks.
+    pub fn inspect(
+        root_dir: &Path,
+        key: &CoworkerJobOwnershipKey,
+        command_digest: &str,
+    ) -> Result<PlanningNoticeMetadata, NativeError> {
+        let (_, state_name) = planning_scope_filenames(key)?;
+        validate_sha256_digest_str(command_digest, "command_digest")?;
+        let store = Self {
+            root_dir: root_dir.to_path_buf(),
+        };
+        let Some(state) = store.read_state_locked(&state_name)? else {
+            return Ok(PlanningNoticeMetadata::default());
+        };
+        state.config.key.validate()?;
+        if validate_coworker_planning_command_id(&state.config.key.job_id).is_err()
+            || &state.config.key != key
+            || !constant_time_str_eq(&state.config.command_digest, command_digest)
+            || state.config.target.thread_id != key.thread_uuid
+            || state.config.target.has_legacy_model_metadata()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "planning notice config identity does not match inspected command scope",
+            ));
+        }
+        let attempt_count = state.attempts.len();
+        let latest = state.attempts.last().map(|attempt| PlanningNoticeReport {
+            attempt_id: Some(attempt.attempt_id.clone()),
+            command_id: key.job_id.clone(),
+            terminal_kind: attempt.terminal_kind,
+            fingerprint: attempt.fingerprint.clone(),
+            status: map_persisted_status(attempt.status),
+            was_duplicate: false,
+            cap_reached: false,
+            attempt_count,
+        });
+        Ok(PlanningNoticeMetadata {
+            configured: true,
+            attempt_count,
+            latest,
+        })
+    }
+
+    /// Persists an immutable planning notice configuration for its command ownership scope.
+    ///
+    /// On duplicate submission for the same command scope, verifies identical command and target
+    /// identity without overwriting or resetting existing intent or attempts.
+    pub fn configure(&self, config: PlanningNoticeConfig) -> Result<(), NativeError> {
+        config.validate()?;
+        let (lock_name, state_name) = planning_scope_filenames(&config.key)?;
+        let _lock = acquire_cross_process_lock(&self.root_dir, &lock_name, "planning_notice_lock")?;
+        if let Some(existing) = self.read_state_locked(&state_name)? {
+            if !existing.config.matches_identity(&config) {
+                return Err(NativeError::new(
+                    NativeErrorCode::SecurityViolation,
+                    "planning notice config is immutable once configured",
+                ));
+            }
+            return Ok(());
+        }
+        self.write_state_locked(
+            &state_name,
+            &StoredPlanningNoticeState {
+                config,
+                attempts: Vec::new(),
+            },
+        )
+    }
+
+    /// Reserves and submits at most one terminal completion/attention notice for a configured planning command.
+    ///
+    /// Returns `Ok(None)` quietly when no notice configuration exists for `key`.
+    pub async fn notify_if_configured(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        command_digest: &str,
+        repository_path: &Path,
+        snapshot: PlanningNoticeSnapshot,
+    ) -> Result<Option<PlanningNoticeReport>, NativeError> {
+        let reserved = self.reserve_attempt(key, command_digest, repository_path, snapshot)?;
+        let (context, attempt, fingerprint, terminal_kind) = match reserved {
+            PlanningReserveOutcome::MissingConfig => return Ok(None),
+            PlanningReserveOutcome::Completed(report) => return Ok(Some(report)),
+            PlanningReserveOutcome::Reserved {
+                context,
+                attempt,
+                fingerprint,
+                terminal_kind,
+            } => (context, attempt, fingerprint, terminal_kind),
+        };
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
+        let report = self.finalize_attempt(key, terminal_kind, &fingerprint, &outcome)?;
+        Ok(Some(report))
+    }
+
+    fn reserve_attempt(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        command_digest: &str,
+        repository_path: &Path,
+        snapshot: PlanningNoticeSnapshot,
+    ) -> Result<PlanningReserveOutcome, NativeError> {
+        let (lock_name, state_name) = planning_scope_filenames(key)?;
+        let _lock = acquire_cross_process_lock(&self.root_dir, &lock_name, "planning_notice_lock")?;
+        let Some(mut state) = self.read_state_locked(&state_name)? else {
+            return Ok(PlanningReserveOutcome::MissingConfig);
+        };
+        validate_planning_config_identity(&state.config, key, command_digest, repository_path)?;
+        let terminal_kind = validate_planning_notice_eligibility(snapshot)?;
+        let mut dirty = false;
+        for entry in &mut state.attempts {
+            if entry.status == PersistedAttemptStatus::Intent {
+                entry.status = PersistedAttemptStatus::Unknown;
+                dirty = true;
+            }
+        }
+        if dirty {
+            self.write_state_locked(&state_name, &state)?;
+        }
+        let fingerprint = derive_planning_notice_fingerprint(key, command_digest)?;
+        let count = state.attempts.len();
+        if let Some(existing) = state.attempts.iter().find(|a| a.fingerprint == fingerprint) {
+            return Ok(PlanningReserveOutcome::Completed(PlanningNoticeReport {
+                attempt_id: Some(existing.attempt_id.clone()),
+                command_id: key.job_id.clone(),
+                terminal_kind: existing.terminal_kind,
+                fingerprint,
+                status: map_persisted_status(existing.status),
+                was_duplicate: true,
+                cap_reached: false,
+                attempt_count: count,
+            }));
+        }
+        if count >= MAX_NOTICE_ATTEMPTS {
+            return Ok(PlanningReserveOutcome::Completed(PlanningNoticeReport {
+                attempt_id: None,
+                command_id: key.job_id.clone(),
+                terminal_kind,
+                fingerprint,
+                status: NoticeDeliveryStatus::CapReached,
+                was_duplicate: false,
+                cap_reached: true,
+                attempt_count: count,
+            }));
+        }
+        let context = state.config.build_wakeup_context()?;
+        let attempt_id = format!("pnotice_{}_{}", count + 1, &fingerprint[..16]);
+        let attempt = CoworkerPlanningWakeupAttempt::new(key.job_id.clone(), attempt_id.clone())
+            .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+        state.attempts.push(PersistedPlanningNoticeAttempt {
+            attempt_id,
+            terminal_kind,
+            fingerprint: fingerprint.clone(),
+            status: PersistedAttemptStatus::Intent,
+        });
+        self.write_state_locked(&state_name, &state)?;
+        Ok(PlanningReserveOutcome::Reserved {
+            context: Box::new(context),
+            attempt,
+            fingerprint,
+            terminal_kind,
+        })
+    }
+
+    fn finalize_attempt(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        terminal_kind: PlanningNoticeTerminalKind,
+        fingerprint: &str,
+        outcome: &WakeupOutcome,
+    ) -> Result<PlanningNoticeReport, NativeError> {
+        let (lock_name, state_name) = planning_scope_filenames(key)?;
+        let _lock = acquire_cross_process_lock(&self.root_dir, &lock_name, "planning_notice_lock")?;
+        let mut state = self.read_state_locked(&state_name)?.ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                "missing planning notice state on finalize",
+            )
+        })?;
+        let persisted = match outcome {
+            WakeupOutcome::Submitted => PersistedAttemptStatus::Submitted,
+            WakeupOutcome::Failed { .. } => PersistedAttemptStatus::Failed,
+            WakeupOutcome::Unknown { .. } => PersistedAttemptStatus::Unknown,
+        };
+        let entry = state
+            .attempts
+            .iter_mut()
+            .find(|a| a.fingerprint == fingerprint)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::IoError,
+                    "missing reserved planning notice intent",
+                )
+            })?;
+        entry.status = persisted;
+        let attempt_id = entry.attempt_id.clone();
+        let attempt_count = state.attempts.len();
+        self.write_state_locked(&state_name, &state)?;
+        Ok(PlanningNoticeReport {
+            attempt_id: Some(attempt_id),
+            command_id: key.job_id.clone(),
+            terminal_kind,
+            fingerprint: fingerprint.to_string(),
+            status: map_persisted_status(persisted),
+            was_duplicate: false,
+            cap_reached: false,
+            attempt_count,
+        })
+    }
+
+    fn read_state_locked(
+        &self,
+        filename: &str,
+    ) -> Result<Option<StoredPlanningNoticeState>, NativeError> {
+        let path = self.root_dir.join(filename);
+        let Some(bytes) =
+            read_private_file_bounded(&path, MAX_NOTICE_STATE_BYTES, "planning_notice_state")?
+        else {
+            return Ok(None);
+        };
+        let state: StoredPlanningNoticeState = serde_json::from_slice(&bytes).map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("invalid planning notice state JSON: {err}"),
+            )
+        })?;
+        if state.attempts.len() > MAX_NOTICE_ATTEMPTS {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "persisted planning notice attempts exceed cap",
+            ));
+        }
+        Ok(Some(state))
+    }
+
+    fn write_state_locked(
+        &self,
+        filename: &str,
+        state: &StoredPlanningNoticeState,
+    ) -> Result<(), NativeError> {
+        let bytes = serde_json::to_vec(state)
+            .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+        write_private_file_atomic(&self.root_dir, filename, &bytes, "planning_notice_state")?;
+        Ok(())
+    }
+}
+
+fn planning_scope_filenames(
+    key: &CoworkerJobOwnershipKey,
+) -> Result<(String, String), NativeError> {
+    key.validate()?;
+    validate_coworker_planning_command_id(&key.job_id)
+        .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+    let digest = sha256_hex(
+        format!(
+            "planning_notice_scope\0{}\0{}\0{}",
+            key.binding_id, key.thread_uuid, key.job_id
+        )
+        .as_bytes(),
+    );
+    Ok((
+        format!("planning-notice-{digest}.lock"),
+        format!("planning-notice-{digest}.json"),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,5 +1657,155 @@ mod tests {
             std::fs::metadata(&state_path).unwrap().modified().unwrap(),
             mtime
         );
+    }
+
+    #[test]
+    fn planning_notice_eligibility_and_reserve_intent_reopen_no_replay() {
+        let tmp = tempfile::tempdir().unwrap();
+        prepare_private_dir(tmp.path(), "test_root").unwrap();
+        let sock = tmp.path().join("codex.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let key = CoworkerJobOwnershipKey::new(
+            "binding_1",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "pcm_0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        let target = NativeToolOutputConfig::new_user_message_steer(
+            sock,
+            key.thread_uuid.clone(),
+            tmp.path().to_path_buf(),
+        );
+        let cfg = PlanningNoticeConfig::new(key, "b".repeat(64), target).unwrap();
+        let store_root = tmp.path().join("planning-notices");
+
+        // Pure read-only inspect on missing root creates nothing.
+        let unconfigured =
+            PlanningNoticeStore::inspect(&store_root, &cfg.key, &cfg.command_digest).unwrap();
+        assert!(!unconfigured.configured);
+        assert!(!store_root.exists());
+
+        let store = PlanningNoticeStore::new(&store_root).unwrap();
+        store.configure(cfg.clone()).unwrap();
+        // Idempotent duplicate configure succeeds without resetting.
+        store.configure(cfg.clone()).unwrap();
+
+        // Queued, Running, active lock, and unverified Completed are rejected.
+        for bad_snap in [
+            PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Queued,
+                pending_reconciliation: false,
+                has_active_owner_lock: false,
+                verified_completed_outcome: false,
+            },
+            PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Running,
+                pending_reconciliation: false,
+                has_active_owner_lock: false,
+                verified_completed_outcome: false,
+            },
+            PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Completed,
+                pending_reconciliation: false,
+                has_active_owner_lock: true,
+                verified_completed_outcome: true,
+            },
+            PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Completed,
+                pending_reconciliation: false,
+                has_active_owner_lock: false,
+                verified_completed_outcome: false,
+            },
+            PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Completed,
+                pending_reconciliation: true,
+                has_active_owner_lock: false,
+                verified_completed_outcome: true,
+            },
+        ] {
+            assert!(validate_planning_notice_eligibility(bad_snap).is_err());
+        }
+
+        // Eligible terminal states: Completed, KnownFailed, Unknown.
+        assert_eq!(
+            validate_planning_notice_eligibility(PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Completed,
+                pending_reconciliation: false,
+                has_active_owner_lock: false,
+                verified_completed_outcome: true,
+            })
+            .unwrap(),
+            PlanningNoticeTerminalKind::Completed
+        );
+        assert_eq!(
+            validate_planning_notice_eligibility(PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::KnownFailed,
+                pending_reconciliation: false,
+                has_active_owner_lock: false,
+                verified_completed_outcome: false,
+            })
+            .unwrap(),
+            PlanningNoticeTerminalKind::KnownFailed
+        );
+        assert_eq!(
+            validate_planning_notice_eligibility(PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Unknown,
+                pending_reconciliation: true,
+                has_active_owner_lock: false,
+                verified_completed_outcome: false,
+            })
+            .unwrap(),
+            PlanningNoticeTerminalKind::Unknown
+        );
+
+        let completed_snap = PlanningNoticeSnapshot {
+            status: PlanningCommandStatus::Completed,
+            pending_reconciliation: false,
+            has_active_owner_lock: false,
+            verified_completed_outcome: true,
+        };
+        assert!(matches!(
+            store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.command_digest,
+                    &cfg.target.project_root,
+                    completed_snap
+                )
+                .unwrap(),
+            PlanningReserveOutcome::Reserved { .. }
+        ));
+
+        // Duplicate configure does not reset reserved intent.
+        store.configure(cfg.clone()).unwrap();
+
+        // Inspect maps Intent to Unknown without mutating bytes or mtime.
+        let meta =
+            PlanningNoticeStore::inspect(&store_root, &cfg.key, &cfg.command_digest).unwrap();
+        assert!(meta.configured);
+        assert_eq!(meta.attempt_count, 1);
+        assert_eq!(
+            meta.latest.as_ref().map(|r| r.status),
+            Some(NoticeDeliveryStatus::Unknown)
+        );
+
+        // Reopen / second reserve promotes Intent to Unknown and deduplicates without replaying.
+        let reopened = PlanningNoticeStore::new(&store_root).unwrap();
+        match reopened
+            .reserve_attempt(
+                &cfg.key,
+                &cfg.command_digest,
+                &cfg.target.project_root,
+                completed_snap,
+            )
+            .unwrap()
+        {
+            PlanningReserveOutcome::Completed(report) => {
+                assert!(report.was_duplicate);
+                assert_eq!(report.status, NoticeDeliveryStatus::Unknown);
+                assert_eq!(report.attempt_count, 1);
+            }
+            _ => panic!("expected duplicate Unknown completion without replay"),
+        }
     }
 }

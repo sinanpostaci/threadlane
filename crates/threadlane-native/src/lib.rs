@@ -148,6 +148,15 @@ pub use coworker_grants::{
     PlanningGrantPreviewStatus, PlanningGrantSummary, PreparePlanningGrantRequest,
     RecordPlanningGrantRequest, TrustedGrantScope, PLANNING_GRANT_PREVIEW_DOMAIN,
 };
+pub use coworker_notice::{
+    coworker_notice_dir, derive_notice_fingerprint, derive_planning_notice_fingerprint,
+    planning_notice_dir, satisfies_notice_milestone, validate_config_identity,
+    validate_planning_config_identity, validate_planning_notice_eligibility, CoworkerNoticeConfig,
+    CoworkerNoticeStore, NoticeDeliveryStatus, NoticeKind, NoticeMetadata, NoticeMilestoneSnapshot,
+    NoticeReport, PersistedAttemptStatus, PersistedNoticeAttempt, PersistedPlanningNoticeAttempt,
+    PlanningNoticeConfig, PlanningNoticeMetadata, PlanningNoticeReport, PlanningNoticeSnapshot,
+    PlanningNoticeStore, PlanningNoticeTerminalKind, MAX_NOTICE_ATTEMPTS, NOTICE_TIMEOUT_MS,
+};
 pub use coworker_observation::{
     begin_coworker_call_observation, current_verified_coworker_observation_context_for_scope,
     derive_coworker_observation_ids, extract_observed_model_and_effort,
@@ -208,11 +217,11 @@ pub use planning_commands::{
 pub use planning_driver::{
     enqueue_planning_command_summary, execute_planning_command,
     get_planning_command_summary_readonly, list_planning_command_summaries_readonly,
-    open_planning_driver_for_plans_dir, planning_artifacts_dir, planning_commands_dir,
-    start_planning_command_detached, PlanningCommandDriver, PlanningCommandExecutionOutcome,
-    PlanningCommandExecutionSummary, PlanningCommandPage, PlanningCommandStartOutcome,
-    PlanningCommandStartStatus, PlanningCommandSummary, PLANNING_ARTIFACTS_DIR_NAME,
-    PLANNING_COMMANDS_DIR_NAME,
+    notify_terminal_planning_command_if_configured, open_planning_driver_for_plans_dir,
+    planning_artifacts_dir, planning_commands_dir, start_planning_command_detached,
+    PlanningCommandDriver, PlanningCommandExecutionOutcome, PlanningCommandExecutionSummary,
+    PlanningCommandPage, PlanningCommandStartOutcome, PlanningCommandStartStatus,
+    PlanningCommandSummary, PLANNING_ARTIFACTS_DIR_NAME, PLANNING_COMMANDS_DIR_NAME,
 };
 pub use planning_gateway::{
     resolve_sibling_flow_executable, resolve_sibling_flow_executable_from, ConsultArchitectParams,

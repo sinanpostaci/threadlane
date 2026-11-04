@@ -1253,3 +1253,294 @@ async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_archi
 
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn detached_cli_planning_completion_notifies_private_websocket_peer_once() {
+    use futures_util::{SinkExt, StreamExt};
+    use threadlane::NativeToolOutputConfig;
+    use threadlane_native::coworker_workflow::CoworkerJobOwnershipKey;
+    use threadlane_native::{PlanningNoticeConfig, PlanningNoticeStore};
+    use tokio::net::UnixListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::Message;
+
+    for disconnect_after_write in [false, true] {
+        let mut fixture = GatewayFixture::start().await;
+        let mcp = fixture.enrolled_mcp();
+        let now_ms = current_wall_clock_ms().expect("wall clock");
+        let grant_id = fixture.create_grant(
+            "req-notice-grant-1",
+            now_ms.saturating_sub(5_000),
+            now_ms + 3_600_000,
+        );
+        let prep: PrepareWorkResponse = invoke_mcp_ok(
+            &mcp,
+            "prepare_work",
+            json!({
+                "grant_id": grant_id,
+                "request_key": "req-notice-prep-1",
+                "summary": "Prove detached planning completion notices",
+                "confirmed_requirements": ["Use the private native socket"],
+                "proposed_additions": ["Notify after the CLI command completes"],
+                "open_questions": ["Is the notice delivered exactly once?"]
+            }),
+        )
+        .await;
+        assert!(prep.ready_for_execution_planning);
+
+        create_private_dir(&threadlane_native::planning_commands_dir(
+            &fixture.plans_dir,
+        ));
+        let notice_root = threadlane_native::planning_notice_dir(&fixture.plans_dir);
+        create_private_dir(&notice_root);
+        let socket_path = notice_root.join("native-notice.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind private notice socket");
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+            .expect("restrict notice socket permissions");
+
+        let repo = fixture.repo_dir.to_string_lossy().into_owned();
+        let (receipt_tx, receipt_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept notice connection");
+            let mut websocket = accept_async(stream)
+                .await
+                .expect("accept private websocket");
+            let mut receipt_tx = Some(receipt_tx);
+            while let Some(message) = websocket.next().await {
+                let message = message.expect("read websocket request");
+                let request = match message {
+                    Message::Text(text) => text.to_string(),
+                    Message::Binary(bytes) => {
+                        String::from_utf8(bytes.to_vec()).expect("utf8 binary request")
+                    }
+                    Message::Ping(payload) => {
+                        websocket
+                            .send(Message::Pong(payload))
+                            .await
+                            .expect("send websocket pong");
+                        continue;
+                    }
+                    Message::Close(_) => break,
+                    _ => continue,
+                };
+                let request: Value =
+                    serde_json::from_str(&request).expect("parse websocket request");
+                let method = request["method"].as_str().unwrap_or_default().to_string();
+                if method == "initialized" {
+                    continue;
+                }
+                let is_turn_start = method == "turn/start";
+                if is_turn_start && disconnect_after_write {
+                    receipt_tx
+                        .take()
+                        .expect("single turn/start receipt")
+                        .send(request)
+                        .expect("deliver turn/start receipt");
+                    break;
+                }
+                let result = match method.as_str() {
+                    "initialize" => json!({}),
+                    "thread/read" => json!({
+                        "thread": {
+                            "id": THREAD_UUID,
+                            "cwd": repo.clone(),
+                            "status": {"type": "idle"}
+                        }
+                    }),
+                    "thread/resume" => json!({
+                        "thread": {"id": THREAD_UUID, "cwd": repo.clone(), "status": {"type": "idle"}},
+                        "cwd": repo.clone()
+                    }),
+                    "turn/start" => json!({
+                        "turn": {
+                            "id": "0196ed00-0000-7000-8000-0000000000aa",
+                            "status": "inProgress"
+                        }
+                    }),
+                    other => panic!("unexpected websocket request {other}: {request}"),
+                };
+                let response =
+                    json!({"jsonrpc": "2.0", "id": request["id"].clone(), "result": result});
+                websocket
+                    .send(Message::Text(response.to_string().into()))
+                    .await
+                    .expect("send websocket response");
+                if is_turn_start {
+                    receipt_tx
+                        .take()
+                        .expect("single turn/start receipt")
+                        .send(request)
+                        .expect("deliver turn/start receipt");
+                    break;
+                }
+            }
+        });
+
+        fs::remove_file(&fixture.release_path).expect("hold fake worker");
+        let consult_args = json!({
+            "grant_id": grant_id,
+            "job_id": prep.job_id,
+            "request_key": "req-notice-consult-1",
+            "question": "How should detached completion be announced?",
+            "dependency_files": ["src/lib.rs"],
+            "difficulty": "hard"
+        });
+        let command: PlanningCommandSubmissionResponse =
+            invoke_mcp_ok(&mcp, "consult_architect", consult_args.clone()).await;
+        assert_eq!(command.binding_id, fixture.binding_id);
+        assert_eq!(command.role, WorkflowRole::Architect);
+        assert_eq!(
+            command.submission_status,
+            PlanningCommandStartStatus::SubmissionRequested
+        );
+        assert!(command.submission_requested);
+        assert!(command.launched);
+
+        let ownership_key = CoworkerJobOwnershipKey {
+            binding_id: fixture.binding_id.clone(),
+            thread_uuid: THREAD_UUID.to_string(),
+            job_id: command.command_id.clone(),
+        };
+        let target = NativeToolOutputConfig::new_user_message_steer(
+            socket_path,
+            THREAD_UUID.to_string(),
+            fixture.repo_dir.clone(),
+        );
+        let notice_config = PlanningNoticeConfig::new(
+            ownership_key,
+            command.command.command_digest.clone(),
+            target,
+        )
+        .expect("valid planning notice configuration");
+        let notice_store =
+            PlanningNoticeStore::new(&notice_root).expect("open trusted planning notice store");
+        notice_store
+            .configure(notice_config)
+            .expect("configure planning notice target");
+
+        fs::write(&fixture.release_path, b"release\n").expect("release held worker");
+        let callback = tokio::time::timeout(Duration::from_secs(10), receipt_rx)
+            .await
+            .expect("detached CLI callback must arrive within the bounded planning deadline")
+            .expect("receive callback request");
+        let params = callback["params"]
+            .as_object()
+            .expect("turn/start params object");
+        let text = params["input"][0]["text"]
+            .as_str()
+            .expect("turn/start input text");
+        assert!(text.contains(&command.command_id));
+        assert!(text.contains("planning_command"));
+        assert!(!params.contains_key("model"));
+        assert!(!params.contains_key("reasoningEffort"));
+        assert!(!params.contains_key("queue"));
+        assert!(!params.contains_key("toolOutput"));
+        assert!(!text.contains("toolOutput"));
+
+        let detail = wait_for_command_completion(&mcp, &command.command_id).await;
+        assert_eq!(detail.status, PlanningCommandStatus::Completed);
+        assert!(!detail.pending_reconciliation);
+        assert_eq!(
+            detail
+                .structured_architect_advice
+                .as_ref()
+                .expect("structured architect advice")
+                .decision_summary,
+            "Keep strict planning command boundary"
+        );
+        let expected_status = if disconnect_after_write {
+            "unknown"
+        } else {
+            "submitted"
+        };
+        let notified =
+            wait_for_planning_notice_delivery(&mcp, &command.command_id, expected_status).await;
+        assert_eq!(notified["native_notice"]["configured"], json!(true));
+        assert_eq!(notified["native_notice"]["attempt_count"], json!(1));
+        assert_eq!(
+            notified["native_notice"]["latest"]["status"],
+            json!(expected_status)
+        );
+
+        let repeat: PlanningCommandSubmissionResponse =
+            invoke_mcp_ok(&mcp, "consult_architect", consult_args).await;
+        assert_eq!(repeat.command_id, command.command_id);
+        assert_eq!(
+            repeat.submission_status,
+            PlanningCommandStartStatus::AlreadyCompleted
+        );
+        assert!(!repeat.launched);
+
+        let duplicate_cli = tokio::process::Command::new(env!("CARGO_BIN_EXE_threadlane-flow"))
+            .arg("--state-dir")
+            .arg(&fixture.state_dir)
+            .arg("--registry-dir")
+            .arg(&fixture.registry_dir)
+            .arg("--plans-dir")
+            .arg(&fixture.plans_dir)
+            .arg("--authority-dir")
+            .arg(&fixture.authority_dir)
+            .arg("--sessions-dir")
+            .arg(&fixture.sessions_dir)
+            .arg("--binding")
+            .arg(&fixture.binding_id)
+            .arg("--thread")
+            .arg(THREAD_UUID)
+            .arg("coworker-planning")
+            .arg("execute-command")
+            .arg("--command-id")
+            .arg(&command.command_id)
+            .output()
+            .await
+            .expect("run duplicate detached driver command");
+        assert!(
+            duplicate_cli.status.success(),
+            "duplicate detached driver command failed: {}",
+            String::from_utf8_lossy(&duplicate_cli.stderr)
+        );
+
+        let provider_calls = fs::read_to_string(&fixture.worker_marker)
+            .expect("read worker marker")
+            .lines()
+            .count();
+        assert_eq!(provider_calls, 1);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_repeat =
+            wait_for_planning_notice_delivery(&mcp, &command.command_id, expected_status).await;
+        assert_eq!(after_repeat["native_notice"]["attempt_count"], json!(1));
+        assert_eq!(
+            after_repeat["native_notice"]["latest"]["status"],
+            json!(expected_status)
+        );
+
+        peer.await
+            .expect("private websocket peer exits after one turn/start");
+        fixture.shutdown().await;
+    }
+}
+
+async fn wait_for_planning_notice_delivery(
+    mcp: &PairedMcpServer,
+    command_id: &str,
+    expected_status: &str,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let detail: PlanningCommandDetailResponse =
+            invoke_mcp_ok(mcp, "planning_command", json!({"command_id": command_id})).await;
+        let value = serde_json::to_value(&detail).expect("serialize planning command detail");
+        let notice = &value["native_notice"];
+        if notice["configured"] == json!(true)
+            && notice["attempt_count"] == json!(1)
+            && notice["latest"]["status"] == json!(expected_status)
+        {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "planning notice callback was not finalized: {value}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
