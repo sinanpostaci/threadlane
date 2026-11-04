@@ -87,6 +87,9 @@ use crate::fs_safety::{
     read_private_file_bounded, sanitize_diagnostic_text, validate_absolute_no_symlink_components,
     validate_bounded_identifier, write_private_file_atomic,
 };
+use crate::planning_commands::{
+    PlanningCommandPayload, PlanningCommandRecord, PlanningCommandStatus, PlanningRecoveryTarget,
+};
 use crate::profile_flow::{
     preflight, PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
     SelectedRoleChoice,
@@ -3038,6 +3041,19 @@ impl CoworkerPlanningService {
                 ));
             }
         }
+        if let Some(plan_id) = &request.plan_id {
+            if initial_ledger.jobs.iter().any(|j| {
+                j.job_id != request.job_id
+                    && j.planning_result
+                        .as_ref()
+                        .is_some_and(|pr| &pr.plan_id == plan_id)
+            }) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "plan_id is owned by another job; omit plan_id for a new or amendment job",
+                ));
+            }
+        }
         if let Some(exp_rev) = request.expected_ledger_revision {
             if initial_ledger.ledger_revision != exp_rev {
                 let already_recorded = initial_ledger
@@ -3123,6 +3139,7 @@ impl CoworkerPlanningService {
                         &call_base,
                         &frozen_scope,
                         &active_advice_ids,
+                        None,
                         summary,
                         tasks,
                         check_suggestions,
@@ -4000,6 +4017,153 @@ impl CoworkerPlanningService {
         }
     }
 
+    /// Publishes only an exact, already completed direct-round receipt after a legacy
+    /// cross-job plan collision. This path cannot reserve a call or invoke a provider.
+    pub(crate) fn recover_completed_command_plan(
+        &self,
+        workflow: &ScopedWorkflow,
+        cmd: &PlanningCommandRecord,
+    ) -> Result<bool, NativeError> {
+        cmd.validate()?;
+        let PlanningCommandPayload::Orchestrator(request) = &cmd.payload else {
+            return Ok(false);
+        };
+        if cmd.status != PlanningCommandStatus::Unknown
+            || !cmd.pending_reconciliation
+            || workflow.binding_id() != cmd.binding_id
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "receipt recovery requires an Unknown scoped command",
+            ));
+        }
+        let binding_mutex = self.binding_async_mutex(&cmd.binding_id);
+        let _binding_guard = binding_mutex.try_lock().map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                "planning service is busy during receipt recovery",
+            )
+        })?;
+        let ledger = self.store.read_binding_ledger(&cmd.binding_id)?;
+        let grant = find_grant(&ledger, &cmd.grant_id)?;
+        grant.validate()?;
+        // Completed evidence can outlive invocation authority. Multi-round recovery
+        // remains unsupported; this function never checks or consumes new call budget.
+        let Some(reservation) = grant
+            .reservations
+            .iter()
+            .find(|r| r.request_key == cmd.service_request_key)
+        else {
+            return Ok(false);
+        };
+        let orch_prefix = format!("{}_orch_r", cmd.service_request_key);
+        let arch_prefix = format!("{}_arch_r", cmd.service_request_key);
+        if grant.reservations.iter().any(|r| {
+            r.request_key.starts_with(&orch_prefix) || r.request_key.starts_with(&arch_prefix)
+        }) {
+            return Ok(false);
+        }
+        let (Some(artifact_id), Some(output_digest)) =
+            (&reservation.report_artifact_id, &reservation.output_digest)
+        else {
+            return Ok(false);
+        };
+        let Some(target) = PlanningRecoveryTarget::derive(cmd, &ledger, artifact_id, output_digest)
+        else {
+            return Ok(false);
+        };
+        if reservation.status != PlanningReservationStatus::Completed
+            || reservation.role != WorkflowRole::Orchestrator
+            || reservation.difficulty != request.difficulty
+            || reservation.selected_choice != cmd.selected_choice
+            || reservation.call_project_base.as_ref() != Some(&cmd.call_project_base)
+            || !constant_time_str_eq(&reservation.context_digest, &cmd.context_digest)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "completed receipt reservation does not match frozen command",
+            ));
+        }
+        let artifact = self.read_planning_artifact(artifact_id)?;
+        artifact.validate_against_grant(artifact_id, grant)?;
+        if artifact.binding_id != cmd.binding_id
+            || artifact.thread_uuid != cmd.thread_uuid
+            || artifact.grant_id != cmd.grant_id
+            || artifact.reservation_id != reservation.reservation_id
+            || artifact.request_key != cmd.service_request_key
+            || reservation.run_id.as_deref() != Some(artifact.run_id.as_str())
+            || artifact.role != WorkflowRole::Orchestrator
+            || artifact.selected_choice != cmd.selected_choice
+            || artifact.call_project_base != cmd.call_project_base
+            || !constant_time_str_eq(&artifact.context_digest, &cmd.context_digest)
+            || artifact.output_digest.as_ref() != Some(output_digest)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "completed artifact does not match frozen command and reservation",
+            ));
+        }
+        let PlanningArtifactOutcomeKind::OrchestratorOutput {
+            job_id,
+            job_revision: Some(job_revision),
+            work_brief_digest,
+            work_brief: Some(work_brief),
+            architect_advice_ids,
+            structured_output:
+                StructuredOrchestratorOutput::Plan {
+                    summary,
+                    tasks,
+                    check_suggestions,
+                    unconfirmed_proposal_notes,
+                    resolved_open_questions,
+                    deferred_proposals,
+                    ..
+                },
+        } = artifact.outcome
+        else {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "receipt recovery requires a Plan with a frozen brief and job revision",
+            ));
+        };
+        if job_id != request.job_id
+            || architect_advice_ids != request.architect_advice_ids
+            || work_brief.project_base != cmd.call_project_base
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "receipt Plan does not match the command job, advice, or source base",
+            ));
+        }
+        let current_job = find_job(&ledger, &job_id)?;
+        verify_recovery_command_context(cmd, &ledger, grant, current_job)?;
+        let frozen_scope = FrozenOrchestratorJobScope {
+            job_id,
+            job_revision,
+            work_brief_digest,
+            work_brief,
+        };
+        verify_call_base_against_grant(&grant.project_base, &cmd.call_project_base)?;
+        self.publish_and_link_orchestrator_plan(
+            workflow,
+            request,
+            grant,
+            reservation,
+            &cmd.selected_choice,
+            &cmd.call_project_base,
+            &frozen_scope,
+            &architect_advice_ids,
+            Some(&target),
+            summary,
+            tasks,
+            check_suggestions,
+            unconfirmed_proposal_notes,
+            resolved_open_questions,
+            deferred_proposals,
+        )?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn publish_and_link_orchestrator_plan(
         &self,
@@ -4011,6 +4175,7 @@ impl CoworkerPlanningService {
         call_base: &CanonicalProjectBaseRef,
         frozen_scope: &FrozenOrchestratorJobScope,
         architect_advice_ids: &[String],
+        recovery_target: Option<&PlanningRecoveryTarget>,
         summary: String,
         tasks: Vec<StructuredPlannedTask>,
         check_suggestions: Vec<PlannedCheckSuggestion>,
@@ -4091,9 +4256,13 @@ impl CoworkerPlanningService {
 
         let plan_summary = workflow
             .save_draft(SavePlanDraft {
-                command_key,
-                plan_id: request.plan_id.clone(),
-                expected_revision: request.expected_plan_revision,
+                command_key: recovery_target
+                    .map_or(command_key, |target| target.command_key.clone()),
+                plan_id: recovery_target.map_or_else(
+                    || request.plan_id.clone(),
+                    |target| Some(target.plan_id.clone()),
+                ),
+                expected_revision: recovery_target.map_or(request.expected_plan_revision, |_| 0),
                 profile_id: grant.profile_id.clone(),
                 profile_revision: grant.registry_revision,
                 summary,
@@ -4681,6 +4850,54 @@ fn compute_architect_question_digest(
         )
     })?;
     Ok(sha256_hex(&bytes))
+}
+
+/// Recomputes the original command context from durable job/advice provenance.
+/// Historical grant status and registry availability do not confer invocation authority.
+pub(crate) fn verify_recovery_command_context(
+    cmd: &PlanningCommandRecord,
+    ledger: &CoworkerBindingLedger,
+    grant: &PlanningAdviceGrant,
+    job: &CoworkerJobRecord,
+) -> Result<(), NativeError> {
+    let PlanningCommandPayload::Orchestrator(request) = &cmd.payload else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "recovery context requires an Orchestrator command",
+        ));
+    };
+    let mut advice = Vec::new();
+    for id in &request.architect_advice_ids {
+        let record = ledger
+            .architect_advice
+            .iter()
+            .find(|a| &a.advice_id == id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "recovery context advice is missing",
+                )
+            })?;
+        record.validate()?;
+        advice.push(record.clone());
+    }
+    let digest = compute_orchestrator_context_digest(
+        &cmd.binding_id,
+        &cmd.thread_uuid,
+        grant,
+        job,
+        request.plan_id.as_deref(),
+        request.expected_plan_revision,
+        &cmd.selected_choice,
+        &advice,
+    )?;
+    if !constant_time_str_eq(&digest, &cmd.context_digest) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "receipt recovery job/advice context drifted from the frozen command",
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

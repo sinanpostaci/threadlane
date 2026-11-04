@@ -1034,3 +1034,914 @@ async fn orchestrator_multi_round_architect_consultation_and_round_cap_enforceme
     assert_eq!(cap_err.code, NativeErrorCode::ValidationFailed);
     assert_eq!(fx.invocation_count(), 6);
 }
+
+// Historical fixtures are built only inside disposable stores. Temporarily hiding
+// the owner models the old missing admission check; real worker supervision still
+// produces and validates the bounded receipt, reservation, and published revision.
+struct LegacyCollision {
+    fx: OrchestratorTestFixture,
+    commands: threadlane_native::PlanningCommandStore,
+    command: threadlane_native::PlanningCommandRecord,
+    owner: CoworkerJobRecord,
+    job: CoworkerJobRecord,
+    artifact_path: PathBuf,
+    artifact_bytes: Vec<u8>,
+}
+
+fn receipt_command_store(fx: &OrchestratorTestFixture) -> threadlane_native::PlanningCommandStore {
+    let commands_dir = fx.root_dir.join("receipt-commands");
+    fs::create_dir_all(&commands_dir).expect("create commands directory");
+    fs::set_permissions(&commands_dir, fs::Permissions::from_mode(0o700))
+        .expect("private commands directory");
+    let ownership =
+        threadlane_native::coworker_workflow::CoworkerJobOwnershipStore::new(&commands_dir)
+            .expect("ownership store");
+    threadlane_native::PlanningCommandStore::new(
+        &commands_dir,
+        fx.store.clone(),
+        &fx.registry_dir,
+        ownership,
+    )
+    .expect("command store")
+    .with_artifacts_dir(&fx.artifacts_dir)
+    .expect("artifact directory")
+}
+
+fn replace_fixture_job(fx: &OrchestratorTestFixture, replacement: &CoworkerJobRecord) {
+    fx.store
+        .transact_binding_ledger(BINDING_ID, None, |ledger| {
+            *ledger
+                .jobs
+                .iter_mut()
+                .find(|j| j.job_id == replacement.job_id)
+                .expect("fixture job") = replacement.clone();
+            Ok(threadlane_native::coworker_workflow::CoworkerLedgerMutationOutcome::Mutated(()))
+        })
+        .expect("replace historical fixture job");
+}
+
+async fn legacy_collision_fixture() -> LegacyCollision {
+    legacy_collision_fixture_with_budget(false).await
+}
+
+async fn legacy_collision_fixture_with_budget(exhaust_after_receipt: bool) -> LegacyCollision {
+    use threadlane_native::{EnqueuePlanningCommandRequest, PlanningCommandPayload};
+    let fx = OrchestratorTestFixture::new();
+    let grant = if exhaust_after_receipt {
+        fx.create_grant_with_budget(
+            "receipt-grant",
+            PlanningCallBudget {
+                max_total_calls: 2,
+                max_orchestrator_calls: 2,
+                max_architect_calls: 0,
+                max_timeout_ms_per_call: 30_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            1_800_000_000_000,
+        )
+    } else {
+        fx.create_default_grant("receipt-grant")
+    };
+    let original = fx.create_initial_job(
+        "receipt-owner",
+        vec!["Implement telemetry parser".into()],
+        vec![],
+        vec![],
+    );
+    let output = fx
+        .service
+        .orchestrate_brief_to_plan(
+            &fx.workflow,
+            &OrchestratorTestFixture::plan_req(
+                &grant.grant_id,
+                &original.job_id,
+                "receipt-owner-plan",
+                0,
+            ),
+        )
+        .await
+        .expect("owner plan");
+    let original_result = output.planning_result.expect("owner result");
+    let mut brief = original.work_brief.clone();
+    brief.brief_id = "brf_receipt_amendment".into();
+    brief.kind = WorkBriefKind::Amendment {
+        target_job_id: original.job_id.clone(),
+        target_job_revision: 2,
+        amendment_reason: "Refine telemetry parser behavior".into(),
+    };
+    let job = fx
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_ID.into(),
+            thread_uuid: THREAD_UUID.into(),
+            request_key: "receipt-amendment".into(),
+            expected_ledger_revision: None,
+            work_brief: brief,
+            amended_target_task_ids: vec![],
+            amended_write_paths: vec!["src/parser.rs".into()],
+            amended_interfaces: vec![],
+        })
+        .expect("amendment job");
+    let owner = fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("ledger")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == original.job_id)
+        .expect("held owner");
+    let mut hidden_owner = owner.clone();
+    hidden_owner.planning_result = None;
+    replace_fixture_job(&fx, &hidden_owner);
+    let commands = receipt_command_store(&fx);
+    let mut request =
+        OrchestratorTestFixture::plan_req(&grant.grant_id, &job.job_id, "legacy-collision", 0);
+    request.plan_id = Some(original_result.plan_id.clone());
+    request.expected_plan_revision = 1;
+    let command = commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(request))
+        .expect("historical enqueue with missing owner visibility");
+    let guard = commands
+        .ownership_store()
+        .try_acquire_job(
+            &command.ownership_key().expect("key"),
+            threadlane_native::current_wall_clock_ms().expect("clock"),
+        )
+        .expect("acquire")
+        .into_guard()
+        .expect("guard");
+    commands
+        .claim_running(&guard, BINDING_ID, THREAD_UUID, &command.command_id, None)
+        .expect("claim");
+    let PlanningCommandPayload::Orchestrator(request) = &command.payload else {
+        panic!("orchestrator");
+    };
+    let historical_output = fx
+        .service
+        .orchestrate_brief_to_plan(&fx.workflow, request)
+        .await
+        .expect("historical output");
+    let result = historical_output
+        .planning_result
+        .expect("historical result");
+    assert_eq!(result.plan_id, original_result.plan_id);
+    assert_eq!(result.plan_revision, 2);
+    // Simulate the legacy crash window after publish but before linkage. Preserve
+    // both original plan revisions, the immutable command, and the genuine receipt.
+    replace_fixture_job(&fx, &job);
+    replace_fixture_job(&fx, &owner);
+    let command = commands
+        .record_unknown(
+            &guard,
+            BINDING_ID,
+            THREAD_UUID,
+            &command.command_id,
+            "legacy cross-job publication/link collision",
+            None,
+        )
+        .expect("unknown");
+    drop(guard);
+    let artifact_path = fx
+        .artifacts_dir
+        .join(format!("{}.json", result.report_artifact_id));
+    let artifact_bytes = fs::read(&artifact_path).expect("artifact bytes");
+    assert_eq!(fx.invocation_count(), 2);
+    LegacyCollision {
+        fx,
+        commands,
+        command,
+        owner,
+        job,
+        artifact_path,
+        artifact_bytes,
+    }
+}
+
+#[tokio::test]
+async fn cross_job_plan_id_is_refused_before_enqueue_and_direct_service_call() {
+    use threadlane_native::EnqueuePlanningCommandRequest;
+    let legacy = legacy_collision_fixture().await;
+    let mut request = match &legacy.command.payload {
+        threadlane_native::PlanningCommandPayload::Orchestrator(r) => r.clone(),
+        _ => unreachable!(),
+    };
+    request.request_key = "new-cross-job-refused".into();
+    let before = legacy
+        .fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("before");
+    let enqueue_error = legacy
+        .commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            request.clone(),
+        ))
+        .expect_err("cross-job enqueue must fail");
+    // Unknown commands block unrelated enqueue; verify admission in an empty command store.
+    let fresh_commands_dir = legacy.fx.root_dir.join("fresh-refusal-commands");
+    fs::create_dir_all(&fresh_commands_dir).expect("fresh commands directory");
+    fs::set_permissions(&fresh_commands_dir, fs::Permissions::from_mode(0o700))
+        .expect("private fresh commands directory");
+    let fresh_ownership =
+        threadlane_native::coworker_workflow::CoworkerJobOwnershipStore::new(&fresh_commands_dir)
+            .expect("fresh ownership");
+    let fresh_commands = threadlane_native::PlanningCommandStore::new(
+        &fresh_commands_dir,
+        legacy.fx.store.clone(),
+        &legacy.fx.registry_dir,
+        fresh_ownership,
+    )
+    .expect("fresh commands");
+    let error = fresh_commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            request.clone(),
+        ))
+        .expect_err("owner admission must fail");
+    assert!(error.message().contains("owned by another job"));
+    assert!(!enqueue_error.message().is_empty());
+    let error = legacy
+        .fx
+        .service
+        .orchestrate_brief_to_plan(&legacy.fx.workflow, &request)
+        .await
+        .expect_err("direct owner admission must fail");
+    assert!(error.message().contains("owned by another job"));
+    assert_eq!(
+        legacy
+            .fx
+            .store
+            .read_binding_ledger(BINDING_ID)
+            .expect("after"),
+        before
+    );
+    assert_eq!(legacy.fx.invocation_count(), 2);
+}
+
+#[tokio::test]
+async fn receipt_only_collision_recovery_preserves_history_and_reopens_without_provider_replay() {
+    use threadlane_native::{
+        PlanningCommandDriver, PlanningCommandResultRef, PlanningCommandStatus,
+    };
+    let legacy = legacy_collision_fixture().await;
+    let old_plan_id = legacy
+        .owner
+        .planning_result
+        .as_ref()
+        .expect("owner result")
+        .plan_id
+        .clone();
+    let old_r1 = legacy
+        .fx
+        .workflow
+        .get_plan(&old_plan_id, Some(1), None, None)
+        .expect("r1");
+    let old_r2 = legacy
+        .fx
+        .workflow
+        .get_plan(&old_plan_id, Some(2), None, None)
+        .expect("r2");
+    let before = legacy
+        .fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("ledger");
+    // A read only command query cannot publish or link a plan.
+    assert_eq!(
+        legacy
+            .commands
+            .get_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+            .expect("query")
+            .expect("command")
+            .status,
+        PlanningCommandStatus::Unknown
+    );
+    assert_eq!(
+        legacy
+            .fx
+            .store
+            .read_binding_ledger(BINDING_ID)
+            .expect("ledger after read"),
+        before
+    );
+    let driver = PlanningCommandDriver::new(legacy.commands.clone(), legacy.fx.service.clone())
+        .expect("driver");
+    let outcome = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+        .await
+        .expect("recover exact receipt");
+    assert!(outcome.reconciled_from_existing);
+    let PlanningCommandResultRef::OrchestratorPlan {
+        planning_result,
+        artifact_verified,
+        ..
+    } = outcome.command.result_ref.as_ref().expect("result")
+    else {
+        panic!("plan");
+    };
+    assert!(*artifact_verified);
+    assert_ne!(planning_result.plan_id, old_plan_id);
+    assert_eq!(planning_result.plan_revision, 1);
+    assert_eq!(
+        planning_result.request_key,
+        legacy.command.service_request_key
+    );
+    let artifact: threadlane_native::coworker_workflow::PersistedPlanningCallArtifact =
+        serde_json::from_slice(&legacy.artifact_bytes).expect("artifact");
+    assert_eq!(planning_result.report_artifact_id, artifact.artifact_id);
+    assert_eq!(
+        Some(&planning_result.output_digest),
+        artifact.output_digest.as_ref()
+    );
+    assert_eq!(outcome.command.payload, legacy.command.payload);
+    assert_eq!(
+        outcome.command.command_digest,
+        legacy.command.command_digest
+    );
+    let after = legacy
+        .fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("after");
+    assert_eq!(after.planning_grants, before.planning_grants);
+    assert_eq!(
+        after
+            .jobs
+            .iter()
+            .find(|j| j.job_id == legacy.owner.job_id)
+            .expect("owner"),
+        &legacy.owner
+    );
+    let job = after
+        .jobs
+        .iter()
+        .find(|j| j.job_id == legacy.job.job_id)
+        .expect("recovered job");
+    assert_eq!(job.phase, CoworkerJobPhase::AwaitingApproval);
+    assert!(job.approval_linkage.is_none());
+    assert!(job.tasks.is_empty());
+    assert_eq!(
+        legacy
+            .fx
+            .workflow
+            .get_plan(&old_plan_id, Some(1), None, None)
+            .expect("r1 after"),
+        old_r1
+    );
+    assert_eq!(
+        legacy
+            .fx
+            .workflow
+            .get_plan(&old_plan_id, Some(2), None, None)
+            .expect("r2 after"),
+        old_r2
+    );
+    assert_eq!(
+        fs::read(&legacy.artifact_path).expect("artifact after"),
+        legacy.artifact_bytes
+    );
+    let reopened = threadlane_native::PlanningCommandStore::open_existing(
+        legacy.commands.commands_dir(),
+        legacy.fx.store.clone(),
+        &legacy.fx.registry_dir,
+    )
+    .expect("reopen commands")
+    .with_artifacts_dir(&legacy.fx.artifacts_dir)
+    .expect("artifacts");
+    let (_, service, _) = legacy.fx.reopen_all();
+    let reopened_driver = PlanningCommandDriver::new(reopened, service).expect("reopened driver");
+    let duplicate = reopened_driver
+        .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+        .await
+        .expect("duplicate");
+    assert!(duplicate.was_already_completed);
+    assert_eq!(duplicate.command.result_ref, outcome.command.result_ref);
+    assert_eq!(legacy.fx.invocation_count(), 2);
+}
+
+#[tokio::test]
+async fn same_job_plan_updates_remain_supported() {
+    use threadlane_native::EnqueuePlanningCommandRequest;
+    let fx = OrchestratorTestFixture::new();
+    let grant = fx.create_default_grant("same-job-grant");
+    let job = fx.create_initial_job(
+        "same-job",
+        vec!["Implement telemetry parser".into()],
+        vec![],
+        vec![],
+    );
+    let first = fx
+        .service
+        .orchestrate_brief_to_plan(
+            &fx.workflow,
+            &OrchestratorTestFixture::plan_req(&grant.grant_id, &job.job_id, "same-job-first", 0),
+        )
+        .await
+        .expect("first plan")
+        .planning_result
+        .expect("first result");
+    let commands = receipt_command_store(&fx);
+    let mut request =
+        OrchestratorTestFixture::plan_req(&grant.grant_id, &job.job_id, "same-job-update", 0);
+    request.plan_id = Some(first.plan_id.clone());
+    request.expected_plan_revision = 1;
+    let command = commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(request))
+        .expect("same-job update enqueue");
+    let driver = threadlane_native::PlanningCommandDriver::new(commands, fx.service.clone())
+        .expect("driver");
+    let outcome = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &command.command_id)
+        .await
+        .expect("same-job update");
+    let threadlane_native::PlanningCommandResultRef::OrchestratorPlan {
+        planning_result, ..
+    } = outcome.command.result_ref.expect("result")
+    else {
+        panic!("plan");
+    };
+    assert_eq!(planning_result.plan_id, first.plan_id);
+    assert_eq!(planning_result.plan_revision, 2);
+    assert_eq!(fx.invocation_count(), 2);
+}
+
+#[tokio::test]
+async fn receipt_recovery_rejects_missing_tampered_and_drifted_evidence_without_mutations() {
+    use threadlane_native::coworker_workflow::{
+        ApplyWorkflowHoldRequest, FrozenApprovalLinkage, PersistedPlanningCallArtifact,
+    };
+    use threadlane_native::{PlanningCommandDriver, PlanningCommandStatus};
+    let legacy = legacy_collision_fixture().await;
+    let driver = PlanningCommandDriver::new(legacy.commands.clone(), legacy.fx.service.clone())
+        .expect("driver");
+    for mode in [
+        "missing",
+        "tampered-output",
+        "wrong-job",
+        "wrong-scope",
+        "missing-brief",
+        "missing-revision",
+        "changed-brief",
+        "coherent-brief-tamper",
+        "revision-drift",
+        "held",
+        "approved",
+        "nonterminal",
+        "superseded",
+        "dirty-source",
+    ] {
+        let mut artifact: PersistedPlanningCallArtifact =
+            serde_json::from_slice(&legacy.artifact_bytes).expect("artifact");
+        match mode {
+            "missing" => fs::remove_file(&legacy.artifact_path).expect("remove synthetic artifact"),
+            "tampered-output" => {
+                artifact
+                    .verified_response
+                    .as_mut()
+                    .expect("response")
+                    .text
+                    .push(' ');
+                fs::write(
+                    &legacy.artifact_path,
+                    serde_json::to_vec(&artifact).expect("serialize artifact"),
+                )
+                .expect("tamper synthetic artifact");
+            }
+            "wrong-scope" => {
+                artifact.thread_uuid = "018f5a30-2222-7000-8000-000000000003".into();
+                fs::write(
+                    &legacy.artifact_path,
+                    serde_json::to_vec(&artifact).expect("serialize artifact"),
+                )
+                .expect("wrong scope");
+            }
+            "wrong-job" | "missing-brief" | "missing-revision" => {
+                let PlanningArtifactOutcomeKind::OrchestratorOutput {
+                    job_id,
+                    work_brief,
+                    job_revision,
+                    ..
+                } = &mut artifact.outcome
+                else {
+                    panic!("output");
+                };
+                match mode {
+                    "wrong-job" => *job_id = legacy.owner.job_id.clone(),
+                    "missing-brief" => *work_brief = None,
+                    _ => *job_revision = None,
+                }
+                artifact
+                    .validate(&artifact.artifact_id)
+                    .expect("structurally valid but insufficient receipt");
+                fs::write(
+                    &legacy.artifact_path,
+                    serde_json::to_vec(&artifact).expect("serialize artifact"),
+                )
+                .expect("insufficient artifact");
+            }
+            "changed-brief" | "coherent-brief-tamper" | "revision-drift" => {
+                let mut job = legacy.job.clone();
+                job.job_revision += 1;
+                if mode != "revision-drift" {
+                    job.work_brief
+                        .confirmed_requirements
+                        .push("New unplanned requirement".into());
+                    job.work_brief_digest = job.work_brief.digest().expect("changed brief digest");
+                }
+                if mode == "coherent-brief-tamper" {
+                    let PlanningArtifactOutcomeKind::OrchestratorOutput {
+                        work_brief,
+                        work_brief_digest,
+                        job_revision,
+                        ..
+                    } = &mut artifact.outcome
+                    else {
+                        panic!("output");
+                    };
+                    *work_brief = Some(job.work_brief.clone());
+                    *work_brief_digest = job.work_brief_digest.clone();
+                    *job_revision = Some(job.job_revision);
+                    artifact
+                        .validate(&artifact.artifact_id)
+                        .expect("coherent metadata still cannot change command context");
+                    fs::write(
+                        &legacy.artifact_path,
+                        serde_json::to_vec(&artifact).expect("serialize artifact"),
+                    )
+                    .expect("coherently changed artifact");
+                }
+                replace_fixture_job(&legacy.fx, &job);
+            }
+            "held" => {
+                legacy
+                    .fx
+                    .store
+                    .apply_workflow_hold(&ApplyWorkflowHoldRequest {
+                        binding_id: BINDING_ID.into(),
+                        thread_uuid: THREAD_UUID.into(),
+                        job_id: legacy.job.job_id.clone(),
+                        expected_job_revision: legacy.job.job_revision,
+                        expected_ledger_revision: None,
+                        request_key: "receipt-hold".into(),
+                        reason: WorkflowHoldReason::ConversationReplanRequired,
+                        detail: "Hold pending human replan".into(),
+                        directly_affected_task_ids: vec![],
+                        affected_write_paths: vec![],
+                        affected_interfaces: vec![],
+                        holds_entire_job: true,
+                    })
+                    .expect("hold");
+            }
+            "approved" => {
+                // Schema-valid synthetic historical linkage is local test data only.
+                let pr = legacy.owner.planning_result.as_ref().expect("owner plan");
+                let mut job = legacy.job.clone();
+                job.approval_linkage = Some(FrozenApprovalLinkage {
+                    approval_id: "apr_0123456789abcdef0123456789abcdef".into(),
+                    approval_subject_digest: "a".repeat(64),
+                    plan_id: "plan_receipt_independent_approval".into(),
+                    plan_revision: pr.plan_revision,
+                    plan_digest: pr.plan_digest.clone(),
+                    project_base: pr.project_base.clone(),
+                    profile_id: pr.profile_id.clone(),
+                    registry_revision: pr.registry_revision,
+                    policy_id: "receipt-synthetic-policy".into(),
+                    policy_digest: "b".repeat(64),
+                    approved_task_ids: vec!["task_parse".into()],
+                    approved_write_paths: vec!["src/parser.rs".into()],
+                    controller_envelope: None,
+                });
+                replace_fixture_job(&legacy.fx, &job);
+            }
+            "nonterminal" => {
+                legacy.fx.store.transact_binding_ledger(BINDING_ID, None, |ledger| {
+                    let grant = ledger.planning_grants.iter_mut().find(|g| g.grant_id == legacy.command.grant_id).expect("grant");
+                    let reservation = grant.reservations.iter_mut().find(|r| r.request_key == legacy.command.service_request_key).expect("reservation");
+                    reservation.status = PlanningReservationStatus::EffectUnknown;
+                    grant.usage.completed_calls -= 1;
+                    grant.usage.unknown_effect_calls += 1;
+                    Ok(threadlane_native::coworker_workflow::CoworkerLedgerMutationOutcome::Mutated(()))
+                }).expect("nonterminal fixture");
+            }
+            "superseded" => {
+                let mut brief = legacy.job.work_brief.clone();
+                brief.brief_id = "brf_receipt_superseding".into();
+                brief.kind = WorkBriefKind::Amendment {
+                    target_job_id: legacy.job.job_id.clone(),
+                    target_job_revision: legacy.job.job_revision,
+                    amendment_reason: "Newer scope".into(),
+                };
+                legacy
+                    .fx
+                    .store
+                    .create_or_amend_job(&CreateCoworkerJobRequest {
+                        binding_id: BINDING_ID.into(),
+                        thread_uuid: THREAD_UUID.into(),
+                        request_key: "receipt-superseding".into(),
+                        expected_ledger_revision: None,
+                        work_brief: brief,
+                        amended_target_task_ids: vec![],
+                        amended_write_paths: vec!["src/parser.rs".into()],
+                        amended_interfaces: vec![],
+                    })
+                    .expect("superseding job");
+            }
+            "dirty-source" => {
+                fs::write(legacy.fx.repo_dir.join("untracked.txt"), "dirty").expect("dirty source")
+            }
+            _ => unreachable!(),
+        }
+        let before = legacy
+            .fx
+            .store
+            .read_binding_ledger(BINDING_ID)
+            .expect("before refusal");
+        let command_before = legacy
+            .commands
+            .get_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+            .expect("command before");
+        let plans_before = legacy
+            .fx
+            .workflow
+            .list_plans(None, None)
+            .expect("plans before");
+        driver
+            .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+            .await
+            .expect_err(mode);
+        assert_eq!(
+            legacy
+                .fx
+                .store
+                .read_binding_ledger(BINDING_ID)
+                .expect("after refusal"),
+            before,
+            "{mode}"
+        );
+        assert_eq!(
+            legacy
+                .commands
+                .get_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+                .expect("command after"),
+            command_before,
+            "{mode}"
+        );
+        assert_eq!(
+            legacy
+                .fx
+                .workflow
+                .list_plans(None, None)
+                .expect("plans after"),
+            plans_before,
+            "{mode}"
+        );
+        assert_eq!(
+            command_before.expect("command").status,
+            PlanningCommandStatus::Unknown
+        );
+        assert_eq!(legacy.fx.invocation_count(), 2, "{mode}");
+        fs::write(&legacy.artifact_path, &legacy.artifact_bytes)
+            .expect("restore synthetic artifact");
+        replace_fixture_job(&legacy.fx, &legacy.job);
+        if mode == "nonterminal" || mode == "superseded" {
+            legacy.fx.store.transact_binding_ledger(BINDING_ID, None, |ledger| {
+                ledger.jobs.retain(|j| j.job_id == legacy.job.job_id || j.job_id == legacy.owner.job_id);
+                for grant in &mut ledger.planning_grants {
+                    for reservation in &mut grant.reservations {
+                        if reservation.request_key == legacy.command.service_request_key && reservation.status == PlanningReservationStatus::EffectUnknown {
+                            reservation.status = PlanningReservationStatus::Completed;
+                            grant.usage.completed_calls += 1;
+                            grant.usage.unknown_effect_calls -= 1;
+                        }
+                    }
+                }
+                Ok(threadlane_native::coworker_workflow::CoworkerLedgerMutationOutcome::Mutated(()))
+            }).expect("restore fixture history");
+        }
+        if mode == "dirty-source" {
+            fs::remove_file(legacy.fx.repo_dir.join("untracked.txt"))
+                .expect("restore clean source");
+        }
+    }
+}
+
+#[tokio::test]
+async fn receipt_recovery_resumes_publication_and_link_crash_windows_without_new_revision_or_call()
+{
+    use threadlane_native::{
+        PlanningCommandBindingLedger, PlanningCommandDriver, PlanningCommandStatus,
+    };
+    let legacy = legacy_collision_fixture().await;
+    let driver = PlanningCommandDriver::new(legacy.commands.clone(), legacy.fx.service.clone())
+        .expect("driver");
+    let first = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+        .await
+        .expect("initial recovery");
+    let completed_job = legacy
+        .fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("ledger")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == legacy.job.job_id)
+        .expect("linked job");
+    let command_path = legacy
+        .commands
+        .ledger_path_for_binding(BINDING_ID)
+        .expect("command ledger path");
+    let completed_ledger: PlanningCommandBindingLedger =
+        serde_json::from_slice(&fs::read(&command_path).expect("command ledger"))
+            .expect("parse ledger");
+    let plans = legacy.fx.workflow.list_plans(None, None).expect("plans");
+    for linked in [false, true] {
+        replace_fixture_job(
+            &legacy.fx,
+            if linked { &completed_job } else { &legacy.job },
+        );
+        // This represents a process dying after publish (or after link) but before
+        // command completion. No production recovery interface edits ledger JSON.
+        let mut interrupted = completed_ledger.clone();
+        let command = interrupted
+            .commands
+            .iter_mut()
+            .find(|c| c.command_id == legacy.command.command_id)
+            .expect("command");
+        command.status = PlanningCommandStatus::Unknown;
+        command.pending_reconciliation = true;
+        command.result_ref = None;
+        command.completed_at_ms = None;
+        command.diagnostic = Some("synthetic crash before command completion".into());
+        command.validate().expect("valid interrupted command");
+        fs::write(
+            &command_path,
+            serde_json::to_vec(&interrupted).expect("serialize interrupted ledger"),
+        )
+        .expect("persist synthetic crash");
+        let reopened = threadlane_native::PlanningCommandStore::open_existing(
+            legacy.commands.commands_dir(),
+            legacy.fx.store.clone(),
+            &legacy.fx.registry_dir,
+        )
+        .expect("reopen")
+        .with_artifacts_dir(&legacy.fx.artifacts_dir)
+        .expect("artifacts");
+        let (_, service, _) = legacy.fx.reopen_all();
+        let reopened_driver = PlanningCommandDriver::new(reopened, service).expect("driver");
+        let recovered = reopened_driver
+            .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+            .await
+            .expect("recover partial persistence");
+        assert!(recovered.reconciled_from_existing);
+        assert_eq!(recovered.command.result_ref, first.command.result_ref);
+        assert_eq!(
+            legacy
+                .fx
+                .workflow
+                .list_plans(None, None)
+                .expect("plans after recovery"),
+            plans
+        );
+        assert_eq!(legacy.fx.invocation_count(), 2);
+        assert_eq!(
+            fs::read(&legacy.artifact_path).expect("artifact"),
+            legacy.artifact_bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn completed_receipt_proof_survives_expired_or_exhausted_grant_without_new_authority() {
+    use threadlane_native::coworker_workflow::{
+        CoworkerLedgerMutationOutcome, PlanningGrantStatus,
+    };
+    for expired in [false, true] {
+        let legacy = legacy_collision_fixture_with_budget(true).await;
+        let grant_before = legacy
+            .fx
+            .store
+            .read_binding_ledger(BINDING_ID)
+            .expect("ledger")
+            .planning_grants
+            .into_iter()
+            .find(|g| g.grant_id == legacy.command.grant_id)
+            .expect("grant");
+        assert_eq!(grant_before.status, PlanningGrantStatus::Exhausted);
+        if expired {
+            legacy
+                .fx
+                .store
+                .transact_binding_ledger(BINDING_ID, None, |ledger| {
+                    let grant = ledger
+                        .planning_grants
+                        .iter_mut()
+                        .find(|g| g.grant_id == legacy.command.grant_id)
+                        .expect("grant");
+                    grant.expires_at_ms = threadlane_native::current_wall_clock_ms()
+                        .expect("clock")
+                        .saturating_sub(1);
+                    grant.status = PlanningGrantStatus::Expired;
+                    Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+                })
+                .expect("historical expiration");
+        }
+        let before = legacy
+            .fx
+            .store
+            .read_binding_ledger(BINDING_ID)
+            .expect("before")
+            .planning_grants;
+        let driver = threadlane_native::PlanningCommandDriver::new(
+            legacy.commands.clone(),
+            legacy.fx.service.clone(),
+        )
+        .expect("driver");
+        assert!(
+            driver
+                .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+                .await
+                .expect("receipt recovery")
+                .reconciled_from_existing
+        );
+        assert_eq!(
+            legacy
+                .fx
+                .store
+                .read_binding_ledger(BINDING_ID)
+                .expect("after")
+                .planning_grants,
+            before
+        );
+        assert_eq!(legacy.fx.invocation_count(), 2);
+    }
+}
+
+#[tokio::test]
+async fn recovered_result_verifier_refuses_arbitrary_plan_revision_or_receipt_substitution() {
+    use threadlane_native::{PlanningCommandDriver, PlanningCommandResultRef};
+    let legacy = legacy_collision_fixture().await;
+    let driver = PlanningCommandDriver::new(legacy.commands.clone(), legacy.fx.service.clone())
+        .expect("driver");
+    let completed = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &legacy.command.command_id)
+        .await
+        .expect("recovered command")
+        .command;
+    let linked_job = legacy
+        .fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("ledger")
+        .jobs
+        .into_iter()
+        .find(|j| j.job_id == legacy.job.job_id)
+        .expect("job");
+    for mutation in ["plan-id", "revision", "artifact", "request-key"] {
+        let mut substituted = completed.clone();
+        let PlanningCommandResultRef::OrchestratorPlan {
+            planning_result, ..
+        } = substituted.result_ref.as_mut().expect("result")
+        else {
+            panic!("plan");
+        };
+        match mutation {
+            "plan-id" => planning_result.plan_id = "plan_arbitrary_substitution".into(),
+            "revision" => planning_result.plan_revision += 1,
+            "artifact" => {
+                planning_result.report_artifact_id = legacy
+                    .owner
+                    .planning_result
+                    .as_ref()
+                    .expect("owner receipt")
+                    .report_artifact_id
+                    .clone()
+            }
+            "request-key" => planning_result.request_key = "unrelated-service-request".into(),
+            _ => unreachable!(),
+        }
+        // Keep job/result references mutually consistent to exercise the stronger
+        // command/receipt boundary, rather than just unequal result references.
+        let mut job = linked_job.clone();
+        job.planning_result = Some(planning_result.as_ref().clone());
+        if matches!(mutation, "artifact" | "request-key") {
+            // The shared ledger rejects receipt substitution before it can even
+            // become a candidate result. Preserve that stronger store invariant.
+            legacy.fx.store.transact_binding_ledger(BINDING_ID, None, |ledger| {
+                *ledger.jobs.iter_mut().find(|j| j.job_id == job.job_id).expect("job") = job.clone();
+                Ok(threadlane_native::coworker_workflow::CoworkerLedgerMutationOutcome::Mutated(()))
+            }).expect_err("store must reject substituted receipt provenance");
+        } else {
+            replace_fixture_job(&legacy.fx, &job);
+        }
+        legacy
+            .commands
+            .verify_completed_command(&substituted)
+            .expect_err(mutation);
+        replace_fixture_job(&legacy.fx, &linked_job);
+    }
+    legacy
+        .commands
+        .verify_completed_command(&completed)
+        .expect("exact result still verifies");
+    assert_eq!(legacy.fx.invocation_count(), 2);
+}

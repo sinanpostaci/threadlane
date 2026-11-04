@@ -996,18 +996,6 @@ fn try_reconcile_interrupted_unknown(
     command_id: &str,
     cmd: &PlanningCommandRecord,
 ) -> Result<PlanningCommandExecutionOutcome, NativeError> {
-    let Some(candidate_ref) = discover_reconcilable_result_ref(command_store, service, cmd)? else {
-        return Err(NativeError::new(
-            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-            format!(
-                "planning command `{command_id}` is Unknown pending reconciliation and has no complete verified service outcome on disk: {}",
-                cmd.diagnostic
-                    .as_deref()
-                    .unwrap_or("no diagnostic recorded")
-            ),
-        ));
-    };
-
     let key = cmd.ownership_key()?;
     let now_ms = current_wall_clock_ms()?;
     let guard = command_store
@@ -1022,6 +1010,47 @@ fn try_reconcile_interrupted_unknown(
                 ),
             )
         })?;
+
+    // Ownership precedes discovery and every possible recovery mutation.
+    let cmd = command_store
+        .get_command(binding_id, thread_uuid, command_id)?
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "planning command disappeared during reconciliation",
+            )
+        })?;
+    cmd.validate()?;
+    if cmd.status == PlanningCommandStatus::Completed {
+        let verified_ref = command_store.verify_completed_command(&cmd)?;
+        verify_published_plan_if_required(command_store, service, &cmd, &verified_ref)?;
+        let mut command = cmd;
+        command.result_ref = Some(verified_ref);
+        return Ok(PlanningCommandExecutionOutcome {
+            command,
+            was_already_completed: true,
+            reconciled_from_existing: false,
+            orchestrator_outcome: None,
+        });
+    }
+    if cmd.status != PlanningCommandStatus::Unknown || !cmd.pending_reconciliation {
+        return Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "command is no longer Unknown pending reconciliation",
+        ));
+    }
+    let mut candidate_ref = discover_reconcilable_result_ref(command_store, service, &cmd)?;
+    if candidate_ref.is_none() {
+        verify_store_and_service_alignment(command_store, service)?;
+        let workflow = open_scoped_workflow_for_store(command_store, binding_id)?;
+        if service.recover_completed_command_plan(&workflow, &cmd)? {
+            candidate_ref = discover_reconcilable_result_ref(command_store, service, &cmd)?;
+        }
+    }
+    let candidate_ref = candidate_ref.ok_or_else(|| NativeError::new(
+        NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+        format!("planning command `{command_id}` has no complete verified service outcome; provider redispatch is forbidden"),
+    ))?;
 
     let reconciled = command_store.reconcile_unknown_completed(
         &guard,
@@ -1184,11 +1213,7 @@ fn discover_reconcilable_result_ref(
     if verify_published_plan_if_required(command_store, service, cmd, &candidate).is_err() {
         return Ok(None);
     }
-    let mut probe = cmd.clone();
-    probe.status = PlanningCommandStatus::Completed;
-    probe.pending_reconciliation = false;
-    probe.result_ref = Some(candidate);
-    match command_store.verify_completed_command(&probe) {
+    match command_store.verify_reconciliation_candidate(cmd, candidate) {
         Ok(verified) => Ok(Some(verified)),
         Err(_) => Ok(None),
     }

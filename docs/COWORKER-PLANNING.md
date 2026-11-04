@@ -34,6 +34,32 @@ This document specifies the implemented runtime boundaries for read-only Coworke
   - Repeating an identical completed `OrchestrateWorkBriefPlanRequest` across store/service reopen replays the persisted artifact, deterministic `ScopedWorkflow::save_draft` command journal entry, published plan revision, and `PlanningResultRef` without invoking the worker a second time or creating duplicate plan revisions.
   - Before `ScopedWorkflow::save_draft` / `publish` and `CoworkerWorkflowStore::record_job_planning_result`, the service verifies that the target job's `job_revision`, `work_brief_digest`, active holds, and amendment supersession status have not drifted since the call was reserved. If a brief amendment or hold occurs mid-flight, the call artifact remains on disk for auditability while plan publication and job linkage are refused.
 
+### Explicit receipt-only recovery of legacy plan ownership collisions
+
+New requests reject a `plan_id` already linked to another job before enqueue or
+provider reservation. Updates to the same job remain supported. An amendment job
+must receive its own logical plan; publication never transfers plan ownership.
+
+For a legacy `Unknown` command whose direct Orchestrator call completed before a
+cross-job publication/link collision, explicit `execute-command` may recover the
+exact persisted Plan without a provider invocation. The driver first acquires
+command ownership and refreshes durable state. Recovery requires a Completed
+reservation, fully verified bounded artifact, matching original request key,
+job/brief/revision, model choice, grant provenance, and context/output digests.
+The original requested plan must still be demonstrably owned by another job.
+Missing or changed evidence, held/superseded/approved jobs, source drift, dirty
+source checkouts, and ambiguous multi-round receipts are refused.
+
+The recovered plan uses a new deterministic identity and draft command key bound
+to the original command digest, job, artifact, and output digest. It is published
+at revision 1 through the existing command journal and one-job-per-plan linkage
+checks. Reopening after publication or linkage resumes the same identity without
+a new revision or call. The original payload, artifact, reservation, owner, and
+plan history stay intact. Expired or exhausted grants can prove historical output
+but grant no new invocation authority. Recovery leaves the job awaiting explicit
+execution approval; it creates no tasks, approvals, dispatches, or notice retries.
+Status/get/list operations remain read-only and never initiate recovery.
+
 ## 4. Non-Claims and Out-of-Scope Boundaries
 
 - This module implements library/service-level read-only planning and advice (`CoworkerPlanningService`). It does **not** expose MCP tools, does **not** run an automatic background task/review/fix scheduler (`controller.rs`), and does **not** assemble combined candidates (`candidate.rs`).

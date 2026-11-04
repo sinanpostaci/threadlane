@@ -18,14 +18,15 @@ use threadlane_workflow::{Difficulty, ToolAdapter, WorkflowRole};
 
 use crate::coworker_workflow::{
     deterministic_prefixed_id, sha256_hex, validate_bounded_text,
-    validate_non_native_worker_choice, validate_unique_id_list, ArchitectAdviceRecord,
-    ArchitectConsultationRequestOutcome, ArchitectDecisionStatus, CanonicalProjectBaseRef,
-    CoworkerBindingLedger, CoworkerJobLockState, CoworkerJobOwnershipGuard,
-    CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerOwnershipSummary,
-    CoworkerPlanningService, CoworkerWorkflowStore, HumanClarificationRequestOutcome,
-    OrchestrateWorkBriefPlanRequest, PersistedPlanningCallArtifact, PlanningAdviceGrant,
-    PlanningArtifactOutcomeKind, PlanningGrantStatus, PlanningReservationStatus, PlanningResultRef,
-    PriorArchitectAdviceContext, RunArchitectAdviceRequest, StructuredOrchestratorOutput,
+    validate_non_native_worker_choice, validate_unique_id_list, verify_recovery_command_context,
+    ArchitectAdviceRecord, ArchitectConsultationRequestOutcome, ArchitectDecisionStatus,
+    CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobLockState,
+    CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
+    CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerWorkflowStore,
+    HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
+    PersistedPlanningCallArtifact, PlanningAdviceGrant, PlanningArtifactOutcomeKind,
+    PlanningGrantStatus, PlanningReservationStatus, PlanningResultRef, PriorArchitectAdviceContext,
+    RunArchitectAdviceRequest, StructuredOrchestratorOutput,
     MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_COWORKER_ID_LEN,
     MAX_ORCHESTRATOR_ARCHITECT_ROUNDS, MAX_PLANNING_ARTIFACT_BYTES, MAX_WORK_BRIEF_ITEMS,
 };
@@ -447,6 +448,57 @@ pub struct PlanningCommandRecord {
     /// Local wall-clock timestamp (ms since Unix epoch) when `Completed` or `KnownFailed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at_ms: Option<u64>,
+}
+
+/// Deterministic publication identity for an exact completed cross-job collision receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanningRecoveryTarget {
+    pub(crate) plan_id: String,
+    pub(crate) command_key: String,
+}
+
+impl PlanningRecoveryTarget {
+    pub(crate) fn derive(
+        cmd: &PlanningCommandRecord,
+        ledger: &CoworkerBindingLedger,
+        artifact_id: &str,
+        output_digest: &str,
+    ) -> Option<Self> {
+        let PlanningCommandPayload::Orchestrator(req) = &cmd.payload else {
+            return None;
+        };
+        let original_plan_id = req.plan_id.as_ref()?;
+        if !ledger.jobs.iter().any(|job| {
+            job.job_id != req.job_id
+                && job
+                    .planning_result
+                    .as_ref()
+                    .is_some_and(|pr| &pr.plan_id == original_plan_id)
+        }) {
+            return None;
+        }
+        let parts = [
+            cmd.binding_id.as_str(),
+            cmd.thread_uuid.as_str(),
+            cmd.command_id.as_str(),
+            cmd.command_digest.as_str(),
+            req.job_id.as_str(),
+            artifact_id,
+            output_digest,
+        ];
+        Some(Self {
+            plan_id: deterministic_prefixed_id(
+                "threadlane-native:planning-recovery-plan:v1",
+                "plan",
+                &parts,
+            ),
+            command_key: deterministic_prefixed_id(
+                "threadlane-native:planning-recovery-draft:v1",
+                "cmd",
+                &parts,
+            ),
+        })
+    }
 }
 
 impl PlanningCommandRecord {
@@ -1613,6 +1665,23 @@ impl PlanningCommandStore {
         self.verify_completed_result_against_stores(cmd, result_ref)
     }
 
+    /// Verifies a candidate without forging a terminal command before its receipt is checked.
+    pub(crate) fn verify_reconciliation_candidate(
+        &self,
+        cmd: &PlanningCommandRecord,
+        result_ref: PlanningCommandResultRef,
+    ) -> Result<PlanningCommandResultRef, NativeError> {
+        cmd.validate()?;
+        if cmd.status != PlanningCommandStatus::Unknown || !cmd.pending_reconciliation {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "reconciliation candidate requires an Unknown command",
+            ));
+        }
+        result_ref.validate()?;
+        self.verify_completed_result_against_stores(cmd, result_ref)
+    }
+
     /// Reconciles an `Unknown` (`pending_reconciliation = true`) command to `Completed` under a
     /// live [`CoworkerJobOwnershipGuard`] when a complete, store- and artifact-verified service
     /// outcome produced for this command already exists on disk without executing a new model call.
@@ -2053,6 +2122,19 @@ impl PlanningCommandStore {
                         "CoworkerJobRecord scope does not match OrchestrateWorkBriefPlanRequest",
                     ));
                 }
+                if let Some(plan_id) = &req.plan_id {
+                    if wf_ledger.jobs.iter().any(|j| {
+                        j.job_id != req.job_id
+                            && j.planning_result
+                                .as_ref()
+                                .is_some_and(|pr| &pr.plan_id == plan_id)
+                    }) {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "plan_id is owned by another job; omit plan_id for a new or amendment job",
+                        ));
+                    }
+                }
                 if wf_ledger
                     .jobs
                     .iter()
@@ -2372,6 +2454,13 @@ impl PlanningCommandStore {
                         )
                     })?;
                 job.validate()?;
+                let recovered_plan = req
+                    .plan_id
+                    .as_ref()
+                    .is_some_and(|id| id != &planning_result.plan_id);
+                if recovered_plan {
+                    verify_recovery_command_context(cmd, &wf_ledger, grant, job)?;
+                }
                 let job_pr = job.planning_result.as_ref().ok_or_else(|| {
                     NativeError::new(
                         NativeErrorCode::ValidationFailed,
@@ -2394,10 +2483,21 @@ impl PlanningCommandStore {
                         &planning_result.work_brief_digest,
                         &job.work_brief_digest,
                     )
-                    || req
+                    || (req
                         .plan_id
                         .as_ref()
                         .is_some_and(|expected_pid| &planning_result.plan_id != expected_pid)
+                        && !PlanningRecoveryTarget::derive(
+                            cmd,
+                            &wf_ledger,
+                            &planning_result.report_artifact_id,
+                            &planning_result.output_digest,
+                        )
+                        .is_some_and(|target| {
+                            target.plan_id == planning_result.plan_id
+                                && planning_result.plan_revision == 1
+                                && planning_result.request_key == cmd.service_request_key
+                        }))
                 {
                     return Err(NativeError::new(
                         NativeErrorCode::ValidationFailed,
@@ -2454,6 +2554,7 @@ impl PlanningCommandStore {
                 match &artifact.outcome {
                     PlanningArtifactOutcomeKind::OrchestratorOutput {
                         job_id: art_job_id,
+                        job_revision: art_job_revision,
                         work_brief_digest: art_brief_digest,
                         work_brief: art_brief,
                         architect_advice_ids: art_advice_ids,
@@ -2465,7 +2566,11 @@ impl PlanningCommandStore {
                             },
                         ..
                     } => {
-                        if art_job_id != job_id
+                        if (recovered_plan
+                            && (art_brief.is_none()
+                                || art_job_revision.is_none()
+                                || res.difficulty != req.difficulty))
+                            || art_job_id != job_id
                             || !constant_time_str_eq(
                                 art_brief_digest,
                                 &planning_result.work_brief_digest,
