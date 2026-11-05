@@ -17,7 +17,9 @@ pub use crate::permissions::{
     AntigravityPermissionsBlock, AntigravitySessionSettings, OpenCodeAgentConfig,
     OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule, OpenCodeRuleEffect,
     WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
-    AGY_PROTECTED_READ_DENY_PATTERNS, CODEX_PROJECT_CONFIG_MARKERS, MAX_OPENCODE_CONFIG_BYTES,
+    AGY_PROTECTED_READ_DENY_PATTERNS, CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN,
+    CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH, CODEX_ADVISORY_MAX_WORKDIR_DEPTH,
+    CODEX_ADVISORY_MAX_WORKDIR_ENTRIES, CODEX_PROJECT_CONFIG_MARKERS, MAX_OPENCODE_CONFIG_BYTES,
     MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
     OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
     OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
@@ -74,11 +76,12 @@ pub const CODEX_ADVISORY_PERMISSION_PROFILE_NAME: &str = "threadlane-advisory";
 /// permission profile for [`WorkerProvider::CodexCli`].
 ///
 /// Scopes filesystem reads to `:minimal`, `/nix/store`, and `.` inside `:workspace_roots` with
-/// explicit recursive exact plus descendant denials (`**/.env`, `**/.env.*`, `**/codex.toml`,
-/// `**/.codex.toml`, `**/.git`, `**/.git/**`, `**/.codex`, `**/.codex/**`, `**/.agents`,
-/// `**/.agents/**`, `**/.aws`, `**/.aws/**`), and disables network access
-/// (`"network"={"enabled"=false}`). Never combined with legacy `--sandbox` flags.
-pub const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG: &str = r#"permissions.threadlane-advisory={"filesystem"={":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
+/// explicit `glob_scan_max_depth=64` ([`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`]) and recursive exact
+/// plus descendant denials (`**/.env`, `**/.env.*`, `**/codex.toml`, `**/.codex.toml`, `**/.git`,
+/// `**/.git/**`, `**/.codex`, `**/.codex/**`, `**/.agents`, `**/.agents/**`, `**/.aws`,
+/// `**/.aws/**`), and disables network access (`"network"={"enabled"=false}`). Never combined with
+/// legacy `--sandbox` flags.
+pub const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG: &str = r#"permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
 
 /// Features explicitly disabled via `--disable <feature>` on [`WorkerProvider::CodexCli`]
 /// read-only advisory invocations.

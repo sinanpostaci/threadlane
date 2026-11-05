@@ -168,6 +168,51 @@ pub const MAX_OPENCODE_CONFIG_BYTES: usize = 65_536;
 /// its enclosing project ancestors.
 pub const CODEX_PROJECT_CONFIG_MARKERS: [&str; 3] = [".codex", "codex.toml", ".codex.toml"];
 
+/// Pinned positive integer value for `permissions.threadlane-advisory.filesystem.glob_scan_max_depth`
+/// on [`WorkerProvider::CodexCli`] read-only advisory invocations (`64`).
+///
+/// Codex's Linux sandbox glob scanner requires an explicit positive integer `glob_scan_max_depth`
+/// whenever `:workspace_roots` deny-read rules use recursive `**` patterns; without it, `codex exec --json`
+/// emits `type: "error"` warning events for each unbounded `**` rule. Because a finite scan depth
+/// alone leaves descendants deeper than the scan bound unexpanded and readable (even under a denied
+/// parent directory such as `.git`), [`validate_codex_advisory_workdir`] pairs this constant with a
+/// fail-closed, unpruned filesystem preflight capped at [`CODEX_ADVISORY_MAX_WORKDIR_DEPTH`]
+/// (`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH - CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN`).
+pub const CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH: usize = 64;
+
+/// Mandatory safety margin subtracted from [`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`] to derive
+/// [`CODEX_ADVISORY_MAX_WORKDIR_DEPTH`].
+///
+/// A 2-level margin (`2`) accounts for both:
+/// 1. 0-based vs. 1-based directory/component depth accounting across glob walker implementations, and
+/// 2. `<dir>/**` descendant matching when a protected directory (`.aws`, `.agents`, `.codex`,
+///    `.git`) appears within the permitted workdir depth.
+pub const CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN: usize = 2;
+
+/// Maximum relative path component depth (`62`) permitted inside a [`WorkerProvider::CodexCli`]
+/// read-only advisory `working_directory`.
+///
+/// Direct children of `working_directory` have relative component depth `1` (`<workdir>/<entry>`).
+/// Any entry at relative component depth `> CODEX_ADVISORY_MAX_WORKDIR_DEPTH` (i.e. `>= 63` components)
+/// fails closed in [`validate_codex_advisory_workdir`] before provider invocation so that no
+/// readable path in `working_directory` can ever approach or exceed [`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`] (`64`).
+pub const CODEX_ADVISORY_MAX_WORKDIR_DEPTH: usize =
+    CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH - CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN;
+
+/// Maximum number of filesystem entries inspected by [`validate_codex_advisory_workdir`] before
+/// failing closed (`32_768`).
+///
+/// Bounds worst-case preflight traversal work on large directory trees without silently truncating
+/// validation.
+pub const CODEX_ADVISORY_MAX_WORKDIR_ENTRIES: usize = 32_768;
+
+const _: () = {
+    assert!(CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH == 64);
+    assert!(CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH > CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN);
+    assert!(CODEX_ADVISORY_MAX_WORKDIR_DEPTH == 62);
+    assert!(CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN >= 2);
+};
+
 /// Protected control paths denied for `read`, `glob`, `grep`, and `edit` in OpenCode V2 `TaskFiles`.
 const OPENCODE_PROTECTED_READ_AND_EDIT_PATTERNS: [&str; 28] = [
     ".env",
@@ -560,15 +605,121 @@ pub fn validate_advisory_read_only_workdir(
 /// Validates `working_directory` for a [`WorkerProvider::CodexCli`] read-only advisory invocation.
 ///
 /// Performs all [`validate_advisory_read_only_workdir`] checks and additionally fails closed with
-/// [`WorkerError::InvalidSpec`] if `working_directory` or any enclosing project directory up to
-/// the nearest `.git` root (or non-system ancestor when outside Git) contains a project-local
-/// Codex configuration or hooks path ([`CODEX_PROJECT_CONFIG_MARKERS`]: `.codex`, `codex.toml`,
-/// `.codex.toml`). This prevents project config or hooks from expanding capabilities when
-/// `--ignore-user-config` ignores user-level configuration.
+/// [`WorkerError::InvalidSpec`] if:
+/// 1. `working_directory` or any enclosing project directory up to the nearest `.git` root (or
+///    non-system ancestor when outside Git) contains a project-local Codex configuration or hooks
+///    path ([`CODEX_PROJECT_CONFIG_MARKERS`]: `.codex`, `codex.toml`, `.codex.toml`), preventing
+///    project config or hooks from expanding capabilities under `--ignore-user-config`; or
+/// 2. any entry inside `working_directory` violates the bounded filesystem preflight paired with
+///    `permissions.threadlane-advisory.filesystem.glob_scan_max_depth = 64`
+///    ([`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH`]):
+///    - relative component depth exceeding [`CODEX_ADVISORY_MAX_WORKDIR_DEPTH`] (`62`, leaving a
+///      [`CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN`] = `2` safety margin below `glob_scan_max_depth`),
+///    - total visited entries exceeding [`CODEX_ADVISORY_MAX_WORKDIR_ENTRIES`] (`32_768`),
+///    - any symbolic link, non-regular/non-directory special file, non-UTF-8 entry name, or
+///      unreadable directory/entry, or
+///    - any nested project-local Codex configuration marker ([`CODEX_PROJECT_CONFIG_MARKERS`]).
+///
+/// No subdirectories are skipped or pruned during traversal: all directories (including `.git`/`.GIT`,
+/// `.aws`, and `.agents`) are traversed and enforced against the depth and entry bounds because a
+/// directory-level deny rule does not block descendant paths beyond `glob_scan_max_depth`.
 pub fn validate_codex_advisory_workdir(working_directory: &Path) -> Result<PathBuf, WorkerError> {
     let canonical_workdir = validate_advisory_read_only_workdir(working_directory)?;
     ensure_no_codex_project_config_in_hierarchy(&canonical_workdir)?;
+    validate_codex_advisory_workdir_tree(&canonical_workdir)?;
     Ok(canonical_workdir)
+}
+
+fn validate_codex_advisory_workdir_tree(canonical_workdir: &Path) -> Result<(), WorkerError> {
+    let mut visited_entries: usize = 0;
+    let mut stack: Vec<(PathBuf, usize)> = vec![(canonical_workdir.to_path_buf(), 0)];
+
+    while let Some((current_dir, dir_depth)) = stack.pop() {
+        let read_dir = fs::read_dir(&current_dir).map_err(|err| {
+            WorkerError::InvalidSpec(format!(
+                "refusing to launch `codex_cli` advisory worker in `{}`: directory `{}` is not readable during bounded depth preflight: {err}",
+                canonical_workdir.display(),
+                current_dir.display()
+            ))
+        })?;
+
+        for entry_res in read_dir {
+            let entry = entry_res.map_err(|err| {
+                WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: failed to read directory entry under `{}` during bounded depth preflight: {err}",
+                    canonical_workdir.display(),
+                    current_dir.display()
+                ))
+            })?;
+
+            visited_entries = visited_entries.saturating_add(1);
+            if visited_entries > CODEX_ADVISORY_MAX_WORKDIR_ENTRIES {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: working directory exceeds maximum preflight entry budget of {CODEX_ADVISORY_MAX_WORKDIR_ENTRIES} entries",
+                    canonical_workdir.display()
+                )));
+            }
+
+            let entry_path = entry.path();
+            let file_name_os = entry.file_name();
+            let Some(file_name) = file_name_os.to_str() else {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: entry `{}` is not valid UTF-8",
+                    canonical_workdir.display(),
+                    entry_path.display()
+                )));
+            };
+
+            let metadata = fs::symlink_metadata(&entry_path).map_err(|err| {
+                WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: failed to inspect metadata for `{}` during bounded depth preflight: {err}",
+                    canonical_workdir.display(),
+                    entry_path.display()
+                ))
+            })?;
+            let file_type = metadata.file_type();
+
+            if file_type.is_symlink() {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: symbolic link `{}` is not permitted inside advisory working directory",
+                    canonical_workdir.display(),
+                    entry_path.display()
+                )));
+            }
+
+            if CODEX_PROJECT_CONFIG_MARKERS
+                .iter()
+                .any(|marker| file_name.eq_ignore_ascii_case(marker))
+            {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: project Codex configuration or hooks path `{}` exists and could expand capabilities under `--ignore-user-config`",
+                    canonical_workdir.display(),
+                    entry_path.display()
+                )));
+            }
+
+            let entry_depth = dir_depth + 1;
+            if entry_depth > CODEX_ADVISORY_MAX_WORKDIR_DEPTH {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: path `{}` has relative component depth {entry_depth}, exceeding maximum allowed workdir depth {CODEX_ADVISORY_MAX_WORKDIR_DEPTH} (paired with `glob_scan_max_depth={CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH}` and safety margin {CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN})",
+                    canonical_workdir.display(),
+                    entry_path.display()
+                )));
+            }
+
+            if file_type.is_dir() {
+                stack.push((entry_path, entry_depth));
+            } else if !file_type.is_file() {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: unsupported non-regular filesystem entry `{}`",
+                    canonical_workdir.display(),
+                    entry_path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn ensure_no_codex_project_config_in_hierarchy(

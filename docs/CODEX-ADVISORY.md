@@ -37,7 +37,7 @@ codex --no-daemon exec --json --ephemeral --ignore-user-config \
   -c approval_policy="never" \
   -c model_provider="openai" \
   -c default_permissions="threadlane-advisory" \
-  -c 'permissions.threadlane-advisory={"filesystem"={":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}' \
+  -c 'permissions.threadlane-advisory={"filesystem"={"glob_scan_max_depth"=64,":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}' \
   -c web_search="disabled" \
   --disable hooks --disable plugins --disable apps --disable multi_agent \
   --disable browser_use --disable computer_use --disable in_app_browser \
@@ -46,7 +46,7 @@ codex --no-daemon exec --json --ephemeral --ignore-user-config \
   -- <prompt>
 ```
 
-- **Zero write scopes and clean workdir checks**: `allowed_write_paths` must be empty. `validate_codex_advisory_workdir` requires a canonical non-root directory and fails closed if any project-local Codex configuration or hook marker (`CODEX_PROJECT_CONFIG_MARKERS`: `.codex`, `codex.toml`, `.codex.toml`) exists in or above the working directory. Source and snapshot checkouts are verified clean before and after execution.
+- **Zero write scopes, bounded depth/entry preflight, and clean workdir checks**: `allowed_write_paths` must be empty. Because Codex's Linux sandbox glob scanner requires a finite positive `glob_scan_max_depth` (`CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH = 64`) for recursive `**` deny patterns—and a directory deny rule does not block descendants beyond that expansion bound—`validate_codex_advisory_workdir` requires a canonical non-root directory and performs a fail-closed, unpruned traversal of all directories (including `.git`/`.GIT`, `.aws`, and `.agents`) before provider invocation. It rejects any entry deeper than `CODEX_ADVISORY_MAX_WORKDIR_DEPTH = 62` relative path components (`glob_scan_max_depth - 2`), any working tree exceeding `CODEX_ADVISORY_MAX_WORKDIR_ENTRIES = 32_768` entries, any symbolic link or non-regular/non-directory special file, and any project-local Codex configuration or hook marker (`CODEX_PROJECT_CONFIG_MARKERS`: `.codex`, `codex.toml`, `.codex.toml`) in, under, or above the working directory. Source and snapshot checkouts are verified clean before and after execution, and stream `type: "error"` / `turn.failed` events remain unconditionally fatal without warning relaxation.
 - **No second app-server or persistent daemon**: Each invocation runs as an ephemeral (`--no-daemon`, `--ephemeral`, `--ignore-user-config`) child in its own supervised Unix process group (`process_group(0)`). Threadlane never starts a second shared Codex app-server or installs a persistent OS service.
 
 ## 4. Stream Framing, Evidence Provenance, and Usage
