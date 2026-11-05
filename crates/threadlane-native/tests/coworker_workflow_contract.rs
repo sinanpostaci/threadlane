@@ -20,6 +20,7 @@ use threadlane_native::coworker_workflow::{
     RevokePlanningGrantRequest, StructuredReviewVerdict, TaskCandidateRef,
     TaskInterfaceOwnershipSpec, WorkBrief, WorkBriefKind, WorkflowHoldReason,
     COWORKER_IS_CONVERSATIONAL_INTERFACE_ONLY, COWORKER_WORKFLOW_SCHEMA_VERSION,
+    MAX_COWORKER_ID_LEN,
 };
 use threadlane_native::{
     Difficulty, ExecutionPolicy, NativeErrorCode, PolicyAllowRule, RegistryStore,
@@ -170,7 +171,7 @@ fn setup_fixture() -> CoworkerTestFixture {
                         allow_no_effort: false,
                     },
                     ModelDefinition {
-                        id: "model-deepseek".to_string(),
+                        id: "opencode-go/deepseek-v4.1-flash".to_string(),
                         tool_id: "tool-oc".to_string(),
                         label: "DeepSeek v4.1 Flash".to_string(),
                         model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
@@ -227,7 +228,7 @@ fn setup_fixture() -> CoworkerTestFixture {
                             role: WorkflowRole::Coder,
                             difficulty: Some(Difficulty::Easy),
                             choice: ModelChoice {
-                                model_id: "model-deepseek".to_string(),
+                                model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
                                 effort: Some("max".to_string()),
                             },
                         },
@@ -330,7 +331,7 @@ fn execution_policy() -> ExecutionPolicy {
             },
             PolicyAllowRule {
                 tool_id: "tool-oc".to_string(),
-                model_id: "model-deepseek".to_string(),
+                model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
                 efforts: vec!["max".to_string()],
                 allow_no_effort: false,
                 roles: vec![WorkflowRole::Coder],
@@ -3177,12 +3178,12 @@ fn frozen_approval_linkage_requires_explicit_controller_capability_envelope_for_
         vec!["src/".to_string()],
     );
 
-    // `model-deepseek` is only allowed for `Coder` in `execution_policy()`, not `Reviewer`.
+    // `opencode-go/deepseek-v4.1-flash` is only allowed for `Coder` in `execution_policy()`, not `Reviewer`.
     let unauthorized_reviewer_choice = SelectedRoleChoice {
         tool_id: "tool-oc".to_string(),
         adapter: ToolAdapter::OpencodeV2,
         route: RoleExecutionRoute::HeadlessWorker,
-        model_id: "model-deepseek".to_string(),
+        model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
         model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
         effort: Some("max".to_string()),
         matched_difficulty: Some(Difficulty::Easy),
@@ -3497,4 +3498,217 @@ fn orchestrator_reservation_in_binding_allows_independent_manual_job_approval() 
         superseded_err.code(),
         NativeErrorCode::ValidationFailed.as_str()
     );
+}
+
+#[test]
+fn namespaced_coder_model_id_admitted_in_contract_and_job_binding_while_invalid_model_ids_fail() {
+    let fixture = setup_fixture();
+
+    let namespaced_coder_choice = SelectedRoleChoice {
+        tool_id: "tool-oc".to_string(),
+        adapter: ToolAdapter::OpencodeV2,
+        route: RoleExecutionRoute::HeadlessWorker,
+        model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
+        model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+        effort: Some("max".to_string()),
+        matched_difficulty: Some(Difficulty::Easy),
+    };
+
+    // 1. Direct contract admission for a provider-namespaced registry model_id and 128-char boundary.
+    validate_non_native_worker_choice(WorkflowRole::Coder, &namespaced_coder_choice)
+        .expect("namespaced registry model_id must be admitted for Coder");
+
+    let mut max_len_choice = namespaced_coder_choice.clone();
+    max_len_choice.model_id = "m".repeat(MAX_COWORKER_ID_LEN);
+    validate_non_native_worker_choice(WorkflowRole::Coder, &max_len_choice)
+        .expect("128-character canonical registry model_id must be admitted");
+
+    // 2. Invalid registry model identifiers still fail: empty, padded, control chars, length overflow.
+    let overflow_id = "m".repeat(MAX_COWORKER_ID_LEN + 1);
+    for invalid_model_id in [
+        "",
+        " opencode-go/deepseek-v4.1-flash",
+        "opencode-go/deepseek-v4.1-flash ",
+        "\topencode-go/deepseek-v4.1-flash",
+        "opencode-go/deepseek\0flash",
+        "opencode-go/deepseek\nflash",
+        "opencode-go/deepseek\rflash",
+        "opencode-go/deepseek\u{007f}flash",
+        overflow_id.as_str(),
+    ] {
+        let mut bad_choice = namespaced_coder_choice.clone();
+        bad_choice.model_id = invalid_model_id.to_string();
+        let err = validate_non_native_worker_choice(WorkflowRole::Coder, &bad_choice)
+            .expect_err("invalid registry model_id must fail validation");
+        assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+    }
+
+    // 3. Generic bounded-identifier validation on tool_id and effort remains strict (rejects '/'),
+    // and Follower / NativeHandoff / CodexCli Coder rejections remain intact.
+    let mut bad_tool_id_choice = namespaced_coder_choice.clone();
+    bad_tool_id_choice.tool_id = "tool/oc".to_string();
+    assert_eq!(
+        validate_non_native_worker_choice(WorkflowRole::Coder, &bad_tool_id_choice)
+            .expect_err("slash in tool_id must still be rejected")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut bad_effort_choice = namespaced_coder_choice.clone();
+    bad_effort_choice.effort = Some("max/effort".to_string());
+    assert_eq!(
+        validate_non_native_worker_choice(WorkflowRole::Coder, &bad_effort_choice)
+            .expect_err("slash in effort must still be rejected")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    assert_eq!(
+        validate_non_native_worker_choice(WorkflowRole::Follower, &namespaced_coder_choice)
+            .expect_err("WorkflowRole::Follower must still be rejected")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut native_route_choice = namespaced_coder_choice.clone();
+    native_route_choice.route = RoleExecutionRoute::NativeHandoff;
+    assert_eq!(
+        validate_non_native_worker_choice(WorkflowRole::Coder, &native_route_choice)
+            .expect_err("NativeHandoff route must still be rejected")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    let mut codex_coder_choice = namespaced_coder_choice.clone();
+    codex_coder_choice.adapter = ToolAdapter::CodexCli;
+    assert_eq!(
+        validate_non_native_worker_choice(WorkflowRole::Coder, &codex_coder_choice)
+            .expect_err("CodexCli Coder must still be rejected")
+            .code(),
+        NativeErrorCode::ValidationFailed.as_str()
+    );
+
+    // 4. Full fixture chain: plan -> authority approval -> bind_job_approval -> reopen & read ledger
+    // for a namespaced Coder job (`opencode-go/deepseek-v4.1-flash`, effort `max`).
+    let job = fixture
+        .store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-job-namespaced-coder".to_string(),
+            expected_ledger_revision: Some(0),
+            work_brief: sample_ready_brief(
+                &fixture,
+                "brf_namespaced_coder",
+                BINDING_A,
+                THREAD_UUID_A,
+            ),
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job for namespaced Coder");
+
+    let tasks = vec![PlanTask {
+        id: "task-namespaced-coder".to_string(),
+        title: "Implement slice with namespaced OpenCode model".to_string(),
+        instruction: "Update docs/guide.md".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Easy,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["docs/guide.md".to_string()],
+    }];
+    let approval_id = publish_and_approve_plan(
+        &fixture,
+        "plan-namespaced-coder",
+        BINDING_A,
+        THREAD_UUID_A,
+        tasks,
+        vec!["docs/".to_string()],
+    );
+
+    let approval = fixture
+        .authority
+        .get_for_operator(&approval_id)
+        .expect("read approval");
+    let approved_task = &approval.tasks[0];
+    assert_eq!(approved_task.model_id, "opencode-go/deepseek-v4.1-flash");
+    assert_eq!(approved_task.model_arg, "opencode-go/deepseek-v4.1-flash");
+    assert_eq!(approved_task.effort.as_deref(), Some("max"));
+    assert_eq!(approved_task.adapter, ToolAdapter::OpencodeV2);
+
+    let cap_env = FrozenControllerCapabilityEnvelope {
+        allowed_reviewer_choices: vec![headless_argon_choice()],
+        allowed_closure_choices: vec![headless_argon_choice()],
+        max_in_scope_correction_attempts: 1,
+        allowed_check_ids: vec!["cargo_test".to_string()],
+        local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
+    };
+
+    let bound_job = fixture
+        .store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                approval_id: approval_id.clone(),
+                policy: execution_policy(),
+                controller_envelope: Some(cap_env),
+                task_interfaces: BTreeMap::new(),
+            },
+            &fixture.authority,
+        )
+        .expect("bind job approval for namespaced Coder task");
+    assert_eq!(bound_job.phase, CoworkerJobPhase::Executing);
+
+    let bound_task = bound_job
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-namespaced-coder")
+        .expect("bound namespaced Coder task");
+    assert_eq!(bound_task.selected_choice, namespaced_coder_choice);
+    assert_eq!(
+        bound_task.selected_choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        bound_task.selected_choice.model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(bound_task.selected_choice.effort.as_deref(), Some("max"));
+
+    // Reopen the workflow store from disk and verify the persisted ledger validates and preserves
+    // the exact namespaced model_id and max effort.
+    let reopened_store =
+        CoworkerWorkflowStore::new(fixture.store.plans_dir()).expect("reopen workflow store");
+    let reopened_ledger = reopened_store
+        .read_binding_ledger(BINDING_A)
+        .expect("read reopened binding ledger");
+    reopened_ledger
+        .validate(BINDING_A)
+        .expect("reopened ledger with namespaced model_id must validate");
+    let reopened_job = reopened_ledger
+        .jobs
+        .iter()
+        .find(|reopened| reopened.job_id == job.job_id)
+        .expect("reopened job exists");
+    let reopened_task = reopened_job
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-namespaced-coder")
+        .expect("reopened task exists");
+    assert_eq!(reopened_task.selected_choice, namespaced_coder_choice);
+    assert_eq!(
+        reopened_task.selected_choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        reopened_task.selected_choice.model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(reopened_task.selected_choice.effort.as_deref(), Some("max"));
 }

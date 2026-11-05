@@ -16,7 +16,7 @@ use threadlane_native::coworker_workflow::{
     CoworkerLockFileIdentity, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
     FrozenCheckExecutionReport, FrozenCheckExecutionStatus, FrozenCheckSubject,
     FrozenCheckTargetKind, FrozenControllerCapabilityEnvelope, WorkBrief, WorkBriefKind,
-    FROZEN_CHECK_EXECUTION_SCHEMA_VERSION,
+    FROZEN_CHECK_EXECUTION_SCHEMA_VERSION, MAX_COWORKER_ID_LEN,
 };
 use threadlane_native::{
     Difficulty, ExecutionPolicy, NativeErrorCode, PolicyAllowRule, RegistryStore,
@@ -167,7 +167,7 @@ fn setup_fixture() -> ControllerPolicyFixture {
                         allow_no_effort: false,
                     },
                     ModelDefinition {
-                        id: "model-deepseek".to_string(),
+                        id: "opencode-go/deepseek-v4.1-flash".to_string(),
                         tool_id: "tool-oc".to_string(),
                         label: "DeepSeek v4.1 Flash".to_string(),
                         model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
@@ -224,7 +224,7 @@ fn setup_fixture() -> ControllerPolicyFixture {
                             role: WorkflowRole::Coder,
                             difficulty: Some(Difficulty::Easy),
                             choice: ModelChoice {
-                                model_id: "model-deepseek".to_string(),
+                                model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
                                 effort: Some("max".to_string()),
                             },
                         },
@@ -302,7 +302,7 @@ fn headless_deepseek_choice() -> SelectedRoleChoice {
         tool_id: "tool-oc".to_string(),
         adapter: ToolAdapter::OpencodeV2,
         route: RoleExecutionRoute::HeadlessWorker,
-        model_id: "model-deepseek".to_string(),
+        model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
         model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
         effort: Some("max".to_string()),
         matched_difficulty: Some(Difficulty::Easy),
@@ -329,7 +329,7 @@ fn execution_policy() -> ExecutionPolicy {
             },
             PolicyAllowRule {
                 tool_id: "tool-oc".to_string(),
-                model_id: "model-deepseek".to_string(),
+                model_id: "opencode-go/deepseek-v4.1-flash".to_string(),
                 efforts: vec!["max".to_string()],
                 allow_no_effort: false,
                 roles: vec![
@@ -1772,4 +1772,276 @@ fn derived_task_attempt_receipt_preserves_v1_digest_and_validates_check_failure_
     let mut multiline_diag_basis = valid_basis.clone();
     multiline_diag_basis.diagnostic_summary = "line one\nline two".to_string();
     assert!(multiline_diag_basis.validate().is_err());
+}
+
+#[test]
+fn namespaced_coder_job_freezes_controller_envelope_and_reopens_preserving_exact_model_id_and_max_effort(
+) {
+    let fixture = setup_fixture();
+
+    let brief = WorkBrief {
+        brief_id: "brf_namespaced_coder_env".to_string(),
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        project_base: project_base(&fixture),
+        kind: WorkBriefKind::NewJob,
+        summary: "Verify namespaced OpenCode Coder model_id through frozen controller envelope"
+            .to_string(),
+        confirmed_requirements: vec![
+            "Admit opencode-go/deepseek-v4.1-flash with effort max across approval, job binding, and controller envelope".to_string(),
+        ],
+        proposed_additions: Vec::new(),
+        assumptions: vec!["Trusted-local Linux workspace".to_string()],
+        open_questions: Vec::new(),
+        accepted_architect_decisions: vec!["adv_0123456789abcdef0123456789abcdef".to_string()],
+    };
+    let job = fixture
+        .workflow_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            request_key: "req-job-namespaced-coder-env".to_string(),
+            expected_ledger_revision: None,
+            work_brief: brief,
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job");
+
+    // `WorkflowRole::Coder` with `Difficulty::Easy` resolves to `opencode-go/deepseek-v4.1-flash`
+    // (`effort: Some("max")`, `adapter: ToolAdapter::OpencodeV2`) in `profile-coworker`.
+    let tasks = vec![PlanTask {
+        id: "task-namespaced-coder".to_string(),
+        title: "Namespaced Coder slice".to_string(),
+        instruction: "Update src/lib.rs".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: Difficulty::Easy,
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/lib.rs".to_string()],
+    }];
+    let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+    let draft = fixture
+        .plans
+        .change_at(
+            0,
+            PlanChange::SaveDraft {
+                plan_id: "plan-namespaced-coder-env".to_string(),
+                binding_id: BINDING_A.to_string(),
+                profile_id: "profile-coworker".to_string(),
+                profile_revision: reg_snap.revision,
+                summary: "Plan with namespaced OpenCode Coder task".to_string(),
+                tasks,
+            },
+            1_700_000_000_000,
+        )
+        .expect("save draft");
+    let published = fixture
+        .plans
+        .change(
+            draft.revision,
+            PlanChange::Publish {
+                plan_id: "plan-namespaced-coder-env".to_string(),
+                revision: draft.revision,
+            },
+        )
+        .expect("publish plan");
+    let compiled = compile_plan_revision(&published, &reg_snap).expect("compile plan");
+    assert_eq!(
+        compiled.tasks[0].choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        compiled.tasks[0].model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(compiled.tasks[0].choice.effort.as_deref(), Some("max"));
+
+    let summary = fixture
+        .authority
+        .approve_at(
+            OperatorApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                plan_id: "plan-namespaced-coder-env".to_string(),
+                plan_revision: published.revision,
+                expected_registry_revision: reg_snap.revision,
+                expected_plan_digest: compiled.plan_digest,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-namespaced-coder".to_string()],
+                approved_write_paths: vec!["src/".to_string()],
+                max_parallel: 1,
+                budgets: ExecutionBudgets::default(),
+            },
+            1_700_000_001_000,
+        )
+        .expect("approve plan");
+
+    let cap_env = FrozenControllerCapabilityEnvelope {
+        allowed_reviewer_choices: vec![headless_argon_choice(), headless_deepseek_choice()],
+        allowed_closure_choices: vec![headless_argon_choice(), headless_deepseek_choice()],
+        max_in_scope_correction_attempts: 2,
+        allowed_check_ids: vec!["cargo_fmt".to_string(), "cargo_test".to_string()],
+        local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
+    };
+
+    let bound_job = fixture
+        .workflow_store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id,
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                approval_id: summary.approval_id,
+                policy: execution_policy(),
+                controller_envelope: Some(cap_env),
+                task_interfaces: BTreeMap::new(),
+            },
+            &fixture.authority,
+        )
+        .expect("bind job approval for namespaced Coder job");
+
+    let coder_task = bound_job
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-namespaced-coder")
+        .expect("bound namespaced Coder task");
+    assert_eq!(coder_task.selected_choice, headless_deepseek_choice());
+    assert_eq!(
+        coder_task.selected_choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        coder_task.selected_choice.model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(coder_task.selected_choice.effort.as_deref(), Some("max"));
+
+    // Invalid registry model identifiers on controller choices must still fail preview before any disk write.
+    let mut base_preview_req = sample_preview_request(&fixture, &bound_job);
+    base_preview_req.reviewer_choice = headless_deepseek_choice();
+    base_preview_req.closure_choice = headless_deepseek_choice();
+
+    let overflow_id = "m".repeat(MAX_COWORKER_ID_LEN + 1);
+    for invalid_model_id in [
+        "",
+        " opencode-go/deepseek-v4.1-flash",
+        "opencode-go/deepseek-v4.1-flash ",
+        "opencode-go/deepseek\0flash",
+        "opencode-go/deepseek\nflash",
+        overflow_id.as_str(),
+    ] {
+        let mut bad_req = base_preview_req.clone();
+        bad_req.reviewer_choice.model_id = invalid_model_id.to_string();
+        let err = fixture
+            .policy_store
+            .preview_execution_envelope(&bad_req, &bound_job, &fixture.authority)
+            .expect_err("invalid registry model_id in controller envelope must fail");
+        assert_eq!(err.code(), NativeErrorCode::ValidationFailed.as_str());
+    }
+    assert!(!fixture
+        .policy_store
+        .ledger_path_for_binding(BINDING_A)
+        .expect("policy ledger path")
+        .exists());
+
+    // Preview and record the frozen controller execution envelope with namespaced Coder, Reviewer, and Closure choices.
+    let preview = fixture
+        .policy_store
+        .preview_execution_envelope(&base_preview_req, &bound_job, &fixture.authority)
+        .expect("preview controller execution envelope with namespaced choices");
+    assert_eq!(
+        preview
+            .envelope
+            .task_coder_choices
+            .get("task-namespaced-coder"),
+        Some(&headless_deepseek_choice())
+    );
+    assert_eq!(preview.envelope.reviewer_choice, headless_deepseek_choice());
+    assert_eq!(preview.envelope.closure_choice, headless_deepseek_choice());
+
+    let record_req = attested_record_request_from_preview(&base_preview_req, &preview);
+    let recorded = fixture
+        .policy_store
+        .record_execution_envelope(&record_req, &bound_job, &fixture.authority)
+        .expect("record controller execution envelope with namespaced choices");
+    recorded
+        .envelope
+        .verify_matches_job(&bound_job)
+        .expect("recorded envelope matches bound namespaced Coder job");
+
+    // Reopen both stores from disk and verify exact model_id and max effort preservation.
+    let plans_dir = fixture.workflow_store.plans_dir();
+    let reopened_workflow =
+        CoworkerWorkflowStore::new(plans_dir).expect("reopen CoworkerWorkflowStore");
+    let reopened_policy =
+        ControllerPolicyStore::new(plans_dir).expect("reopen ControllerPolicyStore");
+
+    let reopened_ledger = reopened_workflow
+        .read_binding_ledger(BINDING_A)
+        .expect("read reopened workflow ledger");
+    reopened_ledger
+        .validate(BINDING_A)
+        .expect("reopened workflow ledger validates");
+    let reopened_job = reopened_ledger
+        .jobs
+        .iter()
+        .find(|job| job.job_id == bound_job.job_id)
+        .expect("reopened job exists");
+    let reopened_coder_choice = &reopened_job
+        .tasks
+        .iter()
+        .find(|task| task.task_id == "task-namespaced-coder")
+        .expect("reopened task exists")
+        .selected_choice;
+    assert_eq!(
+        reopened_coder_choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        reopened_coder_choice.model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(reopened_coder_choice.effort.as_deref(), Some("max"));
+
+    let reopened_runtime = reopened_policy
+        .get_job_runtime_readonly(BINDING_A, &bound_job.job_id)
+        .expect("read reopened controller runtime")
+        .expect("reopened controller runtime exists");
+    reopened_runtime
+        .envelope
+        .verify_matches_job(reopened_job)
+        .expect("reopened controller envelope matches reopened job");
+
+    let env_coder_choice = reopened_runtime
+        .envelope
+        .task_coder_choices
+        .get("task-namespaced-coder")
+        .expect("envelope coder choice exists");
+    assert_eq!(env_coder_choice.model_id, "opencode-go/deepseek-v4.1-flash");
+    assert_eq!(
+        env_coder_choice.model_arg,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(env_coder_choice.effort.as_deref(), Some("max"));
+    assert_eq!(
+        reopened_runtime.envelope.reviewer_choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        reopened_runtime.envelope.reviewer_choice.effort.as_deref(),
+        Some("max")
+    );
+    assert_eq!(
+        reopened_runtime.envelope.closure_choice.model_id,
+        "opencode-go/deepseek-v4.1-flash"
+    );
+    assert_eq!(
+        reopened_runtime.envelope.closure_choice.effort.as_deref(),
+        Some("max")
+    );
 }

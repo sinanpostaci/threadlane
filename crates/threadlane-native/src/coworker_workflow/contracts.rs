@@ -46,7 +46,9 @@ use threadlane_workers::{
     validate_repo_relative_path, validate_sha256_hex_digest, WorkerProvider,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
-use threadlane_workflow::{Difficulty, PlanStatus, ToolAdapter, WorkflowRole};
+use threadlane_workflow::{
+    validate_registry_identifier, Difficulty, PlanStatus, ToolAdapter, WorkflowRole,
+};
 
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
@@ -443,11 +445,12 @@ pub fn validate_non_native_worker_choice(
         "selected_choice.tool_id",
         MAX_COWORKER_ID_LEN,
     )?;
-    validate_bounded_identifier(
-        &choice.model_id,
-        "selected_choice.model_id",
-        MAX_COWORKER_ID_LEN,
-    )?;
+    validate_registry_identifier(&choice.model_id).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "selected_choice.model_id failed canonical registry identifier validation",
+        )
+    })?;
     validate_bounded_text(&choice.model_arg, "selected_choice.model_arg")?;
     if let Some(ref effort) = choice.effort {
         validate_bounded_identifier(effort, "selected_choice.effort", MAX_COWORKER_ID_LEN)?;
