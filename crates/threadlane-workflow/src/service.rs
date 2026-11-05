@@ -118,6 +118,47 @@ impl ScopedWorkflow {
         })
     }
 
+    /// Reads a scoped plan header and its verified digest without opening stores or writer locks.
+    ///
+    /// Existing private directories and the same bounded ledger/registry parsers are
+    /// required. Superseded or registry-stale publication digests require the frozen
+    /// command journal proof. This historical read never admits execution.
+    pub fn read_plan_summary_readonly_at(
+        registry_dir: &Path,
+        plans_dir: &Path,
+        binding_id: &str,
+        plan_id: &str,
+        revision: u64,
+    ) -> Result<PlanSummary, WorkflowError> {
+        validate_identifier("binding_id", binding_id)?;
+        validate_identifier("plan_id", plan_id)?;
+        validate_js_safe_revision("revision", revision)?;
+        if revision == 0 {
+            return Err(WorkflowError::InvalidInput(
+                "Requested plan revision must be at least 1.",
+            ));
+        }
+        let registry = RegistryStore::read_snapshot_readonly_at(registry_dir)?;
+        let revisions = PlanStore::read_snapshot_readonly_at(plans_dir)?;
+        let target = revisions
+            .iter()
+            .find(|candidate| {
+                candidate.binding_id == binding_id
+                    && candidate.plan_id == plan_id
+                    && candidate.revision == revision
+            })
+            .ok_or_else(WorkflowError::plan_not_found)?;
+        let (journal_path, _) = journal_paths_for_binding(plans_dir, binding_id)?;
+        Ok(build_plan_summary_readonly(
+            target,
+            &registry,
+            binding_id,
+            plans_dir,
+            &journal_path,
+            &mut None,
+        ))
+    }
+
     /// Returns the trusted chat binding identifier owning this [`ScopedWorkflow`].
     pub fn binding_id(&self) -> &str {
         &self.binding_id
@@ -943,27 +984,53 @@ impl ScopedWorkflow {
         registry_snapshot: &RegistrySnapshot,
         cached_journal: &mut Option<Option<PersistedCommandJournal>>,
     ) -> PlanSummary {
-        let plan_digest = match preview_draft_compilation(revision, registry_snapshot) {
-            Ok(compiled) => Some(compiled.plan_digest),
-            Err(PlanError::ProfileRevisionMismatch { .. })
-                if revision.status.is_active_published()
-                    && revision.profile_revision > 0
-                    && revision.profile_revision < registry_snapshot.revision
-                    && revision.binding_id == self.binding_id =>
-            {
-                let journal_opt = cached_journal.get_or_insert_with(|| {
-                    read_journal_readonly(self.plans.dir(), &self.journal_path, &self.binding_id)
-                        .ok()
-                        .flatten()
-                });
-                journal_opt.as_ref().and_then(|journal| {
-                    journal.verified_historical_plan_digest(&self.binding_id, revision)
-                })
-            }
-            Err(_) => None,
-        };
-        PlanSummary::from_revision(revision, plan_digest)
+        build_plan_summary_readonly(
+            revision,
+            registry_snapshot,
+            &self.binding_id,
+            self.plans.dir(),
+            &self.journal_path,
+            cached_journal,
+        )
     }
+}
+
+fn build_plan_summary_readonly(
+    revision: &PlanRevision,
+    registry_snapshot: &RegistrySnapshot,
+    binding_id: &str,
+    plans_dir: &Path,
+    journal_path: &Path,
+    cached_journal: &mut Option<Option<PersistedCommandJournal>>,
+) -> PlanSummary {
+    // Superseded revisions must never be recompiled or admitted for execution.
+    // Their frozen journal proof is required even without registry drift.
+    let historical_proof_required = revision.status == PlanStatus::Superseded
+        || (revision.status.is_active_published()
+            && revision.profile_revision > 0
+            && revision.profile_revision < registry_snapshot.revision);
+    let plan_digest = if historical_proof_required {
+        if revision.binding_id == binding_id
+            && revision.profile_revision > 0
+            && revision.profile_revision <= registry_snapshot.revision
+        {
+            let journal_opt = cached_journal.get_or_insert_with(|| {
+                read_journal_readonly(plans_dir, journal_path, binding_id)
+                    .ok()
+                    .flatten()
+            });
+            journal_opt
+                .as_ref()
+                .and_then(|journal| journal.verified_historical_plan_digest(binding_id, revision))
+        } else {
+            None
+        }
+    } else {
+        preview_draft_compilation(revision, registry_snapshot)
+            .ok()
+            .map(|compiled| compiled.plan_digest)
+    };
+    PlanSummary::from_revision(revision, plan_digest)
 }
 
 fn validate_page_limit(

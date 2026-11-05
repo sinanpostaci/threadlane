@@ -61,6 +61,8 @@ pub enum NativeErrorCode {
     AmbiguousWakeupPendingReconciliation,
     /// Underlying filesystem I/O error.
     IoError,
+    /// Atomic replacement succeeded on the filesystem path, but post-rename durability confirmation failed.
+    PersistenceUncertain,
 }
 
 impl NativeErrorCode {
@@ -95,6 +97,7 @@ impl NativeErrorCode {
             Self::TurnSteerRejected => "turn_steer_rejected",
             Self::AmbiguousWakeupPendingReconciliation => "ambiguous_wakeup_pending_reconciliation",
             Self::IoError => "io_error",
+            Self::PersistenceUncertain => "persistence_uncertain",
         }
     }
 }
@@ -122,6 +125,11 @@ impl NativeError {
             message: message.into(),
             rpc_code: None,
         }
+    }
+
+    /// Constructs a new [`NativeError`] when a replacement became visible on disk but durability could not be confirmed.
+    pub fn persistence_uncertain(message: impl Into<String>) -> Self {
+        Self::new(NativeErrorCode::PersistenceUncertain, message)
     }
 
     /// Constructs a new [`NativeError`] representing a JSON-RPC error response.

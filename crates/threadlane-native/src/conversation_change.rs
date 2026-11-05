@@ -846,6 +846,11 @@ pub enum ConversationChangeError {
         /// Static human-safe corrupt store description.
         reason: &'static str,
     },
+    /// Store replacement may already be visible, but parent-directory durability sync failed.
+    PersistenceUncertain {
+        /// Static human-safe persistence uncertainty description.
+        reason: &'static str,
+    },
     /// Filesystem I/O error while reading or writing the conversation-change store.
     Io {
         /// Static human-safe I/O failure description.
@@ -886,6 +891,7 @@ impl ConversationChangeError {
             Self::InvalidRunState { .. } => "invalid_run_state",
             Self::StoreLimitExceeded { .. } => "store_limit_exceeded",
             Self::CorruptStore { .. } => "corrupt_store",
+            Self::PersistenceUncertain { .. } => "persistence_uncertain",
             Self::Io { .. } => "io_error",
         }
     }
@@ -910,6 +916,7 @@ impl ConversationChangeError {
             | Self::InvalidRunState { reason }
             | Self::StoreLimitExceeded { reason }
             | Self::CorruptStore { reason }
+            | Self::PersistenceUncertain { reason }
             | Self::Io { reason } => reason,
             Self::UnsupportedPlatform => {
                 "Conversation change routing is only supported on Unix platforms."
@@ -962,6 +969,9 @@ impl From<ConversationChangeError> for NativeError {
                 NativeErrorCode::AmbiguousTransportFailure
             }
             ConversationChangeError::StoreLimitExceeded { .. } => NativeErrorCode::OutputOverflow,
+            ConversationChangeError::PersistenceUncertain { .. } => {
+                NativeErrorCode::PersistenceUncertain
+            }
             ConversationChangeError::Io { .. } => NativeErrorCode::IoError,
             _ => NativeErrorCode::ValidationFailed,
         };
@@ -3422,6 +3432,9 @@ fn map_fs_error(err: NativeError) -> ConversationChangeError {
         NativeErrorCode::OutputOverflow => ConversationChangeError::StoreLimitExceeded {
             reason: "Conversation-change store file exceeded the 1 MiB size limit.",
         },
+        NativeErrorCode::PersistenceUncertain => ConversationChangeError::PersistenceUncertain {
+            reason: "Conversation-change store replacement may already be visible, but durability is unconfirmed; reconcile stored state before retrying.",
+        },
         _ => ConversationChangeError::Io {
             reason: "Filesystem I/O error while accessing the conversation-change store.",
         },
@@ -3551,6 +3564,33 @@ fn map_host_cancel_error(err: &HostError) -> ConversationChangeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn map_fs_error_preserves_persistence_uncertain_roundtrip_and_sanitizes_message() {
+        let private_path = "/private/secret/root/changes/binding.json";
+        let mapped = map_fs_error(NativeError::new(
+            NativeErrorCode::PersistenceUncertain,
+            format!("post-rename sync failed at {private_path}"),
+        ));
+        assert_eq!(mapped.code(), "persistence_uncertain");
+        assert!(mapped
+            .safe_message()
+            .contains("replacement may already be visible"));
+        assert!(mapped.safe_message().contains("durability is unconfirmed"));
+        assert!(mapped.safe_message().contains("reconcile stored state"));
+        let native = NativeError::from(mapped);
+        assert_eq!(native.error_code(), NativeErrorCode::PersistenceUncertain);
+        assert!(!format!("{native} {native:?}").contains(private_path));
+
+        let ordinary_io = map_fs_error(NativeError::new(
+            NativeErrorCode::IoError,
+            format!("read failed at {private_path}"),
+        ));
+        assert_eq!(ordinary_io.code(), "io_error");
+        let native = NativeError::from(ordinary_io);
+        assert_eq!(native.error_code(), NativeErrorCode::IoError);
+        assert!(!format!("{native} {native:?}").contains(private_path));
+    }
 
     #[test]
     fn uncertain_cancel_marker_blocks_advancement_without_a_change_record() {

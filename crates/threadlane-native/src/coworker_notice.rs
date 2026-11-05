@@ -10,10 +10,11 @@ use threadlane::native_tool_output::NativeToolOutputConfig;
 use threadlane_core::WakeupOutcome;
 use tokio::sync::watch;
 
+use crate::coworker_driver::CoworkerDriverPipelineReport;
 use crate::coworker_workflow::{
     sha256_hex, CombinedCandidateStatus, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
-    CoworkerJobPhase, OwnedCoworkerControllerSession, PendingControllerEffectStatus,
-    VerifiedControllerAdmission,
+    CoworkerJobPhase, CoworkerPipelineStatus, CoworkerTaskStage, OwnedCoworkerControllerSession,
+    PendingControllerEffectStatus, VerifiedControllerAdmission,
 };
 use crate::fs_safety::{
     acquire_cross_process_lock, constant_time_str_eq, prepare_private_dir,
@@ -226,6 +227,8 @@ pub struct NoticeMilestoneSnapshot {
     pub has_unknown_effect: bool,
     /// Indicates whether a stop has been requested for the job runtime.
     pub stop_requested: bool,
+    /// Settled pipeline block verified against fresh admission, never inferred from worker prose.
+    pub settled_pipeline_block: Option<CoworkerPipelineStatus>,
 }
 
 /// Returns whether the snapshot satisfies the eligibility milestone for the given notice kind.
@@ -243,6 +246,13 @@ pub fn satisfies_notice_milestone(kind: NoticeKind, snapshot: NoticeMilestoneSna
                 || snapshot.has_attention_task
                 || snapshot.has_rejected_closure
                 || snapshot.has_unknown_effect
+                || matches!(
+                    snapshot.settled_pipeline_block,
+                    Some(
+                        CoworkerPipelineStatus::BlockedByFailedChecks
+                            | CoworkerPipelineStatus::AwaitingCorrectionExecution
+                    )
+                )
         }
     }
 }
@@ -275,7 +285,136 @@ fn snapshot_from_admission(admission: &VerifiedControllerAdmission) -> NoticeMil
             .values()
             .any(|e| e.status == PendingControllerEffectStatus::EffectUnknown),
         stop_requested: admission.runtime_state.stop_requested,
+        settled_pipeline_block: None,
     }
+}
+
+fn validate_settled_report_scope(
+    report: &CoworkerDriverPipelineReport,
+    key: &CoworkerJobOwnershipKey,
+    approval_id: &str,
+    job_revision: u64,
+) -> Result<(), NativeError> {
+    if report.binding_id != key.binding_id
+        || report.thread_uuid != key.thread_uuid
+        || report.job_id != key.job_id
+        || report.approval_id != approval_id
+        || report.job_revision != job_revision
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "settled notice report does not match current admission scope or revision",
+        ));
+    }
+    if !matches!(
+        report.status,
+        CoworkerPipelineStatus::BlockedByFailedChecks
+            | CoworkerPipelineStatus::AwaitingCorrectionExecution
+    ) || report.draining_in_flight_after_stop
+        || !report.in_flight_stages.is_empty()
+        || report.tasks.iter().any(|task| {
+            task.in_flight_stage.is_some()
+                || matches!(
+                    task.host_status,
+                    threadlane_host::TaskExecutionStatus::Queued
+                        | threadlane_host::TaskExecutionStatus::Claimed
+                        | threadlane_host::TaskExecutionStatus::Running
+                        | threadlane_host::TaskExecutionStatus::CancelRequested
+                )
+        })
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "attention notice requires a settled actionable pipeline block",
+        ));
+    }
+    Ok(())
+}
+
+fn snapshot_from_settled_pipeline(
+    admission: &VerifiedControllerAdmission,
+    key: &CoworkerJobOwnershipKey,
+    report: &CoworkerDriverPipelineReport,
+) -> Result<NoticeMilestoneSnapshot, NativeError> {
+    validate_settled_report_scope(
+        report,
+        key,
+        &admission.approval.approval_id,
+        admission.job.job_revision,
+    )?;
+    let runtime = &admission.runtime_state;
+    if report.job_phase != admission.job.phase
+        || runtime.stop_requested
+        || !runtime.lease.as_ref().is_some_and(|lease| {
+            lease.active
+                && lease.lease_epoch == report.lease_epoch
+                && lease.instance_id == report.controller_instance_id
+        })
+        || runtime
+            .pending_effects
+            .values()
+            .any(|effect| effect.status == PendingControllerEffectStatus::ReservedBeforeEffect)
+        || report.tasks.len() != admission.job.tasks.len()
+        || report
+            .tasks
+            .iter()
+            .zip(&admission.job.tasks)
+            .any(|(snapshot, task)| {
+                snapshot.task_id != task.task_id
+                    || snapshot.stage != task.stage
+                    || snapshot.attempt_no != task.current_attempt_no.max(1)
+                    || matches!(
+                        task.stage,
+                        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                    )
+            })
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "settled notice report is stale or controller work remains in flight",
+        ));
+    }
+    // The driver supplies a typed settled outcome, but a status label alone is insufficient:
+    // require the corresponding current task boundary or frozen final-check outcome as well.
+    let has_block_evidence = match report.status {
+        CoworkerPipelineStatus::AwaitingCorrectionExecution => report.tasks.iter().any(|task| {
+            task.stage == CoworkerTaskStage::CorrectInScopeRequired
+                && task.awaiting_correction_execution
+        }),
+        CoworkerPipelineStatus::BlockedByFailedChecks => {
+            report.tasks.iter().any(|task| {
+                task.stage == CoworkerTaskStage::ReadyForReview
+                    && task.failed_check_ids.iter().any(|id| {
+                        runtime
+                            .envelope
+                            .check_commands
+                            .get(id)
+                            .is_some_and(|spec| spec.required_for_task_review)
+                    })
+            }) || report.completion_summary.as_ref().is_some_and(|summary| {
+                summary.status
+                    == crate::coworker_workflow::CoworkerJobCompletionStatus::BlockedByFailedChecks
+                    && summary.failed_check_id.as_ref().is_some_and(|id| {
+                        runtime
+                            .envelope
+                            .check_commands
+                            .get(id)
+                            .is_some_and(|spec| spec.required_for_candidate_closure)
+                    })
+            })
+        }
+        _ => false,
+    };
+    if !has_block_evidence {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "settled notice report has no typed actionable block evidence",
+        ));
+    }
+    Ok(NoticeMilestoneSnapshot {
+        settled_pipeline_block: Some(report.status),
+        ..snapshot_from_admission(admission)
+    })
 }
 
 /// Derives the deterministic SHA-256 fingerprint for a validated key, notice kind, and nonzero job revision.
@@ -436,16 +575,39 @@ impl CoworkerNoticeStore {
         session: &OwnedCoworkerControllerSession,
         kind: NoticeKind,
     ) -> Result<Option<NoticeReport>, NativeError> {
+        self.notify_inner(session, kind, None).await
+    }
+
+    /// Internal driver-only path for settled check/correction blocks absent from job phase.
+    pub(crate) async fn notify_settled_attention(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        report: &CoworkerDriverPipelineReport,
+    ) -> Result<Option<NoticeReport>, NativeError> {
+        self.notify_inner(session, NoticeKind::Attention, Some(report))
+            .await
+    }
+
+    async fn notify_inner(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        kind: NoticeKind,
+        settled_report: Option<&CoworkerDriverPipelineReport>,
+    ) -> Result<Option<NoticeReport>, NativeError> {
         let key = session.guard().key().clone();
         session.guard().validate_before_effect(&key)?;
         let admission = session.verify_admission()?;
+        let snapshot = match settled_report {
+            Some(report) => snapshot_from_settled_pipeline(&admission, &key, report)?,
+            None => snapshot_from_admission(&admission),
+        };
         let reserved = self.reserve_attempt(
             &key,
             &admission.runtime_state.envelope.envelope_digest,
             Path::new(&admission.approval.repository_path),
             kind,
             admission.job.job_revision,
-            snapshot_from_admission(&admission),
+            snapshot,
             Some(session.guard()),
         )?;
         let (context, attempt, fingerprint, job_revision) = match reserved {
@@ -459,6 +621,9 @@ impl CoworkerNoticeStore {
             } => (context, attempt, fingerprint, job_revision),
         };
         session.guard().validate_before_effect(&key)?;
+        if let Some(report) = settled_report {
+            snapshot_from_settled_pipeline(&session.verify_admission()?, &key, report)?;
+        }
         let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
         session.guard().validate_before_effect(&key)?;
@@ -1256,6 +1421,7 @@ mod tests {
             has_attention_task: false,
             has_unknown_effect: false,
             stop_requested: false,
+            settled_pipeline_block: None,
         };
         (store, cfg, snap)
     }
@@ -1270,6 +1436,7 @@ mod tests {
             has_attention_task: false,
             has_unknown_effect: false,
             stop_requested: false,
+            settled_pipeline_block: None,
         };
         assert!(!satisfies_notice_milestone(
             NoticeKind::Complete,
@@ -1294,6 +1461,7 @@ mod tests {
             has_attention_task: false,
             has_unknown_effect: false,
             stop_requested: false,
+            settled_pipeline_block: None,
         };
         assert!(!satisfies_notice_milestone(
             NoticeKind::Attention,
@@ -1356,6 +1524,7 @@ mod tests {
             has_attention_task: false,
             has_unknown_effect: false,
             stop_requested: false,
+            settled_pipeline_block: None,
         };
         let rejected_closure = NoticeMilestoneSnapshot {
             has_rejected_closure: true,
@@ -1417,6 +1586,160 @@ mod tests {
                     ..
                 })
             ));
+        }
+    }
+
+    fn settled_report(
+        cfg: &CoworkerNoticeConfig,
+        status: CoworkerPipelineStatus,
+    ) -> CoworkerDriverPipelineReport {
+        serde_json::from_value(serde_json::json!({
+            "binding_id": cfg.key.binding_id,
+            "thread_uuid": cfg.key.thread_uuid,
+            "job_id": cfg.key.job_id,
+            "approval_id": "approval-current",
+            "job_phase": "executing",
+            "job_revision": 7,
+            "lease_epoch": 1,
+            "controller_instance_id": "controller-current",
+            "status": status
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn settled_block_scope_and_running_controls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, cfg, _) = fixture(tmp.path());
+        for status in [
+            CoworkerPipelineStatus::BlockedByFailedChecks,
+            CoworkerPipelineStatus::AwaitingCorrectionExecution,
+        ] {
+            let report = settled_report(&cfg, status);
+            assert!(
+                validate_settled_report_scope(&report, &cfg.key, "approval-current", 7).is_ok()
+            );
+            for field in [
+                "binding_id",
+                "thread_uuid",
+                "job_id",
+                "approval_id",
+                "job_revision",
+            ] {
+                let mut value = serde_json::to_value(&report).unwrap();
+                value[field] = if field == "job_revision" {
+                    serde_json::json!(8)
+                } else {
+                    serde_json::json!("other-scope")
+                };
+                let forged = serde_json::from_value(value).unwrap();
+                assert!(
+                    validate_settled_report_scope(&forged, &cfg.key, "approval-current", 7)
+                        .is_err(),
+                    "{field}"
+                );
+            }
+            let mut running = report.clone();
+            running.status = CoworkerPipelineStatus::Running;
+            assert!(
+                validate_settled_report_scope(&running, &cfg.key, "approval-current", 7).is_err()
+            );
+            running = report.clone();
+            running.in_flight_stages.push(
+                crate::coworker_workflow::CoworkerPipelineInFlightStageRef {
+                    task_id: None,
+                    attempt_no: None,
+                    kind:
+                        crate::coworker_workflow::CoworkerPipelineInFlightStageKind::JobCompletion,
+                },
+            );
+            assert!(
+                validate_settled_report_scope(&running, &cfg.key, "approval-current", 7).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn settled_block_attention_deduplicates_after_submit_and_interrupted_intent() {
+        for status in [
+            CoworkerPipelineStatus::BlockedByFailedChecks,
+            CoworkerPipelineStatus::AwaitingCorrectionExecution,
+        ] {
+            for submitted in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let (store, cfg, baseline) = fixture(tmp.path());
+                let clean = NoticeMilestoneSnapshot {
+                    phase: CoworkerJobPhase::Executing,
+                    has_closure_accepted: false,
+                    ..baseline
+                };
+                assert!(!satisfies_notice_milestone(NoticeKind::Attention, clean));
+                assert!(!satisfies_notice_milestone(
+                    NoticeKind::Attention,
+                    NoticeMilestoneSnapshot {
+                        settled_pipeline_block: Some(CoworkerPipelineStatus::Running),
+                        ..clean
+                    }
+                ));
+                let snapshot = NoticeMilestoneSnapshot {
+                    settled_pipeline_block: Some(status),
+                    ..clean
+                };
+                assert!(!satisfies_notice_milestone(NoticeKind::Complete, snapshot));
+                assert!(!satisfies_notice_milestone(NoticeKind::Stopped, snapshot));
+                let reserved = store
+                    .reserve_attempt(
+                        &cfg.key,
+                        &cfg.envelope_digest,
+                        &cfg.target.project_root,
+                        NoticeKind::Attention,
+                        7,
+                        snapshot,
+                        None,
+                    )
+                    .unwrap();
+                let ReserveOutcome::Reserved { fingerprint, .. } = reserved else {
+                    panic!("expected reserved intent")
+                };
+                if submitted {
+                    store
+                        .finalize_attempt(
+                            &cfg.key,
+                            NoticeKind::Attention,
+                            7,
+                            &fingerprint,
+                            &WakeupOutcome::Submitted,
+                        )
+                        .unwrap();
+                }
+                let reopened = CoworkerNoticeStore::new(tmp.path().join("store")).unwrap();
+                for _ in 0..2 {
+                    let ReserveOutcome::Completed(duplicate) = reopened
+                        .reserve_attempt(
+                            &cfg.key,
+                            &cfg.envelope_digest,
+                            &cfg.target.project_root,
+                            NoticeKind::Attention,
+                            7,
+                            snapshot,
+                            None,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("must not resend")
+                    };
+                    assert!(duplicate.was_duplicate);
+                    assert_eq!(duplicate.attempt_count, 1);
+                    assert_eq!(
+                        duplicate.status,
+                        if submitted {
+                            NoticeDeliveryStatus::Submitted
+                        } else {
+                            NoticeDeliveryStatus::Unknown
+                        }
+                    );
+                }
+            }
         }
     }
 

@@ -88,16 +88,27 @@ jobs:
       - name: Run frontend tests
         run: npm --prefix apps/desktop test
 
-      - name: Check Rust formatting
-        run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+      - name: Check root Rust workspace formatting
+        run: cargo fmt --all -- --check
 
-      - name: Run Clippy
+      - name: Check standalone Tauri workspace formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Run root Rust workspace Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Run Rust tests
+      - name: Run standalone Tauri workspace Clippy
+        env:
+          CARGO_TARGET_DIR: target/desktop
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+
+      - name: Run root Rust workspace tests
         run: cargo test --workspace --locked -- --test-threads=1
+
+      - name: Run standalone Tauri workspace tests
+        env:
+          CARGO_TARGET_DIR: target/desktop
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
 
       - name: Run offline packaging wrapper tests
         run: python -m unittest discover -s scripts -p test_build_desktop.py -v

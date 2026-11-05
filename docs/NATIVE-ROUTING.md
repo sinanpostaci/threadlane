@@ -1,7 +1,10 @@
 # Native chat routing gate
 
-Documentation review: 2026-10-29. This is a later integration gate, not a claim
-that general multi-chat routing is implemented.
+Historical routing review: 2026-10-29. The fixed-binding description below
+records that checkpoint. The current managed Linux route starts unbound and uses
+verified `connect_current_chat` enrollment; see [native pairing](NATIVE-GATE.md)
+and [the operating guide](MCP-OPERATING-GUIDE.md). General multi-chat and other
+platform acceptance remain separate gates.
 
 Codex host MCP configuration is shared by desktop/CLI/IDE clients; trusted
 project configuration can override it. A project setting does not by itself
@@ -12,8 +15,8 @@ reviewed documentation does not establish an authenticated caller chat ID passed
 to an arbitrary third-party stdio MCP server. Absence from these docs is not proof
 that no compatible mechanism exists. See the official [app-server protocol](https://learn.chatgpt.com/docs/app-server).
 
-Threadlane currently fixes `binding_id` in the trusted MCP launch command and
-checks binding scope in its HTTP/core APIs. This isolates an instance's admitted
+At that checkpoint, Threadlane fixed `binding_id` in the trusted MCP launch command and
+checked binding scope in its HTTP/core APIs. This isolates an instance's admitted
 scope; it does not authenticate the identity of whichever native chat received
 that same server configuration. The observed native experiment used one
 explicitly authorized disposable chat. Do not install a single fixed binding as

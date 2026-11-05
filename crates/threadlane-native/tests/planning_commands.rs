@@ -13,8 +13,10 @@ use threadlane_native::coworker_workflow::{
     WorkBriefKind,
 };
 use threadlane_native::{
-    current_wall_clock_ms, open_workflow_stores, Difficulty, EnqueuePlanningCommandRequest,
-    ExecutionPolicy, NativeErrorCode, PlanStatus, PlanningCommandDriver, PlanningCommandPayload,
+    current_wall_clock_ms, get_planning_command_summary_readonly,
+    list_planning_command_summaries_readonly, open_workflow_stores, planning_artifacts_dir,
+    planning_commands_dir, Difficulty, EnqueuePlanningCommandRequest, ExecutionPolicy,
+    NativeErrorCode, PlanStatus, PlanningCommandDriver, PlanningCommandPayload,
     PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore, PolicyAllowRule,
     RegistryStore, ScopedWorkflow, ToolAdapter, WorkflowProfile, WorkflowRole,
 };
@@ -1354,18 +1356,26 @@ async fn driver_executes_queued_orchestrator_command_publishing_plan_dag_and_ree
     let (job_id, brief_digest) =
         create_job_in_fixture(&fixture, BINDING_A, THREAD_UUID_A, "req-job-driver-orch-1");
 
-    let artifacts_dir = fixture._tmp.path().join("planning-artifacts-orch");
+    let artifacts_dir = planning_artifacts_dir(fixture.workflow_store.plans_dir());
     let service = CoworkerPlanningService::new(
         fixture.workflow_store.clone(),
         fixture.registry_dir.clone(),
         artifacts_dir,
     )
     .expect("create planning service");
-    let store_with_artifacts = fixture
-        .command_store
-        .clone()
-        .with_artifacts_dir(service.artifacts_dir())
-        .expect("with_artifacts_dir");
+    let commands_dir = planning_commands_dir(fixture.workflow_store.plans_dir());
+    make_private_dir(&commands_dir);
+    let ownership_store =
+        CoworkerJobOwnershipStore::new(&commands_dir).expect("canonical ownership store");
+    let store_with_artifacts = PlanningCommandStore::new(
+        &commands_dir,
+        fixture.workflow_store.clone(),
+        &fixture.registry_dir,
+        ownership_store,
+    )
+    .expect("canonical command store")
+    .with_artifacts_dir(service.artifacts_dir())
+    .expect("with_artifacts_dir");
     let driver = PlanningCommandDriver::new(store_with_artifacts.clone(), service.clone())
         .expect("create PlanningCommandDriver");
 
@@ -1499,4 +1509,240 @@ async fn driver_executes_queued_orchestrator_command_publishing_plan_dag_and_ree
         .get_plan(&planning_result.plan_id, None, None, None)
         .expect("get latest plan revision");
     assert_eq!(latest_page.header.revision, 1);
+
+    // A second completed command updates the same job and supersedes the first plan revision.
+    let PlanningCommandPayload::Orchestrator(mut request_v2) = orch_cmd.payload.clone() else {
+        panic!("expected orchestrator request");
+    };
+    request_v2.request_key = "cmd-driver-orch-2".to_string();
+    request_v2.plan_id = Some(planning_result.plan_id.clone());
+    request_v2.expected_plan_revision = 1;
+    let cmd_v2 = store_with_artifacts
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            request_v2,
+        ))
+        .expect("enqueue same-job plan update");
+    let result_v2 = driver
+        .execute_command(BINDING_A, THREAD_UUID_A, &cmd_v2.command_id)
+        .await
+        .expect("execute same-job plan update");
+    assert_eq!(result_v2.command.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        scoped
+            .get_plan(&planning_result.plan_id, Some(1), None, None)
+            .expect("historical header")
+            .header
+            .status,
+        PlanStatus::Superseded
+    );
+
+    let read_old = || {
+        get_planning_command_summary_readonly(
+            fixture.workflow_store.plans_dir(),
+            &fixture.registry_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+            &orch_cmd.command_id,
+        )
+    };
+    let list = || {
+        list_planning_command_summaries_readonly(
+            fixture.workflow_store.plans_dir(),
+            &fixture.registry_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+            20,
+            None,
+        )
+    };
+    let historical = read_old()
+        .expect("read superseded command")
+        .expect("command exists");
+    assert_eq!(historical.current_plan_status, Some(PlanStatus::Superseded));
+    assert_eq!(historical.executable, Some(false));
+    assert_eq!(historical.result_ref, outcome_1.command.result_ref);
+    let page = list().expect("list same-job history");
+    assert_eq!(page.commands.len(), 2);
+    let current = page
+        .commands
+        .iter()
+        .find(|c| c.command_id == cmd_v2.command_id)
+        .expect("current command");
+    assert_eq!(current.current_plan_status, Some(PlanStatus::Published));
+    assert_eq!(current.executable, None); // Never implies execution authority.
+
+    driver
+        .execute_command(BINDING_A, THREAD_UUID_A, &orch_cmd.command_id)
+        .await
+        .expect_err("execution must reject superseded command");
+    store_with_artifacts
+        .verify_completed_command(&outcome_1.command)
+        .expect_err("strict verification must retain current job linkage");
+
+    registry
+        .apply(4, RegistryChange::SetDefaultProfile { profile_id: None })
+        .expect("advance registry after publication");
+    let snapshot = |dir: &Path| {
+        fn visit(dir: &Path, files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(dir).expect("snapshot directory") {
+                let path = entry.expect("snapshot entry").path();
+                if path.is_dir() {
+                    files.insert(path.clone(), Vec::new());
+                    visit(&path, files);
+                } else {
+                    files.insert(path.clone(), fs::read(path).expect("snapshot file"));
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(dir, &mut files);
+        files
+    };
+    // Remove leftover writer locks in this disposable fixture before proving that reads create none.
+    for path in snapshot(fixture.workflow_store.plans_dir()).keys() {
+        if path.extension().is_some_and(|ext| ext == "lock") {
+            fs::remove_file(path).expect("remove fixture writer lock");
+        }
+    }
+    fs::remove_file(fixture.registry_dir.join("registry.lock"))
+        .expect("remove fixture registry lock");
+    let plans_before = snapshot(fixture.workflow_store.plans_dir());
+    let registry_before = snapshot(&fixture.registry_dir);
+    for _ in 0..3 {
+        assert_eq!(
+            read_old()
+                .expect("historical read after registry drift")
+                .expect("command")
+                .current_plan_status,
+            Some(PlanStatus::Superseded)
+        );
+        assert_eq!(
+            list()
+                .expect("historical list after registry drift")
+                .commands
+                .len(),
+            2
+        );
+    }
+    assert!(
+        snapshot(fixture.workflow_store.plans_dir()) == plans_before,
+        "historical reads must not change plan-store files or create locks"
+    );
+    assert!(
+        snapshot(&fixture.registry_dir) == registry_before,
+        "historical reads must not change registry files or create locks"
+    );
+    let ledger = fixture
+        .workflow_store
+        .read_binding_ledger(BINDING_A)
+        .expect("unchanged usage");
+    assert_eq!(
+        ledger
+            .planning_grants
+            .iter()
+            .find(|g| g.grant_id == grant_id)
+            .expect("grant")
+            .usage
+            .reserved_total_calls,
+        2
+    );
+
+    assert!(get_planning_command_summary_readonly(
+        fixture.workflow_store.plans_dir(),
+        &fixture.registry_dir,
+        BINDING_A,
+        THREAD_UUID_B,
+        &orch_cmd.command_id,
+    )
+    .is_err());
+    assert!(get_planning_command_summary_readonly(
+        fixture.workflow_store.plans_dir(),
+        &fixture.registry_dir,
+        BINDING_B,
+        THREAD_UUID_A,
+        &orch_cmd.command_id,
+    )
+    .expect("other binding read")
+    .is_none());
+
+    let journal_path = fs::read_dir(fixture.workflow_store.plans_dir())
+        .expect("plan directory")
+        .map(|entry| entry.expect("entry").path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("workflow-commands-") && name.ends_with(".json")
+                })
+        })
+        .expect("publication journal path");
+    let journal_bytes = fs::read(&journal_path).expect("publication journal");
+    let journal: serde_json::Value = serde_json::from_slice(&journal_bytes).expect("journal JSON");
+    let old_entry = journal["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .position(|entry| entry["target_revision"] == 1)
+        .expect("r1 journal entry");
+    for field in [
+        "tasks_digest",
+        "payload_digest",
+        "plan_digest",
+        "profile_id",
+        "profile_revision",
+        "target_revision",
+    ] {
+        let mut tampered = journal.clone();
+        tampered["entries"][old_entry][field] = match field {
+            "profile_revision" | "target_revision" => serde_json::json!(99),
+            "profile_id" => serde_json::json!("wrong-profile"),
+            _ => serde_json::json!("0".repeat(64)),
+        };
+        fs::write(
+            &journal_path,
+            serde_json::to_vec(&tampered).expect("tampered journal"),
+        )
+        .expect("write tampered journal");
+        assert!(
+            read_old().is_err(),
+            "tampered {field} must fail historical verification"
+        );
+        assert!(
+            list().is_err(),
+            "tampered {field} must fail list verification"
+        );
+    }
+    fs::remove_file(&journal_path).expect("remove journal");
+    assert!(read_old().is_err());
+    assert!(list().is_err());
+    assert!(
+        !journal_path.exists(),
+        "read must not recreate missing journal"
+    );
+    fs::write(&journal_path, &journal_bytes).expect("restore journal");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600))
+            .expect("private journal");
+    }
+    let artifact_path = service
+        .artifacts_dir()
+        .join(format!("{}.json", planning_result.report_artifact_id));
+    let artifact_bytes = fs::read(&artifact_path).expect("r1 artifact");
+    fs::write(&artifact_path, b"{}").expect("tamper artifact");
+    assert!(read_old().is_err());
+    assert!(list().is_err());
+    fs::remove_file(&artifact_path).expect("remove artifact");
+    assert!(read_old().is_err());
+    assert!(list().is_err());
+    assert!(!artifact_path.exists());
+    fs::write(&artifact_path, artifact_bytes).expect("restore artifact");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&artifact_path, fs::Permissions::from_mode(0o600))
+            .expect("private artifact");
+    }
+    assert!(read_old().expect("restored proofs").is_some());
 }

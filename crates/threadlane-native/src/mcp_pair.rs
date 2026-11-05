@@ -1804,7 +1804,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-04.v5) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-05.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,

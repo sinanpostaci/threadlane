@@ -9,7 +9,8 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_plans::{
-    validate_identifier, validate_js_safe_revision, validate_summary, PlanRevision, PlanTask,
+    validate_identifier, validate_js_safe_revision, validate_plan_revision, validate_summary,
+    PlanRevision, PlanStatus, PlanTask,
 };
 use uuid::Uuid;
 
@@ -113,7 +114,8 @@ impl PersistedCommandJournal {
         if self.schema_version != WORKFLOW_JOURNAL_SCHEMA_VERSION
             || self.binding_id != binding_id
             || revision.binding_id != binding_id
-            || !revision.status.is_active_published()
+            || !(revision.status.is_active_published() || revision.status == PlanStatus::Superseded)
+            || validate_plan_revision(revision).is_err()
             || revision.revision == 0
             || revision.profile_revision == 0
             || self.entries.len() > MAX_COMMAND_JOURNAL_ENTRIES

@@ -168,10 +168,37 @@ the workflow. It uses a `fail-fast: false` matrix for:
 | `macos-14` | `macos-aarch64` |
 | `windows-2022` | `windows-x86_64` |
 
-Each job installs the official Rust toolchain, Node.js 22, and Python 3.12,
-then runs frontend build/tests, Rust formatting/Clippy/tests, the offline
-packaging tests, and the desktop wrapper. It uploads the CLI, desktop executable,
-and frontend bundle as a short-lived workflow artifact.
+Each job is configured to install the official Rust toolchain, Node.js 22, and
+Python 3.12. It runs the frontend production build and `npm test`, which
+recursively discovers every `apps/desktop/src/**/*.test.ts` file, including the
+`src` root and nested directories, without a shell glob. The test command is
+implemented by `apps/desktop/scripts/run-tests.mjs`; its small offline
+discovery/exit-status regression test is part of the same run. The command keeps
+`--experimental-strip-types`, uses Node's normal per-file isolation, fails if
+discovery finds no files, and propagates a failing test exit status. On Node.js
+24 only, `npm --prefix apps/desktop test -- --test-isolation=none` runs the
+discovered files in one process for sandbox diagnostics; it is not the default.
+
+The job then runs root workspace formatting, Clippy, and serial tests, followed
+by the standalone `apps/desktop/src-tauri` workspace's formatting, Clippy, and
+serial tests with `CARGO_TARGET_DIR=target/desktop`. That target directory is
+separate from the root workspace's `target/` directory. It finishes with the
+offline packaging tests and the desktop wrapper, and uploads the CLI, desktop
+executable, and frontend bundle as a short-lived workflow artifact.
+
+On a POSIX shell, the equivalent local validation commands are:
+
+```sh
+npm --prefix apps/desktop ci
+npm --prefix apps/desktop run build
+npm --prefix apps/desktop test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked -- --test-threads=1
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+CARGO_TARGET_DIR=target/desktop cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+CARGO_TARGET_DIR=target/desktop cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
+```
 
 The workflow does not publish a release, sign an artifact, use repository
 secrets, or create a system installer. The action versions, hosted runner images,

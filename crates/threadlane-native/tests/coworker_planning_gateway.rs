@@ -908,6 +908,71 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     assert!(job_summary.ready_for_execution_planning);
     assert!(!job_summary.ready_for_execution_approval);
 
+    // A second command for this job supersedes r1 without invalidating its completed history.
+    let update_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
+        &mcp,
+        "request_technical_plan",
+        json!({
+            "grant_id": grant_id,
+            "job_id": prep.job_id,
+            "request_key": "req-tech-plan-publish-2",
+            "plan_id": orch_summary.plan_id,
+            "expected_plan_revision": 1,
+            "max_architect_rounds": 0,
+            "difficulty": "hard"
+        }),
+    )
+    .await;
+    let update_detail = wait_for_command_completion(&mcp, &update_submit.command_id).await;
+    assert_eq!(
+        update_detail
+            .orchestrator_plan_summary
+            .as_ref()
+            .expect("r2 summary")
+            .plan_revision,
+        2
+    );
+    let calls_before_history =
+        fs::read(&fixture.worker_marker).expect("provider calls before history");
+    for _ in 0..3 {
+        let status: CoworkerStatusResponse =
+            invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+        let old = status
+            .commands
+            .iter()
+            .find(|c| c.command_id == plan_submit.command_id)
+            .expect("r1 completed command");
+        assert_eq!(old.current_plan_status, Some(PlanStatus::Superseded));
+        assert_eq!(old.executable, Some(false));
+        assert_eq!(old.result_ref, plan_detail.result_ref);
+        let current = status
+            .commands
+            .iter()
+            .find(|c| c.command_id == update_submit.command_id)
+            .expect("r2 completed command");
+        assert_eq!(current.current_plan_status, Some(PlanStatus::Published));
+        let detail: PlanningCommandDetailResponse = invoke_mcp_ok(
+            &mcp,
+            "planning_command",
+            json!({"command_id": plan_submit.command_id}),
+        )
+        .await;
+        assert_eq!(detail.current_plan_status, Some(PlanStatus::Superseded));
+        assert_eq!(detail.executable, Some(false));
+        assert_eq!(
+            detail
+                .orchestrator_plan_summary
+                .as_ref()
+                .expect("frozen summary")
+                .plan_status,
+            PlanStatus::Published
+        );
+    }
+    assert_eq!(
+        fs::read(&fixture.worker_marker).expect("provider calls after history"),
+        calls_before_history
+    );
+
     // 5. Simulate interrupted `Running` command -> reopens as `Unknown` (`pending_reconciliation == true`)
     //    and blocks a new `request_key` from bypassing reconciliation.
     let wf_store =
@@ -1021,6 +1086,30 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     assert_eq!(
         gw_err.error_code(),
         NativeErrorCode::AmbiguousWakeupPendingReconciliation
+    );
+
+    let registry = RegistryStore::open(&fixture.registry_dir).expect("registry for drift");
+    let revision = registry.snapshot().expect("current registry").revision;
+    registry
+        .apply(
+            revision,
+            RegistryChange::SetDefaultProfile { profile_id: None },
+        )
+        .expect("advance registry after r2");
+    let calls_before_drift_reads = fs::read(&fixture.worker_marker).expect("provider calls");
+    let status: CoworkerStatusResponse = invoke_mcp_ok(&mcp, "coworker_status", json!({})).await;
+    assert_eq!(
+        status
+            .commands
+            .iter()
+            .find(|c| c.command_id == plan_submit.command_id)
+            .expect("historical command after registry drift")
+            .current_plan_status,
+        Some(PlanStatus::Superseded)
+    );
+    assert_eq!(
+        fs::read(&fixture.worker_marker).expect("provider calls after drift reads"),
+        calls_before_drift_reads
     );
 
     fixture.shutdown().await;

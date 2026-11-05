@@ -16,14 +16,14 @@ use tokio::net::UnixListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-async fn run_flow_cli_pipeline(
+async fn run_flow_cli_pipeline_output(
     state_dir: &Path,
     fixture: &PipelineTestFixture,
     binding_id: &str,
     thread_uuid: &str,
     subcommand_args: &[&str],
-) -> Value {
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_threadlane-flow"))
+) -> std::process::Output {
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_threadlane-flow"))
         .arg("--state-dir")
         .arg(state_dir)
         .arg("--registry-dir")
@@ -41,7 +41,19 @@ async fn run_flow_cli_pipeline(
         .args(subcommand_args)
         .output()
         .await
-        .expect("spawn threadlane-flow subprocess");
+        .expect("spawn threadlane-flow subprocess")
+}
+
+async fn run_flow_cli_pipeline(
+    state_dir: &Path,
+    fixture: &PipelineTestFixture,
+    binding_id: &str,
+    thread_uuid: &str,
+    subcommand_args: &[&str],
+) -> Value {
+    let output =
+        run_flow_cli_pipeline_output(state_dir, fixture, binding_id, thread_uuid, subcommand_args)
+            .await;
     assert!(
         output.status.success(),
         "threadlane-flow {:?} failed with status {:?}\nstdout: {}\nstderr: {}",
@@ -188,6 +200,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
     max_parallel: usize,
     approval_budgets: ExecutionBudgets,
     coder_budget: ControllerRoleExecutionBudget,
+    correction_cap: u32,
 ) -> (CoworkerJobRecord, String) {
     Box::pin(async move {
         let pb = project_base(fixture);
@@ -373,7 +386,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
         let cap_env = FrozenControllerCapabilityEnvelope {
             allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
             allowed_closure_choices: vec![headless_argon_choice(Difficulty::Extreme)],
-            max_in_scope_correction_attempts: 1,
+            max_in_scope_correction_attempts: correction_cap,
             allowed_check_ids: vec!["cargo_test".to_string()],
             local_git_integration_allowed: true,
             allow_check_failure_corrections: false,
@@ -419,8 +432,8 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
             reviewer_choice: headless_argon_choice(Difficulty::Hard),
             closure_choice: headless_argon_choice(Difficulty::Extreme),
             role_budgets,
-            max_in_scope_corrections_per_task: 1,
-            max_total_corrections_per_job: 2,
+            max_in_scope_corrections_per_task: correction_cap,
+            max_total_corrections_per_job: correction_cap.saturating_mul(2),
             max_total_task_attempts_per_job: 6,
             check_commands: default_check_commands(fixture),
             allow_task_worktree_commits: true,
@@ -545,6 +558,7 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
             2, // max_parallel = 2
             ExecutionBudgets::default(),
             ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 5),
+            1,
         )
         .await;
 
@@ -1058,6 +1072,7 @@ async fn cli_code_driver_cancel_during_owned_in_flight_reviewer_drains_fences_pr
             1,
             ExecutionBudgets::default(),
             ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+            1,
         )
         .await;
 
@@ -1239,4 +1254,122 @@ async fn cli_code_driver_cancel_during_owned_in_flight_reviewer_drains_fences_pr
         supervisor.shutdown().await;
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_code_driver_settled_check_and_correction_blocks_send_one_attention_notice() {
+    Box::pin(async {
+        // Check-failure corrections are not authorized in this fixture. Reviewer corrections
+        // cover both absent authority and an exhausted Coder budget.
+        for case in ["task_check", "final_check", "correction_no_authority", "correction_budget"] {
+            let fixture = setup_fixture();
+            let state_dir = fixture.root.join("runtime");
+            let supervisor = Supervisor::start(SupervisorConfig::new(state_dir.clone())).await.unwrap();
+            let client = SupervisorClient::from_state_dir(&state_dir).unwrap();
+            let binding = client.create_binding(THREAD_UUID_A, "settled-attention-fixture").await.unwrap();
+            let binding_id = binding.binding_id;
+            let thread_uuid = binding.thread_uuid;
+            let correction = case.starts_with("correction");
+            let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+                &fixture, &binding_id, &thread_uuid, "brf_notice_block", "plan-notice-block",
+                vec![PlanTask {
+                    id: "task-notice-a".into(), title: "Attention fixture task".into(),
+                    instruction: "CTRL_TASK_A implement src/a.rs".into(), role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard, depends_on: Vec::new(), allowed_write_paths: vec!["src/a.rs".into()],
+                }], BTreeMap::new(), vec!["src/a.rs".into()], 1, ExecutionBudgets::default(),
+                ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, if case == "correction_budget" { 1 } else { 4 }),
+                if case == "correction_no_authority" { 0 } else { 1 },
+            ).await;
+            if correction {
+                fs::write(fixture.root.join("reviewer_override_task-notice-a.json"), json!({
+                    "outcome": "correct_in_scope", "findings": ["Return value requires adjustment"],
+                    "required_in_scope_fixes": ["Update a() to return 101"], "summary": "Requires in-scope correction"
+                }).to_string()).unwrap();
+            }
+
+            // Hold the first real frozen check so notice absence is observable while work runs.
+            let gate = fixture.root.join("notice-check.gate");
+            let entered = fixture.root.join("notice-check.entered");
+            fs::write(&gate, "hold").unwrap();
+            let original_check = fs::read_to_string(&fixture.fake_cargo_exe).unwrap();
+            let fail = match case { "task_check" => "exit 1", "final_check" => "if [ \"$c\" -ge 2 ]; then exit 1; fi", _ => "" };
+            let held_check = original_check.replace("exit 0\n", &format!(
+                "touch '{}'\nwhile [ -f '{}' ]; do sleep 0.02; done\n{fail}\nexit 0\n", entered.display(), gate.display()));
+            write_executable_script(&fixture.fake_cargo_exe, &held_check);
+            let (socket, effect_count, server) = spawn_single_coworker_notice_ws_server(&fixture, &thread_uuid);
+            let key = CoworkerJobOwnershipKey::new(&binding_id, &thread_uuid, &job.job_id).unwrap();
+            let runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
+            let digest = runtime.envelope.envelope_digest;
+            let notice_root = coworker_notice_dir(&fixture.plans_dir);
+            CoworkerNoticeStore::new(&notice_root).unwrap().configure(CoworkerNoticeConfig::new(
+                key.clone(), digest.clone(), NativeToolOutputConfig::new_user_message_steer(socket, thread_uuid.clone(), fixture.repo_dir.clone())
+            ).unwrap()).unwrap();
+            let ensure = run_flow_cli_pipeline(&state_dir, &fixture, &binding_id, &thread_uuid,
+                &["code-driver", "ensure", "--job-id", &job.job_id]).await;
+            assert_eq!(ensure["disposition"], "spawned_new_owner");
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !entered.is_file() {
+                assert!(Instant::now() < deadline, "check did not start for {case}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let running = run_flow_cli_pipeline(&state_dir, &fixture, &binding_id, &thread_uuid,
+                &["code-driver", "status", "--job-id", &job.job_id]).await;
+            assert_eq!(running["pipeline_status"], "running", "{case}: {running}");
+            assert_eq!(running["blocked_on_unknown_effect"], false);
+            assert_eq!(CoworkerNoticeStore::inspect(&notice_root, &key, &digest).unwrap().attempt_count, 0);
+            assert_eq!(effect_count.load(Ordering::SeqCst), 0);
+            fs::remove_file(&gate).unwrap();
+
+            let settled = loop {
+                let current = run_flow_cli_pipeline(&state_dir, &fixture, &binding_id, &thread_uuid,
+                    &["code-driver", "status", "--job-id", &job.job_id]).await;
+                if current["owner_state"] == "no_active_owner" { break current; }
+                assert!(Instant::now() < deadline, "owner did not settle for {case}: {current}");
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            };
+            let expected_status = if correction { "awaiting_correction_execution" } else { "blocked_by_failed_checks" };
+            assert_eq!(settled["pipeline_status"], expected_status, "{case}: {settled}");
+            assert_eq!(settled["host_lock_held"], false);
+            assert_ne!(settled["job_phase"], "completed");
+            let turn = tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+            assert_eq!(turn["params"]["threadId"], thread_uuid);
+            assert_eq!(turn["params"]["input"][0]["text"], format_coworker_job_wakeup_message(&job.job_id).unwrap());
+            let metadata = CoworkerNoticeStore::inspect(&notice_root, &key, &digest).unwrap();
+            assert_eq!(metadata.attempt_count, 1, "{case}");
+            let latest = metadata.latest.unwrap();
+            assert_eq!(latest.kind, threadlane_native::coworker_notice::NoticeKind::Attention);
+            assert_eq!(latest.status, NoticeDeliveryStatus::Submitted);
+            assert_eq!(effect_count.load(Ordering::SeqCst), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+            let calls = read_invocation_count(&fixture.agy_reviewer_count_file);
+            let checks = read_invocation_count(&fixture.check_count_file);
+            run_flow_cli_pipeline(&state_dir, &fixture, &binding_id, &thread_uuid,
+                &["code-driver", "status", "--job-id", &job.job_id]).await;
+            let approval = fixture.authority.get_for_operator(&approval_id).unwrap();
+            let session_dir = fixture.sessions_dir.join(&approval_id);
+            let stopped_host = threadlane_host::read_host_manifest_optional(&session_dir, &approval).unwrap().unwrap();
+            assert_eq!(stopped_host.phase, HostPhase::Stopped);
+            assert!(!threadlane_host::is_host_lock_held(&session_dir).unwrap());
+            for command in ["ensure", "reconcile"] {
+                let refused = run_flow_cli_pipeline_output(&state_dir, &fixture, &binding_id, &thread_uuid,
+                    &["code-driver", command, "--job-id", &job.job_id]).await;
+                assert!(!refused.status.success(), "{command} must preserve the stopped-host gate for {case}");
+                assert!(refused.stdout.is_empty(), "refusal must not return a successful result");
+                let error: Value = serde_json::from_slice(&refused.stderr).expect("structured CLI refusal");
+                assert_eq!(error["code"], "validation_failed", "unexpected {command} refusal for {case}: {error}");
+                let host_after = threadlane_host::read_host_manifest_optional(&session_dir, &approval).unwrap().unwrap();
+                assert_eq!(host_after.phase, HostPhase::Stopped);
+                assert_eq!(host_after.instance_id, stopped_host.instance_id);
+                assert_eq!(host_after.updated_at_ms, stopped_host.updated_at_ms);
+                assert!(!threadlane_host::is_host_lock_held(&session_dir).unwrap());
+            }
+            assert_eq!(CoworkerNoticeStore::inspect(&notice_root, &key, &digest).unwrap().attempt_count, 1);
+            assert_eq!(effect_count.load(Ordering::SeqCst), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), calls);
+            assert_eq!(read_invocation_count(&fixture.check_count_file), checks);
+            supervisor.shutdown().await;
+        }
+    }).await;
 }

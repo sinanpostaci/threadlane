@@ -5,6 +5,25 @@ independent local process lifecycle and authenticated Unix-domain socket RPC aro
 `CoworkerPipelineService` (`CoworkerPipelineDriver`), `CoworkerControllerService`, and physical FD
 job ownership (`CoworkerJobOwnershipStore` / `CoworkerJobOwnershipGuard`).
 
+## Settled attention notices
+
+With verified native notices configured, a settled `BlockedByFailedChecks` or
+`AwaitingCorrectionExecution` outcome emits an `Attention` notice before the owner
+exits. This includes task/final check failures and corrections blocked by frozen
+authority or exhausted budgets. The internal driver path verifies the typed report
+against fresh admission, the exact job scope/revision and lease, and the absence of
+in-flight stages, active workers, or reserved effects. Running pipeline stages do
+not emit these notices. Existing `Complete` eligibility still requires accepted
+`Closure`; stop/cancel/draining behavior is unchanged.
+
+The existing private notice store reserves intent before transport, deduplicates
+per job/revision, caps attempts at 16, and fences interrupted or unknown possible
+sends without automatic replay. Read-only status and duplicate ensure/reconcile
+do not create new attempts or provider calls. `Submitted` means transport
+acceptance, not reading, acknowledgement, or human approval. Machine wake-ups
+contain only the fixed scoped message, never raw worker prose, and never use the
+legacy queue as fallback.
+
 ## Subcommands
 
 All subcommands require the trusted CLI scope (`--state-dir`, `--registry-dir`, `--plans-dir`,

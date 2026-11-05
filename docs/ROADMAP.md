@@ -6,6 +6,10 @@ visual direction. README documentation will distinguish planned and working feat
 
 ## Product contract
 
+The active first-use scope, prioritized fixes and acceptance gates are recorded
+in [First personal MVP acceptance](MVP-READINESS.md). Older checkpoint sections
+below describe their original evidence and may predate the current role driver.
+
 The user stays in the native Codex conversation, including frequent Steer and
 questions. Codex interprets intent and plans. Threadlane owns validated execution,
 durable events, profiles, process supervision and observation. It does not grant

@@ -638,6 +638,32 @@ pub fn write_private_file_atomic(
     bytes: &[u8],
     label: &str,
 ) -> Result<PathBuf, NativeError> {
+    write_private_file_atomic_with(
+        dir,
+        filename,
+        bytes,
+        label,
+        |file| file.sync_all(),
+        |path| File::open(path),
+        |dir_file| dir_file.sync_all(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_private_file_atomic_with<SyncFile, OpenDir, SyncDir>(
+    dir: &Path,
+    filename: &str,
+    bytes: &[u8],
+    label: &str,
+    sync_temp_file: SyncFile,
+    open_parent_dir: OpenDir,
+    sync_parent_dir: SyncDir,
+) -> Result<PathBuf, NativeError>
+where
+    SyncFile: FnOnce(&File) -> std::io::Result<()>,
+    OpenDir: FnOnce(&Path) -> std::io::Result<File>,
+    SyncDir: FnOnce(&File) -> std::io::Result<()>,
+{
     ensure_platform_supported()?;
     if bytes.len() > MAX_PRIVATE_STATE_FILE_BYTES {
         return Err(NativeError::new(
@@ -676,15 +702,6 @@ pub fn write_private_file_atomic(
                 ),
             )
         })?;
-        temp.as_file().sync_all().map_err(|err| {
-            NativeError::new(
-                NativeErrorCode::IoError,
-                format!(
-                    "failed to sync temporary {label} file: {}",
-                    sanitize_io_error(&err)
-                ),
-            )
-        })?;
         temp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|err| {
@@ -696,6 +713,15 @@ pub fn write_private_file_atomic(
                     ),
                 )
             })?;
+        sync_temp_file(temp.as_file()).map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                format!(
+                    "failed to sync temporary {label} file: {}",
+                    sanitize_io_error(&err)
+                ),
+            )
+        })?;
 
         temp.persist(&target_path).map_err(|err| {
             NativeError::new(
@@ -707,17 +733,28 @@ pub fn write_private_file_atomic(
             )
         })?;
         fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
-            NativeError::new(
-                NativeErrorCode::IoError,
-                format!(
-                    "failed to enforce 0600 on {label} file: {}",
-                    sanitize_io_error(&err)
-                ),
-            )
+            NativeError::persistence_uncertain(format!(
+                "persisted {label} file replacement may be visible, but failed to enforce 0600 permissions before durability confirmation: {}",
+                sanitize_io_error(&err)
+            ))
         })?;
-        if let Ok(dir_file) = File::open(dir) {
-            let _ = dir_file.sync_all();
-        }
+        let dir_file = open_parent_dir(dir).map_err(|err| {
+            NativeError::persistence_uncertain(format!(
+                "persisted {label} file replacement may be visible, but failed to open parent directory to confirm durability: {}",
+                sanitize_io_error(&err)
+            ))
+        })?;
+        sync_parent_dir(&dir_file).map_err(|err| {
+            NativeError::persistence_uncertain(format!(
+                "persisted {label} file replacement may be visible, but failed to sync parent directory to confirm durability: {}",
+                sanitize_io_error(&err)
+            ))
+        })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (sync_temp_file, open_parent_dir, sync_parent_dir);
     }
 
     Ok(target_path)
@@ -790,4 +827,151 @@ pub fn sanitize_diagnostic_text(raw: &str) -> String {
 
 pub(crate) fn sanitize_io_error(err: &std::io::Error) -> String {
     sanitize_diagnostic_text(&err.kind().to_string())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn create_private_test_dir() -> tempfile::TempDir {
+        let base = fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        let dir = tempfile::Builder::new()
+            .prefix("threadlane-fs-safety-test-")
+            .tempdir_in(base)
+            .expect("create temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+            .expect("set 0700 on temp dir");
+        dir
+    }
+
+    fn count_temp_files(dir: &Path, filename: &str) -> usize {
+        let prefix = format!(".{filename}.tmp.");
+        fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .count()
+    }
+
+    #[test]
+    fn write_private_file_atomic_succeeds_enforces_0600_and_cleans_up_temp_files() {
+        let dir = create_private_test_dir();
+        let path = write_private_file_atomic(dir.path(), "state.json", b"initial", "test state")
+            .expect("initial write");
+        assert_eq!(fs::read(&path).expect("read initial"), b"initial");
+
+        let path = write_private_file_atomic(dir.path(), "state.json", b"updated", "test state")
+            .expect("updated write");
+        assert_eq!(fs::read(&path).expect("read updated"), b"updated");
+        let mode = fs::symlink_metadata(&path)
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(count_temp_files(dir.path(), "state.json"), 0);
+    }
+
+    #[test]
+    fn pre_rename_temp_sync_failure_preserves_old_target_and_cleans_temp_file() {
+        let dir = create_private_test_dir();
+        let target =
+            write_private_file_atomic(dir.path(), "state.json", b"old-bytes", "test state")
+                .expect("seed target");
+
+        let err = write_private_file_atomic_with(
+            dir.path(),
+            "state.json",
+            b"new-bytes",
+            "test state",
+            |_file| Err(io::Error::other("temp fsync failed")),
+            |path| File::open(path),
+            |dir_file| dir_file.sync_all(),
+        )
+        .expect_err("pre-rename sync failure must error");
+
+        assert_eq!(err.error_code(), NativeErrorCode::IoError);
+        assert_eq!(
+            fs::read(&target).expect("read preserved target"),
+            b"old-bytes"
+        );
+        assert_eq!(count_temp_files(dir.path(), "state.json"), 0);
+    }
+
+    #[test]
+    fn post_rename_parent_open_failure_preserves_new_target_and_returns_uncertainty() {
+        let dir = create_private_test_dir();
+        let target =
+            write_private_file_atomic(dir.path(), "state.json", b"old-bytes", "test state")
+                .expect("seed target");
+
+        let err = write_private_file_atomic_with(
+            dir.path(),
+            "state.json",
+            b"new-bytes",
+            "test state",
+            |file| file.sync_all(),
+            |_dir| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "parent open failed",
+                ))
+            },
+            |dir_file| dir_file.sync_all(),
+        )
+        .expect_err("parent open failure must return uncertainty");
+
+        assert_eq!(err.error_code(), NativeErrorCode::PersistenceUncertain);
+        assert_eq!(err.code(), "persistence_uncertain");
+        assert!(err.message().contains("may be visible"));
+        assert!(err.message().contains("durability"));
+        assert_eq!(
+            fs::read(&target).expect("read replaced target"),
+            b"new-bytes"
+        );
+        let mode = fs::symlink_metadata(&target)
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(count_temp_files(dir.path(), "state.json"), 0);
+    }
+
+    #[test]
+    fn post_rename_parent_sync_failure_preserves_new_target_and_returns_uncertainty() {
+        let dir = create_private_test_dir();
+        let target =
+            write_private_file_atomic(dir.path(), "state.json", b"old-bytes", "test state")
+                .expect("seed target");
+
+        let err = write_private_file_atomic_with(
+            dir.path(),
+            "state.json",
+            b"new-bytes-2",
+            "test state",
+            |file| file.sync_all(),
+            |path| File::open(path),
+            |_dir_file| Err(io::Error::other("parent sync failed")),
+        )
+        .expect_err("parent sync failure must return uncertainty");
+
+        assert_eq!(err.error_code(), NativeErrorCode::PersistenceUncertain);
+        assert_eq!(err.code(), "persistence_uncertain");
+        assert!(err.message().contains("may be visible"));
+        assert!(err.message().contains("durability"));
+        assert_eq!(
+            fs::read(&target).expect("read replaced target"),
+            b"new-bytes-2"
+        );
+        let mode = fs::symlink_metadata(&target)
+            .expect("stat target")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(count_temp_files(dir.path(), "state.json"), 0);
+    }
 }

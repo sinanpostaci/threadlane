@@ -8,7 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test src/state.test.ts src/registry/types.test.ts src/registry/model-families.test.ts src/registry/profile-advisor.test.ts src/registry/profile-advisor-ipc.test.ts src/registry/tool-versions.test.ts src/pages/profiles.test.ts src/pages/readiness.test.ts src/pages/recovery-overview.test.ts src/pages/readiness-null-effort.test.ts src/pages/recovery-duplicates.test.ts src/pages/activity-feed.test.ts src/observation/paging.test.ts src/pages/job-plans.test.ts src/codex-setup/codex-setup.test.ts"
+    "test": "node scripts/run-tests.mjs"
   },
   "dependencies": {
     "@lobehub/icons-static-svg": "1.101.0",

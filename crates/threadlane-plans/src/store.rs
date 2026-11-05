@@ -101,6 +101,41 @@ impl PlanStore {
         Ok(ledger.revisions)
     }
 
+    /// Reads a complete validated ledger snapshot without creating or acquiring `plans.lock`.
+    ///
+    /// The private directory must already exist. This route reuses the bounded
+    /// ledger parser and all structural, symlink and permission checks. Writers
+    /// atomically replace `plans.json`, so an open file yields either complete
+    /// committed snapshot; this read grants no mutation or execution authority.
+    pub fn read_snapshot_readonly_at(
+        dir: impl AsRef<Path>,
+    ) -> Result<Vec<PlanRevision>, PlanError> {
+        ensure_platform_supported()?;
+        let dir = resolve_clean_path(dir.as_ref(), "plan store directory")?;
+        let meta = fs::symlink_metadata(&dir)?;
+        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+            return Err(PlanError::SecurityViolation(
+                "plan store directory must be a non-symlink directory".to_string(),
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if meta.permissions().mode() & 0o077 != 0 {
+                return Err(PlanError::SecurityViolation(
+                    "plan store directory must have private 0700 permissions".to_string(),
+                ));
+            }
+        }
+        let store = Self {
+            ledger_path: dir.join(LEDGER_FILENAME),
+            lock_path: dir.join(LOCK_FILENAME),
+            dir,
+            in_process_lock: Mutex::new(()),
+        };
+        Ok(store.read_ledger_locked()?.revisions)
+    }
+
     /// Returns all revisions for `plan_id` in ascending revision order (`1..=current_revision`).
     pub fn plan_revisions(&self, plan_id: &str) -> Result<Vec<PlanRevision>, PlanError> {
         validate_identifier("plan_id", plan_id)?;

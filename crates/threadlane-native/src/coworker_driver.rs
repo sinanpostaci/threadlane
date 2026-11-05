@@ -2691,7 +2691,9 @@ impl CoworkerCodeDriver {
             Some(
                 CoworkerPipelineStatus::Held
                 | CoworkerPipelineStatus::BlockedOnUnknownEffect
-                | CoworkerPipelineStatus::BlockedOrFailed,
+                | CoworkerPipelineStatus::BlockedOrFailed
+                | CoworkerPipelineStatus::BlockedByFailedChecks
+                | CoworkerPipelineStatus::AwaitingCorrectionExecution,
             ) => Some(crate::coworker_notice::NoticeKind::Attention),
             _ => None,
         } {
@@ -2700,7 +2702,22 @@ impl CoworkerCodeDriver {
                     self.controller.workflow_store().plans_dir(),
                 ),
             ) {
-                let _ = store.notify(session, notice_kind).await;
+                if let Some(report) = last_pipeline_report.as_ref().filter(|report| {
+                    matches!(
+                        report.status,
+                        CoworkerPipelineStatus::BlockedByFailedChecks
+                            | CoworkerPipelineStatus::AwaitingCorrectionExecution
+                    )
+                }) {
+                    if pipeline_driver
+                        .as_ref()
+                        .is_some_and(|driver| driver.in_flight_count() == 0)
+                    {
+                        let _ = store.notify_settled_attention(session, report).await;
+                    }
+                } else {
+                    let _ = store.notify(session, notice_kind).await;
+                }
             }
         }
         Ok((
@@ -3614,6 +3631,7 @@ impl CoworkerCodeDriver {
                 &mut inspection,
                 &live_in_flight_stages,
             );
+            filter_live_owned_in_flight_check_reservations(&mut inspection, &live_in_flight_stages);
         }
         let lease = inspection.runtime_state.lease.clone();
         let lease_active = lease.as_ref().is_some_and(|l| l.active);
@@ -5215,6 +5233,86 @@ fn current_time_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+fn reserved_check_matches_live_stage(
+    effect: &crate::coworker_workflow::PendingControllerEffect,
+    stage: &CoworkerPipelineInFlightStageRef,
+) -> bool {
+    use crate::coworker_workflow::CoworkerPipelineInFlightStageKind;
+    effect.kind == PendingControllerEffectKind::CheckExecution
+        && effect.status == PendingControllerEffectStatus::ReservedBeforeEffect
+        && effect.task_id == stage.task_id
+        && effect.attempt_no == stage.attempt_no
+        && match stage.kind {
+            CoworkerPipelineInFlightStageKind::TaskVerification => {
+                stage.task_id.is_some() && stage.attempt_no.is_some_and(|n| n > 0)
+            }
+            CoworkerPipelineInFlightStageKind::JobCompletion => {
+                stage.task_id.is_none() && stage.attempt_no.is_none()
+            }
+            _ => false,
+        }
+}
+
+fn filter_live_owned_in_flight_check_reservations(
+    inspection: &mut ReadonlyScopedJobInspection,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) {
+    let job = &inspection.job;
+    let runtime = &inspection.runtime_state;
+    if runtime.job_id != job.job_id
+        || !runtime.lease.as_ref().is_some_and(|lease| {
+            lease.active && lease.job_id == job.job_id && lease.binding_id == job.binding_id
+        })
+    {
+        return;
+    }
+    let matched: Vec<String> = runtime
+        .pending_effects
+        .values()
+        .filter(|effect| {
+            if effect.job_id != job.job_id
+                || !in_flight_stages
+                    .iter()
+                    .any(|stage| reserved_check_matches_live_stage(effect, stage))
+            {
+                return false;
+            }
+            let Some(spec) = effect
+                .external_correlation_id
+                .as_ref()
+                .and_then(|id| runtime.envelope.check_commands.get(id))
+            else {
+                return false;
+            };
+            match effect.task_id.as_deref() {
+                Some(task_id) => {
+                    spec.required_for_task_review
+                        && job.tasks.iter().any(|task| {
+                            task.task_id == task_id
+                                && Some(task.current_attempt_no) == effect.attempt_no
+                                && task.stage == CoworkerTaskStage::ReadyForReview
+                        })
+                }
+                None => {
+                    spec.required_for_candidate_closure
+                        && !job.tasks.is_empty()
+                        && job
+                            .tasks
+                            .iter()
+                            .all(|task| task.stage == CoworkerTaskStage::Integrated)
+                }
+            }
+        })
+        .map(|effect| effect.effect_id.clone())
+        .collect();
+    // Only the authenticated live owner's read-only copy is filtered. Persisted intent,
+    // true EffectUnknown, and reservations without an exactly matching live future stay fenced.
+    inspection
+        .runtime_state
+        .pending_effects
+        .retain(|_, effect| !matched.contains(&effect.effect_id));
+}
+
 fn filter_live_owned_in_flight_review_reservations(
     inspection: &mut ReadonlyScopedJobInspection,
     in_flight_stages: &[CoworkerPipelineInFlightStageRef],
@@ -5383,4 +5481,77 @@ fn is_live_owned_in_flight_review_effect(
             .as_deref()
             == Some(effect.effect_id.as_str())
     })
+}
+
+#[cfg(test)]
+mod live_check_projection_tests {
+    use super::*;
+    use crate::coworker_workflow::{CoworkerPipelineInFlightStageKind, PendingControllerEffect};
+
+    fn check_effect() -> PendingControllerEffect {
+        PendingControllerEffect {
+            effect_id: "effect-current".into(),
+            request_key: "check-current".into(),
+            job_id: "job-current".into(),
+            task_id: Some("task-current".into()),
+            attempt_no: Some(1),
+            kind: PendingControllerEffectKind::CheckExecution,
+            status: PendingControllerEffectStatus::ReservedBeforeEffect,
+            subject_digest: "a".repeat(64),
+            external_correlation_id: Some("check-current".into()),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            diagnostic: None,
+        }
+    }
+
+    #[test]
+    fn live_check_projection_requires_exact_stage_and_never_hides_unknown() {
+        let effect = check_effect();
+        let stage = CoworkerPipelineInFlightStageRef {
+            task_id: effect.task_id.clone(),
+            attempt_no: effect.attempt_no,
+            kind: CoworkerPipelineInFlightStageKind::TaskVerification,
+        };
+        assert!(reserved_check_matches_live_stage(&effect, &stage));
+        for changed in [
+            CoworkerPipelineInFlightStageRef {
+                task_id: Some("other-task".into()),
+                ..stage.clone()
+            },
+            CoworkerPipelineInFlightStageRef {
+                attempt_no: Some(2),
+                ..stage.clone()
+            },
+            CoworkerPipelineInFlightStageRef {
+                kind: CoworkerPipelineInFlightStageKind::TaskReview,
+                ..stage.clone()
+            },
+        ] {
+            assert!(!reserved_check_matches_live_stage(&effect, &changed));
+        }
+        let mut unknown = effect.clone();
+        unknown.status = PendingControllerEffectStatus::EffectUnknown;
+        assert!(!reserved_check_matches_live_stage(&unknown, &stage));
+        let mut final_check = effect.clone();
+        final_check.task_id = None;
+        final_check.attempt_no = None;
+        assert!(!reserved_check_matches_live_stage(&final_check, &stage));
+        let final_stage = CoworkerPipelineInFlightStageRef {
+            task_id: None,
+            attempt_no: None,
+            kind: CoworkerPipelineInFlightStageKind::JobCompletion,
+        };
+        assert!(reserved_check_matches_live_stage(
+            &final_check,
+            &final_stage
+        ));
+        let interrupted: Vec<CoworkerPipelineInFlightStageRef> = Vec::new();
+        assert!(!interrupted
+            .iter()
+            .any(|stage| reserved_check_matches_live_stage(&effect, stage)));
+        assert!(!interrupted
+            .iter()
+            .any(|stage| reserved_check_matches_live_stage(&final_check, stage)));
+    }
 }

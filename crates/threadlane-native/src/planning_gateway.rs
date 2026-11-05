@@ -642,6 +642,12 @@ pub struct PlanningCommandDetailResponse {
     /// Verified result reference when `status` is [`PlanningCommandStatus::Completed`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_ref: Option<PlanningCommandResultRef>,
+    /// Verified current plan status, separate from the publication-time result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_plan_status: Option<PlanStatus>,
+    /// Explicit non-executable marker; absence does not grant execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
     /// Sanitized diagnostic message when `status` is `KnownFailed` or `Unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
@@ -1202,6 +1208,8 @@ impl CoworkerPlanningGateway {
             selected_choice: summary.selected_choice.clone(),
             context_digest: summary.context_digest.clone(),
             result_ref: summary.result_ref.clone(),
+            current_plan_status: summary.current_plan_status,
+            executable: summary.executable,
             diagnostic: summary.diagnostic.clone(),
             structured_architect_advice,
             orchestrator_plan_summary,
@@ -2071,6 +2079,7 @@ fn parse_flow_cli_error(stderr_bytes: &[u8]) -> NativeError {
                 NativeErrorCode::RebindRejected
             }
             "io_error" => NativeErrorCode::IoError,
+            "persistence_uncertain" => NativeErrorCode::PersistenceUncertain,
             "output_overflow" => NativeErrorCode::OutputOverflow,
             "invalid_config" => NativeErrorCode::InvalidConfig,
             _ => NativeErrorCode::ValidationFailed,

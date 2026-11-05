@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-04.v5`
+Version: `2026-11-05.v1`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -93,8 +93,9 @@ Version: `2026-11-04.v5`
   only on verified Linux desktop sessions. They require an actually verified
   enrolled origin and parent endpoint before start. Terminal planning-command
   (`consult_architect` / `request_technical_plan`) callbacks and execution
-  terminal/held milestone notices are supported; automatic
-  `BlockedByFailedChecks` notices and untested platforms are not implemented.
+  terminal/held milestone notices and settled `BlockedByFailedChecks` /
+  `AwaitingCorrectionExecution` attention notices are supported. Running checks or
+  corrections do not trigger these settled notices. Untested platforms remain unsupported.
 - `Submitted` means backend acceptance, not a read receipt or user acknowledgement.
   The private native-notices stores are immutable: they reserve intent before send,
   promote interrupted intent to `Unknown` on reopen without automatic replay, never

@@ -10,6 +10,11 @@ not require switching to the panel for each task. See
 
 > **Status:** Early development with AI assistance, reviewed before checkpointing. The Linux desktop includes editable tools, model/effort catalogs, workflow profiles, durable plan drafts, appearance settings, and read-only activity history. CLI and Linux desktop Nix source builds pass. One trusted local operator CLI conversation also received a real busy-turn callback and completed a six-event pull/ACK, cancellation of a real OpenCode process, and explicit stop/restart without replay; see [the 2026-10-31 pilot](docs/NATIVE-CLI-PILOT-2026-10-31.md). Immutable operator approvals, detached local hosts, frozen-task MCP dispatch and default-off approved-session notifications have local fixture coverage. Production multi-chat onboarding, live API entitlement, interactive provider steering, and other platforms remain separate acceptance gates. See the [M4 baseline and its validation limits](docs/M4-CHECKPOINT.md), [approved-session notification extension](docs/APPROVED-NOTIFICATIONS.md), [configuration](docs/CONFIGURATION.md), and [desktop usage](docs/DESKTOP.md).
 
+The current first personal Linux release scope and outstanding acceptance gates are
+tracked in [MVP readiness](docs/MVP-READINESS.md). Older milestone reports below
+retain their original evidence; they do not replace qualification of the current
+installed planning, execution, review and completion chain.
+
 ---
 
 ## Working Now and Remaining Milestones

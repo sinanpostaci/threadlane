@@ -450,6 +450,10 @@ fn map_native_error(err: &NativeError) -> GuardedDispatchError {
             "io_error",
             "Filesystem I/O error occurred while accessing the conversation-change store.",
         ),
+        NativeErrorCode::PersistenceUncertain => (
+            "persistence_uncertain",
+            "A conversation-change replacement may be visible but its durability is unconfirmed; reconcile stored state before retrying.",
+        ),
         _ => (
             "invalid_input",
             "Conversation-change store path or parameter failed validation.",

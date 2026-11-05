@@ -1954,7 +1954,10 @@ mod tests {
             .get_plan("plan-lifecycle", Some(1), None, None)
             .expect("get superseded rev 1");
         assert_eq!(rev1_after_v2_pub.header.status, PlanStatus::Superseded);
-        assert_eq!(rev1_after_v2_pub.header.plan_digest, None);
+        assert_eq!(
+            rev1_after_v2_pub.header.plan_digest,
+            published_v1.header.plan_digest
+        );
         assert_eq!(rev1_after_v2_pub.tasks, tasks_v1);
 
         let superseded_pub_err = wf
@@ -2899,7 +2902,7 @@ mod tests {
         assert_eq!(stale_save_err.code(), "profile_revision_mismatch");
 
         // 8. Save and publish v2 at current registry revision, then advance registry again:
-        // superseded v1 must report `plan_digest: None` while published v2 retains its v2 digest.
+        // superseded v1 retains its verified frozen digest while published v2 retains its v2 digest.
         let draft_v2 = reopened_wf
             .save_draft(SavePlanDraft {
                 command_key: "cmd-hist-v2".to_string(),
@@ -2927,7 +2930,11 @@ mod tests {
             .get_plan("plan-hist-v1", Some(1), None, None)
             .expect("get superseded v1");
         assert_eq!(superseded_v1.header.status, PlanStatus::Superseded);
-        assert_eq!(superseded_v1.header.plan_digest, None);
+        assert_eq!(
+            superseded_v1.header.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+        assert!(reopened_wf.publish("plan-hist-v1", 1).is_err());
 
         let historical_v2 = reopened_wf
             .get_plan("plan-hist-v1", Some(2), None, None)

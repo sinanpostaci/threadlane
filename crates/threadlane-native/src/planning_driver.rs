@@ -103,6 +103,13 @@ pub struct PlanningCommandSummary {
     /// Verified service result reference when `status == Completed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_ref: Option<PlanningCommandResultRef>,
+    /// Current persisted status of a verified Orchestrator plan, separate from its frozen result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_plan_status: Option<PlanStatus>,
+    /// Explicit non-executable marker for a plan that is no longer Published.
+    /// Absence does not grant execution authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable: Option<bool>,
     /// Bounded diagnostic message when `KnownFailed` or `Unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<String>,
@@ -154,6 +161,8 @@ impl PlanningCommandSummary {
             pending_reconciliation: record.pending_reconciliation,
             owner_summary: record.owner_summary.clone(),
             result_ref: record.result_ref.clone(),
+            current_plan_status: None,
+            executable: None,
             diagnostic: record.diagnostic.clone(),
             enqueued_at_ms: record.enqueued_at_ms,
             started_at_ms: record.started_at_ms,
@@ -1305,6 +1314,94 @@ fn verify_published_plan_for_store(
     Ok(())
 }
 
+/// Verifies completed history without admitting execution or changing frozen results.
+/// Superseded headers receive their digest only from the read-only journal proof.
+fn verify_historical_plan_for_store_readonly(
+    command_store: &PlanningCommandStore,
+    cmd: &PlanningCommandRecord,
+    result_ref: &PlanningCommandResultRef,
+) -> Result<Option<PlanStatus>, NativeError> {
+    let PlanningCommandResultRef::OrchestratorPlan {
+        planning_result, ..
+    } = result_ref
+    else {
+        return Ok(None);
+    };
+    let header = ScopedWorkflow::read_plan_summary_readonly_at(
+        command_store.registry_dir(),
+        command_store.workflow_store().plans_dir(),
+        &cmd.binding_id,
+        &planning_result.plan_id,
+        planning_result.plan_revision,
+    )
+    .map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "historical plan could not be verified in PlanStore: {}",
+                err.safe_message()
+            ),
+        )
+    })?;
+    if header.binding_id != cmd.binding_id
+        || header.plan_id != planning_result.plan_id
+        || header.revision != planning_result.plan_revision
+        || !(header.status.is_active_published() || header.status == PlanStatus::Superseded)
+        || planning_result.plan_status != PlanStatus::Published
+        || header.profile_id != planning_result.profile_id
+        || header.profile_revision != planning_result.registry_revision
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "historical plan header in PlanStore does not match OrchestratorPlan PlanningResultRef",
+        ));
+    }
+    let Some(stored_digest) = header.plan_digest.as_deref() else {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "historical plan in PlanStore has no verified plan_digest",
+        ));
+    };
+    if !constant_time_str_eq(stored_digest, &planning_result.plan_digest) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "historical plan digest in PlanStore does not match OrchestratorPlan plan_digest",
+        ));
+    }
+    Ok(Some(header.status))
+}
+
+fn verified_command_summary_readonly(
+    command_store: &PlanningCommandStore,
+    mut cmd: PlanningCommandRecord,
+) -> Result<PlanningCommandSummary, NativeError> {
+    cmd.validate()?;
+    let current_plan_status = if cmd.status == PlanningCommandStatus::Completed {
+        let result_ref = cmd.result_ref.as_ref().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Completed planning command is missing result_ref",
+            )
+        })?;
+        let status = verify_historical_plan_for_store_readonly(command_store, &cmd, result_ref)?;
+        let verified_ref = if status == Some(PlanStatus::Superseded) {
+            command_store.verify_completed_command_readonly(&cmd)?
+        } else {
+            command_store.verify_completed_command(&cmd)?
+        };
+        cmd.result_ref = Some(verified_ref);
+        status
+    } else {
+        None
+    };
+    let mut summary = PlanningCommandSummary::from_record(&cmd);
+    summary.current_plan_status = current_plan_status;
+    summary.executable = current_plan_status
+        .filter(|status| *status != PlanStatus::Published)
+        .map(|_| false);
+    Ok(summary)
+}
+
 /// Opens a [`PlanningCommandDriver`] under canonical `plans_dir` and `registry_dir`, creating the
 /// private (`0700`) [`PLANNING_COMMANDS_DIR_NAME`] and [`PLANNING_ARTIFACTS_DIR_NAME`]
 /// subdirectories if they do not yet exist.
@@ -1367,7 +1464,7 @@ pub fn get_planning_command_summary_readonly(
     let Some(command_store) = open_planning_command_store_readonly(plans_dir, registry_dir)? else {
         return Ok(None);
     };
-    let Some(mut cmd) = command_store.get_command(binding_id, thread_uuid, command_id)? else {
+    let Some(cmd) = command_store.get_command(binding_id, thread_uuid, command_id)? else {
         return Ok(None);
     };
     cmd.validate()?;
@@ -1377,12 +1474,7 @@ pub fn get_planning_command_summary_readonly(
             "planning command scope does not match requested binding_id and thread_uuid",
         ));
     }
-    if cmd.status == PlanningCommandStatus::Completed {
-        let verified_ref = command_store.verify_completed_command(&cmd)?;
-        verify_published_plan_for_store(&command_store, &cmd, &verified_ref)?;
-        cmd.result_ref = Some(verified_ref);
-    }
-    Ok(Some(PlanningCommandSummary::from_record(&cmd)))
+    verified_command_summary_readonly(&command_store, cmd).map(Some)
 }
 
 /// Pure read-only bounded list of prompt-redacted [`PlanningCommandSummary`] rows for `(binding_id, thread_uuid)`.
@@ -1416,19 +1508,14 @@ pub fn list_planning_command_summaries_readonly(
     }
     let records = command_store.list_commands(binding_id, thread_uuid)?;
     let mut summaries = Vec::with_capacity(records.len());
-    for mut cmd in records {
+    for cmd in records {
         if cmd.binding_id != binding_id || cmd.thread_uuid != thread_uuid {
             return Err(NativeError::new(
                 NativeErrorCode::SecurityViolation,
                 "planning command scope does not match requested binding_id and thread_uuid",
             ));
         }
-        if cmd.status == PlanningCommandStatus::Completed {
-            let verified_ref = command_store.verify_completed_command(&cmd)?;
-            verify_published_plan_for_store(&command_store, &cmd, &verified_ref)?;
-            cmd.result_ref = Some(verified_ref);
-        }
-        summaries.push(PlanningCommandSummary::from_record(&cmd));
+        summaries.push(verified_command_summary_readonly(&command_store, cmd)?);
     }
 
     let start = match cursor {

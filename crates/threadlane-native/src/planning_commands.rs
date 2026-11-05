@@ -1647,6 +1647,24 @@ impl PlanningCommandStore {
         &self,
         cmd: &PlanningCommandRecord,
     ) -> Result<PlanningCommandResultRef, NativeError> {
+        self.verify_completed_command_with_linkage(cmd, false)
+    }
+
+    /// Verifies immutable completed evidence for read-only history. A newer result for
+    /// the same job and logical plan may replace the current job linkage; callers
+    /// must separately verify the historical plan and its frozen journal digest.
+    pub(crate) fn verify_completed_command_readonly(
+        &self,
+        cmd: &PlanningCommandRecord,
+    ) -> Result<PlanningCommandResultRef, NativeError> {
+        self.verify_completed_command_with_linkage(cmd, true)
+    }
+
+    fn verify_completed_command_with_linkage(
+        &self,
+        cmd: &PlanningCommandRecord,
+        allow_historical_job_link: bool,
+    ) -> Result<PlanningCommandResultRef, NativeError> {
         cmd.validate()?;
         if cmd.status != PlanningCommandStatus::Completed {
             return Err(NativeError::new(
@@ -1663,7 +1681,7 @@ impl PlanningCommandStore {
                 "Completed planning command is missing result_ref",
             )
         })?;
-        self.verify_completed_result_against_stores(cmd, result_ref)
+        self.verify_completed_result_with_linkage(cmd, result_ref, allow_historical_job_link)
     }
 
     /// Verifies a candidate without forging a terminal command before its receipt is checked.
@@ -2242,7 +2260,16 @@ impl PlanningCommandStore {
     fn verify_completed_result_against_stores(
         &self,
         cmd: &PlanningCommandRecord,
+        result_ref: PlanningCommandResultRef,
+    ) -> Result<PlanningCommandResultRef, NativeError> {
+        self.verify_completed_result_with_linkage(cmd, result_ref, false)
+    }
+
+    fn verify_completed_result_with_linkage(
+        &self,
+        cmd: &PlanningCommandRecord,
         mut result_ref: PlanningCommandResultRef,
+        allow_historical_job_link: bool,
     ) -> Result<PlanningCommandResultRef, NativeError> {
         let wf_ledger = self.workflow_store.read_binding_ledger(&cmd.binding_id)?;
         let grant = wf_ledger
@@ -2468,7 +2495,10 @@ impl PlanningCommandStore {
                         "CoworkerJobRecord has no recorded PlanningResultRef",
                     )
                 })?;
-                if job_pr != planning_result.as_ref()
+                let historical_job_link = allow_historical_job_link
+                    && job_pr.plan_id == planning_result.plan_id
+                    && job_pr.plan_revision > planning_result.plan_revision;
+                if (job_pr != planning_result.as_ref() && !historical_job_link)
                     || planning_result.grant_id != cmd.grant_id
                     || !is_valid_orchestrator_round_key(
                         &planning_result.request_key,

@@ -169,6 +169,82 @@ mod tests {
     }
 
     #[test]
+    fn readonly_snapshot_preserves_lock_absence_and_rejects_untrusted_files() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("plans");
+        let store = PlanStore::open(&dir).expect("explicit writer setup");
+        let draft = store
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: "plan-readonly".to_string(),
+                    binding_id: "binding-1".to_string(),
+                    profile_id: "profile-default".to_string(),
+                    profile_revision: 1,
+                    summary: "Read-only snapshot".to_string(),
+                    tasks: vec![sample_task(
+                        "t1",
+                        WorkflowRole::Coder,
+                        Difficulty::Easy,
+                        vec![],
+                        vec!["src/lib.rs"],
+                    )],
+                },
+                1,
+            )
+            .expect("save fixture plan");
+        let ledger_path = dir.join("plans.json");
+        let valid_bytes = fs::read(&ledger_path).expect("valid ledger");
+        fs::remove_file(dir.join("plans.lock")).expect("remove fixture writer lock");
+        for _ in 0..3 {
+            assert_eq!(
+                PlanStore::read_snapshot_readonly_at(&dir).expect("readonly snapshot"),
+                vec![draft.clone()]
+            );
+            assert!(!dir.join("plans.lock").exists());
+            assert_eq!(
+                fs::read(&ledger_path).expect("unchanged ledger"),
+                valid_bytes
+            );
+        }
+        let missing = tmp.path().join("missing");
+        assert!(PlanStore::read_snapshot_readonly_at(&missing).is_err());
+        assert!(!missing.exists());
+        fs::write(&ledger_path, b"{}").expect("corrupt fixture ledger");
+        assert!(PlanStore::read_snapshot_readonly_at(&dir).is_err());
+        assert_eq!(
+            fs::read(&ledger_path).expect("corrupt bytes preserved"),
+            b"{}"
+        );
+        fs::write(&ledger_path, vec![b' '; MAX_PLAN_STORE_BYTES + 1])
+            .expect("oversized fixture ledger");
+        assert!(PlanStore::read_snapshot_readonly_at(&dir).is_err());
+        fs::write(&ledger_path, &valid_bytes).expect("restore valid ledger");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o644))
+                .expect("insecure ledger");
+            assert!(PlanStore::read_snapshot_readonly_at(&dir).is_err());
+            fs::set_permissions(&ledger_path, fs::Permissions::from_mode(0o600))
+                .expect("restore ledger permissions");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))
+                .expect("insecure directory");
+            assert!(PlanStore::read_snapshot_readonly_at(&dir).is_err());
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
+                .expect("restore directory permissions");
+            let linked_dir = tmp.path().join("linked-plans");
+            symlink(&dir, &linked_dir).expect("symlink fixture directory");
+            assert!(PlanStore::read_snapshot_readonly_at(&linked_dir).is_err());
+            let linked_ledger = dir.join("saved-ledger.json");
+            fs::rename(&ledger_path, &linked_ledger).expect("save original ledger");
+            symlink(&linked_ledger, &ledger_path).expect("symlink fixture ledger");
+            assert!(PlanStore::read_snapshot_readonly_at(&dir).is_err());
+        }
+        assert!(!dir.join("plans.lock").exists());
+    }
+
+    #[test]
     fn store_reopen_lifecycle_cas_and_idempotent_dedup_transitions() {
         let tmp = TempDir::new().expect("tempdir");
         let store_dir = tmp.path().join("plans-store");

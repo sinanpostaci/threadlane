@@ -11,9 +11,15 @@ desktop window or a model's context alive to remember the approved plan.
 - Plans, frozen approvals, host manifests and dispatch receipts are persisted
   separately. Plan, approval and host storage use temporary-file writes, file
   synchronization, atomic rename and parent-directory synchronization.
-- Native conversational change and role-handoff ledgers use atomic file
-  replacement. Their shared writer currently treats parent-directory syncing
-  as best effort; stricter failure propagation remains a hardening item.
+- Native conversational changes, role handoffs, planning commands and artifacts,
+  controller policy, workflow state, and notice intents/receipts use the shared
+  private atomic writer. It synchronizes the temporary file before replacement
+  and confirms parent-directory synchronization before reporting success.
+  `persistence_uncertain` means replacement already occurred, but a later step
+  failed: the new contents may be visible and must be reconciled. It does not
+  mean rollback or permission to repeat an external effect. A failed durable
+  reservation stops advancement before provider dispatch; receipt failures retain
+  the prior intent and require evidence-based recovery.
 - Owned worktrees and their on-disk changes are retained for inspection.
   Bounded progress can be coalesced; every generated token is not a durable
   checkpoint, and unsaved UI drafts are not committed task state.
@@ -51,5 +57,8 @@ or restore interrupted hosts. Guided continuation remains explicit operator work
 There is no implicitly installed OS service that restarts all approved hosts after reboot.
 
 Reopen/restart fixtures verify preserved completed state, unknown in-flight
-state and absence of automatic retries. They do not simulate physical power
-loss or guarantee the durability of the last unflushed worker file edits.
+state and absence of automatic retries. Atomic-writer fault-injection tests
+cover failures before rename and during directory open/sync after replacement,
+including preservation of visible contents and private permissions. They do not
+simulate physical power loss or guarantee the durability of the last unflushed
+worker file edits.

@@ -7,7 +7,8 @@ published plan revision's pinned `profile_revision`, active compilation rejects
 the revision with `profile_revision_mismatch`.
 
 For active published revisions (`published`, `received`, or `applied`) whose
-pinned `profile_revision` predates the current registry revision, `get_plan` and
+pinned `profile_revision` predates the current registry revision, and for
+`superseded` revisions even at the current registry revision, `get_plan` and
 `list_plans` consult the binding's existing durable workflow command journal
 (`workflow-commands-<tag>.json`) in read-only mode to recover the frozen
 compiled `plan_digest`.
@@ -18,9 +19,10 @@ The historical summary digest fallback returns `Some(plan_digest)` only when all
 of the following hold:
 
 - The persisted `PlanRevision` passes structural DAG and write-scope validation,
-  belongs to the scoped `binding_id`, is in an active published state
-  (`published`, `received`, or `applied`), and has
-  `0 < profile_revision < current_registry_revision`.
+  belongs to the scoped `binding_id`, is in a published-history state
+  (`published`, `received`, `applied`, or `superseded`), and has
+  `0 < profile_revision <= current_registry_revision`. Active published revisions
+  use this fallback only after registry drift; Superseded revisions always require it.
 - The per-binding command journal exists as a regular `0600` non-symlink file
   inside the `0700` `PlanStore` directory within the 1 MiB / 1,024-entry bounds,
   and its `binding_id` matches the scoped binding.
@@ -34,8 +36,9 @@ of the following hold:
   64-character lowercase hex SHA-256 digest.
 
 If the journal is missing, `Pending`, `Failed`, tampered, corrupt, cross-binding,
-wrong-revision, or ambiguous, or if the plan revision is `draft` or
-`superseded`, the fallback returns `plan_digest: None`.
+wrong-revision, or ambiguous, or if the plan revision is `draft`, the fallback
+returns `plan_digest: None`. A verified historical digest is evidence of frozen
+publication content, never execution admission.
 
 ## Preserved boundaries
 
@@ -46,3 +49,30 @@ wrong-revision, or ambiguous, or if the plan revision is `draft` or
   from a newer registry revision.
 - `save_draft`, `publish`, approval, and dispatch registry-drift gates remain
   strictly enforced against the current `RegistrySnapshot`.
+
+## Completed planning command history
+
+The read-only planning command get/list paths verify the immutable command,
+scoped plan header, frozen compiled digest, completed reservation and private
+service artifact. For a proven Superseded revision, a newer planning result for
+the same job and logical plan may replace the job's current result without
+invalidating the older completed command. All other artifact, grant, thread, binding, brief,
+profile, revision and digest checks remain required. Invalid or unavailable
+proof fails the command read rather than silently accepting an unverified row.
+
+Read summaries expose optional `current_plan_status` separately from the frozen
+`result_ref.planning_result.plan_status`, which remains publication-time
+`published`. A currently `superseded`, `received`, or `applied` revision includes
+`executable: false`. An absent executable field grants no authority.
+
+Execute, start, enqueue replay and reconciliation retain their strict current job
+linkage and Published-plan checks. Historical reads never update the job linkage,
+rewrite a result, re-sign evidence, invoke a provider, create files or acquire
+writer locks. Status polling does not initiate recovery or execution.
+
+The planning command history verifier uses
+`ScopedWorkflow::read_plan_summary_readonly_at`, which reads existing plan and
+registry files through bounded validated snapshot parsers. Atomic file
+replacement provides a complete old or new snapshot without creating or opening
+`plans.lock` or `registry.lock`. This route returns header evidence only; the
+existing locked store APIs and all writer/execution locking remain intact.
