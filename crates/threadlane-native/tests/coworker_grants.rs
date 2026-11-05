@@ -855,36 +855,65 @@ fn wrong_binding_or_thread_revoke_is_rejected_and_rightful_revoke_works() {
 }
 
 #[test]
-fn follower_slot_and_headless_codex_substitution_are_rejected() {
+fn codex_readonly_planning_admission_succeeds_for_sol_xhigh_while_follower_and_coder_remain_rejected(
+) {
     let fixture = setup_fixture();
 
-    // 1. Requesting WorkflowRole::Follower in a planning grant is rejected.
-    let mut follower_req = sample_prepare_request(&fixture);
-    follower_req
-        .roles
-        .push(RolePreflightRequest::new(WorkflowRole::Follower, None));
+    // 1. Requesting WorkflowRole::Follower or WorkflowRole::Coder in a planning grant is rejected.
     let snapshot = fixture.registry.snapshot_readonly().expect("snapshot");
-    let err = prepare_planning_grant_preview(&snapshot, &follower_req)
-        .expect_err("Follower role must be rejected in planning grant");
-    assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+    for forbidden_role in [WorkflowRole::Follower, WorkflowRole::Coder] {
+        let mut bad_role_req = sample_prepare_request(&fixture);
+        bad_role_req
+            .roles
+            .push(RolePreflightRequest::new(forbidden_role, None));
+        let err = prepare_planning_grant_preview(&snapshot, &bad_role_req)
+            .expect_err("Follower and Coder roles must be rejected in planning grant");
+        assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+    }
 
-    // 2. Assigning Orchestrator to native Codex (ToolAdapter::CodexCli) in a profile is rejected.
+    // 2. Register default-style Codex gpt-6.1-sol model with xhigh/high efforts and a profile
+    // assigning Orchestrator (and Architect) to Codex gpt-6.1-sol/xhigh.
     fixture
         .registry
         .apply(
             5,
+            RegistryChange::UpsertModel {
+                model: ModelDefinition {
+                    id: "gpt-6.1-sol".to_string(),
+                    tool_id: "tool-codex".to_string(),
+                    label: "GPT-6.1 Sol".to_string(),
+                    model_arg: "gpt-6.1-sol".to_string(),
+                    efforts: vec!["high".to_string(), "xhigh".to_string()],
+                    allow_no_effort: false,
+                },
+            },
+        )
+        .expect("upsert gpt-6.1-sol model");
+
+    fixture
+        .registry
+        .apply(
+            6,
             RegistryChange::UpsertProfile {
                 profile: WorkflowProfile {
                     decision_advisor: None,
-                    id: "profile-codex-orchestrator".to_string(),
-                    name: "Invalid Native Orchestrator Profile".to_string(),
+                    id: "profile-codex-sol-planning".to_string(),
+                    name: "Default Codex Sol Read-Only Planning Profile".to_string(),
                     assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Follower,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "gpt-6.1-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
+                            },
+                        },
                         RoleAssignment {
                             role: WorkflowRole::Orchestrator,
                             difficulty: Some(Difficulty::Hard),
                             choice: ModelChoice {
-                                model_id: "model-codex-native".to_string(),
-                                effort: Some("high".to_string()),
+                                model_id: "gpt-6.1-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
                             },
                         },
                         RoleAssignment {
@@ -899,20 +928,23 @@ fn follower_slot_and_headless_codex_substitution_are_rejected() {
                 },
             },
         )
-        .expect("upsert invalid codex orchestrator profile");
+        .expect("upsert codex sol planning profile");
 
-    let snap_with_bad_profile = fixture.registry.snapshot_readonly().expect("snapshot");
-    let mut codex_sub_req = sample_prepare_request(&fixture);
-    codex_sub_req.profile_id = "profile-codex-orchestrator".to_string();
-    codex_sub_req.expected_registry_revision = Some(6);
-    codex_sub_req.policy = ExecutionPolicy {
+    let snap_with_sol = fixture.registry.snapshot_readonly().expect("snapshot");
+    assert_eq!(snap_with_sol.revision, 7);
+
+    let mut codex_req = sample_prepare_request(&fixture);
+    codex_req.request_key = "req-grant-codex-sol-1".to_string();
+    codex_req.profile_id = "profile-codex-sol-planning".to_string();
+    codex_req.expected_registry_revision = Some(7);
+    codex_req.policy = ExecutionPolicy {
         schema_version: 1,
-        policy_id: "policy-codex-sub".to_string(),
+        policy_id: "policy-codex-sol-planning".to_string(),
         allow_rules: vec![
             PolicyAllowRule {
                 tool_id: "tool-codex".to_string(),
-                model_id: "model-codex-native".to_string(),
-                efforts: vec!["high".to_string()],
+                model_id: "gpt-6.1-sol".to_string(),
+                efforts: vec!["xhigh".to_string()],
                 allow_no_effort: false,
                 roles: vec![WorkflowRole::Orchestrator],
             },
@@ -926,7 +958,73 @@ fn follower_slot_and_headless_codex_substitution_are_rejected() {
         ],
     };
 
-    let err = prepare_planning_grant_preview(&snap_with_bad_profile, &codex_sub_req)
-        .expect_err("headless Codex substitution for Orchestrator must be rejected");
+    let preview = prepare_planning_grant_preview(&snap_with_sol, &codex_req).expect(
+        "read-only Codex gpt-6.1-sol/xhigh Orchestrator planning grant preview must succeed",
+    );
+    assert_eq!(
+        preview.status,
+        PlanningGrantPreviewStatus::ProposedCandidateNotGranted
+    );
+    assert!(!preview.grant_active);
+    assert!(!preview.capabilities.write_worktree_allowed);
+    assert!(!preview.capabilities.code_execution_approval_granted);
+
+    let orch_choice = preview
+        .frozen_role_choices
+        .iter()
+        .find(|c| c.role == WorkflowRole::Orchestrator)
+        .expect("frozen Orchestrator choice");
+    assert_eq!(orch_choice.selected_choice.tool_id, "tool-codex");
+    assert_eq!(orch_choice.selected_choice.adapter, ToolAdapter::CodexCli);
+    assert_eq!(
+        orch_choice.selected_choice.route,
+        RoleExecutionRoute::HeadlessWorker
+    );
+    assert_eq!(orch_choice.selected_choice.model_id, "gpt-6.1-sol");
+    assert_eq!(orch_choice.selected_choice.model_arg, "gpt-6.1-sol");
+    assert_eq!(orch_choice.selected_choice.effort.as_deref(), Some("xhigh"));
+
+    let recorded = record_planning_grant(
+        &fixture.store,
+        &snap_with_sol,
+        &RecordPlanningGrantRequest {
+            request_key: preview.request_key.clone(),
+            expected_ledger_revision: Some(0),
+            confirmed_preview_digest: preview.preview_digest.clone(),
+            preview: preview.clone(),
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect("record read-only Codex planning grant");
+    assert_eq!(recorded.status, PlanningGrantStatus::Active);
+    assert_eq!(recorded.registry_revision, 7);
+
+    // 3. Policy mismatch (allowing only `high` when profile selects `xhigh`) is rejected before grant creation.
+    let mut mismatch_policy_req = codex_req.clone();
+    mismatch_policy_req.policy.allow_rules[0].efforts = vec!["high".to_string()];
+    let err = prepare_planning_grant_preview(&snap_with_sol, &mismatch_policy_req)
+        .expect_err("policy effort mismatch for Codex Orchestrator must be rejected");
+    assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+
+    // 4. Stale expected_registry_revision is rejected.
+    let mut stale_rev_req = codex_req.clone();
+    stale_rev_req.expected_registry_revision = Some(6);
+    let err = prepare_planning_grant_preview(&snap_with_sol, &stale_rev_req)
+        .expect_err("stale expected_registry_revision must be rejected");
+    assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+
+    // 5. Codex policy rule with allow_no_effort = true or Coder/Follower role is rejected.
+    let mut no_effort_req = codex_req.clone();
+    no_effort_req.policy.allow_rules[0].allow_no_effort = true;
+    let err = prepare_planning_grant_preview(&snap_with_sol, &no_effort_req)
+        .expect_err("Codex allow_no_effort in planning grant policy must be rejected");
+    assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+
+    let mut coder_rule_req = codex_req;
+    coder_rule_req.policy.allow_rules[0]
+        .roles
+        .push(WorkflowRole::Coder);
+    let err = prepare_planning_grant_preview(&snap_with_sol, &coder_rule_req)
+        .expect_err("Codex Coder role in planning grant policy must be rejected");
     assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
 }

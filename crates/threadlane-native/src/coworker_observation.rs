@@ -262,6 +262,21 @@ pub fn extract_observed_model_and_effort(
     (observed_model, observed_effort)
 }
 
+/// Extracts genuine token usage from [`WorkerExecutionReport`] runtime/provider stream telemetry.
+///
+/// Maps actual reported stream token counts without fabricating estimates, costs, or synthetic totals.
+#[must_use]
+pub fn extract_observed_usage(report: &WorkerExecutionReport) -> Option<ObservationUsage> {
+    let usage = report.evidence.observed_usage.as_ref()?;
+    Some(ObservationUsage {
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+        cache_read_tokens: usage.cached_input_tokens,
+        total_tokens: usage.input_tokens.checked_add(usage.output_tokens),
+        provenance: "worker_stream".to_string(),
+    })
+}
+
 /// Maps a [`WorkerRunStatus`] to an [`ObservationCallState`] when a worker call did not complete
 /// with a verified accepted artifact.
 #[must_use]
@@ -319,7 +334,7 @@ const fn adapter_provider_name(adapter: ToolAdapter) -> &'static str {
     match adapter {
         ToolAdapter::Antigravity => "antigravity",
         ToolAdapter::OpencodeV2 => "opencode_v2",
-        ToolAdapter::CodexCli => "codex",
+        ToolAdapter::CodexCli => "codex_cli",
         ToolAdapter::JevApi => "jev_api",
         ToolAdapter::OpenaiDecisionsApi => "openai_decisions_api",
         ToolAdapter::Git => "git",
@@ -735,6 +750,8 @@ pub fn begin_coworker_call_observation(
                 role: Some("coworker".to_string()),
                 source: ctx.actor.source.or_else(|| Some("paired_mcp".to_string())),
                 // Never infer the active Codex conversational model or effort from a profile.
+                selected_model: ctx.actor.selected_model,
+                selected_effort: ctx.actor.selected_effort,
                 model: None,
                 effort: None,
                 evidence: ObservationActorEvidence::Configured,
@@ -747,6 +764,8 @@ pub fn begin_coworker_call_observation(
                 label: Some("Coworker".to_string()),
                 role: Some("coworker".to_string()),
                 source: Some("coworker_workflow".to_string()),
+                selected_model: None,
+                selected_effort: None,
                 model: None,
                 effort: None,
                 evidence: ObservationActorEvidence::Unknown,

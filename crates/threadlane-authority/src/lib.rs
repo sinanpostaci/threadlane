@@ -2279,6 +2279,9 @@ mod tests {
                     assert_eq!(shared_cfg.spec.effort.as_deref(), Some("max"));
                     assert!(shared_cfg.dependency_input.is_some());
                 }
+                Some(WorkerProvider::CodexCli) => {
+                    panic!("CodexCli is read-only advisory only, never an approved Coder task provider");
+                }
                 None => panic!("expected worker provider"),
             }
 

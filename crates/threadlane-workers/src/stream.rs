@@ -164,6 +164,26 @@ pub enum EffortEvidenceSource {
     AntigravityCatalogModelVariant,
 }
 
+/// Genuine token usage telemetry reported by a provider terminal event (such as Codex CLI `turn.completed`).
+///
+/// Never fabricated when a provider stream omits usage metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamTokenUsage {
+    /// Input tokens consumed in the turn.
+    pub input_tokens: u64,
+    /// Cached input tokens read during the turn, when reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input_tokens: Option<u64>,
+    /// Cache-write input tokens recorded during the turn, when reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_input_tokens: Option<u64>,
+    /// Output tokens generated in the turn.
+    pub output_tokens: u64,
+    /// Reasoning output tokens generated in the turn, when reported by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_output_tokens: Option<u64>,
+}
+
 /// Aggregated evidence and normalized events parsed from a worker's stdout NDJSON stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamEvidenceSummary {
@@ -194,6 +214,11 @@ pub struct StreamEvidenceSummary {
     pub session_evidence: FieldEvidence,
     /// First observed session ID in the stream, if any.
     pub observed_session_id: Option<String>,
+    /// Genuine token usage reported on the terminal completion event, when emitted by the provider.
+    ///
+    /// Never fabricated when the provider stream omits usage metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_usage: Option<StreamTokenUsage>,
     /// Provider error events observed in the stream.
     pub provider_errors: Vec<ProviderErrorEvidence>,
     /// Count of non-fatal step/tool errors observed during intermediate steps (`step_update` / `tool_result`).
@@ -207,7 +232,7 @@ pub struct StreamEvidenceSummary {
     pub dropped_events_count: usize,
 }
 
-/// Incremental stateful parser for Antigravity and OpenCode v2 NDJSON streams.
+/// Incremental stateful parser for Antigravity, OpenCode v2, and Codex CLI NDJSON streams.
 pub struct NdjsonStreamParser {
     provider: Option<WorkerProvider>,
     requested_model: ResolvedModelTarget,
@@ -226,6 +251,7 @@ pub struct NdjsonStreamParser {
     effort_conflict: Option<String>,
     observed_session_id: Option<String>,
     session_conflict: Option<String>,
+    observed_usage: Option<StreamTokenUsage>,
     provider_errors: Vec<ProviderErrorEvidence>,
     recoverable_step_errors_count: usize,
     blocked_events: Vec<BlockedEvidence>,
@@ -264,6 +290,7 @@ impl NdjsonStreamParser {
             effort_conflict: None,
             observed_session_id: None,
             session_conflict: None,
+            observed_usage: None,
             provider_errors: Vec::new(),
             recoverable_step_errors_count: 0,
             blocked_events: Vec::new(),
@@ -396,6 +423,12 @@ impl NdjsonStreamParser {
                     .and_then(Value::as_object)
                     .and_then(|r| r.get("status").or_else(|| r.get("subtype")))
                     .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                obj.get("item")
+                    .and_then(Value::as_object)
+                    .and_then(|i| i.get("type"))
+                    .and_then(Value::as_str)
             });
 
         let raw_type = match subtype {
@@ -406,6 +439,22 @@ impl NdjsonStreamParser {
         };
 
         let session_id = extract_session_id(obj);
+        if event_type == "thread.started" && session_id.is_none() && self.session_conflict.is_none()
+        {
+            self.session_conflict = Some(
+                "Codex `thread.started` event is missing a valid non-empty string `thread_id`"
+                    .to_string(),
+            );
+        }
+        if let Some(tid_val) = obj.get("thread_id") {
+            if tid_val.as_str().is_none_or(|s| s.trim().is_empty())
+                && self.session_conflict.is_none()
+            {
+                self.session_conflict = Some(
+                    "stream `thread_id` field must be a non-empty string when present".to_string(),
+                );
+            }
+        }
         if let Some(ref sid) = session_id {
             match &self.observed_session_id {
                 None => self.observed_session_id = Some(sid.clone()),
@@ -561,7 +610,25 @@ impl NdjsonStreamParser {
             self.saw_init_event = true;
         }
 
-        let is_result = is_result_event(obj, event_type, subtype);
+        let mut is_result = is_result_event(obj, event_type, subtype);
+        if event_type.eq_ignore_ascii_case("turn.completed") {
+            match extract_genuine_turn_usage(obj) {
+                Ok(Some(usage)) => {
+                    if is_result {
+                        self.observed_usage = Some(usage);
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    is_result = false;
+                    self.record_malformed(
+                        line_number,
+                        format!("malformed `usage` on `turn.completed`: {err}"),
+                        &raw_type,
+                    );
+                }
+            }
+        }
         if is_result {
             self.saw_result_event = true;
         }
@@ -572,7 +639,8 @@ impl NdjsonStreamParser {
             NormalizedEventKind::Result
         } else if is_init {
             NormalizedEventKind::Init
-        } else if tool_name.is_some()
+        } else if event_is_tool
+            || tool_name.is_some()
             || step_is_tool
             || matches!(event_type, "tool" | "tool_use" | "tool_result")
             || matches!(subtype, Some("tool" | "tool_use" | "tool_result"))
@@ -581,8 +649,10 @@ impl NdjsonStreamParser {
         } else if matches!(
             event_type,
             "assistant" | "message" | "text" | "content" | "step_update"
-        ) || matches!(subtype, Some("text" | "message" | "agent_response"))
-        {
+        ) || matches!(
+            subtype,
+            Some("text" | "message" | "agent_response" | "agent_message" | "reasoning")
+        ) {
             NormalizedEventKind::Progress
         } else {
             NormalizedEventKind::Other
@@ -694,6 +764,7 @@ impl NdjsonStreamParser {
             effort_evidence_source,
             session_evidence,
             observed_session_id: self.observed_session_id,
+            observed_usage: self.observed_usage,
             provider_errors: self.provider_errors,
             recoverable_step_errors_count: self.recoverable_step_errors_count,
             blocked_events: self.blocked_events,
@@ -819,6 +890,7 @@ fn extract_session_from_sub(sub: &Map<String, Value>) -> Option<&str> {
     sub.get("conversation_id")
         .or_else(|| sub.get("session_id"))
         .or_else(|| sub.get("sessionID"))
+        .or_else(|| sub.get("thread_id"))
         .and_then(Value::as_str)
 }
 
@@ -827,6 +899,7 @@ fn extract_session_id(obj: &Map<String, Value>) -> Option<String> {
         obj.get("conversation_id").and_then(Value::as_str),
         obj.get("session_id").and_then(Value::as_str),
         obj.get("sessionID").and_then(Value::as_str),
+        obj.get("thread_id").and_then(Value::as_str),
         obj.get("init")
             .and_then(Value::as_object)
             .and_then(extract_session_from_sub),
@@ -837,6 +910,9 @@ fn extract_session_id(obj: &Map<String, Value>) -> Option<String> {
             .and_then(Value::as_object)
             .and_then(extract_session_from_sub),
         obj.get("part")
+            .and_then(Value::as_object)
+            .and_then(extract_session_from_sub),
+        obj.get("item")
             .and_then(Value::as_object)
             .and_then(extract_session_from_sub),
         obj.get("metadata")
@@ -870,7 +946,14 @@ fn is_tool_event(
         "tool" | "tool_use" | "tool_result" | "tool_call"
     ) || matches!(
         st.as_str(),
-        "tool" | "tool_use" | "tool_result" | "tool_call"
+        "tool"
+            | "tool_use"
+            | "tool_result"
+            | "tool_call"
+            | "command_execution"
+            | "file_change"
+            | "mcp_tool_call"
+            | "web_search"
     ) || obj.contains_key("tool_use")
         || obj.contains_key("tool_result")
     {
@@ -879,7 +962,15 @@ fn is_tool_event(
 
     !matches!(
         et.as_str(),
-        "init" | "result" | "system" | "step_start" | "step_finish" | "session"
+        "init"
+            | "result"
+            | "system"
+            | "step_start"
+            | "step_finish"
+            | "session"
+            | "thread.started"
+            | "turn.started"
+            | "turn.completed"
     ) && (has_tool_name || st.contains("tool"))
 }
 
@@ -1450,10 +1541,13 @@ fn detect_error_event(
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let has_error_field =
-        has_object_error_field(obj) || nested_res.is_some_and(has_object_error_field);
+    let nested_item = obj.get("item").and_then(Value::as_object);
+    let has_error_field = has_object_error_field(obj)
+        || nested_res.is_some_and(has_object_error_field)
+        || nested_item.is_some_and(has_object_error_field);
 
     let is_error = et == "error"
+        || et == "turn.failed"
         || st == "error"
         || st == "error_during_execution"
         || matches!(status.as_str(), "error" | "failed" | "failure")
@@ -1523,13 +1617,15 @@ fn is_init_event(obj: &Map<String, Value>, event_type: &str, subtype: Option<&st
         || (et == "system" && st == "init")
         || et == "step_start"
         || st == "step-start"
+        || (et == "thread.started" && extract_session_id(obj).is_some())
         || (et == "session"
             && (st == "init"
                 || st == "created"
                 || obj.get("status").and_then(Value::as_str) == Some("started")
                 || obj.contains_key("sessionID")
                 || obj.contains_key("session_id")
-                || obj.contains_key("conversation_id")))
+                || obj.contains_key("conversation_id")
+                || obj.contains_key("thread_id")))
 }
 
 fn is_result_event(obj: &Map<String, Value>, event_type: &str, subtype: Option<&str>) -> bool {
@@ -1588,7 +1684,69 @@ fn is_result_event(obj: &Map<String, Value>, event_type: &str, subtype: Option<&
         );
     }
 
+    if et == "turn.completed" {
+        if obj.get("is_error") == Some(&Value::Bool(true)) || has_object_error_field(obj) {
+            return false;
+        }
+        let status = obj
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        return matches!(
+            status.as_str(),
+            "" | "completed" | "success" | "ok" | "done"
+        );
+    }
+
     false
+}
+
+pub(crate) fn extract_genuine_turn_usage(
+    obj: &Map<String, Value>,
+) -> Result<Option<StreamTokenUsage>, String> {
+    let Some(usage_val) = obj.get("usage") else {
+        return Ok(None);
+    };
+    if usage_val.is_null() {
+        return Ok(None);
+    }
+    let Some(usage_obj) = usage_val.as_object() else {
+        return Err("`usage` must be a JSON object when present".to_string());
+    };
+    let input_tokens = usage_obj
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "`usage.input_tokens` must be a non-negative integer".to_string())?;
+    let output_tokens = usage_obj
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "`usage.output_tokens` must be a non-negative integer".to_string())?;
+    let cached_input_tokens = match usage_obj.get("cached_input_tokens") {
+        None | Some(Value::Null) => None,
+        Some(val) => Some(val.as_u64().ok_or_else(|| {
+            "`usage.cached_input_tokens` must be a non-negative integer".to_string()
+        })?),
+    };
+    let cache_write_input_tokens = match usage_obj.get("cache_write_input_tokens") {
+        None | Some(Value::Null) => None,
+        Some(val) => Some(val.as_u64().ok_or_else(|| {
+            "`usage.cache_write_input_tokens` must be a non-negative integer".to_string()
+        })?),
+    };
+    let reasoning_output_tokens = match usage_obj.get("reasoning_output_tokens") {
+        None | Some(Value::Null) => None,
+        Some(val) => Some(val.as_u64().ok_or_else(|| {
+            "`usage.reasoning_output_tokens` must be a non-negative integer".to_string()
+        })?),
+    };
+    Ok(Some(StreamTokenUsage {
+        input_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        output_tokens,
+        reasoning_output_tokens,
+    }))
 }
 
 fn extract_summary(obj: &Map<String, Value>) -> Option<String> {
@@ -1602,6 +1760,7 @@ fn extract_summary(obj: &Map<String, Value>) -> Option<String> {
         .and_then(Value::as_object);
     let nested_step = obj.get("step_update").and_then(Value::as_object);
     let nested_part = obj.get("part").and_then(Value::as_object);
+    let nested_item = obj.get("item").and_then(Value::as_object);
     let nested_msg = obj.get("message").and_then(Value::as_object);
 
     let candidates = [
@@ -1636,6 +1795,13 @@ fn extract_summary(obj: &Map<String, Value>) -> Option<String> {
             .and_then(Value::as_str),
         nested_part
             .and_then(|p| p.get("text").or_else(|| p.get("message")))
+            .and_then(Value::as_str),
+        nested_item
+            .and_then(|i| {
+                i.get("text")
+                    .or_else(|| i.get("message"))
+                    .or_else(|| i.get("error"))
+            })
             .and_then(Value::as_str),
         nested_msg
             .and_then(|m| m.get("text").or_else(|| m.get("content")))

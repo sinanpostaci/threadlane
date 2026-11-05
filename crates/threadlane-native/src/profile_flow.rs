@@ -1,9 +1,11 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Write as _};
+use std::fs;
+use std::path::{Component, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use threadlane_workers::{resolve_model_target, WorkerProvider};
+use threadlane_workers::{resolve_model_target, validate_executable_file, WorkerProvider};
 use threadlane_workflow::{
     Difficulty, ModelDefinition, RegistryError, RegistrySnapshot, RegistryStore, RoleAssignment,
     ToolAdapter, ToolDefinition, WorkflowRole,
@@ -12,7 +14,7 @@ use threadlane_workflow::{
 pub use threadlane_workflow::resolve_choice;
 
 use crate::error::{NativeError, NativeErrorCode};
-use crate::fs_safety::validate_bounded_identifier;
+use crate::fs_safety::{validate_bounded_identifier, validate_executable_path};
 
 /// Current wire and storage schema version for [`ExecutionPolicy`].
 pub const EXECUTION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -303,6 +305,272 @@ impl RoleExecutionRoute {
     pub const fn is_supported(self) -> bool {
         !matches!(self, Self::Unsupported)
     }
+}
+
+/// Returns `true` if `role` is a read-only advisory worker role (`Orchestrator`, `Architect`,
+/// `Reviewer`, or `Closure`).
+///
+/// Conversational [`WorkflowRole::Follower`] and mutating [`WorkflowRole::Coder`] are never
+/// read-only advisory worker roles.
+pub const fn is_read_only_advisory_worker_role(role: WorkflowRole) -> bool {
+    matches!(
+        role,
+        WorkflowRole::Orchestrator
+            | WorkflowRole::Architect
+            | WorkflowRole::Reviewer
+            | WorkflowRole::Closure
+    )
+}
+
+/// Normalizes a preflight-resolved [`SelectedRoleChoice`] for read-only advisory worker execution.
+///
+/// Preserves generic [`RoleExecutionRoute::from_adapter`] and [`preflight`] semantics (`CodexCli`
+/// remains [`RoleExecutionRoute::NativeHandoff`] in general preflight and manual role-flow
+/// handoffs). After normal registry + [`ExecutionPolicy`] preflight succeeds, this helper converts
+/// a [`ToolAdapter::CodexCli`] choice into [`RoleExecutionRoute::HeadlessWorker`] **only** for
+/// read-only advisory roles ([`WorkflowRole::Orchestrator`], [`WorkflowRole::Architect`],
+/// [`WorkflowRole::Reviewer`], and [`WorkflowRole::Closure`]) after validating the exact model and
+/// explicit reasoning effort through [`resolve_model_target`] (`WorkerProvider::CodexCli`).
+///
+/// Already-headless [`ToolAdapter::Antigravity`] and [`ToolAdapter::OpencodeV2`] choices are
+/// validated and returned unchanged. [`WorkflowRole::Follower`], [`WorkflowRole::Coder`], and
+/// unsupported API/auxiliary adapters are strictly refused.
+pub fn normalize_read_only_advisory_choice(
+    role: WorkflowRole,
+    choice: &SelectedRoleChoice,
+) -> Result<SelectedRoleChoice, NativeError> {
+    if !is_read_only_advisory_worker_role(role) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "role `{role}` is not a read-only advisory worker role; Follower and Coder cannot normalize to read-only Codex workers"
+            ),
+        ));
+    }
+
+    validate_registry_id(&choice.tool_id, "selected_choice.tool_id")?;
+    validate_registry_id(&choice.model_id, "selected_choice.model_id")?;
+    validate_registry_text_native(
+        &choice.model_arg,
+        "selected_choice.model_arg",
+        MAX_REGISTRY_MODEL_ARG_LEN,
+    )?;
+    if let Some(ref effort) = choice.effort {
+        validate_bounded_identifier(effort, "selected_choice.effort", MAX_REGISTRY_EFFORT_LEN)?;
+    }
+
+    match choice.adapter {
+        ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 => {
+            if choice.route != RoleExecutionRoute::HeadlessWorker {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "adapter `{}` for role `{role}` must use route `headless_worker` (got `{}`)",
+                        choice.adapter, choice.route
+                    ),
+                ));
+            }
+            Ok(choice.clone())
+        }
+        ToolAdapter::CodexCli => {
+            if !matches!(
+                choice.route,
+                RoleExecutionRoute::NativeHandoff | RoleExecutionRoute::HeadlessWorker
+            ) {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedCapability,
+                    format!(
+                        "CodexCli advisory choice for role `{role}` has unsupported route `{}`",
+                        choice.route
+                    ),
+                ));
+            }
+            if choice.effort.is_none() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "CodexCli read-only advisory worker for role `{role}` requires an explicit reasoning effort"
+                    ),
+                ));
+            }
+            let resolved = resolve_model_target(
+                WorkerProvider::CodexCli,
+                &choice.model_arg,
+                choice.effort.as_deref(),
+            )
+            .map_err(|err| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "invalid CodexCli read-only advisory target for model `{}` ({}): {err}",
+                        choice.model_id, choice.model_arg
+                    ),
+                )
+            })?;
+            if resolved.effort != choice.effort {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "selected_choice.effort `{:?}` does not match resolved CodexCli effort `{:?}` for model `{}`",
+                        choice.effort, resolved.effort, choice.model_id
+                    ),
+                ));
+            }
+            let mut normalized = choice.clone();
+            normalized.route = RoleExecutionRoute::HeadlessWorker;
+            Ok(normalized)
+        }
+        ToolAdapter::JevApi
+        | ToolAdapter::OpenaiDecisionsApi
+        | ToolAdapter::Git
+        | ToolAdapter::Tmux
+        | ToolAdapter::Codegraph => Err(NativeError::new(
+            NativeErrorCode::UnsupportedCapability,
+            format!(
+                "adapter `{}` is not a supported headless advisory worker provider for role `{role}`",
+                choice.adapter
+            ),
+        )),
+    }
+}
+
+/// Resolves and validates the canonical executable path for a read-only advisory CLI tool
+/// (`Antigravity`, `OpencodeV2`, or `CodexCli`).
+///
+/// Uses `tool_def.executable_path` when configured; for [`ToolAdapter::CodexCli`], falls back to
+/// resolving `"codex"` (or a configured bare binary name) from `PATH` when `executable_path` is
+/// `None`. Canonicalizes symlinks and enforces regular executable file and permission checks via
+/// [`validate_executable_file`] and [`validate_executable_path`].
+pub fn resolve_advisory_tool_executable(tool_def: &ToolDefinition) -> Result<PathBuf, NativeError> {
+    if !tool_def.enabled {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "resolved advisory tool `{}` is disabled in registry snapshot",
+                tool_def.id
+            ),
+        ));
+    }
+
+    let candidate_path = match tool_def.executable_path.as_ref() {
+        Some(path) => {
+            if path.as_os_str().is_empty() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "tool `{}` has an empty configured executable_path",
+                        tool_def.id
+                    ),
+                ));
+            }
+            for comp in path.components() {
+                if matches!(comp, Component::CurDir | Component::ParentDir) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::SecurityViolation,
+                        format!(
+                            "tool `{}` executable_path `{}` must not contain `.` or `..` components",
+                            tool_def.id,
+                            path.display()
+                        ),
+                    ));
+                }
+            }
+            if path.is_absolute() {
+                path.clone()
+            } else if path.components().count() == 1 && tool_def.adapter == ToolAdapter::CodexCli {
+                resolve_binary_in_path(path.as_os_str(), &tool_def.id)?
+            } else {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "tool `{}` executable_path `{}` must be an absolute path",
+                        tool_def.id,
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        None => {
+            if tool_def.adapter == ToolAdapter::CodexCli {
+                resolve_binary_in_path(std::ffi::OsStr::new("codex"), &tool_def.id)?
+            } else {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "resolved advisory tool `{}` has no configured executable_path",
+                        tool_def.id
+                    ),
+                ));
+            }
+        }
+    };
+
+    let canonical = fs::canonicalize(&candidate_path).map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "failed to canonicalize executable `{}` for tool `{}`: {err}",
+                candidate_path.display(),
+                tool_def.id
+            ),
+        )
+    })?;
+    let validated = validate_executable_file(&canonical).map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!(
+                "tool `{}` executable `{}` failed worker validation: {err}",
+                tool_def.id,
+                canonical.display()
+            ),
+        )
+    })?;
+    validate_executable_path(&validated)
+}
+
+fn resolve_binary_in_path(
+    bin_name: &std::ffi::OsStr,
+    tool_id: &str,
+) -> Result<PathBuf, NativeError> {
+    let path_var = std::env::var_os("PATH").ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "cannot resolve `{}` for tool `{tool_id}`: PATH environment variable is not set",
+                bin_name.to_string_lossy()
+            ),
+        )
+    })?;
+
+    for dir in std::env::split_paths(&path_var) {
+        if !dir.is_absolute() {
+            continue;
+        }
+        let candidate = dir.join(bin_name);
+        if let Ok(meta) = fs::metadata(&candidate) {
+            if meta.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if meta.permissions().mode() & 0o111 != 0 {
+                        return Ok(candidate);
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+
+    Err(NativeError::new(
+        NativeErrorCode::ValidationFailed,
+        format!(
+            "executable `{}` for tool `{tool_id}` was not found in PATH",
+            bin_name.to_string_lossy()
+        ),
+    ))
 }
 
 impl fmt::Display for RoleExecutionRoute {

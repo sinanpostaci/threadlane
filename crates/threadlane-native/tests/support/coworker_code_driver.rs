@@ -744,7 +744,7 @@ async fn cli_code_driver_cancel_active_held_job_records_durable_stop_releases_lo
     }
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
-    let status_a_running = run_flow_cli(
+    let mut status_a_running = run_flow_cli(
         &state_dir,
         &fixture,
         &binding_a_id,
@@ -753,10 +753,34 @@ async fn cli_code_driver_cancel_active_held_job_records_durable_stop_releases_lo
     )
     .await;
     assert_eq!(status_a_running["overall_status"], "running_tasks");
-    let task_worktree_id = status_a_running["tasks"][0]["task_worktree_id"]
-        .as_str()
-        .expect("running task_worktree_id")
-        .to_string();
+
+    // The live owner's cached step report can reach `running_tasks` after host dispatch
+    // confirmation but before the claimed worker's owned worktree snapshot is recorded.
+    // The fake started marker does not make that cached report current, so wait for the
+    // owner's next status step to expose the concrete task_worktree_id.
+    let worktree_id_deadline = Instant::now() + Duration::from_secs(5);
+    let task_worktree_id = loop {
+        if let Some(task_worktree_id) = status_a_running["tasks"][0]["task_worktree_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+        {
+            break task_worktree_id.to_string();
+        }
+        assert!(
+            Instant::now() < worktree_id_deadline,
+            "timed out after 5s waiting for running task_worktree_id; last status: {status_a_running}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        status_a_running = run_flow_cli(
+            &state_dir,
+            &fixture,
+            &binding_a_id,
+            &thread_a_uuid,
+            &["code-driver", "status", "--job-id", &job_a.job_id],
+        )
+        .await;
+        assert_eq!(status_a_running["overall_status"], "running_tasks");
+    };
 
     // 3. Cancel active held `job_a` and verify durable stop precedes narrow host cancellation and releases all locks.
     let cancel_a = run_flow_cli(

@@ -37,7 +37,8 @@ use crate::fs_safety::{
     validate_bounded_identifier, write_private_file_atomic, MAX_PRIVATE_STATE_FILE_BYTES,
 };
 use crate::profile_flow::{
-    preflight, PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
+    normalize_read_only_advisory_choice, preflight, resolve_advisory_tool_executable,
+    PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
     SelectedRoleChoice,
 };
 use crate::role_flow::read_registry_snapshot_readonly;
@@ -3037,16 +3038,17 @@ fn resolve_headless_choice(
             ),
         ));
     }
-    let selected = outcome.selected.clone().ok_or_else(|| {
+    let raw_selected = outcome.selected.clone().ok_or_else(|| {
         NativeError::new(
             NativeErrorCode::ValidationFailed,
             "preflight outcome marked ready without SelectedRoleChoice",
         )
     })?;
+    let selected = normalize_read_only_advisory_choice(role, &raw_selected)?;
     if selected.route != RoleExecutionRoute::HeadlessWorker
         || !matches!(
             selected.adapter,
-            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
         )
     {
         return Err(NativeError::new(
@@ -3065,7 +3067,15 @@ fn resolve_headless_choice(
                 "resolved tool_id was not found in registry snapshot",
             )
         })?;
-    if !tool_def.enabled || tool_def.executable_path.is_none() {
+    if !tool_def.enabled {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "resolved planning tool is disabled in registry snapshot",
+        ));
+    }
+    if tool_def.adapter == ToolAdapter::CodexCli {
+        let _ = resolve_advisory_tool_executable(tool_def)?;
+    } else if tool_def.executable_path.is_none() {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             "resolved planning tool is disabled or missing executable_path",

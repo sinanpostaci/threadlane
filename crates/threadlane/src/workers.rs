@@ -1706,6 +1706,7 @@ mod tests {
                     value: "ses_owned_001".to_string(),
                 },
                 observed_session_id: Some("ses_owned_001".to_string()),
+                observed_usage: None,
                 provider_errors: Vec::new(),
                 recoverable_step_errors_count: 0,
                 blocked_events: Vec::new(),

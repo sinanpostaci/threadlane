@@ -78,20 +78,42 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
    - Cycles freeze both the [`ExecutionPolicy`] and its SHA-256 `policy_digest`.
      Any policy or registry drift between cycle creation and `handoff_role`
      is refused before effect.
-4. **Native route requested vs. executed evidence**:
-   - `ToolAdapter::CodexCli` maps to `RoleExecutionRoute::NativeHandoff` and
-     never dispatches a headless worker.
+4. **Native route vs. explicit read-only advisory normalization and executed evidence**:
+   - Generic `RoleExecutionRoute::from_adapter(ToolAdapter::CodexCli)` and manual role-flow
+     handoffs (`RoleFlowStore::create_cycle` / `handoff_role`) map `ToolAdapter::CodexCli` to
+     `RoleExecutionRoute::NativeHandoff` and never dispatch a headless worker on the manual
+     role-flow path. The native Coworker remains the human-selected Codex conversation, has no
+     model profile slot or lock, and is never a worker dispatch target.
    - [`NativeRoleHandoff`] records the frozen instruction, `requested_model_id`,
      `requested_model_arg`, and `requested_effort` with
      `model_execution_verified: false` and
      `native_per_call_identity_verified: false`. It is a manual native routing
      record, never proof that native Codex executed with that model or effort.
-   - `ToolAdapter::Antigravity` and `ToolAdapter::OpencodeV2` map to
+   - `ToolAdapter::Antigravity` and `ToolAdapter::OpencodeV2` map directly to
      `RoleExecutionRoute::HeadlessWorker`. [`RoleEvidenceReference`] records
      actual runtime `run_id`, `worker_id`, `task_worktree_id`,
      `report_artifact_id`, `base_commit`, `head_commit`, `observed_model`, and
      `observed_effort` directly from [`TaskStateSnapshot`], with
      `final_summary_is_complete_evidence: false`.
+   - Separate from generic `from_adapter` and manual `RoleFlowStore` handoffs, explicit read-only
+     advisory normalization (`normalize_read_only_advisory_choice` /
+     `is_read_only_advisory_worker_role`, with binary resolution via
+     `resolve_advisory_tool_executable`) runs **after** normal exact `RegistrySnapshot` +
+     [`ExecutionPolicy`] preflight succeeds and converts a `ToolAdapter::CodexCli` choice into
+     `RoleExecutionRoute::HeadlessWorker` **only** for read-only advisory roles
+     (`WorkflowRole::Orchestrator`, `WorkflowRole::Architect`, `WorkflowRole::Reviewer`, and
+     `WorkflowRole::Closure`) when an explicit reasoning effort is configured and validated by
+     `threadlane_workers::resolve_model_target(WorkerProvider::CodexCli, ...)`.
+   - `WorkflowRole::Follower` and `WorkflowRole::Coder` never normalize to headless `CodexCli`
+     workers, and saved profiles or catalog entries never grant authority without an explicit
+     `ExecutionPolicy` and the required `PlanningAdviceGrant` or
+     `FrozenControllerCapabilityEnvelope` gate.
+   - Because Linux `codex exec --json` does not emit runtime model or effort telemetry on stdout,
+     read-only `CodexCli` review and closure evidence records the verified pinned launch
+     configuration explicitly and separately from runtime-observed stream telemetry: absent
+     observed model/effort remains `None` with no `requested -> observed` fallback, while legacy
+     `Antigravity` and `OpencodeV2` runtime telemetry requirements remain strict. See
+     [`docs/CODEX-ADVISORY.md`](CODEX-ADVISORY.md).
 5. **Explicit approvals and separately started hosts**:
    - Creating a cycle requires an existing frozen [`ApprovalRecord`] from
      `threadlane-approve`.
@@ -153,6 +175,7 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
   - `PolicyAllowRule`, `ExecutionPolicy`, `RoleExecutionRoute`, `PreflightBlockReason`
   - `RolePreflightRequest`, `PreflightRequest`, `SelectedRoleChoice`, `RolePreflightOutcome`, `PreflightReport`
   - `resolve_choice`, `preflight`, `preflight_from_store`, `read_registry_snapshot_readonly`, `preflight_from_dir_readonly`
+  - `is_read_only_advisory_worker_role`, `normalize_read_only_advisory_choice`, `resolve_advisory_tool_executable`
 - **Phase A2 (`role_flow`)**:
   - `ROLE_FLOW_SCHEMA_VERSION`, `MAX_CYCLES_PER_BINDING`, `MAX_HANDOFFS_PER_CYCLE`, `MAX_CLOSURES_PER_BINDING`, `MAX_ROLE_FLOW_LEDGER_BYTES`
   - `RoleFlowStore`, `RoleFlowBindingSnapshot`, `RoleFlowCycle`, `FrozenCycleTask`

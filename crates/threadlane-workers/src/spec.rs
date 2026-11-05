@@ -13,12 +13,13 @@ pub use crate::permissions::{
     build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
     build_opencode_config_content, build_opencode_config_content_json,
     evaluate_antigravity_settings, evaluate_opencode_rules, validate_advisory_provider_and_mode,
-    validate_advisory_read_only_workdir, AntigravityPermissionsBlock, AntigravitySessionSettings,
-    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
-    OpenCodeRuleEffect, WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
-    AGY_PROTECTED_READ_DENY_PATTERNS, MAX_OPENCODE_CONFIG_BYTES, MAX_TASK_FILES_SETTINGS_BYTES,
-    MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR, OPENCODE_DEFAULT_AGENT,
-    OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
+    validate_advisory_read_only_workdir, validate_codex_advisory_workdir,
+    AntigravityPermissionsBlock, AntigravitySessionSettings, OpenCodeAgentConfig,
+    OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule, OpenCodeRuleEffect,
+    WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
+    AGY_PROTECTED_READ_DENY_PATTERNS, CODEX_PROJECT_CONFIG_MARKERS, MAX_OPENCODE_CONFIG_BYTES,
+    MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
+    OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
     OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
 };
 use crate::permissions::{
@@ -66,7 +67,37 @@ pub const MAX_IDENTIFIER_LEN: usize = 128;
 /// Maximum byte length for a repository-relative allowed write path entry.
 pub const MAX_PATH_ENTRY_LEN: usize = 512;
 
-/// Supported external worker CLI providers for Milestone 2.
+/// Session-only named permission profile selected for [`WorkerProvider::CodexCli`] read-only advisory runs.
+pub const CODEX_ADVISORY_PERMISSION_PROFILE_NAME: &str = "threadlane-advisory";
+
+/// Session-only TOML inline table `-c` override defining the `threadlane-advisory` read-only
+/// permission profile for [`WorkerProvider::CodexCli`].
+///
+/// Scopes filesystem reads to `:minimal`, `/nix/store`, and `.` inside `:workspace_roots` with
+/// explicit recursive exact plus descendant denials (`**/.env`, `**/.env.*`, `**/codex.toml`,
+/// `**/.codex.toml`, `**/.git`, `**/.git/**`, `**/.codex`, `**/.codex/**`, `**/.agents`,
+/// `**/.agents/**`, `**/.aws`, `**/.aws/**`), and disables network access
+/// (`"network"={"enabled"=false}`). Never combined with legacy `--sandbox` flags.
+pub const CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG: &str = r#"permissions.threadlane-advisory={"filesystem"={":minimal"="read",":workspace_roots"={"."="read","**/.env"="deny","**/.env.*"="deny","**/codex.toml"="deny","**/.codex.toml"="deny","**/.git"="deny","**/.git/**"="deny","**/.codex"="deny","**/.codex/**"="deny","**/.agents"="deny","**/.agents/**"="deny","**/.aws"="deny","**/.aws/**"="deny"},"/nix/store"="read"},"network"={"enabled"=false}}"#;
+
+/// Features explicitly disabled via `--disable <feature>` on [`WorkerProvider::CodexCli`]
+/// read-only advisory invocations.
+pub const CODEX_ADVISORY_DISABLED_FEATURES: [&str; 12] = [
+    "hooks",
+    "plugins",
+    "apps",
+    "multi_agent",
+    "browser_use",
+    "computer_use",
+    "in_app_browser",
+    "image_generation",
+    "memories",
+    "skill_search",
+    "skill_mcp_dependency_install",
+    "shell_snapshot",
+];
+
+/// Supported external worker CLI providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum WorkerProvider {
     /// Google Antigravity (`agy`) CLI using `--output-format stream-json`.
@@ -80,6 +111,9 @@ pub enum WorkerProvider {
         alias = "opencode"
     )]
     OpenCodeV2,
+    /// OpenAI Codex (`codex`) CLI in read-only non-interactive `exec --json --ephemeral` advisory mode.
+    #[serde(rename = "codex_cli", alias = "codex-cli", alias = "codex")]
+    CodexCli,
 }
 
 impl WorkerProvider {
@@ -88,6 +122,7 @@ impl WorkerProvider {
         match self {
             Self::Antigravity => "antigravity",
             Self::OpenCodeV2 => "opencode_v2",
+            Self::CodexCli => "codex_cli",
         }
     }
 }
@@ -363,6 +398,25 @@ impl WorkerSpec {
                     validate_simple_identifier(session_id, "session_id")?;
                 }
             }
+            WorkerProvider::CodexCli => {
+                if self.file_permissions != WorkerFilePermissions::ReadOnly {
+                    return Err(WorkerError::UnsupportedCapability {
+                        provider: self.provider.as_str().to_string(),
+                        capability: format!(
+                            "worker_file_permissions:{}",
+                            self.file_permissions.as_str()
+                        ),
+                        reason: format!(
+                            "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`; mutable `{}` worker invocations are not supported",
+                            self.file_permissions.as_str()
+                        ),
+                    });
+                }
+                return Err(WorkerError::InvalidSpec(
+                    "provider `codex_cli` supports only read-only advisory execution via `AdvisoryWorkerSpec` with zero write scopes; `WorkerSpec` mutable task worktree execution is not supported"
+                        .to_string(),
+                ));
+            }
         }
 
         if self.allowed_write_paths.is_empty() {
@@ -513,6 +567,16 @@ impl WorkerSpec {
                 let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
                 None
             }
+            (WorkerProvider::CodexCli, _) => {
+                return Err(WorkerError::UnsupportedCapability {
+                    provider: self.provider.as_str().to_string(),
+                    capability: format!(
+                        "worker_file_permissions:{}",
+                        self.file_permissions.as_str()
+                    ),
+                    reason: "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`".to_string(),
+                });
+            }
         };
         Ok(self.build_argv_from_resolved(&report.resolved_model, settings_json))
     }
@@ -584,6 +648,14 @@ impl WorkerSpec {
                 let config_json = self.build_opencode_config_for_workdir(&canonical_workdir)?;
                 Ok(vec![(OPENCODE_CONFIG_ENV_VAR.to_string(), config_json)])
             }
+            WorkerProvider::CodexCli => Err(WorkerError::UnsupportedCapability {
+                provider: self.provider.as_str().to_string(),
+                capability: format!(
+                    "worker_file_permissions:{}",
+                    self.file_permissions.as_str()
+                ),
+                reason: "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`".to_string(),
+            }),
         }
     }
 
@@ -854,7 +926,12 @@ impl AdvisoryWorkerSpec {
             .validate_for_provider_and_paths(self.provider, &self.allowed_write_paths)?;
 
         let canonical_executable = validate_executable_file(&self.executable)?;
-        let canonical_working_directory = validate_advisory_read_only_workdir(working_directory)?;
+        let canonical_working_directory = match self.provider {
+            WorkerProvider::CodexCli => validate_codex_advisory_workdir(working_directory)?,
+            WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => {
+                validate_advisory_read_only_workdir(working_directory)?
+            }
+        };
         let resolved_model = self.resolve_model_target()?;
 
         if !self.allowed_models.is_empty()
@@ -893,6 +970,20 @@ impl AdvisoryWorkerSpec {
                     validate_simple_identifier(session_id, "session_id")?;
                 }
             }
+            WorkerProvider::CodexCli => {
+                if self.session_id.is_some() {
+                    return Err(WorkerError::InvalidSpec(
+                        "`session_id` (`--session`) is only supported for provider `opencode_v2`; `codex_cli` advisory runs must use `--ephemeral`"
+                            .to_string(),
+                    ));
+                }
+                if self.standalone {
+                    return Err(WorkerError::InvalidSpec(
+                        "`standalone` (`--standalone`) is only supported for provider `opencode_v2`"
+                            .to_string(),
+                    ));
+                }
+            }
         }
 
         validate_prompt(&self.prompt)?;
@@ -915,6 +1006,7 @@ impl AdvisoryWorkerSpec {
                     vec![(OPENCODE_CONFIG_ENV_VAR.to_string(), config_json)],
                 )
             }
+            WorkerProvider::CodexCli => (None, Vec::new()),
         };
 
         let constructed_argv = build_provider_argv_from_resolved(
@@ -993,14 +1085,107 @@ fn build_provider_argv_from_resolved(
             argv.push(prompt.to_string());
             argv
         }
+        WorkerProvider::CodexCli => {
+            let effort = resolved
+                .effort
+                .as_deref()
+                .expect("CodexCli effort is verified during model target resolution");
+            let mut argv = Vec::with_capacity(19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2 + 2);
+            argv.push("--no-daemon".to_string());
+            argv.push("exec".to_string());
+            argv.push("--json".to_string());
+            argv.push("--ephemeral".to_string());
+            argv.push("--ignore-user-config".to_string());
+            argv.push("--model".to_string());
+            argv.push(resolved.cli_model_arg.clone());
+            argv.push("-c".to_string());
+            argv.push(format!("model_reasoning_effort=\"{effort}\""));
+            argv.push("-c".to_string());
+            argv.push("approval_policy=\"never\"".to_string());
+            argv.push("-c".to_string());
+            argv.push("model_provider=\"openai\"".to_string());
+            argv.push("-c".to_string());
+            argv.push(format!(
+                "default_permissions=\"{CODEX_ADVISORY_PERMISSION_PROFILE_NAME}\""
+            ));
+            argv.push("-c".to_string());
+            argv.push(CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG.to_string());
+            argv.push("-c".to_string());
+            argv.push("web_search=\"disabled\"".to_string());
+            for feature in CODEX_ADVISORY_DISABLED_FEATURES {
+                argv.push("--disable".to_string());
+                argv.push(feature.to_string());
+            }
+            argv.push("--".to_string());
+            argv.push(prompt.to_string());
+            argv
+        }
     }
 }
 
+/// Returns `true` if `argv` matches the exact read-only `codex` advisory argument vector
+/// pinned to `resolved` (`--no-daemon exec --json --ephemeral --ignore-user-config --model <model>`,
+/// `-c` overrides for `model_reasoning_effort`, `approval_policy`, `model_provider`,
+/// `default_permissions`, `permissions.threadlane-advisory`, `web_search`, all
+/// [`CODEX_ADVISORY_DISABLED_FEATURES`] `--disable` pairs, `--`, and a non-empty prompt).
+#[must_use]
+pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelTarget) -> bool {
+    let Some(effort) = resolved.effort.as_deref() else {
+        return false;
+    };
+    if validate_simple_identifier(&resolved.base_model, "model").is_err()
+        || validate_simple_identifier(effort, "effort").is_err()
+        || resolved.cli_model_arg != resolved.base_model
+    {
+        return false;
+    }
+    let expected_len = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2 + 2;
+    if argv.len() != expected_len {
+        return false;
+    }
+    let expected_effort_cfg = format!("model_reasoning_effort=\"{effort}\"");
+    let expected_default_perms =
+        format!("default_permissions=\"{CODEX_ADVISORY_PERMISSION_PROFILE_NAME}\"");
+    if !(argv[0] == "--no-daemon"
+        && argv[1] == "exec"
+        && argv[2] == "--json"
+        && argv[3] == "--ephemeral"
+        && argv[4] == "--ignore-user-config"
+        && argv[5] == "--model"
+        && argv[6] == resolved.cli_model_arg
+        && argv[7] == "-c"
+        && argv[8] == expected_effort_cfg
+        && argv[9] == "-c"
+        && argv[10] == "approval_policy=\"never\""
+        && argv[11] == "-c"
+        && argv[12] == "model_provider=\"openai\""
+        && argv[13] == "-c"
+        && argv[14] == expected_default_perms
+        && argv[15] == "-c"
+        && argv[16] == CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG
+        && argv[17] == "-c"
+        && argv[18] == "web_search=\"disabled\"")
+    {
+        return false;
+    }
+    for (idx, feature) in CODEX_ADVISORY_DISABLED_FEATURES.iter().enumerate() {
+        let base = 19 + idx * 2;
+        if argv[base] != "--disable" || argv[base + 1] != *feature {
+            return false;
+        }
+    }
+    let sep_idx = 19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2;
+    argv[sep_idx] == "--"
+        && !argv[sep_idx + 1].trim().is_empty()
+        && !argv[sep_idx + 1].contains('\0')
+}
+
 /// Resolves and validates a provider-specific model and effort/variant target from the three
-/// explicit inputs used by [`WorkerSpec`]: provider, model argument, and optional effort/variant.
+/// explicit inputs used by [`WorkerSpec`] and [`AdvisoryWorkerSpec`]: provider, model argument,
+/// and optional effort/variant.
 ///
 /// This is the canonical pure target resolver for worker execution. It performs no filesystem,
-/// process, provider, or network I/O and applies the same Antigravity explicit-effort and
+/// process, provider, or network I/O and applies the same Antigravity/Codex explicit-effort and
 /// OpenCode inline-variant rules as [`WorkerSpec::resolve_model_target`].
 pub fn resolve_model_target(
     provider: WorkerProvider,
@@ -1080,6 +1265,20 @@ pub fn resolve_model_target(
                 base_model: base_part.to_string(),
                 effort: resolved_effort,
                 cli_model_arg,
+            })
+        }
+        WorkerProvider::CodexCli => {
+            validate_simple_identifier(model, "model")?;
+            let effort = effort.ok_or_else(|| {
+                WorkerError::InvalidSpec(
+                    "provider `codex_cli` requires an explicit `effort` identifier".to_string(),
+                )
+            })?;
+            validate_simple_identifier(effort, "effort")?;
+            Ok(ResolvedModelTarget {
+                base_model: model.to_string(),
+                effort: Some(effort.to_string()),
+                cli_model_arg: model.to_string(),
             })
         }
     }
@@ -1269,6 +1468,8 @@ pub fn is_control_config_path(rel_path: &str) -> bool {
                 | "claude.md"
                 | "opencode.json"
                 | "opencode.jsonc"
+                | "codex.toml"
+                | ".codex.toml"
                 | ".codex"
                 | ".gemini"
                 | ".opencode"

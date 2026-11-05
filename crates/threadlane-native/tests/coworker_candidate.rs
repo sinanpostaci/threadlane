@@ -1261,13 +1261,17 @@ async fn valid_complete_subject_bound_closure_json_accepted_and_cached_on_repeat
     assert!(!verdict.execution_evidence.grants_merge_or_push_authority);
     assert!(!verdict.execution_evidence.substitutes_for_required_checks);
     assert_eq!(
-        verdict.execution_evidence.observed_model,
-        "gemini-4-argon-high"
+        verdict.execution_evidence.observed_model.as_deref(),
+        Some("gemini-4-argon-high")
     );
     assert_eq!(
         verdict.execution_evidence.observed_effort.as_deref(),
         Some("high")
     );
+    assert!(verdict
+        .execution_evidence
+        .pinned_launch_configuration
+        .is_none());
     assert_eq!(first_outcome.job.phase, CoworkerJobPhase::Completed);
     assert_eq!(
         first_outcome.job.combined_candidates[0].status,
@@ -3379,4 +3383,483 @@ async fn legacy_inline_closure_artifact_remains_readable_without_rewriting_unrel
         .load_closure_execution_artifact(BINDING_ID, THREAD_UUID, &job_main.job_id, &attempt_id)
         .expect_err("record with neither artifact_ref nor execution_report must fail closed");
     assert_eq!(neither_err.code, NativeErrorCode::ValidationFailed);
+}
+
+#[tokio::test]
+async fn codex_cli_final_candidate_closure_persists_pinned_launch_configuration_with_absent_observed_telemetry_and_honest_observation(
+) {
+    let fixture = setup_fixture();
+    let fake_codex_exe = fixture
+        .fake_agy_exe
+        .parent()
+        .expect("bin dir")
+        .join("fake-codex");
+    write_executable_script(&fake_codex_exe, "#!/bin/sh\nexit 0\n");
+
+    let snap0 = fixture.registry.snapshot().expect("snapshot 0");
+    fixture
+        .registry
+        .apply(
+            snap0.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Codex CLI".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(fake_codex_exe.clone()),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert tool-codex");
+    let snap1 = fixture.registry.snapshot().expect("snapshot 1");
+    fixture
+        .registry
+        .apply(
+            snap1.revision,
+            RegistryChange::UpsertModels {
+                models: vec![
+                    ModelDefinition {
+                        id: "model-argon".to_string(),
+                        tool_id: "tool-agy".to_string(),
+                        label: "Gemini 4 Argon High".to_string(),
+                        model_arg: "gemini-4-argon-high".to_string(),
+                        efforts: vec!["high".to_string()],
+                        allow_no_effort: false,
+                    },
+                    ModelDefinition {
+                        id: "model-sol".to_string(),
+                        tool_id: "tool-codex".to_string(),
+                        label: "GPT 6.1 Sol".to_string(),
+                        model_arg: "gpt-6.1-sol".to_string(),
+                        efforts: vec!["xhigh".to_string()],
+                        allow_no_effort: false,
+                    },
+                ],
+            },
+        )
+        .expect("upsert models with model-sol");
+    let snap2 = fixture.registry.snapshot().expect("snapshot 2");
+    fixture
+        .registry
+        .apply(
+            snap2.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-coworker".to_string(),
+                    name: "Coworker Headless Profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Reviewer,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Closure,
+                            difficulty: Some(Difficulty::Extreme),
+                            choice: ModelChoice {
+                                model_id: "model-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("upsert profile with Codex Closure");
+
+    let codex_closure_choice = SelectedRoleChoice {
+        tool_id: "tool-codex".to_string(),
+        adapter: ToolAdapter::CodexCli,
+        route: RoleExecutionRoute::HeadlessWorker,
+        model_id: "model-sol".to_string(),
+        model_arg: "gpt-6.1-sol".to_string(),
+        effort: Some("xhigh".to_string()),
+        matched_difficulty: Some(Difficulty::Extreme),
+    };
+    let codex_policy = ExecutionPolicy {
+        schema_version: 1,
+        policy_id: "policy-coworker-exec".to_string(),
+        allow_rules: vec![
+            PolicyAllowRule {
+                tool_id: "tool-agy".to_string(),
+                model_id: "model-argon".to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Coder, WorkflowRole::Reviewer],
+            },
+            PolicyAllowRule {
+                tool_id: "tool-codex".to_string(),
+                model_id: "model-sol".to_string(),
+                efforts: vec!["xhigh".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Closure],
+            },
+        ],
+    };
+
+    let project_base =
+        CanonicalProjectBaseRef::resolve_and_validate(&fixture.repo_dir, &fixture.base_commit)
+            .expect("resolve project_base");
+    let job = fixture
+        .workflow_store
+        .create_or_amend_job(&CreateCoworkerJobRequest {
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            request_key: "req-job-codex-closure".to_string(),
+            expected_ledger_revision: None,
+            work_brief: WorkBrief {
+                brief_id: "brf_codex_closure".to_string(),
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                project_base,
+                kind: WorkBriefKind::NewJob,
+                summary: "Verify Codex CLI read-only closure with pinned launch configuration"
+                    .to_string(),
+                confirmed_requirements: vec!["Honest telemetry".to_string()],
+                proposed_additions: Vec::new(),
+                assumptions: Vec::new(),
+                open_questions: Vec::new(),
+                accepted_architect_decisions: Vec::new(),
+            },
+            amended_target_task_ids: Vec::new(),
+            amended_write_paths: Vec::new(),
+            amended_interfaces: Vec::new(),
+        })
+        .expect("create job");
+
+    let tasks = vec![
+        PlanTask {
+            id: "task-alpha".to_string(),
+            title: "Task Alpha".to_string(),
+            instruction: "Update src/alpha.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/alpha.rs".to_string()],
+        },
+        PlanTask {
+            id: "task-beta".to_string(),
+            title: "Task Beta".to_string(),
+            instruction: "Update src/beta.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/beta.rs".to_string()],
+        },
+    ];
+    let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+    let draft = fixture
+        .plans
+        .change_at(
+            0,
+            PlanChange::SaveDraft {
+                plan_id: "plan-codex-closure".to_string(),
+                binding_id: BINDING_ID.to_string(),
+                profile_id: "profile-coworker".to_string(),
+                profile_revision: reg_snap.revision,
+                summary: "Plan codex closure".to_string(),
+                tasks,
+            },
+            1_700_000_000_000,
+        )
+        .expect("save draft");
+    let published = fixture
+        .plans
+        .change(
+            draft.revision,
+            PlanChange::Publish {
+                plan_id: "plan-codex-closure".to_string(),
+                revision: draft.revision,
+            },
+        )
+        .expect("publish plan");
+    let compiled = compile_plan_revision(&published, &reg_snap).expect("compile plan");
+    let summary = fixture
+        .authority
+        .approve_at(
+            OperatorApprovalRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                plan_id: "plan-codex-closure".to_string(),
+                plan_revision: published.revision,
+                expected_registry_revision: reg_snap.revision,
+                expected_plan_digest: compiled.plan_digest,
+                repository_path: fixture.repo_dir.clone(),
+                base_commit: fixture.base_commit.clone(),
+                approved_task_ids: vec!["task-alpha".to_string(), "task-beta".to_string()],
+                approved_write_paths: vec!["src/alpha.rs".to_string(), "src/beta.rs".to_string()],
+                max_parallel: 2,
+                budgets: ExecutionBudgets::default(),
+            },
+            1_700_000_001_000,
+        )
+        .expect("approve plan");
+
+    let cap_env = FrozenControllerCapabilityEnvelope {
+        allowed_reviewer_choices: vec![headless_argon_choice(Difficulty::Hard)],
+        allowed_closure_choices: vec![codex_closure_choice.clone()],
+        max_in_scope_correction_attempts: 2,
+        allowed_check_ids: vec!["cargo_fmt".to_string(), "cargo_test".to_string()],
+        local_git_integration_allowed: true,
+        allow_check_failure_corrections: false,
+    };
+    let mut task_interfaces = BTreeMap::new();
+    task_interfaces.insert(
+        "task-alpha".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_alpha".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    task_interfaces.insert(
+        "task-beta".to_string(),
+        TaskInterfaceOwnershipSpec {
+            owned_interfaces: vec!["iface_beta".to_string()],
+            consumed_interfaces: Vec::new(),
+        },
+    );
+    let bound_job = fixture
+        .workflow_store
+        .bind_job_approval(
+            &BindJobApprovalRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id,
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                approval_id: summary.approval_id,
+                policy: codex_policy.clone(),
+                controller_envelope: Some(cap_env),
+                task_interfaces,
+            },
+            &fixture.authority,
+        )
+        .expect("bind job approval");
+
+    let mut role_budgets = BTreeMap::new();
+    role_budgets.insert(
+        WorkflowRole::Coder,
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+    );
+    role_budgets.insert(
+        WorkflowRole::Reviewer,
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 4),
+    );
+    role_budgets.insert(
+        WorkflowRole::Closure,
+        ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Closure, 2),
+    );
+    let preview_req = FreezeControllerExecutionEnvelopeRequest {
+        binding_id: BINDING_ID.to_string(),
+        thread_uuid: THREAD_UUID.to_string(),
+        job_id: bound_job.job_id.clone(),
+        expected_job_revision: bound_job.job_revision,
+        policy: codex_policy,
+        reviewer_choice: headless_argon_choice(Difficulty::Hard),
+        closure_choice: codex_closure_choice,
+        role_budgets,
+        max_in_scope_corrections_per_task: 1,
+        max_total_corrections_per_job: 2,
+        max_total_task_attempts_per_job: 4,
+        check_commands: default_check_commands(&fixture),
+        allow_task_worktree_commits: true,
+        allow_run_integration_execution: true,
+        default_integration_strategy: IntegrationStrategy::FastForwardOnly,
+        independence_completeness_receipt: None,
+        shadow_jev_policy: None,
+        created_at_ms: 1_700_000_100_000,
+        operator_attested: false,
+        confirm_approval_subject_digest: None,
+        confirm_envelope_digest: None,
+    };
+    let preview = fixture
+        .policy_store
+        .preview_execution_envelope(&preview_req, &bound_job, &fixture.authority)
+        .expect("preview codex closure envelope");
+    let mut freeze_req = preview_req;
+    freeze_req.operator_attested = true;
+    freeze_req.confirm_approval_subject_digest = Some(preview.approval_subject_digest);
+    freeze_req.confirm_envelope_digest = Some(preview.envelope_digest);
+    fixture
+        .policy_store
+        .record_execution_envelope(&freeze_req, &bound_job, &fixture.authority)
+        .expect("freeze codex closure envelope");
+
+    let pred_a = commit_review_and_integrate_task_in_work_area(
+        &fixture,
+        "task-alpha",
+        "tokca",
+        "src/alpha.rs",
+        "pub fn alpha() -> u32 {\n    77\n}\n",
+        IntegrationStrategy::FastForwardOnly,
+        1_700_000_110_000,
+    );
+    let pred_b = commit_review_and_integrate_task_in_work_area(
+        &fixture,
+        "task-beta",
+        "tokcb",
+        "src/beta.rs",
+        "pub fn beta() -> u32 {\n    88\n}\n",
+        IntegrationStrategy::MergeNoFf,
+        1_700_000_120_000,
+    );
+    let job = record_integrated_task_on_job(&fixture, bound_job, &pred_a, "src/alpha.rs");
+    let job = record_integrated_task_on_job(&fixture, job, &pred_b, "src/beta.rs");
+
+    let assembled = fixture
+        .candidate_service
+        .assemble_and_inspect_operations_candidate(
+            &fixture.authority,
+            &fixture.policy_store,
+            &AssembleOperationsFinalCandidateRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: "req_codex_closure_assemble".to_string(),
+                work_area_root: fixture.work_area_root.clone(),
+                run_id: fixture.run_id.clone(),
+                integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+                check_evidence: default_check_evidence(),
+                closure_task_id: "task-closure".to_string(),
+                reserve_closure_attempt: true,
+                reserved_at_ms: 1_700_000_900_000,
+            },
+        )
+        .expect("assemble candidate for codex closure");
+
+    assert_eq!(
+        assembled.final_subject.policy.requested_provider,
+        "codex_cli"
+    );
+    assert_eq!(
+        assembled.final_subject.policy.requested_model,
+        "gpt-6.1-sol"
+    );
+    assert_eq!(
+        assembled.final_subject.policy.requested_effort.as_deref(),
+        Some("xhigh")
+    );
+    assert!(assembled.final_subject.policy.require_effort_evidence);
+
+    let payload = StructuredClosureModelResponse {
+        schema_version: STRUCTURED_CLOSURE_RESPONSE_SCHEMA_VERSION,
+        subject_digest: assembled.final_subject.subject_digest.clone(),
+        candidate_tree_sha: assembled.final_subject.candidate_tree_sha.clone(),
+        outcome: ClosureVerdictKind::Accepted,
+        summary: "Codex read-only closure verified final candidate.".to_string(),
+        findings: Vec::new(),
+    };
+    let payload_str = serde_json::to_string(&payload).expect("serialize codex closure response");
+    let line_thread = serde_json::json!({
+        "type": "thread.started",
+        "thread_id": "019d8e5f-1111-7222-8333-444455556666"
+    })
+    .to_string();
+    let line_turn_start = serde_json::json!({
+        "type": "turn.started"
+    })
+    .to_string();
+    let line_item = serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "item_1",
+            "type": "agent_message",
+            "text": payload_str
+        }
+    })
+    .to_string();
+    let line_turn_done = serde_json::json!({
+        "type": "turn.completed",
+        "usage": {
+            "input_tokens": 1200,
+            "cached_input_tokens": 400,
+            "output_tokens": 95
+        }
+    })
+    .to_string();
+    let codex_script = format!(
+        "#!/bin/sh\n\
+         echo 1 >> \"{}\"\n\
+         printf '%s\\n' '{}'\n\
+         printf '%s\\n' '{}'\n\
+         printf '%s\\n' '{}'\n\
+         printf '%s\\n' '{}'\n\
+         exit 0\n",
+        fixture.launch_count_file.display(),
+        line_thread.replace('\'', "'\\''"),
+        line_turn_start.replace('\'', "'\\''"),
+        line_item.replace('\'', "'\\''"),
+        line_turn_done.replace('\'', "'\\''"),
+    );
+    write_executable_script(&fake_codex_exe, &codex_script);
+
+    let outcome = fixture
+        .candidate_service
+        .execute_final_candidate_closure(
+            &fixture.authority,
+            &fixture.policy_store,
+            &ExecuteFinalCandidateClosureRequest {
+                binding_id: BINDING_ID.to_string(),
+                thread_uuid: THREAD_UUID.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: assembled.job.job_revision,
+                expected_ledger_revision: None,
+                command_key: "req_codex_closure_assemble".to_string(),
+                combined_candidate_id: assembled.combined_candidate.combined_candidate_id.clone(),
+                final_subject: assembled.final_subject.clone(),
+                current_time_ms: 1_700_000_910_000,
+            },
+        )
+        .await
+        .expect("execute codex_cli final candidate closure");
+
+    let verdict = outcome.verdict.as_ref().expect("accepted codex verdict");
+    assert_eq!(verdict.kind, ClosureVerdictKind::Accepted);
+    assert_eq!(verdict.execution_evidence.observed_provider, "codex_cli");
+    assert_eq!(
+        verdict.execution_evidence.observed_model, None,
+        "codex_cli closure must never fabricate runtime observed_model telemetry"
+    );
+    assert_eq!(
+        verdict.execution_evidence.observed_effort, None,
+        "codex_cli closure must never fabricate runtime observed_effort telemetry"
+    );
+    let pin = verdict
+        .execution_evidence
+        .pinned_launch_configuration
+        .as_ref()
+        .expect("pinned_launch_configuration must be recorded for codex_cli closure");
+    assert_eq!(pin.requested_model, "gpt-6.1-sol");
+    assert_eq!(pin.requested_effort, "xhigh");
+    assert_eq!(pin.constructed_argv_sha256.len(), 64);
+
+    let loaded_artifact = fixture
+        .policy_store
+        .load_closure_execution_artifact(
+            BINDING_ID,
+            THREAD_UUID,
+            &job.job_id,
+            &outcome.attempt.attempt_id,
+        )
+        .expect("load codex closure sidecar artifact");
+    assert_eq!(loaded_artifact.observed_model, None);
+    assert_eq!(loaded_artifact.observed_effort, None);
+    assert!(loaded_artifact
+        .execution_report
+        .has_pinned_codex_read_only_launch_config());
 }

@@ -36,6 +36,7 @@ import {
   formatRunningCountLabel,
   formatRequesterEvidence,
   formatRequesterIdentity,
+  formatRequesterSelectedModel,
   formatRequesterSummary,
   isLocalMcpExecutor,
   projectActivityFeed,
@@ -1891,5 +1892,112 @@ describe('activity feed request projection', () => {
     assert.equal(projectRequestExecutorDisplay(unknownHistoric).role, 'Executor not recorded');
     assert.equal(projectRequestExecutorDisplay(unknownHistoric).model, null);
     assert.equal(formatCompactUsage(unknownHistoric.usage).value, 'Usage not reported');
+  });
+
+  it('displays native Coworker selected model and effort without claiming runtime-observed execution', () => {
+    const legacyActor = makeActor({
+      label: 'Codex · Follower Onboarding',
+      role: 'coworker',
+      source: 'paired_mcp',
+      model: null,
+      effort: null,
+      evidence: 'configured',
+    });
+    assert.equal(formatRequesterSelectedModel(legacyActor), null);
+    const legacyView = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({ actor: legacyActor })
+    );
+    assert.equal(legacyView.requesterLine.value, 'Codex · Follower Onboarding');
+    assert.equal(legacyView.requesterLine.evidence, 'Configured');
+    assert.equal(legacyView.actorSelectedModel, 'Not reported');
+    assert.equal(legacyView.actorSelectedEffort, 'Not reported');
+    assert.equal(legacyView.actorSelectedSummary, 'Not reported');
+    assert.equal(legacyView.actorModel, 'Not reported');
+    assert.equal(legacyView.actorEffort, 'Not reported');
+
+    const selectedCoworker = makeActor({
+      label: 'Codex · Follower Onboarding',
+      role: 'coworker',
+      source: 'paired_mcp',
+      model: null,
+      effort: null,
+      selected_model: 'Sol',
+      selected_effort: 'xhigh',
+      evidence: 'configured',
+    });
+    assert.equal(
+      formatRequesterSelectedModel(selectedCoworker),
+      'Sol · xhigh (selected)'
+    );
+    assert.equal(
+      formatRequesterSelectedModel({
+        ...selectedCoworker,
+        selected_effort: null,
+      }),
+      'Sol (selected)'
+    );
+
+    const localMcpExecutor = makeExecutor({
+      tool: 'threadlane_mcp',
+      provider: 'local',
+      role: null,
+      requested_model: null,
+      observed_model: null,
+      requested_effort: null,
+      observed_effort: null,
+    });
+    const view = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        actor: selectedCoworker,
+        executor: localMcpExecutor,
+        usage: null,
+        children: [],
+        children_count: 0,
+      })
+    );
+    assert.equal(
+      view.requesterLine.value,
+      'Codex · Follower Onboarding · Sol · xhigh (selected)'
+    );
+    assert.equal(view.requesterLine.evidence, 'Configured');
+    assert.equal(
+      view.requesterLine.detail,
+      'Requester Codex · Follower Onboarding · Sol · xhigh (selected) · Configured.'
+    );
+    assert.equal(
+      view.requesterSummary,
+      'Requester: Codex · Follower Onboarding · Sol · xhigh (selected) (Configured)'
+    );
+    assert.equal(view.actorSelectedModel, 'Sol');
+    assert.equal(view.actorSelectedEffort, 'xhigh');
+    assert.equal(view.actorSelectedSummary, 'Sol · xhigh (selected)');
+    // Runtime-observed actor model/effort remain strictly separate and unreported.
+    assert.equal(view.actorModel, 'Not reported');
+    assert.equal(view.actorEffort, 'Not reported');
+    // Executor rows and usage remain untouched.
+    assert.equal(view.requestedModel, 'Not reported');
+    assert.equal(view.observedModel, 'Not reported');
+    assert.equal(projectRequestExecutorDisplay(view).role, 'Threadlane MCP');
+    assert.equal(projectRequestExecutorDisplay(view).model, 'Local operation');
+    assert.equal(formatCompactUsage(view.usage).value, 'Local operation');
+
+    const requesterEvent = view.timeline.find((e) => e.kind === 'requester');
+    assert.ok(requesterEvent);
+    assert.deepEqual(requesterEvent.lines, [
+      'Evidence: Configured',
+      'Source: paired_mcp · role coworker',
+      'Configured: Sol · xhigh (selected)',
+      'Model: Not reported · effort Not reported',
+    ]);
+    const timelineDisplay = projectTimelineDisplay(view, requesterEvent);
+    assert.equal(
+      timelineDisplay.detail,
+      'Codex · Follower Onboarding · Coworker · Sol · xhigh (selected) · paired_mcp'
+    );
+    assert.ok(
+      timelineDisplay.lines.includes('Configured model: Sol · xhigh (selected)')
+    );
   });
 });

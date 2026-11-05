@@ -45,10 +45,11 @@ use crate::conversation_change::ConversationChangeStore;
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, read_private_file_bounded, sanitize_diagnostic_text,
-    validate_bounded_identifier, validate_executable_path, write_private_file_atomic,
+    validate_bounded_identifier, write_private_file_atomic,
 };
 use crate::profile_flow::{
-    preflight, PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
+    normalize_read_only_advisory_choice, preflight, resolve_advisory_tool_executable,
+    PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
     SelectedRoleChoice,
 };
 use crate::role_flow::read_registry_snapshot_readonly;
@@ -991,7 +992,7 @@ fn resolve_frozen_reviewer_route(
     if reviewer_choice.route != RoleExecutionRoute::HeadlessWorker
         || !matches!(
             reviewer_choice.adapter,
-            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
         )
     {
         return Err(NativeError::new(
@@ -1060,7 +1061,15 @@ fn resolve_frozen_reviewer_route(
             format!("Reviewer preflight blocked: {}", outcome.detail),
         ));
     }
-    if outcome.selected.as_ref() != Some(&reviewer_choice) {
+    let raw_live_choice = outcome.selected.as_ref().ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "Reviewer preflight marked ready without selected choice",
+        )
+    })?;
+    let live_reviewer_choice =
+        normalize_read_only_advisory_choice(WorkflowRole::Reviewer, raw_live_choice)?;
+    if live_reviewer_choice != reviewer_choice {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             "live registry Reviewer resolution does not match frozen envelope reviewer_choice",
@@ -1089,16 +1098,7 @@ fn resolve_frozen_reviewer_route(
             ),
         ));
     }
-    let raw_executable = tool_def.executable_path.as_ref().ok_or_else(|| {
-        NativeError::new(
-            NativeErrorCode::UnsupportedCapability,
-            format!(
-                "frozen Reviewer tool `{}` has no configured headless executable_path",
-                reviewer_choice.tool_id
-            ),
-        )
-    })?;
-    let executable = validate_executable_path(raw_executable).map_err(|err| {
+    let executable = resolve_advisory_tool_executable(tool_def).map_err(|err| {
         NativeError::new(
             NativeErrorCode::UnsupportedCapability,
             format!(
@@ -1112,6 +1112,7 @@ fn resolve_frozen_reviewer_route(
     let provider = match reviewer_choice.adapter {
         ToolAdapter::Antigravity => WorkerProvider::Antigravity,
         ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        ToolAdapter::CodexCli => WorkerProvider::CodexCli,
         _ => {
             return Err(NativeError::new(
                 NativeErrorCode::UnsupportedCapability,

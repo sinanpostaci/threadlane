@@ -2582,4 +2582,682 @@ mod tests {
             .expect_err("corrupt legacy follower reference must still fail closed");
         assert_eq!(corrupt_err.code(), "corrupt_store");
     }
+
+    #[test]
+    fn published_plan_read_and_list_after_registry_advance_retains_original_digest_and_tasks_across_reopen(
+    ) {
+        let (_tmp, registry, plans, reg_rev) = setup_stores();
+        let reg_dir = registry.config_dir().to_path_buf();
+        let plans_dir = plans.dir().to_path_buf();
+
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("create workflow");
+
+        let tasks_v1 = vec![
+            sample_task(
+                "task-easy",
+                WorkflowRole::Coder,
+                Difficulty::Easy,
+                &[],
+                &["crates/threadlane-workflow/src/journal.rs"],
+                "Implement journal provenance helper",
+            ),
+            sample_task(
+                "task-hard",
+                WorkflowRole::Coder,
+                Difficulty::Hard,
+                &["task-easy"],
+                &["crates/threadlane-workflow/src/service.rs"],
+                "Wire historical summary digest fallback",
+            ),
+            sample_task(
+                "task-review",
+                WorkflowRole::Reviewer,
+                Difficulty::Hard,
+                &["task-hard"],
+                &["crates/threadlane-workflow/src/lib.rs"],
+                "Review historical plan digest tests",
+            ),
+        ];
+
+        // 1. Save and publish `plan-hist-v1` at `reg_rev`.
+        let draft_v1 = wf
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-hist-v1".to_string(),
+                plan_id: Some("plan-hist-v1".to_string()),
+                expected_revision: 0,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Historical published plan v1".to_string(),
+                tasks: tasks_v1.clone(),
+            })
+            .expect("save draft v1");
+        let original_digest = draft_v1
+            .plan_digest
+            .clone()
+            .expect("draft v1 compiled plan_digest");
+
+        let published_v1 = wf.publish("plan-hist-v1", 1).expect("publish v1");
+        assert_eq!(published_v1.header.status, PlanStatus::Published);
+        assert_eq!(
+            published_v1.header.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+
+        // 2. Save and publish `plan-hist-applied` at `reg_rev`, then advance its receipt to `Applied`.
+        let applied_tasks = vec![sample_task(
+            "task-1",
+            WorkflowRole::Coder,
+            Difficulty::Easy,
+            &[],
+            &["src/applied.rs"],
+            "Applied task instruction",
+        )];
+        let draft_applied = wf
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-hist-applied".to_string(),
+                plan_id: Some("plan-hist-applied".to_string()),
+                expected_revision: 0,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Historical applied plan".to_string(),
+                tasks: applied_tasks.clone(),
+            })
+            .expect("save draft applied");
+        let applied_digest = draft_applied
+            .plan_digest
+            .clone()
+            .expect("draft applied digest");
+        wf.publish("plan-hist-applied", 1).expect("publish applied");
+        plans
+            .change(
+                1,
+                PlanChange::Receive {
+                    plan_id: "plan-hist-applied".to_string(),
+                    revision: 1,
+                },
+            )
+            .expect("receive plan-hist-applied");
+        plans
+            .change(
+                1,
+                PlanChange::Apply {
+                    plan_id: "plan-hist-applied".to_string(),
+                    revision: 1,
+                },
+            )
+            .expect("apply plan-hist-applied");
+
+        // 3. Save an unpublished `Draft` plan at `reg_rev`.
+        wf.save_draft(SavePlanDraft {
+            command_key: "cmd-hist-draft".to_string(),
+            plan_id: Some("plan-hist-draft".to_string()),
+            expected_revision: 0,
+            profile_id: "default-profile".to_string(),
+            profile_revision: reg_rev,
+            summary: "Unpublished draft at old registry revision".to_string(),
+            tasks: applied_tasks.clone(),
+        })
+        .expect("save unpublished draft");
+
+        // 4. Advance the global registry across multiple revisions, changing role assignments on
+        // `default-profile` (`Coder` Easy changed from `deepseek-flash` to `argon-high`) and
+        // subsequently disabling `opencode`.
+        let reassigned_profile = WorkflowProfile {
+            id: "default-profile".to_string(),
+            name: "Default Workflow Profile Reassigned".to_string(),
+            assignments: vec![
+                RoleAssignment {
+                    role: WorkflowRole::Coder,
+                    difficulty: Some(Difficulty::Easy),
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("medium".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Coder,
+                    difficulty: Some(Difficulty::Hard),
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+                RoleAssignment {
+                    role: WorkflowRole::Reviewer,
+                    difficulty: None,
+                    choice: ModelChoice {
+                        model_id: "argon-high".to_string(),
+                        effort: Some("high".to_string()),
+                    },
+                },
+            ],
+            decision_advisor: None,
+        };
+        let s_reassigned = registry
+            .apply(
+                reg_rev,
+                RegistryChange::UpsertProfile {
+                    profile: reassigned_profile,
+                },
+            )
+            .expect("reassign default-profile");
+
+        // Verify that compiling the same tasks against the reassigned profile at `s_reassigned.revision`
+        // would produce a DIFFERENT `plan_digest` than `original_digest`.
+        let synthetic_reassigned_rev = PlanRevision {
+            plan_id: "plan-hist-v1".to_string(),
+            binding_id: "binding-1".to_string(),
+            revision: 1,
+            profile_id: "default-profile".to_string(),
+            profile_revision: s_reassigned.revision,
+            summary: "Historical published plan v1".to_string(),
+            tasks: tasks_v1.clone(),
+            status: PlanStatus::Published,
+            created_at_ms: published_v1.header.created_at_ms,
+        };
+        let reassigned_compiled =
+            compile_plan_revision(&synthetic_reassigned_rev, &s_reassigned).expect("compile new");
+        assert_ne!(
+            reassigned_compiled.plan_digest, original_digest,
+            "changed role choices must produce a distinct compiled digest and never be substituted for historical v1"
+        );
+
+        let s_disabled = registry
+            .apply(
+                s_reassigned.revision,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("opencode", ToolAdapter::OpencodeV2, false),
+                },
+            )
+            .expect("disable opencode tool");
+        assert!(s_disabled.revision > reg_rev);
+
+        // 5. Verify `get_plan` and `list_plans` preserve the exact original compiled `plan_digest`
+        // and tasks for `Published` and `Applied` plans, while reporting `None` for the stale `Draft`.
+        for rev_arg in [Some(1), None] {
+            let page = wf
+                .get_plan("plan-hist-v1", rev_arg, None, None)
+                .expect("get_plan historical published v1");
+            assert_eq!(page.header.plan_id, "plan-hist-v1");
+            assert_eq!(page.header.revision, 1);
+            assert_eq!(page.header.profile_id, "default-profile");
+            assert_eq!(page.header.profile_revision, reg_rev);
+            assert_eq!(page.header.status, PlanStatus::Published);
+            assert_eq!(
+                page.header.plan_digest.as_deref(),
+                Some(original_digest.as_str())
+            );
+            assert_eq!(page.tasks, tasks_v1);
+        }
+
+        let applied_page = wf
+            .get_plan("plan-hist-applied", Some(1), None, None)
+            .expect("get_plan historical applied");
+        assert_eq!(applied_page.header.status, PlanStatus::Applied);
+        assert_eq!(
+            applied_page.header.plan_digest.as_deref(),
+            Some(applied_digest.as_str())
+        );
+        assert_eq!(applied_page.tasks, applied_tasks);
+
+        let draft_page = wf
+            .get_plan("plan-hist-draft", None, None, None)
+            .expect("get_plan stale draft");
+        assert_eq!(draft_page.header.status, PlanStatus::Draft);
+        assert_eq!(draft_page.header.plan_digest, None);
+
+        let listed = wf.list_plans(None, None).expect("list_plans");
+        assert_eq!(listed.plans.len(), 3);
+        let listed_v1 = listed
+            .plans
+            .iter()
+            .find(|p| p.plan_id == "plan-hist-v1")
+            .expect("plan-hist-v1 in list_plans");
+        assert_eq!(
+            listed_v1.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+        let listed_applied = listed
+            .plans
+            .iter()
+            .find(|p| p.plan_id == "plan-hist-applied")
+            .expect("plan-hist-applied in list_plans");
+        assert_eq!(
+            listed_applied.plan_digest.as_deref(),
+            Some(applied_digest.as_str())
+        );
+        let listed_draft = listed
+            .plans
+            .iter()
+            .find(|p| p.plan_id == "plan-hist-draft")
+            .expect("plan-hist-draft in list_plans");
+        assert_eq!(listed_draft.plan_digest, None);
+
+        // 6. Reopen stores and `ScopedWorkflow` from disk; verify historical digests and tasks survive reopen.
+        drop(wf);
+        drop(plans);
+        drop(registry);
+
+        let reopened_reg = Arc::new(RegistryStore::open(&reg_dir).expect("reopen reg"));
+        let reopened_plans = Arc::new(PlanStore::open(&plans_dir).expect("reopen plans"));
+        let reopened_wf = ScopedWorkflow::new(
+            Arc::clone(&reopened_reg),
+            Arc::clone(&reopened_plans),
+            "binding-1".into(),
+        )
+        .expect("reopen wf");
+
+        let reopened_page = reopened_wf
+            .get_plan("plan-hist-v1", Some(1), None, None)
+            .expect("get_plan after reopen");
+        assert_eq!(
+            reopened_page.header.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+        assert_eq!(reopened_page.tasks, tasks_v1);
+
+        let reopened_list = reopened_wf
+            .list_plans(None, None)
+            .expect("list_plans after reopen");
+        let reopened_listed_v1 = reopened_list
+            .plans
+            .iter()
+            .find(|p| p.plan_id == "plan-hist-v1")
+            .expect("plan-hist-v1 after reopen");
+        assert_eq!(
+            reopened_listed_v1.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+
+        // 7. Verify stale `publish` and `save_draft` registry-drift gates remain strictly enforced.
+        let stale_draft_pub = reopened_wf
+            .publish("plan-hist-draft", 1)
+            .expect_err("publishing stale draft must fail");
+        assert_eq!(stale_draft_pub.code(), "profile_revision_mismatch");
+
+        let stale_pub_repeat = reopened_wf
+            .publish("plan-hist-v1", 1)
+            .expect_err("publish call on historical published plan after registry drift must fail");
+        assert_eq!(stale_pub_repeat.code(), "profile_revision_mismatch");
+
+        let stale_save_err = reopened_wf
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-stale-save".to_string(),
+                plan_id: Some("plan-hist-v1".to_string()),
+                expected_revision: 1,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Attempt new draft with stale profile_revision".to_string(),
+                tasks: tasks_v1.clone(),
+            })
+            .expect_err("saving new draft with stale profile_revision must fail");
+        assert_eq!(stale_save_err.code(), "profile_revision_mismatch");
+
+        // 8. Save and publish v2 at current registry revision, then advance registry again:
+        // superseded v1 must report `plan_digest: None` while published v2 retains its v2 digest.
+        let draft_v2 = reopened_wf
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-hist-v2".to_string(),
+                plan_id: Some("plan-hist-v1".to_string()),
+                expected_revision: 1,
+                profile_id: "default-profile".to_string(),
+                profile_revision: s_disabled.revision,
+                summary: "Historical published plan v2".to_string(),
+                tasks: tasks_v1.clone(),
+            })
+            .expect("save draft v2 at current registry revision");
+        let v2_digest = draft_v2.plan_digest.clone().expect("v2 digest");
+        reopened_wf
+            .publish("plan-hist-v1", 2)
+            .expect("publish v2 at current registry revision");
+
+        reopened_reg
+            .apply(
+                s_disabled.revision,
+                RegistryChange::SetDefaultProfile { profile_id: None },
+            )
+            .expect("advance registry after v2 publish");
+
+        let superseded_v1 = reopened_wf
+            .get_plan("plan-hist-v1", Some(1), None, None)
+            .expect("get superseded v1");
+        assert_eq!(superseded_v1.header.status, PlanStatus::Superseded);
+        assert_eq!(superseded_v1.header.plan_digest, None);
+
+        let historical_v2 = reopened_wf
+            .get_plan("plan-hist-v1", Some(2), None, None)
+            .expect("get historical published v2");
+        assert_eq!(historical_v2.header.status, PlanStatus::Published);
+        assert_eq!(
+            historical_v2.header.plan_digest.as_deref(),
+            Some(v2_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn historical_plan_read_rejects_untrusted_journals_and_creates_no_locks_or_mutations() {
+        let (_tmp, registry, plans, reg_rev) = setup_stores();
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("wf");
+        let wf_other = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-2".into(),
+        )
+        .expect("wf_other");
+
+        let tasks = vec![sample_task(
+            "t1",
+            WorkflowRole::Coder,
+            Difficulty::Hard,
+            &[],
+            &["crates/threadlane-workflow/src/service.rs"],
+            "Original task instruction for provenance verification",
+        )];
+
+        let draft = wf
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-prov-v1".to_string(),
+                plan_id: Some("plan-prov".to_string()),
+                expected_revision: 0,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Provenance plan summary".to_string(),
+                tasks: tasks.clone(),
+            })
+            .expect("save_draft");
+        let original_digest = draft.plan_digest.expect("original plan_digest");
+        wf.publish("plan-prov", 1).expect("publish");
+
+        // Also save a draft in `binding-2` with the exact same `plan_id`, `summary`, and `tasks`
+        // (using a separate PlanStore or after testing cross-binding journal file replacement).
+        wf_other
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-prov-other".to_string(),
+                plan_id: Some("plan-prov-other".to_string()),
+                expected_revision: 0,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Provenance plan summary".to_string(),
+                tasks: tasks.clone(),
+            })
+            .expect("wf_other save_draft");
+
+        // Advance registry so `plan-prov` requires historical journal provenance.
+        registry
+            .apply(
+                reg_rev,
+                RegistryChange::SetDefaultProfile { profile_id: None },
+            )
+            .expect("advance registry");
+
+        let journal_path = wf.command_journal_path().to_path_buf();
+        let valid_journal_bytes = fs::read(&journal_path).expect("read valid journal bytes");
+        let valid_journal: PersistedCommandJournal =
+            serde_json::from_slice(&valid_journal_bytes).expect("parse valid journal");
+        let original_plans_bytes =
+            fs::read(plans.dir().join("plans.json")).expect("read plans.json");
+        let original_registry_bytes =
+            fs::read(registry.registry_path()).expect("read registry.json");
+
+        // Remove command journal `.lock` files so we can verify read-only calls never recreate them.
+        for entry in fs::read_dir(plans.dir()).expect("read plans_dir") {
+            let path = entry.expect("dir entry").path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("workflow-commands-") && n.ends_with(".lock"))
+            {
+                fs::remove_file(&path).expect("remove journal lock file");
+            }
+        }
+
+        let snapshot_dir_names = |dir: &std::path::Path| -> std::collections::BTreeSet<String> {
+            fs::read_dir(dir)
+                .expect("read_dir")
+                .map(|e| {
+                    e.expect("entry")
+                        .file_name()
+                        .into_string()
+                        .expect("utf8 filename")
+                })
+                .collect()
+        };
+        let plans_dir_before = snapshot_dir_names(plans.dir());
+        let reg_dir_before = snapshot_dir_names(registry.config_dir());
+        assert!(!plans_dir_before
+            .iter()
+            .any(|n| n.starts_with("workflow-commands-") && n.ends_with(".lock")));
+
+        // 1. Read-only `get_plan` and `list_plans` return `Some(original_digest)` without creating
+        // lock files, artifacts, or mutating any store file.
+        let page_ok = wf
+            .get_plan("plan-prov", Some(1), None, None)
+            .expect("get_plan ok");
+        assert_eq!(
+            page_ok.header.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+        let list_ok = wf.list_plans(None, None).expect("list_plans ok");
+        assert_eq!(
+            list_ok.plans[0].plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+        assert_eq!(snapshot_dir_names(plans.dir()), plans_dir_before);
+        assert_eq!(snapshot_dir_names(registry.config_dir()), reg_dir_before);
+        assert_eq!(
+            fs::read(&journal_path).expect("journal unchanged"),
+            valid_journal_bytes
+        );
+        assert_eq!(
+            fs::read(plans.dir().join("plans.json")).expect("plans.json unchanged"),
+            original_plans_bytes
+        );
+        assert_eq!(
+            fs::read(registry.registry_path()).expect("registry.json unchanged"),
+            original_registry_bytes
+        );
+
+        let write_private_journal = |bytes: &[u8]| {
+            fs::write(&journal_path, bytes).expect("write journal");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&journal_path, fs::Permissions::from_mode(0o600))
+                    .expect("chmod 0600 journal");
+            }
+        };
+        let assert_digest_not_trusted = |label: &str| {
+            let page = wf
+                .get_plan("plan-prov", Some(1), None, None)
+                .unwrap_or_else(|e| panic!("get_plan failed for {label}: {e}"));
+            assert_eq!(
+                page.header.plan_digest, None,
+                "get_plan must not trust journal for case: {label}"
+            );
+            let list = wf
+                .list_plans(None, None)
+                .unwrap_or_else(|e| panic!("list_plans failed for {label}: {e}"));
+            assert_eq!(
+                list.plans[0].plan_digest, None,
+                "list_plans must not trust journal for case: {label}"
+            );
+        };
+
+        // 2. Missing journal file is not trusted and reading creates no journal or lock files.
+        fs::remove_file(&journal_path).expect("remove journal file");
+        assert_digest_not_trusted("missing journal file");
+        assert!(!journal_path.exists());
+        assert!(!snapshot_dir_names(plans.dir())
+            .iter()
+            .any(|n| n.starts_with("workflow-commands-") && n.ends_with(".lock")));
+
+        // 3. `Pending` and `Failed` journal entries are not trusted.
+        let mut pending_journal = valid_journal.clone();
+        pending_journal.entries[0].state = CommandJournalState::Pending;
+        write_private_journal(
+            &serde_json::to_vec_pretty(&pending_journal).expect("serialize pending"),
+        );
+        assert_digest_not_trusted("Pending journal entry");
+
+        let mut failed_journal = valid_journal.clone();
+        failed_journal.entries[0].state = CommandJournalState::Failed;
+        write_private_journal(
+            &serde_json::to_vec_pretty(&failed_journal).expect("serialize failed"),
+        );
+        assert_digest_not_trusted("Failed journal entry");
+
+        // 4. Tampered `tasks_digest`, `payload_digest`, `summary`, `profile_id`, `profile_revision`,
+        // or inconsistent `plan_digest` in journal are not trusted.
+        let mut bad_tasks_digest = valid_journal.clone();
+        bad_tasks_digest.entries[0].tasks_digest = "0".repeat(64);
+        write_private_journal(
+            &serde_json::to_vec_pretty(&bad_tasks_digest).expect("serialize bad tasks_digest"),
+        );
+        assert_digest_not_trusted("tampered tasks_digest");
+
+        let mut bad_payload_digest = valid_journal.clone();
+        bad_payload_digest.entries[0].payload_digest = "f".repeat(64);
+        write_private_journal(
+            &serde_json::to_vec_pretty(&bad_payload_digest).expect("serialize bad payload_digest"),
+        );
+        assert_digest_not_trusted("tampered payload_digest");
+
+        let mut bad_summary = valid_journal.clone();
+        bad_summary.entries[0].summary = "Tampered summary".to_string();
+        write_private_journal(
+            &serde_json::to_vec_pretty(&bad_summary).expect("serialize bad summary"),
+        );
+        assert_digest_not_trusted("tampered summary");
+
+        let mut bad_profile = valid_journal.clone();
+        bad_profile.entries[0].profile_id = "other-profile".to_string();
+        write_private_journal(
+            &serde_json::to_vec_pretty(&bad_profile).expect("serialize bad profile_id"),
+        );
+        assert_digest_not_trusted("tampered profile_id");
+
+        let mut bad_profile_rev = valid_journal.clone();
+        bad_profile_rev.entries[0].profile_revision = reg_rev + 1;
+        write_private_journal(
+            &serde_json::to_vec_pretty(&bad_profile_rev).expect("serialize bad profile_revision"),
+        );
+        assert_digest_not_trusted("tampered profile_revision");
+
+        let mut mismatched_plan_digest = valid_journal.clone();
+        mismatched_plan_digest.entries[0].plan_digest = Some("a".repeat(64));
+        write_private_journal(
+            &serde_json::to_vec_pretty(&mismatched_plan_digest)
+                .expect("serialize mismatched plan_digest"),
+        );
+        assert_digest_not_trusted("inconsistent entry.plan_digest vs Completed.plan_digest");
+
+        let mut missing_entry_digest = valid_journal.clone();
+        missing_entry_digest.entries[0].plan_digest = None;
+        write_private_journal(
+            &serde_json::to_vec_pretty(&missing_entry_digest)
+                .expect("serialize missing entry.plan_digest"),
+        );
+        assert_digest_not_trusted("missing entry.plan_digest");
+
+        // 5. Ambiguous duplicate `Completed` entries or a contradictory `Pending` entry for the same
+        // `(plan_id, revision)` are not trusted.
+        let mut ambiguous_completed = valid_journal.clone();
+        let mut second_completed = valid_journal.entries[0].clone();
+        second_completed.command_key = "cmd-prov-v1-dup".to_string();
+        ambiguous_completed.entries.push(second_completed);
+        write_private_journal(
+            &serde_json::to_vec_pretty(&ambiguous_completed)
+                .expect("serialize ambiguous completed"),
+        );
+        assert_digest_not_trusted("ambiguous duplicate Completed entries");
+
+        let mut conflicting_pending = valid_journal.clone();
+        let mut extra_pending = valid_journal.entries[0].clone();
+        extra_pending.command_key = "cmd-prov-v1-pending".to_string();
+        extra_pending.state = CommandJournalState::Pending;
+        conflicting_pending.entries.push(extra_pending);
+        write_private_journal(
+            &serde_json::to_vec_pretty(&conflicting_pending)
+                .expect("serialize conflicting pending"),
+        );
+        assert_digest_not_trusted("contradictory Pending entry alongside Completed");
+
+        // 6. Cross-binding journal is not trusted.
+        let mut cross_binding_journal = valid_journal.clone();
+        cross_binding_journal.binding_id = "binding-2".to_string();
+        write_private_journal(
+            &serde_json::to_vec_pretty(&cross_binding_journal).expect("serialize cross-binding"),
+        );
+        assert_digest_not_trusted("cross-binding journal");
+
+        // 7. Wrong-revision and wrong-plan journal entries are not trusted.
+        let mut wrong_rev_journal = valid_journal.clone();
+        wrong_rev_journal.entries[0].expected_revision = 1;
+        wrong_rev_journal.entries[0].target_revision = 2;
+        if let CommandJournalState::Completed {
+            ref mut created_revision,
+            ..
+        } = wrong_rev_journal.entries[0].state
+        {
+            *created_revision = 2;
+        }
+        write_private_journal(
+            &serde_json::to_vec_pretty(&wrong_rev_journal).expect("serialize wrong revision"),
+        );
+        assert_digest_not_trusted("wrong-revision journal entry");
+
+        let mut wrong_plan_journal = valid_journal.clone();
+        wrong_plan_journal.entries[0].explicit_plan_id = Some("other-plan".to_string());
+        wrong_plan_journal.entries[0].resolved_plan_id = "other-plan".to_string();
+        write_private_journal(
+            &serde_json::to_vec_pretty(&wrong_plan_journal).expect("serialize wrong plan"),
+        );
+        assert_digest_not_trusted("wrong-plan journal entry");
+
+        // 8. Tampering with the persisted task in `plans.json` while keeping the original valid journal
+        // must fail the recomputed task/payload digest check.
+        write_private_journal(&valid_journal_bytes);
+        let raw_plans = String::from_utf8(original_plans_bytes.clone()).expect("utf8 plans.json");
+        let tampered_plans = raw_plans.replacen(
+            "Original task instruction for provenance verification",
+            "Tampered task instruction in PlanStore after publish",
+            1,
+        );
+        assert_ne!(raw_plans, tampered_plans);
+        let plans_file = plans.dir().join("plans.json");
+        fs::write(&plans_file, tampered_plans.as_bytes()).expect("write tampered plans.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plans_file, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 plans.json");
+        }
+        assert_digest_not_trusted("tampered task instruction in persisted PlanRevision");
+
+        // Restore original `plans.json` and verify the valid journal receipt is trusted again.
+        fs::write(&plans_file, &original_plans_bytes).expect("restore plans.json");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&plans_file, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 plans.json");
+        }
+        let restored_page = wf
+            .get_plan("plan-prov", Some(1), None, None)
+            .expect("get_plan after restore");
+        assert_eq!(
+            restored_page.header.plan_digest.as_deref(),
+            Some(original_digest.as_str())
+        );
+    }
 }

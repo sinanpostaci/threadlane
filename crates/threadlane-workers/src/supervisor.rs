@@ -17,7 +17,8 @@ use crate::fs_safety::{
 use crate::opencode_collector::{self, OpenCodeCollectorContext, OpenCodeCollectorError};
 use crate::opencode_metadata::{OpenCodeMetadataEvidence, OwnedOpenCodeSession};
 use crate::spec::{
-    AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec,
+    is_pinned_codex_read_only_argv, AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget,
+    WorkerProvider, WorkerSpec,
 };
 use crate::stream::{
     FieldEvidence, NdjsonStreamParser, NormalizedWorkerEvent, StreamEvidenceSummary,
@@ -310,8 +311,31 @@ impl WorkerExecutionReport {
         })
     }
 
-    /// Returns `true` if model evidence is satisfied by the stream or by validated OpenCode v2
-    /// session metadata without any model conflict.
+    /// Returns `true` when this report is for a [`WorkerProvider::CodexCli`] read-only advisory
+    /// invocation whose `constructed_argv` matches the exact pinned launch configuration for
+    /// `self.requested_model` (`--no-daemon exec --json --ephemeral --ignore-user-config --model`,
+    /// `-c` overrides for `model_reasoning_effort`, `approval_policy`, `model_provider`,
+    /// `default_permissions`, `permissions.threadlane-advisory`, `web_search`, and all disabled
+    /// capability flags).
+    ///
+    /// Because Codex CLI `exec --json` does not emit runtime model or reasoning-effort telemetry
+    /// in its JSONL event stream, this launch-pinned configuration check provides requested-only
+    /// launch evidence for `CodexCli` without fabricating `effective_observed_model()` or
+    /// `effective_observed_effort()` and without relaxing strict observed evidence rules for
+    /// [`WorkerProvider::Antigravity`] or [`WorkerProvider::OpenCodeV2`].
+    #[must_use]
+    pub fn has_pinned_codex_read_only_launch_config(&self) -> bool {
+        self.provider == WorkerProvider::CodexCli
+            && self.requested_session_id.is_none()
+            && self.allocated_session_id.is_none()
+            && self.opencode_metadata.is_none()
+            && self.opencode_metadata_error.is_none()
+            && is_pinned_codex_read_only_argv(&self.constructed_argv, &self.requested_model)
+    }
+
+    /// Returns `true` if model evidence is satisfied by the stream, by validated OpenCode v2
+    /// session metadata, or (for [`WorkerProvider::CodexCli`] read-only advisory runs) by an
+    /// exact pinned launch configuration without any stream model conflict.
     pub fn has_satisfied_model_evidence(&self) -> bool {
         if matches!(self.evidence.model_evidence, FieldEvidence::Mismatch { .. })
             || matches!(
@@ -341,11 +365,15 @@ impl WorkerExecutionReport {
         if self.evidence.model_evidence.is_satisfied() {
             return true;
         }
+        if self.provider == WorkerProvider::CodexCli {
+            return self.has_pinned_codex_read_only_launch_config();
+        }
         self.validated_opencode_metadata().is_some()
     }
 
-    /// Returns `true` if effort/variant evidence is satisfied by the stream or by validated
-    /// OpenCode v2 session metadata without any effort conflict.
+    /// Returns `true` if effort/variant evidence is satisfied by the stream, by validated
+    /// OpenCode v2 session metadata, or (for [`WorkerProvider::CodexCli`] read-only advisory
+    /// runs) by an exact pinned launch configuration without any stream effort conflict.
     pub fn has_satisfied_effort_evidence(&self) -> bool {
         if matches!(
             self.evidence.effort_evidence,
@@ -386,6 +414,9 @@ impl WorkerExecutionReport {
         if self.evidence.effort_evidence.is_satisfied() {
             return true;
         }
+        if self.provider == WorkerProvider::CodexCli {
+            return self.has_pinned_codex_read_only_launch_config();
+        }
         self.validated_opencode_metadata().is_some()
     }
 
@@ -395,6 +426,11 @@ impl WorkerExecutionReport {
         if self.status == WorkerRunStatus::SessionMismatch
             || self.opencode_metadata_error.as_deref() == Some("ownership_mismatch")
             || !self.evidence.session_evidence.is_satisfied()
+        {
+            return false;
+        }
+        if self.provider == WorkerProvider::CodexCli
+            && (!self.evidence.saw_init_event || self.evidence.observed_session_id.is_none())
         {
             return false;
         }
@@ -445,8 +481,10 @@ impl WorkerExecutionReport {
 
     /// Returns `true` if the worker exited 0 cleanly without timeout, overflow, cleanup issues,
     /// blocked events, provider errors, malformed lines, or metadata errors, and has complete
-    /// model, effort, session, and completion evidence from the stream (or from validated
-    /// OpenCode v2 session metadata on an owned session run).
+    /// model, effort, session, and completion evidence from the stream, from validated
+    /// OpenCode v2 session metadata on an owned session run, or from a launch-pinned
+    /// [`WorkerProvider::CodexCli`] read-only advisory run with verified thread and turn
+    /// completion evidence.
     pub fn has_complete_natural_completion_evidence(&self) -> bool {
         if self.exit_code != Some(0)
             || self.signal.is_some()
@@ -459,6 +497,19 @@ impl WorkerExecutionReport {
             || self.opencode_metadata_error.is_some()
         {
             return false;
+        }
+
+        if self.provider == WorkerProvider::CodexCli {
+            return self.has_pinned_codex_read_only_launch_config()
+                && !matches!(self.evidence.model_evidence, FieldEvidence::Mismatch { .. })
+                && !matches!(
+                    self.evidence.effort_evidence,
+                    FieldEvidence::Mismatch { .. }
+                )
+                && self.evidence.saw_init_event
+                && self.evidence.observed_session_id.is_some()
+                && self.evidence.session_evidence.is_satisfied()
+                && self.evidence.saw_result_event;
         }
 
         let stream_complete = self.evidence.model_evidence.is_satisfied()
@@ -1280,6 +1331,9 @@ where
     let (exit_code, signal) = extract_exit_code_and_signal(exit_status);
 
     let mut status = classify_run_status(
+        provider,
+        &resolved_model,
+        &constructed_argv,
         cancelled,
         timed_out,
         final_overflow,
@@ -1664,7 +1718,11 @@ pub(crate) fn extract_exit_code_and_signal(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_run_status(
+    provider: WorkerProvider,
+    resolved_model: &ResolvedModelTarget,
+    constructed_argv: &[String],
     cancelled: bool,
     timed_out: bool,
     overflow: Option<OutputOverflowKind>,
@@ -1705,6 +1763,21 @@ fn classify_run_status(
     }
     if matches!(evidence.session_evidence, FieldEvidence::Mismatch { .. }) {
         return WorkerRunStatus::SessionMismatch;
+    }
+    if provider == WorkerProvider::CodexCli {
+        if !is_pinned_codex_read_only_argv(constructed_argv, resolved_model) {
+            return WorkerRunStatus::MissingModelEvidence;
+        }
+        if !evidence.saw_result_event {
+            return WorkerRunStatus::MissingResultEvidence;
+        }
+        if !evidence.saw_init_event
+            || evidence.observed_session_id.is_none()
+            || !evidence.session_evidence.is_satisfied()
+        {
+            return WorkerRunStatus::SessionMismatch;
+        }
+        return WorkerRunStatus::Succeeded;
     }
     if matches!(evidence.model_evidence, FieldEvidence::Missing { .. }) {
         return WorkerRunStatus::MissingModelEvidence;

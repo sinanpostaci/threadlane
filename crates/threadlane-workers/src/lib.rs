@@ -9,10 +9,10 @@
 //!
 //! ## Key Boundaries and Invariants
 //!
-//! - **Explicit trusted inputs**: Provider (`antigravity` or `opencode_v2`), absolute non-symlink
-//!   executable path, exact requested model and effort/variant, canonical repository path,
-//!   base commit, private work area, and allowed repository-relative write paths are validated
-//!   before launch.
+//! - **Explicit trusted inputs**: Provider (`antigravity`, `opencode_v2`, or read-only advisory
+//!   `codex_cli`), absolute non-symlink executable path, exact requested model and effort/variant,
+//!   canonical repository path, base commit, private work area, and allowed repository-relative
+//!   write paths are validated before launch.
 //! - **Exact argument arrays**: Never invokes a shell, never invents unsupported flags (such as
 //!   `--variant`), and never adds `--dangerously-skip-permissions` or `--auto`.
 //! - **Incremental bounded NDJSON & evidence verification**: Captures stdout and stderr in bounded
@@ -112,11 +112,12 @@ pub use permissions::{
     build_antigravity_task_files_settings_json_for_scopes, build_opencode_config_content,
     build_opencode_config_content_json, evaluate_antigravity_settings, evaluate_opencode_rules,
     is_unsafe_permission_pattern_char, validate_advisory_provider_and_mode,
-    validate_advisory_read_only_workdir, validate_permission_pattern_path,
-    validate_permission_pattern_str, AntigravityPermissionsBlock, AntigravitySessionSettings,
-    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
-    OpenCodeRuleEffect, WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
-    AGY_PROTECTED_READ_DENY_PATTERNS, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    validate_advisory_read_only_workdir, validate_codex_advisory_workdir,
+    validate_permission_pattern_path, validate_permission_pattern_str, AntigravityPermissionsBlock,
+    AntigravitySessionSettings, OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject,
+    OpenCodePermissionRule, OpenCodeRuleEffect, WorkerFilePermissions,
+    AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS, AGY_PROTECTED_READ_DENY_PATTERNS,
+    AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS, CODEX_PROJECT_CONFIG_MARKERS,
     MAX_OPENCODE_CONFIG_BYTES, MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS,
     OPENCODE_CONFIG_ENV_VAR, OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS,
     OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS, OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
@@ -124,17 +125,19 @@ pub use permissions::{
 pub use spec::resolve_model_target;
 pub use spec::{
     is_control_config_path, is_path_allowed, is_path_allowed_by_scopes, is_path_allowed_syntactic,
-    validate_commit_ref, validate_repo_relative_path, validate_simple_identifier,
-    AdvisorySpecValidationReport, AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget,
-    SpecValidationReport, WorkerPolicy, WorkerProvider, WorkerSpec, WriteScopeKind,
-    DEFAULT_MAX_EVENTS, DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES,
-    DEFAULT_TIMEOUT_MS, MAX_EVENTS, MAX_IDENTIFIER_LEN, MAX_LINE_BYTES, MAX_PATH_ENTRY_LEN,
-    MAX_PROMPT_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
+    is_pinned_codex_read_only_argv, validate_commit_ref, validate_repo_relative_path,
+    validate_simple_identifier, AdvisorySpecValidationReport, AdvisoryWorkerSpec, ExecutionBudgets,
+    ResolvedModelTarget, SpecValidationReport, WorkerPolicy, WorkerProvider, WorkerSpec,
+    WriteScopeKind, CODEX_ADVISORY_DISABLED_FEATURES, CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG,
+    CODEX_ADVISORY_PERMISSION_PROFILE_NAME, DEFAULT_MAX_EVENTS, DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_MAX_STDERR_BYTES, DEFAULT_MAX_STDOUT_BYTES, DEFAULT_TIMEOUT_MS, MAX_EVENTS,
+    MAX_IDENTIFIER_LEN, MAX_LINE_BYTES, MAX_PATH_ENTRY_LEN, MAX_PROMPT_BYTES, MAX_STDERR_BYTES,
+    MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
 pub use stream::{
     BlockedEvidence, BlockedKind, EffortEvidenceSource, FieldEvidence, MalformedLineDiagnostic,
     NdjsonStreamParser, NormalizedEventKind, NormalizedWorkerEvent, ProviderErrorEvidence,
-    StreamEvidenceSummary,
+    StreamEvidenceSummary, StreamTokenUsage,
 };
 pub use supervisor::{
     is_process_alive, is_process_group_alive, run_advisory_worker, run_advisory_worker_with_cancel,

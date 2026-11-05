@@ -62,8 +62,8 @@ use threadlane_workflow::{
 };
 
 use crate::coworker_observation::{
-    begin_coworker_call_observation, extract_observed_model_and_effort, CoworkerCallFinishSpec,
-    CoworkerCallObservationSpec, CoworkerObservationExecutorSpec,
+    begin_coworker_call_observation, extract_observed_model_and_effort, extract_observed_usage,
+    CoworkerCallFinishSpec, CoworkerCallObservationSpec, CoworkerObservationExecutorSpec,
     COWORKER_OBS_OP_PLANNING_ARCHITECT, COWORKER_OBS_OP_PLANNING_ORCHESTRATOR,
 };
 use crate::coworker_workflow::contracts::{
@@ -91,7 +91,8 @@ use crate::planning_commands::{
     PlanningCommandPayload, PlanningCommandRecord, PlanningCommandStatus, PlanningRecoveryTarget,
 };
 use crate::profile_flow::{
-    preflight, PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
+    normalize_read_only_advisory_choice, preflight, resolve_advisory_tool_executable,
+    PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
     SelectedRoleChoice,
 };
 use crate::role_flow::read_registry_snapshot_readonly;
@@ -1168,6 +1169,7 @@ impl PersistedPlanningCallArtifact {
         let provider_str = match execution.provider {
             WorkerProvider::Antigravity => "antigravity",
             WorkerProvider::OpenCodeV2 => "opencode_v2",
+            WorkerProvider::CodexCli => "codex_cli",
         };
         let duration_str = execution.duration_ms.to_string();
         let stdout_str = execution.stdout_bytes_captured.to_string();
@@ -1278,6 +1280,7 @@ impl PersistedPlanningCallArtifact {
         let expected_provider = match self.selected_choice.adapter {
             ToolAdapter::Antigravity => WorkerProvider::Antigravity,
             ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+            ToolAdapter::CodexCli => WorkerProvider::CodexCli,
             _ => {
                 return Err(NativeError::new(
                     NativeErrorCode::ProtocolError,
@@ -2429,6 +2432,7 @@ impl CoworkerPlanningService {
 
         let (observed_model, observed_effort) =
             extract_observed_model_and_effort(&structured_exec.execution);
+        let observed_usage = extract_observed_usage(&structured_exec.execution);
         let failed_call_state = if structured_exec.execution.status == WorkerRunStatus::Cancelled {
             ObservationCallState::Cancelled
         } else {
@@ -2440,6 +2444,7 @@ impl CoworkerPlanningService {
                 state: Some(failed_call_state),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 artifact_id: Some(artifact_id.clone()),
                 diagnostic: Some("architect_post_snapshot_check_failed".to_string()),
                 ..Default::default()
@@ -2468,6 +2473,7 @@ impl CoworkerPlanningService {
                 state: Some(failed_call_state),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 artifact_id: Some(artifact_id.clone()),
                 diagnostic: Some("architect_missing_or_invalid_response".to_string()),
                 ..Default::default()
@@ -2506,6 +2512,7 @@ impl CoworkerPlanningService {
                     state: Some(failed_call_state),
                     observed_model,
                     observed_effort,
+                    usage: observed_usage,
                     artifact_id: Some(artifact_id.clone()),
                     diagnostic: Some("architect_invalid_json_response".to_string()),
                     ..Default::default()
@@ -2538,6 +2545,7 @@ impl CoworkerPlanningService {
                         state: Some(failed_call_state),
                         observed_model,
                         observed_effort,
+                        usage: observed_usage,
                         artifact_id: Some(artifact_id.clone()),
                         diagnostic: Some("architect_output_validation_failed".to_string()),
                         ..Default::default()
@@ -2603,6 +2611,7 @@ impl CoworkerPlanningService {
                 state: Some(ObservationCallState::Unknown),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 run_id: Some(run_id),
                 artifact_id: Some(artifact_id),
                 diagnostic: Some("architect_artifact_persist_failed".to_string()),
@@ -2648,6 +2657,7 @@ impl CoworkerPlanningService {
             state: Some(ObservationCallState::Completed),
             observed_model,
             observed_effort,
+            usage: observed_usage,
             run_id: Some(run_id),
             receipt_id: Some(record.advice_id.clone()),
             artifact_id: Some(artifact_id),
@@ -3630,6 +3640,7 @@ impl CoworkerPlanningService {
 
         let (observed_model, observed_effort) =
             extract_observed_model_and_effort(&structured_exec.execution);
+        let observed_usage = extract_observed_usage(&structured_exec.execution);
         let failed_call_state = if structured_exec.execution.status == WorkerRunStatus::Cancelled {
             ObservationCallState::Cancelled
         } else {
@@ -3641,6 +3652,7 @@ impl CoworkerPlanningService {
                 state: Some(failed_call_state),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 artifact_id: Some(artifact_id.clone()),
                 diagnostic: Some("orchestrator_post_snapshot_check_failed".to_string()),
                 ..Default::default()
@@ -3669,6 +3681,7 @@ impl CoworkerPlanningService {
                 state: Some(failed_call_state),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 artifact_id: Some(artifact_id.clone()),
                 diagnostic: Some("orchestrator_missing_or_invalid_response".to_string()),
                 ..Default::default()
@@ -3707,6 +3720,7 @@ impl CoworkerPlanningService {
                     state: Some(failed_call_state),
                     observed_model,
                     observed_effort,
+                    usage: observed_usage,
                     artifact_id: Some(artifact_id.clone()),
                     diagnostic: Some("orchestrator_invalid_json_response".to_string()),
                     ..Default::default()
@@ -3739,6 +3753,7 @@ impl CoworkerPlanningService {
                 state: Some(failed_call_state),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 artifact_id: Some(artifact_id.clone()),
                 diagnostic: Some("orchestrator_output_validation_failed".to_string()),
                 ..Default::default()
@@ -3803,6 +3818,7 @@ impl CoworkerPlanningService {
                 state: Some(ObservationCallState::Unknown),
                 observed_model,
                 observed_effort,
+                usage: observed_usage,
                 run_id: Some(run_id),
                 artifact_id: Some(artifact_id),
                 diagnostic: Some("orchestrator_artifact_persist_failed".to_string()),
@@ -3831,6 +3847,7 @@ impl CoworkerPlanningService {
             state: Some(ObservationCallState::Completed),
             observed_model,
             observed_effort,
+            usage: observed_usage,
             run_id: Some(run_id),
             artifact_id: Some(artifact_id),
             ..Default::default()
@@ -4727,23 +4744,24 @@ fn resolve_headless_planning_worker(
         ));
     }
 
-    let selected = outcome.selected.clone().ok_or_else(|| {
+    let raw_selected = outcome.selected.clone().ok_or_else(|| {
         NativeError::new(
             NativeErrorCode::ValidationFailed,
             "preflight outcome marked ready without SelectedRoleChoice",
         )
     })?;
+    let selected = normalize_read_only_advisory_choice(role, &raw_selected)?;
 
     if selected.route != RoleExecutionRoute::HeadlessWorker
         || !matches!(
             selected.adapter,
-            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
         )
     {
         return Err(NativeError::new(
             NativeErrorCode::UnsupportedCapability,
             format!(
-                "planning role `{role:?}` resolved to unsupported non-headless route `{:?}` (`{:?}`); only Antigravity and OpenCodeV2 headless worker routes are supported",
+                "planning role `{role:?}` resolved to unsupported non-headless route `{:?}` (`{:?}`); only Antigravity, OpenCodeV2, and CodexCli headless worker routes are supported",
                 selected.route, selected.adapter
             ),
         ));
@@ -4754,8 +4772,8 @@ fn resolve_headless_planning_worker(
     let provider = match selected.adapter {
         ToolAdapter::Antigravity => WorkerProvider::Antigravity,
         ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
-        ToolAdapter::CodexCli
-        | ToolAdapter::JevApi
+        ToolAdapter::CodexCli => WorkerProvider::CodexCli,
+        ToolAdapter::JevApi
         | ToolAdapter::OpenaiDecisionsApi
         | ToolAdapter::Git
         | ToolAdapter::Tmux
@@ -4783,12 +4801,7 @@ fn resolve_headless_planning_worker(
             "resolved planning tool is disabled in registry snapshot",
         ));
     }
-    let executable_path = tool_def.executable_path.clone().ok_or_else(|| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "resolved planning tool has no configured executable_path",
-        )
-    })?;
+    let executable_path = resolve_advisory_tool_executable(tool_def)?;
 
     Ok((selected, provider, executable_path))
 }

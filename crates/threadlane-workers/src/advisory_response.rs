@@ -18,8 +18,16 @@
 //!   with an explicit `step_finish` (`part.type == "step-finish"`, `reason == "stop"`). Partial/delta
 //!   text snapshots, unfinished `part.time` records, duplicate or conflicting text parts in a step,
 //!   tool-result spoofing, and unsupported event shapes are explicitly rejected.
+//! - **Codex CLI (`codex_cli`)**: Captures only from a completed `type: "item.completed"` event
+//!   whose `item.type == "agent_message"` contains a non-empty UTF-8 string `item.text` inside a
+//!   `thread.started` -> `turn.started` -> `turn.completed` lifecycle. Terminal `turn.failed` and
+//!   `error` events, missing `thread.started` or `turn.completed` framing, conflicting `thread_id`
+//!   values, duplicate/conflicting final agent messages, and tool/command spoofing are rejected.
+//!   Because `codex exec --json` does not emit runtime model or reasoning-effort telemetry on stdout,
+//!   observed model/effort fields remain `None` unless genuinely emitted by the CLI while completion
+//!   relies on the verified pinned read-only launch configuration (`--model` + `-c model_reasoning_effort`).
 //! - **Untrusted model data**: A verified [`BoundedAdvisoryResponse`] proves only that the supervised
-//!   provider process exited cleanly with matching CLI-reported model/effort/session/terminal evidence
+//!   provider process exited cleanly with matching CLI-reported or launch-pinned evidence
 //!   and emitted a complete UTF-8 JSON object within [`AdvisoryResponseBudget`]. Parsing a valid JSON
 //!   object grants no execution authority, approves no scope, and executes no tools.
 
@@ -38,8 +46,8 @@ use crate::spec::{
     ResolvedModelTarget, WorkerProvider, DEFAULT_MAX_LINE_BYTES, MAX_IDENTIFIER_LEN, MAX_LINE_BYTES,
 };
 use crate::stream::{
-    has_object_error_field, trim_ascii_whitespace, EffortEvidenceSource,
-    MAX_DIAGNOSTIC_SUMMARY_BYTES,
+    extract_genuine_turn_usage, has_object_error_field, trim_ascii_whitespace,
+    EffortEvidenceSource, StreamTokenUsage, MAX_DIAGNOSTIC_SUMMARY_BYTES,
 };
 use crate::supervisor::{WorkerExecutionReport, WorkerRunStatus};
 
@@ -99,6 +107,9 @@ pub enum AdvisoryResponseSource {
     /// Captured from OpenCode v2's complete assistant `type: "text"` (`part.type == "text"`) event
     /// sealed by a terminal `type: "step_finish"` (`part.type == "step-finish"`, `reason == "stop"`).
     OpenCodeAssistantTextPartStop,
+    /// Captured from Codex CLI's completed `type: "item.completed"` (`item.type == "agent_message"`)
+    /// event sealed by a terminal `type: "turn.completed"` event.
+    CodexAgentMessageTurnCompleted,
 }
 
 impl AdvisoryResponseSource {
@@ -108,6 +119,7 @@ impl AdvisoryResponseSource {
         match self {
             Self::AntigravityFinalResultResponse => "antigravity_final_result_response",
             Self::OpenCodeAssistantTextPartStop => "opencode_assistant_text_part_stop",
+            Self::CodexAgentMessageTurnCompleted => "codex_agent_message_turn_completed",
         }
     }
 }
@@ -120,7 +132,7 @@ pub struct AdvisoryResponseFraming {
     pub response_line_number: usize,
     /// 1-based stdout NDJSON line number of the terminal completion event that sealed the response.
     pub terminal_line_number: usize,
-    /// Verified session/conversation ID bound to the response framing, when observed.
+    /// Verified session/conversation/thread ID bound to the response framing, when observed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Verified assistant message ID bound to the response framing, when observed (OpenCode v2).
@@ -129,10 +141,16 @@ pub struct AdvisoryResponseFraming {
     /// Verified assistant text part ID bound to the response framing, when observed (OpenCode v2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub part_id: Option<String>,
+    /// Verified completed item ID bound to the response framing, when observed (Codex CLI `item.id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     /// Provenance of observed stream effort evidence (`direct_stream_metadata` or
     /// `antigravity_catalog_model_variant`), when effort was verified from the stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_evidence_source: Option<EffortEvidenceSource>,
+    /// Genuine token usage telemetry observed on the terminal completion event, when emitted by the CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<StreamTokenUsage>,
 }
 
 /// Verified, byte-bounded complete UTF-8 structured advisory response from a read-only worker run.
@@ -257,6 +275,7 @@ impl BoundedAdvisoryResponse {
             ("session_id", self.framing.session_id.as_deref()),
             ("message_id", self.framing.message_id.as_deref()),
             ("part_id", self.framing.part_id.as_deref()),
+            ("item_id", self.framing.item_id.as_deref()),
         ] {
             if let Some(id_val) = id_opt {
                 if !is_safe_stream_id(id_val) {
@@ -283,9 +302,12 @@ impl BoundedAdvisoryResponse {
                             .to_string(),
                     ));
                 }
-                if self.framing.message_id.is_some() || self.framing.part_id.is_some() {
+                if self.framing.message_id.is_some()
+                    || self.framing.part_id.is_some()
+                    || self.framing.item_id.is_some()
+                {
                     return Err(WorkerError::InvalidSpec(
-                        "Antigravity advisory response framing must not carry OpenCode message_id or part_id"
+                        "Antigravity advisory response framing must not carry OpenCode message_id/part_id or Codex item_id"
                             .to_string(),
                     ));
                 }
@@ -305,11 +327,59 @@ impl BoundedAdvisoryResponse {
                             .to_string(),
                     ));
                 }
+                if self.framing.item_id.is_some() {
+                    return Err(WorkerError::InvalidSpec(
+                        "OpenCode v2 advisory response framing must not carry Codex item_id"
+                            .to_string(),
+                    ));
+                }
                 if self.framing.effort_evidence_source
                     == Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
                 {
                     return Err(WorkerError::InvalidSpec(
                         "OpenCode v2 advisory response framing cannot use AntigravityCatalogModelVariant effort source"
+                            .to_string(),
+                    ));
+                }
+            }
+            WorkerProvider::CodexCli => {
+                if self.source != AdvisoryResponseSource::CodexAgentMessageTurnCompleted {
+                    return Err(WorkerError::InvalidSpec(format!(
+                        "Codex CLI advisory response has incompatible source `{}`",
+                        self.source.as_str()
+                    )));
+                }
+                if self.framing.response_line_number < 2
+                    || self.framing.terminal_line_number <= self.framing.response_line_number
+                {
+                    return Err(WorkerError::InvalidSpec(
+                        "Codex CLI advisory response framing requires 2 <= response_line_number < terminal_line_number"
+                            .to_string(),
+                    ));
+                }
+                if self.framing.session_id.is_none() {
+                    return Err(WorkerError::InvalidSpec(
+                        "Codex CLI advisory response framing requires a verified thread_id in session_id"
+                            .to_string(),
+                    ));
+                }
+                if self.framing.item_id.is_none() {
+                    return Err(WorkerError::InvalidSpec(
+                        "Codex CLI advisory response framing requires a verified item_id"
+                            .to_string(),
+                    ));
+                }
+                if self.framing.message_id.is_some() || self.framing.part_id.is_some() {
+                    return Err(WorkerError::InvalidSpec(
+                        "Codex CLI advisory response framing must not carry OpenCode message_id or part_id"
+                            .to_string(),
+                    ));
+                }
+                if self.framing.effort_evidence_source
+                    == Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
+                {
+                    return Err(WorkerError::InvalidSpec(
+                        "Codex CLI advisory response framing cannot use AntigravityCatalogModelVariant effort source"
                             .to_string(),
                     ));
                 }
@@ -566,6 +636,27 @@ impl AdvisoryStructuredExecution {
             }
         }
 
+        if self.execution.provider == WorkerProvider::CodexCli {
+            if !self.execution.has_pinned_codex_read_only_launch_config() {
+                return Err(WorkerError::InvalidSpec(
+                    "Codex CLI advisory execution lacks verified pinned read-only launch configuration"
+                        .to_string(),
+                ));
+            }
+            if self.execution.evidence.observed_session_id.is_none() {
+                return Err(WorkerError::InvalidSpec(
+                    "Codex CLI advisory execution lacks an observed thread_id in stream evidence"
+                        .to_string(),
+                ));
+            }
+            if response.framing.usage != self.execution.evidence.observed_usage {
+                return Err(WorkerError::InvalidSpec(
+                    "Codex CLI advisory response framing usage does not match execution observed_usage"
+                        .to_string(),
+                ));
+            }
+        }
+
         Ok(response)
     }
 
@@ -620,6 +711,7 @@ struct CapturedCandidate {
     session_id: Option<String>,
     message_id: Option<String>,
     part_id: Option<String>,
+    item_id: Option<String>,
 }
 
 /// Incremental stdout collector that captures complete terminal advisory output alongside
@@ -641,6 +733,11 @@ pub(crate) struct AdvisoryResponseCollector {
     oc_step_message_id: Option<String>,
     oc_step_candidate: Option<CapturedCandidate>,
     oc_sealed_candidate: Option<(CapturedCandidate, usize)>,
+    codex_saw_thread_started: bool,
+    codex_in_turn: bool,
+    codex_seen_agent_item_ids: BTreeSet<String>,
+    codex_turn_candidate: Option<CapturedCandidate>,
+    codex_sealed_candidate: Option<(CapturedCandidate, usize, Option<StreamTokenUsage>)>,
 }
 
 impl AdvisoryResponseCollector {
@@ -667,6 +764,11 @@ impl AdvisoryResponseCollector {
             oc_step_message_id: None,
             oc_step_candidate: None,
             oc_sealed_candidate: None,
+            codex_saw_thread_started: false,
+            codex_in_turn: false,
+            codex_seen_agent_item_ids: BTreeSet::new(),
+            codex_turn_candidate: None,
+            codex_sealed_candidate: None,
         }
     }
 
@@ -719,6 +821,7 @@ impl AdvisoryResponseCollector {
         match self.provider {
             WorkerProvider::Antigravity => self.ingest_antigravity_event(line_number, obj),
             WorkerProvider::OpenCodeV2 => self.ingest_opencode_event(line_number, obj),
+            WorkerProvider::CodexCli => self.ingest_codex_event(line_number, obj),
         }
     }
 
@@ -734,10 +837,11 @@ impl AdvisoryResponseCollector {
             obj.get("step_update").and_then(Value::as_object),
             obj.get("result").and_then(Value::as_object),
             obj.get("part").and_then(Value::as_object),
+            obj.get("item").and_then(Value::as_object),
             obj.get("metadata").and_then(Value::as_object),
         ];
         for scope in scopes.into_iter().flatten() {
-            for key in ["conversation_id", "session_id", "sessionID"] {
+            for key in ["conversation_id", "session_id", "sessionID", "thread_id"] {
                 if let Some(val) = scope.get(key) {
                     let Some(s) = val.as_str() else {
                         return Err(AdvisoryResponseError::at_line(
@@ -1249,6 +1353,7 @@ impl AdvisoryResponseCollector {
                     session_id: self.observed_session_id.clone(),
                     message_id: None,
                     part_id: None,
+                    item_id: None,
                 });
             }
             "assistant" | "message" | "text" | "content" => {
@@ -1523,6 +1628,7 @@ impl AdvisoryResponseCollector {
                     session_id: self.observed_session_id.clone(),
                     message_id: self.oc_step_message_id.clone(),
                     part_id,
+                    item_id: None,
                 });
             }
             "step_finish" => {
@@ -1671,6 +1777,424 @@ impl AdvisoryResponseCollector {
         }
     }
 
+    fn ingest_codex_event(&mut self, line_number: usize, obj: &Map<String, Value>) {
+        if self.codex_sealed_candidate.is_some() {
+            self.codex_sealed_candidate = None;
+            self.latch_error(AdvisoryResponseError::at_line(
+                AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                line_number,
+                "Codex CLI stream emitted additional event after terminal turn.completed",
+            ));
+            return;
+        }
+
+        let ty_field = obj.get("type").and_then(Value::as_str);
+        let ev_field = obj.get("event").and_then(Value::as_str);
+        if let (Some(ty), Some(ev)) = (ty_field, ev_field) {
+            if ty != ev {
+                let code = if is_tool_keyword(ty) || is_tool_keyword(ev) {
+                    AdvisoryResponseErrorCode::SpoofedOrToolOutput
+                } else {
+                    AdvisoryResponseErrorCode::UnsupportedFraming
+                };
+                self.latch_error(AdvisoryResponseError::at_line(
+                    code,
+                    line_number,
+                    format!("conflicting Codex `type` (`{ty}`) and `event` (`{ev}`) fields"),
+                ));
+                return;
+            }
+        }
+
+        let event_type = ty_field.or(ev_field).unwrap_or("");
+        let item_obj = obj.get("item").and_then(Value::as_object);
+        let item_type = item_obj.and_then(|i| i.get("type")).and_then(Value::as_str);
+
+        if has_denied_actions(obj, item_obj) {
+            self.latch_error(AdvisoryResponseError::at_line(
+                AdvisoryResponseErrorCode::WorkerExecutionFailed,
+                line_number,
+                "Codex CLI stream event reported denied_actions permission block",
+            ));
+            return;
+        }
+
+        let is_tool = is_tool_keyword(event_type)
+            || item_type.is_some_and(is_codex_tool_item_type)
+            || has_tool_markers(obj)
+            || item_obj.is_some_and(has_tool_markers);
+
+        if !is_tool {
+            if let Err(err) = self.verify_and_record_model_and_effort(line_number, obj, false) {
+                self.latch_error(err);
+                return;
+            }
+        }
+
+        match event_type {
+            "thread.started" => {
+                if is_tool || has_any_error_indicator(obj, None) {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::ProviderError,
+                        line_number,
+                        "Codex thread.started event reported an error or invalid tool marker",
+                    ));
+                    return;
+                }
+                if self.codex_saw_thread_started {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                        line_number,
+                        "Codex CLI stream emitted duplicate thread.started events",
+                    ));
+                    return;
+                }
+                if self.observed_session_id.is_none() {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::SessionEvidenceFailed,
+                        line_number,
+                        "Codex thread.started event is missing a valid `thread_id`",
+                    ));
+                    return;
+                }
+                self.codex_saw_thread_started = true;
+            }
+            "turn.started" => {
+                if is_tool || has_any_error_indicator(obj, None) {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::ProviderError,
+                        line_number,
+                        "Codex turn.started event reported an error or invalid tool marker",
+                    ));
+                    return;
+                }
+                if !self.codex_saw_thread_started {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::MissingTerminalFraming,
+                        line_number,
+                        "Codex turn.started event was not preceded by thread.started",
+                    ));
+                    return;
+                }
+                if self.codex_in_turn {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::UnsupportedFraming,
+                        line_number,
+                        "Codex emitted nested turn.started before closing active turn",
+                    ));
+                    return;
+                }
+                self.codex_in_turn = true;
+                self.codex_turn_candidate = None;
+            }
+            "item.started" | "item.updated" => {
+                if !self.codex_saw_thread_started || !self.codex_in_turn {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::UnsupportedFraming,
+                        line_number,
+                        format!("Codex `{event_type}` occurred outside an active thread/turn"),
+                    ));
+                    return;
+                }
+                let Some(item) = item_obj else {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::UnsupportedFraming,
+                        line_number,
+                        format!("Codex `{event_type}` is missing `item` object"),
+                    ));
+                    return;
+                };
+                if item_type == Some("error")
+                    || (!is_tool && has_any_error_indicator(obj, Some(item)))
+                {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::ProviderError,
+                        line_number,
+                        format!("Codex `{event_type}` reported an error"),
+                    ));
+                    return;
+                }
+                if is_tool && has_codex_candidate_text(item) {
+                    self.saw_tool_output_candidate = true;
+                }
+            }
+            "item.completed" => {
+                if !self.codex_saw_thread_started || !self.codex_in_turn {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::UnsupportedFraming,
+                        line_number,
+                        "Codex item.completed occurred outside an active thread.started/turn.started frame",
+                    ));
+                    return;
+                }
+                let Some(item) = item_obj else {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::UnsupportedFraming,
+                        line_number,
+                        "Codex item.completed event is missing `item` object",
+                    ));
+                    return;
+                };
+                let Some(ity) = item_type else {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::UnsupportedFraming,
+                        line_number,
+                        "Codex item.completed event is missing `item.type`",
+                    ));
+                    return;
+                };
+
+                match ity {
+                    "agent_message" => {
+                        if is_tool || has_non_assistant_role(obj, Some(item)) {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::SpoofedOrToolOutput,
+                                line_number,
+                                "Codex agent_message item contains tool or non-assistant role markers",
+                            ));
+                            return;
+                        }
+                        if has_any_error_indicator(obj, Some(item)) {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::ProviderError,
+                                line_number,
+                                "Codex agent_message item reported an error status",
+                            ));
+                            return;
+                        }
+                        if has_truncation_stop_reason(obj, Some(item))
+                            || obj.contains_key("delta")
+                            || item.contains_key("delta")
+                            || item.get("partial") == Some(&Value::Bool(true))
+                            || item.get("incomplete") == Some(&Value::Bool(true))
+                        {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::IncompleteOrPartialOutput,
+                                line_number,
+                                "Codex agent_message item carries partial, delta, or truncated markers",
+                            ));
+                            return;
+                        }
+
+                        let Some(raw_item_id) = item.get("id").and_then(Value::as_str) else {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::UnsupportedFraming,
+                                line_number,
+                                "Codex agent_message item is missing string `item.id`",
+                            ));
+                            return;
+                        };
+                        let item_id = raw_item_id.trim();
+                        if !is_safe_stream_id(item_id) {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::UnsupportedFraming,
+                                line_number,
+                                "Codex `item.id` is malformed or exceeds bounds",
+                            ));
+                            return;
+                        }
+                        if !self.codex_seen_agent_item_ids.insert(item_id.to_string()) {
+                            self.codex_turn_candidate = None;
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                                line_number,
+                                format!("Codex stream emitted duplicate completed agent_message id `{item_id}`"),
+                            ));
+                            return;
+                        }
+
+                        let Some(text_val) = item.get("text") else {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::MissingResponseOutput,
+                                line_number,
+                                "Codex agent_message item is missing `item.text`",
+                            ));
+                            return;
+                        };
+                        let Some(raw_text) = text_val.as_str() else {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::UnsupportedFraming,
+                                line_number,
+                                "Codex `item.text` must be a UTF-8 string",
+                            ));
+                            return;
+                        };
+                        if raw_text.trim().is_empty() {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::MissingResponseOutput,
+                                line_number,
+                                "Codex `item.text` is empty",
+                            ));
+                            return;
+                        }
+
+                        let byte_count = raw_text.len();
+                        if byte_count > self.budget.max_response_bytes {
+                            self.latch_error(AdvisoryResponseError {
+                                code: AdvisoryResponseErrorCode::ResponseTooLarge,
+                                message: sanitize_and_redact(
+                                    &format!(
+                                        "Codex `item.text` ({byte_count} bytes) exceeds max_response_bytes ({})",
+                                        self.budget.max_response_bytes
+                                    ),
+                                    MAX_DIAGNOSTIC_SUMMARY_BYTES,
+                                ),
+                                line_number: Some(line_number),
+                                observed_bytes: Some(byte_count),
+                                max_response_bytes: Some(self.budget.max_response_bytes),
+                            });
+                            return;
+                        }
+
+                        if self.codex_turn_candidate.is_some() {
+                            self.codex_turn_candidate = None;
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                                line_number,
+                                "Codex turn emitted multiple completed agent_message items",
+                            ));
+                            return;
+                        }
+
+                        self.codex_turn_candidate = Some(CapturedCandidate {
+                            text: raw_text.to_string(),
+                            response_line_number: line_number,
+                            session_id: self.observed_session_id.clone(),
+                            message_id: None,
+                            part_id: None,
+                            item_id: Some(item_id.to_string()),
+                        });
+                    }
+                    "reasoning" | "todo_list" => {
+                        if has_any_error_indicator(obj, Some(item)) {
+                            self.latch_error(AdvisoryResponseError::at_line(
+                                AdvisoryResponseErrorCode::ProviderError,
+                                line_number,
+                                format!("Codex `{ity}` item reported an error"),
+                            ));
+                        }
+                    }
+                    "command_execution" | "mcp_tool_call" | "web_search" | "file_change" => {
+                        self.saw_tool_output_candidate = true;
+                        // A read-only shell command under the scoped permission profile may precede the
+                        // final agent_message, so if an earlier agent_message was buffered in the same
+                        // turn before a tool item completed, clear it so only the final post-tool
+                        // agent_message can seal the turn.
+                        self.codex_turn_candidate = None;
+                    }
+                    "error" => {
+                        self.latch_error(AdvisoryResponseError::at_line(
+                            AdvisoryResponseErrorCode::ProviderError,
+                            line_number,
+                            "Codex stream emitted an error item",
+                        ));
+                    }
+                    other => {
+                        let code = if is_codex_tool_item_type(other) {
+                            AdvisoryResponseErrorCode::SpoofedOrToolOutput
+                        } else {
+                            AdvisoryResponseErrorCode::UnsupportedFraming
+                        };
+                        self.latch_error(AdvisoryResponseError::at_line(
+                            code,
+                            line_number,
+                            format!("unsupported Codex item.completed type `{other}`"),
+                        ));
+                    }
+                }
+            }
+            "turn.completed" => {
+                if is_tool {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::SpoofedOrToolOutput,
+                        line_number,
+                        "Codex turn.completed event contains tool markers",
+                    ));
+                    return;
+                }
+                if !self.codex_saw_thread_started || !self.codex_in_turn {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::MissingTerminalFraming,
+                        line_number,
+                        "Codex turn.completed occurred without an active thread.started and turn.started",
+                    ));
+                    return;
+                }
+                if has_any_error_indicator(obj, None) {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::ProviderError,
+                        line_number,
+                        "Codex turn.completed event reported an error or failure status",
+                    ));
+                    return;
+                }
+                if has_truncation_stop_reason(obj, None) {
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::IncompleteOrPartialOutput,
+                        line_number,
+                        "Codex turn.completed reported a truncated stop reason",
+                    ));
+                    return;
+                }
+
+                let usage = match extract_genuine_turn_usage(obj) {
+                    Ok(u) => u,
+                    Err(msg) => {
+                        self.latch_error(AdvisoryResponseError::at_line(
+                            AdvisoryResponseErrorCode::UnsupportedFraming,
+                            line_number,
+                            msg,
+                        ));
+                        return;
+                    }
+                };
+
+                self.codex_in_turn = false;
+                let Some(mut candidate) = self.codex_turn_candidate.take() else {
+                    let code = if self.saw_tool_output_candidate {
+                        AdvisoryResponseErrorCode::SpoofedOrToolOutput
+                    } else {
+                        AdvisoryResponseErrorCode::MissingResponseOutput
+                    };
+                    self.latch_error(AdvisoryResponseError::at_line(
+                        code,
+                        line_number,
+                        "Codex turn.completed occurred without a completed final agent_message item",
+                    ));
+                    return;
+                };
+                if candidate.session_id.is_none() {
+                    candidate.session_id = self.observed_session_id.clone();
+                }
+                if let Err(err) =
+                    validate_structured_json_object(&candidate.text, candidate.response_line_number)
+                {
+                    self.latch_error(err);
+                    return;
+                }
+                self.codex_sealed_candidate = Some((candidate, line_number, usage));
+            }
+            "turn.failed" | "error" => {
+                self.codex_in_turn = false;
+                self.codex_turn_candidate = None;
+                self.latch_error(AdvisoryResponseError::at_line(
+                    AdvisoryResponseErrorCode::ProviderError,
+                    line_number,
+                    format!("Codex stream emitted terminal failure event `{event_type}`"),
+                ));
+            }
+            other => {
+                self.latch_error(AdvisoryResponseError::at_line(
+                    AdvisoryResponseErrorCode::UnsupportedFraming,
+                    line_number,
+                    format!(
+                        "unsupported Codex CLI stream event `{other}`; expected thread.started, turn.started, item.*, and turn.completed"
+                    ),
+                ));
+            }
+        }
+    }
+
     pub(crate) fn finalize(self, execution: WorkerExecutionReport) -> AdvisoryStructuredExecution {
         if let Some(err) = self.evaluate_failure(&execution) {
             return AdvisoryStructuredExecution {
@@ -1680,7 +2204,7 @@ impl AdvisoryResponseCollector {
             };
         }
 
-        let (candidate, terminal_line_number, source) = match self.provider {
+        let (candidate, terminal_line_number, source, usage) = match self.provider {
             WorkerProvider::Antigravity => {
                 let Some(cand) = self.agy_candidate else {
                     let code = if self.saw_tool_output_candidate {
@@ -1702,6 +2226,7 @@ impl AdvisoryResponseCollector {
                     cand,
                     line,
                     AdvisoryResponseSource::AntigravityFinalResultResponse,
+                    None,
                 )
             }
             WorkerProvider::OpenCodeV2 => {
@@ -1734,6 +2259,40 @@ impl AdvisoryResponseCollector {
                     cand,
                     term_line,
                     AdvisoryResponseSource::OpenCodeAssistantTextPartStop,
+                    None,
+                )
+            }
+            WorkerProvider::CodexCli => {
+                if self.codex_in_turn {
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError::new(
+                            AdvisoryResponseErrorCode::MissingTerminalFraming,
+                            "Codex CLI stream ended before closing the active turn with `turn.completed`",
+                        )),
+                    };
+                }
+                let Some((cand, term_line, turn_usage)) = self.codex_sealed_candidate else {
+                    let code = if self.saw_tool_output_candidate {
+                        AdvisoryResponseErrorCode::SpoofedOrToolOutput
+                    } else {
+                        AdvisoryResponseErrorCode::MissingTerminalFraming
+                    };
+                    return AdvisoryStructuredExecution {
+                        execution,
+                        response: None,
+                        response_error: Some(AdvisoryResponseError::new(
+                            code,
+                            "Codex CLI stream did not emit a completed `agent_message` sealed by `turn.completed`",
+                        )),
+                    };
+                };
+                (
+                    cand,
+                    term_line,
+                    AdvisoryResponseSource::CodexAgentMessageTurnCompleted,
+                    turn_usage.or_else(|| execution.evidence.observed_usage.clone()),
                 )
             }
         };
@@ -1813,7 +2372,9 @@ impl AdvisoryResponseCollector {
                 session_id: final_session_id,
                 message_id: candidate.message_id,
                 part_id: candidate.part_id,
+                item_id: candidate.item_id,
                 effort_evidence_source,
+                usage,
             },
         };
 
@@ -2254,6 +2815,27 @@ fn is_tool_keyword(value: &str) -> bool {
             | "tool_call"
             | "tool-call"
     ) || lower.contains("tool")
+}
+
+fn is_codex_tool_item_type(value: &str) -> bool {
+    is_tool_keyword(value)
+        || matches!(
+            value,
+            "command_execution" | "mcp_tool_call" | "web_search" | "file_change"
+        )
+}
+
+fn has_codex_candidate_text(item: &Map<String, Value>) -> bool {
+    for key in ["text", "aggregated_output", "output", "result"] {
+        if item
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn has_tool_markers(obj: &Map<String, Value>) -> bool {

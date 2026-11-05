@@ -74,9 +74,13 @@ fn unsupported_advisory_providers_and_non_read_only_modes_fail_closed() {
             .expect("opencode_v2 read_only supported"),
         WorkerProvider::OpenCodeV2
     );
+    assert_eq!(
+        validate_advisory_provider_and_mode("codex_cli", WorkerFilePermissions::ReadOnly)
+            .expect("codex_cli read_only supported"),
+        WorkerProvider::CodexCli
+    );
 
     for unsupported_provider in [
-        "codex_cli",
         "jev_api",
         "openai_decisions_api",
         "git",
@@ -94,7 +98,11 @@ fn unsupported_advisory_providers_and_non_read_only_modes_fail_closed() {
         assert!(matches!(err, WorkerError::UnsupportedCapability { .. }));
     }
 
-    for provider in [WorkerProvider::Antigravity, WorkerProvider::OpenCodeV2] {
+    for provider in [
+        WorkerProvider::Antigravity,
+        WorkerProvider::OpenCodeV2,
+        WorkerProvider::CodexCli,
+    ] {
         for non_advisory_mode in [
             WorkerFilePermissions::Inherit,
             WorkerFilePermissions::TaskFiles,
@@ -171,7 +179,11 @@ fn read_only_requires_zero_write_scopes_while_write_modes_require_non_empty_scop
     let empty_scopes = BTreeSet::new();
     let non_empty_scopes = BTreeSet::from(["src/lib.rs".to_string()]);
 
-    for provider in [WorkerProvider::Antigravity, WorkerProvider::OpenCodeV2] {
+    for provider in [
+        WorkerProvider::Antigravity,
+        WorkerProvider::OpenCodeV2,
+        WorkerProvider::CodexCli,
+    ] {
         WorkerFilePermissions::ReadOnly
             .validate_for_provider_and_paths(provider, &empty_scopes)
             .expect("read_only must accept zero write scopes");
@@ -183,7 +195,9 @@ fn read_only_requires_zero_write_scopes_while_write_modes_require_non_empty_scop
         assert!(non_empty_err
             .to_string()
             .contains("allowed_write_paths must be empty when `file_permissions` is `read_only`"));
+    }
 
+    for provider in [WorkerProvider::Antigravity, WorkerProvider::OpenCodeV2] {
         for write_mode in [
             WorkerFilePermissions::Inherit,
             WorkerFilePermissions::TaskFiles,

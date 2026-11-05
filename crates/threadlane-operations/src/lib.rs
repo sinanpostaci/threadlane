@@ -57,10 +57,11 @@ pub use candidate::{
     ClosureVerdictKind, FinalCandidateClosureLedger, FinalCandidateClosureStore,
     FinalCandidatePolicyBinding, FinalCandidateSubject, FinalCandidateTaskInput,
     InspectFinalCandidateRequest, MarkClosureSubmittedRequest, MarkClosureUnknownRequest,
-    ReconcileClosureAttemptRequest, RecordClosureFailureRequest, RecordClosureVerdictRequest,
-    ReserveClosureAttemptRequest, VerifiedCandidateTaskEvidence, CLOSURES_SUBDIR,
-    CLOSURE_LEDGER_FILENAME, CLOSURE_LEDGER_LOCK_FILENAME, FINAL_CANDIDATE_CLOSURE_SCHEMA_VERSION,
-    FINAL_CANDIDATE_SUBJECT_SCHEMA_VERSION, MAX_CLOSURE_ATTEMPTS, MAX_CLOSURE_LEDGER_BYTES,
+    PinnedClosureLaunchConfiguration, ReconcileClosureAttemptRequest, RecordClosureFailureRequest,
+    RecordClosureVerdictRequest, ReserveClosureAttemptRequest, VerifiedCandidateTaskEvidence,
+    CLOSURES_SUBDIR, CLOSURE_LEDGER_FILENAME, CLOSURE_LEDGER_LOCK_FILENAME,
+    FINAL_CANDIDATE_CLOSURE_SCHEMA_VERSION, FINAL_CANDIDATE_SUBJECT_SCHEMA_VERSION,
+    MAX_CLOSURE_ATTEMPTS, MAX_CLOSURE_LEDGER_BYTES,
 };
 pub use capabilities::{
     build_tmux_readonly_descriptor, inspect_codegraph_worktree, inspect_tool_capabilities_passive,

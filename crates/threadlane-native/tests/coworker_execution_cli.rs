@@ -1265,7 +1265,7 @@ async fn coworker_execution_rejects_tampered_checks_caps_models_native_routes_an
         ))
         .await,
         "native route for reviewer_choice",
-        "validation_failed",
+        "unauthorized_operator",
     );
 
     let mut unapproved_model_req = base_req.clone();

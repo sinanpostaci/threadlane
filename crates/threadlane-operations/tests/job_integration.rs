@@ -178,11 +178,12 @@ fn default_execution_evidence(handoff_receipt_id: &str) -> ClosureExecutionEvide
         producer_worker_id: Some("wrk_closure_1".to_string()),
         handoff_receipt_id: handoff_receipt_id.to_string(),
         observed_provider: "codex".to_string(),
-        observed_model: "gpt-6-astra".to_string(),
+        observed_model: Some("gpt-6-astra".to_string()),
         observed_effort: Some("max".to_string()),
         transcript_or_event_digest: "44".repeat(32),
         grants_merge_or_push_authority: false,
         substitutes_for_required_checks: false,
+        pinned_launch_configuration: None,
     }
 }
 

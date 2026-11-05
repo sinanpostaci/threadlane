@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use threadlane_core::observation::{
-    sanitize_observation_summary, ObservationActor, ObservationCall, ObservationCallState,
-    ObservationDelivery, ObservationDeliveryStage, ObservationExecutor, ObservationJob,
-    ObservationJournalRecord, ObservationRecordPhase, ObservationRequest, ObservationUsage,
-    ReadonlyBindingRecord, ReadonlyCoreStateSnapshot, ReadonlyEventBatchRecord,
-    ReadonlyEventRecord, ReadonlyRunRecord, ReadonlyWakeupRecord,
+    sanitize_observation_selection_token, sanitize_observation_summary, ObservationActor,
+    ObservationCall, ObservationCallState, ObservationDelivery, ObservationDeliveryStage,
+    ObservationExecutor, ObservationJob, ObservationJournalRecord, ObservationRecordPhase,
+    ObservationRequest, ObservationUsage, ReadonlyBindingRecord, ReadonlyCoreStateSnapshot,
+    ReadonlyEventBatchRecord, ReadonlyEventRecord, ReadonlyRunRecord, ReadonlyWakeupRecord,
 };
 
 const MAX_REQUEST_CHILDREN: usize = 64;
@@ -2031,6 +2031,10 @@ fn merge_actor(previous: Option<ObservationActor>, next: &ObservationActor) -> O
         source: sanitize_opt(next.source.as_deref()).or(prev.source),
         model: sanitize_opt(next.model.as_deref()).or(prev.model),
         effort: sanitize_opt(next.effort.as_deref()).or(prev.effort),
+        selected_model: sanitize_observation_selection_token(next.selected_model.as_deref())
+            .or(prev.selected_model),
+        selected_effort: sanitize_observation_selection_token(next.selected_effort.as_deref())
+            .or(prev.selected_effort),
         evidence: next.evidence,
     }
 }
@@ -2667,6 +2671,8 @@ mod tests {
             source: Some("journal".to_string()),
             model: Some("gpt-5.4".to_string()),
             effort: Some("high".to_string()),
+            selected_model: None,
+            selected_effort: None,
             evidence: ObservationActorEvidence::Unknown,
         });
 
@@ -3124,6 +3130,8 @@ mod tests {
             source: Some("journal".to_string()),
             model: Some("gpt-5.4-mini".to_string()),
             effort: Some("low".to_string()),
+            selected_model: None,
+            selected_effort: None,
             evidence: ObservationActorEvidence::Unknown,
         };
 
@@ -3172,6 +3180,75 @@ mod tests {
     }
 
     #[test]
+    fn selected_actor_metadata_survives_entry_finish_merge_without_becoming_observed() {
+        let mut selected_entry = base_journal_record(
+            "rec-sel-e",
+            "req-sel",
+            ObservationRecordPhase::Entry,
+            1_000,
+            "mcp.paired.status",
+            ObservationCallState::Running,
+        );
+        let mut selected_actor = ObservationActor::paired_coworker("Main Chat");
+        selected_actor.selected_model = Some("  gpt-6-astra  ".to_string());
+        selected_actor.selected_effort = Some(" high ".to_string());
+        selected_entry.actor = Some(selected_actor);
+
+        let mut selected_finish = base_journal_record(
+            "rec-sel-f",
+            "req-sel",
+            ObservationRecordPhase::Finish,
+            1_500,
+            "mcp.paired.status",
+            ObservationCallState::Completed,
+        );
+        selected_finish.actor = Some(ObservationActor::unknown(Some("paired_mcp".to_string())));
+
+        let mut plain_finish = base_journal_record(
+            "rec-plain-f",
+            "req-plain",
+            ObservationRecordPhase::Finish,
+            1_600,
+            "workflow.save-draft",
+            ObservationCallState::Completed,
+        );
+        plain_finish.actor = Some(ObservationActor::unknown(Some(
+            "trusted_local_operator".to_string(),
+        )));
+
+        let projection = project_requests(
+            SOURCE_ID,
+            &[],
+            &[selected_entry, selected_finish, plain_finish],
+            &[ReadonlyCoreStateSnapshot::default()],
+            &[],
+        );
+
+        let selected_row = projection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-sel")
+            .expect("request with selected metadata should exist");
+        assert_eq!(
+            selected_row.actor.selected_model.as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(selected_row.actor.selected_effort.as_deref(), Some("high"));
+        assert_eq!(selected_row.actor.model, None);
+        assert_eq!(selected_row.actor.effort, None);
+
+        let plain_row = projection
+            .requests
+            .iter()
+            .find(|r| r.id == "req-plain")
+            .expect("request without selected metadata should exist");
+        assert_eq!(plain_row.actor.selected_model, None);
+        assert_eq!(plain_row.actor.selected_effort, None);
+        assert_eq!(plain_row.actor.model, None);
+        assert_eq!(plain_row.actor.effort, None);
+    }
+
+    #[test]
     fn mcp_completed_and_in_flight_metadata_and_live_worker_receipt_behavior() {
         let job = sample_job("job-1", "bnd-1", THREAD_UUID_A, "plan-1", "task-1");
         let live_link = sample_link(
@@ -3191,6 +3268,8 @@ mod tests {
             source: Some("mcp.journal".to_string()),
             model: Some("gpt-5.4".to_string()),
             effort: Some("high".to_string()),
+            selected_model: None,
+            selected_effort: None,
             evidence: ObservationActorEvidence::Unknown,
         };
         let expected_usage = ObservationUsage {
@@ -3678,6 +3757,8 @@ mod tests {
             source: Some("cli.context".to_string()),
             model: Some("gpt-5.4".to_string()),
             effort: Some("high".to_string()),
+            selected_model: None,
+            selected_effort: None,
             evidence: ObservationActorEvidence::Unknown,
         };
 

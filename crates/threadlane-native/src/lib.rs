@@ -2851,12 +2851,14 @@ fi
                 },
             )
             .expect("enroll mcp_auto");
-        mcp_auto.record_test_observation_context(
+        mcp_auto.record_test_observation_context_with_selection(
             binding_auto,
             thread_auto,
             "Follower Onboarding Chat",
             Path::new("/tmp/workspace/follower-repo"),
             Some("proj_follower"),
+            Some("GPT-5.4"),
+            Some("high"),
         );
 
         pairing_store
@@ -2959,6 +2961,8 @@ fi
             // Must never borrow `gpt-follow` or `deepseek-flash` from the workflow profile!
             assert_eq!(actor.model, None);
             assert_eq!(actor.effort, None);
+            assert_eq!(actor.selected_model.as_deref(), Some("GPT-5.4"));
+            assert_eq!(actor.selected_effort.as_deref(), Some("high"));
             assert_eq!(actor.evidence, ObservationActorEvidence::Configured);
             assert_eq!(rec.executor, Some(ObservationExecutor::local_mcp()));
             assert_eq!(rec.usage, None);

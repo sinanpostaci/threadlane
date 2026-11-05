@@ -49,7 +49,7 @@ use threadlane_workers::{
 };
 
 use crate::coworker_observation::{
-    begin_coworker_call_observation, extract_observed_model_and_effort,
+    begin_coworker_call_observation, extract_observed_model_and_effort, extract_observed_usage,
     map_worker_run_status_to_call_state, resolve_coworker_journal_dir, CoworkerCallFinishSpec,
     CoworkerCallObservationSpec, CoworkerObservationExecutorSpec, COWORKER_OBS_OP_REVIEW_TASK,
 };
@@ -863,10 +863,12 @@ pub async fn run_task_review_with_claim(
         };
         let (genuine_obs_model, genuine_obs_effort) =
             extract_observed_model_and_effort(&report.structured_execution.execution);
+        let observed_usage = extract_observed_usage(&report.structured_execution.execution);
         let _ = obs.finish(CoworkerCallFinishSpec {
             state: Some(obs_state),
             observed_model: genuine_obs_model,
             observed_effort: genuine_obs_effort,
+            usage: observed_usage,
             receipt_id: report
                 .verified_verdict
                 .as_ref()
@@ -970,19 +972,20 @@ fn verify_observed_model_and_effort(
             "task review worker did not satisfy model evidence".to_string(),
         ));
     }
-    let Some(obs_model) = observed_model else {
+    if let Some(obs_model) = observed_model {
+        if obs_model != requested_model.base_model && obs_model != requested_model.cli_model_arg {
+            return Err((
+                TaskReviewFailureKind::ModelEvidenceFailed,
+                format!(
+                    "task review observed_model `{obs_model}` does not match requested `{}`",
+                    requested_model.base_model
+                ),
+            ));
+        }
+    } else if execution.provider != WorkerProvider::CodexCli {
         return Err((
             TaskReviewFailureKind::ModelEvidenceFailed,
             "task review worker did not emit verified observed_model".to_string(),
-        ));
-    };
-    if obs_model != requested_model.base_model && obs_model != requested_model.cli_model_arg {
-        return Err((
-            TaskReviewFailureKind::ModelEvidenceFailed,
-            format!(
-                "task review observed_model `{obs_model}` does not match requested `{}`",
-                requested_model.base_model
-            ),
         ));
     }
     if !execution.has_satisfied_effort_evidence() {
@@ -992,7 +995,14 @@ fn verify_observed_model_and_effort(
         ));
     }
     if let Some(ref req_effort) = requested_model.effort {
-        if observed_effort != Some(req_effort.as_str()) {
+        if let Some(obs_eff) = observed_effort {
+            if obs_eff != req_effort.as_str() {
+                return Err((
+                    TaskReviewFailureKind::EffortEvidenceFailed,
+                    format!("task review observed_effort `{observed_effort:?}` does not match requested `{req_effort}`"),
+                ));
+            }
+        } else if execution.provider != WorkerProvider::CodexCli {
             return Err((
                 TaskReviewFailureKind::EffortEvidenceFailed,
                 format!("task review observed_effort `{observed_effort:?}` does not match requested `{req_effort}`"),

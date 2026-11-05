@@ -4,6 +4,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use threadlane_native::OPERATING_GUIDE_VERSION;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -70,7 +71,7 @@ async fn paired_server_rejects_stateless_requests_and_negotiates_a_session_hands
         .as_str()
         .expect("handshake instructions");
     let first_512: String = instructions.chars().take(512).collect();
-    assert!(first_512.contains("2026-11-03.v3"));
+    assert!(first_512.contains(OPERATING_GUIDE_VERSION));
     assert!(first_512.contains("Coworker"));
     assert!(first_512.contains("connect_current_chat"));
     assert!(first_512.contains("operating_guide"));

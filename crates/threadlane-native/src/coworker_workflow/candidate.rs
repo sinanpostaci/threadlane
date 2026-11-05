@@ -16,24 +16,24 @@ use threadlane_operations::{
     FinalCandidateClosureStore, FinalCandidatePolicyBinding, FinalCandidateSubject,
     FinalCandidateTaskInput, InspectFinalCandidateRequest, IntegrationReceipt,
     JobIntegrationIntentState, JobIntegrationReport, MarkClosureSubmittedRequest,
-    MarkClosureUnknownRequest, OperationsError, ReconcileClosureAttemptRequest,
-    RecordClosureFailureRequest, RecordClosureVerdictRequest, ReserveClosureAttemptRequest,
-    ReviewReceipt, TestEvidenceSummary,
+    MarkClosureUnknownRequest, OperationsError, PinnedClosureLaunchConfiguration,
+    ReconcileClosureAttemptRequest, RecordClosureFailureRequest, RecordClosureVerdictRequest,
+    ReserveClosureAttemptRequest, ReviewReceipt, TestEvidenceSummary,
 };
 use threadlane_workers::{
     load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
     resolve_model_target, run_advisory_worker_with_structured_result, validate_exact_40_hex_sha,
-    validate_executable_file, validate_sha256_hex_digest, AdvisoryResponseBudget,
-    AdvisoryStructuredExecution, AdvisoryWorkerSpec, ExecutionBudgets, WorkerFilePermissions,
-    WorkerProvider, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    DEFAULT_MAX_LINE_BYTES, MAX_EVENTS, MAX_LINE_BYTES,
+    validate_sha256_hex_digest, AdvisoryResponseBudget, AdvisoryStructuredExecution,
+    AdvisoryWorkerSpec, ExecutionBudgets, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
+    WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_LINE_BYTES, MAX_EVENTS,
+    MAX_LINE_BYTES,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
 use crate::coworker_observation::{
-    begin_coworker_call_observation, extract_observed_model_and_effort, CoworkerCallFinishSpec,
-    CoworkerCallObservationHandle, CoworkerCallObservationSpec, CoworkerObservationExecutorSpec,
-    COWORKER_OBS_OP_CLOSURE_CANDIDATE,
+    begin_coworker_call_observation, extract_observed_model_and_effort, extract_observed_usage,
+    CoworkerCallFinishSpec, CoworkerCallObservationHandle, CoworkerCallObservationSpec,
+    CoworkerObservationExecutorSpec, COWORKER_OBS_OP_CLOSURE_CANDIDATE,
 };
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, validate_non_native_worker_choice, AcceptedPredecessorReceiptRef,
@@ -55,7 +55,7 @@ use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, sanitize_diagnostic_text, validate_bounded_identifier,
 };
-use crate::profile_flow::SelectedRoleChoice;
+use crate::profile_flow::{resolve_advisory_tool_executable, SelectedRoleChoice};
 use crate::role_flow::{
     read_registry_snapshot_readonly, ClosureSubjectSource, PackageClosureReservation,
     ReservePackageClosureRequest, RoleFlowStore,
@@ -1773,10 +1773,12 @@ impl CoworkerCandidateService {
             if let Some((obs, art_id)) = obs_ctx {
                 let (genuine_model, genuine_effort) =
                     extract_observed_model_and_effort(&structured_exec.execution);
+                let observed_usage = extract_observed_usage(&structured_exec.execution);
                 let _ = obs.finish(CoworkerCallFinishSpec {
                     state: Some(ObservationCallState::Unknown),
                     observed_model: genuine_model,
                     observed_effort: genuine_effort,
+                    usage: observed_usage,
                     worker_id: Some(worker_id.clone()),
                     artifact_id: Some(art_id),
                     diagnostic: Some(reason.clone()),
@@ -1896,7 +1898,31 @@ impl CoworkerCandidateService {
             }
         };
 
-        let Some(ref observed_model) = actual_observed_model else {
+        if let Some(ref observed_model) = actual_observed_model {
+            if observed_model != &request.final_subject.policy.requested_model {
+                let reason = format!(
+                    "closure observed_model `{observed_model}` does not match requested_model `{}`",
+                    request.final_subject.policy.requested_model
+                );
+                return self.record_local_terminal_closure_failure(
+                    policy_store,
+                    &closure_store,
+                    request,
+                    submitted_ledger_rev,
+                    &reserved_attempt.attempt_id,
+                    &reserved_attempt.command_key,
+                    &effect_id,
+                    "model_evidence_failed",
+                    &reason,
+                    &structured_exec,
+                    actual_observed_model,
+                    actual_observed_effort,
+                    false,
+                    recorded_at_ms,
+                    obs_ctx,
+                );
+            }
+        } else if provider != WorkerProvider::CodexCli {
             return self.record_local_terminal_closure_failure(
                 policy_store,
                 &closure_store,
@@ -1914,33 +1940,35 @@ impl CoworkerCandidateService {
                 recorded_at_ms,
                 obs_ctx,
             );
-        };
-        if observed_model != &request.final_subject.policy.requested_model {
-            let reason = format!(
-                "closure observed_model `{observed_model}` does not match requested_model `{}`",
-                request.final_subject.policy.requested_model
-            );
-            return self.record_local_terminal_closure_failure(
-                policy_store,
-                &closure_store,
-                request,
-                submitted_ledger_rev,
-                &reserved_attempt.attempt_id,
-                &reserved_attempt.command_key,
-                &effect_id,
-                "model_evidence_failed",
-                &reason,
-                &structured_exec,
-                actual_observed_model,
-                actual_observed_effort,
-                false,
-                recorded_at_ms,
-                obs_ctx,
-            );
         }
-        if request.final_subject.policy.require_effort_evidence
-            && actual_observed_effort.as_deref()
+        if let Some(ref observed_effort) = actual_observed_effort {
+            if Some(observed_effort.as_str())
                 != request.final_subject.policy.requested_effort.as_deref()
+            {
+                let reason = format!(
+                    "closure observed_effort `{:?}` does not match requested_effort `{:?}`",
+                    actual_observed_effort, request.final_subject.policy.requested_effort
+                );
+                return self.record_local_terminal_closure_failure(
+                    policy_store,
+                    &closure_store,
+                    request,
+                    submitted_ledger_rev,
+                    &reserved_attempt.attempt_id,
+                    &reserved_attempt.command_key,
+                    &effect_id,
+                    "effort_evidence_failed",
+                    &reason,
+                    &structured_exec,
+                    actual_observed_model,
+                    actual_observed_effort,
+                    false,
+                    recorded_at_ms,
+                    obs_ctx,
+                );
+            }
+        } else if request.final_subject.policy.require_effort_evidence
+            && provider != WorkerProvider::CodexCli
         {
             let reason = format!(
                 "closure observed_effort `{:?}` does not match requested_effort `{:?}`",
@@ -1964,6 +1992,64 @@ impl CoworkerCandidateService {
                 obs_ctx,
             );
         }
+
+        let pinned_launch_configuration = if provider == WorkerProvider::CodexCli {
+            let Some(ref req_effort) = request.final_subject.policy.requested_effort else {
+                return self.record_local_terminal_closure_failure(
+                    policy_store,
+                    &closure_store,
+                    request,
+                    submitted_ledger_rev,
+                    &reserved_attempt.attempt_id,
+                    &reserved_attempt.command_key,
+                    &effect_id,
+                    "effort_evidence_failed",
+                    "codex_cli closure requires explicit requested_effort in subject policy",
+                    &structured_exec,
+                    actual_observed_model,
+                    actual_observed_effort,
+                    false,
+                    recorded_at_ms,
+                    obs_ctx,
+                );
+            };
+            if !structured_exec
+                .execution
+                .has_pinned_codex_read_only_launch_config()
+                || structured_exec.execution.requested_model.base_model
+                    != request.final_subject.policy.requested_model
+                || structured_exec.execution.requested_model.effort.as_deref()
+                    != Some(req_effort.as_str())
+            {
+                return self.record_local_terminal_closure_failure(
+                    policy_store,
+                    &closure_store,
+                    request,
+                    submitted_ledger_rev,
+                    &reserved_attempt.attempt_id,
+                    &reserved_attempt.command_key,
+                    &effect_id,
+                    "model_evidence_failed",
+                    "codex_cli closure execution report lacks verified pinned read-only launch configuration",
+                    &structured_exec,
+                    actual_observed_model,
+                    actual_observed_effort,
+                    false,
+                    recorded_at_ms,
+                    obs_ctx,
+                );
+            }
+            let argv_bytes = serde_json::to_vec(&structured_exec.execution.constructed_argv)
+                .map_err(|err| NativeError::new(NativeErrorCode::ProtocolError, err.to_string()))?;
+            let constructed_argv_sha256 = format!("{:x}", Sha256::digest(&argv_bytes));
+            Some(PinnedClosureLaunchConfiguration {
+                requested_model: request.final_subject.policy.requested_model.clone(),
+                requested_effort: req_effort.clone(),
+                constructed_argv_sha256,
+            })
+        } else {
+            None
+        };
 
         // Re-validate live candidate subject, active holds, stop_requested, and current job_revision
         // AFTER awaited worker completion before promoting acceptance or job completion.
@@ -2008,11 +2094,12 @@ impl CoworkerCandidateService {
             producer_worker_id: Some(worker_id.clone()),
             handoff_receipt_id,
             observed_provider: provider.as_str().to_string(),
-            observed_model: observed_model.clone(),
+            observed_model: actual_observed_model.clone(),
             observed_effort: actual_observed_effort.clone(),
             transcript_or_event_digest: verified_response.sha256_digest.clone(),
             grants_merge_or_push_authority: false,
             substitutes_for_required_checks: false,
+            pinned_launch_configuration,
         };
 
         let (terminal_rev, terminal_attempt, verdict) =
@@ -2079,10 +2166,12 @@ impl CoworkerCandidateService {
         if let Some((obs, art_id)) = obs_ctx {
             let (genuine_model, genuine_effort) =
                 extract_observed_model_and_effort(&structured_exec.execution);
+            let observed_usage = extract_observed_usage(&structured_exec.execution);
             let _ = obs.finish(CoworkerCallFinishSpec {
                 state: Some(ObservationCallState::Completed),
                 observed_model: genuine_model,
                 observed_effort: genuine_effort,
+                usage: observed_usage,
                 worker_id: Some(worker_id),
                 receipt_id: Some(verdict.verdict_id.clone()),
                 artifact_id: Some(art_id),
@@ -2429,6 +2518,7 @@ impl CoworkerCandidateService {
         if let Some((obs, art_id)) = obs_ctx {
             let (genuine_model, genuine_effort) =
                 extract_observed_model_and_effort(&structured_exec.execution);
+            let observed_usage = extract_observed_usage(&structured_exec.execution);
             let obs_state = if structured_exec.execution.status == WorkerRunStatus::Cancelled {
                 ObservationCallState::Cancelled
             } else {
@@ -2438,6 +2528,7 @@ impl CoworkerCandidateService {
                 state: Some(obs_state),
                 observed_model: genuine_model,
                 observed_effort: genuine_effort,
+                usage: observed_usage,
                 artifact_id: Some(art_id),
                 diagnostic: Some(reason.to_string()),
                 ..CoworkerCallFinishSpec::default()
@@ -2494,14 +2585,7 @@ pub fn resolve_tool_executable(
                 format!("enabled tool `{tool_id}` was not found in RegistryStore"),
             )
         })?;
-    let exe_path = tool.executable_path.as_ref().ok_or_else(|| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!("tool `{tool_id}` has no executable_path configured"),
-        )
-    })?;
-    validate_executable_file(exe_path)
-        .map_err(|err| NativeError::new(NativeErrorCode::SecurityViolation, err.to_string()))
+    resolve_advisory_tool_executable(tool)
 }
 
 /// Converts [`CandidateCheckEvidence`] records from the coworker workflow contract into an
@@ -2569,10 +2653,7 @@ pub fn map_tool_adapter_to_provider(adapter: ToolAdapter) -> Result<WorkerProvid
     match adapter {
         ToolAdapter::Antigravity => Ok(WorkerProvider::Antigravity),
         ToolAdapter::OpencodeV2 => Ok(WorkerProvider::OpenCodeV2),
-        ToolAdapter::CodexCli => Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "CodexCli is the native human conversational interface and cannot be dispatched as a headless worker",
-        )),
+        ToolAdapter::CodexCli => Ok(WorkerProvider::CodexCli),
         ToolAdapter::JevApi
         | ToolAdapter::OpenaiDecisionsApi
         | ToolAdapter::Git

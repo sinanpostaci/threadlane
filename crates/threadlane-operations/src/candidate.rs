@@ -1522,6 +1522,23 @@ impl ClosureVerdictKind {
 
 /// Actual execution evidence bound to a recorded [`ClosureVerdict`].
 ///
+/// Verified pinned read-only CLI launch configuration bound into [`ClosureExecutionEvidence`] for
+/// `codex_cli` closure runs whose structured JSONL output omits runtime model/effort telemetry.
+///
+/// This record stores only requested launch configuration and the SHA-256 digest of the constructed
+/// argv vector; it never claims runtime-observed model/effort telemetry and never persists raw argv
+/// or prompt strings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PinnedClosureLaunchConfiguration {
+    /// Exact requested model identifier passed on the pinned CLI command line.
+    pub requested_model: String,
+    /// Explicit reasoning effort passed on the pinned CLI command line.
+    pub requested_effort: String,
+    /// 64-character lowercase hex SHA-256 digest of the JSON-serialized constructed argv vector.
+    pub constructed_argv_sha256: String,
+}
+
 /// Recording a positive verdict (`ClosureVerdictKind::Accepted`) requires verified execution
 /// telemetry matching [`FinalCandidatePolicyBinding`] and explicitly sets both
 /// `grants_merge_or_push_authority` and `substitutes_for_required_checks` to `false`.
@@ -1539,8 +1556,9 @@ pub struct ClosureExecutionEvidence {
     pub handoff_receipt_id: String,
     /// Observed provider identifier verified from structured execution telemetry.
     pub observed_provider: String,
-    /// Observed model identifier verified from structured execution telemetry.
-    pub observed_model: String,
+    /// Observed model identifier verified from structured execution telemetry, if emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
     /// Observed reasoning effort or variant verified from structured execution telemetry, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_effort: Option<String>,
@@ -1550,6 +1568,10 @@ pub struct ClosureExecutionEvidence {
     pub grants_merge_or_push_authority: bool,
     /// Always `false`: a closure verdict never substitutes for required formatting, Clippy, or test checks.
     pub substitutes_for_required_checks: bool,
+    /// Verified pinned read-only CLI launch configuration for `codex_cli` closure runs whose
+    /// structured JSONL output omits runtime model/effort telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_launch_configuration: Option<PinnedClosureLaunchConfiguration>,
 }
 
 impl ClosureExecutionEvidence {
@@ -1571,12 +1593,25 @@ impl ClosureExecutionEvidence {
             &self.observed_provider,
             "execution_evidence.observed_provider",
         )?;
-        validate_closure_model_identifier(
-            &self.observed_model,
-            "execution_evidence.observed_model",
-        )?;
+        if let Some(ref model) = self.observed_model {
+            validate_closure_model_identifier(model, "execution_evidence.observed_model")?;
+        }
         if let Some(ref effort) = self.observed_effort {
             validate_simple_identifier(effort, "execution_evidence.observed_effort")?;
+        }
+        if let Some(ref pin) = self.pinned_launch_configuration {
+            validate_closure_model_identifier(
+                &pin.requested_model,
+                "execution_evidence.pinned_launch_configuration.requested_model",
+            )?;
+            validate_simple_identifier(
+                &pin.requested_effort,
+                "execution_evidence.pinned_launch_configuration.requested_effort",
+            )?;
+            let _ = validate_sha256_hex_digest(
+                &pin.constructed_argv_sha256,
+                "execution_evidence.pinned_launch_configuration.constructed_argv_sha256",
+            )?;
         }
         let _ = validate_sha256_hex_digest(
             &self.transcript_or_event_digest,
@@ -1602,11 +1637,50 @@ impl ClosureExecutionEvidence {
                 self.observed_provider, subject.policy.requested_provider
             )));
         }
-        if self.observed_model != subject.policy.requested_model {
-            return Err(OperationsError::UncertainWorkerOutcome(format!(
-                "closure observed_model `{}` does not match requested_model `{}`",
-                self.observed_model, subject.policy.requested_model
-            )));
+        if let Some(ref pin) = self.pinned_launch_configuration {
+            if self.observed_provider != "codex_cli" {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure pinned_launch_configuration is only permitted for `codex_cli`, found `{}`",
+                    self.observed_provider
+                )));
+            }
+            if pin.requested_model != subject.policy.requested_model {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure pinned_launch_configuration.requested_model `{}` does not match requested_model `{}`",
+                    pin.requested_model, subject.policy.requested_model
+                )));
+            }
+            if Some(pin.requested_effort.as_str()) != subject.policy.requested_effort.as_deref() {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure pinned_launch_configuration.requested_effort `{}` does not match requested_effort `{:?}`",
+                    pin.requested_effort, subject.policy.requested_effort
+                )));
+            }
+        }
+        match self.observed_model.as_deref() {
+            Some(obs_model) if obs_model == subject.policy.requested_model => {}
+            Some(obs_model) => {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure observed_model `{obs_model}` does not match requested_model `{}`",
+                    subject.policy.requested_model
+                )));
+            }
+            None if self.observed_provider == "codex_cli"
+                && self.pinned_launch_configuration.is_some() => {}
+            None => {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "missing observed_model for requested_model `{}` on provider `{}`",
+                    subject.policy.requested_model, self.observed_provider
+                )));
+            }
+        }
+        if let Some(ref obs_effort) = self.observed_effort {
+            if Some(obs_effort.as_str()) != subject.policy.requested_effort.as_deref() {
+                return Err(OperationsError::UncertainWorkerOutcome(format!(
+                    "closure observed_effort `{obs_effort}` does not match requested_effort `{:?}`",
+                    subject.policy.requested_effort
+                )));
+            }
         }
         if subject.policy.require_effort_evidence {
             let expected_effort =
@@ -1623,6 +1697,11 @@ impl ClosureExecutionEvidence {
                         "closure observed_effort `{obs}` does not match requested_effort `{expected_effort}`"
                     )));
                 }
+                None if self.observed_provider == "codex_cli"
+                    && self
+                        .pinned_launch_configuration
+                        .as_ref()
+                        .is_some_and(|pin| pin.requested_effort == expected_effort) => {}
                 None => {
                     return Err(OperationsError::UncertainWorkerOutcome(format!(
                         "missing observed_effort for requested_effort `{expected_effort}` while require_effort_evidence is true"

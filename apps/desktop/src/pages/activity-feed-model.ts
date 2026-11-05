@@ -191,6 +191,9 @@ export interface ActivityRequestView {
   actorSource: string;
   actorModel: string;
   actorEffort: string;
+  actorSelectedModel: string;
+  actorSelectedEffort: string;
+  actorSelectedSummary: string;
   conversationDetails: string;
   executorIdentity: string;
   executorSummary: string;
@@ -474,10 +477,31 @@ export function formatRequesterIdentity(
   return trimOrNull(actor?.label) ?? 'Unknown';
 }
 
+export function formatRequesterSelectedModel(
+  actor: ObservationActor | null | undefined
+): string | null {
+  const selectedModel = trimOrNull(actor?.selected_model);
+  const selectedEffort = trimOrNull(actor?.selected_effort);
+  if (selectedModel && selectedEffort) {
+    return `${selectedModel} · ${selectedEffort} (selected)`;
+  }
+  if (selectedModel) {
+    return `${selectedModel} (selected)`;
+  }
+  if (selectedEffort) {
+    return `${selectedEffort} (selected)`;
+  }
+  return null;
+}
+
 export function formatRequesterSummary(
   actor: ObservationActor | null | undefined
 ): string {
-  return `Requester: ${formatRequesterIdentity(actor)} (${formatRequesterEvidence(
+  const selectedModel = formatRequesterSelectedModel(actor);
+  const identity = selectedModel
+    ? `${formatRequesterIdentity(actor)} · ${selectedModel}`
+    : formatRequesterIdentity(actor);
+  return `Requester: ${identity} (${formatRequesterEvidence(
     actor?.evidence
   )})`;
 }
@@ -489,9 +513,11 @@ export function formatRequesterSummary(
 export function projectRequesterLine(
   actor: ObservationActor | null | undefined
 ): ActivityRequesterLineView {
-  const value = formatRequesterIdentity(actor);
+  const baseValue = formatRequesterIdentity(actor);
+  const selectedModel = formatRequesterSelectedModel(actor);
+  const value = selectedModel ? `${baseValue} · ${selectedModel}` : baseValue;
   const evidence = formatRequesterEvidence(actor?.evidence);
-  const knownLabel = trimOrNull(actor?.label) !== null;
+  const knownLabel = trimOrNull(actor?.label) !== null || selectedModel !== null;
   const showEvidence = knownLabel || evidence !== 'Unknown';
   return {
     value,
@@ -643,9 +669,11 @@ export function projectTimelineDisplay(
 ): ActivityTimelineDisplay {
   if (event.kind === 'requester') {
     const actor = view.request.actor;
+    const selectedModel = formatRequesterSelectedModel(actor);
     const detail = [
       view.requesterLabel,
       trimOrNull(actor.role) ? capitalizeLabel(humanizeRecordedLabel(actor.role!)) : null,
+      selectedModel,
       trimOrNull(actor.source),
     ].filter(Boolean).join(' · ');
     const conversation = trimOrNull(view.request.thread_label);
@@ -654,6 +682,7 @@ export function projectTimelineDisplay(
       detail,
       lines: [
         conversation ? `Conversation: ${conversation}` : '',
+        selectedModel ? `Configured model: ${selectedModel}` : '',
         !trimOrNull(actor.label) && trimOrNull(actor.source)
           ? 'Source is known; caller identity is unavailable.' : '',
       ].filter(Boolean),
@@ -1705,6 +1734,9 @@ function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventVi
     lines: [
       `Evidence: ${requesterEvidence}`,
       `Source: ${view.actorSource} · role ${view.actorRole}`,
+      ...(view.actorSelectedSummary !== 'Not reported'
+        ? [`Configured: ${view.actorSelectedSummary}`]
+        : []),
       `Model: ${view.actorModel} · effort ${view.actorEffort}`,
     ],
     note: '',
@@ -1864,6 +1896,9 @@ export function buildActivityRequestView(
     actorSource: formatOptionalField(actor?.source),
     actorModel: formatOptionalField(actor?.model),
     actorEffort: formatOptionalField(actor?.effort),
+    actorSelectedModel: formatOptionalField(actor?.selected_model),
+    actorSelectedEffort: formatOptionalField(actor?.selected_effort),
+    actorSelectedSummary: formatRequesterSelectedModel(actor) ?? 'Not reported',
     conversationDetails: formatConversationDetails(request),
     executorIdentity: formatExecutorIdentity(executor),
     executorSummary: formatExecutorSummary(executor),

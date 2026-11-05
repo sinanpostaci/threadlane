@@ -43,6 +43,8 @@ export interface ObservationActor {
   source: string | null;
   model: string | null;
   effort: string | null;
+  selected_model?: string | null;
+  selected_effort?: string | null;
   evidence: ObservationEvidence;
 }
 

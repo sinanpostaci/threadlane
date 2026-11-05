@@ -9,7 +9,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane_plans::{
-    validate_identifier, validate_js_safe_revision, validate_summary, PlanTask,
+    validate_identifier, validate_js_safe_revision, validate_summary, PlanRevision, PlanTask,
 };
 use uuid::Uuid;
 
@@ -103,6 +103,116 @@ impl PersistedCommandJournal {
         self.entries
             .iter_mut()
             .find(|e| e.command_key == command_key)
+    }
+
+    pub(crate) fn verified_historical_plan_digest(
+        &self,
+        binding_id: &str,
+        revision: &PlanRevision,
+    ) -> Option<String> {
+        if self.schema_version != WORKFLOW_JOURNAL_SCHEMA_VERSION
+            || self.binding_id != binding_id
+            || revision.binding_id != binding_id
+            || !revision.status.is_active_published()
+            || revision.revision == 0
+            || revision.profile_revision == 0
+            || self.entries.len() > MAX_COMMAND_JOURNAL_ENTRIES
+        {
+            return None;
+        }
+
+        let expected_tasks_digest = compute_tasks_digest(&revision.tasks).ok()?;
+        let expected_payload_digest = compute_payload_digest(
+            &revision.plan_id,
+            &revision.profile_id,
+            revision.profile_revision,
+            &revision.summary,
+            &revision.tasks,
+        )
+        .ok()?;
+
+        let mut matched_digest: Option<String> = None;
+
+        for entry in &self.entries {
+            let touches_plan = entry.resolved_plan_id == revision.plan_id
+                || entry
+                    .explicit_plan_id
+                    .as_deref()
+                    .is_some_and(|id| id == revision.plan_id);
+            if !touches_plan {
+                continue;
+            }
+
+            let touches_revision = entry.target_revision == revision.revision
+                || matches!(
+                    entry.state,
+                    CommandJournalState::Completed {
+                        created_revision,
+                        ..
+                    } if created_revision == revision.revision
+                );
+            if !touches_revision {
+                continue;
+            }
+
+            if entry.resolved_plan_id != revision.plan_id
+                || entry
+                    .explicit_plan_id
+                    .as_deref()
+                    .is_some_and(|id| id != revision.plan_id)
+            {
+                return None;
+            }
+
+            match &entry.state {
+                CommandJournalState::Pending => {
+                    return None;
+                }
+                CommandJournalState::Failed => {
+                    if entry.target_revision == revision.revision
+                        && entry.profile_id == revision.profile_id
+                        && entry.profile_revision == revision.profile_revision
+                        && entry.summary == revision.summary
+                        && entry.tasks_digest == expected_tasks_digest
+                        && entry.payload_digest == expected_payload_digest
+                    {
+                        return None;
+                    }
+                }
+                CommandJournalState::Completed {
+                    created_revision,
+                    created_at_ms,
+                    plan_digest,
+                } => {
+                    if matched_digest.is_some() {
+                        return None;
+                    }
+                    if *created_revision != revision.revision
+                        || entry.target_revision != revision.revision
+                        || entry.expected_revision.checked_add(1) != Some(revision.revision)
+                        || *created_at_ms < 0
+                        || entry.profile_id != revision.profile_id
+                        || entry.profile_revision != revision.profile_revision
+                        || entry.summary != revision.summary
+                        || entry.tasks_digest != expected_tasks_digest
+                        || entry.payload_digest != expected_payload_digest
+                    {
+                        return None;
+                    }
+                    let (Some(entry_digest), Some(completed_digest)) =
+                        (entry.plan_digest.as_deref(), plan_digest.as_deref())
+                    else {
+                        return None;
+                    };
+                    if entry_digest != completed_digest || !is_hex_64(completed_digest) {
+                        return None;
+                    }
+                    matched_digest = Some(completed_digest.to_string());
+                }
+            }
+        }
+
+        matched_digest
     }
 }
 
@@ -268,6 +378,89 @@ pub(crate) fn read_journal_locked(
 
     validate_journal(&journal, binding_id)?;
     Ok(journal)
+}
+
+pub(crate) fn read_journal_readonly(
+    plans_dir: &Path,
+    journal_path: &Path,
+    binding_id: &str,
+) -> Result<Option<PersistedCommandJournal>, WorkflowError> {
+    ensure_platform_supported()?;
+    let clean_dir = ensure_private_dir(plans_dir)?;
+    let clean_journal_path = validate_absolute_no_symlink_components(journal_path)?;
+    if clean_journal_path.parent() != Some(clean_dir.as_path()) {
+        return Err(WorkflowError::SecurityViolation(
+            "Workflow command journal file must reside directly inside the private plan store directory.",
+        ));
+    }
+    validate_preexisting_private_file(&clean_journal_path)?;
+
+    let file = match File::open(&clean_journal_path) {
+        Ok(f) => f,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(_) => {
+            return Err(WorkflowError::Io(
+                "Failed to open workflow command journal.",
+            ));
+        }
+    };
+
+    let meta = fs::symlink_metadata(&clean_journal_path)
+        .map_err(|_| WorkflowError::Io("Failed to read workflow command journal metadata."))?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(WorkflowError::SecurityViolation(
+            "Workflow command journal must be a regular non-symlink file.",
+        ));
+    }
+    if meta.len() > MAX_COMMAND_JOURNAL_BYTES as u64 {
+        return Err(WorkflowError::SecurityViolation(
+            "Workflow command journal file size exceeds the 1 MiB security limit.",
+        ));
+    }
+
+    let file_meta = file
+        .metadata()
+        .map_err(|_| WorkflowError::Io("Failed to read open workflow command journal metadata."))?;
+    if !file_meta.file_type().is_file() || file_meta.len() > MAX_COMMAND_JOURNAL_BYTES as u64 {
+        return Err(WorkflowError::SecurityViolation(
+            "Workflow command journal open descriptor failed security validation.",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if meta.dev() != file_meta.dev() || meta.ino() != file_meta.ino() {
+            return Err(WorkflowError::SecurityViolation(
+                "Workflow command journal file changed during open.",
+            ));
+        }
+        if (file_meta.permissions().mode() & 0o077) != 0 {
+            return Err(WorkflowError::SecurityViolation(
+                "Workflow command journal file has insecure permissions (expected 0600).",
+            ));
+        }
+    }
+
+    let mut buf = Vec::new();
+    file.take(MAX_COMMAND_JOURNAL_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| WorkflowError::Io("Failed to read workflow command journal."))?;
+    if buf.len() > MAX_COMMAND_JOURNAL_BYTES {
+        return Err(WorkflowError::SecurityViolation(
+            "Workflow command journal exceeded the 1 MiB read bound.",
+        ));
+    }
+
+    let Ok(journal) = serde_json::from_slice::<PersistedCommandJournal>(&buf) else {
+        return Err(WorkflowError::CorruptStore(
+            "Persisted workflow command journal is corrupt or incompatible.",
+        ));
+    };
+
+    validate_journal(&journal, binding_id)?;
+    Ok(Some(journal))
 }
 
 pub(crate) fn write_journal_locked(
@@ -451,6 +644,15 @@ fn validate_journal(
                 if !is_hex_64(digest) {
                     return Err(WorkflowError::CorruptStore(
                         "Persisted workflow command journal contains an invalid completed plan_digest.",
+                    ));
+                }
+            }
+            if let (Some(entry_digest), Some(completed_digest)) =
+                (entry.plan_digest.as_deref(), plan_digest.as_deref())
+            {
+                if entry_digest != completed_digest {
+                    return Err(WorkflowError::CorruptStore(
+                        "Persisted workflow command journal contains inconsistent plan_digest values.",
                     ));
                 }
             }

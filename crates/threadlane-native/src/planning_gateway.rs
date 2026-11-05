@@ -2606,24 +2606,37 @@ fn can_resolve_headless_architect_for_grant(
     if !report.ready || !outcome.ready {
         return false;
     }
-    let Some(ref selected) = outcome.selected else {
+    let Some(ref raw_selected) = outcome.selected else {
+        return false;
+    };
+    let Ok(selected) = crate::profile_flow::normalize_read_only_advisory_choice(
+        WorkflowRole::Architect,
+        raw_selected,
+    ) else {
         return false;
     };
     if selected.route != RoleExecutionRoute::HeadlessWorker
         || !matches!(
             selected.adapter,
-            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
         )
     {
         return false;
     }
-    if validate_non_native_worker_choice(WorkflowRole::Architect, selected).is_err() {
+    if validate_non_native_worker_choice(WorkflowRole::Architect, &selected).is_err() {
         return false;
     }
     let Some(tool_def) = reg_snapshot.tools.iter().find(|t| t.id == selected.tool_id) else {
         return false;
     };
-    tool_def.enabled && tool_def.executable_path.is_some()
+    if !tool_def.enabled {
+        return false;
+    }
+    if tool_def.adapter == ToolAdapter::CodexCli {
+        crate::profile_flow::resolve_advisory_tool_executable(tool_def).is_ok()
+    } else {
+        tool_def.executable_path.is_some()
+    }
 }
 
 fn sha256_hex_bytes(bytes: &[u8]) -> String {

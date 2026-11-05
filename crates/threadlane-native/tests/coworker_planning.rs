@@ -1945,3 +1945,414 @@ async fn recovered_result_verifier_refuses_arbitrary_plan_revision_or_receipt_su
         .expect("exact result still verifies");
     assert_eq!(legacy.fx.invocation_count(), 2);
 }
+
+fn write_fake_codex_planning_script(script_path: &Path, count_file: &Path, prompts_dir: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = script_path.parent() {
+        fs::create_dir_all(parent).expect("create codex script parent dir");
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 codex script parent dir");
+    }
+    fs::create_dir_all(prompts_dir).expect("create codex prompts dir");
+    fs::set_permissions(prompts_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 codex prompts dir");
+
+    let script = format!(
+        r#"#!/bin/sh
+set -eu
+COUNT_FILE="{count_file}"
+PROMPTS_DIR="{prompts_dir}"
+
+c=0
+if [ -f "$COUNT_FILE" ]; then
+    c=$(cat "$COUNT_FILE")
+fi
+c=$((c + 1))
+printf "%s" "$c" > "$COUNT_FILE"
+printf "%s\n" "$@" > "$PROMPTS_DIR/args_$c.txt"
+
+resp_file="$PROMPTS_DIR/resp_$c.json"
+cat <<'EOF' > "$resp_file"
+{{"outcome":"plan","schema_version":1,"summary":"Compile two independent Coder tasks and one dependent exporter Coder task for sample-telemetry-service using read-only Codex Orchestrator advisory execution.","tasks":[{{"task_id":"task_parse","title":"Implement binary frame header parser","description":"Parse binary telemetry frames in src/parser.rs and expose the stable ParsedFrame struct for downstream batch export.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]}},{{"task_id":"task_metrics","title":"Add frame counter helper","description":"Update src/metrics.rs to track total parsed telemetry frames without overlapping parser or exporter files.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["src/metrics.rs"],"owned_interfaces":[],"consumed_interfaces":[]}},{{"task_id":"task_export","title":"Wire batch exporter to ParsedFrame","description":"Consume iface_parsed_frame in src/exporter.rs and emit framed telemetry batches to the configured sink.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":["iface_export_sink"],"consumed_interfaces":["iface_parsed_frame"]}}],"check_suggestions":[{{"check_id":"chk_telemetry_unit","command_summary":"cargo test --workspace","required":true}}],"unconfirmed_proposal_notes":["Keep optional pushgateway exporter out of scope until human approval."],"resolved_open_questions":[],"deferred_proposals":[]}}
+EOF
+
+esc=$(sed 's/\\/\\\\/g; s/"/\\"/g' "$resp_file" | tr '\n' ' ')
+printf '{{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-00000000000%s"}}\n' "$c"
+printf '{{"type":"turn.started"}}\n'
+printf '{{"type":"item.completed","item":{{"id":"item_%s","type":"agent_message","text":"%s"}}}}\n' "$c" "$esc"
+printf '{{"type":"turn.completed","usage":{{"input_tokens":1420,"cached_input_tokens":320,"output_tokens":410}}}}\n'
+"#,
+        count_file = count_file.display(),
+        prompts_dir = prompts_dir.display(),
+    );
+
+    let staging_path = script_path.with_extension("tmp");
+    let mut f = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o700)
+        .open(&staging_path)
+        .expect("create staged fake-codex");
+    f.write_all(script.as_bytes()).expect("write fake-codex");
+    f.sync_all().expect("sync fake-codex");
+    drop(f);
+    fs::rename(&staging_path, script_path).expect("publish closed fake-codex");
+}
+
+#[tokio::test]
+async fn codex_sol_xhigh_orchestrator_planning_command_executes_replays_without_reinvo_and_records_unfabricated_observation(
+) {
+    use threadlane_core::observation::{read_journal_records_readonly, ObservationRecordPhase};
+    use threadlane_native::coworker_grants::{
+        prepare_planning_grant_preview_with_store, record_planning_grant,
+        LocalOperatorGrantAttestation, PreparePlanningGrantRequest, RecordPlanningGrantRequest,
+    };
+    use threadlane_native::profile_flow::{RoleExecutionRoute, RolePreflightRequest};
+    use threadlane_native::{
+        EnqueuePlanningCommandRequest, PlanningCommandBindingLedger, PlanningCommandDriver,
+        PlanningCommandResultRef, PlanningCommandStatus, PlanningCommandStore,
+    };
+
+    let fx = OrchestratorTestFixture::new();
+    let fake_codex_exe = fx.root_dir.join("bin/fake-codex");
+    let codex_count_file = fx.root_dir.join("codex-invocations.txt");
+    let codex_prompts_dir = fx.root_dir.join("codex-prompts");
+    write_fake_codex_planning_script(&fake_codex_exe, &codex_count_file, &codex_prompts_dir);
+
+    let rev0 = fx.registry.snapshot().expect("snapshot").revision;
+    fx.registry
+        .apply(
+            rev0,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Codex CLI".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(fake_codex_exe.clone()),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert tool-codex");
+    fx.registry
+        .apply(
+            rev0 + 1,
+            RegistryChange::UpsertModels {
+                models: vec![
+                    ModelDefinition {
+                        id: "model-argon".to_string(),
+                        tool_id: "tool-agy".to_string(),
+                        label: "Gemini 4 Argon High".to_string(),
+                        model_arg: "gemini-4-argon-high".to_string(),
+                        efforts: vec!["high".to_string()],
+                        allow_no_effort: false,
+                    },
+                    ModelDefinition {
+                        id: "model-codex-sol".to_string(),
+                        tool_id: "tool-codex".to_string(),
+                        label: "GPT-6.1 Sol".to_string(),
+                        model_arg: "gpt-6.1-sol".to_string(),
+                        efforts: vec!["xhigh".to_string()],
+                        allow_no_effort: false,
+                    },
+                ],
+            },
+        )
+        .expect("upsert models with codex sol");
+    fx.registry
+        .apply(
+            rev0 + 2,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-main".to_string(),
+                    name: "Main Planning Profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Architect,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-codex-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Orchestrator,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-codex-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("upsert profile with codex sol orchestrator/architect");
+
+    let codex_policy = ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "pol-codex-sol-planning".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: "tool-codex".to_string(),
+            model_id: "model-codex-sol".to_string(),
+            efforts: vec!["xhigh".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+        }],
+    };
+
+    let snapshot = fx.registry.snapshot().expect("snapshot with codex sol");
+    let preview = prepare_planning_grant_preview_with_store(
+        &fx.store,
+        &snapshot,
+        &PreparePlanningGrantRequest {
+            request_key: "req_grant_codex_sol_1".to_string(),
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            repository_path: fx.repo_dir.clone(),
+            base_commit: fx.project_base.base_commit.clone(),
+            expected_base_tree_sha: Some(fx.project_base.base_tree_sha.clone()),
+            profile_id: "profile-main".to_string(),
+            expected_registry_revision: Some(snapshot.revision),
+            roles: vec![
+                RolePreflightRequest {
+                    role: WorkflowRole::Orchestrator,
+                    difficulty: None,
+                },
+                RolePreflightRequest {
+                    role: WorkflowRole::Architect,
+                    difficulty: None,
+                },
+            ],
+            policy: codex_policy.clone(),
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget: PlanningCallBudget {
+                max_total_calls: 4,
+                max_orchestrator_calls: 2,
+                max_architect_calls: 2,
+                max_timeout_ms_per_call: 30_000,
+                max_output_bytes_per_call: 65_536,
+            },
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_800_000_000_000,
+        },
+    )
+    .expect("prepare codex planning grant preview");
+
+    let recorded_grant = record_planning_grant(
+        &fx.store,
+        &snapshot,
+        &RecordPlanningGrantRequest {
+            request_key: "req_grant_codex_sol_1".to_string(),
+            expected_ledger_revision: None,
+            preview: preview.clone(),
+            confirmed_preview_digest: preview.preview_digest.clone(),
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect("record codex planning grant");
+
+    let job = fx.create_initial_job(
+        "job_codex_sol_1",
+        vec![
+            "Implement binary frame header parser in src/parser.rs".to_string(),
+            "Add frame counter helper in src/metrics.rs".to_string(),
+            "Wire batch exporter in src/exporter.rs to consume parsed frames".to_string(),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+    let cmd_store = receipt_command_store(&fx);
+    let plan_req = OrchestratorTestFixture::plan_req(
+        &recorded_grant.grant_id,
+        &job.job_id,
+        "cmd_orch_codex_sol_1",
+        0,
+    );
+    let enqueue_req = EnqueuePlanningCommandRequest::from_orchestrator(plan_req);
+    let enqueued = cmd_store
+        .enqueue_command(&enqueue_req)
+        .expect("enqueue codex orchestrator command");
+    assert_eq!(enqueued.selected_choice.adapter, ToolAdapter::CodexCli);
+    assert_eq!(
+        enqueued.selected_choice.route,
+        RoleExecutionRoute::HeadlessWorker
+    );
+    assert_eq!(enqueued.selected_choice.model_arg, "gpt-6.1-sol");
+    assert_eq!(enqueued.selected_choice.effort.as_deref(), Some("xhigh"));
+
+    let driver =
+        PlanningCommandDriver::new(cmd_store.clone(), fx.service.clone()).expect("create driver");
+    let executed = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &enqueued.command_id)
+        .await
+        .expect("execute codex orchestrator command");
+    assert_eq!(executed.command.status, PlanningCommandStatus::Completed);
+    assert!(!executed.was_already_completed);
+    assert!(!executed.reconciled_from_existing);
+
+    let PlanningCommandResultRef::OrchestratorPlan {
+        job_id: ref res_job_id,
+        ref planning_result,
+        artifact_verified,
+    } = executed
+        .command
+        .result_ref
+        .as_ref()
+        .expect("completed command result_ref")
+    else {
+        panic!("expected OrchestratorPlan result_ref");
+    };
+    assert!(artifact_verified);
+    assert_eq!(res_job_id, &job.job_id);
+    assert_eq!(planning_result.grant_id, recorded_grant.grant_id);
+    assert_eq!(planning_result.plan_revision, 1);
+
+    let published_plan = fx
+        .workflow
+        .get_plan(&planning_result.plan_id, None, None, None)
+        .expect("fetch published plan from workflow");
+    assert_eq!(published_plan.header.status, PlanStatus::Published);
+    assert_eq!(published_plan.header.revision, 1);
+    assert_eq!(published_plan.tasks.len(), 3);
+
+    let codex_invocations: u32 = fs::read_to_string(&codex_count_file)
+        .expect("read codex count")
+        .trim()
+        .parse()
+        .expect("parse codex count");
+    assert_eq!(codex_invocations, 1);
+    assert_eq!(fx.invocation_count(), 0);
+
+    // Reopen stores and verify duplicate enqueue + re-executing completed command + interrupted Unknown reconciliation
+    // all reuse the persisted result without a second Codex CLI invocation.
+    let (reopened_store, reopened_service, reopened_wf) = fx.reopen_all();
+    let reopened_cmd_store = PlanningCommandStore::open_existing(
+        cmd_store.commands_dir(),
+        reopened_store,
+        &fx.registry_dir,
+    )
+    .expect("reopen cmd store")
+    .with_artifacts_dir(&fx.artifacts_dir)
+    .expect("configure artifacts dir");
+    let dup_enqueued = reopened_cmd_store
+        .enqueue_command(&enqueue_req)
+        .expect("idempotent duplicate enqueue");
+    assert_eq!(dup_enqueued.command_id, enqueued.command_id);
+    assert_eq!(dup_enqueued.status, PlanningCommandStatus::Completed);
+
+    let reopened_driver = PlanningCommandDriver::new(reopened_cmd_store.clone(), reopened_service)
+        .expect("reopen driver");
+    let replayed = reopened_driver
+        .execute_command(BINDING_ID, THREAD_UUID, &enqueued.command_id)
+        .await
+        .expect("replay completed codex command");
+    assert_eq!(replayed.command.status, PlanningCommandStatus::Completed);
+    assert!(replayed.was_already_completed);
+    assert!(!replayed.reconciled_from_existing);
+    assert_eq!(replayed.command.result_ref, executed.command.result_ref);
+
+    // Simulate an interrupted Unknown command after publication/link and reconcile on reopen.
+    let command_path = reopened_cmd_store
+        .ledger_path_for_binding(BINDING_ID)
+        .expect("command ledger path");
+    let mut interrupted: PlanningCommandBindingLedger =
+        serde_json::from_slice(&fs::read(&command_path).expect("read command ledger"))
+            .expect("parse command ledger");
+    let cmd_mut = interrupted
+        .commands
+        .iter_mut()
+        .find(|c| c.command_id == enqueued.command_id)
+        .expect("find command");
+    cmd_mut.status = PlanningCommandStatus::Unknown;
+    cmd_mut.pending_reconciliation = true;
+    cmd_mut.result_ref = None;
+    cmd_mut.completed_at_ms = None;
+    cmd_mut.diagnostic = Some("synthetic crash before command completion".to_string());
+    cmd_mut.validate().expect("valid interrupted command");
+    fs::write(
+        &command_path,
+        serde_json::to_vec(&interrupted).expect("serialize interrupted command ledger"),
+    )
+    .expect("write interrupted command ledger");
+
+    let (reopened_store_2, reopened_service_2, _) = fx.reopen_all();
+    let reopened_cmd_store_2 = PlanningCommandStore::open_existing(
+        cmd_store.commands_dir(),
+        reopened_store_2,
+        &fx.registry_dir,
+    )
+    .expect("reopen cmd store 2")
+    .with_artifacts_dir(&fx.artifacts_dir)
+    .expect("configure artifacts dir 2");
+    let reopened_driver_2 =
+        PlanningCommandDriver::new(reopened_cmd_store_2, reopened_service_2).expect("driver 2");
+    let reconciled = reopened_driver_2
+        .execute_command(BINDING_ID, THREAD_UUID, &enqueued.command_id)
+        .await
+        .expect("reconcile interrupted codex command");
+    assert_eq!(reconciled.command.status, PlanningCommandStatus::Completed);
+    assert!(reconciled.reconciled_from_existing);
+    assert!(!reconciled.was_already_completed);
+    assert_eq!(reconciled.command.result_ref, executed.command.result_ref);
+    assert_eq!(
+        reopened_wf
+            .list_plans(None, None)
+            .expect("list plans after reconciliation")
+            .plans
+            .len(),
+        1
+    );
+
+    let codex_invocations_after: u32 = fs::read_to_string(&codex_count_file)
+        .expect("read codex count after replay and reconciliation")
+        .trim()
+        .parse()
+        .expect("parse codex count after replay and reconciliation");
+    assert_eq!(
+        codex_invocations_after, 1,
+        "reopen/duplicate replay and reconciliation must not invoke Codex CLI a second time"
+    );
+
+    // Inspect Activity observation journal: requested model/effort is gpt-6.1-sol/xhigh,
+    // observed_model and observed_effort remain None (not fabricated), and genuine stream usage is recorded.
+    let (records, _) =
+        read_journal_records_readonly(&fx.plans_dir).expect("read observation journal");
+    let finish_rec = records
+        .iter()
+        .find(|r| {
+            r.phase == ObservationRecordPhase::Finish
+                && r.operation == "coworker.planning.orchestrator"
+        })
+        .expect("orchestrator finish observation record");
+    let exec = finish_rec.executor.as_ref().expect("executor metadata");
+    assert_eq!(exec.provider.as_deref(), Some("codex_cli"));
+    assert_eq!(exec.requested_model.as_deref(), Some("gpt-6.1-sol"));
+    assert_eq!(exec.requested_effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        exec.observed_model, None,
+        "requested Codex launch configuration must never be fabricated as observed_model"
+    );
+    assert_eq!(
+        exec.observed_effort, None,
+        "requested Codex launch configuration must never be fabricated as observed_effort"
+    );
+    let usage = finish_rec
+        .usage
+        .as_ref()
+        .expect("genuine stream token usage");
+    assert_eq!(usage.input_tokens, Some(1420));
+    assert_eq!(usage.output_tokens, Some(410));
+    assert_eq!(usage.cache_read_tokens, Some(320));
+    assert_eq!(usage.total_tokens, Some(1830));
+}

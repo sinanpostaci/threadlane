@@ -112,8 +112,33 @@ pub struct ObservationActor {
     pub model: Option<String>,
     /// Actor reasoning effort only when proven by runtime receipt; never inferred from profile defaults or thread configuration.
     pub effort: Option<String>,
+    /// Configured / selected conversational model from verified exact-thread native metadata; never treated as runtime execution telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_model: Option<String>,
+    /// Configured / selected conversational reasoning effort from verified exact-thread native metadata; never treated as runtime execution telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_effort: Option<String>,
     /// Provenance level of the actor metadata.
     pub evidence: ObservationActorEvidence,
+}
+
+/// Sanitizes an optional configured model or effort token from verified native metadata,
+/// stripping control characters, rejecting secret-like markers, and bounding length to
+/// [`crate::MAX_LABEL_LEN`] bytes.
+pub fn sanitize_observation_selection_token(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if !ch.is_control() && out.len() + ch.len_utf8() <= crate::MAX_LABEL_LEN {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() || contains_sensitive_marker(&trimmed.to_ascii_lowercase()) {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 impl ObservationActor {
@@ -125,6 +150,8 @@ impl ObservationActor {
             source,
             model: None,
             effort: None,
+            selected_model: None,
+            selected_effort: None,
             evidence: ObservationActorEvidence::Unknown,
         }
     }
@@ -140,8 +167,32 @@ impl ObservationActor {
             source: Some("paired_mcp".to_string()),
             model: None,
             effort: None,
+            selected_model: None,
+            selected_effort: None,
             evidence: ObservationActorEvidence::Configured,
         }
+    }
+
+    /// Returns a verified paired-MCP caller actor record carrying sanitized configured thread
+    /// selection metadata while keeping runtime-observed `model` and `effort` `None`.
+    pub fn paired_coworker_with_selection(
+        thread_label: &str,
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
+    ) -> Self {
+        Self::paired_coworker(thread_label).with_selected_model(selected_model, selected_effort)
+    }
+
+    /// Attaches or replaces sanitized configured `selected_model` and `selected_effort` metadata
+    /// while leaving runtime-observed `model` and `effort` untouched.
+    pub fn with_selected_model(
+        mut self,
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
+    ) -> Self {
+        self.selected_model = sanitize_observation_selection_token(selected_model);
+        self.selected_effort = sanitize_observation_selection_token(selected_effort);
+        self
     }
 
     /// Compatibility alias for [`Self::paired_coworker`].
@@ -268,6 +319,44 @@ impl VerifiedMcpObservationContext {
         } else {
             None
         }
+    }
+
+    /// Attaches or replaces sanitized configured `selected_model` and `selected_effort` metadata
+    /// from verified exact-thread native metadata while keeping runtime-observed `model` and
+    /// `effort` `None`.
+    pub fn with_selected_model(
+        mut self,
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
+    ) -> Self {
+        self.actor = self
+            .actor
+            .with_selected_model(selected_model, selected_effort);
+        self
+    }
+
+    /// Clears configured `selected_model` and `selected_effort` when a live metadata refresh is
+    /// unavailable or fails validation so stale selections are never carried forward as current.
+    pub fn clear_selected_model(&mut self) {
+        self.actor.selected_model = None;
+        self.actor.selected_effort = None;
+    }
+
+    /// Updates the sanitized thread title and configured `selected_model` / `selected_effort`
+    /// from a verified exact-thread native metadata read.
+    pub fn refresh_thread_metadata(
+        &mut self,
+        thread_title: Option<&str>,
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
+    ) {
+        if let Some(title) = thread_title {
+            let sanitized = sanitize_observation_label(title, "Codex chat");
+            self.thread_label = sanitized.clone();
+            self.actor.label = Some(format!("Codex · {sanitized}"));
+        }
+        self.actor.selected_model = sanitize_observation_selection_token(selected_model);
+        self.actor.selected_effort = sanitize_observation_selection_token(selected_effort);
     }
 }
 
@@ -3955,7 +4044,58 @@ mod tests {
         )
         .expect("historical follower actor must still deserialize");
         assert_eq!(legacy_actor.role.as_deref(), Some("follower"));
+        assert_eq!(legacy_actor.selected_model, None);
+        assert_eq!(legacy_actor.selected_effort, None);
         assert_eq!(legacy_actor.evidence, ObservationActorEvidence::Configured);
+        assert_eq!(
+            serde_json::to_string(&legacy_actor).expect("re-serialize legacy actor"),
+            r#"{"label":"Codex · Legacy Chat","role":"follower","source":"paired_mcp","model":null,"effort":null,"evidence":"configured"}"#,
+            "omitted selected_model/selected_effort must be skipped when None"
+        );
+
+        let selected_ctx = ctx
+            .clone()
+            .with_selected_model(Some("  gpt-5-sol\n "), Some(" xhigh\t"));
+        assert_eq!(selected_ctx.actor.model, None);
+        assert_eq!(selected_ctx.actor.effort, None);
+        assert_eq!(
+            selected_ctx.actor.selected_model.as_deref(),
+            Some("gpt-5-sol")
+        );
+        assert_eq!(selected_ctx.actor.selected_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            selected_ctx.actor.evidence,
+            ObservationActorEvidence::Configured
+        );
+
+        let mut refreshable = selected_ctx.clone();
+        refreshable.refresh_thread_metadata(
+            Some("Updated Chat"),
+            Some("gpt-6-astra"),
+            Some("high"),
+        );
+        assert_eq!(refreshable.thread_label, "Updated Chat");
+        assert_eq!(
+            refreshable.actor.label.as_deref(),
+            Some("Codex · Updated Chat")
+        );
+        assert_eq!(refreshable.actor.model, None);
+        assert_eq!(refreshable.actor.effort, None);
+        assert_eq!(
+            refreshable.actor.selected_model.as_deref(),
+            Some("gpt-6-astra")
+        );
+        assert_eq!(refreshable.actor.selected_effort.as_deref(), Some("high"));
+
+        // Secret-like tokens or empty strings are rejected, and clear_selected_model drops stale data.
+        assert_eq!(
+            sanitize_observation_selection_token(Some("sk-secret-model-token")),
+            None
+        );
+        assert_eq!(sanitize_observation_selection_token(Some("   \n\t ")), None);
+        refreshable.clear_selected_model();
+        assert_eq!(refreshable.actor.selected_model, None);
+        assert_eq!(refreshable.actor.selected_effort, None);
 
         assert!(ctx
             .matching_scope(

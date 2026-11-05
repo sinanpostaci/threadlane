@@ -43,8 +43,8 @@ use crate::coworker_workflow::store::{
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{constant_time_str_eq, validate_bounded_identifier};
 use crate::profile_flow::{
-    preflight, ExecutionPolicy, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
-    SelectedRoleChoice,
+    normalize_read_only_advisory_choice, preflight, ExecutionPolicy, PreflightRequest,
+    RoleExecutionRoute, RolePreflightRequest, SelectedRoleChoice,
 };
 use crate::role_flow::read_registry_snapshot_readonly;
 
@@ -624,12 +624,13 @@ pub fn prepare_planning_grant_preview(
                 ),
             ));
         }
-        let selected_choice = outcome.selected.ok_or_else(|| {
+        let raw_choice = outcome.selected.ok_or_else(|| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "ready preflight outcome is missing selected role choice",
             )
         })?;
+        let selected_choice = normalize_read_only_advisory_choice(outcome.role, &raw_choice)?;
         validate_non_native_worker_choice(outcome.role, &selected_choice)?;
         frozen_role_choices.push(FrozenPlanningRoleChoice {
             role: outcome.role,
@@ -1096,22 +1097,45 @@ fn validate_policy_rules_against_snapshot(
             ));
         }
         let route = RoleExecutionRoute::from_adapter(tool.adapter);
-        if route != RoleExecutionRoute::HeadlessWorker {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "policy tool `{}` uses adapter `{}` ({route}); planning grants require supported headless workers (Antigravity or OpencodeV2)",
-                    tool.id, tool.adapter
-                ),
-            ));
-        }
         let provider = match tool.adapter {
-            ToolAdapter::Antigravity => WorkerProvider::Antigravity,
-            ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+            ToolAdapter::Antigravity if route == RoleExecutionRoute::HeadlessWorker => {
+                WorkerProvider::Antigravity
+            }
+            ToolAdapter::OpencodeV2 if route == RoleExecutionRoute::HeadlessWorker => {
+                WorkerProvider::OpenCodeV2
+            }
+            ToolAdapter::CodexCli => {
+                if rule.roles.is_empty()
+                    || !rule.roles.iter().all(|role| {
+                        matches!(role, WorkflowRole::Orchestrator | WorkflowRole::Architect)
+                    })
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "CodexCli policy rule on tool `{}` may only authorize read-only planning roles (Orchestrator or Architect)",
+                            tool.id
+                        ),
+                    ));
+                }
+                if rule.allow_no_effort || rule.efforts.is_empty() {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        format!(
+                            "CodexCli policy rule on tool `{}` requires explicit reasoning efforts (allow_no_effort is not supported)",
+                            tool.id
+                        ),
+                    ));
+                }
+                WorkerProvider::CodexCli
+            }
             _ => {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "planning grant requires Antigravity or OpencodeV2 adapter",
+                    format!(
+                        "policy tool `{}` uses adapter `{}` ({route}); planning grants require supported headless or read-only advisory workers (Antigravity, OpencodeV2, or CodexCli)",
+                        tool.id, tool.adapter
+                    ),
                 ));
             }
         };

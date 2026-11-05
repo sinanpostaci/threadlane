@@ -6,13 +6,24 @@ Coworker workflow package.
 
 ## 1. Architectural Boundaries and Core Invariants
 
-1. **Native Coworker is the conversational interface only (`COWORKER_IS_CONVERSATIONAL_INTERFACE_ONLY = true`)**
-   - Native Codex (`ToolAdapter::CodexCli` / `WorkflowRole::Follower` / `RoleExecutionRoute::NativeHandoff`)
-     remains the human's conversational interface and is **never** a headless registry execution
-     model or planning-grant worker.
-   - `validate_non_native_worker_choice` rejects `WorkflowRole::Follower`, `ToolAdapter::CodexCli`,
-     and any non-`HeadlessWorker` route across all planning reservations, architect advice records,
-     controller capability envelopes, and job task assignments.
+1. **Native Coworker is the conversational interface only (`COWORKER_IS_CONVERSATIONAL_INTERFACE_ONLY = true`), while read-only advisory roles may normalize `CodexCli` explicitly**
+   - The native Coworker (`WorkflowRole::Follower`) remains the human-selected Codex conversation,
+     occupies no model profile slot or lock, and is **never** dispatched as a headless worker.
+   - Generic `RoleExecutionRoute::from_adapter(ToolAdapter::CodexCli)` and manual role-flow handoffs
+     stay `RoleExecutionRoute::NativeHandoff`.
+   - After normal exact `RegistrySnapshot` + `ExecutionPolicy` preflight succeeds, explicit
+     read-only normalization (`normalize_read_only_advisory_choice` /
+     `is_read_only_advisory_worker_role`) permits `ToolAdapter::CodexCli`
+     (`RoleExecutionRoute::HeadlessWorker`) **only** for read-only advisory roles
+     (`WorkflowRole::Orchestrator`, `WorkflowRole::Architect`, `WorkflowRole::Reviewer`, and
+     `WorkflowRole::Closure`) with an explicit reasoning effort validated via
+     `resolve_model_target(WorkerProvider::CodexCli, ...)`. See
+     [`docs/CODEX-ADVISORY.md`](CODEX-ADVISORY.md).
+   - `validate_non_native_worker_choice` rejects `WorkflowRole::Follower`, any non-`HeadlessWorker`
+     route (`NativeHandoff`), `ToolAdapter::CodexCli` for `WorkflowRole::Coder` or
+     `WorkflowRole::Follower`, and any `CodexCli` choice lacking an explicit validated reasoning
+     effort across all planning reservations, architect advice records, controller capability
+     envelopes, and job task assignments.
 2. **Supported trust and provenance model**
    - Grants and execution approvals rely on the existing trusted-local human-confirmation
      attestation (`operator_attested = true` on `PlanningAdviceGrant`; operator token +
@@ -85,6 +96,10 @@ Coworker workflow package.
    - Once bound on a `CoworkerJobRecord`, `approval_linkage` is immutable; any attempt to rebind a
      different approval, plan revision, base commit, write scope, policy, or controller capability
      envelope on the same job fails closed.
+   - When `Reviewer` or `Closure` uses a normalized read-only `CodexCli` advisory worker, pinned
+     launch configuration evidence is recorded explicitly and kept separate from runtime-observed
+     stream telemetry: absent observed model/effort remains `None` with no `requested -> observed`
+     fallback, while legacy `Antigravity` and `OpencodeV2` runtime telemetry gates remain strict.
 7. **Routine task state machine, reserve-before-effect outbox, and structured review verdicts**
    - `CoworkerTaskStage::can_transition_to` defines the legal transition graph across
      `PendingDependencies`, `ReadyToDispatch`, `DispatchReserved`, `Running`, `ReadyForReview`,
@@ -572,8 +587,10 @@ The later integration writer owns:
 ### 4.1 Stage 1 Foundation Acceptance Cases (`crates/threadlane-native/tests/coworker_workflow_contract.rs`)
 
 1. **`native_coworker_rejected_as_headless_worker_or_grant_model_and_provenance_honest`**
-   - Rejects `ToolAdapter::CodexCli`, `WorkflowRole::Follower`, and `RoleExecutionRoute::NativeHandoff`
-     in `validate_non_native_worker_choice`.
+   - Rejects `WorkflowRole::Follower`, `RoleExecutionRoute::NativeHandoff`, and `ToolAdapter::CodexCli`
+     for `Coder`/`Follower` (or without an explicit reasoning effort) in
+     `validate_non_native_worker_choice`, while permitting normalized `HeadlessWorker` `CodexCli`
+     choices only for read-only advisory roles (`Orchestrator`, `Architect`, `Reviewer`, `Closure`).
    - Rejects `PlanningAdviceGrant` with `operator_attested: false`, write/mutation capabilities,
      or policies permitting `Coder`/`Reviewer`/`Follower`.
    - Enforces `native_per_call_identity_verified == false`.

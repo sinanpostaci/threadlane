@@ -158,6 +158,16 @@ pub const MAX_TASK_FILES_SETTINGS_BYTES: usize = 65_536;
 /// configuration (`65_536` bytes / 64 KiB).
 pub const MAX_OPENCODE_CONFIG_BYTES: usize = 65_536;
 
+/// Project-local Codex configuration and hook path names that must not exist in or above a
+/// [`WorkerProvider::CodexCli`] read-only advisory working directory.
+///
+/// Because `--ignore-user-config` ignores user-level configuration (`~/.codex/config.toml`)
+/// while project-local `.codex/` directories or `codex.toml` files in the checkout hierarchy
+/// could otherwise define project hooks, MCP servers, or capability overrides, `codex_cli`
+/// advisory validation fails closed if any of these markers exist in `working_directory` or
+/// its enclosing project ancestors.
+pub const CODEX_PROJECT_CONFIG_MARKERS: [&str; 3] = [".codex", "codex.toml", ".codex.toml"];
+
 /// Protected control paths denied for `read`, `glob`, `grep`, and `edit` in OpenCode V2 `TaskFiles`.
 const OPENCODE_PROTECTED_READ_AND_EDIT_PATTERNS: [&str; 28] = [
     ".env",
@@ -241,7 +251,10 @@ pub enum WorkerFilePermissions {
     /// non-root working directory with zero allowed write scopes, explicit write/notebook/shell/
     /// delegation/MCP/web/browser denials, and protected-control read denials (`--mode plan` and
     /// `--settings <inline-json>` with scoped `allow` and `deny` for Antigravity; V2 `policies`
-    /// and `permissions` in `OPENCODE_CONFIG_CONTENT` for OpenCode v2).
+    /// and `permissions` in `OPENCODE_CONFIG_CONTENT` for OpenCode v2; `--no-daemon exec --json
+    /// --ephemeral --ignore-user-config` with the session-only `threadlane-advisory` permission
+    /// profile, disabled capability flags, and project-config fail-closed validation for
+    /// `codex_cli`).
     ReadOnly,
 }
 
@@ -287,7 +300,9 @@ impl WorkerFilePermissions {
     ) -> Result<(), WorkerError> {
         match self {
             Self::ReadOnly => match provider {
-                WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => Ok(()),
+                WorkerProvider::Antigravity
+                | WorkerProvider::OpenCodeV2
+                | WorkerProvider::CodexCli => Ok(()),
             },
             Self::Inherit | Self::TaskFiles => Err(WorkerError::UnsupportedCapability {
                 provider: provider.as_str().to_string(),
@@ -305,6 +320,8 @@ impl WorkerFilePermissions {
     /// - When `self` is [`WorkerFilePermissions::ReadOnly`], `allowed_write_paths` **must be empty**
     ///   (zero write scopes).
     /// - When `self` is [`WorkerFilePermissions::Inherit`] or [`WorkerFilePermissions::TaskFiles`],
+    ///   `provider` must support mutable worker execution (`antigravity` or `opencode_v2`;
+    ///   `codex_cli` is rejected with [`WorkerError::UnsupportedCapability`]) and
     ///   `allowed_write_paths` must be non-empty, within finite `TaskFiles` bounds, free of
     ///   protected control paths, and free of unsafe glob/rule metacharacters.
     pub fn validate_for_provider_and_paths(
@@ -321,6 +338,17 @@ impl WorkerFilePermissions {
                 )));
             }
             return Ok(());
+        }
+
+        if provider == WorkerProvider::CodexCli {
+            return Err(WorkerError::UnsupportedCapability {
+                provider: provider.as_str().to_string(),
+                capability: format!("worker_file_permissions:{}", self.as_str()),
+                reason: format!(
+                    "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`; mutable `{}` worker invocations are not supported",
+                    self.as_str()
+                ),
+            });
         }
 
         if allowed_write_paths.is_empty() {
@@ -355,7 +383,7 @@ impl WorkerFilePermissions {
 
 /// Validates a raw provider identifier string and [`WorkerFilePermissions`] mode for read-only
 /// advisory worker admission, failing closed with [`WorkerError::UnsupportedCapability`] when the
-/// provider has no supported read-only advisory configuration (for example `codex_cli`, `jev_api`,
+/// provider has no supported read-only advisory configuration (for example `jev_api`,
 /// `openai_decisions_api`, `git`, `tmux`, `codegraph`, or unknown providers) or when the mode is
 /// not [`WorkerFilePermissions::ReadOnly`].
 ///
@@ -369,6 +397,7 @@ pub fn validate_advisory_provider_and_mode(
     let provider = match trimmed {
         "antigravity" | "agy" => WorkerProvider::Antigravity,
         "opencode_v2" | "open_code_v2" | "opencode-v2" | "opencode" => WorkerProvider::OpenCodeV2,
+        "codex_cli" | "codex-cli" | "codex" => WorkerProvider::CodexCli,
         other => {
             return Err(WorkerError::UnsupportedCapability {
                 provider: if other.is_empty() {
@@ -378,7 +407,7 @@ pub fn validate_advisory_provider_and_mode(
                 },
                 capability: "read_only_advisory_worker".to_string(),
                 reason: format!(
-                    "provider `{}` does not support preventive `read_only` advisory capability enforcement; only `antigravity` and `opencode_v2` are supported",
+                    "provider `{}` does not support preventive `read_only` advisory capability enforcement; only `antigravity`, `opencode_v2`, and `codex_cli` are supported",
                     if other.is_empty() { "<empty>" } else { other }
                 ),
             });
@@ -528,6 +557,60 @@ pub fn validate_advisory_read_only_workdir(
     Ok(canonical_workdir)
 }
 
+/// Validates `working_directory` for a [`WorkerProvider::CodexCli`] read-only advisory invocation.
+///
+/// Performs all [`validate_advisory_read_only_workdir`] checks and additionally fails closed with
+/// [`WorkerError::InvalidSpec`] if `working_directory` or any enclosing project directory up to
+/// the nearest `.git` root (or non-system ancestor when outside Git) contains a project-local
+/// Codex configuration or hooks path ([`CODEX_PROJECT_CONFIG_MARKERS`]: `.codex`, `codex.toml`,
+/// `.codex.toml`). This prevents project config or hooks from expanding capabilities when
+/// `--ignore-user-config` ignores user-level configuration.
+pub fn validate_codex_advisory_workdir(working_directory: &Path) -> Result<PathBuf, WorkerError> {
+    let canonical_workdir = validate_advisory_read_only_workdir(working_directory)?;
+    ensure_no_codex_project_config_in_hierarchy(&canonical_workdir)?;
+    Ok(canonical_workdir)
+}
+
+fn ensure_no_codex_project_config_in_hierarchy(
+    canonical_workdir: &Path,
+) -> Result<(), WorkerError> {
+    let git_root = canonical_workdir
+        .ancestors()
+        .find(|dir| fs::symlink_metadata(dir.join(".git")).is_ok());
+
+    let temp_root = std::env::temp_dir();
+    let canonical_temp_root = fs::canonicalize(&temp_root).unwrap_or(temp_root);
+    let home_root = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|p| fs::canonicalize(&p).unwrap_or(p));
+
+    for (depth, dir) in canonical_workdir.ancestors().enumerate() {
+        if depth > 0
+            && git_root.is_none()
+            && (dir.parent().is_none()
+                || dir == canonical_temp_root
+                || dir == Path::new("/tmp")
+                || home_root.as_deref() == Some(dir))
+        {
+            break;
+        }
+        for marker in CODEX_PROJECT_CONFIG_MARKERS {
+            let candidate = dir.join(marker);
+            if fs::symlink_metadata(&candidate).is_ok() {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "refusing to launch `codex_cli` advisory worker in `{}`: project Codex configuration or hooks path `{}` exists and could expand capabilities under `--ignore-user-config`",
+                    canonical_workdir.display(),
+                    candidate.display()
+                )));
+            }
+        }
+        if Some(dir) == git_root {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn validate_read_only_canonical_workdir(
     working_directory: &Path,
 ) -> Result<(PathBuf, String), WorkerError> {
@@ -575,6 +658,8 @@ fn is_protected_control_workdir_component(lowered_component: &str) -> bool {
             | "claude.md"
             | "opencode.json"
             | "opencode.jsonc"
+            | "codex.toml"
+            | ".codex.toml"
             | ".codex"
             | ".gemini"
             | ".opencode"

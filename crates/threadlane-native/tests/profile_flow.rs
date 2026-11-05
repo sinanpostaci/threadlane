@@ -1292,3 +1292,187 @@ fn provider_qualified_registry_ids_remain_exact_policy_keys() {
         "control characters remain forbidden"
     );
 }
+
+#[test]
+fn codex_advisory_normalization_preserves_native_preflight_and_restricts_to_readonly_roles() {
+    use threadlane_native::coworker_workflow::validate_non_native_worker_choice;
+    use threadlane_native::profile_flow::{
+        is_read_only_advisory_worker_role, normalize_read_only_advisory_choice,
+    };
+
+    let mut snap = base_snapshot();
+    snap.models.push(sample_model(
+        "gpt-6.1-sol",
+        "tool-codex",
+        "gpt-6.1-sol",
+        &["high", "xhigh"],
+        false,
+    ));
+    snap.profiles.push(WorkflowProfile {
+        decision_advisor: None,
+        id: "profile-codex-sol".to_string(),
+        name: "Codex Sol Default".to_string(),
+        assignments: vec![
+            RoleAssignment {
+                role: WorkflowRole::Follower,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "gpt-6.1-sol".to_string(),
+                    effort: Some("xhigh".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Orchestrator,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "gpt-6.1-sol".to_string(),
+                    effort: Some("xhigh".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Architect,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "gpt-6.1-sol".to_string(),
+                    effort: Some("xhigh".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Reviewer,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "gpt-6.1-sol".to_string(),
+                    effort: Some("xhigh".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Closure,
+                difficulty: None,
+                choice: ModelChoice {
+                    model_id: "gpt-6.1-sol".to_string(),
+                    effort: Some("xhigh".to_string()),
+                },
+            },
+            RoleAssignment {
+                role: WorkflowRole::Coder,
+                difficulty: Some(Difficulty::Hard),
+                choice: ModelChoice {
+                    model_id: "gpt-6.1-sol".to_string(),
+                    effort: Some("xhigh".to_string()),
+                },
+            },
+        ],
+    });
+
+    let policy = ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "policy-codex-sol-all".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: "tool-codex".to_string(),
+            model_id: "gpt-6.1-sol".to_string(),
+            efforts: vec!["high".to_string(), "xhigh".to_string()],
+            allow_no_effort: false,
+            roles: vec![],
+        }],
+    };
+
+    // 1. Generic RoleExecutionRoute::from_adapter(CodexCli) and normal preflight remain NativeHandoff.
+    assert_eq!(
+        RoleExecutionRoute::from_adapter(ToolAdapter::CodexCli),
+        RoleExecutionRoute::NativeHandoff
+    );
+    let req = PreflightRequest {
+        profile_id: Some("profile-codex-sol".to_string()),
+        roles: vec![
+            RolePreflightRequest::new(WorkflowRole::Follower, None),
+            RolePreflightRequest::new(WorkflowRole::Orchestrator, Some(Difficulty::Hard)),
+            RolePreflightRequest::new(WorkflowRole::Architect, Some(Difficulty::Hard)),
+            RolePreflightRequest::new(WorkflowRole::Reviewer, Some(Difficulty::Hard)),
+            RolePreflightRequest::new(WorkflowRole::Closure, None),
+            RolePreflightRequest::new(WorkflowRole::Coder, Some(Difficulty::Hard)),
+        ],
+    };
+    let report = preflight(&snap, &req, &policy).expect("preflight codex sol");
+    assert!(report.ready);
+    for outcome in &report.roles {
+        let selected = outcome.selected.as_ref().expect("selected choice");
+        assert_eq!(selected.adapter, ToolAdapter::CodexCli);
+        assert_eq!(selected.route, RoleExecutionRoute::NativeHandoff);
+        // Unnormalized NativeHandoff choices are rejected by validate_non_native_worker_choice.
+        assert!(validate_non_native_worker_choice(outcome.role, selected).is_err());
+    }
+
+    // 2. Only Orchestrator, Architect, Reviewer, and Closure normalize to HeadlessWorker and pass
+    //    validate_non_native_worker_choice.
+    for readonly_role in [
+        WorkflowRole::Orchestrator,
+        WorkflowRole::Architect,
+        WorkflowRole::Reviewer,
+        WorkflowRole::Closure,
+    ] {
+        assert!(is_read_only_advisory_worker_role(readonly_role));
+        let raw = report
+            .roles
+            .iter()
+            .find(|r| r.role == readonly_role)
+            .expect("role outcome")
+            .selected
+            .as_ref()
+            .expect("selected");
+        let normalized = normalize_read_only_advisory_choice(readonly_role, raw)
+            .expect("normalize readonly advisory Codex choice");
+        assert_eq!(normalized.route, RoleExecutionRoute::HeadlessWorker);
+        assert_eq!(normalized.adapter, ToolAdapter::CodexCli);
+        assert_eq!(normalized.model_arg, "gpt-6.1-sol");
+        assert_eq!(normalized.effort.as_deref(), Some("xhigh"));
+        validate_non_native_worker_choice(readonly_role, &normalized)
+            .expect("normalized readonly Codex choice must pass non-native worker validation");
+
+        // Missing effort on Codex advisory choice is rejected.
+        let mut missing_effort = normalized.clone();
+        missing_effort.effort = None;
+        assert!(normalize_read_only_advisory_choice(readonly_role, &missing_effort).is_err());
+        assert!(validate_non_native_worker_choice(readonly_role, &missing_effort).is_err());
+    }
+
+    // 3. Follower and Coder are strictly refused by both normalize_read_only_advisory_choice and
+    //    validate_non_native_worker_choice (even if route is forged to HeadlessWorker).
+    for non_advisory_role in [WorkflowRole::Follower, WorkflowRole::Coder] {
+        assert!(!is_read_only_advisory_worker_role(non_advisory_role));
+        let raw = report
+            .roles
+            .iter()
+            .find(|r| r.role == non_advisory_role)
+            .expect("role outcome")
+            .selected
+            .as_ref()
+            .expect("selected");
+        let err = normalize_read_only_advisory_choice(non_advisory_role, raw)
+            .expect_err("Follower and Coder must not normalize to headless Codex worker");
+        assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+
+        let mut forged_headless = raw.clone();
+        forged_headless.route = RoleExecutionRoute::HeadlessWorker;
+        let err = validate_non_native_worker_choice(non_advisory_role, &forged_headless)
+            .expect_err("forged HeadlessWorker Codex choice for Follower/Coder must be rejected");
+        assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+    }
+
+    // 4. Already-headless Antigravity / OpenCode choices remain unchanged.
+    let agy_report = preflight(
+        &snap,
+        &PreflightRequest {
+            profile_id: Some("profile-active".to_string()),
+            roles: vec![RolePreflightRequest::new(
+                WorkflowRole::Reviewer,
+                Some(Difficulty::Hard),
+            )],
+        },
+        &allow_all_test_models_policy(),
+    )
+    .expect("preflight agy reviewer");
+    let agy_choice = agy_report.roles[0].selected.as_ref().expect("agy selected");
+    let agy_normalized = normalize_read_only_advisory_choice(WorkflowRole::Reviewer, agy_choice)
+        .expect("normalize agy reviewer");
+    assert_eq!(&agy_normalized, agy_choice);
+}

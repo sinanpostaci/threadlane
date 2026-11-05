@@ -21,8 +21,8 @@ use crate::cursor::{
 use crate::error::WorkflowError;
 use crate::journal::{
     compute_payload_digest, compute_tasks_digest, journal_paths_for_binding, read_journal_locked,
-    with_journal_lock, write_journal_locked, CommandJournalEntry, CommandJournalState,
-    MAX_COMMAND_JOURNAL_ENTRIES,
+    read_journal_readonly, with_journal_lock, write_journal_locked, CommandJournalEntry,
+    CommandJournalState, PersistedCommandJournal, MAX_COMMAND_JOURNAL_ENTRIES,
 };
 use crate::types::{
     CatalogDecisionAdvisor, CatalogPage, CatalogProfile, CatalogRoleAssignment, PlanPage,
@@ -235,6 +235,9 @@ impl ScopedWorkflow {
     ///
     /// - Page size defaults to [`DEFAULT_PLAN_LIST_LIMIT`] (`20`) and cannot exceed [`MAX_PLAN_LIST_LIMIT`] (`20`).
     /// - Summaries omit task instructions and CLI executable paths.
+    /// - Active published revisions whose pinned `profile_revision` predates the current registry
+    ///   revision resolve `plan_digest` read-only from the binding's verified `Completed` command
+    ///   journal receipt without opening lock files or recompiling against changed role choices.
     /// - Read-only: never acknowledges or advances delivery receipts.
     pub fn list_plans(
         &self,
@@ -283,12 +286,7 @@ impl ScopedWorkflow {
             None => 0,
         };
 
-        let summaries: Vec<PlanSummary> = own_revisions
-            .iter()
-            .map(|rev| build_plan_summary(rev, &registry_snapshot))
-            .collect();
-
-        if start_idx >= summaries.len() {
+        if start_idx >= own_revisions.len() {
             let empty_page = PlanSummaryPage {
                 binding_id: self.binding_id.clone(),
                 plans: Vec::new(),
@@ -299,14 +297,18 @@ impl ScopedWorkflow {
             return Ok(empty_page);
         }
 
-        let max_take = requested_limit.min(summaries.len() - start_idx);
+        let max_take = requested_limit.min(own_revisions.len() - start_idx);
+        let page_summaries = self.build_plan_summaries(
+            &own_revisions[start_idx..start_idx + max_take],
+            &registry_snapshot,
+        );
         for take_count in (1..=max_take).rev() {
             let end_idx = start_idx + take_count;
-            let next_cursor = if end_idx < summaries.len() {
+            let next_cursor = if end_idx < own_revisions.len() {
                 Some(encode_cursor(
                     &cursor_spec,
                     end_idx,
-                    &summaries[end_idx - 1].plan_id,
+                    &page_summaries[take_count - 1].plan_id,
                 )?)
             } else {
                 None
@@ -314,7 +316,7 @@ impl ScopedWorkflow {
             let has_more = next_cursor.is_some();
             let candidate = PlanSummaryPage {
                 binding_id: self.binding_id.clone(),
-                plans: summaries[start_idx..end_idx].to_vec(),
+                plans: page_summaries[..take_count].to_vec(),
                 next_cursor,
                 has_more,
             };
@@ -340,6 +342,9 @@ impl ScopedWorkflow {
     ///   if a single task exceeds the 256 KiB MCP envelope, fails with `response_too_large`.
     /// - Returns the identical static `not_found` error when `plan_id` does not exist, belongs to
     ///   another binding, or the requested `revision` does not exist.
+    /// - Active published revisions whose pinned `profile_revision` predates the current registry
+    ///   revision resolve `header.plan_digest` read-only from the binding's verified `Completed`
+    ///   command journal receipt without opening lock files or recompiling against changed role choices.
     /// - Read-only: never acknowledges or advances delivery receipts.
     pub fn get_plan(
         &self,
@@ -400,7 +405,12 @@ impl ScopedWorkflow {
         };
 
         let registry_snapshot = self.registry.snapshot()?;
-        let header = build_plan_summary(target_rev, &registry_snapshot);
+        let mut cached_journal = None;
+        let header = self.build_plan_summary_with_journal_cache(
+            target_rev,
+            &registry_snapshot,
+            &mut cached_journal,
+        );
 
         if start_idx >= target_rev.tasks.len() {
             let empty_page = PlanPage {
@@ -600,6 +610,7 @@ impl ScopedWorkflow {
                                 }
                             };
                             if let Some(slot) = journal.find_mut(&request.command_key) {
+                                slot.plan_digest = resolved_digest.clone();
                                 slot.state = CommandJournalState::Completed {
                                     created_revision: persisted_rev.revision,
                                     created_at_ms: persisted_rev.created_at_ms,
@@ -907,6 +918,52 @@ impl ScopedWorkflow {
             Err(other) => Err(WorkflowError::from_plan_error(&other)),
         }
     }
+
+    fn build_plan_summaries(
+        &self,
+        revisions: &[PlanRevision],
+        registry_snapshot: &RegistrySnapshot,
+    ) -> Vec<PlanSummary> {
+        let mut cached_journal = None;
+        revisions
+            .iter()
+            .map(|rev| {
+                self.build_plan_summary_with_journal_cache(
+                    rev,
+                    registry_snapshot,
+                    &mut cached_journal,
+                )
+            })
+            .collect()
+    }
+
+    fn build_plan_summary_with_journal_cache(
+        &self,
+        revision: &PlanRevision,
+        registry_snapshot: &RegistrySnapshot,
+        cached_journal: &mut Option<Option<PersistedCommandJournal>>,
+    ) -> PlanSummary {
+        let plan_digest = match preview_draft_compilation(revision, registry_snapshot) {
+            Ok(compiled) => Some(compiled.plan_digest),
+            Err(PlanError::ProfileRevisionMismatch { .. })
+                if revision.status.is_active_published()
+                    && revision.profile_revision > 0
+                    && revision.profile_revision < registry_snapshot.revision
+                    && revision.binding_id == self.binding_id =>
+            {
+                let journal_opt = cached_journal.get_or_insert_with(|| {
+                    read_journal_readonly(self.plans.dir(), &self.journal_path, &self.binding_id)
+                        .ok()
+                        .flatten()
+                });
+                journal_opt.as_ref().and_then(|journal| {
+                    journal.verified_historical_plan_digest(&self.binding_id, revision)
+                })
+            }
+            Err(_) => None,
+        };
+        PlanSummary::from_revision(revision, plan_digest)
+    }
 }
 
 fn validate_page_limit(
@@ -1010,14 +1067,4 @@ fn build_catalog_profile(
         assignments,
         decision_advisor,
     })
-}
-
-fn build_plan_summary(
-    revision: &PlanRevision,
-    registry_snapshot: &RegistrySnapshot,
-) -> PlanSummary {
-    let plan_digest = preview_draft_compilation(revision, registry_snapshot)
-        .ok()
-        .map(|compiled| compiled.plan_digest);
-    PlanSummary::from_revision(revision, plan_digest)
 }

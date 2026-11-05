@@ -42,8 +42,9 @@ use threadlane_authority::validation::{
 };
 use threadlane_authority::ApprovalRecord;
 use threadlane_workers::{
-    resolve_exact_tree_sha, validate_exact_40_hex_sha, validate_repo_relative_path,
-    validate_sha256_hex_digest, DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
+    resolve_exact_tree_sha, resolve_model_target, validate_exact_40_hex_sha,
+    validate_repo_relative_path, validate_sha256_hex_digest, WorkerProvider,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
 use threadlane_workflow::{Difficulty, PlanStatus, ToolAdapter, WorkflowRole};
 
@@ -52,7 +53,10 @@ use crate::fs_safety::{
     constant_time_str_eq, validate_absolute_no_symlink_components, validate_bounded_identifier,
     MAX_PRIVATE_STATE_FILE_BYTES,
 };
-use crate::profile_flow::{ExecutionPolicy, RoleExecutionRoute, SelectedRoleChoice};
+use crate::profile_flow::{
+    is_read_only_advisory_worker_role, normalize_read_only_advisory_choice, ExecutionPolicy,
+    RoleExecutionRoute, SelectedRoleChoice,
+};
 
 /// Current wire and on-disk schema version for per-binding Coworker workflow ledgers.
 pub const COWORKER_WORKFLOW_SCHEMA_VERSION: u32 = 1;
@@ -413,7 +417,11 @@ impl WorkBrief {
 }
 
 /// Enforces that a role and resolved choice represent a supported headless worker model, never
-/// native Coworker (`CodexCli` / `Follower`).
+/// conversational `Follower`, `native_handoff`, or a `CodexCli` `Coder`.
+///
+/// Normalized `CodexCli` headless choices (`route == HeadlessWorker`) are permitted **only** for
+/// read-only advisory roles (`Orchestrator`, `Architect`, `Reviewer`, `Closure`) with an explicit
+/// reasoning effort validated by [`resolve_model_target`] (`WorkerProvider::CodexCli`).
 pub fn validate_non_native_worker_choice(
     role: WorkflowRole,
     choice: &SelectedRoleChoice,
@@ -424,8 +432,7 @@ pub fn validate_non_native_worker_choice(
             "WorkflowRole::Follower is the conversational native interface, not a headless worker role",
         ));
     }
-    if choice.adapter == ToolAdapter::CodexCli || choice.route != RoleExecutionRoute::HeadlessWorker
-    {
+    if choice.route != RoleExecutionRoute::HeadlessWorker {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             "native Coworker (codex_cli / native_handoff) is not a headless registry execution model",
@@ -445,7 +452,53 @@ pub fn validate_non_native_worker_choice(
     if let Some(ref effort) = choice.effort {
         validate_bounded_identifier(effort, "selected_choice.effort", MAX_COWORKER_ID_LEN)?;
     }
-    Ok(())
+
+    match choice.adapter {
+        ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 => Ok(()),
+        ToolAdapter::CodexCli => {
+            if !is_read_only_advisory_worker_role(role) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "native Coworker (codex_cli) cannot execute as a headless Coder or Follower worker",
+                ));
+            }
+            if choice.effort.is_none() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "headless CodexCli read-only advisory worker requires an explicit reasoning effort",
+                ));
+            }
+            let resolved = resolve_model_target(
+                WorkerProvider::CodexCli,
+                &choice.model_arg,
+                choice.effort.as_deref(),
+            )
+            .map_err(|err| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "invalid headless CodexCli advisory target for model `{}`: {err}",
+                        choice.model_id
+                    ),
+                )
+            })?;
+            if resolved.effort != choice.effort {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "selected_choice.effort does not match resolved CodexCli effort",
+                ));
+            }
+            Ok(())
+        }
+        ToolAdapter::JevApi
+        | ToolAdapter::OpenaiDecisionsApi
+        | ToolAdapter::Git
+        | ToolAdapter::Tmux
+        | ToolAdapter::Codegraph => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "selected_choice.adapter is not a supported headless CLI worker adapter",
+        )),
+    }
 }
 
 /// Provider-visible read-only capability and tool-policy envelope enforced on every
@@ -1343,7 +1396,7 @@ impl FrozenApprovalLinkage {
     /// Attaches and validates an explicit [`FrozenControllerCapabilityEnvelope`] against `policy`.
     pub fn with_controller_envelope(
         mut self,
-        envelope: FrozenControllerCapabilityEnvelope,
+        mut envelope: FrozenControllerCapabilityEnvelope,
         policy: &ExecutionPolicy,
     ) -> Result<Self, NativeError> {
         let computed_digest = policy.digest()?;
@@ -1353,6 +1406,16 @@ impl FrozenApprovalLinkage {
                 "FrozenApprovalLinkage.policy_digest does not match the supplied ExecutionPolicy",
             ));
         }
+        envelope.allowed_reviewer_choices = envelope
+            .allowed_reviewer_choices
+            .iter()
+            .map(|c| normalize_read_only_advisory_choice(WorkflowRole::Reviewer, c))
+            .collect::<Result<Vec<_>, _>>()?;
+        envelope.allowed_closure_choices = envelope
+            .allowed_closure_choices
+            .iter()
+            .map(|c| normalize_read_only_advisory_choice(WorkflowRole::Closure, c))
+            .collect::<Result<Vec<_>, _>>()?;
         envelope.validate(Some(policy))?;
         self.controller_envelope = Some(envelope);
         self.validate()?;

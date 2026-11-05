@@ -33,8 +33,8 @@ use crate::fs_safety::{
     MAX_PRIVATE_STATE_FILE_BYTES,
 };
 use crate::profile_flow::{
-    preflight, ExecutionPolicy, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
-    SelectedRoleChoice,
+    normalize_read_only_advisory_choice, preflight, ExecutionPolicy, PreflightRequest,
+    RoleExecutionRoute, RolePreflightRequest, SelectedRoleChoice,
 };
 
 use super::checks::{
@@ -4270,6 +4270,11 @@ impl ControllerPolicyStore {
             ],
         );
 
+        let reviewer_choice =
+            normalize_read_only_advisory_choice(WorkflowRole::Reviewer, &request.reviewer_choice)?;
+        let closure_choice =
+            normalize_read_only_advisory_choice(WorkflowRole::Closure, &request.closure_choice)?;
+
         let mut envelope = FrozenControllerExecutionEnvelope {
             schema_version: CONTROLLER_POLICY_SCHEMA_VERSION,
             envelope_id: envelope_id.clone(),
@@ -4289,8 +4294,8 @@ impl ControllerPolicyStore {
             policy: request.policy.clone(),
             policy_digest: linkage.policy_digest.clone(),
             task_coder_choices,
-            reviewer_choice: request.reviewer_choice.clone(),
-            closure_choice: request.closure_choice.clone(),
+            reviewer_choice,
+            closure_choice,
             role_budgets: request.role_budgets.clone(),
             max_in_scope_corrections_per_task: request.max_in_scope_corrections_per_task,
             max_total_corrections_per_job: request.max_total_corrections_per_job,

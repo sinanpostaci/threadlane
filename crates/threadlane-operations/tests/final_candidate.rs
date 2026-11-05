@@ -8,14 +8,14 @@ use threadlane_operations::{
     inspect_final_candidate_readonly, inspect_review_subject,
     verify_final_candidate_subject_readonly, verify_legacy_base_closure_insufficient,
     ClosureAttemptState, ClosureExecutionEvidence, ClosureReservationOutcome,
-    ClosureTerminalFailure, ClosureVerdictKind, CommitTaskChangesRequest,
+    ClosureTerminalFailure, ClosureVerdict, ClosureVerdictKind, CommitTaskChangesRequest,
     ExecuteIntegrationRequest, FinalCandidateClosureStore, FinalCandidatePolicyBinding,
     FinalCandidateSubject, FinalCandidateTaskInput, InspectFinalCandidateRequest,
     InspectReviewSubjectRequest, IntegrationReceipt, IntegrationStrategy,
     MarkClosureSubmittedRequest, MarkClosureUnknownRequest, OperationsError,
-    ReconcileClosureAttemptRequest, RecordClosureFailureRequest, RecordClosureVerdictRequest,
-    ReserveClosureAttemptRequest, ReviewAcceptanceRequest, ReviewPolicyBinding, ReviewReceipt,
-    TestEvidenceSummary,
+    PinnedClosureLaunchConfiguration, ReconcileClosureAttemptRequest, RecordClosureFailureRequest,
+    RecordClosureVerdictRequest, ReserveClosureAttemptRequest, ReviewAcceptanceRequest,
+    ReviewPolicyBinding, ReviewReceipt, TestEvidenceSummary,
 };
 use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git, WorkerFilePermissions,
@@ -174,11 +174,12 @@ fn default_execution_evidence(handoff_receipt_id: &str) -> ClosureExecutionEvide
         producer_worker_id: Some("wrk_closure_1".to_string()),
         handoff_receipt_id: handoff_receipt_id.to_string(),
         observed_provider: "codex".to_string(),
-        observed_model: "gpt-6-astra".to_string(),
+        observed_model: Some("gpt-6-astra".to_string()),
         observed_effort: Some("max".to_string()),
         transcript_or_event_digest: "44".repeat(32),
         grants_merge_or_push_authority: false,
         substitutes_for_required_checks: false,
+        pinned_launch_configuration: None,
     }
 }
 
@@ -1382,4 +1383,257 @@ fn known_local_terminal_closure_failure_blocks_blind_retry_and_supports_reconcil
     assert_eq!(rec_rev, 4);
     assert_eq!(rec_attempt.state, ClosureAttemptState::Terminal);
     assert_eq!(rec_verdict.kind, ClosureVerdictKind::Accepted);
+}
+
+#[test]
+fn codex_cli_pinned_launch_configuration_and_legacy_digest_compatibility() {
+    let fixture = init_candidate_fixture();
+    let task_a = create_accept_and_integrate_task(
+        &fixture,
+        "task_alpha",
+        "t01",
+        "aa",
+        "src/alpha.rs",
+        "pub fn alpha() -> u32 {\n    99\n}\n",
+        IntegrationStrategy::FastForwardOnly,
+        1_000,
+    );
+
+    // 1. Legacy ClosureVerdict JSON fixture without `pinned_launch_configuration` and with string
+    // `"observed_model"` round-trips to the exact same JSON string and computed verdict digest.
+    let frozen_legacy_raw = include_str!("fixtures/closure-verdict-v1.json").trim();
+    let legacy: ClosureVerdict =
+        serde_json::from_str(frozen_legacy_raw).expect("deserialize legacy ClosureVerdict fixture");
+    assert_eq!(
+        legacy.execution_evidence.observed_model.as_deref(),
+        Some("gpt-6-astra")
+    );
+    assert!(legacy
+        .execution_evidence
+        .pinned_launch_configuration
+        .is_none());
+    let reencoded_raw =
+        serde_json::to_string(&legacy).expect("re-serialize legacy ClosureVerdict fixture");
+    assert_eq!(
+        reencoded_raw, frozen_legacy_raw,
+        "legacy ClosureVerdict serialization must remain byte-for-byte identical"
+    );
+    assert_eq!(
+        legacy
+            .compute_digest()
+            .expect("compute legacy ClosureVerdict digest"),
+        legacy.verdict_digest,
+        "legacy ClosureVerdict computed digest must match frozen baseline verdict_digest"
+    );
+
+    // 2. Inspect a `codex_cli` final candidate subject with `require_effort_evidence = true`.
+    let mut codex_policy = default_candidate_policy();
+    codex_policy.requested_provider = "codex_cli".to_string();
+    codex_policy.requested_model = "gpt-6.1-sol".to_string();
+    codex_policy.requested_effort = Some("xhigh".to_string());
+    codex_policy.require_effort_evidence = true;
+
+    let codex_subject = inspect_final_candidate_readonly(&InspectFinalCandidateRequest {
+        repository_path: fixture.repo_path.clone(),
+        work_area_root: fixture.work_area_root.clone(),
+        run_id: fixture.run_id.clone(),
+        integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+        approved_base_commit: fixture.approved_base_commit.clone(),
+        expected_source_head_commit: fixture.approved_base_commit.clone(),
+        expected_candidate_head_commit: None,
+        expected_candidate_tree_sha: None,
+        predecessor_tasks: vec![to_task_input(&task_a)],
+        expected_aggregate_write_paths: None,
+        policy: codex_policy,
+        check_evidence: default_test_evidence("passed", 10),
+    })
+    .expect("inspect codex_cli candidate");
+
+    let valid_codex_evidence = ClosureExecutionEvidence {
+        evidence_id: "cev_codex_1".to_string(),
+        producer_run_id: fixture.run_id.clone(),
+        producer_worker_id: Some("wrk_codex_1".to_string()),
+        handoff_receipt_id: "rcp_codex_1".to_string(),
+        observed_provider: "codex_cli".to_string(),
+        observed_model: None,
+        observed_effort: None,
+        transcript_or_event_digest: "55".repeat(32),
+        grants_merge_or_push_authority: false,
+        substitutes_for_required_checks: false,
+        pinned_launch_configuration: Some(PinnedClosureLaunchConfiguration {
+            requested_model: "gpt-6.1-sol".to_string(),
+            requested_effort: "xhigh".to_string(),
+            constructed_argv_sha256: "66".repeat(32),
+        }),
+    };
+    valid_codex_evidence
+        .validate_against_subject(&codex_subject)
+        .expect("valid codex_cli pinned launch configuration must satisfy subject policy");
+
+    // 3. Present `observed_model` or `observed_effort` contradiction is refused even when a valid
+    // `pinned_launch_configuration` is present.
+    let mut contradicted_model = valid_codex_evidence.clone();
+    contradicted_model.observed_model = Some("gpt-6-astra".to_string());
+    assert!(matches!(
+        contradicted_model
+            .validate_against_subject(&codex_subject)
+            .expect_err("contradictory observed_model must be refused"),
+        OperationsError::UncertainWorkerOutcome(_)
+    ));
+
+    let mut contradicted_effort = valid_codex_evidence.clone();
+    contradicted_effort.observed_effort = Some("low".to_string());
+    assert!(matches!(
+        contradicted_effort
+            .validate_against_subject(&codex_subject)
+            .expect_err("contradictory observed_effort must be refused"),
+        OperationsError::UncertainWorkerOutcome(_)
+    ));
+
+    // 4. Absent, mismatched, or invalid-digest pinned launch configuration on `codex_cli` is refused.
+    let mut missing_pin = valid_codex_evidence.clone();
+    missing_pin.pinned_launch_configuration = None;
+    assert!(matches!(
+        missing_pin
+            .validate_against_subject(&codex_subject)
+            .expect_err(
+                "codex_cli without observed_model or pinned_launch_configuration must fail"
+            ),
+        OperationsError::UncertainWorkerOutcome(_)
+    ));
+
+    let mut wrong_pin_model = valid_codex_evidence.clone();
+    wrong_pin_model
+        .pinned_launch_configuration
+        .as_mut()
+        .expect("pin")
+        .requested_model = "gpt-6-astra".to_string();
+    assert!(matches!(
+        wrong_pin_model
+            .validate_against_subject(&codex_subject)
+            .expect_err("mismatched pinned requested_model must fail"),
+        OperationsError::UncertainWorkerOutcome(_)
+    ));
+
+    let mut wrong_pin_effort = valid_codex_evidence.clone();
+    wrong_pin_effort
+        .pinned_launch_configuration
+        .as_mut()
+        .expect("pin")
+        .requested_effort = "high".to_string();
+    assert!(matches!(
+        wrong_pin_effort
+            .validate_against_subject(&codex_subject)
+            .expect_err("mismatched pinned requested_effort must fail"),
+        OperationsError::UncertainWorkerOutcome(_)
+    ));
+
+    let mut bad_pin_digest = valid_codex_evidence.clone();
+    bad_pin_digest
+        .pinned_launch_configuration
+        .as_mut()
+        .expect("pin")
+        .constructed_argv_sha256 = "not-a-sha256".to_string();
+    assert!(matches!(
+        bad_pin_digest
+            .validate_against_subject(&codex_subject)
+            .expect_err("invalid constructed_argv_sha256 must fail"),
+        OperationsError::InvalidInput(_)
+    ));
+
+    // 5. Forged `pinned_launch_configuration` on `antigravity` or `opencode_v2` cannot bypass
+    // required `observed_model` / `observed_effort` telemetry.
+    for provider in ["antigravity", "opencode_v2"] {
+        let mut non_codex_policy = default_candidate_policy();
+        non_codex_policy.requested_provider = provider.to_string();
+        non_codex_policy.requested_model = "gemini-4-argon-high".to_string();
+        non_codex_policy.requested_effort = Some("high".to_string());
+        non_codex_policy.require_effort_evidence = true;
+        let non_codex_subject = inspect_final_candidate_readonly(&InspectFinalCandidateRequest {
+            repository_path: fixture.repo_path.clone(),
+            work_area_root: fixture.work_area_root.clone(),
+            run_id: fixture.run_id.clone(),
+            integration_worktree_id: fixture.integration_manifest.worktree_id.clone(),
+            approved_base_commit: fixture.approved_base_commit.clone(),
+            expected_source_head_commit: fixture.approved_base_commit.clone(),
+            expected_candidate_head_commit: None,
+            expected_candidate_tree_sha: None,
+            predecessor_tasks: vec![to_task_input(&task_a)],
+            expected_aggregate_write_paths: None,
+            policy: non_codex_policy,
+            check_evidence: default_test_evidence("passed", 10),
+        })
+        .expect("inspect non-codex subject");
+
+        let forged_pin = ClosureExecutionEvidence {
+            evidence_id: "cev_forged_1".to_string(),
+            producer_run_id: fixture.run_id.clone(),
+            producer_worker_id: Some("wrk_forged_1".to_string()),
+            handoff_receipt_id: "rcp_forged_1".to_string(),
+            observed_provider: provider.to_string(),
+            observed_model: None,
+            observed_effort: None,
+            transcript_or_event_digest: "55".repeat(32),
+            grants_merge_or_push_authority: false,
+            substitutes_for_required_checks: false,
+            pinned_launch_configuration: Some(PinnedClosureLaunchConfiguration {
+                requested_model: "gemini-4-argon-high".to_string(),
+                requested_effort: "high".to_string(),
+                constructed_argv_sha256: "66".repeat(32),
+            }),
+        };
+        assert!(matches!(
+            forged_pin
+                .validate_against_subject(&non_codex_subject)
+                .expect_err("forged pinned_launch_configuration on non-codex provider must fail"),
+            OperationsError::UncertainWorkerOutcome(_)
+        ));
+    }
+
+    // 6. Recording and verifying the `codex_cli` verdict through `FinalCandidateClosureStore` succeeds.
+    let store = FinalCandidateClosureStore::open(&fixture.repo_path, &fixture.work_area_root)
+        .expect("open store");
+    store
+        .reserve_closure_attempt(&ReserveClosureAttemptRequest {
+            expected_ledger_revision: 0,
+            command_key: "cmd_codex_1".to_string(),
+            attempt_id: Some("cat_codex_1".to_string()),
+            subject: codex_subject.clone(),
+            legacy_base_tree_digest: Some(fixture.approved_base_tree_sha.clone()),
+            reserved_at_ms: 2_000,
+        })
+        .expect("reserve codex attempt");
+    store
+        .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
+            expected_ledger_revision: 1,
+            attempt_id: "cat_codex_1".to_string(),
+            command_key: "cmd_codex_1".to_string(),
+            expected_subject_digest: codex_subject.subject_digest.clone(),
+            external_request_id: "req_codex_1".to_string(),
+            submitted_at_ms: 2_050,
+        })
+        .expect("submit codex attempt");
+    let (_, _, codex_verdict) = store
+        .record_closure_verdict(&RecordClosureVerdictRequest {
+            expected_ledger_revision: 2,
+            attempt_id: "cat_codex_1".to_string(),
+            command_key: "cmd_codex_1".to_string(),
+            verdict_id: Some("cvd_codex_1".to_string()),
+            subject: codex_subject.clone(),
+            kind: ClosureVerdictKind::Accepted,
+            summary: "Accepted via read-only codex_cli closure with pinned launch config"
+                .to_string(),
+            execution_evidence: valid_codex_evidence,
+            recorded_at_ms: 2_100,
+        })
+        .expect("record codex verdict");
+    assert!(codex_verdict.execution_evidence.observed_model.is_none());
+    assert!(codex_verdict.execution_evidence.observed_effort.is_none());
+    assert!(codex_verdict
+        .execution_evidence
+        .pinned_launch_configuration
+        .is_some());
+    store
+        .verify_accepted_closure_verdict_readonly(&codex_subject, &codex_verdict)
+        .expect("verify accepted codex_cli verdict");
 }

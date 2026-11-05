@@ -334,6 +334,12 @@ struct CachedScopedWorkflow {
     workflow: ScopedWorkflow,
 }
 
+#[derive(Debug, Clone)]
+struct PairedObservationHandle {
+    request_id: String,
+    matched_context: Option<VerifiedMcpObservationContext>,
+}
+
 /// Paired stdio MCP server that starts `Unbound` with a unique connection nonce/epoch and
 /// delegates scoped runtime, workflow, and approved-task tools only after verified operator enrollment.
 #[derive(Debug, Clone)]
@@ -1080,35 +1086,66 @@ impl PairedMcpServer {
         )
     }
 
+    async fn refreshed_observation_context(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+    ) -> Option<VerifiedMcpObservationContext> {
+        self.automatic_pairing
+            .refresh_observation_context_for_call(
+                &self.connection_nonce,
+                &self.epoch_id,
+                self.server_pid,
+                binding_id,
+                thread_uuid,
+            )
+            .await
+    }
+
     #[cfg(test)]
-    pub(crate) fn record_test_observation_context(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_test_observation_context_with_selection(
         &self,
         binding_id: &str,
         thread_id: &str,
         thread_title: &str,
         canonical_cwd: &Path,
         project_id: Option<&str>,
+        selected_model: Option<&str>,
+        selected_effort: Option<&str>,
     ) {
-        self.automatic_pairing.record_verified_observation_context(
-            &self.connection_nonce,
-            &self.epoch_id,
-            self.server_pid,
-            binding_id,
-            thread_id,
-            thread_title,
-            canonical_cwd,
-            project_id,
-        );
+        self.automatic_pairing
+            .record_verified_observation_context_with_selection(
+                &self.connection_nonce,
+                &self.epoch_id,
+                self.server_pid,
+                binding_id,
+                thread_id,
+                thread_title,
+                canonical_cwd,
+                project_id,
+                selected_model,
+                selected_effort,
+            );
     }
 
-    fn begin_paired_observation(
+    #[cfg(test)]
+    pub(crate) fn set_test_observation_metadata_refresher<F>(&self, refresher: F)
+    where
+        F: Fn(&str) -> Result<crate::NativeThread, NativeError> + Send + Sync + 'static,
+    {
+        self.automatic_pairing
+            .set_test_metadata_refresher(refresher);
+    }
+
+    async fn begin_paired_observation(
         &self,
         binding_id: &str,
         thread_uuid: &str,
         tool_name: &'static str,
         approval_id: Option<&str>,
         task_id: Option<&str>,
-    ) -> String {
+    ) -> PairedObservationHandle {
         self.begin_paired_observation_with_job(
             binding_id,
             thread_uuid,
@@ -1117,9 +1154,10 @@ impl PairedMcpServer {
             approval_id,
             task_id,
         )
+        .await
     }
 
-    fn begin_paired_observation_with_job(
+    async fn begin_paired_observation_with_job(
         &self,
         binding_id: &str,
         thread_uuid: &str,
@@ -1127,13 +1165,15 @@ impl PairedMcpServer {
         job_id: Option<&str>,
         approval_id: Option<&str>,
         task_id: Option<&str>,
-    ) -> String {
+    ) -> PairedObservationHandle {
         let request_id = generate_observation_id("obsreq");
         let dir = self.observation_journal_dir();
         let started_at_ms = current_observation_time_ms();
         let op = format!("mcp.paired.{tool_name}");
         let title = format!("mcp paired {}", tool_name.replace('_', " "));
-        let matched = self.matched_observation_context(binding_id, thread_uuid);
+        let matched = self
+            .refreshed_observation_context(binding_id, thread_uuid)
+            .await;
         let actor = matched
             .as_ref()
             .map(|ctx| ctx.actor.clone())
@@ -1170,13 +1210,16 @@ impl PairedMcpServer {
                 summary: Some(format!("MCP tool {op}")),
             },
         );
-        request_id
+        PairedObservationHandle {
+            request_id,
+            matched_context: matched,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn finish_paired_observation(
         &self,
-        request_id: String,
+        observation: PairedObservationHandle,
         binding_id: &str,
         thread_uuid: &str,
         tool_name: &'static str,
@@ -1185,7 +1228,7 @@ impl PairedMcpServer {
         result: &Result<CallToolResult, CallToolResult>,
     ) {
         self.finish_paired_observation_with_job(
-            request_id,
+            observation,
             binding_id,
             thread_uuid,
             tool_name,
@@ -1199,7 +1242,7 @@ impl PairedMcpServer {
     #[allow(clippy::too_many_arguments)]
     fn finish_paired_observation_with_job(
         &self,
-        request_id: String,
+        observation: PairedObservationHandle,
         binding_id: &str,
         thread_uuid: &str,
         tool_name: &'static str,
@@ -1208,6 +1251,10 @@ impl PairedMcpServer {
         task_id: Option<&str>,
         result: &Result<CallToolResult, CallToolResult>,
     ) {
+        let PairedObservationHandle {
+            request_id,
+            matched_context: matched,
+        } = observation;
         let plan_id = observation_result_plan_id(tool_name, binding_id, result);
         let job_id = observation_result_job_id(tool_name, binding_id, result)
             .or_else(|| plan_id.clone())
@@ -1233,7 +1280,6 @@ impl PairedMcpServer {
                 format!("Failed {op}"),
             ),
         };
-        let matched = self.matched_observation_context(binding_id, thread_uuid);
         let actor = matched
             .as_ref()
             .map(|ctx| ctx.actor.clone())
@@ -1275,10 +1321,14 @@ impl PairedMcpServer {
         );
     }
 
-    fn enrolled_delegate(&self, tool_name: &str) -> Result<ThreadlaneMcpServer, CallToolResult> {
+    async fn enrolled_delegate(
+        &self,
+        tool_name: &str,
+    ) -> Result<ThreadlaneMcpServer, CallToolResult> {
         let enrollment = self.verify_enrolled_binding_for_tool(tool_name)?;
-        let matched =
-            self.matched_observation_context(&enrollment.binding_id, &enrollment.thread_id);
+        let matched = self
+            .refreshed_observation_context(&enrollment.binding_id, &enrollment.thread_id)
+            .await;
 
         let scoped_client = ScopedClient::from_state_dir_lazy(
             &self.state_dir,
@@ -1361,13 +1411,15 @@ impl PairedMcpServer {
         };
 
         let workflow = self.scoped_workflow_for_enrolled(stores, &trusted_binding_id, tool_name)?;
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            tool_name,
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                tool_name,
+                None,
+                None,
+            )
+            .await;
 
         let outcome = tokio::task::spawn_blocking(move || op(workflow))
             .await
@@ -1576,14 +1628,16 @@ impl PairedMcpServer {
     {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_planning_gateway(tool_name)?;
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            tool_name,
-            initial_job_id,
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                tool_name,
+                initial_job_id,
+                None,
+                None,
+            )
+            .await;
 
         let outcome = tokio::task::spawn_blocking(move || op(gateway))
             .await
@@ -1763,7 +1817,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<OperatingGuideParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate(OPERATING_GUIDE_TOOL)?;
+        let delegate = self.enrolled_delegate(OPERATING_GUIDE_TOOL).await?;
         delegate.operating_guide(Parameters(params)).await
     }
 
@@ -1783,7 +1837,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StatusParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("status")?;
+        let delegate = self.enrolled_delegate("status").await?;
         delegate.status(Parameters(params)).await
     }
 
@@ -1803,7 +1857,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<GetRunParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("get_run")?;
+        let delegate = self.enrolled_delegate("get_run").await?;
         delegate.get_run(Parameters(params)).await
     }
 
@@ -1823,7 +1877,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListRunsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_runs")?;
+        let delegate = self.enrolled_delegate("list_runs").await?;
         delegate.list_runs(Parameters(params)).await
     }
 
@@ -1843,7 +1897,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListRunRevisionsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_run_revisions")?;
+        let delegate = self.enrolled_delegate("list_run_revisions").await?;
         delegate.list_run_revisions(Parameters(params)).await
     }
 
@@ -1863,7 +1917,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListRunQuestionsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_run_questions")?;
+        let delegate = self.enrolled_delegate("list_run_questions").await?;
         delegate.list_run_questions(Parameters(params)).await
     }
 
@@ -1883,7 +1937,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<ListActivityParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("list_activity")?;
+        let delegate = self.enrolled_delegate("list_activity").await?;
         delegate.list_activity(Parameters(params)).await
     }
 
@@ -1903,7 +1957,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StartDemoParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("start_demo")?;
+        let delegate = self.enrolled_delegate("start_demo").await?;
         delegate.start_demo(Parameters(params)).await
     }
 
@@ -1923,7 +1977,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<PullEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("pull_events")?;
+        let delegate = self.enrolled_delegate("pull_events").await?;
         delegate.pull_events(Parameters(params)).await
     }
 
@@ -1943,7 +1997,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<AckEventsParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("ack_events")?;
+        let delegate = self.enrolled_delegate("ack_events").await?;
         delegate.ack_events(Parameters(params)).await
     }
 
@@ -1963,7 +2017,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<AnswerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("answer")?;
+        let delegate = self.enrolled_delegate("answer").await?;
         delegate.answer(Parameters(params)).await
     }
 
@@ -1983,7 +2037,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<SteerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("steer")?;
+        let delegate = self.enrolled_delegate("steer").await?;
         delegate.steer(Parameters(params)).await
     }
 
@@ -2003,7 +2057,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CancelParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("cancel")?;
+        let delegate = self.enrolled_delegate("cancel").await?;
         delegate.cancel(Parameters(params)).await
     }
 
@@ -2023,7 +2077,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<StartWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("start_worker")?;
+        let delegate = self.enrolled_delegate("start_worker").await?;
         delegate.start_worker(Parameters(params)).await
     }
 
@@ -2043,7 +2097,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<GetWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("get_worker")?;
+        let delegate = self.enrolled_delegate("get_worker").await?;
         delegate.get_worker(Parameters(params)).await
     }
 
@@ -2063,7 +2117,7 @@ impl PairedMcpServer {
         &self,
         Parameters(params): Parameters<CancelWorkerParams>,
     ) -> Result<CallToolResult, CallToolResult> {
-        let delegate = self.enrolled_delegate("cancel_worker")?;
+        let delegate = self.enrolled_delegate("cancel_worker").await?;
         delegate.cancel_worker(Parameters(params)).await
     }
 
@@ -2199,13 +2253,15 @@ impl PairedMcpServer {
     ) -> Result<CallToolResult, CallToolResult> {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("list_approvals")?;
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "list_approvals",
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "list_approvals",
+                None,
+                None,
+            )
+            .await;
         let res = execute_list_approvals(
             stores.authority,
             trusted_binding_id.clone(),
@@ -2244,13 +2300,15 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_session")?;
         let approval_id = params.approval_id.clone();
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_session",
-            Some(&approval_id),
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "approved_session",
+                Some(&approval_id),
+                None,
+            )
+            .await;
         let res = execute_approved_session(
             stores.authority,
             stores.sessions_dir,
@@ -2302,13 +2360,15 @@ impl PairedMcpServer {
             .as_ref()
             .map(|launcher| Instant::now() + launcher.policy().startup_timeout());
 
-        let req_id = self.begin_paired_observation(
-            &guard_binding_id,
-            &guard_thread_uuid,
-            "start_approved_task",
-            Some(&guard_approval_id),
-            Some(&guard_task_id),
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &guard_binding_id,
+                &guard_thread_uuid,
+                "start_approved_task",
+                Some(&guard_approval_id),
+                Some(&guard_task_id),
+            )
+            .await;
 
         let res = crate::dispatch_guard::with_guarded_native_dispatch_until(
             &authority_for_guard,
@@ -2401,13 +2461,15 @@ impl PairedMcpServer {
             self.verified_host_context("approved_task")?;
         let approval_id = params.approval_id.clone();
         let task_id = params.task_id.clone();
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_task",
-            Some(&approval_id),
-            Some(&task_id),
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "approved_task",
+                Some(&approval_id),
+                Some(&task_id),
+            )
+            .await;
         let res = execute_approved_task(
             stores.authority,
             stores.sessions_dir,
@@ -2448,13 +2510,15 @@ impl PairedMcpServer {
             self.verified_host_context("cancel_approved_task")?;
         let approval_id = params.approval_id.clone();
         let task_id = params.task_id.clone();
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "cancel_approved_task",
-            Some(&approval_id),
-            Some(&task_id),
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "cancel_approved_task",
+                Some(&approval_id),
+                Some(&task_id),
+            )
+            .await;
         let res = execute_cancel_approved_task(
             stores.authority,
             stores.sessions_dir,
@@ -2495,13 +2559,15 @@ impl PairedMcpServer {
             self.verified_host_context("approved_activity")?;
         let approval_id = params.approval_id.clone();
         let task_id = params.task_id.clone();
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_activity",
-            Some(&approval_id),
-            task_id.as_deref(),
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "approved_activity",
+                Some(&approval_id),
+                task_id.as_deref(),
+            )
+            .await;
         let res = execute_approved_activity(
             stores.authority,
             stores.sessions_dir,
@@ -2541,13 +2607,15 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_pull_events")?;
         let approval_id = params.approval_id.clone();
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_pull_events",
-            Some(&approval_id),
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "approved_pull_events",
+                Some(&approval_id),
+                None,
+            )
+            .await;
         let res = execute_approved_pull_events(
             stores.authority,
             stores.sessions_dir,
@@ -2587,13 +2655,15 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, stores) =
             self.verified_host_context("approved_ack_events")?;
         let approval_id = params.approval_id.clone();
-        let req_id = self.begin_paired_observation(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "approved_ack_events",
-            Some(&approval_id),
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "approved_ack_events",
+                Some(&approval_id),
+                None,
+            )
+            .await;
         let res = execute_approved_ack_events(
             stores.authority,
             stores.sessions_dir,
@@ -2680,14 +2750,16 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_planning_gateway("consult_architect")?;
         let job_id = params.job_id.clone();
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "consult_architect",
-            Some(&job_id),
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "consult_architect",
+                Some(&job_id),
+                None,
+                None,
+            )
+            .await;
         let result = match gateway.consult_architect(&params).await {
             Ok(data) => {
                 Self::format_planning_gateway_result(&trusted_binding_id, "consult_architect", data)
@@ -2730,14 +2802,16 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_planning_gateway("request_technical_plan")?;
         let job_id = params.job_id.clone();
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "request_technical_plan",
-            Some(&job_id),
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "request_technical_plan",
+                Some(&job_id),
+                None,
+                None,
+            )
+            .await;
         let result = match gateway.request_technical_plan(&params).await {
             Ok(data) => Self::format_planning_gateway_result(
                 &trusted_binding_id,
@@ -2804,14 +2878,16 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_execution_gateway("preview_execution")?;
         let job_id = params.job_id.clone();
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "preview_execution",
-            Some(&job_id),
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "preview_execution",
+                Some(&job_id),
+                None,
+                None,
+            )
+            .await;
         let outcome = tokio::task::spawn_blocking(move || gateway.preview_execution(&params))
             .await
             .map_err(|_| {
@@ -2865,14 +2941,16 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_execution_gateway("start_execution")?;
         let job_id = params.job_id.clone();
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "start_execution",
-            Some(&job_id),
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "start_execution",
+                Some(&job_id),
+                None,
+                None,
+            )
+            .await;
         let result = match gateway.start_execution(&params).await {
             Ok(data) => {
                 Self::format_planning_gateway_result(&trusted_binding_id, "start_execution", data)
@@ -2915,14 +2993,16 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_execution_gateway("execution_status")?;
         let job_id = params.job_id.clone();
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "execution_status",
-            Some(&job_id),
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "execution_status",
+                Some(&job_id),
+                None,
+                None,
+            )
+            .await;
         let result = match gateway.execution_status(&params).await {
             Ok(data) => {
                 Self::format_planning_gateway_result(&trusted_binding_id, "execution_status", data)
@@ -2965,14 +3045,16 @@ impl PairedMcpServer {
         let (trusted_binding_id, trusted_thread_uuid, gateway) =
             self.verified_execution_gateway("stop_execution")?;
         let job_id = params.job_id.clone();
-        let req_id = self.begin_paired_observation_with_job(
-            &trusted_binding_id,
-            &trusted_thread_uuid,
-            "stop_execution",
-            Some(&job_id),
-            None,
-            None,
-        );
+        let req_id = self
+            .begin_paired_observation_with_job(
+                &trusted_binding_id,
+                &trusted_thread_uuid,
+                "stop_execution",
+                Some(&job_id),
+                None,
+                None,
+            )
+            .await;
         let result = match gateway.stop_execution(&params).await {
             Ok(data) => {
                 Self::format_planning_gateway_result(&trusted_binding_id, "stop_execution", data)
@@ -3405,6 +3487,8 @@ mod observation_correlation_tests {
             assert_eq!(actor.source.as_deref(), Some("paired_mcp"));
             assert_eq!(actor.model, None);
             assert_eq!(actor.effort, None);
+            assert_eq!(actor.selected_model, None);
+            assert_eq!(actor.selected_effort, None);
             assert_eq!(actor.evidence, ObservationActorEvidence::Configured);
             assert_eq!(rec.executor, Some(ObservationExecutor::local_mcp()));
             assert_eq!(rec.usage, None);
@@ -3427,6 +3511,262 @@ mod observation_correlation_tests {
             assert_eq!(rec.usage, None);
         }
 
+        // Now verify configured model switch across two calls and refresh failure clearing selection
+        // while normal MCP tools continue to succeed.
+        server_auto.record_test_observation_context_with_selection(
+            &binding_auto.binding_id,
+            thread_auto,
+            "Auto Chat",
+            Path::new("/tmp/workspace/auto-project"),
+            Some("proj_auto"),
+            Some("GPT-5.4"),
+            Some("high"),
+        );
+
+        CALL_THREAD_HINT
+            .scope(Some(thread_auto.to_string()), async {
+                server_auto
+                    .status(Parameters(StatusParams::default()))
+                    .await
+                    .expect("status with initial GPT-5.4 selection");
+
+                server_auto.set_test_observation_metadata_refresher(move |requested_thread| {
+                    assert_eq!(requested_thread, thread_auto);
+                    Ok(crate::NativeThread {
+                        id: thread_auto.to_string(),
+                        project_id: Some("proj_auto".to_string()),
+                        title: Some("Auto Chat".to_string()),
+                        cwd: "/tmp/workspace/auto-project".to_string(),
+                        status: "idle".to_string(),
+                        model: Some("Sol".to_string()),
+                        effort: Some("xhigh".to_string()),
+                        can_accept_direct_input: Some(true),
+                    })
+                });
+                server_auto
+                    .status(Parameters(StatusParams::default()))
+                    .await
+                    .expect("status after switching model to Sol xhigh");
+
+                server_auto.set_test_observation_metadata_refresher(|_| {
+                    Err(NativeError::new(
+                        NativeErrorCode::TransportUnavailable,
+                        "parent backend temporarily unreachable",
+                    ))
+                });
+                server_auto
+                    .status(Parameters(StatusParams::default()))
+                    .await
+                    .expect("status must still succeed when metadata refresh fails");
+            })
+            .await;
+
+        let (records, warnings) =
+            read_journal_records_readonly(&state_dir).expect("read updated journal records");
+        assert!(warnings.is_empty());
+        assert_eq!(records.len(), 12);
+
+        for rec in &records[6..8] {
+            let actor = rec.actor.as_ref().expect("actor on call 1");
+            assert_eq!(actor.selected_model.as_deref(), Some("GPT-5.4"));
+            assert_eq!(actor.selected_effort.as_deref(), Some("high"));
+            assert_eq!(actor.model, None);
+            assert_eq!(actor.effort, None);
+        }
+        for rec in &records[8..10] {
+            let actor = rec.actor.as_ref().expect("actor on call 2");
+            assert_eq!(actor.selected_model.as_deref(), Some("Sol"));
+            assert_eq!(actor.selected_effort.as_deref(), Some("xhigh"));
+            assert_eq!(actor.model, None);
+            assert_eq!(actor.effort, None);
+        }
+        for rec in &records[10..12] {
+            let actor = rec
+                .actor
+                .as_ref()
+                .expect("actor on call 3 after failed refresh");
+            assert_eq!(actor.label.as_deref(), Some("Codex · Auto Chat"));
+            assert_eq!(actor.selected_model, None);
+            assert_eq!(actor.selected_effort, None);
+            assert_eq!(actor.model, None);
+            assert_eq!(actor.effort, None);
+        }
+
         sup_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_paired_observations_preserve_entry_captured_actor_selection_across_interleaved_switch_and_failed_refresh(
+    ) {
+        use std::fs;
+        use threadlane_core::observation::{read_journal_records_readonly, ObservationRecordPhase};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("runtime");
+        fs::create_dir_all(&state_dir).expect("create state_dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
+                .expect("chmod 0700 state_dir");
+        }
+        let pairing_store = PairingStore::open(tmp.path().join("pairing")).expect("pairing store");
+        let token = pairing_store.operator_token().expect("operator token");
+        let server = PairedMcpServer::new(&state_dir, pairing_store.clone()).expect("server");
+        let thread_id = "0196ed00-0000-7000-8000-0000000000c3";
+        let binding_id = "bnd_concurrent_obs_1";
+        pairing_store
+            .enroll(
+                &token,
+                crate::OperatorEnrollRequest {
+                    connection_nonce: server.connection_nonce().to_string(),
+                    epoch_id: server.epoch_id().to_string(),
+                    binding_id: binding_id.to_string(),
+                    thread_id: thread_id.to_string(),
+                    project_id: Some("proj_concurrent".to_string()),
+                },
+            )
+            .expect("enroll binding");
+
+        server.record_test_observation_context_with_selection(
+            binding_id,
+            thread_id,
+            "Concurrent Chat",
+            Path::new("/tmp/workspace/concurrent-project"),
+            Some("proj_concurrent"),
+            Some("GPT-5.4"),
+            Some("high"),
+        );
+
+        let ok_res = Ok(ThreadlaneMcpServer::build_structured_tool_result(
+            binding_id,
+            "list_plans",
+            json!({"items": []}),
+        ));
+
+        let (req_a1_id, req_b1_id, req_a2_id, req_b2_id) = CALL_THREAD_HINT
+            .scope(Some(thread_id.to_string()), async {
+                // 1. Request A1 begins with initial model1 ("GPT-5.4", "high").
+                let obs_a1 = server
+                    .begin_paired_observation(binding_id, thread_id, "list_plans", None, None)
+                    .await;
+                let req_a1_id = obs_a1.request_id.clone();
+
+                // While A1 is in flight, Request B1 refreshes the shared context to model2 ("Sol", "xhigh")
+                // and completes.
+                server.set_test_observation_metadata_refresher(move |requested_thread| {
+                    assert_eq!(requested_thread, thread_id);
+                    Ok(crate::NativeThread {
+                        id: thread_id.to_string(),
+                        project_id: Some("proj_concurrent".to_string()),
+                        title: Some("Concurrent Chat".to_string()),
+                        cwd: "/tmp/workspace/concurrent-project".to_string(),
+                        status: "idle".to_string(),
+                        model: Some("Sol".to_string()),
+                        effort: Some("xhigh".to_string()),
+                        can_accept_direct_input: Some(true),
+                    })
+                });
+                let obs_b1 = server
+                    .begin_paired_observation(binding_id, thread_id, "catalog", None, None)
+                    .await;
+                let req_b1_id = obs_b1.request_id.clone();
+                server.finish_paired_observation(
+                    obs_b1, binding_id, thread_id, "catalog", None, None, &ok_res,
+                );
+
+                // Request A1 now finishes; its Finish record must retain its entry-captured model1 ("GPT-5.4", "high").
+                server.finish_paired_observation(
+                    obs_a1,
+                    binding_id,
+                    thread_id,
+                    "list_plans",
+                    None,
+                    None,
+                    &ok_res,
+                );
+
+                // 2. Request A2 begins while selection is model2 ("Sol", "xhigh").
+                let obs_a2 = server
+                    .begin_paired_observation(binding_id, thread_id, "get_plan", None, None)
+                    .await;
+                let req_a2_id = obs_a2.request_id.clone();
+
+                // While A2 is in flight, Request B2 hits a failed metadata refresh (clearing shared selection)
+                // and completes.
+                server.set_test_observation_metadata_refresher(|_| {
+                    Err(NativeError::new(
+                        NativeErrorCode::TransportUnavailable,
+                        "parent backend temporarily unreachable",
+                    ))
+                });
+                let obs_b2 = server
+                    .begin_paired_observation(binding_id, thread_id, "list_approvals", None, None)
+                    .await;
+                let req_b2_id = obs_b2.request_id.clone();
+                server.finish_paired_observation(
+                    obs_b2,
+                    binding_id,
+                    thread_id,
+                    "list_approvals",
+                    None,
+                    None,
+                    &ok_res,
+                );
+
+                // Request A2 now finishes; its Finish record must still retain model2 ("Sol", "xhigh").
+                server.finish_paired_observation(
+                    obs_a2, binding_id, thread_id, "get_plan", None, None, &ok_res,
+                );
+
+                (req_a1_id, req_b1_id, req_a2_id, req_b2_id)
+            })
+            .await;
+
+        let (records, warnings) =
+            read_journal_records_readonly(&state_dir).expect("read journal records");
+        assert!(warnings.is_empty());
+        assert_eq!(records.len(), 8);
+
+        let find_record = |req_id: &str, phase: ObservationRecordPhase| {
+            records
+                .iter()
+                .find(|r| r.request_id == req_id && r.phase == phase)
+                .expect("expected observation record for (request_id, phase)")
+        };
+
+        for phase in [
+            ObservationRecordPhase::Entry,
+            ObservationRecordPhase::Finish,
+        ] {
+            let rec_a1 = find_record(&req_a1_id, phase);
+            let actor_a1 = rec_a1.actor.as_ref().expect("A1 actor");
+            assert_eq!(actor_a1.selected_model.as_deref(), Some("GPT-5.4"));
+            assert_eq!(actor_a1.selected_effort.as_deref(), Some("high"));
+            assert_eq!(actor_a1.model, None);
+            assert_eq!(actor_a1.effort, None);
+            assert_eq!(rec_a1.executor, Some(ObservationExecutor::local_mcp()));
+
+            let rec_b1 = find_record(&req_b1_id, phase);
+            let actor_b1 = rec_b1.actor.as_ref().expect("B1 actor");
+            assert_eq!(actor_b1.selected_model.as_deref(), Some("Sol"));
+            assert_eq!(actor_b1.selected_effort.as_deref(), Some("xhigh"));
+            assert_eq!(actor_b1.model, None);
+            assert_eq!(actor_b1.effort, None);
+
+            let rec_a2 = find_record(&req_a2_id, phase);
+            let actor_a2 = rec_a2.actor.as_ref().expect("A2 actor");
+            assert_eq!(actor_a2.selected_model.as_deref(), Some("Sol"));
+            assert_eq!(actor_a2.selected_effort.as_deref(), Some("xhigh"));
+            assert_eq!(actor_a2.model, None);
+            assert_eq!(actor_a2.effort, None);
+
+            let rec_b2 = find_record(&req_b2_id, phase);
+            let actor_b2 = rec_b2.actor.as_ref().expect("B2 actor");
+            assert_eq!(actor_b2.selected_model, None);
+            assert_eq!(actor_b2.selected_effort, None);
+            assert_eq!(actor_b2.model, None);
+            assert_eq!(actor_b2.effort, None);
+        }
     }
 }

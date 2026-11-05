@@ -179,15 +179,32 @@ the MCP surface, start execution, merge or push. The flags are local operator
 attestations, not proof of the human source of an approval; automatic
 conversation monitoring and general multi-chat routing remain separate gates.
 
+Read-only [Codex CLI advisory workers](CODEX-ADVISORY.md) extend explicit
+post-preflight normalization to `Orchestrator`, `Architect`, `Reviewer`, and
+`Closure` roles while keeping generic `RoleExecutionRoute::from_adapter(CodexCli)`
+and manual role-flow handoffs on `NativeHandoff`, keeping the native Coworker
+conversational-only with no model profile slot or lock, and keeping headless
+`Coder` Codex execution unsupported. Paired MCP Activity records also separate
+runtime-observed actor telemetry from bounded once-per-call verified thread
+`selected_model`/`selected_effort` metadata; see
+[Coworker observation](COWORKER-OBSERVATION.md) and
+[Coworker model observation](COWORKER-MODEL-OBSERVATION.md). Source-free CLI
+framing probes and local fixtures do not claim installed desktop or live
+end-to-end provider acceptance.
+
 ## Default workflow example
 
-Profiles remain configurable. The current desired usage profile is Luna Max for
-the Codex follower, Sol 6.1 High for substantive orchestration, Sol 6.1 Max for
-architecture, OpenCode Go/DeepSeek 4.1 Flash Max for routine coding and AGY/Argon
-Medium for hard coding, Argon High for task review and Sol xhigh for one valid
-package closure. This is a future product profile, not the development staffing:
-the user requests **Argon High implementation, ordinary review/validation by the
-primary agent, and one Astra Max package-closing review**.
+Profiles remain configurable across the executable worker roles (`Orchestrator`,
+`Architect`, `Coder`, `Reviewer`, and `Closure`) using explicit registry tools,
+exact model/effort targets, and deny-by-default execution policies (see
+[profile flow](PROFILE-FLOW.md) and [Codex advisory workers](CODEX-ADVISORY.md)).
+The native Coworker remains the human-selected Codex conversation, requires no
+`Follower` profile slot or model lock, and is never dispatched as a worker.
+Saved profiles and catalog entries grant no execution authority on their own.
+Development staffing and review rules are governed by [`AGENTS.md`](../AGENTS.md)
+(active human conversation model/quota restrictions, primary Codex agent
+implementation review/validation, and one authorized `gpt-6-astra` `high`
+package-closing review).
 
 ## Non-negotiable invariants
 

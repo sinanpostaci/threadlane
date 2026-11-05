@@ -3144,7 +3144,19 @@ async fn codex_first_auto_start_cli_and_policy_prerequisites_and_default_off_inv
     let enabled_server = cli_enabled.into_server().expect("enabled into_server");
     assert!(enabled_server.has_host_launcher_policy());
     assert_eq!(enabled_server.host_launcher_policy(), Some(&sibling_policy));
-    assert_eq!(enabled_server.list_tools().len(), 36);
+    let enabled_tools = enabled_server.list_tools();
+    assert_eq!(enabled_tools.len(), 40);
+    for planning_tool in [
+        "prepare_work",
+        "consult_architect",
+        "request_technical_plan",
+        "planning_command",
+    ] {
+        assert!(
+            enabled_tools.iter().any(|t| t.name == planning_tool),
+            "expected planning tool `{planning_tool}` in enabled_server.list_tools()"
+        );
+    }
 
     // 6. Legacy/default-off server never spawns when `start_approved_task` is called on an unstarted approval.
     let (rev, digest) = create_published_plan(
