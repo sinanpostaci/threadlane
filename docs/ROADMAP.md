@@ -134,7 +134,7 @@ returned `jev-latest` and `jev-preview`; live classification, paid entitlement
 and cross-platform keychain acceptance remain separate gates.
 
 [Profile decision advisors](PROFILE-ADVISOR.md) add an optional shadow-only API
-model selection independently of the six worker roles. The desktop editor and
+model selection independently of the five execution roles. The desktop editor and
 native profile catalog expose the same selection; explicit `advice --profile-id`
 calls require an exact request/profile match. No request is sent by editing or
 saving a profile, legacy off profiles preserve their original wire shape, and

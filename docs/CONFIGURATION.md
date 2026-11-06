@@ -59,8 +59,10 @@ Browser design fixtures cannot store real credentials or establish API access.
 
 ## Create a profile
 
-Open **Profiles**, choose **New profile**, and assign models to the six roles. Each
-role can have a default and optional Easy, Medium, Hard, and Extreme overrides.
+Open **Profiles**, choose **New profile**, and assign models to the five execution
+roles: Orchestrator, Architect, Coder, Reviewer, and Closure. Select the Coworker
+model in Codex. Each execution role can have a default and optional Easy, Medium,
+Hard, and Extreme overrides.
 Only efforts configured for the selected model are offered; none is silently
 chosen. Expand **Difficulty overrides** to edit those assignments.
 

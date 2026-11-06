@@ -1,7 +1,7 @@
 # Profile decision advisor
 
-A profile may select an optional **Decision advisor**, independently of its six
-worker roles. Connections, credentials, and model catalogs stay in **Tools**;
+A profile may select an optional **Decision advisor**, independently of its five
+execution roles. Connections, credentials, and model catalogs stay in **Tools**;
 profiles reference a registered API model without copying its credential.
 
 ## Configure a profile
@@ -45,7 +45,8 @@ credential, effort, endpoint override, or executable in this object.
 
 Missing or null metadata means off. Off profiles serialize without the field,
 preserving the original profile shape and existing approval material. Registry
-schema version 1 and the six workflow roles are unchanged. Unsupported modes,
+schema version 1 is unchanged. Profiles expose five execution roles; the legacy
+`follower` identifier remains readable for compatibility. Unsupported modes,
 duplicate fields, invalid references, and stale compare-and-swap revisions are
 refused. A referenced advisor model cannot be deleted until the profile clears
 or changes its selection.

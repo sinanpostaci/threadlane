@@ -92,7 +92,7 @@ installed planning, execution, review and completion chain.
   See [Jev shadow advice](docs/JEV-SHADOW.md).
 
 - **Optional decision advisor**: Profiles may reference a global decision API
-  model separately from the six worker roles. Advisors default to off, have no
+  model separately from the five execution roles. Advisors default to off, have no
   effort setting, and provide shadow advice only. Saving a choice sends no
   provider request. See [profile decision advisors](docs/PROFILE-ADVISOR.md).
 
