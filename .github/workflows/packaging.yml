@@ -3,9 +3,9 @@ name: Packaging validation
 # Reusable source-build validation for the automatic Linux checks, and a manual
 # full cross-platform packaging run. This workflow does not publish releases,
 # sign binaries, create installers, use repository secrets, or modify a host.
-# The action tags, hosted runner images, and stable Rust channel below have not
-# all been executed; the first hosted Linux run and the pending rerun are
-# recorded in docs/INSTALL.md.
+# Hosted validation results, including partial failures and the pending post-fix
+# rerun, are recorded in docs/INSTALL.md. Not all action tags, runner images, or
+# the manual macOS/Windows packaging path have been qualified.
 
 on:
   workflow_dispatch:
@@ -117,6 +117,10 @@ jobs:
 
       - name: Check standalone Tauri workspace formatting
         run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+
+      - name: Run Linux worker cleanup regressions
+        if: ${{ inputs.skip_artifacts && runner.os == 'Linux' }}
+        run: cargo test --locked -p threadlane-workers --test worker_and_git_foundation -- --test-threads=1
 
       - name: Run root Rust workspace Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings

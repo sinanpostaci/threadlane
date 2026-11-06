@@ -12,7 +12,7 @@ checkout; the existing development shells remain the normal development path.
 | Python desktop build wrapper | Ten offline fixture tests pass. |
 | Nix CLI package | Source build passed using the root `Cargo.lock`. Includes `threadlane`, the paired `threadlane-native-mcp` bootstrap, and the trusted `threadlane-context`, `threadlane-workflow`, `threadlane-session`, approval and operator commands. |
 | Nix desktop package | Linux source build passed with the standalone Tauri lockfile, a separately built frontend, and explicit Cargo build subdirectory. The resulting executable's `--help` passed. The latest native window creation was observed; visual human acceptance of the current window is still pending. |
-| GitHub Actions workflows | The first automatic Linux run (`ci.yml` calling `packaging.yml`) passed frontend build/tests, both formatting checks, and both Clippy checks, then failed while compiling Rust test binaries before the root test gate completed because the runner disk filled. No failed test assertion was established. A source-only resource correction now awaits a successful hosted rerun. Manual macOS, Windows, and full packaging remain unqualified. |
+| GitHub Actions workflows | Automatic Linux checks have run twice and failed; the fixture correction passes local checks and awaits hosted validation. See [CI workflows](#ci-workflows) for the exact results. Manual packaging and non-Linux runners remain unqualified. |
 | Desktop runtime | The standalone M4 Linux binary builds and passes all-target Clippy. The earlier native Wayland preview rendered successfully. Current Tools/Profiles and History browser checks use explicit DEV fixtures; they do not prove native chat pairing. |
 
 The locked npm dependency hash is recorded in:
@@ -160,12 +160,23 @@ touch the network.
 
 Two workflows cover source validation. Neither publishes a release, signs an
 artifact, uses repository secrets, creates a system installer, or modifies a
-host. The first automatic Linux run on a hosted pull request passed the frontend
-build/tests, both formatting checks, and both Clippy checks, then failed while
-compiling Rust test binaries before the root test gate completed because the
-runner ran out of disk space. No failed test assertion was established. The
-source-only resource correction still needs a successful hosted rerun; manual
-macOS, Windows, and full packaging remain unqualified.
+host. Two automatic Linux runs have now failed. The
+[first run](https://github.com/sinanpostaci/threadlane/actions/runs/42235190924)
+failed while compiling Rust test binaries because the runner ran out of disk
+space; no test assertion was established. The
+[second run](https://github.com/sinanpostaci/threadlane/actions/runs/42239119291)
+at head `58231ed3493d00c1a8813f3a4122311c6ee666f3` passed the frontend
+build/tests, both formatting checks, and both Clippy checks, then ran the root
+tests and failed in `worker_and_git_foundation`: 23 passed / 1 failed in
+`escaped_pipe_descendant_bounded_join_aborted_future_raii_kill_and_false_cancel_ignored`,
+at the assertion `escaped pipe holder must mark cleanup_incomplete = true`. Its
+final disk report showed 8.0 GB free, so this failure was not disk exhaustion.
+The explicit-Bash fixture correction and independent escape proof passed the
+local focused checks (escaped scenario 1/1, full foundation suite 24/24,
+formatting, and worker Clippy with `-D warnings`); hosted post-fix validation
+remains pending. No complete root workspace pass, standalone Tauri test pass,
+manual packaging, macOS/Windows, or installed workflow acceptance is claimed
+from these failed hosted runs.
 
 ### Automatic Linux source validation
 
@@ -189,12 +200,19 @@ persistence. Its concurrency group is distinct from the packaging workflow's
 group and cancels an older run for the same pull request or ref. There is no path
 filter, so a required check is always scheduled for a matching pull request.
 
+After both formatting checks, the automatic Linux source lane also runs
+`cargo test --locked -p threadlane-workers --test worker_and_git_foundation -- --test-threads=1`.
+This is an additional early signal for the worker cleanup fixture before root
+Clippy and the full workspace tests; it does not replace any existing command.
+The step is limited to the `skip_artifacts` Linux automatic lane, so manual
+full-artifact packaging runs keep their original command sequence.
+
 The source-only Linux path sets `CARGO_PROFILE_DEV_DEBUG=0`,
 `CARGO_PROFILE_TEST_DEBUG=0`, and `CARGO_INCREMENTAL=0` for the job before Rust
 compilation. This removes DWARF and incremental files without disabling debug
 assertions or changing optimization levels. It also records `df -h .` before
-validation and in a final `always()` step, so the next hosted run captures disk
-capacity on success or failure. Manual full-artifact runs keep Cargo's normal
+validation and in a final `always()` step, so hosted runs capture disk capacity
+on success or failure. Manual full-artifact runs keep Cargo's normal
 build defaults.
 
 ### Manual cross-platform packaging
@@ -228,8 +246,8 @@ serial tests with `CARGO_TARGET_DIR=target/desktop`. That target directory is
 separate from the root workspace's `target/` directory. It finishes with the
 offline packaging tests, the desktop release wrapper, the CLI release build,
 artifact staging, and a short-lived workflow artifact upload. The automatic Linux
-caller reuses the same steps but skips only those final release and artifact
-steps.
+caller reuses the same steps, adds the early worker cleanup regression described
+above, and skips only those final release and artifact steps.
 
 On a POSIX shell, the equivalent local validation commands are:
 
@@ -238,17 +256,20 @@ npm --prefix apps/desktop ci
 npm --prefix apps/desktop run build
 npm --prefix apps/desktop test
 cargo fmt --all -- --check
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+cargo test --locked -p threadlane-workers --test worker_and_git_foundation -- --test-threads=1
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked -- --test-threads=1
-cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
 CARGO_TARGET_DIR=target/desktop cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 CARGO_TARGET_DIR=target/desktop cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_build_desktop.py -v
 ```
 
 The workflows do not publish a release, sign an artifact, use repository
-secrets, or create a system installer. The first hosted Linux run exercised only
-part of this pipeline; successful end-to-end behavior and the macOS and Windows
+secrets, or create a system installer. Both hosted Linux runs failed: the first
+exhausted disk while compiling test binaries, and the second reached the root
+tests before the worker cleanup fixture assertion failed. Successful end-to-end
+behavior, including the post-fix hosted rerun, and the macOS and Windows
 packaging entries remain unverified.
 
 ## Linux runtime notes
@@ -287,11 +308,12 @@ remain untested.
 
 | Platform | Nix package | Source/CI build |
 | --- | --- | --- |
-| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. First automatic Linux run passed frontend build/tests, both formatting checks, and both Clippy checks, then failed compiling Rust test binaries before the root test gate completed from runner disk exhaustion; a successful hosted rerun is pending. Manual packaging has not run on hosted CI. |
+| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. Automatic Linux post-fix validation is pending; see [recorded CI results](#ci-workflows). Manual packaging has not run on hosted CI. |
 | Linux aarch64 | Defined for CLI and desktop; not built. | No workflow matrix entry yet. |
 | macOS | CLI expression only; desktop Nix package not provided. | Manual packaging-workflow entry has not run on hosted CI. |
 | Windows | No Nix package. | Manual packaging-workflow entry has not run on hosted CI; Windows runtime ACL support remains a separate product concern. |
 
 No successful CLI submission, generated workflow, or Nix expression is evidence
-that a binary was built, installed, run, signed, or released. The first automatic
-Linux run did not complete, so successful hosted workflow results remain pending.
+that a binary was built, installed, run, signed, or released. Both automatic
+Linux runs failed, and the post-fix hosted rerun is pending, so successful hosted
+workflow results remain unverified.

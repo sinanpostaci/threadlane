@@ -2,8 +2,8 @@ name: Linux CI
 
 # Automatic Linux source validation for pull requests and main. The job calls
 # the local reusable packaging workflow from the same revision and disables
-# release builds and artifact upload. Hosted behavior remains unverified until a
-# real run is recorded in docs/INSTALL.md.
+# release builds and artifact upload. Hosted validation results are recorded in
+# docs/INSTALL.md.
 
 on:
   pull_request:
