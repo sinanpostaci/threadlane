@@ -120,6 +120,16 @@ socket and checks native metadata, including the exact thread, working directory
 model and effort. It sends one `turn/start` with empty `input` and a named
 `toolOutput` containing fixed metadata and the existing pull/ACK notice.
 
+For `user_message_steer` delivery only, a stable target that reports the
+documented `systemError` status in both `thread/read` and `thread/resume` is
+eligible for the ordinary new-user-input `turn/start` route. It receives the
+same fixed notice with no model or effort override and no pending tool-output
+context. The status remains distinct and must match exactly at resume; a status
+change, identity mismatch or unknown active turn still fails before any effect.
+`tool_output` delivery continues to reject `systemError`, while `notLoaded` and
+unknown statuses keep their existing behavior. This compatibility path is
+covered by fake-peer tests, not live desktop qualification or acceptance proof.
+
 The durable supervisor claim owns event coalescing. Raw worker text, task
 instructions and answers are not inserted into the wake-up notice. Events are
 pulled through the existing scoped tools and handled as untrusted data. A notice

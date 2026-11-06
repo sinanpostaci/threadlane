@@ -79,12 +79,25 @@ The Coworker reads the exact command through `planning_command`; a notice never
 accepts advice, grants execution approval, or starts coding.
 
 `planning_command` exposes redacted `native_notice` metadata separately from the
-planning outcome. `submitted` records backend acceptance only. Interrupted intent
-and a possible-send disconnect remain `unknown` and are not automatically replayed,
-including after a duplicate CLI invocation. Status reads never send notices. A
-notification error does not replace the verified planning result. A crash before
-notice reservation can still leave a terminal command without a notice; this is
-not an indefinite background delivery service.
+planning outcome. `submitted` records backend acceptance only and carries no
+failure diagnostic. When a notice attempt finishes in `failed` or `unknown`,
+`PersistedPlanningNoticeAttempt` and `PlanningNoticeReport` (`native_notice.latest`)
+record an optional, privacy-safe `diagnostic` stage (`configuration_or_shutdown`,
+`endpoint_or_identity`, `connect_or_handshake`, `initialize`, `thread_read`,
+`thread_resume`, `status_or_active_turn_lookup`, `delivery`, `timeout`, or
+`unclassified`) mapped only from known software-owned wake-up reasons without
+persisting raw error text, paths, URLs, prompts, tokens, or hashes. This
+metadata is diagnostic only: historical records written without a `diagnostic`
+field cannot have their failure reasons reconstructed and remain `None` without
+inventing a cause. Interrupted `intent` and post-send `unknown` outcomes remain
+uncertain, must be reconciled by inspecting the durable command and plan state,
+and are not automatically replayed, including after a duplicate CLI invocation.
+Status reads never send notices. Failed or unknown notice delivery does not
+invalidate an already verified planning artifact or published plan and never
+grants permission to replay a notice or re-run a model call; recording this
+diagnostic classification does not by itself claim the observed live notice
+failure is fixed. A crash before notice reservation can still leave a terminal
+command without a notice; this is not an indefinite background delivery service.
 
 Tests use disposable repositories, local fake providers, and private WebSocket
 peers. Installed managed enrollment and real desktop delivery remain separate

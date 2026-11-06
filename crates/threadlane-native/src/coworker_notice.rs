@@ -1295,6 +1295,247 @@ impl PlanningNoticeConfig {
     }
 }
 
+/// Bounded, privacy-safe stage classification for a failed or ambiguous planning notice attempt.
+///
+/// Maps only known software-owned [`WakeupOutcome`] error/reason strings to fixed stage categories.
+/// Never stores raw error strings, filesystem paths, socket URLs, prompts, tokens, provider/server
+/// payloads, or digests of those values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanningNoticeDiagnostic {
+    /// Local wake-up configuration validation, platform check, frame preparation, or supervisor shutdown prevented completion.
+    ConfigurationOrShutdown,
+    /// Native endpoint discovery, reconnect descriptor, socket/directory policy, process ancestry, or peer credential verification failed.
+    EndpointOrIdentity,
+    /// Unix domain socket connection, WebSocket handshake, or pre-send retry budget failed.
+    ConnectOrHandshake,
+    /// Native `initialize` or `initialized` handshake exchange failed.
+    Initialize,
+    /// Native `thread/read` request or target thread metadata/status verification failed.
+    ThreadRead,
+    /// Native `thread/resume` request or resumed thread verification failed.
+    ThreadResume,
+    /// Active turn lookup (`thread/turns/list`) or pre-send thread status verification failed.
+    StatusOrActiveTurnLookup,
+    /// Final `turn/start` or `turn/steer` delivery or WebSocket frame exchange failed.
+    Delivery,
+    /// Native wake-up exchange exceeded its bounded timeout.
+    Timeout,
+    /// Unrecognized or non-software-owned failure/reason string mapped to a fixed fallback.
+    Unclassified,
+}
+
+impl PlanningNoticeDiagnostic {
+    /// Returns the stable `snake_case` identifier for this diagnostic category.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ConfigurationOrShutdown => "configuration_or_shutdown",
+            Self::EndpointOrIdentity => "endpoint_or_identity",
+            Self::ConnectOrHandshake => "connect_or_handshake",
+            Self::Initialize => "initialize",
+            Self::ThreadRead => "thread_read",
+            Self::ThreadResume => "thread_resume",
+            Self::StatusOrActiveTurnLookup => "status_or_active_turn_lookup",
+            Self::Delivery => "delivery",
+            Self::Timeout => "timeout",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// Returns a fixed, privacy-safe English summary for this diagnostic category.
+    #[must_use]
+    pub const fn summary(self) -> &'static str {
+        match self {
+            Self::ConfigurationOrShutdown => {
+                "native notice wake-up configuration validation, frame preparation, platform check, or supervisor shutdown prevented completion"
+            }
+            Self::EndpointOrIdentity => {
+                "native endpoint discovery, reconnect descriptor, socket policy, process ancestry, or peer credential verification failed"
+            }
+            Self::ConnectOrHandshake => {
+                "native Unix domain socket connection, WebSocket handshake, or pre-send retry budget failed"
+            }
+            Self::Initialize => "native initialize handshake exchange failed",
+            Self::ThreadRead => "native thread/read request or target thread verification failed",
+            Self::ThreadResume => {
+                "native thread/resume request or resumed thread verification failed"
+            }
+            Self::StatusOrActiveTurnLookup => {
+                "native active-turn lookup or pre-send thread status verification failed"
+            }
+            Self::Delivery => "native turn delivery or WebSocket frame exchange failed",
+            Self::Timeout => "native notice wake-up exchange timed out",
+            Self::Unclassified => {
+                "native notice wake-up failed with an unclassified software reason"
+            }
+        }
+    }
+
+    /// Classifies a [`WakeupOutcome`] into an optional [`PlanningNoticeDiagnostic`].
+    ///
+    /// Returns `None` for [`WakeupOutcome::Submitted`] and a bounded [`PlanningNoticeDiagnostic`]
+    /// for [`WakeupOutcome::Failed`] and [`WakeupOutcome::Unknown`].
+    #[must_use]
+    pub fn from_wakeup_outcome(outcome: &WakeupOutcome) -> Option<Self> {
+        match outcome {
+            WakeupOutcome::Submitted => None,
+            WakeupOutcome::Failed { error } => Some(Self::classify_reason(error)),
+            WakeupOutcome::Unknown { reason } => Some(Self::classify_reason(reason)),
+        }
+    }
+
+    /// Classifies a software-owned wake-up error or reason string into a bounded [`PlanningNoticeDiagnostic`].
+    ///
+    /// Only known software-owned messages and prefixes are mapped to specific stage variants; any
+    /// unknown or arbitrary input yields [`PlanningNoticeDiagnostic::Unclassified`].
+    #[must_use]
+    pub fn classify_reason(reason: &str) -> Self {
+        if reason == "native tool-output wake-up exchange timed out" {
+            return Self::Timeout;
+        }
+        if matches!(
+            reason,
+            "unsupported platform: native coworker planning wake-up transport is only supported on Unix"
+                | "unsupported platform: native coworker job wake-up transport is only supported on Unix"
+                | "native tool-output transport is only supported on Unix"
+                | "supervisor shutdown before native tool-output wake-up started"
+                | "supervisor shutdown during native tool-output wake-up exchange"
+                | "supervisor shutdown before native tool-output turn/start send"
+                | "coworker planning wake-up context command_id validation failed"
+                | "coworker planning wake-up attempt validation failed"
+                | "coworker planning wake-up attempt command_id does not match wake-up context command_id"
+                | "coworker planning wake-up requires user_message_steer delivery"
+                | "coworker planning wake-up configuration must not include model or effort metadata"
+                | "coworker planning wake-up timeout validation failed"
+                | "coworker job wake-up requires user_message_steer delivery"
+                | "coworker job wake-up configuration must not include model or effort metadata"
+                | "native tool-output configuration validation failed"
+                | "native tool-output request serialization failed"
+                | "native tool-output payload serialization failed"
+                | "native tool-output request exceeded maximum frame size"
+                | "native user-message turn/steer serialization failed"
+                | "native user-message turn/steer request exceeded maximum frame size"
+        ) || reason.starts_with("coworker planning wake-up ")
+            || reason.starts_with("coworker job wake-up ")
+            || reason.starts_with("supervisor shutdown before native tool-output ")
+            || reason.starts_with("supervisor shutdown during native tool-output ")
+            || reason.starts_with("unsupported platform: native coworker ")
+        {
+            return Self::ConfigurationOrShutdown;
+        }
+        if matches!(
+            reason,
+            "native endpoint auto-reconnect is only supported on Linux"
+                | "multiple live matching native endpoints found"
+                | "no live matching native endpoint found"
+                | "invalid process ID"
+                | "invalid process ID in descriptor"
+                | "unselected native backend violated executable policy"
+                | "unselected native descriptor disagrees with its live backend executable"
+                | "failed to read native Unix socket peer credentials"
+                | "failed to inspect advertised native socket"
+                | "failed to inspect resolved native socket target"
+                | "failed to inspect native endpoint session directory"
+        ) || reason.starts_with("native reconnect ")
+            || reason.starts_with("native endpoint ")
+            || reason.starts_with("native Unix socket peer ")
+            || reason.starts_with("failed to enumerate native reconnect ")
+            || reason.starts_with("failed to revalidate native reconnect ")
+            || reason.starts_with("failed to read directory entry in native reconnect ")
+            || reason.starts_with("failed to canonicalize native reconnect ")
+            || reason.starts_with("private file ")
+            || reason.starts_with("failed to inspect private file ")
+            || reason.starts_with("failed to open private file ")
+            || reason.starts_with("failed to read opened private file ")
+            || reason.starts_with("failed to read private file ")
+            || reason.starts_with("failed to revalidate private file ")
+            || reason.starts_with("unsupported native reconnect descriptor ")
+            || reason.starts_with("malformed /proc/pid/stat")
+            || reason.starts_with("malformed /proc/pid/status")
+            || reason.starts_with("/proc/pid/stat PID ")
+            || reason.starts_with("/proc process ")
+            || reason.starts_with("failed to open /proc process ")
+            || reason.starts_with("failed to read /proc process ")
+            || reason.starts_with("failed to inspect /proc process ")
+            || reason.starts_with("process directory UID ")
+            || reason.starts_with("process credentials ")
+            || reason.starts_with("process executable ")
+            || reason.starts_with("failed to read process executable ")
+            || reason.starts_with("failed to inspect process executable ")
+            || reason.starts_with("process identity changed ")
+            || reason.starts_with("advertised native socket ")
+            || reason.starts_with("resolved native socket ")
+        {
+            return Self::EndpointOrIdentity;
+        }
+        if matches!(
+            reason,
+            "failed to connect to native tool-output Unix socket"
+                | "native tool-output WebSocket handshake failed"
+                | "native tool-output wake-up exchange exhausted retry attempts"
+        ) {
+            return Self::ConnectOrHandshake;
+        }
+        if matches!(
+            reason,
+            "native tool-output initialize request rejected"
+                | "native tool-output initialize response was not an object"
+        ) || reason.starts_with("native tool-output initialize ")
+        {
+            return Self::Initialize;
+        }
+        if reason == "native tool-output target thread is not loaded in idle or active status"
+            || reason.starts_with("native tool-output thread/read ")
+        {
+            return Self::ThreadRead;
+        }
+        if reason.starts_with("native tool-output thread/resume ") {
+            return Self::ThreadResume;
+        }
+        if reason == "native user-message current thread status missing or changed before send"
+            || reason.starts_with("native user-message thread/turns/list ")
+            || reason.starts_with("native user-message latest turn summary ")
+        {
+            return Self::StatusOrActiveTurnLookup;
+        }
+        if reason.starts_with("native tool-output turn/start ")
+            || reason.starts_with("native user-message turn/steer ")
+            || matches!(
+                reason,
+                "failed to send native tool-output WebSocket request"
+                    | "native tool-output WebSocket closed before response completed"
+                    | "native tool-output WebSocket closed by peer before response"
+                    | "native tool-output WebSocket receive error"
+                    | "native tool-output exchange exceeded maximum frame count"
+                    | "native tool-output WebSocket frame exceeded maximum size"
+                    | "native tool-output exchange exceeded cumulative response byte limit"
+                    | "native tool-output received malformed JSON frame"
+                    | "native tool-output JSON frame must be an object"
+                    | "native tool-output received invalid JSON-RPC notification"
+                    | "native tool-output rejected unexpected server-initiated request"
+                    | "native tool-output response missing expected numeric id"
+                    | "native tool-output response id did not match expected request id"
+                    | "native tool-output response missing result field"
+                    | "native tool-output control ping exceeded maximum size"
+                    | "native tool-output failed to flush WebSocket pong"
+                    | "native tool-output control pong exceeded maximum size"
+                    | "native tool-output rejected unexpected binary WebSocket frame"
+                    | "native tool-output rejected raw WebSocket frame"
+            )
+        {
+            return Self::Delivery;
+        }
+        Self::Unclassified
+    }
+}
+
+impl std::fmt::Display for PlanningNoticeDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A durable record of one reserved planning command notice delivery attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1307,6 +1548,20 @@ pub struct PersistedPlanningNoticeAttempt {
     pub fingerprint: String,
     /// Current durable status of the attempted delivery.
     pub status: PersistedAttemptStatus,
+    /// Optional bounded, privacy-safe diagnostic classification when delivery failed or became unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<PlanningNoticeDiagnostic>,
+}
+
+impl PersistedPlanningNoticeAttempt {
+    /// Returns the fixed, privacy-safe diagnostic summary when a failure or unknown classification is present.
+    #[must_use]
+    pub const fn diagnostic_summary(&self) -> Option<&'static str> {
+        match self.diagnostic {
+            Some(diagnostic) => Some(diagnostic.summary()),
+            None => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1330,12 +1585,26 @@ pub struct PlanningNoticeReport {
     pub fingerprint: String,
     /// Delivery status reported for this notice attempt.
     pub status: NoticeDeliveryStatus,
+    /// Optional bounded, privacy-safe diagnostic classification when delivery failed or became unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<PlanningNoticeDiagnostic>,
     /// Indicates whether an existing attempt was found instead of a new reservation.
     pub was_duplicate: bool,
     /// Indicates whether the maximum persisted attempt count was reached.
     pub cap_reached: bool,
     /// Total number of persisted attempts for the planning command scope.
     pub attempt_count: usize,
+}
+
+impl PlanningNoticeReport {
+    /// Returns the fixed, privacy-safe diagnostic summary when a failure or unknown classification is present.
+    #[must_use]
+    pub const fn diagnostic_summary(&self) -> Option<&'static str> {
+        match self.diagnostic {
+            Some(diagnostic) => Some(diagnostic.summary()),
+            None => None,
+        }
+    }
 }
 
 /// Read-only inspection summary of persisted planning command notice state.
@@ -1450,6 +1719,7 @@ impl PlanningNoticeStore {
             terminal_kind: attempt.terminal_kind,
             fingerprint: attempt.fingerprint.clone(),
             status: map_persisted_status(attempt.status),
+            diagnostic: attempt.diagnostic,
             was_duplicate: false,
             cap_reached: false,
             attempt_count,
@@ -1547,6 +1817,7 @@ impl PlanningNoticeStore {
                 terminal_kind: existing.terminal_kind,
                 fingerprint,
                 status: map_persisted_status(existing.status),
+                diagnostic: existing.diagnostic,
                 was_duplicate: true,
                 cap_reached: false,
                 attempt_count: count,
@@ -1559,6 +1830,7 @@ impl PlanningNoticeStore {
                 terminal_kind,
                 fingerprint,
                 status: NoticeDeliveryStatus::CapReached,
+                diagnostic: None,
                 was_duplicate: false,
                 cap_reached: true,
                 attempt_count: count,
@@ -1573,6 +1845,7 @@ impl PlanningNoticeStore {
             terminal_kind,
             fingerprint: fingerprint.clone(),
             status: PersistedAttemptStatus::Intent,
+            diagnostic: None,
         });
         self.write_state_locked(&state_name, &state)?;
         Ok(PlanningReserveOutcome::Reserved {
@@ -1598,10 +1871,16 @@ impl PlanningNoticeStore {
                 "missing planning notice state on finalize",
             )
         })?;
-        let persisted = match outcome {
-            WakeupOutcome::Submitted => PersistedAttemptStatus::Submitted,
-            WakeupOutcome::Failed { .. } => PersistedAttemptStatus::Failed,
-            WakeupOutcome::Unknown { .. } => PersistedAttemptStatus::Unknown,
+        let (persisted, diagnostic) = match outcome {
+            WakeupOutcome::Submitted => (PersistedAttemptStatus::Submitted, None),
+            WakeupOutcome::Failed { error } => (
+                PersistedAttemptStatus::Failed,
+                Some(PlanningNoticeDiagnostic::classify_reason(error)),
+            ),
+            WakeupOutcome::Unknown { reason } => (
+                PersistedAttemptStatus::Unknown,
+                Some(PlanningNoticeDiagnostic::classify_reason(reason)),
+            ),
         };
         let entry = state
             .attempts
@@ -1614,6 +1893,7 @@ impl PlanningNoticeStore {
                 )
             })?;
         entry.status = persisted;
+        entry.diagnostic = diagnostic;
         let attempt_id = entry.attempt_id.clone();
         let attempt_count = state.attempts.len();
         self.write_state_locked(&state_name, &state)?;
@@ -1623,6 +1903,7 @@ impl PlanningNoticeStore {
             terminal_kind,
             fingerprint: fingerprint.to_string(),
             status: map_persisted_status(persisted),
+            diagnostic,
             was_duplicate: false,
             cap_reached: false,
             attempt_count,
@@ -1649,6 +1930,17 @@ impl PlanningNoticeStore {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "persisted planning notice attempts exceed cap",
+            ));
+        }
+        if state.attempts.iter().any(|attempt| {
+            matches!(
+                attempt.status,
+                PersistedAttemptStatus::Intent | PersistedAttemptStatus::Submitted
+            ) && attempt.diagnostic.is_some()
+        }) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "persisted planning notice intent or submitted attempt must not carry a failure diagnostic",
             ));
         }
         Ok(Some(state))
@@ -2634,6 +2926,10 @@ mod tests {
         store.configure(cfg.clone()).unwrap();
 
         // Inspect maps Intent to Unknown without mutating bytes or mtime.
+        let (_, state_name) = planning_scope_filenames(&cfg.key).unwrap();
+        let state_path = store_root.join(&state_name);
+        let intent_bytes = std::fs::read(&state_path).unwrap();
+        let intent_mtime = std::fs::metadata(&state_path).unwrap().modified().unwrap();
         let meta =
             PlanningNoticeStore::inspect(&store_root, &cfg.key, &cfg.command_digest).unwrap();
         assert!(meta.configured);
@@ -2642,8 +2938,81 @@ mod tests {
             meta.latest.as_ref().map(|r| r.status),
             Some(NoticeDeliveryStatus::Unknown)
         );
+        assert_eq!(meta.latest.as_ref().and_then(|r| r.diagnostic), None);
+        assert_eq!(std::fs::read(&state_path).unwrap(), intent_bytes);
+        assert_eq!(
+            std::fs::metadata(&state_path).unwrap().modified().unwrap(),
+            intent_mtime
+        );
 
-        // Reopen / second reserve promotes Intent to Unknown and deduplicates without replaying.
+        // Stale/foreign identity rejection on inspect, validate_planning_config_identity, and reserve_attempt.
+        let wrong_digest = "c".repeat(64);
+        let wrong_repo = tmp.path().join("foreign-repo");
+        let foreign_key = CoworkerJobOwnershipKey::new(
+            "binding_foreign",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "pcm_0123456789abcdef0123456789abcdef",
+        )
+        .unwrap();
+        assert_eq!(
+            validate_planning_config_identity(
+                &cfg,
+                &cfg.key,
+                &wrong_digest,
+                &cfg.target.project_root
+            )
+            .unwrap_err()
+            .code,
+            NativeErrorCode::SecurityViolation
+        );
+        assert_eq!(
+            validate_planning_config_identity(
+                &cfg,
+                &foreign_key,
+                &cfg.command_digest,
+                &cfg.target.project_root
+            )
+            .unwrap_err()
+            .code,
+            NativeErrorCode::SecurityViolation
+        );
+        assert_eq!(
+            validate_planning_config_identity(&cfg, &cfg.key, &cfg.command_digest, &wrong_repo)
+                .unwrap_err()
+                .code,
+            NativeErrorCode::SecurityViolation
+        );
+        assert_eq!(
+            PlanningNoticeStore::inspect(&store_root, &cfg.key, &wrong_digest)
+                .unwrap_err()
+                .code,
+            NativeErrorCode::SecurityViolation
+        );
+        assert_eq!(
+            store
+                .reserve_attempt(
+                    &cfg.key,
+                    &wrong_digest,
+                    &cfg.target.project_root,
+                    completed_snap
+                )
+                .err()
+                .unwrap()
+                .code,
+            NativeErrorCode::SecurityViolation
+        );
+        assert_eq!(
+            store
+                .reserve_attempt(&cfg.key, &cfg.command_digest, &wrong_repo, completed_snap)
+                .err()
+                .unwrap()
+                .code,
+            NativeErrorCode::SecurityViolation
+        );
+        assert_eq!(std::fs::read(&state_path).unwrap(), intent_bytes);
+
+        // Reopen / second reserve promotes Intent to Unknown and deduplicates without replaying
+        // and without inventing a failure diagnostic cause.
         let reopened = PlanningNoticeStore::new(&store_root).unwrap();
         match reopened
             .reserve_attempt(
@@ -2657,9 +3026,963 @@ mod tests {
             PlanningReserveOutcome::Completed(report) => {
                 assert!(report.was_duplicate);
                 assert_eq!(report.status, NoticeDeliveryStatus::Unknown);
+                assert_eq!(report.diagnostic, None);
+                assert_eq!(report.diagnostic_summary(), None);
                 assert_eq!(report.attempt_count, 1);
             }
             _ => panic!("expected duplicate Unknown completion without replay"),
+        }
+        let post_reopen_meta =
+            PlanningNoticeStore::inspect(&store_root, &cfg.key, &cfg.command_digest).unwrap();
+        assert_eq!(
+            post_reopen_meta.latest.as_ref().map(|r| r.status),
+            Some(NoticeDeliveryStatus::Unknown)
+        );
+        assert_eq!(
+            post_reopen_meta.latest.as_ref().and_then(|r| r.diagnostic),
+            None
+        );
+    }
+
+    fn planning_fixture(
+        dir: &Path,
+        command_id: &str,
+    ) -> (
+        PlanningNoticeStore,
+        PlanningNoticeConfig,
+        PlanningNoticeSnapshot,
+    ) {
+        prepare_private_dir(dir, "test_planning_root").unwrap();
+        let sock = dir.join("codex.sock");
+        if !sock.exists() {
+            let _ = UnixListener::bind(&sock).unwrap();
+        }
+        let key = CoworkerJobOwnershipKey::new(
+            "binding_1",
+            "550e8400-e29b-41d4-a716-446655440000",
+            command_id,
+        )
+        .unwrap();
+        let target = NativeToolOutputConfig::new_user_message_steer(
+            sock,
+            key.thread_uuid.clone(),
+            dir.to_path_buf(),
+        );
+        let cfg =
+            PlanningNoticeConfig::new(key, sha256_hex(command_id.as_bytes()), target).unwrap();
+        let store = PlanningNoticeStore::new(dir.join("planning-notices")).unwrap();
+        store.configure(cfg.clone()).unwrap();
+        let snap = PlanningNoticeSnapshot {
+            status: PlanningCommandStatus::Completed,
+            pending_reconciliation: false,
+            has_active_owner_lock: false,
+            verified_completed_outcome: true,
+        };
+        (store, cfg, snap)
+    }
+
+    #[test]
+    fn planning_notice_classifier_maps_known_software_stages_and_redacts_unknown_input() {
+        assert_eq!(
+            PlanningNoticeDiagnostic::from_wakeup_outcome(&WakeupOutcome::Submitted),
+            None
+        );
+
+        let cases = [
+            (
+                "supervisor shutdown before native tool-output wake-up started",
+                PlanningNoticeDiagnostic::ConfigurationOrShutdown,
+            ),
+            (
+                "coworker planning wake-up requires user_message_steer delivery",
+                PlanningNoticeDiagnostic::ConfigurationOrShutdown,
+            ),
+            (
+                "native user-message turn/steer serialization failed",
+                PlanningNoticeDiagnostic::ConfigurationOrShutdown,
+            ),
+            (
+                "no live matching native endpoint found",
+                PlanningNoticeDiagnostic::EndpointOrIdentity,
+            ),
+            (
+                "native Unix socket peer PID does not match expected backend PID",
+                PlanningNoticeDiagnostic::EndpointOrIdentity,
+            ),
+            (
+                "malformed /proc/pid/stat: invalid PPID field",
+                PlanningNoticeDiagnostic::EndpointOrIdentity,
+            ),
+            (
+                "failed to connect to native tool-output Unix socket",
+                PlanningNoticeDiagnostic::ConnectOrHandshake,
+            ),
+            (
+                "native tool-output WebSocket handshake failed",
+                PlanningNoticeDiagnostic::ConnectOrHandshake,
+            ),
+            (
+                "native tool-output wake-up exchange exhausted retry attempts",
+                PlanningNoticeDiagnostic::ConnectOrHandshake,
+            ),
+            (
+                "native tool-output initialize request rejected",
+                PlanningNoticeDiagnostic::Initialize,
+            ),
+            (
+                "native tool-output thread/read request rejected",
+                PlanningNoticeDiagnostic::ThreadRead,
+            ),
+            (
+                "native tool-output target thread is not loaded in idle or active status",
+                PlanningNoticeDiagnostic::ThreadRead,
+            ),
+            (
+                "native tool-output thread/resume request rejected",
+                PlanningNoticeDiagnostic::ThreadResume,
+            ),
+            (
+                "native user-message current thread status missing or changed before send",
+                PlanningNoticeDiagnostic::StatusOrActiveTurnLookup,
+            ),
+            (
+                "native user-message thread/turns/list request rejected",
+                PlanningNoticeDiagnostic::StatusOrActiveTurnLookup,
+            ),
+            (
+                "native user-message latest turn summary is not inProgress",
+                PlanningNoticeDiagnostic::StatusOrActiveTurnLookup,
+            ),
+            (
+                "native user-message turn/steer send failed",
+                PlanningNoticeDiagnostic::Delivery,
+            ),
+            (
+                "native user-message turn/steer turnId did not match expectedTurnId",
+                PlanningNoticeDiagnostic::Delivery,
+            ),
+            (
+                "native tool-output WebSocket closed before response completed",
+                PlanningNoticeDiagnostic::Delivery,
+            ),
+            (
+                "native tool-output wake-up exchange timed out",
+                PlanningNoticeDiagnostic::Timeout,
+            ),
+            (
+                "RPC error -32603: /home/user/.codex/auth.json Bearer sk-secret https://api.example/ prompt=private",
+                PlanningNoticeDiagnostic::Unclassified,
+            ),
+            ("", PlanningNoticeDiagnostic::Unclassified),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(
+                PlanningNoticeDiagnostic::classify_reason(reason),
+                expected,
+                "reason: {reason}"
+            );
+            assert_eq!(
+                PlanningNoticeDiagnostic::from_wakeup_outcome(&WakeupOutcome::Failed {
+                    error: reason.to_string(),
+                }),
+                Some(expected)
+            );
+            assert_eq!(
+                PlanningNoticeDiagnostic::from_wakeup_outcome(&WakeupOutcome::Unknown {
+                    reason: reason.to_string(),
+                }),
+                Some(expected)
+            );
+            assert!(!expected.as_str().is_empty());
+            assert!(!expected.summary().is_empty());
+            assert_eq!(expected.to_string(), expected.as_str());
+        }
+    }
+
+    #[test]
+    fn planning_notice_persistence_preserves_classified_failed_unknown_submitted_legacy_json_and_strips_sensitive_text(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. Pre-send Failed examples survive reopen, inspect, and duplicate reservation without resending.
+        let pre_send_cases = [
+            (
+                "pcm_10000000000000000000000000000001",
+                "native tool-output thread/read request rejected",
+                PlanningNoticeDiagnostic::ThreadRead,
+            ),
+            (
+                "pcm_10000000000000000000000000000002",
+                "native user-message latest turn summary is not inProgress",
+                PlanningNoticeDiagnostic::StatusOrActiveTurnLookup,
+            ),
+            (
+                "pcm_10000000000000000000000000000003",
+                "no live matching native endpoint found",
+                PlanningNoticeDiagnostic::EndpointOrIdentity,
+            ),
+            (
+                "pcm_10000000000000000000000000000004",
+                "failed to connect to native tool-output Unix socket",
+                PlanningNoticeDiagnostic::ConnectOrHandshake,
+            ),
+        ];
+        for (cmd_id, err_msg, expected_diag) in pre_send_cases {
+            let case_dir = tmp.path().join(cmd_id);
+            let (store, cfg, snap) = planning_fixture(&case_dir, cmd_id);
+            let PlanningReserveOutcome::Reserved {
+                fingerprint,
+                terminal_kind,
+                ..
+            } = store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.command_digest,
+                    &cfg.target.project_root,
+                    snap,
+                )
+                .unwrap()
+            else {
+                panic!("expected reserved planning notice intent");
+            };
+            let finalized = store
+                .finalize_attempt(
+                    &cfg.key,
+                    terminal_kind,
+                    &fingerprint,
+                    &WakeupOutcome::Failed {
+                        error: err_msg.to_string(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(finalized.status, NoticeDeliveryStatus::Failed);
+            assert_eq!(finalized.diagnostic, Some(expected_diag));
+            assert_eq!(
+                finalized.diagnostic_summary(),
+                Some(expected_diag.summary())
+            );
+            assert!(!finalized.was_duplicate);
+            assert_eq!(finalized.attempt_count, 1);
+
+            let (_, state_name) = planning_scope_filenames(&cfg.key).unwrap();
+            let persisted_state = store.read_state_locked(&state_name).unwrap().unwrap();
+            assert_eq!(persisted_state.attempts.len(), 1);
+            assert_eq!(
+                persisted_state.attempts[0].status,
+                PersistedAttemptStatus::Failed
+            );
+            assert_eq!(persisted_state.attempts[0].diagnostic, Some(expected_diag));
+            assert_eq!(
+                persisted_state.attempts[0].diagnostic_summary(),
+                Some(expected_diag.summary())
+            );
+
+            let reopened = PlanningNoticeStore::new(&store.root_dir).unwrap();
+            let inspected =
+                PlanningNoticeStore::inspect(&reopened.root_dir, &cfg.key, &cfg.command_digest)
+                    .unwrap();
+            let latest = inspected.latest.expect("latest report");
+            assert_eq!(latest.status, NoticeDeliveryStatus::Failed);
+            assert_eq!(latest.diagnostic, Some(expected_diag));
+            assert!(!latest.was_duplicate);
+
+            let PlanningReserveOutcome::Completed(dup) = reopened
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.command_digest,
+                    &cfg.target.project_root,
+                    snap,
+                )
+                .unwrap()
+            else {
+                panic!("failed notice must deduplicate without extra send");
+            };
+            assert!(dup.was_duplicate);
+            assert_eq!(dup.status, NoticeDeliveryStatus::Failed);
+            assert_eq!(dup.diagnostic, Some(expected_diag));
+            assert_eq!(dup.attempt_count, 1);
+        }
+
+        // 2. Post-send Unknown examples survive reopen, inspect, and duplicate reservation without resending.
+        let post_send_cases = [
+            (
+                "pcm_20000000000000000000000000000001",
+                "native tool-output WebSocket closed before response completed",
+                PlanningNoticeDiagnostic::Delivery,
+            ),
+            (
+                "pcm_20000000000000000000000000000002",
+                "native user-message turn/steer send failed",
+                PlanningNoticeDiagnostic::Delivery,
+            ),
+            (
+                "pcm_20000000000000000000000000000003",
+                "native tool-output wake-up exchange timed out",
+                PlanningNoticeDiagnostic::Timeout,
+            ),
+        ];
+        for (cmd_id, reason_msg, expected_diag) in post_send_cases {
+            let case_dir = tmp.path().join(cmd_id);
+            let (store, cfg, snap) = planning_fixture(&case_dir, cmd_id);
+            let PlanningReserveOutcome::Reserved {
+                fingerprint,
+                terminal_kind,
+                ..
+            } = store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.command_digest,
+                    &cfg.target.project_root,
+                    snap,
+                )
+                .unwrap()
+            else {
+                panic!("expected reserved planning notice intent");
+            };
+            let finalized = store
+                .finalize_attempt(
+                    &cfg.key,
+                    terminal_kind,
+                    &fingerprint,
+                    &WakeupOutcome::Unknown {
+                        reason: reason_msg.to_string(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(finalized.status, NoticeDeliveryStatus::Unknown);
+            assert_eq!(finalized.diagnostic, Some(expected_diag));
+            assert!(!finalized.was_duplicate);
+
+            let (_, state_name) = planning_scope_filenames(&cfg.key).unwrap();
+            let persisted_state = store.read_state_locked(&state_name).unwrap().unwrap();
+            assert_eq!(
+                persisted_state.attempts[0].status,
+                PersistedAttemptStatus::Unknown
+            );
+            assert_eq!(persisted_state.attempts[0].diagnostic, Some(expected_diag));
+
+            let reopened = PlanningNoticeStore::new(&store.root_dir).unwrap();
+            let inspected =
+                PlanningNoticeStore::inspect(&reopened.root_dir, &cfg.key, &cfg.command_digest)
+                    .unwrap();
+            let latest = inspected.latest.expect("latest report");
+            assert_eq!(latest.status, NoticeDeliveryStatus::Unknown);
+            assert_eq!(latest.diagnostic, Some(expected_diag));
+
+            let PlanningReserveOutcome::Completed(dup) = reopened
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.command_digest,
+                    &cfg.target.project_root,
+                    snap,
+                )
+                .unwrap()
+            else {
+                panic!("unknown notice must deduplicate without extra send");
+            };
+            assert!(dup.was_duplicate);
+            assert_eq!(dup.status, NoticeDeliveryStatus::Unknown);
+            assert_eq!(dup.diagnostic, Some(expected_diag));
+            assert_eq!(dup.attempt_count, 1);
+        }
+
+        // 3. Submitted has no failure diagnostic and rejects forged diagnostic on disk.
+        let sub_dir = tmp.path().join("submitted_case");
+        let (sub_store, sub_cfg, sub_snap) =
+            planning_fixture(&sub_dir, "pcm_30000000000000000000000000000001");
+        let PlanningReserveOutcome::Reserved {
+            fingerprint: sub_fp,
+            terminal_kind: sub_tk,
+            ..
+        } = sub_store
+            .reserve_attempt(
+                &sub_cfg.key,
+                &sub_cfg.command_digest,
+                &sub_cfg.target.project_root,
+                sub_snap,
+            )
+            .unwrap()
+        else {
+            panic!("expected reserved intent");
+        };
+        let sub_report = sub_store
+            .finalize_attempt(&sub_cfg.key, sub_tk, &sub_fp, &WakeupOutcome::Submitted)
+            .unwrap();
+        assert_eq!(sub_report.status, NoticeDeliveryStatus::Submitted);
+        assert_eq!(sub_report.diagnostic, None);
+        assert_eq!(sub_report.diagnostic_summary(), None);
+
+        let (_, sub_state_name) = planning_scope_filenames(&sub_cfg.key).unwrap();
+        let sub_state_path = sub_store.root_dir.join(&sub_state_name);
+        let sub_raw_json = std::fs::read_to_string(&sub_state_path).unwrap();
+        assert!(
+            !sub_raw_json.contains("\"diagnostic\""),
+            "submitted state JSON must omit diagnostic field: {sub_raw_json}"
+        );
+        let sub_report_json = serde_json::to_string(&sub_report).unwrap();
+        assert!(!sub_report_json.contains("\"diagnostic\""));
+
+        let sub_inspected = PlanningNoticeStore::inspect(
+            &sub_store.root_dir,
+            &sub_cfg.key,
+            &sub_cfg.command_digest,
+        )
+        .unwrap();
+        assert_eq!(
+            sub_inspected.latest.as_ref().map(|r| r.status),
+            Some(NoticeDeliveryStatus::Submitted)
+        );
+        assert_eq!(
+            sub_inspected.latest.as_ref().and_then(|r| r.diagnostic),
+            None
+        );
+
+        let PlanningReserveOutcome::Completed(sub_dup) = sub_store
+            .reserve_attempt(
+                &sub_cfg.key,
+                &sub_cfg.command_digest,
+                &sub_cfg.target.project_root,
+                sub_snap,
+            )
+            .unwrap()
+        else {
+            panic!("expected duplicate submitted report");
+        };
+        assert!(sub_dup.was_duplicate);
+        assert_eq!(sub_dup.status, NoticeDeliveryStatus::Submitted);
+        assert_eq!(sub_dup.diagnostic, None);
+
+        // Forging a diagnostic onto a Submitted attempt on disk is rejected on read.
+        let mut forged_val: serde_json::Value = serde_json::from_str(&sub_raw_json).unwrap();
+        forged_val["attempts"][0]["diagnostic"] = serde_json::json!("delivery");
+        write_private_file_atomic(
+            &sub_store.root_dir,
+            &sub_state_name,
+            &serde_json::to_vec(&forged_val).unwrap(),
+            "planning_notice_state",
+        )
+        .unwrap();
+        assert_eq!(
+            PlanningNoticeStore::inspect(
+                &sub_store.root_dir,
+                &sub_cfg.key,
+                &sub_cfg.command_digest
+            )
+            .unwrap_err()
+            .code,
+            NativeErrorCode::ValidationFailed
+        );
+
+        // 4. Arbitrary sensitive error text or hashes are never serialized.
+        let sens_dir = tmp.path().join("sensitive_case");
+        let (sens_store, sens_cfg, sens_snap) =
+            planning_fixture(&sens_dir, "pcm_40000000000000000000000000000001");
+        let sensitive_error = "provider failure path=/home/operator/.ssh/id_ed25519 url=wss://127.0.0.1:9999/private token=sk-live-super-secret-token prompt=CONFIDENTIAL_USER_PROMPT";
+        let sensitive_error_hash = sha256_hex(sensitive_error.as_bytes());
+        let PlanningReserveOutcome::Reserved {
+            fingerprint: sens_fp,
+            terminal_kind: sens_tk,
+            ..
+        } = sens_store
+            .reserve_attempt(
+                &sens_cfg.key,
+                &sens_cfg.command_digest,
+                &sens_cfg.target.project_root,
+                sens_snap,
+            )
+            .unwrap()
+        else {
+            panic!("expected reserved intent");
+        };
+        let sens_report = sens_store
+            .finalize_attempt(
+                &sens_cfg.key,
+                sens_tk,
+                &sens_fp,
+                &WakeupOutcome::Failed {
+                    error: sensitive_error.to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(sens_report.status, NoticeDeliveryStatus::Failed);
+        assert_eq!(
+            sens_report.diagnostic,
+            Some(PlanningNoticeDiagnostic::Unclassified)
+        );
+        let (_, sens_state_name) = planning_scope_filenames(&sens_cfg.key).unwrap();
+        let sens_disk_json =
+            std::fs::read_to_string(sens_store.root_dir.join(&sens_state_name)).unwrap();
+        let sens_meta = PlanningNoticeStore::inspect(
+            &sens_store.root_dir,
+            &sens_cfg.key,
+            &sens_cfg.command_digest,
+        )
+        .unwrap();
+        let sens_meta_json = serde_json::to_string(&sens_meta).unwrap();
+        for forbidden in [
+            "/home/operator",
+            "id_ed25519",
+            "wss://",
+            "127.0.0.1:9999",
+            "sk-live-super-secret-token",
+            "CONFIDENTIAL_USER_PROMPT",
+            "provider failure",
+            sensitive_error_hash.as_str(),
+        ] {
+            assert!(
+                !sens_disk_json.contains(forbidden),
+                "persisted JSON leaked `{forbidden}`: {sens_disk_json}"
+            );
+            assert!(
+                !sens_meta_json.contains(forbidden),
+                "inspect JSON leaked `{forbidden}`: {sens_meta_json}"
+            );
+        }
+
+        // 5. Legacy JSON on disk without `diagnostic` remains readable and keeps `diagnostic: None`
+        //    without inventing a cause across inspect and duplicate reservation.
+        for (idx, legacy_status, expected_delivery) in [
+            (1u8, "failed", NoticeDeliveryStatus::Failed),
+            (2u8, "unknown", NoticeDeliveryStatus::Unknown),
+            (3u8, "submitted", NoticeDeliveryStatus::Submitted),
+        ] {
+            let cmd_id = format!("pcm_5000000000000000000000000000000{idx}");
+            let leg_dir = tmp.path().join(&cmd_id);
+            let (leg_store, leg_cfg, leg_snap) = planning_fixture(&leg_dir, &cmd_id);
+            let leg_fp =
+                derive_planning_notice_fingerprint(&leg_cfg.key, &leg_cfg.command_digest).unwrap();
+            let (_, leg_state_name) = planning_scope_filenames(&leg_cfg.key).unwrap();
+            let legacy_json = serde_json::json!({
+                "config": leg_cfg,
+                "attempts": [{
+                    "attempt_id": format!("pnotice_1_{}", &leg_fp[..16]),
+                    "terminal_kind": "completed",
+                    "fingerprint": leg_fp,
+                    "status": legacy_status
+                }]
+            });
+            write_private_file_atomic(
+                &leg_store.root_dir,
+                &leg_state_name,
+                &serde_json::to_vec(&legacy_json).unwrap(),
+                "planning_notice_state",
+            )
+            .unwrap();
+
+            let leg_meta = PlanningNoticeStore::inspect(
+                &leg_store.root_dir,
+                &leg_cfg.key,
+                &leg_cfg.command_digest,
+            )
+            .unwrap();
+            let leg_latest = leg_meta.latest.expect("legacy latest report");
+            assert_eq!(leg_latest.status, expected_delivery);
+            assert_eq!(
+                leg_latest.diagnostic, None,
+                "historical record with no reason must stay None and never invent a cause"
+            );
+
+            let PlanningReserveOutcome::Completed(leg_dup) = leg_store
+                .reserve_attempt(
+                    &leg_cfg.key,
+                    &leg_cfg.command_digest,
+                    &leg_cfg.target.project_root,
+                    leg_snap,
+                )
+                .unwrap()
+            else {
+                panic!("expected duplicate completion for legacy record");
+            };
+            assert!(leg_dup.was_duplicate);
+            assert_eq!(leg_dup.status, expected_delivery);
+            assert_eq!(leg_dup.diagnostic, None);
+            assert_eq!(leg_dup.attempt_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn planning_notice_live_unix_websocket_pre_send_failed_post_send_unknown_and_submitted_do_not_resend(
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::net::{UnixListener as TokioUnixListener, UnixStream as TokioUnixStream};
+        use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
+
+        async fn recv_rpc_frame(
+            ws: &mut WebSocketStream<TokioUnixStream>,
+            expected_id: Option<u64>,
+            expected_method: &str,
+        ) -> serde_json::Value {
+            let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("fake peer timed out waiting for client frame")
+                .expect("client closed before expected frame")
+                .expect("client frame read error");
+            let text = frame.into_text().expect("expected text frame");
+            let val: serde_json::Value = serde_json::from_str(&text).expect("valid JSON request");
+            assert_eq!(
+                val.get("id").and_then(serde_json::Value::as_u64),
+                expected_id,
+                "unexpected request id for {expected_method}: {val}"
+            );
+            assert_eq!(
+                val.get("method").and_then(serde_json::Value::as_str),
+                Some(expected_method),
+                "unexpected request method: {val}"
+            );
+            val
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        prepare_private_dir(tmp.path(), "ws_planning_notice_test").unwrap();
+        let snap = PlanningNoticeSnapshot {
+            status: PlanningCommandStatus::Completed,
+            pending_reconciliation: false,
+            has_active_owner_lock: false,
+            verified_completed_outcome: true,
+        };
+
+        // Case 1: Pre-send `thread/read` rejection over Unix WebSocket -> Failed + ThreadRead, no extra send on retry.
+        {
+            let case_dir = tmp.path().join("ws_pre_send_failed");
+            prepare_private_dir(&case_dir, "ws_pre_send_failed").unwrap();
+            let sock = case_dir.join("native.sock");
+            let listener = TokioUnixListener::bind(&sock).unwrap();
+            let conn_count = Arc::new(AtomicUsize::new(0));
+            let conn_count_srv = Arc::clone(&conn_count);
+
+            let srv = tokio::spawn(async move {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                conn_count_srv.fetch_add(1, Ordering::SeqCst);
+                let mut ws = accept_async(stream).await.unwrap();
+                // 1. initialize (id 1)
+                let _ = recv_rpc_frame(&mut ws, Some(1), "initialize").await;
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"userAgent":"test"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                // 2. initialized notification
+                let _ = recv_rpc_frame(&mut ws, None, "initialized").await;
+                // 3. thread/read (id 2) -> reject with sensitive error text
+                let _ = recv_rpc_frame(&mut ws, Some(2), "thread/read").await;
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32001,"message":"secret /var/private/db token=sk-secret-999"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            });
+
+            let key = CoworkerJobOwnershipKey::new(
+                "binding_ws_1",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "pcm_60000000000000000000000000000001",
+            )
+            .unwrap();
+            let target = NativeToolOutputConfig::new_user_message_steer(
+                sock,
+                key.thread_uuid.clone(),
+                case_dir.clone(),
+            );
+            let cfg = PlanningNoticeConfig::new(key, "a".repeat(64), target).unwrap();
+            let store = PlanningNoticeStore::new(case_dir.join("notices")).unwrap();
+            store.configure(cfg.clone()).unwrap();
+
+            let report = store
+                .notify_if_configured(&cfg.key, &cfg.command_digest, &case_dir, snap)
+                .await
+                .unwrap()
+                .expect("configured notice report");
+            srv.await.unwrap();
+
+            assert_eq!(report.status, NoticeDeliveryStatus::Failed);
+            assert_eq!(
+                report.diagnostic,
+                Some(PlanningNoticeDiagnostic::ThreadRead)
+            );
+            assert!(!report.was_duplicate);
+            assert_eq!(conn_count.load(Ordering::SeqCst), 1);
+
+            let (_, state_name) = planning_scope_filenames(&cfg.key).unwrap();
+            let raw_disk = std::fs::read_to_string(store.root_dir.join(&state_name)).unwrap();
+            assert!(!raw_disk.contains("/var/private/db"));
+            assert!(!raw_disk.contains("sk-secret-999"));
+
+            let reopened = PlanningNoticeStore::new(&store.root_dir).unwrap();
+            let inspected =
+                PlanningNoticeStore::inspect(&reopened.root_dir, &cfg.key, &cfg.command_digest)
+                    .unwrap();
+            assert_eq!(
+                inspected.latest.as_ref().and_then(|r| r.diagnostic),
+                Some(PlanningNoticeDiagnostic::ThreadRead)
+            );
+            let dup = reopened
+                .notify_if_configured(&cfg.key, &cfg.command_digest, &case_dir, snap)
+                .await
+                .unwrap()
+                .expect("duplicate report");
+            assert!(dup.was_duplicate);
+            assert_eq!(dup.status, NoticeDeliveryStatus::Failed);
+            assert_eq!(dup.diagnostic, Some(PlanningNoticeDiagnostic::ThreadRead));
+            assert_eq!(conn_count.load(Ordering::SeqCst), 1);
+        }
+
+        // Case 2: Post-send WebSocket disconnect after receiving `turn/steer` -> Unknown + Delivery, no extra send on retry.
+        {
+            let case_dir = tmp.path().join("ws_post_send_unknown");
+            prepare_private_dir(&case_dir, "ws_post_send_unknown").unwrap();
+            let sock = case_dir.join("native.sock");
+            let listener = TokioUnixListener::bind(&sock).unwrap();
+            let conn_count = Arc::new(AtomicUsize::new(0));
+            let conn_count_srv = Arc::clone(&conn_count);
+            let cwd_str = case_dir.to_string_lossy().to_string();
+            let thread_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+
+            let srv = tokio::spawn(async move {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                conn_count_srv.fetch_add(1, Ordering::SeqCst);
+                let mut ws = accept_async(stream).await.unwrap();
+                // 1. initialize (id 1)
+                let _ = recv_rpc_frame(&mut ws, Some(1), "initialize").await;
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"userAgent":"test"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                // 2. initialized
+                let _ = recv_rpc_frame(&mut ws, None, "initialized").await;
+                // 3. thread/read (id 2) -> active
+                let read_req = recv_rpc_frame(&mut ws, Some(2), "thread/read").await;
+                assert_eq!(read_req["params"]["threadId"], thread_id);
+                let read_resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": thread_id,
+                            "cwd": cwd_str,
+                            "status": { "type": "active" }
+                        }
+                    }
+                });
+                ws.send(Message::Text(read_resp.to_string().into()))
+                    .await
+                    .unwrap();
+                // 4. thread/resume (id 3) -> active
+                let resume_req = recv_rpc_frame(&mut ws, Some(3), "thread/resume").await;
+                assert_eq!(resume_req["params"]["threadId"], thread_id);
+                assert_eq!(resume_req["params"]["excludeTurns"], true);
+                let resume_resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": thread_id,
+                            "cwd": cwd_str,
+                            "status": { "type": "active" }
+                        }
+                    }
+                });
+                ws.send(Message::Text(resume_resp.to_string().into()))
+                    .await
+                    .unwrap();
+                // 5. thread/turns/list (id 4) -> one active turn
+                let turns_req = recv_rpc_frame(&mut ws, Some(4), "thread/turns/list").await;
+                assert_eq!(turns_req["params"]["threadId"], thread_id);
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":4,"result":{"data":[{"id":"550e8400-e29b-41d4-a716-446655440111","status":"inProgress"}]}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                // 6. turn/steer (id 5) received, then drop connection before sending response!
+                let steer_req = recv_rpc_frame(&mut ws, Some(5), "turn/steer").await;
+                assert_eq!(steer_req["params"]["threadId"], thread_id);
+                assert_eq!(
+                    steer_req["params"]["expectedTurnId"],
+                    "550e8400-e29b-41d4-a716-446655440111"
+                );
+                let _ = ws.close(None).await;
+            });
+
+            let key = CoworkerJobOwnershipKey::new(
+                "binding_ws_2",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "pcm_60000000000000000000000000000002",
+            )
+            .unwrap();
+            let target = NativeToolOutputConfig::new_user_message_steer(
+                sock,
+                key.thread_uuid.clone(),
+                case_dir.clone(),
+            );
+            let cfg = PlanningNoticeConfig::new(key, "b".repeat(64), target).unwrap();
+            let store = PlanningNoticeStore::new(case_dir.join("notices")).unwrap();
+            store.configure(cfg.clone()).unwrap();
+
+            let report = store
+                .notify_if_configured(&cfg.key, &cfg.command_digest, &case_dir, snap)
+                .await
+                .unwrap()
+                .expect("configured notice report");
+            srv.await.unwrap();
+
+            assert_eq!(report.status, NoticeDeliveryStatus::Unknown);
+            assert_eq!(report.diagnostic, Some(PlanningNoticeDiagnostic::Delivery));
+            assert!(!report.was_duplicate);
+            assert_eq!(conn_count.load(Ordering::SeqCst), 1);
+
+            let reopened = PlanningNoticeStore::new(&store.root_dir).unwrap();
+            let inspected =
+                PlanningNoticeStore::inspect(&reopened.root_dir, &cfg.key, &cfg.command_digest)
+                    .unwrap();
+            assert_eq!(
+                inspected.latest.as_ref().map(|r| r.status),
+                Some(NoticeDeliveryStatus::Unknown)
+            );
+            assert_eq!(
+                inspected.latest.as_ref().and_then(|r| r.diagnostic),
+                Some(PlanningNoticeDiagnostic::Delivery)
+            );
+            let dup = reopened
+                .notify_if_configured(&cfg.key, &cfg.command_digest, &case_dir, snap)
+                .await
+                .unwrap()
+                .expect("duplicate report");
+            assert!(dup.was_duplicate);
+            assert_eq!(dup.status, NoticeDeliveryStatus::Unknown);
+            assert_eq!(dup.diagnostic, Some(PlanningNoticeDiagnostic::Delivery));
+            assert_eq!(conn_count.load(Ordering::SeqCst), 1);
+        }
+
+        // Case 3: Successful `turn/steer` over Unix WebSocket -> Submitted with `diagnostic: None`, no extra send on retry.
+        {
+            let case_dir = tmp.path().join("ws_submitted");
+            prepare_private_dir(&case_dir, "ws_submitted").unwrap();
+            let sock = case_dir.join("native.sock");
+            let listener = TokioUnixListener::bind(&sock).unwrap();
+            let conn_count = Arc::new(AtomicUsize::new(0));
+            let conn_count_srv = Arc::clone(&conn_count);
+            let cwd_str = case_dir.to_string_lossy().to_string();
+            let thread_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+
+            let srv = tokio::spawn(async move {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                conn_count_srv.fetch_add(1, Ordering::SeqCst);
+                let mut ws = accept_async(stream).await.unwrap();
+                // 1. initialize (id 1)
+                let _ = recv_rpc_frame(&mut ws, Some(1), "initialize").await;
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"userAgent":"test"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                // 2. initialized
+                let _ = recv_rpc_frame(&mut ws, None, "initialized").await;
+                // 3. thread/read (id 2) -> active
+                let read_req = recv_rpc_frame(&mut ws, Some(2), "thread/read").await;
+                assert_eq!(read_req["params"]["threadId"], thread_id);
+                let read_resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": thread_id,
+                            "cwd": cwd_str,
+                            "status": { "type": "active" }
+                        }
+                    }
+                });
+                ws.send(Message::Text(read_resp.to_string().into()))
+                    .await
+                    .unwrap();
+                // 4. thread/resume (id 3) -> active
+                let resume_req = recv_rpc_frame(&mut ws, Some(3), "thread/resume").await;
+                assert_eq!(resume_req["params"]["threadId"], thread_id);
+                assert_eq!(resume_req["params"]["excludeTurns"], true);
+                let resume_resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": thread_id,
+                            "cwd": cwd_str,
+                            "status": { "type": "active" }
+                        }
+                    }
+                });
+                ws.send(Message::Text(resume_resp.to_string().into()))
+                    .await
+                    .unwrap();
+                // 5. thread/turns/list (id 4) -> one active turn
+                let turns_req = recv_rpc_frame(&mut ws, Some(4), "thread/turns/list").await;
+                assert_eq!(turns_req["params"]["threadId"], thread_id);
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":4,"result":{"data":[{"id":"550e8400-e29b-41d4-a716-446655440111","status":"inProgress"}]}}"#.into(),
+                ))
+                .await
+                .unwrap();
+                // 6. turn/steer (id 5) -> reply with matching turnId
+                let steer_req = recv_rpc_frame(&mut ws, Some(5), "turn/steer").await;
+                assert_eq!(steer_req["params"]["threadId"], thread_id);
+                assert_eq!(
+                    steer_req["params"]["expectedTurnId"],
+                    "550e8400-e29b-41d4-a716-446655440111"
+                );
+                ws.send(Message::Text(
+                    r#"{"jsonrpc":"2.0","id":5,"result":{"turnId":"550e8400-e29b-41d4-a716-446655440111"}}"#.into(),
+                ))
+                .await
+                .unwrap();
+            });
+
+            let key = CoworkerJobOwnershipKey::new(
+                "binding_ws_3",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "pcm_60000000000000000000000000000003",
+            )
+            .unwrap();
+            let target = NativeToolOutputConfig::new_user_message_steer(
+                sock,
+                key.thread_uuid.clone(),
+                case_dir.clone(),
+            );
+            let cfg = PlanningNoticeConfig::new(key, "c".repeat(64), target).unwrap();
+            let store = PlanningNoticeStore::new(case_dir.join("notices")).unwrap();
+            store.configure(cfg.clone()).unwrap();
+
+            let report = store
+                .notify_if_configured(&cfg.key, &cfg.command_digest, &case_dir, snap)
+                .await
+                .unwrap()
+                .expect("configured notice report");
+            srv.await.unwrap();
+
+            assert_eq!(report.status, NoticeDeliveryStatus::Submitted);
+            assert_eq!(report.diagnostic, None);
+            assert!(!report.was_duplicate);
+            assert_eq!(conn_count.load(Ordering::SeqCst), 1);
+
+            let dup = store
+                .notify_if_configured(&cfg.key, &cfg.command_digest, &case_dir, snap)
+                .await
+                .unwrap()
+                .expect("duplicate report");
+            assert!(dup.was_duplicate);
+            assert_eq!(dup.status, NoticeDeliveryStatus::Submitted);
+            assert_eq!(dup.diagnostic, None);
+            assert_eq!(conn_count.load(Ordering::SeqCst), 1);
         }
     }
 }
