@@ -912,7 +912,9 @@ pub struct CoworkerDriverStatusReport {
     pub max_total_task_attempts_per_job: u32,
     /// Per-task Phase 1 observations.
     pub tasks: Vec<CoworkerControllerTaskObservation>,
-    /// Latest Phase 1 step report when a controller step was executed or recorded.
+    /// Latest recorded Phase 1 step report. When the owner is inactive this is historical;
+    /// its past running count is not current host evidence. Use `tasks` and `pipeline_report`
+    /// for the current read-only projection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step_report: Option<CoworkerControllerStepReport>,
     /// Explicit pipeline boundary.
@@ -1050,6 +1052,9 @@ struct ReadonlyScopedJobInspection {
     job: CoworkerJobRecord,
     runtime_state: ControllerJobRuntimeState,
     approval: ApprovalRecord,
+    // Ephemeral exact task/attempt proof, minted only by the authenticated live-derived
+    // matcher below. Never deserialized from cached state or inferred from owner presence.
+    verified_live_derived_attempts: std::collections::BTreeMap<String, u32>,
 }
 
 /// Independent code controller process lifecycle driver.
@@ -3496,6 +3501,7 @@ impl CoworkerCodeDriver {
             job,
             runtime_state,
             approval,
+            verified_live_derived_attempts: Default::default(),
         })
     }
 
@@ -4375,7 +4381,8 @@ impl CoworkerCodeDriver {
             if task.stage == CoworkerTaskStage::CorrectInScopeRequired {
                 push_unique_id(&mut awaiting_correction_task_ids, &task.task_id);
             }
-            if task.stage == CoworkerTaskStage::EffectUnknown
+            if host_status == TaskExecutionStatus::Unknown
+                || task.stage == CoworkerTaskStage::EffectUnknown
                 || (task.unresolved_outbox_id.is_some()
                     && !is_review_reserved_task_confirmed_but_fenced_by_stop(
                         &inspection.job,
@@ -4622,12 +4629,18 @@ impl CoworkerCodeDriver {
         NativeError,
     > {
         let session_dir = self.sessions_dir.join(&inspection.approval.approval_id);
+        let mut stopped_host = false;
         let (intents, receipts) = match fs::symlink_metadata(&session_dir) {
             Ok(_) => {
                 if let Some(manifest) =
                     read_host_manifest_optional(&session_dir, &inspection.approval)
                         .map_err(map_host_error)?
                 {
+                    // A known stopped host with no physical host lock cannot prove that a
+                    // historical Running/DispatchReserved stage still has an active worker.
+                    // Missing manifests and transient RPC failures do not establish this.
+                    stopped_host = manifest.phase == HostPhase::Stopped
+                        && !is_host_lock_held(&session_dir).map_err(map_host_error)?;
                     if let Some(ref session_binding_id) = manifest.session_binding_id {
                         read_session_task_ledger_readonly(
                             &session_dir,
@@ -4715,8 +4728,18 @@ impl CoworkerCodeDriver {
                     }
                 }
                 CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running => {
-                    active_running_count += 1;
-                    TaskExecutionStatus::Running
+                    let status = project_cached_running_host_status(
+                        stopped_host,
+                        &task.task_id,
+                        task.current_attempt_no,
+                        &inspection.verified_live_derived_attempts,
+                    );
+                    if status == TaskExecutionStatus::Unknown {
+                        unknown_effect_task_ids.push(task.task_id.clone());
+                    } else {
+                        active_running_count += 1;
+                    }
+                    status
                 }
                 CoworkerTaskStage::ReadyForReview
                 | CoworkerTaskStage::ReviewReserved
@@ -5524,6 +5547,22 @@ fn is_review_reserved_task_confirmed_but_fenced_by_stop(
             })
 }
 
+// Shared current-status projection for historical Running/DispatchReserved task stages.
+fn project_cached_running_host_status(
+    stopped_host: bool,
+    task_id: &str,
+    attempt_no: u32,
+    verified_live_derived_attempts: &std::collections::BTreeMap<String, u32>,
+) -> TaskExecutionStatus {
+    let verified_direct_attempt =
+        attempt_no >= 2 && verified_live_derived_attempts.get(task_id) == Some(&attempt_no);
+    if stopped_host && !verified_direct_attempt {
+        TaskExecutionStatus::Unknown
+    } else {
+        TaskExecutionStatus::Running
+    }
+}
+
 fn has_unresolved_or_unknown_effect(
     job: &CoworkerJobRecord,
     runtime_state: &ControllerJobRuntimeState,
@@ -5987,6 +6026,7 @@ fn filter_live_owned_in_flight_coder_reservations(
     step_report: Option<&CoworkerControllerStepReport>,
     in_flight_stages: &[CoworkerPipelineInFlightStageRef],
 ) {
+    inspection.verified_live_derived_attempts.clear();
     if verified_owner_summary.validate_for_key(key).is_err() {
         return;
     }
@@ -6061,6 +6101,16 @@ fn filter_live_owned_in_flight_coder_reservations(
             )
         })
         .map(|effect| effect.effect_id.clone())
+        .collect();
+
+    inspection.verified_live_derived_attempts = runtime
+        .pending_effects
+        .values()
+        .filter(|effect| matched.contains(&effect.effect_id))
+        .filter_map(|effect| {
+            let attempt = effect.attempt_no.filter(|&attempt| attempt >= 2)?;
+            Some((effect.task_id.clone()?, attempt))
+        })
         .collect();
 
     // Only the authenticated live owner's read-only status inspection copy is filtered.
@@ -6530,6 +6580,7 @@ pub fn evaluate_live_coder_projection_snapshot_from_job_and_runtime(
         job: job.clone(),
         runtime_state: runtime.clone(),
         approval: approval.clone(),
+        verified_live_derived_attempts: Default::default(),
     };
     filter_live_owned_in_flight_coder_reservations(
         &mut inspection,
@@ -6544,11 +6595,25 @@ pub fn evaluate_live_coder_projection_snapshot_from_job_and_runtime(
         step_report,
         in_flight_stages,
     );
-    has_unresolved_or_unknown_effect(
-        &inspection.job,
-        &inspection.runtime_state,
-        CoworkerControllerPhase1Status::RunningTasks,
-    )
+    let projected_unknown = host_phase == Some(HostPhase::Stopped)
+        && !host_lock_held
+        && inspection.job.tasks.iter().any(|task| {
+            matches!(
+                task.stage,
+                CoworkerTaskStage::Running | CoworkerTaskStage::DispatchReserved
+            ) && project_cached_running_host_status(
+                true,
+                &task.task_id,
+                task.current_attempt_no,
+                &inspection.verified_live_derived_attempts,
+            ) == TaskExecutionStatus::Unknown
+        });
+    projected_unknown
+        || has_unresolved_or_unknown_effect(
+            &inspection.job,
+            &inspection.runtime_state,
+            CoworkerControllerPhase1Status::RunningTasks,
+        )
 }
 
 #[cfg(test)]
@@ -6730,5 +6795,90 @@ mod live_check_projection_tests {
         assert!(!interrupted
             .iter()
             .any(|stage| reserved_check_matches_live_stage(&final_check, stage)));
+    }
+}
+
+#[cfg(test)]
+mod stopped_host_derived_projection_tests {
+    use super::*;
+
+    #[test]
+    fn stopped_original_host_requires_exact_live_derived_task_and_attempt_proof() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_dir = temp.path().join("stopped-fixture");
+        prepare_private_dir(&session_dir, "stopped_projection_fixture").unwrap();
+        let approval = ApprovalRecord {
+            approval_id: format!("apr_{}", uuid::Uuid::new_v4().simple()),
+            subject_digest: "a".repeat(64),
+            policy_version: 1,
+            binding_id: format!("binding_{}", uuid::Uuid::new_v4().simple()),
+            thread_uuid: uuid::Uuid::new_v4().to_string(),
+            plan_id: "fixture-plan".into(),
+            plan_revision: 1,
+            profile_id: "fixture-profile".into(),
+            registry_revision: 1,
+            plan_digest: "b".repeat(64),
+            repository_path: temp.path().to_path_buf(),
+            base_commit: "c".repeat(40),
+            approved_task_ids: Vec::new(),
+            approved_write_paths: Vec::new(),
+            max_parallel: 1,
+            budgets: threadlane_workers::ExecutionBudgets::default(),
+            tasks: Vec::new(),
+            created_at_ms: 1,
+        };
+        let manifest = threadlane_host::HostSessionManifest::from_approval_record(
+            &approval,
+            None,
+            HostPhase::Stopped,
+            None,
+            None,
+            1,
+            2,
+        );
+        threadlane_host::storage::write_host_manifest(&session_dir, &manifest).unwrap();
+        let stored = read_host_manifest_optional(&session_dir, &approval)
+            .unwrap()
+            .unwrap();
+        let stopped_host =
+            stored.phase == HostPhase::Stopped && !is_host_lock_held(&session_dir).unwrap();
+        assert!(stopped_host);
+        let manifest_path = session_dir.join("host-manifest.json");
+        let before = fs::read(&manifest_path).unwrap();
+        let proof = std::collections::BTreeMap::from([
+            ("derived-task".to_string(), 2),
+            ("original-task".to_string(), 1),
+        ]);
+        assert_eq!(
+            project_cached_running_host_status(stopped_host, "derived-task", 2, &proof),
+            TaskExecutionStatus::Running,
+            "a fully correlated live direct correction is independent of the stopped original host"
+        );
+        for (task, attempt) in [
+            ("derived-task", 1),
+            ("derived-task", 3),
+            ("unrelated-running-task", 2),
+            ("original-task", 1),
+        ] {
+            assert_eq!(
+                project_cached_running_host_status(stopped_host, task, attempt, &proof),
+                TaskExecutionStatus::Unknown
+            );
+        }
+        assert_eq!(
+            project_cached_running_host_status(
+                stopped_host,
+                "derived-task",
+                2,
+                &Default::default()
+            ),
+            TaskExecutionStatus::Unknown
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        assert_eq!(
+            fs::read_dir(&session_dir).unwrap().count(),
+            1,
+            "projection must not create state or locks"
+        );
     }
 }

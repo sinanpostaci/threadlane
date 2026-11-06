@@ -1686,10 +1686,22 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
         let derived_job = fixture.workflow_store.read_binding_ledger(&binding_id).expect("ledger")
             .jobs.into_iter().find(|j| j.job_id == job.job_id).expect("derived job");
         assert!(!project(&derived_job, &runtime_derived, &status_derived_running));
+        // Decompose original-host lifecycle from the retained direct execution: this saved
+        // genuine owner/lease/receipt/inflight context must still prove the same derived
+        // attempt when the original host is stopped. The private manifest test supplies
+        // actual stopped/unlocked filesystem evidence for the shared observation rule.
+        let mut stopped_original = status_derived_running.clone();
+        stopped_original["host_phase"] = json!("stopped");
+        stopped_original["host_lock_held"] = json!(false);
+        assert!(!project(&derived_job, &runtime_derived, &stopped_original));
+        let mut unrelated_stale = derived_job.clone();
+        unrelated_stale.tasks.iter_mut().find(|task| task.task_id == "task-root-b").unwrap().stage = CoworkerTaskStage::Running;
+        assert!(project(&unrelated_stale, &runtime_derived, &stopped_original), "live derived proof must not exempt an unrelated stale original task");
         let mut stale_derived = derived_job.clone();
         stale_derived.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 2)
             .expect("derived outbox").receipt_id = Some("dar_00000000000000000000000000000099".to_string());
         assert!(project(&stale_derived, &runtime_derived, &status_derived_running));
+        assert!(project(&stale_derived, &runtime_derived, &stopped_original));
         let mut unknown_derived = derived_job.clone();
         unknown_derived.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 2)
             .expect("derived outbox").status = OutboxDispatchStatus::EffectUnknown;
@@ -1697,6 +1709,9 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
         let mut stale_flight = status_derived_running.clone();
         stale_flight["in_flight_stages"] = json!([]);
         assert!(project(&derived_job, &runtime_derived, &stale_flight));
+        let mut stopped_stale_flight = stopped_original.clone();
+        stopped_stale_flight["in_flight_stages"] = json!([]);
+        assert!(project(&derived_job, &runtime_derived, &stopped_stale_flight));
 
         // Only an actual NotFound proves absence; an inaccessible report directory stays blocked.
         let denied_dir = fixture.root.join("denied-projection-reports");
@@ -1865,5 +1880,97 @@ async fn explicit_unauthorized_driver_mode_refuses_without_fatal_record_or_notic
             assert_eq!(read_invocation_count(&fixture.check_count_file), 0);
         }
         peer.abort();
+    }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopped_host_cached_running_is_unknown_without_mutating_historical_state() {
+    Box::pin(async {
+        fn json_records(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+            let mut result = BTreeMap::new();
+            if !root.exists() { return result; }
+            for entry in fs::read_dir(root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { result.extend(json_records(&path)); }
+                else if path.extension().is_some_and(|ext| ext == "json") {
+                    result.insert(path.clone(), fs::read(path).unwrap());
+                }
+            }
+            result
+        }
+        let fixture = setup_fixture();
+        let state_dir = fixture.root.join("inactive-control");
+        let control = Supervisor::start(SupervisorConfig::new(state_dir.clone())).await.unwrap();
+        let client = SupervisorClient::from_state_dir(&state_dir).unwrap();
+        let thread = uuid::Uuid::new_v4().to_string();
+        let binding = client.create_binding(&thread, "inactive-status-fixture").await.unwrap();
+        let tasks = [
+            ("task-inactive-a", "CTRL_TASK_A implement src/a.rs", "src/a.rs", Vec::new()),
+            ("task-complete-b", "CTRL_TASK_B implement src/b.rs", "src/b.rs", Vec::new()),
+            ("task-pending-c", "Implement src/c.rs after both accepted roots", "src/c.rs", vec!["task-inactive-a".into(), "task-complete-b".into()]),
+        ].into_iter().map(|(id, instruction, path, depends_on)| PlanTask {
+            id: id.into(), title: format!("Fixture {id}"), instruction: instruction.into(),
+            role: WorkflowRole::Coder, difficulty: Difficulty::Hard, depends_on,
+            allowed_write_paths: vec![path.into()],
+        }).collect();
+        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+            &fixture, &binding.binding_id, &thread, "brf_inactive_projection", "plan-inactive-projection",
+            tasks, BTreeMap::new(), vec!["src/a.rs".into(), "src/b.rs".into(), "src/c.rs".into()],
+            2, ExecutionBudgets::default(), ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4), 1,
+        ).await;
+        let original = fs::read_to_string(&fixture.fake_agy_exe).unwrap();
+        let exec = original.lines().find(|line| line.starts_with("exec node ")).unwrap();
+        let gate = fixture.root.join("inactive-coder.gate");
+        fs::write(&gate, "hold").unwrap();
+        write_executable_script(&fixture.fake_agy_exe, &format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in *CTRL_TASK_A*) while [ -f '{}' ]; do sleep 0.02; done ;; esac\n{exec}\n", gate.display()));
+        let host = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir, &fixture.plans_dir, &fixture.authority_dir, &fixture.sessions_dir, &approval_id,
+        ))).await.unwrap();
+        let driver = CoworkerCodeDriver::open_from_dirs(&state_dir, &fixture.registry_dir, &fixture.plans_dir,
+            &fixture.authority_dir, &fixture.sessions_dir).unwrap();
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let session = driver.controller().open_owned_session(&binding.binding_id, &thread, &job.job_id, now()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let step = session.step(now()).await.unwrap();
+            if step.tasks.iter().any(|task| task.task_id == "task-complete-b" && task.stage == CoworkerTaskStage::ReadyForReview) { break; }
+            assert!(Instant::now() < deadline, "completed sibling did not reach verified ReadyForReview");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // A genuine Ready host is not declared inactive merely because this fixture's held
+        // controller guard has no owner RPC socket. Live workers still report Running.
+        let live = driver.status(&binding.binding_id, &thread, &job.job_id).await.unwrap();
+        assert_eq!(live.host_phase, Some(HostPhase::Ready)); assert!(live.host_lock_held);
+        assert_eq!(live.tasks.iter().find(|task| task.task_id == "task-inactive-a").unwrap().host_status, TaskExecutionStatus::Running);
+        let host_client = ApprovedHostClient::new(Arc::clone(&fixture.authority), &fixture.sessions_dir, &binding.binding_id, &thread).unwrap();
+        let completed_snapshot = host_client.get_task(&approval_id, "task-complete-b").await.unwrap();
+        assert_eq!(completed_snapshot.status, TaskExecutionStatus::ReadyForReview);
+        assert!(!completed_snapshot.accepted, "verified completion is not review acceptance");
+        session.release().unwrap();
+        host.shutdown().await.unwrap();
+        let before: Vec<_> = [&fixture.plans_dir, &fixture.registry_dir, &fixture.authority_dir, &fixture.sessions_dir]
+            .into_iter().map(|dir| json_records(dir)).collect();
+        let status = driver.status(&binding.binding_id, &thread, &job.job_id).await.unwrap();
+        assert_eq!(status.host_phase, Some(HostPhase::Stopped)); assert!(!status.host_lock_held); assert!(!status.lease_active);
+        let inactive = status.tasks.iter().find(|task| task.task_id == "task-inactive-a").unwrap();
+        assert_eq!(inactive.stage, CoworkerTaskStage::Running, "historical stage must be preserved");
+        assert_eq!(inactive.host_status, TaskExecutionStatus::Unknown, "stopped host cannot prove a cached Running task is active");
+        assert_eq!(status.overall_status, threadlane_native::coworker_workflow::CoworkerControllerPhase1Status::BlockedOnUnknownEffect);
+        assert!(status.blocked_on_unknown_effect);
+        let complete = status.tasks.iter().find(|task| task.task_id == "task-complete-b").unwrap();
+        assert_eq!(complete.stage, CoworkerTaskStage::ReadyForReview); assert_eq!(complete.host_status, TaskExecutionStatus::ReadyForReview);
+        assert_eq!(status.tasks.iter().find(|task| task.task_id == "task-pending-c").unwrap().host_status, TaskExecutionStatus::DependencyInputsUnverified);
+        let pipeline = status.pipeline_report.as_ref().unwrap();
+        assert_eq!(pipeline.status, CoworkerPipelineStatus::BlockedOnUnknownEffect);
+        assert_eq!(pipeline.unknown_effect_task_ids, vec!["task-inactive-a"]);
+        assert_eq!(pipeline.tasks.iter().find(|task| task.task_id == "task-inactive-a").unwrap().host_status, TaskExecutionStatus::Unknown);
+        assert_eq!(driver.status(&binding.binding_id, &thread, &job.job_id).await.unwrap(), status);
+        let after: Vec<_> = [&fixture.plans_dir, &fixture.registry_dir, &fixture.authority_dir, &fixture.sessions_dir]
+            .into_iter().map(|dir| json_records(dir)).collect();
+        assert_eq!(after, before, "status reads must not mutate authoritative fixture records");
+        assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 1, "only completed sibling reaches fake provider body");
+        assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 0); assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+        control.shutdown().await;
     }).await;
 }
