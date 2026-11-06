@@ -3,9 +3,10 @@ name: Packaging validation
 # Reusable source-build validation for the automatic Linux checks, and a manual
 # full cross-platform packaging run. This workflow does not publish releases,
 # sign binaries, create installers, use repository secrets, or modify a host.
-# Hosted validation results, including partial failures and the pending post-fix
-# rerun, are recorded in docs/INSTALL.md. Not all action tags, runner images, or
-# the manual macOS/Windows packaging path have been qualified.
+# Hosted validation results, including partial failures and the pending
+# source-only supervision qualification, are recorded in docs/INSTALL.md. Not
+# all action tags, runner images, or the manual macOS/Windows packaging path
+# have been qualified.
 
 on:
   workflow_dispatch:
@@ -130,10 +131,26 @@ jobs:
           CARGO_TARGET_DIR: target/desktop
         run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 
+      - name: Run offline CI wrapper tests
+        if: ${{ inputs.skip_artifacts && runner.os == 'Linux' }}
+        run: python -m unittest discover -s scripts -p test_run_ci_check.py -v
+
       - name: Run root Rust workspace tests
+        if: ${{ inputs.skip_artifacts && runner.os == 'Linux' }}
+        run: python scripts/run-ci-check.py --timeout-seconds 3600 -- cargo test --workspace --locked -- --test-threads=1
+
+      - name: Run root Rust workspace tests (manual packaging)
+        if: ${{ !inputs.skip_artifacts || runner.os != 'Linux' }}
         run: cargo test --workspace --locked -- --test-threads=1
 
       - name: Run standalone Tauri workspace tests
+        if: ${{ inputs.skip_artifacts && runner.os == 'Linux' }}
+        env:
+          CARGO_TARGET_DIR: target/desktop
+        run: python scripts/run-ci-check.py --timeout-seconds 900 -- cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
+
+      - name: Run standalone Tauri workspace tests (manual packaging)
+        if: ${{ !inputs.skip_artifacts || runner.os != 'Linux' }}
         env:
           CARGO_TARGET_DIR: target/desktop
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
