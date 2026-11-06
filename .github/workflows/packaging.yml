@@ -4,7 +4,8 @@ name: Packaging validation
 # full cross-platform packaging run. This workflow does not publish releases,
 # sign binaries, create installers, use repository secrets, or modify a host.
 # The action tags, hosted runner images, and stable Rust channel below have not
-# been executed from this checkout; record the first real run in docs/INSTALL.md.
+# all been executed; the first hosted Linux run and the pending rerun are
+# recorded in docs/INSTALL.md.
 
 on:
   workflow_dispatch:
@@ -88,6 +89,20 @@ jobs:
           npm --version
           python --version
 
+      - name: Report Linux disk space before validation
+        if: ${{ inputs.skip_artifacts && runner.os == 'Linux' }}
+        shell: bash
+        run: df -h .
+
+      - name: Configure source-only Rust build resources
+        if: ${{ inputs.skip_artifacts }}
+        shell: bash
+        run: |
+          printf '%s\n' \
+            'CARGO_PROFILE_DEV_DEBUG=0' \
+            'CARGO_PROFILE_TEST_DEBUG=0' \
+            'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+
       - name: Install frontend dependencies
         run: npm ci --prefix apps/desktop
 
@@ -157,3 +172,8 @@ jobs:
           path: artifacts/
           if-no-files-found: error
           retention-days: 7
+
+      - name: Report Linux disk space after validation
+        if: ${{ always() && inputs.skip_artifacts && runner.os == 'Linux' }}
+        shell: bash
+        run: df -h .
