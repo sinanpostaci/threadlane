@@ -18,14 +18,19 @@
 //!   with an explicit `step_finish` (`part.type == "step-finish"`, `reason == "stop"`). Partial/delta
 //!   text snapshots, unfinished `part.time` records, duplicate or conflicting text parts in a step,
 //!   tool-result spoofing, and unsupported event shapes are explicitly rejected.
-//! - **Codex CLI (`codex_cli`)**: Captures only from a completed `type: "item.completed"` event
-//!   whose `item.type == "agent_message"` contains a non-empty UTF-8 string `item.text` inside a
-//!   `thread.started` -> `turn.started` -> `turn.completed` lifecycle. Terminal `turn.failed` and
-//!   `error` events, missing `thread.started` or `turn.completed` framing, conflicting `thread_id`
-//!   values, duplicate/conflicting final agent messages, and tool/command spoofing are rejected.
-//!   Because `codex exec --json` does not emit runtime model or reasoning-effort telemetry on stdout,
-//!   observed model/effort fields remain `None` unless genuinely emitted by the CLI while completion
-//!   relies on the verified pinned read-only launch configuration (`--model` + `-c model_reasoning_effort`).
+//! - **Codex CLI (`codex_cli`)**: Captures only from the single final completed
+//!   `type: "item.completed"` event whose `item.type == "agent_message"` contains a non-empty
+//!   UTF-8 top-level JSON object `item.text` inside a `thread.started` -> `turn.started` ->
+//!   `turn.completed` lifecycle. Bounded ordinary prose preamble `agent_message` items
+//!   (up to [`MAX_CODEX_PROSE_PREAMBLES_PER_TURN`]) may precede the final structured JSON object,
+//!   while terminal `turn.failed` and `error` events, missing `thread.started` or `turn.completed`
+//!   framing, conflicting `thread_id` values, duplicate `item.id` values, prior malformed
+//!   JSON-like or non-object JSON candidates, multiple/conflicting structured JSON candidates,
+//!   trailing `agent_message` items after a structured JSON candidate, prose-only turns, and
+//!   tool/command spoofing are rejected. Because `codex exec --json` does not emit runtime model
+//!   or reasoning-effort telemetry on stdout, observed model/effort fields remain `None` unless
+//!   genuinely emitted by the CLI while completion relies on the verified pinned read-only launch
+//!   configuration (`--model` + `-c model_reasoning_effort`).
 //! - **Untrusted model data**: A verified [`BoundedAdvisoryResponse`] proves only that the supervised
 //!   provider process exited cleanly with matching CLI-reported or launch-pinned evidence
 //!   and emitted a complete UTF-8 JSON object within [`AdvisoryResponseBudget`]. Parsing a valid JSON
@@ -56,6 +61,10 @@ pub const DEFAULT_MAX_ADVISORY_RESPONSE_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
 
 /// Hard maximum configurable UTF-8 byte length for a captured structured advisory response (`4 MiB`).
 pub const MAX_ADVISORY_RESPONSE_BYTES: usize = MAX_LINE_BYTES;
+
+/// Maximum number of intermediate ordinary prose `agent_message` preambles permitted before the
+/// single final structured JSON-object `agent_message` in a Codex CLI advisory turn (`32`).
+pub const MAX_CODEX_PROSE_PREAMBLES_PER_TURN: usize = 32;
 
 const fn default_max_advisory_response_bytes() -> usize {
     DEFAULT_MAX_ADVISORY_RESPONSE_BYTES
@@ -736,6 +745,8 @@ pub(crate) struct AdvisoryResponseCollector {
     codex_saw_thread_started: bool,
     codex_in_turn: bool,
     codex_seen_agent_item_ids: BTreeSet<String>,
+    codex_prose_preamble_count: usize,
+    codex_segment_prose_line: Option<usize>,
     codex_turn_candidate: Option<CapturedCandidate>,
     codex_sealed_candidate: Option<(CapturedCandidate, usize, Option<StreamTokenUsage>)>,
 }
@@ -767,6 +778,8 @@ impl AdvisoryResponseCollector {
             codex_saw_thread_started: false,
             codex_in_turn: false,
             codex_seen_agent_item_ids: BTreeSet::new(),
+            codex_prose_preamble_count: 0,
+            codex_segment_prose_line: None,
             codex_turn_candidate: None,
             codex_sealed_candidate: None,
         }
@@ -1885,6 +1898,8 @@ impl AdvisoryResponseCollector {
                     return;
                 }
                 self.codex_in_turn = true;
+                self.codex_prose_preamble_count = 0;
+                self.codex_segment_prose_line = None;
                 self.codex_turn_candidate = None;
             }
             "item.started" | "item.updated" => {
@@ -2056,14 +2071,37 @@ impl AdvisoryResponseCollector {
                             return;
                         }
 
-                        self.codex_turn_candidate = Some(CapturedCandidate {
-                            text: raw_text.to_string(),
-                            response_line_number: line_number,
-                            session_id: self.observed_session_id.clone(),
-                            message_id: None,
-                            part_id: None,
-                            item_id: Some(item_id.to_string()),
-                        });
+                        match classify_codex_agent_message_text(raw_text, line_number) {
+                            CodexAgentMessageClassification::StructuredJsonObject => {
+                                self.codex_turn_candidate = Some(CapturedCandidate {
+                                    text: raw_text.to_string(),
+                                    response_line_number: line_number,
+                                    session_id: self.observed_session_id.clone(),
+                                    message_id: None,
+                                    part_id: None,
+                                    item_id: Some(item_id.to_string()),
+                                });
+                            }
+                            CodexAgentMessageClassification::OrdinaryProsePreamble => {
+                                self.codex_prose_preamble_count += 1;
+                                if self.codex_prose_preamble_count
+                                    > MAX_CODEX_PROSE_PREAMBLES_PER_TURN
+                                {
+                                    self.latch_error(AdvisoryResponseError::at_line(
+                                        AdvisoryResponseErrorCode::ConflictingTerminalOutput,
+                                        line_number,
+                                        format!(
+                                            "Codex turn exceeded maximum ordinary prose preamble agent_message count ({MAX_CODEX_PROSE_PREAMBLES_PER_TURN})"
+                                        ),
+                                    ));
+                                    return;
+                                }
+                                self.codex_segment_prose_line = Some(line_number);
+                            }
+                            CodexAgentMessageClassification::InvalidStructuredCandidate(err) => {
+                                self.latch_error(err);
+                            }
+                        }
                     }
                     "reasoning" | "todo_list" => {
                         if has_any_error_indicator(obj, Some(item)) {
@@ -2081,6 +2119,7 @@ impl AdvisoryResponseCollector {
                         // turn before a tool item completed, clear it so only the final post-tool
                         // agent_message can seal the turn.
                         self.codex_turn_candidate = None;
+                        self.codex_segment_prose_line = None;
                     }
                     "error" => {
                         self.latch_error(AdvisoryResponseError::at_line(
@@ -2150,7 +2189,16 @@ impl AdvisoryResponseCollector {
                 };
 
                 self.codex_in_turn = false;
+                let prose_line = self.codex_segment_prose_line.take();
                 let Some(mut candidate) = self.codex_turn_candidate.take() else {
+                    if let Some(prose_line_number) = prose_line {
+                        self.latch_error(AdvisoryResponseError::at_line(
+                            AdvisoryResponseErrorCode::InvalidStructuredJson,
+                            prose_line_number,
+                            "Codex turn completed with ordinary prose agent_message output and no final structured JSON object",
+                        ));
+                        return;
+                    }
                     let code = if self.saw_tool_output_candidate {
                         AdvisoryResponseErrorCode::SpoofedOrToolOutput
                     } else {
@@ -2176,6 +2224,7 @@ impl AdvisoryResponseCollector {
             }
             "turn.failed" | "error" => {
                 self.codex_in_turn = false;
+                self.codex_segment_prose_line = None;
                 self.codex_turn_candidate = None;
                 self.latch_error(AdvisoryResponseError::at_line(
                     AdvisoryResponseErrorCode::ProviderError,
@@ -2583,6 +2632,69 @@ fn validate_structured_json_object(
             format!("captured advisory response is not valid complete JSON: {err}"),
         )),
     }
+}
+
+enum CodexAgentMessageClassification {
+    StructuredJsonObject,
+    OrdinaryProsePreamble,
+    InvalidStructuredCandidate(AdvisoryResponseError),
+}
+
+fn classify_codex_agent_message_text(
+    raw_text: &str,
+    line_number: usize,
+) -> CodexAgentMessageClassification {
+    match serde_json::from_str::<Value>(raw_text) {
+        Ok(Value::Object(_)) => CodexAgentMessageClassification::StructuredJsonObject,
+        Ok(_) => CodexAgentMessageClassification::InvalidStructuredCandidate(
+            AdvisoryResponseError::at_line(
+                AdvisoryResponseErrorCode::InvalidStructuredJson,
+                line_number,
+                "captured advisory response must be a top-level JSON object",
+            ),
+        ),
+        Err(err) => {
+            if looks_like_malformed_json_candidate(raw_text) {
+                CodexAgentMessageClassification::InvalidStructuredCandidate(
+                    AdvisoryResponseError::at_line(
+                        AdvisoryResponseErrorCode::InvalidStructuredJson,
+                        line_number,
+                        format!("captured advisory response is not valid complete JSON: {err}"),
+                    ),
+                )
+            } else {
+                CodexAgentMessageClassification::OrdinaryProsePreamble
+            }
+        }
+    }
+}
+
+fn looks_like_malformed_json_candidate(raw_text: &str) -> bool {
+    let trimmed = raw_text.trim();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with('"')
+        || trimmed.ends_with('}')
+        || trimmed.contains("```")
+        || contains_json_object_opening(trimmed)
+}
+
+fn contains_json_object_opening(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j == bytes.len() || matches!(bytes[j], b'"' | b'}' | b'{') {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn validate_opencode_text_part_completeness(
