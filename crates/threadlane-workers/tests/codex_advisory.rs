@@ -830,3 +830,869 @@ exit 0
         .expect("run antigravity without model telemetry");
     assert_eq!(agy_report.status, WorkerRunStatus::MissingModelEvidence);
 }
+
+#[tokio::test]
+async fn codex_cli_accepts_multiple_ordinary_prose_preambles_and_prose_tools_prose_before_single_final_json_object(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let (expected_payload, payload_json) = build_large_codex_review_payload();
+    let final_item_line_4 = serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "item_final_json_4",
+            "type": "agent_message",
+            "text": payload_json
+        }
+    });
+    let final_line_4_file = temp.path().join("codex_final_line_4.json");
+    fs::write(
+        &final_line_4_file,
+        serde_json::to_string(&final_item_line_4).expect("serialize final item line 4"),
+    )
+    .expect("write final_line_4_file");
+
+    // 1. Multiple ordinary prose preambles in a single tool-free turn followed by one final JSON object
+    let multi_prose_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"019a52d7-7c00-7111-8222-codexprose01"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_prose_1","type":"agent_message","text":"I will inspect `docs/ROADMAP.md` and `crates/threadlane-workers/src/advisory_response.rs` [read-only]."}}}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_prose_2","type":"agent_message","text":"1. Verified launch flags and workdir rules.\n2. Preparing the final structured review JSON."}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":810,"cached_input_tokens":512,"output_tokens":245}}}}'
+exit 0
+"#,
+        final_line_4_file.display()
+    );
+    let fake_multi_prose =
+        write_executable_script(&bin_dir, "fake-codex-multi-prose", &multi_prose_script);
+    let mut spec = sample_codex_advisory_spec(
+        fake_multi_prose,
+        workdir.clone(),
+        "Review workspace after prose updates.",
+    );
+
+    let multi_prose_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("multi-prose + single JSON final run should succeed");
+    assert!(multi_prose_out.has_verified_response());
+    assert!(multi_prose_out.response_error.is_none());
+    assert_eq!(multi_prose_out.execution.status, WorkerRunStatus::Succeeded);
+    assert_eq!(multi_prose_out.execution.effective_observed_model(), None);
+    assert_eq!(multi_prose_out.execution.effective_observed_effort(), None);
+
+    let resp_a = multi_prose_out
+        .verified_response()
+        .expect("verified response for multi-prose turn");
+    assert_eq!(resp_a.text, payload_json);
+    assert_eq!(resp_a.framing.response_line_number, 5);
+    assert_eq!(resp_a.framing.terminal_line_number, 6);
+    assert_eq!(resp_a.framing.item_id.as_deref(), Some("item_final_json_4"));
+    assert_eq!(
+        resp_a.framing.session_id.as_deref(),
+        Some("019a52d7-7c00-7111-8222-codexprose01")
+    );
+    let parsed_a: SampleCodexReviewPayload =
+        resp_a.parse_json().expect("deserialize multi-prose JSON");
+    assert_eq!(parsed_a, expected_payload);
+
+    // 2. Structural shape with prose (line 3) -> reasoning/tools (lines 4..17) -> post-tool prose (line 18) -> final JSON (line 19) -> turn.completed (line 20)
+    let final_item_line_19 = serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "item_final_19",
+            "type": "agent_message",
+            "text": payload_json
+        }
+    });
+    let final_line_19_file = temp.path().join("codex_final_line_19.json");
+    fs::write(
+        &final_line_19_file,
+        serde_json::to_string(&final_item_line_19).expect("serialize final item line 19"),
+    )
+    .expect("write final_line_19_file");
+
+    let prose_tools_prose_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"019a52d7-7c00-7111-8222-codexprose02"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_3","type":"agent_message","text":"I will inspect the repository structure and read the relevant files before producing the plan."}}}}'
+for i in $(seq 4 17); do
+    if [ $((i % 2)) -eq 0 ]; then
+        printf '{{"type":"item.completed","item":{{"id":"item_%d","type":"reasoning","text":"Reasoning step %d"}}}}\n' "$i" "$i"
+    else
+        printf '{{"type":"item.completed","item":{{"id":"item_%d","type":"command_execution","command":"git status --short","aggregated_output":"{{\\"tool_output\\":%d}}","exit_code":0,"status":"completed"}}}}\n' "$i" "$i"
+    fi
+done
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_18","type":"agent_message","text":"I have completed the read-only inspection and will now emit the structured JSON response."}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":2048,"cached_input_tokens":1536,"output_tokens":512}}}}'
+exit 0
+"#,
+        final_line_19_file.display()
+    );
+    spec.executable = write_executable_script(
+        &bin_dir,
+        "fake-codex-prose-tools-prose",
+        &prose_tools_prose_script,
+    );
+
+    let ptp_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("prose -> tools -> prose -> final JSON run should succeed");
+    assert!(ptp_out.has_verified_response());
+    assert!(ptp_out.response_error.is_none());
+    assert_eq!(ptp_out.execution.status, WorkerRunStatus::Succeeded);
+    assert_eq!(ptp_out.execution.evidence.total_lines, 20);
+
+    let resp_b = ptp_out
+        .verified_response()
+        .expect("verified response for prose-tools-prose-final turn");
+    assert_eq!(resp_b.text, payload_json);
+    assert_eq!(resp_b.framing.response_line_number, 19);
+    assert_eq!(resp_b.framing.terminal_line_number, 20);
+    assert_eq!(resp_b.framing.item_id.as_deref(), Some("item_final_19"));
+    assert_eq!(
+        resp_b.framing.session_id.as_deref(),
+        Some("019a52d7-7c00-7111-8222-codexprose02")
+    );
+    let parsed_b: SampleCodexReviewPayload = resp_b
+        .parse_json()
+        .expect("deserialize prose-tools-prose JSON");
+    assert_eq!(parsed_b, expected_payload);
+
+    // 3. Exact 32-preamble boundary (`MAX_CODEX_PROSE_PREAMBLES_PER_TURN = 32`) followed by one final JSON object
+    let mut boundary_32_lines = vec![
+        serde_json::to_string(&serde_json::json!({
+            "type": "thread.started",
+            "thread_id": "019a52d7-7c00-7111-8222-codexprose32"
+        }))
+        .expect("serialize thread.started"),
+        serde_json::to_string(&serde_json::json!({
+            "type": "turn.started"
+        }))
+        .expect("serialize turn.started"),
+    ];
+    for idx in 1..=32 {
+        boundary_32_lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": format!("item_preamble_{idx}"),
+                    "type": "agent_message",
+                    "text": format!("Ordinary read-only inspection note {idx} of 32.")
+                }
+            }))
+            .expect("serialize prose preamble"),
+        );
+    }
+    boundary_32_lines.push(
+        serde_json::to_string(&serde_json::json!({
+            "type": "item.completed",
+            "item": {
+                "id": "item_final_after_32",
+                "type": "agent_message",
+                "text": payload_json
+            }
+        }))
+        .expect("serialize final JSON item"),
+    );
+    boundary_32_lines.push(
+        serde_json::to_string(&serde_json::json!({
+            "type": "turn.completed",
+            "usage": {
+                "input_tokens": 1024,
+                "cached_input_tokens": 512,
+                "output_tokens": 256
+            }
+        }))
+        .expect("serialize turn.completed"),
+    );
+    let boundary_32_ndjson = temp.path().join("codex_boundary_32.ndjson");
+    fs::write(
+        &boundary_32_ndjson,
+        format!("{}\n", boundary_32_lines.join("\n")),
+    )
+    .expect("write boundary_32_ndjson");
+    let boundary_32_script = format!(
+        "#!/usr/bin/env sh\nset -eu\ncat \"{}\"\nexit 0\n",
+        boundary_32_ndjson.display()
+    );
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-boundary-32", &boundary_32_script);
+
+    let boundary_32_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("32 prose preambles + 1 final JSON run should succeed");
+    assert!(boundary_32_out.has_verified_response());
+    assert!(boundary_32_out.response_error.is_none());
+    assert_eq!(boundary_32_out.execution.status, WorkerRunStatus::Succeeded);
+    let resp_32 = boundary_32_out
+        .verified_response()
+        .expect("verified response at 32-preamble boundary");
+    assert_eq!(resp_32.text, payload_json);
+    assert_eq!(resp_32.framing.response_line_number, 35);
+    assert_eq!(resp_32.framing.terminal_line_number, 36);
+    assert_eq!(
+        resp_32.framing.item_id.as_deref(),
+        Some("item_final_after_32")
+    );
+}
+
+#[tokio::test]
+async fn codex_cli_rejects_prose_only_missing_final_duplicate_ids_conflicting_finals_and_malformed_json_like_prior_candidates(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let dummy_exe =
+        write_executable_script(&bin_dir, "fake-codex-init", "#!/usr/bin/env sh\nexit 0\n");
+    let mut spec = sample_codex_advisory_spec(dummy_exe, workdir, "regression checks");
+
+    // 1. Prose-only turn (multiple normal prose messages with no final JSON object) -> `InvalidStructuredJson`
+    let prose_only_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-prose-only-1"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"I will inspect the repository layout first."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"Everything looks clean; no structured JSON object was emitted."}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#;
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-prose-only", prose_only_script);
+    let prose_only_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("prose-only run");
+    assert!(!prose_only_out.has_verified_response());
+    assert_eq!(prose_only_out.execution.status, WorkerRunStatus::Succeeded);
+    let prose_only_err = prose_only_out
+        .response_error
+        .expect("prose-only response_error");
+    assert_eq!(
+        prose_only_err.code,
+        AdvisoryResponseErrorCode::InvalidStructuredJson
+    );
+    assert_eq!(prose_only_err.line_number, Some(4));
+
+    // 2. Prose -> tool -> prose-only (no final JSON object after tool) -> `InvalidStructuredJson`
+    let post_tool_prose_only_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-pt-prose-only"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Running read-only check."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_2","type":"command_execution","command":"git status","aggregated_output":"","exit_code":0,"status":"completed"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Check finished in plain prose without JSON."}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#;
+    spec.executable = write_executable_script(
+        &bin_dir,
+        "fake-codex-pt-prose-only",
+        post_tool_prose_only_script,
+    );
+    let pt_prose_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("post-tool prose-only run");
+    assert!(!pt_prose_out.has_verified_response());
+    let pt_prose_err = pt_prose_out
+        .response_error
+        .expect("post-tool prose-only error");
+    assert_eq!(
+        pt_prose_err.code,
+        AdvisoryResponseErrorCode::InvalidStructuredJson
+    );
+    assert_eq!(pt_prose_err.line_number, Some(5));
+
+    // 3. Missing final `agent_message` in tool-free turn -> `MissingResponseOutput`
+    let missing_final_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-missing-final"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_r1","type":"reasoning","text":"Thinking only."}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":4}}'
+exit 0
+"#;
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-missing-final", missing_final_script);
+    let missing_final_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("missing final run");
+    assert!(!missing_final_out.has_verified_response());
+    let missing_final_err = missing_final_out
+        .response_error
+        .expect("missing final error");
+    assert_eq!(
+        missing_final_err.code,
+        AdvisoryResponseErrorCode::MissingResponseOutput
+    );
+    assert_eq!(missing_final_err.line_number, Some(4));
+
+    // 4. Post-tool candidate reset: pre-tool prose or pre-tool JSON followed by a tool and no post-tool `agent_message` -> `SpoofedOrToolOutput`
+    for (idx, pre_tool_text) in [
+        "I will run a read-only command.",
+        "{\"pre_tool_only\":true}",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let reset_script = format!(
+            r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread-reset-{idx}"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_pre","type":"agent_message","text":{}}}}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_cmd","type":"command_execution","command":"git status","aggregated_output":"{{\"spoof\":1}}","exit_code":0,"status":"completed"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":15,"output_tokens":5}}}}'
+exit 0
+"#,
+            serde_json::to_string(pre_tool_text).unwrap()
+        );
+        spec.executable = write_executable_script(
+            &bin_dir,
+            &format!("fake-codex-post-tool-reset-{idx}"),
+            &reset_script,
+        );
+        let reset_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("post-tool reset run");
+        assert!(!reset_out.has_verified_response());
+        assert_eq!(
+            reset_out.response_error.as_ref().map(|e| e.code),
+            Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+        );
+    }
+
+    // 5. Duplicate `item.id` across prose and final JSON (both within a segment and across a tool call) -> `ConflictingTerminalOutput`
+    for (idx, dup_id_script) in [
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-dupid-1"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_shared","type":"agent_message","text":"Inspecting repository before emitting JSON."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_shared","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-dupid-2"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_shared","type":"agent_message","text":"Inspecting repository before tool."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_cmd","type":"command_execution","command":"git status","aggregated_output":"","exit_code":0,"status":"completed"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_shared","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-dupid-{idx}"), dup_id_script);
+        let dup_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("duplicate item.id run");
+        assert!(!dup_out.has_verified_response());
+        assert_eq!(
+            dup_out.response_error.as_ref().map(|e| e.code),
+            Some(AdvisoryResponseErrorCode::ConflictingTerminalOutput)
+        );
+    }
+
+    // 6. Conflicting JSON finals and trailing prose after a structured JSON candidate -> `ConflictingTerminalOutput`
+    for (idx, conflict_script) in [
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-conflict-json-1"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","text":"Reading workspace files first."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j1","type":"agent_message","text":"{\"verdict\":\"rejected\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#,
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-trailing-prose-2"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j1","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p2","type":"agent_message","text":"Let me know if you need anything else."}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        spec.executable = write_executable_script(
+            &bin_dir,
+            &format!("fake-codex-conflict-final-{idx}"),
+            conflict_script,
+        );
+        let conflict_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("conflicting final run");
+        assert!(!conflict_out.has_verified_response());
+        assert_eq!(
+            conflict_out.response_error.as_ref().map(|e| e.code),
+            Some(AdvisoryResponseErrorCode::ConflictingTerminalOutput)
+        );
+    }
+
+    // 7. Malformed JSON-like prior candidates (truncated `{...`, fenced ```json, JSON array `[...]`,
+    //    and embedded `{"` before a tool call) followed by a valid JSON object -> `InvalidStructuredJson` at line 3
+    for (idx, bad_prior_script) in [
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-malformed-prior-1"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_bad_1","type":"agent_message","text":"{\"verdict\":\"rejected\",\"unterminated\":true"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_good_2","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#,
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-malformed-prior-2"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_bad_1","type":"agent_message","text":"```json\n{\"verdict\":\"rejected\"}\n```"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_good_2","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#,
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-malformed-prior-3"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_bad_1","type":"agent_message","text":"[{\"verdict\":\"rejected\"}]"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_good_2","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#,
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-malformed-prior-4"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_bad_1","type":"agent_message","text":"Draft response: {\"verdict\":\"rejected\",\"unterminated\":1"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_cmd_2","type":"command_execution","command":"git status","aggregated_output":"","exit_code":0,"status":"completed"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_good_3","type":"agent_message","text":"{\"verdict\":\"approved\",\"schema_version\":1}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":20,"output_tokens":10}}'
+exit 0
+"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        spec.executable = write_executable_script(
+            &bin_dir,
+            &format!("fake-codex-bad-prior-{idx}"),
+            bad_prior_script,
+        );
+        let bad_prior_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("malformed JSON-like prior candidate run");
+        assert!(!bad_prior_out.has_verified_response());
+        let err = bad_prior_out
+            .response_error
+            .expect("malformed prior candidate must populate response_error");
+        assert_eq!(err.code, AdvisoryResponseErrorCode::InvalidStructuredJson);
+        assert_eq!(err.line_number, Some(3));
+    }
+
+    // 7b. Leading-quoted malformed JSON fragments (`"verdict":"rejected",` and `"rejected`)
+    //     followed by a valid JSON object, both directly and across a tool completion -> `InvalidStructuredJson` at line 3
+    for (idx, quoted_fragment, include_tool) in [
+        (0usize, "\"verdict\":\"rejected\",", false),
+        (1usize, "\"rejected", false),
+        (2usize, "\"verdict\":\"rejected\",", true),
+        (3usize, "\"rejected", true),
+    ] {
+        let mut lines = vec![
+            serde_json::to_string(&serde_json::json!({
+                "type": "thread.started",
+                "thread_id": format!("thread-quoted-fragment-{idx}")
+            }))
+            .expect("serialize thread.started"),
+            serde_json::to_string(&serde_json::json!({
+                "type": "turn.started"
+            }))
+            .expect("serialize turn.started"),
+            serde_json::to_string(&serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_bad_quoted_1",
+                    "type": "agent_message",
+                    "text": quoted_fragment
+                }
+            }))
+            .expect("serialize quoted fragment item"),
+        ];
+        if include_tool {
+            lines.push(
+                serde_json::to_string(&serde_json::json!({
+                    "type": "item.completed",
+                    "item": {
+                        "id": "item_cmd_2",
+                        "type": "command_execution",
+                        "command": "git status --short",
+                        "aggregated_output": "",
+                        "exit_code": 0,
+                        "status": "completed"
+                    }
+                }))
+                .expect("serialize command_execution item"),
+            );
+        }
+        lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_good_final",
+                    "type": "agent_message",
+                    "text": "{\"verdict\":\"approved\",\"schema_version\":1}"
+                }
+            }))
+            .expect("serialize valid final JSON item"),
+        );
+        lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 20,
+                    "output_tokens": 10
+                }
+            }))
+            .expect("serialize turn.completed"),
+        );
+        let ndjson_path = temp
+            .path()
+            .join(format!("codex_quoted_fragment_{idx}.ndjson"));
+        fs::write(&ndjson_path, format!("{}\n", lines.join("\n")))
+            .expect("write quoted fragment ndjson");
+        let script = format!(
+            "#!/usr/bin/env sh\nset -eu\ncat \"{}\"\nexit 0\n",
+            ndjson_path.display()
+        );
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-quoted-frag-{idx}"), &script);
+        let out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("leading-quoted malformed JSON fragment run");
+        assert!(!out.has_verified_response());
+        let err = out
+            .response_error
+            .expect("leading-quoted malformed fragment must populate response_error");
+        assert_eq!(err.code, AdvisoryResponseErrorCode::InvalidStructuredJson);
+        assert_eq!(err.line_number, Some(3));
+    }
+
+    // 8. Exceeding the 32-preamble bound (`MAX_CODEX_PROSE_PREAMBLES_PER_TURN = 32`):
+    //    (a) 33 ordinary prose preambles in one tool-free turn -> `ConflictingTerminalOutput` at line 35
+    //    (b) 33 ordinary prose preambles split across a tool completion (16 pre-tool + 1 tool + 17 post-tool) ->
+    //        `ConflictingTerminalOutput` at line 36 (counter does not reset on tools)
+    for (idx, split_at_tool, expected_error_line) in
+        [(0usize, None, 35usize), (1usize, Some(16usize), 36usize)]
+    {
+        let mut lines = vec![
+            serde_json::to_string(&serde_json::json!({
+                "type": "thread.started",
+                "thread_id": format!("thread-preamble-overflow-{idx}")
+            }))
+            .expect("serialize thread.started"),
+            serde_json::to_string(&serde_json::json!({
+                "type": "turn.started"
+            }))
+            .expect("serialize turn.started"),
+        ];
+        for p_idx in 1..=33 {
+            lines.push(
+                serde_json::to_string(&serde_json::json!({
+                    "type": "item.completed",
+                    "item": {
+                        "id": format!("item_prose_{p_idx}"),
+                        "type": "agent_message",
+                        "text": format!("Ordinary prose preamble {p_idx} of 33.")
+                    }
+                }))
+                .expect("serialize prose preamble"),
+            );
+            if split_at_tool == Some(p_idx) {
+                lines.push(
+                    serde_json::to_string(&serde_json::json!({
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_tool_mid",
+                            "type": "command_execution",
+                            "command": "git status --short",
+                            "aggregated_output": "",
+                            "exit_code": 0,
+                            "status": "completed"
+                        }
+                    }))
+                    .expect("serialize mid-turn tool item"),
+                );
+            }
+        }
+        lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": "item.completed",
+                "item": {
+                    "id": "item_final_json",
+                    "type": "agent_message",
+                    "text": "{\"verdict\":\"approved\",\"schema_version\":1}"
+                }
+            }))
+            .expect("serialize final JSON item"),
+        );
+        lines.push(
+            serde_json::to_string(&serde_json::json!({
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 64,
+                    "output_tokens": 32
+                }
+            }))
+            .expect("serialize turn.completed"),
+        );
+        let ndjson_path = temp.path().join(format!("codex_preamble_33_{idx}.ndjson"));
+        fs::write(&ndjson_path, format!("{}\n", lines.join("\n")))
+            .expect("write 33-preamble ndjson");
+        let script = format!(
+            "#!/usr/bin/env sh\nset -eu\ncat \"{}\"\nexit 0\n",
+            ndjson_path.display()
+        );
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-preamble-33-{idx}"), &script);
+        let out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("33-preamble overflow run");
+        assert!(!out.has_verified_response());
+        let err = out
+            .response_error
+            .expect("33-preamble overflow must populate response_error");
+        assert_eq!(
+            err.code,
+            AdvisoryResponseErrorCode::ConflictingTerminalOutput
+        );
+        assert_eq!(err.line_number, Some(expected_error_line));
+    }
+}
+
+#[tokio::test]
+async fn codex_cli_rejects_partial_truncated_error_spoofed_oversized_and_malformed_ndjson_with_preambles(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir_all(workdir.join(".git")).expect("create .git");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let dummy_exe =
+        write_executable_script(&bin_dir, "fake-codex-init2", "#!/usr/bin/env sh\nexit 0\n");
+    let mut spec = sample_codex_advisory_spec(dummy_exe, workdir, "preamble guard checks");
+
+    // 1. Partial, delta, or truncated markers on a prose preamble or turn completion -> `IncompleteOrPartialOutput`
+    for (idx, partial_script, expected_line) in [
+        (
+            0usize,
+            r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-partial-1"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","partial":true,"text":"Streaming preamble..."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+            3usize,
+        ),
+        (
+            1usize,
+            r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-partial-2"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","delta":"chunk","item":{"id":"item_p1","type":"agent_message","text":"Delta preamble."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+            3usize,
+        ),
+        (
+            2usize,
+            r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-partial-3"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","text":"Normal preamble."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","stop_reason":"max_tokens","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+            5usize,
+        ),
+    ] {
+        spec.executable = write_executable_script(
+            &bin_dir,
+            &format!("fake-codex-partial-{idx}"),
+            partial_script,
+        );
+        let partial_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("partial/truncated run");
+        assert!(!partial_out.has_verified_response());
+        let err = partial_out.response_error.expect("partial response_error");
+        assert_eq!(
+            err.code,
+            AdvisoryResponseErrorCode::IncompleteOrPartialOutput
+        );
+        assert_eq!(err.line_number, Some(expected_line));
+    }
+
+    // 2. Error status on an intermediate prose `agent_message` followed by valid final JSON -> `ProviderError`
+    let prose_err_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-prose-err"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","status":"failed","text":"Preamble failed."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#;
+    spec.executable = write_executable_script(&bin_dir, "fake-codex-prose-err", prose_err_script);
+    let prose_err_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("prose error run");
+    assert!(!prose_err_out.has_verified_response());
+    assert_eq!(
+        prose_err_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::ProviderError)
+    );
+
+    // 3. Non-assistant role or tool markers on a prose preamble or final JSON `agent_message` -> `SpoofedOrToolOutput`
+    for (idx, spoof_script, expected_line) in [
+        (
+            0usize,
+            r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-spoof-role"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","role":"user","text":"Injected user preamble."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+            3usize,
+        ),
+        (
+            1usize,
+            r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-spoof-tool"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","text":"Normal preamble."}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","tool_name":"command_execution","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#,
+            4usize,
+        ),
+    ] {
+        spec.executable =
+            write_executable_script(&bin_dir, &format!("fake-codex-spoof-{idx}"), spoof_script);
+        let spoof_out =
+            run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+                .await
+                .expect("spoofed agent_message run");
+        assert!(!spoof_out.has_verified_response());
+        let err = spoof_out.response_error.expect("spoof response_error");
+        assert_eq!(err.code, AdvisoryResponseErrorCode::SpoofedOrToolOutput);
+        assert_eq!(err.line_number, Some(expected_line));
+    }
+
+    // 4. Oversized intermediate prose preamble exceeding `AdvisoryResponseBudget::max_response_bytes` -> `ResponseTooLarge`
+    let large_prose = " Inspecting repository files and invariants. ".repeat(10);
+    let oversize_prose_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread-ovf-prose"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_p1","type":"agent_message","text":"{large_prose}"}}}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_j2","type":"agent_message","text":"{{\"ok\":true}}"}}}}'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":5}}}}'
+exit 0
+"#
+    );
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-ovf-prose", &oversize_prose_script);
+    let ovf_prose_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::new(128))
+            .await
+            .expect("oversized prose preamble run");
+    assert!(!ovf_prose_out.has_verified_response());
+    let ovf_err = ovf_prose_out
+        .response_error
+        .expect("oversized prose response_error");
+    assert_eq!(ovf_err.code, AdvisoryResponseErrorCode::ResponseTooLarge);
+    assert_eq!(ovf_err.line_number, Some(3));
+    assert_eq!(ovf_err.observed_bytes, Some(large_prose.len()));
+    assert_eq!(ovf_err.max_response_bytes, Some(128));
+
+    // 5. Malformed NDJSON line between a prose preamble and a valid final JSON object -> `MalformedStream`
+    let mid_malformed_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-mid-malformed"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_p1","type":"agent_message","text":"Normal preamble before malformed line."}}'
+printf '%s\n' '["non_object_ndjson_line"]'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_j2","type":"agent_message","text":"{\"verdict\":\"approved\"}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
+exit 0
+"#;
+    spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-mid-malformed", mid_malformed_script);
+    let mid_malformed_out =
+        run_advisory_worker_with_structured_result(&spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("mid-stream malformed NDJSON run");
+    assert!(!mid_malformed_out.has_verified_response());
+    assert_eq!(
+        mid_malformed_out.execution.status,
+        WorkerRunStatus::MalformedStream
+    );
+    let mal_err = mid_malformed_out
+        .response_error
+        .expect("malformed stream error");
+    assert_eq!(mal_err.code, AdvisoryResponseErrorCode::MalformedStream);
+    assert_eq!(mal_err.line_number, Some(4));
+}

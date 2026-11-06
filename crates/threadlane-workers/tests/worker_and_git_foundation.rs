@@ -102,6 +102,15 @@ impl TestEnv {
         path
     }
 
+    fn write_bash_fake_executable(&self, name: &str, script_body: &str) -> PathBuf {
+        let path = self.bin_dir.join(name);
+        let full_script = format!("#!/usr/bin/env bash\nset -eu\n{script_body}\n");
+        fs::write(&path, full_script).expect("write bash fake executable");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 bash fake executable");
+        path
+    }
+
     fn default_allowed_paths(&self) -> BTreeSet<String> {
         BTreeSet::from([
             "crates/threadlane-workers".to_string(),
@@ -1501,8 +1510,11 @@ async fn escaped_pipe_descendant_bounded_join_aborted_future_raii_kill_and_false
     let workdir = env.root_dir.join("process-bounds-dir");
     fs::create_dir_all(&workdir).expect("create workdir");
 
-    // 1. Escaped descendant in its own process group (`set -m` background job) holding stdout/stderr open
-    let escaped_bin = env.write_fake_executable(
+    // 1. Escaped descendant in its own process group (`set -m` background job) holding
+    // stdout/stderr open. Explicit Bash removes reliance on the host's varying `/bin/sh`
+    // job-control behavior; Bash is an existing CI/developer prerequisite. Ubuntu hosted
+    // qualification remains pending.
+    let escaped_bin = env.write_bash_fake_executable(
         "escaped-pipe-worker",
         r#"
 printf '{"type":"system","subtype":"init","model":"gemini-4-argon-high","effort":"high"}\n'
@@ -1526,10 +1538,49 @@ exit 0
         .parse()
         .expect("parse escaped_pid");
 
-    // Explicitly clean up the escaped fixture process regardless of assertions.
+    let worker_pgid = escaped_report.process_group_id;
+    let escaped_was_alive_before_cleanup = is_process_alive(escaped_pid);
+    let escaped_pid_i32 = i32::try_from(escaped_pid).ok();
+    let escaped_group_was_alive_before_cleanup =
+        escaped_pid_i32.is_some_and(is_process_group_alive);
+    let escaped_owns_separate_group = escaped_was_alive_before_cleanup
+        && escaped_group_was_alive_before_cleanup
+        && escaped_pid_i32.is_some_and(|pgid| worker_pgid != Some(pgid));
+
+    // Clean up the actually owned descendant before any assertion can panic. Only signal its
+    // own group after confirming the group is alive for this PID and differs from the worker's.
+    if let Some(pgid) = escaped_pid_i32.filter(|_| escaped_owns_separate_group) {
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pgid}")])
+            .status();
+    }
     let _ = Command::new("kill")
         .args(["-9", &escaped_pid.to_string()])
         .status();
+    for _ in 0..40 {
+        if !is_process_alive(escaped_pid) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Independent pre-cleanup fixture evidence, asserted only after owned cleanup.
+    assert!(
+        escaped_was_alive_before_cleanup,
+        "escaped pipe holder {escaped_pid} must be alive before fixture cleanup"
+    );
+    assert!(
+        escaped_group_was_alive_before_cleanup,
+        "escaped pipe holder {escaped_pid} must have a live process group before fixture cleanup"
+    );
+    assert!(
+        escaped_owns_separate_group,
+        "escaped pipe holder {escaped_pid} must be alive with a live process group matching its PID (pgid={escaped_pid_i32:?}) separate from worker group {worker_pgid:?}"
+    );
+    assert!(
+        !is_process_alive(escaped_pid),
+        "escaped fixture descendant {escaped_pid} must be cleaned up before assertions"
+    );
 
     assert!(
         escaped_report.cleanup_incomplete,
