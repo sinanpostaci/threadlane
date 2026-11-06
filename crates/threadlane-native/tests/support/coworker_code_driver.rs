@@ -291,6 +291,7 @@ async fn cli_code_driver_ensure_reuses_live_owner_survives_default_hold_reconcil
     assert_eq!(status_running["lease_active"], true);
     assert_eq!(status_running["host_lock_held"], true);
     assert_eq!(status_running["overall_status"], "running_tasks");
+    assert_eq!(status_running["blocked_on_unknown_effect"], false);
     assert_eq!(status_running["step_report"]["active_running_count"], 1);
     let running_host_task_count = status_running["tasks"]
         .as_array()
@@ -329,6 +330,7 @@ async fn cli_code_driver_ensure_reuses_live_owner_survives_default_hold_reconcil
             owner_instance_id
         );
         assert_eq!(dup["status"]["overall_status"], "running_tasks");
+        assert_eq!(dup["status"]["blocked_on_unknown_effect"], false);
     }
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
 
@@ -354,6 +356,7 @@ async fn cli_code_driver_ensure_reuses_live_owner_survives_default_hold_reconcil
     assert_eq!(status_after_hold["lease_active"], true);
     assert_eq!(status_after_hold["host_lock_held"], true);
     assert_eq!(status_after_hold["overall_status"], "running_tasks");
+    assert_eq!(status_after_hold["blocked_on_unknown_effect"], false);
     assert_eq!(status_after_hold["tasks"][0]["task_id"], "task-cli-a");
     assert_eq!(status_after_hold["tasks"][0]["stage"], "running");
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
@@ -1044,6 +1047,7 @@ async fn cli_code_driver_owner_crash_reports_stale_evidence_refuses_blind_replay
     };
     assert_eq!(status_before_crash["owner_state"], "live_verified_owner");
     assert_eq!(status_before_crash["overall_status"], "running_tasks");
+    assert_eq!(status_before_crash["blocked_on_unknown_effect"], false);
     assert_eq!(
         status_before_crash["step_report"]["active_running_count"],
         1

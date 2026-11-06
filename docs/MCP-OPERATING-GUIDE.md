@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-05.v1`
+Version: `2026-11-06.v1`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -103,6 +103,17 @@ Version: `2026-11-05.v1`
   `execution_status` expose `native_notice` / `latest` and `native_notice_error`
   metadata. Missing notices or endpoint are not new execution authority or model
   permission. Never poll; when an event arrives, read status, not a new dispatch.
+- Automatic Coder corrections currently follow a Reviewer `CorrectInScope` verdict.
+  Failed verification checks settle in `BlockedByFailedChecks`. Allowing or recording
+  a check-failure correction basis does not prove provider execution is implemented.
+- After terminal status or once an approved host has stopped (`phase: "stopped"`),
+  read `execution_status` and use `approved_activity` (with optional `task_id`,
+  `cursor`, `after_seq`, `limit`, or `kind`) to inspect bounded read-only history
+  from the stopped host without restarting it. Stopped history is strictly
+  read-only and cannot be ACKed; `approved_pull_events`, `approved_ack_events`, and
+  task dispatch still require a live authenticated ready host. Residual SQLite WAL/SHM
+  sidecars make the clean immutable snapshot unavailable; this route rejects the read
+  without checkpointing, recovering, deleting sidecars, or starting a host.
 
 ## Start and recover context
 

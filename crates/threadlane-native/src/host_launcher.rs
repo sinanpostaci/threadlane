@@ -19,8 +19,8 @@ use threadlane_host::{
     validate_canonical_thread_uuid, validate_identifier, validate_sessions_root,
     verify_existing_session_dir, write_host_launch_intent, ApprovedHostClient,
     HostControlRuntimeState, HostError, HostLaunchIntent, HostLaunchIntentLock,
-    HostLaunchIntentStatus, HostPhase, HOST_LOCK_FILENAME, HOST_MANIFEST_FILENAME,
-    WORK_AREA_SUBDIR,
+    HostLaunchIntentStatus, HostPhase, HostSessionSummary, HOST_LOCK_FILENAME,
+    HOST_MANIFEST_FILENAME, WORK_AREA_SUBDIR,
 };
 use threadlane_workflow::ToolAdapter;
 use tokio::process::{Child, Command};
@@ -1593,6 +1593,26 @@ async fn verify_live_authenticated_ready(
         reason: err.to_string(),
     })??;
 
+    verify_live_authenticated_ready_summary(
+        &client,
+        summary,
+        canonical_sessions_root,
+        record,
+        trusted_binding_id,
+        trusted_thread_uuid,
+    )
+    .await
+}
+
+/// Verifies a cached summary through current live IPC before reconciling a launch intent.
+pub(crate) async fn verify_live_authenticated_ready_summary(
+    client: &ApprovedHostClient,
+    summary: HostSessionSummary,
+    canonical_sessions_root: &Path,
+    record: &ApprovalRecord,
+    trusted_binding_id: &str,
+    trusted_thread_uuid: &str,
+) -> Result<(), HostError> {
     if summary.approval_id != record.approval_id
         || summary.subject_digest != record.subject_digest
         || summary.binding_id != trusted_binding_id
@@ -1640,18 +1660,19 @@ async fn verify_live_authenticated_ready(
         });
     }
 
-    let activity_page = client
-        .list_activity(&record.approval_id, None, None, Some(1), None)
+    let live_binding = client
+        .verify_live_ready_binding(&record.approval_id)
         .await?;
-    if activity_page.binding_id != expected_session_binding_id
-        || activity_page.binding_id == trusted_binding_id
+    if live_binding.binding_id != expected_session_binding_id
+        || live_binding.binding_id == trusted_binding_id
+        || live_binding.thread_uuid != trusted_thread_uuid
     {
         return Err(HostError::ScopeMismatch {
             field: "session_binding_id".to_string(),
             expected: expected_session_binding_id,
-            actual: activity_page.binding_id,
+            actual: live_binding.binding_id,
             reason:
-                "live supervisor activity binding did not match Ready manifest session_binding_id"
+                "live supervisor binding did not match Ready manifest session_binding_id and thread"
                     .to_string(),
         });
     }

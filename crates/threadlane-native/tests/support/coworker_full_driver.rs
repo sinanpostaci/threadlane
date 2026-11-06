@@ -10,7 +10,9 @@ use threadlane_native::coworker_driver::{CoworkerCodeDriver, CoworkerDriverEnsur
 use threadlane_native::coworker_notice::{
     coworker_notice_dir, CoworkerNoticeConfig, CoworkerNoticeStore, NoticeDeliveryStatus,
 };
-use threadlane_native::coworker_workflow::{CoworkerJobLockState, CoworkerJobOwnershipKey};
+use threadlane_native::coworker_workflow::{
+    CoworkerJobLockState, CoworkerJobOwnershipKey, OutboxDispatchStatus,
+};
 use threadlane_native::planning_driver::planning_artifacts_dir;
 use tokio::net::UnixListener;
 use tokio_tungstenite::accept_async;
@@ -1372,4 +1374,427 @@ async fn cli_code_driver_settled_check_and_correction_blocks_send_one_attention_
             supervisor.shutdown().await;
         }
     }).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unknown_and_reject_stale_correlation(
+) {
+    Box::pin(async {
+        let fixture = setup_fixture();
+        let state_dir = fixture.root.join("runtime-held-coders");
+        let supervisor = Supervisor::start(SupervisorConfig::new(state_dir.clone()))
+            .await
+            .expect("start supervisor");
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("supervisor client");
+        let binding = client
+            .create_binding(THREAD_UUID_A, "live-held-coders-fixture")
+            .await
+            .expect("create binding");
+        let binding_id = binding.binding_id;
+        let thread_uuid = binding.thread_uuid;
+
+        let (job, approval_id) = create_planned_approved_and_frozen_pipeline_job_for_scope(
+            &fixture,
+            &binding_id,
+            &thread_uuid,
+            "brf_held_coders",
+            "plan-held-coders",
+            vec![
+                PlanTask {
+                    id: "task-root-a".to_string(),
+                    title: "Implement module A".to_string(),
+                    instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/a.rs".to_string()],
+                },
+                PlanTask {
+                    id: "task-root-b".to_string(),
+                    title: "Implement module B".to_string(),
+                    instruction: "CTRL_TASK_B implement src/b.rs".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/b.rs".to_string()],
+                },
+            ],
+            BTreeMap::new(),
+            vec!["src/a.rs".to_string(), "src/b.rs".to_string()],
+            2,
+            ExecutionBudgets::default(),
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+            1,
+        )
+        .await;
+
+        // Select a real Reviewer- or failed-check-based correction before the owner starts.
+        let override_a_path = fixture.root.join("reviewer_override_task-root-a.json");
+        fs::write(
+            &override_a_path,
+            serde_json::to_string_pretty(&json!({
+                "outcome": "correct_in_scope",
+                "findings": ["Return value in src/a.rs should be 101 instead of 100."],
+                "required_in_scope_fixes": ["Update pub fn a() -> u32 in src/a.rs to return 101."],
+                "summary": "Requires bounded in-scope correction in src/a.rs."
+            }))
+            .expect("serialize reviewer override"),
+        )
+        .expect("write reviewer_override_task-root-a.json");
+        let hold_initial_a = fixture.root.join("hold_initial_coder_a.gate");
+        let hold_initial_b = fixture.root.join("hold_initial_coder_b.gate");
+        let hold_derived_a = fixture.root.join("hold_derived_coder_a.gate");
+        let entered_initial_a = fixture.root.join("entered_initial_coder_a.marker");
+        let entered_initial_b = fixture.root.join("entered_initial_coder_b.marker");
+        let entered_derived_a = fixture.root.join("entered_derived_coder_a.marker");
+        fs::write(&hold_initial_a, "hold\n").expect("create hold_initial_a");
+        fs::write(&hold_initial_b, "hold\n").expect("create hold_initial_b");
+        fs::write(&hold_derived_a, "hold\n").expect("create hold_derived_a");
+
+        let original_agy = fs::read_to_string(&fixture.fake_agy_exe).expect("read fake_agy_exe");
+        let exec_line = original_agy
+            .lines()
+            .find(|line| line.starts_with("exec node "))
+            .expect("find exec node line in fake_agy_exe")
+            .to_string();
+        let gated_agy = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n  *\"--mode plan\"*)\n    ;;\n  *\"IN-SCOPE CORRECTION DIRECTIVE\"*)\n    if [ -f \"{hold_derived}\" ]; then\n      : > \"{entered_derived}\"\n      while [ -f \"{hold_derived}\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\"CTRL_TASK_A\"*)\n    if [ -f \"{hold_a}\" ]; then\n      : > \"{entered_a}\"\n      while [ -f \"{hold_a}\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\"CTRL_TASK_B\"*)\n    if [ -f \"{hold_b}\" ]; then\n      : > \"{entered_b}\"\n      while [ -f \"{hold_b}\" ]; do sleep 0.02; done\n    fi\n    ;;\nesac\n{exec_line}\n",
+            hold_derived = hold_derived_a.display(),
+            entered_derived = entered_derived_a.display(),
+            hold_a = hold_initial_a.display(),
+            entered_a = entered_initial_a.display(),
+            hold_b = hold_initial_b.display(),
+            entered_b = entered_initial_b.display(),
+        );
+        write_executable_script(&fixture.fake_agy_exe, &gated_agy);
+
+        let ensure_initial = run_flow_cli_pipeline(
+            &state_dir,
+            &fixture,
+            &binding_id,
+            &thread_uuid,
+            &["code-driver", "ensure", "--job-id", &job.job_id],
+        )
+        .await;
+        assert_eq!(ensure_initial["disposition"], "spawned_new_owner");
+
+        let initial_deadline = Instant::now() + Duration::from_secs(20);
+        while !entered_initial_a.is_file() || !entered_initial_b.is_file() {
+            assert!(
+                Instant::now() < initial_deadline,
+                "timed out waiting for both parallel initial Coders to enter gates"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let status_initial_running = loop {
+            let current = run_flow_cli_pipeline(
+                &state_dir,
+                &fixture,
+                &binding_id,
+                &thread_uuid,
+                &["code-driver", "status", "--job-id", &job.job_id],
+            )
+            .await;
+            let running_tasks = current["tasks"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter(|t| t["stage"] == "running" && t["host_status"] == "running")
+                        .count()
+                })
+                .unwrap_or(0);
+            if current["step_report"]["active_running_count"] == 2 && running_tasks == 2 {
+                break current;
+            }
+            assert!(
+                Instant::now() < initial_deadline,
+                "timed out waiting for live owner status to observe 2 running initial Coders; last: {current}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(status_initial_running["owner_state"], "live_verified_owner");
+        assert_eq!(
+            status_initial_running["execution_mode"],
+            "full_automatic_pipeline"
+        );
+        assert_eq!(status_initial_running["overall_status"], "running_tasks");
+        assert_eq!(status_initial_running["pipeline_status"], "running");
+        assert_eq!(
+            status_initial_running["pipeline_report"]["status"],
+            "running"
+        );
+        assert_eq!(
+            status_initial_running["pipeline_report"]["unknown_effect_task_ids"],
+            json!([])
+        );
+        assert_eq!(status_initial_running["blocked_on_unknown_effect"], false);
+
+        // Durable PendingControllerEffect records remain ReservedBeforeEffect on disk with actual run_id correlations.
+        let runtime_initial = fixture
+            .policy_store
+            .get_job_runtime_readonly(&binding_id, &job.job_id)
+            .expect("read runtime while initial Coders held")
+            .expect("runtime exists");
+        assert_eq!(runtime_initial.unresolved_effects().len(), 2);
+        for eff in runtime_initial.unresolved_effects() {
+            assert_eq!(eff.kind, PendingControllerEffectKind::CoderDispatch);
+            assert_eq!(eff.status, PendingControllerEffectStatus::ReservedBeforeEffect);
+            assert_eq!(eff.attempt_no, Some(1));
+            assert!(
+                eff.external_correlation_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("run_")),
+                "expected run_id correlation on ReservedBeforeEffect initial CoderDispatch: {eff:?}"
+            );
+        }
+
+        // Duplicate ensure while held reuses the live owner with zero extra provider calls.
+        let dup_ensure = run_flow_cli_pipeline(
+            &state_dir,
+            &fixture,
+            &binding_id,
+            &thread_uuid,
+            &["code-driver", "ensure", "--job-id", &job.job_id],
+        )
+        .await;
+        assert_eq!(dup_ensure["disposition"], "reused_live_owner");
+        assert_eq!(dup_ensure["status"]["pipeline_status"], "running");
+        assert_eq!(dup_ensure["status"]["blocked_on_unknown_effect"], false);
+
+        // Negative cases use isolated snapshots; never rewrite a ledger owned by the driver.
+        let approval = fixture.authority.get_for_operator(&approval_id).expect("approval");
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        let manifest = threadlane_host::read_host_manifest_optional(&session_dir, &approval)
+            .expect("manifest").expect("manifest exists");
+        let (intents, receipts) = threadlane_host::read_session_task_ledger_readonly(
+            &session_dir, &approval, manifest.session_binding_id.as_deref().expect("session binding"),
+        ).expect("read task ledger").expect("task ledger exists");
+        let key = CoworkerJobOwnershipKey::new(&binding_id, &thread_uuid, &job.job_id).expect("key");
+        let project_with_plans = |snapshot_job: &CoworkerJobRecord, snapshot_runtime: &ControllerJobRuntimeState, status: &Value, plans_dir: &Path| {
+            let report: threadlane_native::coworker_driver::CoworkerDriverStatusReport =
+                serde_json::from_value(status.clone()).expect("status report");
+            threadlane_native::coworker_driver::evaluate_live_coder_projection_snapshot_from_job_and_runtime(
+                snapshot_job, snapshot_runtime, &approval, &key,
+                report.verified_owner_summary.as_ref().expect("verified owner"),
+                report.execution_mode, report.host_phase, report.host_lock_held,
+                &intents, &receipts, plans_dir,
+                report.step_report.as_ref(), &report.in_flight_stages,
+            )
+        };
+        let project = |snapshot_job: &CoworkerJobRecord, snapshot_runtime: &ControllerJobRuntimeState, status: &Value| {
+            project_with_plans(snapshot_job, snapshot_runtime, status, &fixture.plans_dir)
+        };
+        let initial_job = fixture.workflow_store.read_binding_ledger(&binding_id).expect("ledger")
+            .jobs.into_iter().find(|j| j.job_id == job.job_id).expect("job");
+        assert!(!project(&initial_job, &runtime_initial, &status_initial_running));
+        let mut stale_initial = initial_job.clone();
+        stale_initial.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 1)
+            .expect("outbox").run_id = Some("run_00000000-0000-4000-8000-000000000099".to_string());
+        assert!(project(&stale_initial, &runtime_initial, &status_initial_running));
+        let mut orphan_initial = runtime_initial.clone();
+        orphan_initial.lease.as_mut().expect("lease").instance_id = "stale-owner".to_string();
+        assert!(project(&initial_job, &orphan_initial, &status_initial_running));
+        let mut expired_initial = runtime_initial.clone();
+        expired_initial.lease.as_mut().expect("lease").expires_at_ms = 1;
+        assert!(project(&initial_job, &expired_initial, &status_initial_running));
+        let mut reopened_initial = initial_job.clone();
+        reopened_initial.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 1).expect("outbox")
+            .status = OutboxDispatchStatus::ReservedBeforeEffect;
+        assert!(project(&reopened_initial, &runtime_initial, &status_initial_running));
+        let mut unknown_initial = runtime_initial.clone();
+        unknown_initial.pending_effects.values_mut().next().expect("effect").status = PendingControllerEffectStatus::EffectUnknown;
+        assert!(project(&initial_job, &unknown_initial, &status_initial_running));
+
+        // Release both initial Coder gates so task-root-b integrates and task-root-a enters
+        // Reviewer -> CorrectInScopeRequired -> derived Coder attempt 2 (held on hold_derived_a).
+        fs::remove_file(&hold_initial_a).expect("release hold_initial_a");
+        fs::remove_file(&hold_initial_b).expect("release hold_initial_b");
+
+        let derived_deadline = Instant::now() + Duration::from_secs(30);
+        while !entered_derived_a.is_file() {
+            assert!(
+                Instant::now() < derived_deadline,
+                "timed out waiting for derived correction Coder attempt 2 to enter gate"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Clear the Reviewer override before derived attempt 2 finishes so attempt 2 is accepted.
+        fs::remove_file(&override_a_path).expect("remove reviewer_override_task-root-a.json");
+
+        let status_derived_running = run_flow_cli_pipeline(
+            &state_dir,
+            &fixture,
+            &binding_id,
+            &thread_uuid,
+            &["code-driver", "status", "--job-id", &job.job_id],
+        )
+        .await;
+        assert_eq!(status_derived_running["owner_state"], "live_verified_owner");
+        assert_eq!(status_derived_running["pipeline_status"], "running");
+        assert_eq!(
+            status_derived_running["pipeline_report"]["status"],
+            "running"
+        );
+        assert_eq!(
+            status_derived_running["pipeline_report"]["unknown_effect_task_ids"],
+            json!([])
+        );
+        assert_eq!(status_derived_running["blocked_on_unknown_effect"], false);
+        assert!(
+            status_derived_running["in_flight_stages"]
+                .as_array()
+                .is_some_and(|stages| stages.iter().any(|s| {
+                    s["kind"] == "task_correction"
+                        && s["task_id"] == "task-root-a"
+                        && s["attempt_no"] == 2
+                })),
+            "expected in_flight_stages to contain task_correction for task-root-a attempt 2: {status_derived_running}"
+        );
+
+        let runtime_derived = fixture
+            .policy_store
+            .get_job_runtime_readonly(&binding_id, &job.job_id)
+            .expect("read runtime while derived Coder held")
+            .expect("runtime exists");
+        assert_eq!(runtime_derived.unresolved_effects().len(), 1);
+        let derived_eff = runtime_derived.unresolved_effects()[0];
+        assert_eq!(derived_eff.kind, PendingControllerEffectKind::CoderDispatch);
+        assert_eq!(
+            derived_eff.status,
+            PendingControllerEffectStatus::ReservedBeforeEffect
+        );
+        assert_eq!(derived_eff.task_id.as_deref(), Some("task-root-a"));
+        assert_eq!(derived_eff.attempt_no, Some(2));
+        assert!(
+            derived_eff
+                .external_correlation_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("dar_")),
+            "expected DerivedTaskAttemptReceipt correlation on derived CoderDispatch: {derived_eff:?}"
+        );
+
+        let derived_job = fixture.workflow_store.read_binding_ledger(&binding_id).expect("ledger")
+            .jobs.into_iter().find(|j| j.job_id == job.job_id).expect("derived job");
+        assert!(!project(&derived_job, &runtime_derived, &status_derived_running));
+        let mut stale_derived = derived_job.clone();
+        stale_derived.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 2)
+            .expect("derived outbox").receipt_id = Some("dar_00000000000000000000000000000099".to_string());
+        assert!(project(&stale_derived, &runtime_derived, &status_derived_running));
+        let mut unknown_derived = derived_job.clone();
+        unknown_derived.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 2)
+            .expect("derived outbox").status = OutboxDispatchStatus::EffectUnknown;
+        assert!(project(&unknown_derived, &runtime_derived, &status_derived_running));
+        let mut stale_flight = status_derived_running.clone();
+        stale_flight["in_flight_stages"] = json!([]);
+        assert!(project(&derived_job, &runtime_derived, &stale_flight));
+
+        // Only an actual NotFound proves absence; an inaccessible report directory stays blocked.
+        let denied_dir = fixture.root.join("denied-projection-reports");
+        fs::create_dir(&denied_dir).expect("create isolated report directory");
+        fs::set_permissions(&denied_dir, fs::Permissions::from_mode(0o000)).expect("deny report access");
+        let denied_path = threadlane_native::coworker_workflow::derived_execution_report_file_path(&denied_dir, &derived_eff.effect_id);
+        assert_eq!(fs::symlink_metadata(&denied_path).expect_err("must exercise denied access").kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(project_with_plans(&derived_job, &runtime_derived, &status_derived_running, &denied_dir));
+        fs::set_permissions(&denied_dir, fs::Permissions::from_mode(0o700)).expect("restore isolated directory");
+        fs::write(&denied_path, b"existing report").expect("create isolated report marker");
+        assert!(project_with_plans(&derived_job, &runtime_derived, &status_derived_running, &denied_dir));
+
+        // The check-failure execution route remains unsupported. Exercise its read-only
+        // receipt projection using isolated typed snapshots; never persist or dispatch them.
+        let mut check_job = derived_job.clone();
+        let mut check_runtime = runtime_derived.clone();
+        check_runtime.envelope.allow_check_failure_corrections = true;
+        check_runtime.envelope.envelope_digest = check_runtime.envelope.compute_digest().expect("snapshot envelope digest");
+        let task = check_job.tasks.iter_mut().find(|t| t.task_id == "task-root-a").expect("snapshot task");
+        let prior = task.candidates.iter_mut().find(|c| c.attempt_no == 1).expect("prior candidate");
+        prior.review_verdict = None;
+        // Align the synthetic failed-check attempt evidence with its candidate lineage.
+        for attempt in task.attempts.iter_mut().filter(|a| a.role == WorkflowRole::Coder && a.attempt_no == 1) {
+            attempt.head_commit = Some(prior.head_commit.clone());
+            attempt.tree_sha = Some(prior.tree_sha.clone());
+        }
+        let receipt = check_runtime.derived_attempts.iter_mut().find(|d| d.task_id == task.task_id && d.attempt_no == 2).expect("derived receipt");
+        let spec = check_runtime.envelope.check_commands.get("cargo_test").expect("check spec");
+        let basis = threadlane_native::coworker_workflow::CheckFailureCorrectionBasis {
+            task_id: task.task_id.clone(), task_manifest_id: "w_projection_snapshot".to_string(),
+            prior_attempt_no: 1, prior_candidate_id: prior.candidate_id.clone(),
+            execution_base_commit: receipt.execution_base_commit.clone(),
+            committed_head_commit: prior.head_commit.clone(), committed_tree_sha: prior.tree_sha.clone(),
+            check_subject_digest: sha256_hex(b"snapshot check subject"),
+            prior_review_subject_digest: receipt.prior_review_subject_digest.clone().expect("prior review subject"),
+            failed_checks: vec![threadlane_native::coworker_workflow::CheckFailureReportRef {
+                check_id: spec.check_id.clone(), kind: spec.kind, spec_digest: spec.spec_digest().expect("snapshot check digest"),
+                effect_id: "eff_projection_snapshot".to_string(),
+                report_path: fixture.root.join("snapshot-failed-check.json").display().to_string(),
+                evidence_digest: sha256_hex(b"snapshot failure evidence"),
+                status: threadlane_native::coworker_workflow::FrozenCheckExecutionStatus::NonZeroExit,
+                exit_code: Some(1), signal: None, stdout_sha256: sha256_hex(b""), stderr_sha256: sha256_hex(b"check failed"),
+                post_worktree_clean: true, subject_drifted: false, diagnostic_summary: "Snapshot check failure".to_string(),
+            }], diagnostic_summary: "Snapshot required check failure".to_string(),
+        };
+        receipt.envelope_digest = check_runtime.envelope.envelope_digest.clone();
+        receipt.prior_review_verdict_id = None;
+        receipt.prior_check_failure_basis = Some(basis);
+        receipt.receipt_digest = receipt.compute_digest().expect("snapshot receipt digest");
+        receipt.validate_against_task(task, &check_runtime.envelope).expect("valid check-basis snapshot receipt");
+        let digest = receipt.receipt_digest.clone();
+        check_job.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 2).expect("outbox").subject_digest = digest.clone();
+        check_runtime.pending_effects.values_mut().find(|e| e.task_id.as_deref() == Some("task-root-a") && e.attempt_no == Some(2)).expect("effect").subject_digest = digest;
+        assert!(!project(&check_job, &check_runtime, &status_derived_running));
+        let mut unauthorized_check = check_runtime.clone();
+        unauthorized_check.envelope.allow_check_failure_corrections = false;
+        assert!(project(&check_job, &unauthorized_check, &status_derived_running));
+        let mut stale_check = check_runtime.clone();
+        stale_check.derived_attempts.iter_mut().find(|d| d.task_id == "task-root-a" && d.attempt_no == 2).expect("receipt")
+            .prior_check_failure_basis.as_mut().expect("basis").committed_head_commit = "f".repeat(40);
+        assert!(project(&check_job, &stale_check, &status_derived_running));
+
+        // Release derived Coder gate and verify clean completion with zero duplicate provider calls.
+        fs::remove_file(&hold_derived_a).expect("release hold_derived_a");
+
+        // Match the existing full-pipeline fixture's bound for real Git/provenance checks.
+        let complete_deadline = Instant::now() + Duration::from_secs(300);
+        let status_completed = loop {
+            let current = run_flow_cli_pipeline(
+                &state_dir,
+                &fixture,
+                &binding_id,
+                &thread_uuid,
+                &["code-driver", "status", "--job-id", &job.job_id],
+            )
+            .await;
+            if current["pipeline_status"] == "completed"
+                && current["owner_state"] == "no_active_owner"
+            {
+                break current;
+            }
+            if Instant::now() >= complete_deadline || (current["pipeline_status"] == "blocked_or_failed" && current["owner_state"] == "no_active_owner") {
+                let runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id)
+                    .expect("failure runtime").expect("runtime exists");
+                let diagnostics: Vec<_> = runtime.closure_artifacts.values().map(|r| {
+                    let loaded = fixture.policy_store.load_closure_execution_artifact_for_record(&binding_id, &thread_uuid, &job.job_id, r)
+                        .expect("load fake Closure artifact");
+                    (loaded.diagnostic, loaded.response_error, loaded.observed_model, loaded.observed_effort)
+                }).collect();
+                panic!("pipeline did not complete; Closure calls: {}; diagnostics: {diagnostics:?}; last: {current}",
+                    read_invocation_count(&fixture.agy_closure_count_file));
+            }
+            // Bound diagnostic traffic between the owner's existing 50ms ticks.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+
+        assert_eq!(status_completed["job_phase"], "completed");
+        assert_eq!(status_completed["pipeline_status"], "completed");
+        assert_eq!(status_completed["blocked_on_unknown_effect"], false);
+        assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 3);
+        assert_eq!(read_invocation_count(&fixture.root.join("agy_derived_coder_count.txt")), 1);
+        assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 3);
+        assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+
+        let _ = approval_id;
+        supervisor.shutdown().await;
+    })
+    .await;
 }

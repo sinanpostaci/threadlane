@@ -2337,6 +2337,137 @@ fn build_sqlite_readonly_immutable_uri(
     Ok(uri)
 }
 
+/// Errors returned by read-only SQLite state queries that must never create or mutate files.
+#[derive(Debug, Error)]
+pub enum ReadonlySqliteError {
+    /// A clean immutable database snapshot is unavailable without recovery.
+    #[error("clean immutable SQLite snapshot unavailable: {0}")]
+    SnapshotUnavailable(String),
+    /// Target directory or database file failed private path or symlink validation.
+    #[error("sqlite read-only path failed security validation: {0}")]
+    SecurityViolation(String),
+    /// Target database or sidecar file exceeds the maximum allowed size.
+    #[error("sqlite read-only file exceeds maximum size limit")]
+    DatabaseTooLarge,
+    /// Underlying filesystem or SQLite read-only I/O error.
+    #[error("sqlite read-only I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// Core domain or query validation error.
+    #[error(transparent)]
+    Core(#[from] crate::CoreError),
+}
+
+impl From<ObservationJournalError> for ReadonlySqliteError {
+    fn from(err: ObservationJournalError) -> Self {
+        match err {
+            ObservationJournalError::SecurityViolation(reason) => Self::SecurityViolation(reason),
+            ObservationJournalError::JournalTooLarge | ObservationJournalError::RecordTooLarge => {
+                Self::DatabaseTooLarge
+            }
+            ObservationJournalError::Io(io_err) => Self::Io(io_err),
+            ObservationJournalError::Json(json_err) => Self::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                json_err.to_string(),
+            )),
+        }
+    }
+}
+
+/// Executes `f` inside a strictly read-only SQLite deferred transaction on an existing `state.db`
+/// without creating directories, creating database or sidecar files, running schema migrations,
+/// recovering in-flight state, or modifying any rows or filesystem metadata.
+pub(crate) fn with_existing_readonly_sqlite_tx<T, F>(
+    database_path: &Path,
+    f: F,
+) -> Result<T, ReadonlySqliteError>
+where
+    F: FnOnce(&rusqlite::Transaction<'_>) -> Result<T, crate::CoreError>,
+{
+    const MAX_CORE_DB_BYTES: u64 = 64 * 1024 * 1024;
+
+    let parent = database_path.parent().ok_or_else(|| {
+        ReadonlySqliteError::SecurityViolation("database path has no parent directory".to_string())
+    })?;
+    let parent_pre_meta = validate_private_dir_metadata(parent)?;
+    let db_pre_meta = validate_readonly_sqlite_file(
+        database_path,
+        &parent_pre_meta,
+        MAX_CORE_DB_BYTES,
+        "state.db",
+    )?;
+
+    let wal_path = sqlite_sidecar_path(database_path, "-wal");
+    let shm_path = sqlite_sidecar_path(database_path, "-shm");
+    // A stopped database must already be checkpointed. Even a read-only SQLite WAL
+    // connection can write shared-memory read marks; do not open it or ignore WAL frames.
+    for (path, label) in [(&wal_path, "state.db-wal"), (&shm_path, "state.db-shm")] {
+        if inspect_readonly_sqlite_sidecar(path, &parent_pre_meta, MAX_CORE_DB_BYTES, label)?
+            .is_some()
+        {
+            return Err(ReadonlySqliteError::SnapshotUnavailable(
+                "residual WAL/SHM sidecars require recovery; stopped history cannot provide a clean immutable snapshot".to_string(),
+            ));
+        }
+    }
+    let uri = build_sqlite_readonly_immutable_uri(database_path)?;
+    let mut conn = rusqlite::Connection::open_with_flags(
+        &uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|err| {
+        ReadonlySqliteError::from(sqlite_readonly_error("immutable open failed", err))
+    })?;
+
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+        .map_err(|err| {
+            ReadonlySqliteError::from(sqlite_readonly_error("begin read transaction failed", err))
+        })?;
+
+    let schema_version: i64 = tx
+        .query_row("SELECT version FROM schema_meta WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .map_err(|err| {
+            ReadonlySqliteError::from(sqlite_readonly_error("schema_meta query failed", err))
+        })?;
+    if schema_version != i64::from(crate::SCHEMA_VERSION) {
+        let found = u32::try_from(schema_version).unwrap_or(u32::MAX);
+        return Err(ReadonlySqliteError::Core(
+            crate::CoreError::IncompatibleSchemaVersion {
+                found,
+                expected: crate::SCHEMA_VERSION,
+            },
+        ));
+    }
+
+    let out = f(&tx)?;
+
+    drop(tx);
+    drop(conn);
+
+    let parent_post_meta = validate_private_dir_metadata(parent)?;
+    verify_unchanged_dir_metadata(
+        &parent_pre_meta,
+        &parent_post_meta,
+        "state.db parent directory",
+    )?;
+    let db_post_meta = validate_readonly_sqlite_file(
+        database_path,
+        &parent_post_meta,
+        MAX_CORE_DB_BYTES,
+        "state.db",
+    )?;
+    verify_unchanged_file_metadata(&db_pre_meta, &db_post_meta, "state.db")?;
+
+    verify_sqlite_sidecar_absent(&wal_path, "state.db-wal sidecar")?;
+    verify_sqlite_sidecar_absent(&shm_path, "state.db-shm sidecar")?;
+
+    Ok(out)
+}
+
 /// Reads `state.db` at `database_path` using `SQLITE_OPEN_READ_ONLY` without creating directories,
 /// creating database files, running schema migrations, recovering in-flight state, or modifying
 /// any rows.
@@ -4132,5 +4263,184 @@ mod tests {
         let context =
             VerifiedMcpObservationContext::new("binding", "thread", "Chat", invalid_path, None);
         assert!(context.project_path.is_none());
+    }
+
+    #[test]
+    fn list_activity_readonly_reads_bounded_history_and_validates_scope_without_mutation() {
+        let dir = ScopedPrivateDir::new("readonly-activity");
+        let db_path = dir.path.join("state.db");
+        let thread_uuid = "0196ed00-0000-7000-8000-00000000000a";
+
+        let (binding_id, run_id) = {
+            let mut core = crate::Core::open(&db_path).expect("open core");
+            let binding = core
+                .create_binding(thread_uuid, "Stopped History Test")
+                .expect("create binding");
+            let out = core
+                .execute(
+                    &binding.binding_id,
+                    crate::Command::StartDemo {
+                        command_key: "cmd-ro-start-1".to_string(),
+                        instruction: "Test stopped activity read".to_string(),
+                        step_delay_ms: Some(100),
+                        now_ms: 1_000,
+                    },
+                )
+                .expect("start run");
+            let run = match out {
+                crate::CommandOutput::Run(r) => *r,
+                other => panic!("unexpected output: {other:?}"),
+            };
+            core.tick(1_200).expect("tick 1");
+            core.tick(1_400).expect("tick 2");
+            (binding.binding_id, run.run_id)
+        };
+
+        let pre_snap = read_core_state_readonly(&db_path).expect("pre snapshot");
+        let pre_meta = fs::symlink_metadata(&db_path).expect("pre db meta");
+
+        let page1 = crate::Core::list_activity_readonly(
+            &db_path,
+            &binding_id,
+            thread_uuid,
+            None,
+            None,
+            1,
+            Some(&run_id),
+            None,
+        )
+        .expect("list_activity_readonly page 1");
+        assert_eq!(page1.binding_id, binding_id);
+        assert_eq!(page1.events.len(), 1);
+        assert!(page1.has_more);
+        assert!(page1.next_cursor.is_some());
+
+        let page2 = crate::Core::list_activity_readonly(
+            &db_path,
+            &binding_id,
+            thread_uuid,
+            None,
+            page1.next_cursor.as_deref(),
+            10,
+            Some(&run_id),
+            None,
+        )
+        .expect("list_activity_readonly page 2");
+        assert!(!page2.events.is_empty());
+        assert!(page2.events[0].seq > page1.events[0].seq);
+
+        let wrong_binding_err = crate::Core::list_activity_readonly(
+            &db_path,
+            "bnd_00000000000000000000000000000000",
+            thread_uuid,
+            None,
+            None,
+            10,
+            None,
+            None,
+        )
+        .expect_err("wrong binding must fail");
+        assert!(matches!(
+            wrong_binding_err,
+            ReadonlySqliteError::Core(crate::CoreError::BindingNotFound { .. })
+        ));
+
+        let wrong_thread_err = crate::Core::list_activity_readonly(
+            &db_path,
+            &binding_id,
+            "0196ed00-0000-7000-8000-00000000000b",
+            None,
+            None,
+            10,
+            None,
+            None,
+        )
+        .expect_err("wrong thread_uuid must fail");
+        assert!(matches!(
+            wrong_thread_err,
+            ReadonlySqliteError::Core(crate::CoreError::Validation {
+                field: "thread_uuid",
+                ..
+            })
+        ));
+
+        let post_snap = read_core_state_readonly(&db_path).expect("post snapshot");
+        let post_meta = fs::symlink_metadata(&db_path).expect("post db meta");
+        assert_eq!(pre_snap, post_snap);
+        assert_eq!(pre_meta.len(), post_meta.len());
+        verify_unchanged_file_metadata(&pre_meta, &post_meta, "state.db")
+            .expect("state.db metadata must be unchanged");
+
+        // Residual sidecars are rejected before SQLite opens them, preserving bytes and metadata.
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sqlite_sidecar_path(&db_path, suffix);
+            fs::write(&sidecar, b"residual sidecar").expect("write isolated sidecar");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o600))
+                    .expect("private sidecar");
+            }
+            let before = fs::symlink_metadata(&sidecar).expect("sidecar metadata");
+            let err = crate::Core::list_activity_readonly(
+                &db_path,
+                &binding_id,
+                thread_uuid,
+                None,
+                None,
+                10,
+                None,
+                None,
+            )
+            .expect_err("residual sidecar must fail closed");
+            assert!(matches!(err, ReadonlySqliteError::SnapshotUnavailable(_)));
+            assert_eq!(
+                fs::read(&sidecar).expect("sidecar bytes"),
+                b"residual sidecar"
+            );
+            verify_unchanged_file_metadata(
+                &before,
+                &fs::symlink_metadata(&sidecar).expect("post sidecar"),
+                "sidecar",
+            )
+            .expect("sidecar unchanged");
+            fs::remove_file(sidecar).expect("remove isolated sidecar");
+        }
+
+        // A historical schema is rejected in place, without running migrations.
+        let conn = rusqlite::Connection::open(&db_path).expect("open isolated schema fixture");
+        conn.execute(
+            "UPDATE schema_meta SET version = ?1 WHERE id = 1",
+            [i64::from(crate::SCHEMA_VERSION) - 1],
+        )
+        .expect("set old schema");
+        drop(conn);
+        let old_schema_bytes = fs::read(&db_path).expect("old schema bytes");
+        let old_schema_meta = fs::symlink_metadata(&db_path).expect("old schema metadata");
+        let err = crate::Core::list_activity_readonly(
+            &db_path,
+            &binding_id,
+            thread_uuid,
+            None,
+            None,
+            10,
+            None,
+            None,
+        )
+        .expect_err("old schema must not be migrated");
+        assert!(matches!(
+            err,
+            ReadonlySqliteError::Core(crate::CoreError::IncompatibleSchemaVersion { .. })
+        ));
+        assert_eq!(
+            fs::read(&db_path).expect("unchanged old schema"),
+            old_schema_bytes
+        );
+        verify_unchanged_file_metadata(
+            &old_schema_meta,
+            &fs::symlink_metadata(&db_path).expect("post schema metadata"),
+            "state.db",
+        )
+        .expect("schema rejection leaves metadata unchanged");
     }
 }

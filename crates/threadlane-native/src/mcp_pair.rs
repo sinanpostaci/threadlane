@@ -1804,7 +1804,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-05.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-06.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -2284,7 +2284,7 @@ impl PairedMcpServer {
     /// Queries live authenticated host session readiness for an operator approval record owned by the enrolled chat binding and native thread (requires verified operator enrollment).
     #[tool(
         name = "approved_session",
-        description = "Verify live authenticated approved-host session readiness for an approval_id owned by the enrolled (control_binding_id, native_thread_uuid) via a read-only activity probe before reporting Ready. Never consumes or acknowledges events.",
+        description = "Verify live authenticated approved-host session readiness for an approval_id owned by the enrolled (control_binding_id, native_thread_uuid) via a live-only binding probe before reporting Ready. Never consumes or acknowledges events.",
         annotations(
             title = "Get Approved Host Session Status",
             read_only_hint = true,

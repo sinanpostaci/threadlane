@@ -996,7 +996,7 @@ pub(crate) async fn execute_list_approvals(
 /// Executes the `approved_session` tool after enrollment verification.
 ///
 /// Constructs [`ApprovedHostClient`] and loads [`HostSessionSummary`] inside `spawn_blocking`,
-/// then verifies live authenticated host readiness via a read-only `list_activity(limit = 1)`
+/// then verifies live authenticated host readiness via read-only `verify_live_ready_binding`
 /// probe before reporting `Ready`. Manifest and lock presence alone are never accepted as proof
 /// of live authentication.
 pub(crate) async fn execute_approved_session(
@@ -1079,10 +1079,11 @@ pub(crate) async fn execute_approved_session(
         ));
     }
 
-    // Verify live authenticated host supervisor via read-only `list_activity(limit = 1)`.
-    // This never calls `pull_events` or `ack_events` and never consumes or advances cursors.
-    let activity_probe = client
-        .list_activity(&approval_id, None, None, Some(1), None)
+    // Verify live authenticated host supervisor via read-only `verify_live_ready_binding`.
+    // This never falls back to stopped history, never calls `pull_events` or `ack_events`,
+    // and never consumes or advances cursors.
+    let live_binding = client
+        .verify_live_ready_binding(&approval_id)
         .await
         .map_err(|err| {
             let (code, message) = match err {
@@ -1095,8 +1096,9 @@ pub(crate) async fn execute_approved_session(
             format_approved_scoped_error(&trusted_binding_id, TOOL, code, message)
         })?;
 
-    if Some(activity_probe.binding_id.as_str()) != summary.session_binding_id.as_deref()
-        || activity_probe.binding_id == trusted_binding_id
+    if Some(live_binding.binding_id.as_str()) != summary.session_binding_id.as_deref()
+        || live_binding.binding_id == trusted_binding_id
+        || live_binding.thread_uuid != trusted_thread_uuid
     {
         return Err(format_approved_scoped_error(
             &trusted_binding_id,

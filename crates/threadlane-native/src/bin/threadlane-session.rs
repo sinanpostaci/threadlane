@@ -543,35 +543,9 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 ));
             }
             if summary.phase == HostPhase::Ready {
-                if !summary.gates.supervisor_authenticated_ready
-                    || summary.session_binding_id.is_none()
-                {
-                    return Err(OperatorCliError::new(
-                        "host_not_ready",
-                        "Approved host session is not ready in the requested scope.",
-                    ));
-                }
-
-                let live_probe = client
-                    .list_activity(&approval_id, None, None, Some(1), None)
-                    .await
-                    .map_err(|err| match err {
-                        HostError::HostNotReady { .. }
-                        | HostError::Runtime { .. }
-                        | HostError::Io { .. } => OperatorCliError::new(
-                            "host_not_ready",
-                            "Approved host session is not ready in the requested scope.",
-                        ),
-                        other => map_host_error(&other),
-                    })?;
-                if Some(live_probe.binding_id.as_str()) != summary.session_binding_id.as_deref()
-                    || live_probe.binding_id == globals.binding
-                {
-                    return Err(OperatorCliError::new(
-                        "corrupt_session_state",
-                        "Approved host session binding identity failed validation.",
-                    ));
-                }
+                verify_live_ready_session_summary(
+                    &client, &approval_id, &summary, &globals.binding, &globals.thread,
+                ).await?;
             }
 
             let notif_report = client
@@ -1441,6 +1415,45 @@ fn map_conversation_change_error(
     OperatorCliError::new(error.code(), error.safe_message())
 }
 
+// A cached Ready summary is descriptive; only current live IPC authenticates readiness.
+async fn verify_live_ready_session_summary(
+    client: &ApprovedHostClient,
+    approval_id: &str,
+    summary: &threadlane_host::HostSessionSummary,
+    control_binding_id: &str,
+    native_thread_uuid: &str,
+) -> Result<(), OperatorCliError> {
+    if !summary.gates.supervisor_authenticated_ready || summary.session_binding_id.is_none() {
+        return Err(OperatorCliError::new(
+            "host_not_ready",
+            "Approved host session is not ready in the requested scope.",
+        ));
+    }
+
+    let live_probe = client
+        .verify_live_ready_binding(approval_id)
+        .await
+        .map_err(|err| match err {
+            HostError::HostNotReady { .. } | HostError::Runtime { .. } | HostError::Io { .. } => {
+                OperatorCliError::new(
+                    "host_not_ready",
+                    "Approved host session is not ready in the requested scope.",
+                )
+            }
+            other => map_host_error(&other),
+        })?;
+    if Some(live_probe.binding_id.as_str()) != summary.session_binding_id.as_deref()
+        || live_probe.binding_id == control_binding_id
+        || live_probe.thread_uuid != native_thread_uuid
+    {
+        return Err(OperatorCliError::new(
+            "corrupt_session_state",
+            "Approved host session binding identity failed validation.",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1722,8 +1735,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_operator_approval_enforces_scope_before_digest_check() {
+    fn setup_approved_session_fixture() -> (
+        TempDir,
+        Arc<AuthorityStore>,
+        threadlane_authority::ApprovalSummary,
+        PathBuf,
+    ) {
         let tmp = TempDir::new().expect("tempdir");
         let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
@@ -1874,6 +1891,12 @@ mod tests {
             })
             .expect("approve plan");
 
+        (tmp, Arc::new(authority), approval, root)
+    }
+
+    #[test]
+    fn verify_operator_approval_enforces_scope_before_digest_check() {
+        let (_tmp, authority, approval, _root) = setup_approved_session_fixture();
         verify_operator_approval(&authority, &approval.approval_id, BINDING_A, THREAD_A, None)
             .expect("matching scope without digest succeeds");
         verify_operator_approval(
@@ -1914,6 +1937,56 @@ mod tests {
         )
         .expect_err("foreign thread must fail with scope_mismatch before digest comparison");
         assert_eq!(foreign_thread_err.code, "scope_mismatch");
+    }
+
+    #[tokio::test]
+    async fn session_readiness_rejects_cached_ready_summary_after_shutdown() {
+        let (_tmp, authority, approval, root) = setup_approved_session_fixture();
+        let sessions_dir = root.join("sessions");
+        let host = threadlane_host::ApprovedHost::start(threadlane_host::ApprovedHostConfig::new(
+            root.join("registry"),
+            root.join("plans"),
+            root.join("authority"),
+            &sessions_dir,
+            &approval.approval_id,
+        ))
+        .await
+        .expect("start fixture host without dispatch");
+        let client = ApprovedHostClient::new(authority, &sessions_dir, BINDING_A, THREAD_A)
+            .expect("fixture client");
+        let ready = client
+            .session_summary(&approval.approval_id)
+            .expect("cached Ready summary");
+        assert_eq!(ready.phase, HostPhase::Ready);
+        verify_live_ready_session_summary(
+            &client,
+            &approval.approval_id,
+            &ready,
+            BINDING_A,
+            THREAD_A,
+        )
+        .await
+        .expect("live Ready summary authenticates");
+        host.shutdown().await.expect("stop fixture host");
+        client
+            .list_activity(&approval.approval_id, None, None, Some(1), None)
+            .await
+            .expect("history remains available after shutdown");
+        let err = verify_live_ready_session_summary(
+            &client,
+            &approval.approval_id,
+            &ready,
+            BINDING_A,
+            THREAD_A,
+        )
+        .await
+        .expect_err("cached Ready summary cannot authenticate stopped history");
+        assert_eq!(err.code, "host_not_ready");
+        let fresh = client
+            .session_summary(&approval.approval_id)
+            .expect("fresh stopped summary");
+        assert_eq!(fresh.phase, HostPhase::Stopped);
+        assert!(!fresh.gates.supervisor_authenticated_ready);
     }
 
     #[test]

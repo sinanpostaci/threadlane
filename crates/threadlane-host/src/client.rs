@@ -11,7 +11,10 @@ use threadlane::{
     SupervisorClient, ValidatedWorkersConfig, WorkerAcceptanceState, WorkerSnapshot, WorkerStatus,
 };
 use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
-use threadlane_core::{AckResult, Binding, EventBatch, WorkerExecutionBinding};
+use threadlane_core::{
+    observation::ReadonlySqliteError, AckResult, Binding, Core, CoreError, EventBatch,
+    WorkerExecutionBinding, DEFAULT_PAGE_LIMIT,
+};
 use threadlane_operations::{
     inspect_dependency_input_seal_readonly, prepare_and_seal_dependency_input,
     verify_dependency_predecessor_proof, DependencyPredecessorCandidate, OperationsError,
@@ -38,7 +41,7 @@ use crate::types::{
     HostNotificationRearmReport, HostNotificationStatusReport, HostPhase, HostSessionManifest,
     HostSessionSummary, PrepareDependencyInputsRequest, TaskDispatchIntent, TaskExecutionStatus,
     TaskRunReceipt, TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES,
-    APPROVED_EVENT_BATCH_MAX_EVENTS, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
+    APPROVED_EVENT_BATCH_MAX_EVENTS, HOST_LOCK_FILENAME, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
 
 const STOP_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1652,6 +1655,10 @@ impl ApprovedHostClient {
     }
 
     /// Lists bounded read-only activity events for the host session's runtime binding.
+    ///
+    /// Serves live authenticated `Ready` sessions over supervisor IPC and verifiably `Stopped`
+    /// sessions directly from the existing read-only `state.db` while holding the existing
+    /// exclusive `host.lock` guard. Never restarts a host or mutates cursors, wake-ups, or files.
     pub async fn list_activity(
         &self,
         approval_id: &str,
@@ -1660,15 +1667,24 @@ impl ApprovedHostClient {
         limit: Option<usize>,
         kind: Option<EventKind>,
     ) -> Result<ActivityPage, HostError> {
+        self.query_activity_live_or_stopped(approval_id, None, after_seq, cursor, limit, kind)
+            .await
+    }
+
+    /// Verifies that the approved host session is currently in live authenticated `Ready` state
+    /// over supervisor IPC and returns its verified live runtime [`Binding`].
+    ///
+    /// Never falls back to stopped SQLite history and never mutates cursors, batches, or wake-ups.
+    pub async fn verify_live_ready_binding(&self, approval_id: &str) -> Result<Binding, HostError> {
         let session = self.verify_active_ready_session(approval_id).await?;
-        let page = session
-            .scoped_client
-            .list_activity(after_seq, cursor, limit, None, kind)
-            .await?;
-        Ok(page)
+        Ok(session.live_binding)
     }
 
     /// Lists bounded read-only activity events filtered to the sealed `run_id` of `task_id`.
+    ///
+    /// Serves live authenticated `Ready` sessions over supervisor IPC and verifiably `Stopped`
+    /// sessions directly from the existing read-only `state.db` while holding the existing
+    /// exclusive `host.lock` guard. Never restarts a host or mutates cursors, wake-ups, or files.
     pub async fn list_task_activity(
         &self,
         approval_id: &str,
@@ -1679,32 +1695,241 @@ impl ApprovedHostClient {
         kind: Option<EventKind>,
     ) -> Result<ActivityPage, HostError> {
         validate_identifier("task_id", task_id)?;
-        let session = self.verify_active_ready_session(approval_id).await?;
+        self.query_activity_live_or_stopped(
+            approval_id,
+            Some(task_id),
+            after_seq,
+            cursor,
+            limit,
+            kind,
+        )
+        .await
+    }
 
-        let task = session
-            .record
+    async fn query_activity_live_or_stopped(
+        &self,
+        approval_id: &str,
+        task_id: Option<&str>,
+        after_seq: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, HostError> {
+        let record = self.resolve_authorized_approval(approval_id)?;
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let manifest = read_host_manifest_optional(&session_dir, &record)?.ok_or_else(|| {
+            HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: None,
+                reason: "host-manifest.json does not exist".to_string(),
+            }
+        })?;
+
+        match manifest.phase {
+            HostPhase::Ready => {
+                let session = self.verify_active_ready_session(approval_id).await?;
+                let run_id = match task_id {
+                    Some(tid) => Some(self.resolve_started_task_run_id(
+                        &session.record,
+                        &session.session_dir,
+                        &session.work_area_dir,
+                        &session.manifest,
+                        &session.live_binding.binding_id,
+                        tid,
+                    )?),
+                    None => None,
+                };
+                let page = session
+                    .scoped_client
+                    .list_activity(after_seq, cursor, limit, run_id, kind)
+                    .await?;
+                Ok(page)
+            }
+            HostPhase::Stopped => self.query_stopped_session_activity(
+                &record,
+                &session_dir,
+                &manifest,
+                task_id,
+                after_seq,
+                cursor,
+                limit,
+                kind,
+            ),
+            HostPhase::Bootstrapping | HostPhase::Stopping | HostPhase::Failed => {
+                Err(HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: Some(manifest.phase),
+                    reason: manifest.last_error.clone().unwrap_or_else(|| {
+                        format!("host session is in phase `{}`", manifest.phase)
+                    }),
+                })
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn query_stopped_session_activity(
+        &self,
+        record: &ApprovalRecord,
+        initial_session_dir: &Path,
+        initial_manifest: &HostSessionManifest,
+        task_id: Option<&str>,
+        after_seq: Option<u64>,
+        cursor: Option<String>,
+        limit: Option<usize>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, HostError> {
+        if initial_manifest.phase != HostPhase::Stopped
+            || initial_manifest.gates.supervisor_authenticated_ready
+            || initial_manifest.pid.is_some()
+        {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(initial_manifest.phase),
+                reason: "stopped host manifest still reports active readiness or pid".to_string(),
+            });
+        }
+
+        let session_binding_id = initial_manifest.session_binding_id.clone().ok_or_else(|| {
+            HostError::CorruptManifest {
+                path: initial_session_dir.display().to_string(),
+                reason: "stopped manifest is missing session_binding_id".to_string(),
+            }
+        })?;
+
+        let host_lock_guard = ExistingHostLockGuard::acquire(
+            initial_session_dir,
+            &record.approval_id,
+            HostPhase::Stopped,
+        )?;
+
+        let session_dir = verify_existing_session_dir(&self.sessions_dir, &record.approval_id)?;
+        let locked_manifest =
+            read_host_manifest_optional(&session_dir, record)?.ok_or_else(|| {
+                HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: None,
+                    reason: "host-manifest.json disappeared during stopped-session read"
+                        .to_string(),
+                }
+            })?;
+
+        if locked_manifest.phase != HostPhase::Stopped
+            || locked_manifest.gates.supervisor_authenticated_ready
+            || locked_manifest.pid.is_some()
+            || locked_manifest.instance_id != initial_manifest.instance_id
+            || locked_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
+        {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(locked_manifest.phase),
+                reason: format!(
+                    "host session changed state to `{}` before stopped-history read",
+                    locked_manifest.phase
+                ),
+            });
+        }
+
+        host_lock_guard.verify_identity(&session_dir)?;
+        let runtime_state_dir =
+            verify_existing_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR))?;
+        let work_area_dir = verify_existing_private_dir(&session_dir.join(WORK_AREA_SUBDIR))?;
+        verify_stopped_supervisor_lock_not_held(
+            &runtime_state_dir,
+            &record.approval_id,
+            HostPhase::Stopped,
+        )?;
+
+        let run_id = match task_id {
+            Some(tid) => Some(self.resolve_started_task_run_id(
+                record,
+                &session_dir,
+                &work_area_dir,
+                &locked_manifest,
+                &session_binding_id,
+                tid,
+            )?),
+            None => None,
+        };
+
+        let db_path = runtime_state_dir.join("state.db");
+        let page = Core::list_activity_readonly(
+            &db_path,
+            &session_binding_id,
+            &self.native_thread_uuid,
+            after_seq,
+            cursor.as_deref(),
+            limit.unwrap_or(DEFAULT_PAGE_LIMIT),
+            run_id.as_deref(),
+            kind,
+        )
+        .map_err(|err| {
+            map_readonly_sqlite_activity_error(
+                err,
+                &record.approval_id,
+                &db_path,
+                &session_binding_id,
+                &self.native_thread_uuid,
+            )
+        })?;
+
+        let post_manifest =
+            read_host_manifest_optional(&session_dir, record)?.ok_or_else(|| {
+                HostError::HostNotReady {
+                    approval_id: record.approval_id.clone(),
+                    phase: None,
+                    reason: "host-manifest.json disappeared during stopped-session read"
+                        .to_string(),
+                }
+            })?;
+        if post_manifest.phase != HostPhase::Stopped
+            || post_manifest.gates.supervisor_authenticated_ready
+            || post_manifest.pid.is_some()
+            || post_manifest.instance_id != locked_manifest.instance_id
+            || post_manifest.session_binding_id.as_deref() != Some(session_binding_id.as_str())
+        {
+            return Err(HostError::HostNotReady {
+                approval_id: record.approval_id.clone(),
+                phase: Some(post_manifest.phase),
+                reason: format!(
+                    "host session changed state to `{}` during stopped-history read",
+                    post_manifest.phase
+                ),
+            });
+        }
+
+        host_lock_guard.verify_identity(&session_dir)?;
+        Ok(page)
+    }
+
+    fn resolve_started_task_run_id(
+        &self,
+        record: &ApprovalRecord,
+        session_dir: &Path,
+        work_area_dir: &Path,
+        manifest: &HostSessionManifest,
+        session_binding_id: &str,
+        task_id: &str,
+    ) -> Result<String, HostError> {
+        let task = record
             .tasks
             .iter()
             .find(|t| t.task_id == task_id)
             .ok_or_else(|| HostError::UnknownTask {
-                approval_id: session.record.approval_id.clone(),
+                approval_id: record.approval_id.clone(),
                 task_id: task_id.to_string(),
             })?;
 
         if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
             return Err(HostError::NativeRouteRequired {
-                approval_id: session.record.approval_id.clone(),
+                approval_id: record.approval_id.clone(),
                 task_id: task.task_id.clone(),
                 adapter: task.adapter,
             });
         }
 
-        let (intent, receipt) = read_task_ledger_entry(
-            &session.session_dir,
-            &session.record,
-            &session.live_binding.binding_id,
-            task_id,
-        )?;
+        let (intent, receipt) =
+            read_task_ledger_entry(session_dir, record, session_binding_id, task_id)?;
 
         let Some(receipt) = receipt else {
             if let Some(intent) = intent {
@@ -1713,39 +1938,37 @@ impl ApprovedHostClient {
                     action: "list_task_activity".to_string(),
                     reason: format!(
                         "task `{}` in approval `{}` has an unresolved dispatch intent (command_key `{}`) in unknown state without a sealed run_id receipt",
-                        task.task_id, session.record.approval_id, intent.command_key
+                        task.task_id, record.approval_id, intent.command_key
                     ),
                 });
             }
             if !task.depends_on.is_empty() {
-                let prepared = !session.manifest.gates.is_legacy_root_only()
-                    && verify_all_transitive_predecessors_in_approval(
-                        &session.record,
-                        &task.task_id,
-                    )
-                    .is_ok()
+                let prepared = !manifest.gates.is_legacy_root_only()
+                    && verify_all_transitive_predecessors_in_approval(record, &task.task_id)
+                        .is_ok()
                     && self
-                        .inspect_readonly_verified_dependency_seal(&session, task)?
+                        .inspect_readonly_verified_dependency_seal_in_work_area(
+                            record,
+                            session_binding_id,
+                            work_area_dir,
+                            task,
+                        )?
                         .is_some();
                 if !prepared {
                     return Err(HostError::DependencyInputsUnverified {
-                        approval_id: session.record.approval_id.clone(),
+                        approval_id: record.approval_id.clone(),
                         task_id: task.task_id.clone(),
                         depends_on: task.depends_on.clone(),
                     });
                 }
             }
             return Err(HostError::TaskNotStarted {
-                approval_id: session.record.approval_id.clone(),
+                approval_id: record.approval_id.clone(),
                 task_id: task.task_id.clone(),
             });
         };
 
-        let page = session
-            .scoped_client
-            .list_activity(after_seq, cursor, limit, Some(receipt.run_id), kind)
-            .await?;
-        Ok(page)
+        Ok(receipt.run_id)
     }
 
     // Historical reads remain useful after parents move; only show input details that still
@@ -1793,12 +2016,24 @@ impl ApprovedHostClient {
         session: &VerifiedSession,
         task: &ApprovedTaskRecord,
     ) -> Result<Option<DependencyInputSeal>, HostError> {
-        let Ok(profile) = build_validated_task_profile(
+        self.inspect_readonly_verified_dependency_seal_in_work_area(
             &session.record,
             &session.live_binding.binding_id,
             &session.work_area_dir,
             task,
-        ) else {
+        )
+    }
+
+    fn inspect_readonly_verified_dependency_seal_in_work_area(
+        &self,
+        record: &ApprovalRecord,
+        session_binding_id: &str,
+        work_area_dir: &Path,
+        task: &ApprovedTaskRecord,
+    ) -> Result<Option<DependencyInputSeal>, HostError> {
+        let Ok(profile) =
+            build_validated_task_profile(record, session_binding_id, work_area_dir, task)
+        else {
             return Ok(None);
         };
         let Some(ref policy) = profile.dependency_input else {
@@ -1807,9 +2042,9 @@ impl ApprovedHostClient {
 
         match inspect_dependency_input_seal_readonly(
             policy,
-            &session.record.repository_path,
-            &session.work_area_dir,
-            &session.record.base_commit,
+            &record.repository_path,
+            work_area_dir,
+            &record.base_commit,
             &task.instruction,
             &policy.command_key,
         ) {
@@ -1830,7 +2065,7 @@ impl ApprovedHostClient {
             }
             Ok(None) => Ok(None),
             Err(OperationsError::SecurityViolation(reason)) => Err(HostError::SecurityViolation {
-                path: session.work_area_dir.display().to_string(),
+                path: work_area_dir.display().to_string(),
                 reason,
             }),
             Err(_) => Ok(None),
@@ -2539,6 +2774,264 @@ impl ApprovedHostClient {
             live_binding,
             scoped_client,
         })
+    }
+}
+
+struct ExistingHostLockGuard {
+    file: std::fs::File,
+}
+
+impl ExistingHostLockGuard {
+    fn acquire(session_dir: &Path, approval_id: &str, phase: HostPhase) -> Result<Self, HostError> {
+        use fs2::FileExt;
+
+        let lock_path = session_dir.join(HOST_LOCK_FILENAME);
+        let pre_meta = match std::fs::symlink_metadata(&lock_path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HostError::HostNotReady {
+                    approval_id: approval_id.to_string(),
+                    phase: Some(phase),
+                    reason: "host.lock does not exist".to_string(),
+                });
+            }
+            Err(err) => {
+                return Err(HostError::Io {
+                    operation: "symlink_metadata(host.lock)".to_string(),
+                    reason: err.to_string(),
+                });
+            }
+        };
+        verify_existing_lock_file_metadata(&lock_path, &pre_meta)?;
+
+        let file = open_existing_lock_file_readonly(&lock_path, &pre_meta)?;
+        if file.try_lock_exclusive().is_err() {
+            return Err(HostError::HostNotReady {
+                approval_id: approval_id.to_string(),
+                phase: Some(phase),
+                reason: "host.lock is held by an active host process".to_string(),
+            });
+        }
+
+        let guard = Self { file };
+        guard.verify_identity(session_dir)?;
+        Ok(guard)
+    }
+
+    fn verify_identity(&self, session_dir: &Path) -> Result<(), HostError> {
+        let lock_path = session_dir.join(HOST_LOCK_FILENAME);
+        let path_meta = std::fs::symlink_metadata(&lock_path).map_err(|err| HostError::Io {
+            operation: "recheck(host.lock)".to_string(),
+            reason: err.to_string(),
+        })?;
+        verify_existing_lock_file_metadata(&lock_path, &path_meta)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held_meta = self.file.metadata().map_err(|err| HostError::Io {
+                operation: "fstat(host.lock)".to_string(),
+                reason: err.to_string(),
+            })?;
+            if held_meta.dev() != path_meta.dev() || held_meta.ino() != path_meta.ino() {
+                return Err(HostError::SecurityViolation {
+                    path: lock_path.display().to_string(),
+                    reason: "host.lock identity changed while held".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ExistingHostLockGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn verify_stopped_supervisor_lock_not_held(
+    runtime_state_dir: &Path,
+    approval_id: &str,
+    phase: HostPhase,
+) -> Result<(), HostError> {
+    use fs2::FileExt;
+
+    let sup_lock_path = runtime_state_dir.join("supervisor.lock");
+    let pre_meta = match std::fs::symlink_metadata(&sup_lock_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(HostError::Io {
+                operation: "symlink_metadata(supervisor.lock)".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    };
+    verify_existing_lock_file_metadata(&sup_lock_path, &pre_meta)?;
+
+    let file = open_existing_lock_file_readonly(&sup_lock_path, &pre_meta)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(())
+        }
+        Err(_) => Err(HostError::HostNotReady {
+            approval_id: approval_id.to_string(),
+            phase: Some(phase),
+            reason: "supervisor.lock is held by an active supervisor process".to_string(),
+        }),
+    }
+}
+
+fn verify_existing_lock_file_metadata(
+    lock_path: &Path,
+    meta: &std::fs::Metadata,
+) -> Result<(), HostError> {
+    if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+        return Err(HostError::SecurityViolation {
+            path: lock_path.display().to_string(),
+            reason: "lock file must be a non-symlink regular file".to_string(),
+        });
+    }
+    if meta.len() != 0 {
+        return Err(HostError::SecurityViolation {
+            path: lock_path.display().to_string(),
+            reason: format!(
+                "lock file must be empty (0 bytes), found {} bytes",
+                meta.len()
+            ),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = meta.permissions().mode() & 0o777;
+        if (mode & 0o177) != 0 {
+            return Err(HostError::SecurityViolation {
+                path: lock_path.display().to_string(),
+                reason: format!(
+                    "lock file permissions {mode:04o} are too permissive (expected 0600)"
+                ),
+            });
+        }
+        if let Ok(self_meta) = std::fs::metadata("/proc/self") {
+            if meta.uid() != self_meta.uid() {
+                return Err(HostError::SecurityViolation {
+                    path: lock_path.display().to_string(),
+                    reason: "lock file owner does not match current process owner".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_existing_lock_file_readonly(
+    lock_path: &Path,
+    pre_meta: &std::fs::Metadata,
+) -> Result<std::fs::File, HostError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(false).create(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(lock_path).map_err(|err| {
+        #[cfg(unix)]
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            return HostError::SecurityViolation {
+                path: lock_path.display().to_string(),
+                reason: "lock file must not be a symlink".to_string(),
+            };
+        }
+        HostError::Io {
+            operation: "open(lock_file)".to_string(),
+            reason: err.to_string(),
+        }
+    })?;
+    let post_meta = file.metadata().map_err(|err| HostError::Io {
+        operation: "fstat(lock_file)".to_string(),
+        reason: err.to_string(),
+    })?;
+    verify_existing_lock_file_metadata(lock_path, &post_meta)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if pre_meta.dev() != post_meta.dev() || pre_meta.ino() != post_meta.ino() {
+            return Err(HostError::SecurityViolation {
+                path: lock_path.display().to_string(),
+                reason: "lock file identity changed during open".to_string(),
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pre_meta;
+    }
+    Ok(file)
+}
+
+fn map_readonly_sqlite_activity_error(
+    err: ReadonlySqliteError,
+    approval_id: &str,
+    db_path: &Path,
+    expected_binding_id: &str,
+    expected_thread_uuid: &str,
+) -> HostError {
+    match err {
+        ReadonlySqliteError::SnapshotUnavailable(reason) => HostError::HostNotReady {
+            approval_id: approval_id.to_string(), phase: Some(HostPhase::Stopped), reason,
+        },
+        ReadonlySqliteError::SecurityViolation(reason) => HostError::SecurityViolation {
+            path: db_path.display().to_string(),
+            reason,
+        },
+        ReadonlySqliteError::DatabaseTooLarge => HostError::SecurityViolation {
+            path: db_path.display().to_string(),
+            reason: "state.db exceeds maximum size limit".to_string(),
+        },
+        ReadonlySqliteError::Io(io_err) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            HostError::CorruptSessionState {
+                reason: "stopped host session runtime-state is missing state.db".to_string(),
+            }
+        }
+        ReadonlySqliteError::Io(io_err) => HostError::CorruptSessionState {
+            reason: format!("stopped host session state.db read failed: {io_err}"),
+        },
+        ReadonlySqliteError::Core(CoreError::BindingNotFound { binding_id }) => {
+            HostError::ScopeMismatch {
+                field: "session_binding_id".to_string(),
+                expected: expected_binding_id.to_string(),
+                actual: binding_id,
+                reason: "stopped session state.db binding_id does not match manifest session_binding_id".to_string(),
+            }
+        }
+        ReadonlySqliteError::Core(CoreError::Validation {
+            field: "thread_uuid",
+            reason,
+        }) => HostError::ScopeMismatch {
+            field: "thread_uuid".to_string(),
+            expected: expected_thread_uuid.to_string(),
+            actual: "<mismatched>".to_string(),
+            reason,
+        },
+        ReadonlySqliteError::Core(CoreError::CorruptState(reason)) => {
+            HostError::CorruptSessionState { reason }
+        }
+        ReadonlySqliteError::Core(CoreError::IncompatibleSchemaVersion { found, expected }) => {
+            HostError::CorruptSessionState {
+                reason: format!(
+                    "stopped session state.db has incompatible schema version {found} (expected {expected})"
+                ),
+            }
+        }
+        ReadonlySqliteError::Core(CoreError::Storage(err)) => HostError::CorruptSessionState {
+            reason: format!("stopped host session state.db storage error: {err}"),
+        },
+        ReadonlySqliteError::Core(other_core_err) => {
+            HostError::from(threadlane::Error::from(other_core_err))
+        }
     }
 }
 

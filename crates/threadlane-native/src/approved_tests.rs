@@ -1479,7 +1479,7 @@ async fn approved_mcp_session_live_auth_verification_task_dispatch_retry_cancel_
     let host_session_binding_id = host_a.session_binding_id().to_string();
     assert_ne!(host_session_binding_id, fixture.binding_a);
 
-    // 6. `approved_session` now verifies live authenticated readiness via `list_activity(limit = 1)`
+    // 6. `approved_session` verifies live authenticated readiness via `verify_live_ready_binding`
     // without advancing `delivered_seq` or `acked_seq`, and returns original control `binding_id`
     // in the outer envelope and distinct `session_binding_id` in the session summary.
     let session_res = mcp_a
@@ -4877,6 +4877,301 @@ async fn codex_first_held_intent_lock_bounds_wait_and_prevents_late_spawn_after_
             .is_none(),
         "enrollment revocation before lock release must prevent launch intent creation"
     );
+}
+
+#[tokio::test]
+async fn approved_activity_reads_stopped_host_history_without_restart_or_mutation_and_keeps_session_not_ready(
+) {
+    let fixture = setup_approved_mcp_fixture().await;
+    let binding_a = &fixture.binding_a;
+    let (revision, digest) = create_published_plan(
+        &fixture,
+        "plan-stopped-native",
+        binding_a,
+        default_plan_tasks("Stopped history test"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-stopped-native",
+        revision,
+        &digest,
+        binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_000_100,
+    );
+    let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+        .expect("create MCP")
+        .with_workflow_stores(Arc::clone(&fixture.registry), Arc::clone(&fixture.plans))
+        .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir);
+    enroll_server(&fixture, &mcp, binding_a, THREAD_UUID_A).await;
+
+    let host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval.approval_id,
+    ))
+    .await
+    .expect("start host");
+
+    let client = threadlane_host::ApprovedHostClient::open(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        binding_a,
+        THREAD_UUID_A,
+    )
+    .expect("open host client");
+
+    client
+        .dispatch_task(&approval.approval_id, "task-root-agy")
+        .await
+        .expect("dispatch task-root-agy");
+
+    let mut completed = false;
+    for _ in 0..80 {
+        let snap = client
+            .get_task(&approval.approval_id, "task-root-agy")
+            .await
+            .expect("poll get_task");
+        if snap.status == TaskExecutionStatus::ReadyForReview {
+            completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(completed, "task-root-agy should reach ReadyForReview");
+
+    let cached_ready_summary = client
+        .session_summary(&approval.approval_id)
+        .expect("inspect ready summary before shutdown");
+    assert_eq!(cached_ready_summary.phase, HostPhase::Ready);
+    assert!(cached_ready_summary.gates.supervisor_authenticated_ready);
+    let verified_live_binding = client
+        .verify_live_ready_binding(&approval.approval_id)
+        .await
+        .expect("verify_live_ready_binding while Ready");
+    assert_eq!(
+        Some(verified_live_binding.binding_id.as_str()),
+        cached_ready_summary.session_binding_id.as_deref()
+    );
+    assert_eq!(verified_live_binding.thread_uuid, THREAD_UUID_A);
+
+    let session_dir = host.session_dir().to_path_buf();
+    let db_path = host.runtime_state_dir().join(DATABASE_FILENAME);
+    host.shutdown().await.expect("shutdown host to Stopped");
+
+    // TOCTOU regression: caller holding `cached_ready_summary` (`phase == Ready`) when the host
+    // stops between `inspect_session_summary` and the live probe can still read stopped history
+    // via `list_activity`, while `verify_live_ready_binding` fails closed with `host_not_ready`.
+    assert_eq!(cached_ready_summary.phase, HostPhase::Ready);
+    let probe_err = client
+        .verify_live_ready_binding(&approval.approval_id)
+        .await
+        .expect_err("verify_live_ready_binding must fail after host stops");
+    assert_eq!(probe_err.code(), "host_not_ready");
+
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("load approval record");
+    let stopped_manifest = threadlane_host::read_host_manifest_optional(&session_dir, &record)
+        .expect("read manifest")
+        .expect("stopped manifest exists");
+    assert_eq!(stopped_manifest.phase, HostPhase::Stopped);
+    assert!(
+        !threadlane_host::is_host_lock_held(&session_dir).expect("check host.lock after shutdown")
+    );
+
+    let pre_snap =
+        threadlane_core::observation::read_core_state_readonly(&db_path).expect("pre db snap");
+    let agy_before = read_invocation_count(&fixture.agy_count_file);
+
+    // 1. Stopped global and task-filtered history succeed with pagination and kind filtering.
+    let page1 = client
+        .list_task_activity(
+            &approval.approval_id,
+            "task-root-agy",
+            None,
+            None,
+            Some(1),
+            None,
+        )
+        .await
+        .expect("stopped list_activity page 1");
+    assert_eq!(page1.events.len(), 1);
+    assert!(page1.has_more);
+    let cursor = page1.next_cursor.clone().expect("next_cursor");
+
+    let page2 = client
+        .list_task_activity(
+            &approval.approval_id,
+            "task-root-agy",
+            None,
+            Some(cursor),
+            Some(20),
+            None,
+        )
+        .await
+        .expect("stopped list_task_activity page 2");
+    assert!(!page2.events.is_empty());
+
+    let kind_page = client
+        .list_task_activity(
+            &approval.approval_id,
+            "task-root-agy",
+            None,
+            None,
+            Some(20),
+            Some(EventKind::WorkerCompleted),
+        )
+        .await
+        .expect("stopped list_task_activity kind filter");
+    assert_eq!(kind_page.events.len(), 1);
+    assert_eq!(kind_page.events[0].kind, EventKind::WorkerCompleted);
+
+    // 2. Mutation/live-session operations and session readiness gate still reject when Stopped.
+    let session_summary = client
+        .session_summary(&approval.approval_id)
+        .expect("session_summary");
+    assert_eq!(session_summary.phase, HostPhase::Stopped);
+    assert!(!session_summary.gates.supervisor_authenticated_ready);
+
+    assert_eq!(
+        client
+            .pull_events(&approval.approval_id, None, None)
+            .await
+            .expect_err("pull_events must fail when Stopped")
+            .code(),
+        "host_not_ready"
+    );
+    assert_eq!(
+        client
+            .ack_events(
+                &approval.approval_id,
+                "bat_00000000000000000000000000000001".to_string()
+            )
+            .await
+            .expect_err("ack_events must fail when Stopped")
+            .code(),
+        "host_not_ready"
+    );
+
+    let activity = mcp
+        .invoke_tool_json(
+            "approved_activity",
+            json!({"approval_id": approval.approval_id, "task_id": "task-root-agy", "limit": 20}),
+            None,
+        )
+        .await
+        .expect("MCP reads stopped activity");
+    assert!(
+        !activity.structured_content.expect("activity envelope")["data"]["events"]
+            .as_array()
+            .expect("events")
+            .is_empty()
+    );
+    let session_error = mcp
+        .invoke_tool_json(
+            "approved_session",
+            json!({"approval_id": approval.approval_id}),
+            None,
+        )
+        .await
+        .expect_err("MCP stopped session remains not ready");
+    assert!(
+        serde_json::to_string(&session_error)
+            .expect("error JSON")
+            .contains("host_not_ready"),
+        "{session_error:?}"
+    );
+
+    // 3. Verify zero process spawns and zero DB/cursor/wakeup mutations.
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), agy_before);
+    let post_snap =
+        threadlane_core::observation::read_core_state_readonly(&db_path).expect("post db snap");
+    assert_eq!(pre_snap, post_snap);
+}
+
+#[tokio::test]
+async fn host_launcher_rejects_cached_ready_after_shutdown_without_reconciling_launch_intent() {
+    let fixture = setup_approved_mcp_fixture().await;
+    let (revision, digest) = create_published_plan(
+        &fixture,
+        "plan-launcher-stopped-race",
+        &fixture.binding_a,
+        default_plan_tasks("Readiness race fixture; no worker dispatch"),
+    );
+    let approval = approve_published_plan(
+        &fixture,
+        "plan-launcher-stopped-race",
+        revision,
+        &digest,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+        vec!["task-root-agy".to_string()],
+        1_700_000_000_100,
+    );
+    let host = ApprovedHost::start(ApprovedHostConfig::new(
+        &fixture.registry_dir,
+        &fixture.plans_dir,
+        &fixture.authority_dir,
+        &fixture.sessions_dir,
+        &approval.approval_id,
+    ))
+    .await
+    .expect("start fixture host without dispatch");
+    let client = threadlane_host::ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+    )
+    .expect("fixture client");
+    let ready = client
+        .session_summary(&approval.approval_id)
+        .expect("cached Ready summary");
+    assert_eq!(ready.phase, HostPhase::Ready);
+    assert!(ready.gates.supervisor_authenticated_ready);
+    let record = fixture
+        .authority
+        .get_for_operator(&approval.approval_id)
+        .expect("approval record");
+    let intent = threadlane_host::HostLaunchIntent::new_pending(
+        &record,
+        std::env::current_exe().expect("test executable"),
+        1_700_000_000_200,
+    );
+    write_host_launch_intent(&fixture.sessions_dir, &record, &intent)
+        .expect("pending launch intent");
+    host.shutdown()
+        .await
+        .expect("stop fixture host after caching Ready");
+    client
+        .list_activity(&approval.approval_id, None, None, Some(1), None)
+        .await
+        .expect("stopped history is still readable");
+    let err = crate::host_launcher::verify_live_authenticated_ready_summary(
+        &client,
+        ready,
+        &fixture.sessions_dir,
+        &record,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+    )
+    .await
+    .expect_err("stopped history cannot prove launcher readiness");
+    assert_eq!(err.code(), "host_not_ready");
+    let after = read_host_launch_intent_optional(&fixture.sessions_dir, &record)
+        .expect("read unreconciled intent")
+        .expect("intent exists");
+    assert_eq!(after, intent);
+    assert_eq!(after.status, HostLaunchIntentStatus::Pending);
+    assert_eq!(read_invocation_count(&fixture.agy_count_file), 0);
+    assert_eq!(read_invocation_count(&fixture.oc_count_file), 0);
 }
 
 #[path = "approved_tests/closure_regressions.rs"]

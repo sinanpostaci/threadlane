@@ -194,7 +194,11 @@ impl Core {
 
     /// Lists all configured bindings ordered by `binding_id`.
     pub fn list_bindings(&self) -> Result<Vec<Binding>, CoreError> {
-        let mut stmt = self.conn.prepare(
+        Self::list_bindings_conn(&self.conn)
+    }
+
+    fn list_bindings_conn(conn: &Connection) -> Result<Vec<Binding>, CoreError> {
+        let mut stmt = conn.prepare(
             "SELECT binding_id, thread_uuid, label, delivered_seq, acked_seq
              FROM bindings
              ORDER BY rowid ASC",
@@ -1220,6 +1224,75 @@ impl Core {
             clean_run_id.as_deref(),
             kind,
         )
+    }
+
+    /// Lists a bounded, read-only page of historical [`Event`] records from an existing `state.db`
+    /// without opening a mutating [`Core`] instance, running schema migrations, recovering wake-ups,
+    /// or modifying any database rows or sidecar files.
+    ///
+    /// Validates `binding_id` and `expected_thread_uuid` against the stored binding inside the same
+    /// read-only SQLite transaction and enforces the standard `cursor`, `after_seq`, `limit`,
+    /// `run_id`, `kind`, and [`MAX_PAGE_RESPONSE_BYTES`] bounds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn list_activity_readonly(
+        database_path: impl AsRef<Path>,
+        binding_id: &str,
+        expected_thread_uuid: &str,
+        after_seq: Option<u64>,
+        cursor: Option<&str>,
+        limit: usize,
+        run_id: Option<&str>,
+        kind: Option<EventKind>,
+    ) -> Result<ActivityPage, crate::observation::ReadonlySqliteError> {
+        let clean_binding_id = validate_identifier("binding_id", binding_id)?;
+        let clean_thread_uuid = validate_thread_uuid(expected_thread_uuid)?;
+        if cursor.is_some() && after_seq.is_some() {
+            return Err(crate::observation::ReadonlySqliteError::Core(
+                CoreError::Validation {
+                    field: "cursor",
+                    reason: "cursor and after_seq cannot be specified simultaneously".to_string(),
+                },
+            ));
+        }
+        let valid_limit = validate_page_limit(limit)?;
+        let clean_run_id = match run_id {
+            Some(raw_run_id) => Some(validate_activity_run_id(raw_run_id)?),
+            None => None,
+        };
+
+        crate::observation::with_existing_readonly_sqlite_tx(database_path.as_ref(), |tx| {
+            let bindings = Self::list_bindings_conn(tx)?;
+            if bindings.len() != 1 {
+                return Err(CoreError::CorruptState(format!(
+                    "expected 1 binding in stopped session state.db, found {}",
+                    bindings.len()
+                )));
+            }
+            let stored = &bindings[0];
+            if stored.binding_id != clean_binding_id {
+                return Err(CoreError::BindingNotFound {
+                    binding_id: stored.binding_id.clone(),
+                });
+            }
+            if stored.thread_uuid != clean_thread_uuid {
+                return Err(CoreError::Validation {
+                    field: "thread_uuid",
+                    reason: format!(
+                        "stored binding thread_uuid `{}` does not match expected `{}`",
+                        stored.thread_uuid, clean_thread_uuid
+                    ),
+                });
+            }
+            Self::list_activity_conn(
+                tx,
+                &clean_binding_id,
+                after_seq,
+                cursor,
+                valid_limit,
+                clean_run_id.as_deref(),
+                kind,
+            )
+        })
     }
 
     /// Computes SQL aggregate counts (`total_runs`, `active_runs`) and returns at most `recent_limit`

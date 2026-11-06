@@ -43,7 +43,8 @@ use threadlane_core::WorkerStatus;
 use threadlane_host::{
     is_host_lock_held, read_host_launch_intent_optional, read_host_manifest_optional,
     read_session_task_ledger_readonly, ApprovedHost, ApprovedHostClient, ApprovedHostConfig,
-    ApprovedHostHandle, HostError, HostPhase, TaskExecutionStatus,
+    ApprovedHostHandle, HostError, HostPhase, TaskDispatchIntent, TaskExecutionStatus,
+    TaskRunReceipt,
 };
 use threadlane_operations::{ClosureVerdict, ClosureVerdictKind};
 use threadlane_workers::validate_sha256_hex_digest;
@@ -52,16 +53,19 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::coworker_workflow::{
-    sha256_hex, CandidateCheckEvidence, CombinedCandidateStatus, ControllerJobLeaseRecord,
+    compute_derived_coder_effect_id, derived_execution_report_file_path,
+    deterministic_controller_instance_id, deterministic_prefixed_id, sha256_hex,
+    CandidateCheckEvidence, CombinedCandidateStatus, ControllerJobLeaseRecord,
     ControllerJobRuntimeState, ControllerPolicyStore, CoworkerControllerPhase1Status,
     CoworkerControllerService, CoworkerControllerStepReport, CoworkerControllerTaskObservation,
     CoworkerJobCompletionOutcome, CoworkerJobCompletionRequest, CoworkerJobCompletionStatus,
     CoworkerJobLockState, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore, CoworkerJobPhase,
     CoworkerJobRecord, CoworkerLockFileIdentity, CoworkerOwnershipAcquireOutcome,
-    CoworkerOwnershipSummary, CoworkerPipelineDriver, CoworkerPipelineInFlightStageRef,
-    CoworkerPipelineService, CoworkerPipelineStatus, CoworkerPipelineTaskSnapshot,
-    CoworkerPipelineTickReport, CoworkerTaskRecord, CoworkerTaskStage, CoworkerWorkflowStore,
-    OutboxDispatchKind, OutboxDispatchRecord, OutboxDispatchStatus, OwnedCoworkerControllerSession,
+    CoworkerOwnershipSummary, CoworkerPipelineDriver, CoworkerPipelineInFlightStageKind,
+    CoworkerPipelineInFlightStageRef, CoworkerPipelineService, CoworkerPipelineStatus,
+    CoworkerPipelineTaskSnapshot, CoworkerPipelineTickReport, CoworkerTaskRecord,
+    CoworkerTaskStage, CoworkerWorkflowStore, OutboxDispatchKind, OutboxDispatchRecord,
+    OutboxDispatchStatus, OwnedCoworkerControllerSession, PendingControllerEffect,
     PendingControllerEffectKind, PendingControllerEffectStatus, VerifiedControllerAdmission,
 };
 use crate::error::{NativeError, NativeErrorCode};
@@ -3640,6 +3644,26 @@ impl CoworkerCodeDriver {
         let session_dir = self.sessions_dir.join(&inspection.approval.approval_id);
         let (host_phase, host_lock_held) =
             self.inspect_host_phase_and_lock(&session_dir, &inspection.approval)?;
+        let (session_intents, session_receipts) = if host_phase == Some(HostPhase::Ready)
+            && host_lock_held
+        {
+            self.read_live_ready_session_task_ledger_optional(&session_dir, &inspection.approval)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        filter_live_owned_in_flight_coder_reservations(
+            &mut inspection,
+            key,
+            verified_owner_summary,
+            effective_mode,
+            host_phase,
+            host_lock_held,
+            &session_intents,
+            &session_receipts,
+            self.controller.workflow_store().plans_dir(),
+            step_report.as_ref(),
+            &live_in_flight_stages,
+        );
 
         let (overall_status, tasks) = match (&effective_mode, step_report.as_ref()) {
             (CoworkerDriverExecutionMode::Phase1InitialDispatchOnly, Some(report)) => {
@@ -4186,6 +4210,48 @@ impl CoworkerCodeDriver {
             read_host_manifest_optional(session_dir, approval).map_err(map_host_error)?;
         let lock_held = is_host_lock_held(session_dir).unwrap_or(false);
         Ok((manifest.map(|m| m.phase), lock_held))
+    }
+
+    fn read_live_ready_session_task_ledger_optional(
+        &self,
+        session_dir: &Path,
+        approval: &ApprovalRecord,
+    ) -> Result<(Vec<TaskDispatchIntent>, Vec<TaskRunReceipt>), NativeError> {
+        match fs::symlink_metadata(session_dir) {
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok((Vec::new(), Vec::new())),
+            Err(err) => {
+                return Err(map_io_error(
+                    "failed to inspect host session directory",
+                    err,
+                ))
+            }
+        }
+        if !is_host_lock_held(session_dir).unwrap_or(false) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let Some(manifest) =
+            read_host_manifest_optional(session_dir, approval).map_err(map_host_error)?
+        else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        if manifest.phase != HostPhase::Ready
+            || !manifest.gates.supervisor_authenticated_ready
+            || manifest.approval_id != approval.approval_id
+            || manifest.control_binding_id != approval.binding_id
+            || manifest.thread_uuid != approval.thread_uuid
+            || !constant_time_str_eq(&manifest.subject_digest, &approval.subject_digest)
+        {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let Some(ref session_binding_id) = manifest.session_binding_id else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        Ok(
+            read_session_task_ledger_readonly(session_dir, approval, session_binding_id)
+                .map_err(map_host_error)?
+                .unwrap_or_default(),
+        )
     }
 
     fn synthesize_status_and_tasks(
@@ -5481,6 +5547,584 @@ fn is_live_owned_in_flight_review_effect(
             .as_deref()
             == Some(effect.effect_id.as_str())
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_live_owned_in_flight_coder_reservations(
+    inspection: &mut ReadonlyScopedJobInspection,
+    key: &CoworkerJobOwnershipKey,
+    verified_owner_summary: &CoworkerOwnershipSummary,
+    effective_mode: CoworkerDriverExecutionMode,
+    host_phase: Option<HostPhase>,
+    host_lock_held: bool,
+    session_intents: &[TaskDispatchIntent],
+    session_receipts: &[TaskRunReceipt],
+    plans_dir: &Path,
+    step_report: Option<&CoworkerControllerStepReport>,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) {
+    if verified_owner_summary.validate_for_key(key).is_err() {
+        return;
+    }
+    let job = &inspection.job;
+    let runtime = &inspection.runtime_state;
+    let approval = &inspection.approval;
+    if job.binding_id != key.binding_id
+        || job.thread_uuid != key.thread_uuid
+        || job.job_id != key.job_id
+        || approval.binding_id != key.binding_id
+        || approval.thread_uuid != key.thread_uuid
+        || runtime.envelope.binding_id != key.binding_id
+        || runtime.envelope.thread_uuid != key.thread_uuid
+        || runtime.job_id != key.job_id
+        || runtime.envelope.approval_id != approval.approval_id
+        || !matches!(
+            job.phase,
+            CoworkerJobPhase::Executing | CoworkerJobPhase::Held
+        )
+        || runtime.stop_requested
+    {
+        return;
+    }
+    let expected_controller_instance_id = deterministic_controller_instance_id(
+        &job.binding_id,
+        &job.job_id,
+        &verified_owner_summary.instance_id,
+    );
+    let Some(ref lease) = runtime.lease else {
+        return;
+    };
+    if !lease.is_active_at(current_time_ms())
+        || lease.job_id != job.job_id
+        || lease.binding_id != job.binding_id
+        || lease.lease_epoch == 0
+        || lease.expires_at_ms <= lease.acquired_at_ms
+        || !constant_time_str_eq(&lease.instance_id, &expected_controller_instance_id)
+    {
+        return;
+    }
+    if runtime
+        .pending_effects
+        .values()
+        .any(|eff| eff.status == PendingControllerEffectStatus::EffectUnknown)
+        || job
+            .outbox
+            .iter()
+            .any(|o| o.status == OutboxDispatchStatus::EffectUnknown)
+        || job
+            .tasks
+            .iter()
+            .any(|t| t.stage == CoworkerTaskStage::EffectUnknown)
+    {
+        return;
+    }
+
+    let matched: Vec<String> = runtime
+        .pending_effects
+        .values()
+        .filter(|effect| {
+            live_owned_running_coder_effect_matches(
+                inspection,
+                effect,
+                effective_mode,
+                host_phase,
+                host_lock_held,
+                session_intents,
+                session_receipts,
+                plans_dir,
+                step_report,
+                in_flight_stages,
+            )
+        })
+        .map(|effect| effect.effect_id.clone())
+        .collect();
+
+    // Only the authenticated live owner's read-only status inspection copy is filtered.
+    // Durable PendingControllerEffect records on disk, true EffectUnknown, DispatchReserved
+    // unstarted/reopened reservations, and stale or mismatched correlations remain untouched.
+    inspection
+        .runtime_state
+        .pending_effects
+        .retain(|_, effect| !matched.contains(&effect.effect_id));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_owned_running_coder_effect_matches(
+    inspection: &ReadonlyScopedJobInspection,
+    effect: &PendingControllerEffect,
+    effective_mode: CoworkerDriverExecutionMode,
+    host_phase: Option<HostPhase>,
+    host_lock_held: bool,
+    session_intents: &[TaskDispatchIntent],
+    session_receipts: &[TaskRunReceipt],
+    plans_dir: &Path,
+    step_report: Option<&CoworkerControllerStepReport>,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    let job = &inspection.job;
+    let runtime = &inspection.runtime_state;
+    let approval = &inspection.approval;
+
+    if effect.kind != PendingControllerEffectKind::CoderDispatch
+        || effect.status != PendingControllerEffectStatus::ReservedBeforeEffect
+        || effect.job_id != job.job_id
+        || effect.request_key.is_empty()
+        || effect.subject_digest.is_empty()
+    {
+        return false;
+    }
+    let Some(task_id) = effect.task_id.as_deref().filter(|id| !id.is_empty()) else {
+        return false;
+    };
+    let Some(attempt_no) = effect.attempt_no.filter(|&n| n >= 1) else {
+        return false;
+    };
+
+    let Some(task) = job.tasks.iter().find(|t| t.task_id == task_id) else {
+        return false;
+    };
+    let Some(approved_task) = approval.tasks.iter().find(|t| t.task_id == task_id) else {
+        return false;
+    };
+    let task_held_with_active_hold = task.stage == CoworkerTaskStage::Held
+        && (job.phase == CoworkerJobPhase::Held
+            || !task.active_hold_ids.is_empty()
+            || job.holds.iter().any(|h| {
+                h.active
+                    && (h.holds_entire_job
+                        || h.directly_affected_task_ids.iter().any(|id| id == task_id))
+            }));
+    if task.role != WorkflowRole::Coder
+        || approved_task.role != WorkflowRole::Coder
+        || !constant_time_str_eq(&task.task_digest, &approved_task.task_digest)
+        || (task.stage != CoworkerTaskStage::Running && !task_held_with_active_hold)
+        || task.current_attempt_no != attempt_no
+        || task.unresolved_outbox_id.is_some()
+    {
+        return false;
+    }
+
+    if runtime.get_attempt_artifacts(task_id, attempt_no).is_some()
+        || task.candidates.iter().any(|c| c.attempt_no >= attempt_no)
+        || task.accepted_candidate_id.is_some()
+    {
+        return false;
+    }
+
+    for other in runtime.pending_effects.values() {
+        if other.effect_id == effect.effect_id {
+            continue;
+        }
+        if other.request_key == effect.request_key {
+            return false;
+        }
+        if other.task_id.as_deref() == Some(task_id)
+            && (other.status.blocks_replay() || other.attempt_no.is_some_and(|n| n >= attempt_no))
+        {
+            return false;
+        }
+    }
+
+    if job.outbox.iter().any(|o| {
+        o.task_id == task_id
+            && (o.status.blocks_replay_and_new_dispatch()
+                || o.attempt_no > attempt_no
+                || (o.attempt_no == attempt_no
+                    && o.kind != OutboxDispatchKind::TaskAttemptDispatch))
+    }) {
+        return false;
+    }
+    let mut matching_outboxes = job
+        .outbox
+        .iter()
+        .filter(|o| o.task_id == task_id && o.attempt_no == attempt_no);
+    let Some(outbox) = matching_outboxes.next() else {
+        return false;
+    };
+    if matching_outboxes.next().is_some()
+        || outbox.kind != OutboxDispatchKind::TaskAttemptDispatch
+        || outbox.role != WorkflowRole::Coder
+        || !matches!(
+            outbox.status,
+            OutboxDispatchStatus::DispatchedEffectConfirmed
+                | OutboxDispatchStatus::ReconciledConfirmed
+        )
+        || outbox.request_key != effect.request_key
+        || !constant_time_str_eq(&outbox.subject_digest, &effect.subject_digest)
+    {
+        return false;
+    }
+
+    if task.attempts.iter().any(|a| a.attempt_no > attempt_no)
+        || task.attempts.last().map(|a| a.attempt_no) != Some(attempt_no)
+    {
+        return false;
+    }
+    let mut matching_attempts = task.attempts.iter().filter(|a| a.attempt_no == attempt_no);
+    let Some(attempt) = matching_attempts.next() else {
+        return false;
+    };
+    if matching_attempts.next().is_some()
+        || attempt.role != WorkflowRole::Coder
+        || attempt.request_key != effect.request_key
+        || attempt.outbox_id != outbox.outbox_id
+        || attempt.report_artifact_id.is_some()
+        || attempt.head_commit.is_some()
+        || attempt.tree_sha.is_some()
+        || attempt.diff_digest.is_some()
+    {
+        return false;
+    }
+
+    if attempt_no == 1 {
+        live_owned_running_initial_coder_effect_matches(
+            job,
+            runtime,
+            task,
+            approved_task.command_key.as_deref(),
+            &approved_task.task_digest,
+            effect,
+            outbox,
+            attempt,
+            host_phase,
+            host_lock_held,
+            session_intents,
+            session_receipts,
+            step_report,
+            in_flight_stages,
+        )
+    } else {
+        live_owned_running_derived_coder_effect_matches(
+            job,
+            runtime,
+            &approval.approval_id,
+            task,
+            effect,
+            outbox,
+            attempt,
+            attempt_no,
+            effective_mode,
+            plans_dir,
+            in_flight_stages,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_owned_running_initial_coder_effect_matches(
+    job: &CoworkerJobRecord,
+    runtime: &ControllerJobRuntimeState,
+    task: &CoworkerTaskRecord,
+    expected_command_key_opt: Option<&str>,
+    expected_task_digest: &str,
+    effect: &PendingControllerEffect,
+    outbox: &OutboxDispatchRecord,
+    attempt: &crate::coworker_workflow::TaskAttemptRef,
+    host_phase: Option<HostPhase>,
+    host_lock_held: bool,
+    session_intents: &[TaskDispatchIntent],
+    session_receipts: &[TaskRunReceipt],
+    step_report: Option<&CoworkerControllerStepReport>,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    if host_phase != Some(HostPhase::Ready) || !host_lock_held {
+        return false;
+    }
+    let Some(expected_command_key) = expected_command_key_opt.filter(|k| !k.is_empty()) else {
+        return false;
+    };
+    let expected_effect_id = deterministic_prefixed_id(
+        "threadlane-native:coworker-controller-effect:v1",
+        "eff",
+        &[&job.job_id, &task.task_id, expected_command_key],
+    );
+    if effect.effect_id != expected_effect_id
+        || effect.request_key != expected_command_key
+        || !constant_time_str_eq(&effect.subject_digest, expected_task_digest)
+        || !task.candidates.is_empty()
+        || runtime
+            .derived_attempts
+            .iter()
+            .any(|d| d.task_id == task.task_id)
+        || in_flight_stages
+            .iter()
+            .any(|s| s.task_id.as_deref() == Some(task.task_id.as_str()))
+    {
+        return false;
+    }
+
+    let mut task_receipts = session_receipts
+        .iter()
+        .filter(|r| r.task_id == task.task_id);
+    let Some(receipt) = task_receipts.next() else {
+        return false;
+    };
+    if task_receipts.next().is_some()
+        || receipt.command_key != expected_command_key
+        || !constant_time_str_eq(&receipt.task_digest, expected_task_digest)
+        || receipt.run_id.is_empty()
+        || receipt.worker_id.is_empty()
+    {
+        return false;
+    }
+    if session_intents.iter().any(|i| {
+        i.task_id == task.task_id
+            && (i.command_key != expected_command_key
+                || !constant_time_str_eq(&i.task_digest, expected_task_digest))
+    }) {
+        return false;
+    }
+
+    if effect.external_correlation_id.as_deref() != Some(receipt.run_id.as_str())
+        || outbox.run_id.as_deref() != Some(receipt.run_id.as_str())
+        || outbox.worker_id.as_deref() != Some(receipt.worker_id.as_str())
+        || outbox.receipt_id.is_some()
+        || attempt.run_id.as_deref() != Some(receipt.run_id.as_str())
+        || attempt.worker_id.as_deref() != Some(receipt.worker_id.as_str())
+    {
+        return false;
+    }
+
+    let Some(rep) = step_report else {
+        return false;
+    };
+    if rep.job_id != job.job_id
+        || rep.binding_id != job.binding_id
+        || rep.thread_uuid != job.thread_uuid
+        || rep
+            .unknown_effect_task_ids
+            .iter()
+            .any(|id| id == &task.task_id)
+    {
+        return false;
+    }
+    let Some(obs) = rep.tasks.iter().find(|t| t.task_id == task.task_id) else {
+        return false;
+    };
+    let held_fenced = obs.fenced
+        || task.stage == CoworkerTaskStage::Held
+        || !task.active_hold_ids.is_empty()
+        || job.phase == CoworkerJobPhase::Held;
+    if !held_fenced && rep.active_running_count == 0 {
+        return false;
+    }
+    let valid_obs_stage = if held_fenced {
+        matches!(
+            obs.stage,
+            CoworkerTaskStage::Running | CoworkerTaskStage::Held
+        )
+    } else {
+        obs.stage == CoworkerTaskStage::Running
+    };
+    let valid_host_status = if held_fenced {
+        matches!(
+            obs.host_status,
+            TaskExecutionStatus::Running
+                | TaskExecutionStatus::Claimed
+                | TaskExecutionStatus::Queued
+                | TaskExecutionStatus::ReadyForReview
+        )
+    } else {
+        matches!(
+            obs.host_status,
+            TaskExecutionStatus::Running
+                | TaskExecutionStatus::Claimed
+                | TaskExecutionStatus::Queued
+        )
+    };
+    if obs.command_key != expected_command_key
+        || !valid_obs_stage
+        || !valid_host_status
+        || obs.run_id.as_deref() != Some(receipt.run_id.as_str())
+        || obs.worker_id.as_deref() != Some(receipt.worker_id.as_str())
+        || (attempt.task_worktree_id.is_some() && obs.task_worktree_id != attempt.task_worktree_id)
+    {
+        return false;
+    }
+
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_owned_running_derived_coder_effect_matches(
+    job: &CoworkerJobRecord,
+    runtime: &ControllerJobRuntimeState,
+    approval_id: &str,
+    task: &CoworkerTaskRecord,
+    effect: &PendingControllerEffect,
+    outbox: &OutboxDispatchRecord,
+    attempt: &crate::coworker_workflow::TaskAttemptRef,
+    attempt_no: u32,
+    effective_mode: CoworkerDriverExecutionMode,
+    plans_dir: &Path,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    if effective_mode != CoworkerDriverExecutionMode::FullAutomaticPipeline || attempt_no < 2 {
+        return false;
+    }
+    if !in_flight_stages.iter().any(|s| {
+        s.kind == CoworkerPipelineInFlightStageKind::TaskCorrection
+            && s.task_id.as_deref() == Some(task.task_id.as_str())
+            && s.attempt_no == Some(attempt_no)
+    }) || in_flight_stages.iter().any(|s| {
+        s.task_id.as_deref() == Some(task.task_id.as_str())
+            && (s.kind != CoworkerPipelineInFlightStageKind::TaskCorrection
+                || s.attempt_no != Some(attempt_no))
+    }) {
+        return false;
+    }
+
+    if runtime
+        .derived_attempts
+        .iter()
+        .any(|d| d.task_id == task.task_id && d.attempt_no > attempt_no)
+    {
+        return false;
+    }
+    let mut matching_derived = runtime
+        .derived_attempts
+        .iter()
+        .filter(|d| d.task_id == task.task_id && d.attempt_no == attempt_no);
+    let Some(derived_receipt) = matching_derived.next() else {
+        return false;
+    };
+    if matching_derived.next().is_some()
+        || derived_receipt.binding_id != job.binding_id
+        || derived_receipt.thread_uuid != job.thread_uuid
+        || derived_receipt.job_id != job.job_id
+        || derived_receipt.approval_id != approval_id
+        || derived_receipt
+            .validate_against_task(task, &runtime.envelope)
+            .is_err()
+    {
+        return false;
+    }
+
+    let prior_attempt_no = attempt_no - 1;
+    if runtime
+        .get_attempt_artifacts(&task.task_id, prior_attempt_no)
+        .is_none()
+    {
+        return false;
+    }
+    let Some(prior_cand) = task
+        .candidates
+        .iter()
+        .find(|c| c.attempt_no == prior_attempt_no)
+    else {
+        return false;
+    };
+    if derived_receipt.prior_rejected_candidate_id.as_deref()
+        != Some(prior_cand.candidate_id.as_str())
+        || prior_cand.base_commit != derived_receipt.execution_base_commit
+        || prior_cand.review_receipt_id.is_some()
+        || prior_cand.review_subject_digest.as_deref()
+            != derived_receipt.prior_review_subject_digest.as_deref()
+    {
+        return false;
+    }
+    match (
+        derived_receipt.prior_review_verdict_id.as_deref(),
+        derived_receipt.prior_check_failure_basis.as_ref(),
+    ) {
+        (Some(verdict_id), None) => {
+            if !prior_cand.review_verdict.as_ref().is_some_and(|v| {
+                v.verdict_id == verdict_id
+                    && v.outcome == crate::coworker_workflow::ReviewVerdictOutcome::CorrectInScope
+            }) {
+                return false;
+            }
+        }
+        (None, Some(basis)) => {
+            if !runtime.envelope.allow_check_failure_corrections
+                || basis
+                    .validate_for_receipt(derived_receipt, task, &runtime.envelope)
+                    .is_err()
+                || prior_cand.candidate_id != basis.prior_candidate_id
+                || prior_cand.attempt_no != basis.prior_attempt_no
+                || prior_cand.head_commit != basis.committed_head_commit
+                || prior_cand.tree_sha != basis.committed_tree_sha
+                || prior_cand.review_verdict.is_some()
+                || basis.failed_checks.is_empty()
+            {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    let expected_effect_id = compute_derived_coder_effect_id(
+        &job.job_id,
+        &task.task_id,
+        attempt_no,
+        &effect.request_key,
+    );
+    if effect.effect_id != expected_effect_id
+        || !constant_time_str_eq(&effect.subject_digest, &derived_receipt.receipt_digest)
+        || effect.external_correlation_id.as_deref() != Some(derived_receipt.receipt_id.as_str())
+        || !constant_time_str_eq(&outbox.subject_digest, &derived_receipt.receipt_digest)
+        || outbox.run_id.as_deref() != Some(derived_receipt.run_id.as_str())
+        || outbox.worker_id.as_deref() != Some(derived_receipt.worker_id.as_str())
+        || outbox.receipt_id.as_deref() != Some(derived_receipt.receipt_id.as_str())
+        || attempt.run_id.as_deref() != Some(derived_receipt.run_id.as_str())
+        || attempt.worker_id.as_deref() != Some(derived_receipt.worker_id.as_str())
+        || attempt.task_worktree_id.as_deref() != Some(derived_receipt.task_worktree_id.as_str())
+    {
+        return false;
+    }
+
+    matches!(
+        fs::symlink_metadata(derived_execution_report_file_path(
+            plans_dir,
+            &effect.effect_id,
+        )),
+        Err(err) if err.kind() == ErrorKind::NotFound
+    )
+}
+
+/// Evaluates the read-only live Coder projection on isolated copies of persisted state.
+/// The supplied ownership summary must already have been authenticated by the caller;
+/// this diagnostic helper grants no execution or recovery authority.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_live_coder_projection_snapshot_from_job_and_runtime(
+    job: &CoworkerJobRecord,
+    runtime: &ControllerJobRuntimeState,
+    approval: &ApprovalRecord,
+    key: &CoworkerJobOwnershipKey,
+    verified_owner_summary: &CoworkerOwnershipSummary,
+    effective_mode: CoworkerDriverExecutionMode,
+    host_phase: Option<HostPhase>,
+    host_lock_held: bool,
+    session_intents: &[TaskDispatchIntent],
+    session_receipts: &[TaskRunReceipt],
+    plans_dir: &Path,
+    step_report: Option<&CoworkerControllerStepReport>,
+    in_flight_stages: &[CoworkerPipelineInFlightStageRef],
+) -> bool {
+    let mut inspection = ReadonlyScopedJobInspection {
+        job: job.clone(),
+        runtime_state: runtime.clone(),
+        approval: approval.clone(),
+    };
+    filter_live_owned_in_flight_coder_reservations(
+        &mut inspection,
+        key,
+        verified_owner_summary,
+        effective_mode,
+        host_phase,
+        host_lock_held,
+        session_intents,
+        session_receipts,
+        plans_dir,
+        step_report,
+        in_flight_stages,
+    );
+    has_unresolved_or_unknown_effect(
+        &inspection.job,
+        &inspection.runtime_state,
+        CoworkerControllerPhase1Status::RunningTasks,
+    )
 }
 
 #[cfg(test)]

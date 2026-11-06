@@ -105,6 +105,7 @@ mod tests {
     use clap::Parser;
     use tempfile::TempDir;
     use threadlane_authority::{AuthorityStore, OperatorApprovalRequest};
+    use threadlane_core::EventKind;
     use threadlane_plans::{
         compile_plan_revision, Difficulty, ModelChoice, ModelDefinition, PlanChange, PlanStatus,
         PlanStore, PlanTask, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile,
@@ -8579,5 +8580,407 @@ exit 0
         assert!(!codex_log.exists());
 
         host2.shutdown().await.expect("shutdown host2");
+    }
+
+    #[tokio::test]
+    async fn stopped_host_serves_bounded_readonly_activity_history_without_mutation_or_restart() {
+        let fixture = setup_fixture();
+        let approval_id = create_approved_plan(
+            &fixture,
+            "plan-stopped-activity-history",
+            BINDING_A,
+            THREAD_UUID_A,
+            default_tasks("Stopped activity history test"),
+        );
+
+        let host = ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        ))
+        .await
+        .expect("start host");
+
+        let client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_A,
+        )
+        .expect("open client");
+
+        client
+            .dispatch_task(&approval_id, "task-root-agy")
+            .await
+            .expect("dispatch task-root-agy");
+        let completed = wait_for_task_status(&client, &approval_id, "task-root-agy", |st| {
+            st == TaskExecutionStatus::ReadyForReview
+        })
+        .await;
+        assert_eq!(completed.status, TaskExecutionStatus::ReadyForReview);
+
+        let live_global = client
+            .list_activity(&approval_id, None, None, Some(50), None)
+            .await
+            .expect("live list_activity");
+        let live_task = client
+            .list_task_activity(&approval_id, "task-root-agy", None, None, Some(50), None)
+            .await
+            .expect("live list_task_activity");
+        assert!(!live_global.events.is_empty());
+        assert_eq!(live_global.events, live_task.events);
+
+        let cached_ready_summary = client
+            .session_summary(&approval_id)
+            .expect("inspect ready summary");
+        assert_eq!(cached_ready_summary.phase, HostPhase::Ready);
+        assert!(cached_ready_summary.gates.supervisor_authenticated_ready);
+        let live_binding = client
+            .verify_live_ready_binding(&approval_id)
+            .await
+            .expect("verify_live_ready_binding while Ready");
+        assert_eq!(
+            Some(live_binding.binding_id.as_str()),
+            cached_ready_summary.session_binding_id.as_deref()
+        );
+        assert_eq!(live_binding.thread_uuid, THREAD_UUID_A);
+
+        let session_dir = host.session_dir().to_path_buf();
+        let runtime_state_dir = host.runtime_state_dir().to_path_buf();
+        host.shutdown().await.expect("shutdown host to Stopped");
+
+        // TOCTOU regression: even if a caller holds a cached `Ready` summary from right before
+        // shutdown, `list_activity` serves stopped history while `verify_live_ready_binding`
+        // rejects with `host_not_ready` and never treats historical events as live authentication.
+        assert_eq!(cached_ready_summary.phase, HostPhase::Ready);
+        let live_probe_after_stop = client
+            .verify_live_ready_binding(&approval_id)
+            .await
+            .expect_err("verify_live_ready_binding must fail after shutdown");
+        assert_eq!(live_probe_after_stop.code(), "host_not_ready");
+
+        let record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("load approval record");
+        let stopped_manifest = read_host_manifest_optional(&session_dir, &record)
+            .expect("read manifest")
+            .expect("stopped manifest exists");
+        assert_eq!(stopped_manifest.phase, HostPhase::Stopped);
+        assert!(!stopped_manifest.gates.supervisor_authenticated_ready);
+        assert!(stopped_manifest.pid.is_none());
+
+        let db_path = runtime_state_dir.join("state.db");
+        let manifest_path = session_dir.join(HOST_MANIFEST_FILENAME);
+        let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
+        let lock_path = session_dir.join(HOST_LOCK_FILENAME);
+
+        let pre_db_snap =
+            threadlane_core::observation::read_core_state_readonly(&db_path).expect("pre db snap");
+        let pre_db_bytes = fs::read(&db_path).expect("pre db bytes");
+        let pre_db_meta = fs::symlink_metadata(&db_path).expect("pre db meta");
+        let pre_manifest_bytes = fs::read(&manifest_path).expect("pre manifest bytes");
+        let pre_receipts_bytes = fs::read(&receipts_path).expect("pre receipts bytes");
+        let pre_lock_meta = fs::symlink_metadata(&lock_path).expect("pre lock meta");
+        let pre_provider_calls = (
+            read_invocation_count(&fixture.agy_count_file),
+            read_invocation_count(&fixture.oc_count_file),
+        );
+
+        // 1. Stopped global and task-filtered history match the live history.
+        let stopped_global = client
+            .list_activity(&approval_id, None, None, Some(50), None)
+            .await
+            .expect("stopped list_activity");
+        assert_eq!(stopped_global, live_global);
+
+        let stopped_task = client
+            .list_task_activity(&approval_id, "task-root-agy", None, None, Some(50), None)
+            .await
+            .expect("stopped list_task_activity");
+        assert_eq!(stopped_task, live_task);
+
+        // 2. Pagination (limit + cursor, after_seq) and EventKind filter on stopped history.
+        let page1 = client
+            .list_task_activity(&approval_id, "task-root-agy", None, None, Some(1), None)
+            .await
+            .expect("stopped page 1");
+        assert_eq!(page1.events.len(), 1);
+        assert!(page1.has_more);
+        let cursor1 = page1.next_cursor.clone().expect("cursor 1");
+
+        let page2 = client
+            .list_task_activity(
+                &approval_id,
+                "task-root-agy",
+                None,
+                Some(cursor1),
+                Some(50),
+                None,
+            )
+            .await
+            .expect("stopped page 2");
+        assert_eq!(
+            page1.events.len() + page2.events.len(),
+            stopped_task.events.len()
+        );
+
+        let after_first = client
+            .list_activity(
+                &approval_id,
+                Some(page1.events[0].seq),
+                None,
+                Some(50),
+                None,
+            )
+            .await
+            .expect("stopped after_seq");
+        assert_eq!(after_first.events, page2.events);
+
+        let completed_only = client
+            .list_task_activity(
+                &approval_id,
+                "task-root-agy",
+                None,
+                None,
+                Some(50),
+                Some(EventKind::WorkerCompleted),
+            )
+            .await
+            .expect("stopped kind filter");
+        assert_eq!(completed_only.events.len(), 1);
+        assert_eq!(completed_only.events[0].kind, EventKind::WorkerCompleted);
+
+        // 3. Bounds & task validation errors on stopped history.
+        let both_cursor_and_after_err = client
+            .list_activity(
+                &approval_id,
+                Some(0),
+                page1.next_cursor.clone(),
+                Some(10),
+                None,
+            )
+            .await
+            .expect_err("cursor + after_seq must fail");
+        assert_eq!(both_cursor_and_after_err.code(), "validation");
+
+        let zero_limit_err = client
+            .list_activity(&approval_id, None, None, Some(0), None)
+            .await
+            .expect_err("limit 0 must fail");
+        assert_eq!(zero_limit_err.code(), "validation");
+
+        let unknown_task_err = client
+            .list_task_activity(&approval_id, "task-does-not-exist", None, None, None, None)
+            .await
+            .expect_err("unknown task must fail");
+        assert_eq!(unknown_task_err.code(), "unknown_task");
+
+        let native_route_err = client
+            .list_task_activity(&approval_id, "task-native-codex", None, None, None, None)
+            .await
+            .expect_err("manual native task must fail with native_route_required");
+        assert_eq!(native_route_err.code(), "native_route_required");
+
+        let unstarted_dep_err = client
+            .list_task_activity(&approval_id, "task-dep-agy", None, None, None, None)
+            .await
+            .expect_err("unprepared dependent task must fail");
+        assert_eq!(unstarted_dep_err.code(), "dependency_inputs_unverified");
+
+        let unstarted_root_err = client
+            .list_task_activity(&approval_id, "task-root-oc", None, None, None, None)
+            .await
+            .expect_err("unstarted root task must fail with task_not_started");
+        assert_eq!(unstarted_root_err.code(), "not_started");
+
+        // 4. Authority / scope / thread validation precedes session access.
+        let wrong_binding_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_B,
+            THREAD_UUID_A,
+        )
+        .expect("wrong binding client");
+        assert_eq!(
+            wrong_binding_client
+                .list_activity(&approval_id, None, None, None, None)
+                .await
+                .expect_err("wrong binding must fail")
+                .code(),
+            "scope_mismatch"
+        );
+
+        let wrong_thread_client = ApprovedHostClient::open(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            BINDING_A,
+            THREAD_UUID_B,
+        )
+        .expect("wrong thread client");
+        assert_eq!(
+            wrong_thread_client
+                .list_task_activity(&approval_id, "task-root-agy", None, None, None, None)
+                .await
+                .expect_err("wrong thread must fail")
+                .code(),
+            "scope_mismatch"
+        );
+
+        // 5. Mutation boundary preserved: pull/ack/dispatch/cancel/get_task still require live Ready host.
+        assert_eq!(
+            client
+                .pull_events(&approval_id, None, None)
+                .await
+                .expect_err("pull_events on stopped host must fail")
+                .code(),
+            "host_not_ready"
+        );
+        assert_eq!(
+            client
+                .ack_events(
+                    &approval_id,
+                    "bat_00000000000000000000000000000001".to_string()
+                )
+                .await
+                .expect_err("ack_events on stopped host must fail")
+                .code(),
+            "host_not_ready"
+        );
+        assert_eq!(
+            client
+                .dispatch_task(&approval_id, "task-root-oc")
+                .await
+                .expect_err("dispatch_task on stopped host must fail")
+                .code(),
+            "host_not_ready"
+        );
+        assert_eq!(
+            client
+                .get_task(&approval_id, "task-root-agy")
+                .await
+                .expect_err("get_task on stopped host must fail")
+                .code(),
+            "host_not_ready"
+        );
+
+        // 6. Zero mutations proof across DB, cursors, wake-ups, manifest, receipts, lock, and processes.
+        let post_db_snap =
+            threadlane_core::observation::read_core_state_readonly(&db_path).expect("post db snap");
+        let post_db_bytes = fs::read(&db_path).expect("post db bytes");
+        let post_db_meta = fs::symlink_metadata(&db_path).expect("post db meta");
+        let post_manifest_bytes = fs::read(&manifest_path).expect("post manifest bytes");
+        let post_receipts_bytes = fs::read(&receipts_path).expect("post receipts bytes");
+        let post_lock_meta = fs::symlink_metadata(&lock_path).expect("post lock meta");
+        let post_provider_calls = (
+            read_invocation_count(&fixture.agy_count_file),
+            read_invocation_count(&fixture.oc_count_file),
+        );
+
+        assert_eq!(pre_db_snap, post_db_snap);
+        assert_eq!(pre_db_bytes, post_db_bytes);
+        assert_eq!(pre_manifest_bytes, post_manifest_bytes);
+        assert_eq!(pre_receipts_bytes, post_receipts_bytes);
+        assert_eq!(pre_provider_calls, post_provider_calls);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(pre_db_meta.mtime(), post_db_meta.mtime());
+            assert_eq!(pre_db_meta.mtime_nsec(), post_db_meta.mtime_nsec());
+            assert_eq!(pre_db_meta.ctime(), post_db_meta.ctime());
+            assert_eq!(pre_db_meta.ctime_nsec(), post_db_meta.ctime_nsec());
+            assert_eq!(pre_lock_meta.mtime(), post_lock_meta.mtime());
+            assert_eq!(pre_lock_meta.mtime_nsec(), post_lock_meta.mtime_nsec());
+            assert_eq!(pre_lock_meta.ctime(), post_lock_meta.ctime());
+            assert_eq!(pre_lock_meta.ctime_nsec(), post_lock_meta.ctime_nsec());
+        }
+
+        // 7. Lock fencing & non-Stopped phase rejection:
+        //    - Holding host.lock blocks stopped history with host_not_ready.
+        {
+            let _held_lock =
+                HostSessionLock::acquire(&session_dir, &approval_id).expect("hold host.lock");
+            let locked_err = client
+                .list_activity(&approval_id, None, None, None, None)
+                .await
+                .expect_err("stopped history must reject when host.lock is held");
+            assert_eq!(locked_err.code(), "host_not_ready");
+        }
+
+        //    - Bootstrapping, Stopping, Failed, and stale Ready (unlocked) must never fall back.
+        for bad_phase in [
+            HostPhase::Bootstrapping,
+            HostPhase::Stopping,
+            HostPhase::Failed,
+            HostPhase::Ready,
+        ] {
+            let mut tampered = stopped_manifest.clone();
+            tampered.phase = bad_phase;
+            if bad_phase == HostPhase::Ready {
+                tampered.gates.supervisor_authenticated_ready = true;
+            }
+            write_host_manifest(&session_dir, &tampered).expect("write tampered manifest");
+            let err = client
+                .list_activity(&approval_id, None, None, None, None)
+                .await
+                .expect_err("non-Stopped or stale Ready phase must fail");
+            assert_eq!(err.code(), "host_not_ready");
+        }
+        write_host_manifest(&session_dir, &stopped_manifest).expect("restore stopped manifest");
+
+        // 8. Symlink, permissive permissions, Mismatched DB binding, and missing DB fail closed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&db_path, fs::Permissions::from_mode(0o666))
+                .expect("make db world-writable");
+            let perm_err = client
+                .list_activity(&approval_id, None, None, None, None)
+                .await
+                .expect_err("world-writable state.db must fail");
+            assert_eq!(perm_err.code(), "security_violation");
+            fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))
+                .expect("restore db 0600");
+        }
+
+        let backup_db = fixture.root.join("state.db.backup");
+        fs::rename(&db_path, &backup_db).expect("move state.db aside");
+        let missing_db_err = client
+            .list_activity(&approval_id, None, None, None, None)
+            .await
+            .expect_err("missing state.db must fail");
+        assert_eq!(missing_db_err.code(), "corrupt_session_state");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&backup_db, &db_path).expect("symlink state.db");
+            let symlink_err = client
+                .list_activity(&approval_id, None, None, None, None)
+                .await
+                .expect_err("symlink state.db must fail");
+            assert_eq!(symlink_err.code(), "security_violation");
+            fs::remove_file(&db_path).expect("remove symlink state.db");
+        }
+
+        // Write a state.db with a different binding_id and verify scope_mismatch.
+        {
+            let mut wrong_core = threadlane_core::Core::open(&db_path).expect("open wrong db");
+            wrong_core
+                .create_binding(THREAD_UUID_A, "Mismatched Binding DB")
+                .expect("create mismatched binding");
+        }
+        let mismatch_err = client
+            .list_activity(&approval_id, None, None, None, None)
+            .await
+            .expect_err("mismatched DB binding must fail");
+        assert_eq!(mismatch_err.code(), "scope_mismatch");
     }
 }
