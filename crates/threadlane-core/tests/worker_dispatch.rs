@@ -158,10 +158,12 @@ fn worker_lifecycle_start_claim_progress_complete_and_wake_ack() {
             &claim,
             &[
                 WorkerProgressUpdate {
+                    watchdog_attention: None,
                     event_kind: "system_init".to_string(),
                     summary: "Initialized provider session".to_string(),
                 },
                 WorkerProgressUpdate {
+                    watchdog_attention: None,
                     event_kind: "assistant_message".to_string(),
                     summary: "Inspecting workspace files".to_string(),
                 },
@@ -667,6 +669,7 @@ fn worker_atomic_claim_correlation_and_stale_callback_rejection() {
             core.record_worker_progress(
                 bad_claim,
                 &[WorkerProgressUpdate {
+                    watchdog_attention: None,
                     event_kind: "tool_use".to_string(),
                     summary: "forged progress".to_string(),
                 }],
@@ -1197,6 +1200,7 @@ fn worker_bounded_progress_cap_secret_redaction_and_wire_budget_enforcement() {
     let mut updates = Vec::with_capacity(total_updates);
     for idx in 0..total_updates {
         updates.push(WorkerProgressUpdate {
+                    watchdog_attention: None,
             event_kind: "assistant_message".to_string(),
             summary: format!(
                 "Step {idx} using sk-secret-token-value-123456 and Bearer eyJhbGciOiJIUzI1NiJ9 and OPENAI_API_KEY=supersecret {}",

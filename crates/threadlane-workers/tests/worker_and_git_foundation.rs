@@ -2539,7 +2539,18 @@ sleep 30
         "timeout under full observer must not hang (took {} ms)",
         timeout_report.duration_ms
     );
-    assert_eq!(timeout_report.dropped_live_events, 3);
+    let watchdog = timeout_report
+        .progress_watchdog
+        .as_ref()
+        .expect("watchdog snapshot");
+    assert!(watchdog.attention_emitted);
+    assert_eq!(watchdog.hard_timeout_ms, 200);
+    assert_eq!(
+        watchdog.status,
+        threadlane_workers::ProgressWatchdogStatus::HardLimitReached
+    );
+    // Three provider events and exactly one software attention could not enter the full channel.
+    assert_eq!(timeout_report.dropped_live_events, 3 + 1);
     assert_eq!(timeout_report.evidence.retained_events.len(), 4);
     assert!(timeout_rx.recv().await.is_some());
 
@@ -2598,6 +2609,13 @@ sleep 30
         cancel_report.duration_ms
     );
     assert_eq!(cancel_report.dropped_live_events, 2);
+    assert!(
+        !cancel_report
+            .progress_watchdog
+            .as_ref()
+            .expect("watchdog snapshot")
+            .attention_emitted
+    );
     assert_eq!(cancel_report.evidence.retained_events.len(), 3);
     assert!(cancel_obs_rx.recv().await.is_some());
 

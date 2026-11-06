@@ -449,6 +449,9 @@ pub struct ExecutionStatusResponse {
     pub envelope_digest: String,
     /// Observed physical owner state (`live_verified_owner`, `no_active_owner`, `stale_crash_artifact_detected`, etc.).
     pub owner_state: CoworkerDriverOwnerState,
+    /// Durable bounded first fatal owner diagnosis, independent of job completion or stop state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatal_error: Option<crate::coworker_driver::CoworkerDriverFatalError>,
     /// Verified live ownership summary when a live owner is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_owner_summary: Option<CoworkerOwnershipSummary>,
@@ -531,6 +534,7 @@ impl ExecutionStatusResponse {
             envelope_id,
             envelope_digest,
             owner_state: report.owner_state,
+            fatal_error: report.fatal_error,
             verified_owner_summary: report.verified_owner_summary,
             lease: report.lease,
             lease_active: report.lease_active,

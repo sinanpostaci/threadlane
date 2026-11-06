@@ -1605,6 +1605,7 @@ impl CoworkerCandidateService {
                 prompt,
                 file_permissions: WorkerFilePermissions::ReadOnly,
                 budgets: ExecutionBudgets {
+                    progress_watchdog: None,
                     timeout_ms: closure_budget.max_timeout_ms_per_call,
                     max_stdout_bytes: closure_budget.max_stdout_bytes_per_call,
                     max_stderr_bytes: closure_budget.max_stderr_bytes_per_call,

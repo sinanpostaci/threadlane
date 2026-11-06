@@ -149,6 +149,10 @@ pub struct ExecutionBudgets {
     /// Maximum number of normalized NDJSON events retained in the report (`1..=MAX_EVENTS`).
     #[serde(default = "default_max_events")]
     pub max_events: usize,
+    /// Optional advisory soft policy. Absent policies derive thresholds within `timeout_ms`.
+    /// Omission preserves the serialized shape and digest of existing frozen budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_watchdog: Option<crate::progress_watchdog::ProgressWatchdogPolicy>,
 }
 
 const fn default_timeout_ms() -> u64 {
@@ -179,6 +183,7 @@ impl Default for ExecutionBudgets {
             max_stdout_bytes: DEFAULT_MAX_STDOUT_BYTES,
             max_stderr_bytes: DEFAULT_MAX_STDERR_BYTES,
             max_events: DEFAULT_MAX_EVENTS,
+            progress_watchdog: None,
         }
     }
 }
@@ -221,6 +226,9 @@ impl ExecutionBudgets {
                 "max_events must be between 1 and {MAX_EVENTS} (got {})",
                 self.max_events
             )));
+        }
+        if let Some(policy) = &self.progress_watchdog {
+            policy.validate(self.timeout_ms)?;
         }
         Ok(())
     }

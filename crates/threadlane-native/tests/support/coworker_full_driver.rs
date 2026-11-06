@@ -1331,6 +1331,7 @@ async fn cli_code_driver_settled_check_and_correction_blocks_send_one_attention_
             };
             let expected_status = if correction { "awaiting_correction_execution" } else { "blocked_by_failed_checks" };
             assert_eq!(settled["pipeline_status"], expected_status, "{case}: {settled}");
+            assert!(settled["fatal_error"].is_null(), "ordinary settled block is not fatal: {case}: {settled}");
             assert_eq!(settled["host_lock_held"], false);
             assert_ne!(settled["job_phase"], "completed");
             let turn = tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
@@ -1353,13 +1354,20 @@ async fn cli_code_driver_settled_check_and_correction_blocks_send_one_attention_
             let stopped_host = threadlane_host::read_host_manifest_optional(&session_dir, &approval).unwrap().unwrap();
             assert_eq!(stopped_host.phase, HostPhase::Stopped);
             assert!(!threadlane_host::is_host_lock_held(&session_dir).unwrap());
-            for command in ["ensure", "reconcile"] {
+            for command in ["ensure", "reconcile", "run-owner"] {
                 let refused = run_flow_cli_pipeline_output(&state_dir, &fixture, &binding_id, &thread_uuid,
                     &["code-driver", command, "--job-id", &job.job_id]).await;
                 assert!(!refused.status.success(), "{command} must preserve the stopped-host gate for {case}");
                 assert!(refused.stdout.is_empty(), "refusal must not return a successful result");
                 let error: Value = serde_json::from_slice(&refused.stderr).expect("structured CLI refusal");
                 assert_eq!(error["code"], "validation_failed", "unexpected {command} refusal for {case}: {error}");
+                let notices_after = CoworkerNoticeStore::inspect(&notice_root, &key, &digest).unwrap();
+                assert_eq!(notices_after.attempt_count, 1,
+                    "{case}: refused {command} created a notice: {notices_after:?}; error={error}; fatal_fp={}",
+                    threadlane_native::coworker_notice::derive_fatal_notice_fingerprint(&key).unwrap());
+                let after_refusal = run_flow_cli_pipeline(&state_dir, &fixture, &binding_id, &thread_uuid,
+                    &["code-driver", "status", "--job-id", &job.job_id]).await;
+                assert!(after_refusal["fatal_error"].is_null(), "{case}: refused {command} poisoned first-fatal diagnostics: {after_refusal}");
                 let host_after = threadlane_host::read_host_manifest_optional(&session_dir, &approval).unwrap().unwrap();
                 assert_eq!(host_after.phase, HostPhase::Stopped);
                 assert_eq!(host_after.instance_id, stopped_host.instance_id);
@@ -1797,4 +1805,65 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
         supervisor.shutdown().await;
     })
     .await;
+}
+
+#[tokio::test]
+async fn explicit_unauthorized_driver_mode_refuses_without_fatal_record_or_notice() {
+    Box::pin(async {
+        let fixture = setup_fixture();
+        let (job, _) = create_planned_approved_and_frozen_job(
+            &fixture, "brf_mode_refusal", "plan-mode-refusal",
+            vec![PlanTask {
+                id: "task-mode".into(), title: "Mode refusal fixture".into(),
+                instruction: "CTRL_TASK_A implement src/a.rs".into(), role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard, depends_on: Vec::new(), allowed_write_paths: vec!["src/a.rs".into()],
+            }], BTreeMap::new(), vec!["src/a.rs".into()], 1, ExecutionBudgets::default(),
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 1),
+            IntegrationStrategy::MergeNoFf, true,
+        ).await;
+        // Narrow this offline operator fixture to initial dispatch only. Preserve its exact
+        // approval/job linkage and recompute the frozen envelope digest; admission must still
+        // validate, while the requested full pipeline remains outside this envelope.
+        fixture.policy_store.mutate_job_runtime_for_operator(BINDING_A, &job.job_id, |runtime| {
+            runtime.envelope.allow_run_integration_execution = false;
+            runtime.envelope.envelope_digest = runtime.envelope.compute_digest()?;
+            Ok(())
+        }).unwrap();
+        let driver = CoworkerCodeDriver::from_controller(
+            fixture.root.join("runtime"), &fixture.registry_dir, &fixture.plans_dir,
+            &fixture.authority_dir, &fixture.sessions_dir, Arc::clone(&fixture.authority), fixture.controller.clone(),
+        ).unwrap();
+        let key = CoworkerJobOwnershipKey::new(BINDING_A, THREAD_UUID_A, &job.job_id).unwrap();
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        let session = fixture.controller.open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, now).unwrap();
+        let admission = session.verify_admission().expect("narrowed fixture retains real admission");
+        session.release().unwrap();
+        let (socket, count, peer) = spawn_single_coworker_notice_ws_server(&fixture, THREAD_UUID_A);
+        let notices = coworker_notice_dir(&fixture.plans_dir);
+        let digest = admission.runtime_state.envelope.envelope_digest;
+        CoworkerNoticeStore::new(&notices).unwrap().configure(CoworkerNoticeConfig::new(
+            key.clone(), digest.clone(), NativeToolOutputConfig::new_user_message_steer(socket, THREAD_UUID_A.into(), fixture.repo_dir.clone()),
+        ).unwrap()).unwrap();
+        let options = threadlane_native::coworker_driver::CoworkerDriverRunOptions {
+            execution_mode: Some(threadlane_native::coworker_driver::CoworkerDriverExecutionMode::FullAutomaticPipeline),
+            max_steps: Some(1), ..Default::default()
+        };
+        for operation in ["run-owner", "reconcile", "ensure"] {
+            let error = match operation {
+                "run-owner" => driver.run_owner(BINDING_A, THREAD_UUID_A, &job.job_id, options).await.unwrap_err(),
+                "reconcile" => driver.reconcile_with_options(BINDING_A, THREAD_UUID_A, &job.job_id, Some(options)).await.unwrap_err(),
+                _ => driver.ensure_owner(BINDING_A, THREAD_UUID_A, &job.job_id, Some(options)).await.unwrap_err(),
+            };
+            assert_eq!(error.code, NativeErrorCode::ValidationFailed);
+            assert!(error.message.contains("does not authorize full_automatic_pipeline"));
+            assert!(driver.read_owner_failure_optional(&key).unwrap().is_none(), "{operation} refusal is not a runtime failure");
+            assert_eq!(CoworkerNoticeStore::inspect(&notices, &key, &digest).unwrap().attempt_count, 0);
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+            assert_eq!(fs::read_dir(&fixture.sessions_dir).unwrap().count(), 0, "{operation} must not start a host");
+            assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 0);
+            assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 0);
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 0);
+        }
+        peer.abort();
+    }).await;
 }

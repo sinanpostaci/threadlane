@@ -2200,6 +2200,7 @@ mod tests {
         );
 
         let custom_budgets = ExecutionBudgets {
+            progress_watchdog: None,
             timeout_ms: 123_456,
             max_stdout_bytes: 204_800,
             max_stderr_bytes: 102_400,

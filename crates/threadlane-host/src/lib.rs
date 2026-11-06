@@ -6235,6 +6235,7 @@ exit 0
             compile_plan_revision(&published, &reg_snap).expect("compile published plan");
 
         let custom_budgets = ExecutionBudgets {
+            progress_watchdog: None,
             timeout_ms: 42_000,
             max_stdout_bytes: 262_144,
             max_stderr_bytes: 131_072,

@@ -524,6 +524,112 @@ fn project_base(fixture: &ControllerTestFixture) -> CanonicalProjectBaseRef {
         .expect("resolve project_base")
 }
 
+fn configure_opencode_coder(fixture: &ControllerTestFixture) {
+    let script = fixture.fake_agy_exe.with_file_name("fake-opencode");
+    write_executable_script(
+        &script,
+        r#"#!/bin/sh
+set -eu
+STAMP="$(dirname "$0")/$(basename "$(pwd)")-created-ms"
+if [ "${1:-}" = "api" ] && [ "${3:-}" = "session.create" ]; then
+    date +%s%3N > "$STAMP"
+    printf '{"data":{"id":"sess-oc-initial","location":{"directory":"%s"},"time":{"created":%s}}}\n' "$(pwd)" "$(cat "$STAMP")"
+    exit 0
+fi
+if [ "${1:-}" = "api" ] && [ "${3:-}" = "session.get" ]; then
+    printf '{"data":{"id":"sess-oc-initial","outcome":"succeeded","location":{"directory":"%s"},"time":{"created":%s,"idle":%s}}}\n' "$(pwd)" "$(cat "$STAMP")" "$(cat "$STAMP.done")"
+    exit 0
+fi
+if [ "${1:-}" = "session" ] && [ "${2:-}" = "export" ]; then
+    printf '{"info":{"id":"sess-oc-initial","outcome":"succeeded","location":{"directory":"%s"},"time":{"created":%s,"idle":%s}},"messages":[{"id":"msg-initial","type":"assistant","sessionID":"sess-oc-initial","finish":"stop","time":{"created":%s,"completed":%s},"model":{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}}]}\n' "$(pwd)" "$(cat "$STAMP")" "$(cat "$STAMP.done")" "$(cat "$STAMP")" "$(cat "$STAMP.done")"
+    exit 0
+fi
+if [ "${1:-}" = "--standalone" ]; then shift; fi
+if [ "${1:-}" != "run" ]; then exit 2; fi
+for arg in "$@"; do
+    case "$arg" in
+        *CTRL_TASK_B*) while true; do sleep 0.1; done ;;
+    esac
+done
+printf 'pub fn a() -> u32 { 100 }\n' > src/a.rs
+date +%s%3N > "$STAMP.done"
+printf '%s\n' '{"type":"step_start","sessionID":"sess-oc-initial","model":"opencode-go/deepseek-v4.1-flash","variant":"max"}'
+printf '%s\n' '{"type":"step_finish","sessionID":"sess-oc-initial","model":"opencode-go/deepseek-v4.1-flash","variant":"max","reason":"stop"}'
+"#,
+    );
+    let snapshot = fixture.registry.snapshot().expect("registry snapshot");
+    let mut profile = snapshot.profiles[0].clone();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-opencode".to_string(),
+                    label: "Offline OpenCode fixture".to_string(),
+                    adapter: ToolAdapter::OpencodeV2,
+                    executable_path: Some(script),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("register fake OpenCode");
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-deepseek".to_string(),
+                    tool_id: "tool-opencode".to_string(),
+                    label: "DeepSeek Flash fixture".to_string(),
+                    model_arg: "opencode-go/deepseek-v4.1-flash".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .expect("register pinned OpenCode model");
+    let coder = profile
+        .assignments
+        .iter_mut()
+        .find(|a| a.role == WorkflowRole::Coder)
+        .expect("Coder assignment");
+    coder.difficulty = Some(Difficulty::Medium);
+    coder.choice = ModelChoice {
+        model_id: "model-deepseek".to_string(),
+        effort: Some("max".to_string()),
+    };
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 2,
+            RegistryChange::UpsertProfile { profile },
+        )
+        .expect("pin fake OpenCode Coder");
+}
+
+fn execution_policy_for_fixture(fixture: &ControllerTestFixture) -> ExecutionPolicy {
+    let mut policy = execution_policy();
+    if fixture
+        .registry
+        .snapshot()
+        .expect("registry snapshot")
+        .tools
+        .iter()
+        .any(|t| t.id == "tool-opencode")
+    {
+        policy.allow_rules.push(PolicyAllowRule {
+            tool_id: "tool-opencode".to_string(),
+            model_id: "model-deepseek".to_string(),
+            efforts: vec!["max".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Coder],
+        });
+    }
+    policy
+}
+
 fn headless_argon_choice(difficulty: Difficulty) -> SelectedRoleChoice {
     SelectedRoleChoice {
         tool_id: "tool-agy".to_string(),
@@ -919,7 +1025,7 @@ async fn create_planned_approved_and_frozen_job_for_scope_with_options(
                 expected_job_revision: job.job_revision,
                 expected_ledger_revision: None,
                 approval_id: approval_summary.approval_id.clone(),
-                policy: execution_policy(),
+                policy: execution_policy_for_fixture(fixture),
                 controller_envelope: Some(cap_env),
                 task_interfaces,
             },
@@ -943,7 +1049,7 @@ async fn create_planned_approved_and_frozen_job_for_scope_with_options(
         thread_uuid: thread_uuid.to_string(),
         job_id: bound_job.job_id.clone(),
         expected_job_revision: bound_job.job_revision,
-        policy: execution_policy(),
+        policy: execution_policy_for_fixture(fixture),
         reviewer_choice: headless_argon_choice(Difficulty::Hard),
         closure_choice: headless_argon_choice(Difficulty::Extreme),
         role_budgets,
@@ -2137,7 +2243,19 @@ async fn hold_stop_unknown_intent_and_conflicting_request_key_fence_dispatch_and
 #[tokio::test]
 async fn task_verification_commits_coder_worktree_executes_frozen_checks_and_reconciles_idempotently(
 ) {
+    assert_initial_coder_verification(false).await;
+}
+
+#[tokio::test]
+async fn initial_opencode_root_task_verification_while_parallel_root_runs_and_dependent_waits() {
+    assert_initial_coder_verification(true).await;
+}
+
+async fn assert_initial_coder_verification(opencode: bool) {
     let fixture = setup_fixture();
+    if opencode {
+        configure_opencode_coder(&fixture);
+    }
     let check_count_file = fixture
         .plans_dir
         .parent()
@@ -2161,22 +2279,74 @@ async fn task_verification_commits_coder_worktree_executes_frozen_checks_and_rec
             consumed_interfaces: Vec::new(),
         },
     );
+    let mut tasks = vec![PlanTask {
+        id: "task-verify-a".to_string(),
+        title: "Verify Task A".to_string(),
+        instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+        role: WorkflowRole::Coder,
+        difficulty: if opencode {
+            Difficulty::Medium
+        } else {
+            Difficulty::Hard
+        },
+        depends_on: Vec::new(),
+        allowed_write_paths: vec!["src/a.rs".to_string()],
+    }];
+    if opencode {
+        task_interfaces.insert(
+            "task-running-b".to_string(),
+            TaskInterfaceOwnershipSpec {
+                owned_interfaces: vec!["iface_running_b".to_string()],
+                consumed_interfaces: Vec::new(),
+            },
+        );
+        task_interfaces.insert(
+            "task-dependent-c".to_string(),
+            TaskInterfaceOwnershipSpec {
+                owned_interfaces: Vec::new(),
+                consumed_interfaces: vec![
+                    "iface_verify_a".to_string(),
+                    "iface_running_b".to_string(),
+                ],
+            },
+        );
+        tasks.extend([
+            PlanTask {
+                id: "task-running-b".to_string(),
+                title: "Keep second root running".to_string(),
+                instruction: "CTRL_TASK_B implement src/b.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Medium,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/b.rs".to_string()],
+            },
+            PlanTask {
+                id: "task-dependent-c".to_string(),
+                title: "Wait for both roots".to_string(),
+                instruction: "CTRL_TASK_C implement src/c.rs".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Medium,
+                depends_on: vec!["task-verify-a".to_string(), "task-running-b".to_string()],
+                allowed_write_paths: vec!["src/c.rs".to_string()],
+            },
+        ]);
+    }
     let (job, approval_id) = create_planned_approved_and_frozen_job(
         &fixture,
         "brf_verify_pass",
         "plan-verify-pass",
-        vec![PlanTask {
-            id: "task-verify-a".to_string(),
-            title: "Verify Task A".to_string(),
-            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
-            role: WorkflowRole::Coder,
-            difficulty: Difficulty::Hard,
-            depends_on: Vec::new(),
-            allowed_write_paths: vec!["src/a.rs".to_string()],
-        }],
+        tasks,
         task_interfaces,
-        vec!["src/a.rs".to_string()],
-        1,
+        if opencode {
+            vec![
+                "src/a.rs".to_string(),
+                "src/b.rs".to_string(),
+                "src/c.rs".to_string(),
+            ]
+        } else {
+            vec!["src/a.rs".to_string()]
+        },
+        if opencode { 2 } else { 1 },
         ExecutionBudgets::default(),
         ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
     )
@@ -2208,7 +2378,67 @@ async fn task_verification_commits_coder_worktree_executes_frozen_checks_and_rec
             .find(|t| t.task_id == "task-verify-a")
             .expect("task-verify-a observation");
         if obs.stage == CoworkerTaskStage::ReadyForReview {
+            if opencode {
+                assert_eq!(rep.active_running_count, 1, "{rep:?}");
+                assert_eq!(
+                    rep.tasks
+                        .iter()
+                        .find(|t| t.task_id == "task-running-b")
+                        .unwrap()
+                        .stage,
+                    CoworkerTaskStage::Running
+                );
+                assert_eq!(
+                    rep.tasks
+                        .iter()
+                        .find(|t| t.task_id == "task-dependent-c")
+                        .unwrap()
+                        .stage,
+                    CoworkerTaskStage::PendingDependencies
+                );
+                let runtime = fixture
+                    .policy_store
+                    .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                    .unwrap()
+                    .unwrap();
+                let artifact = runtime
+                    .attempt_artifacts
+                    .get(&ControllerJobRuntimeState::artifact_key("task-verify-a", 1))
+                    .unwrap();
+                assert_eq!(artifact.observed_provider, "opencode_v2");
+                assert_eq!(artifact.observed_model, "opencode-go/deepseek-v4.1-flash");
+                assert_eq!(artifact.observed_effort.as_deref(), Some("max"));
+                assert_eq!(
+                    artifact.committed_head_commit.as_deref(),
+                    Some(fixture.base_commit.as_str())
+                );
+                assert_eq!(
+                    artifact.committed_tree_sha.as_deref(),
+                    Some(fixture.base_tree_sha.as_str())
+                );
+                assert!(runtime
+                    .pending_effects
+                    .values()
+                    .all(|e| e.kind == PendingControllerEffectKind::CoderDispatch));
+                assert_eq!(read_invocation_count(&check_count_file), 0);
+            }
             break;
+        }
+        if opencode && obs.stage == CoworkerTaskStage::Failed {
+            let client = ApprovedHostClient::new(
+                Arc::clone(&fixture.authority),
+                &fixture.sessions_dir,
+                BINDING_A,
+                THREAD_UUID_A,
+            )
+            .unwrap();
+            panic!(
+                "OpenCode fixture failed: {:?}",
+                client
+                    .get_task(&approval_id, "task-verify-a")
+                    .await
+                    .unwrap()
+            );
         }
         assert!(
             Instant::now() < deadline,

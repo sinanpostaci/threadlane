@@ -117,6 +117,8 @@ pub enum NormalizedEventKind {
     Error,
     /// Terminal completion/result event (`result:success`, `step_finish:stop`).
     Result,
+    /// Advisory attention generated only by the supervisor, never by provider event parsing.
+    SupervisorAttention,
     /// Other valid JSON object event.
     Other,
 }
@@ -124,7 +126,7 @@ pub enum NormalizedEventKind {
 /// Bounded, normalized representation of a single provider NDJSON event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedWorkerEvent {
-    /// 1-based stdout line number.
+    /// 1-based provider stdout line number; `0` is reserved for supervisor-generated events.
     pub line_number: usize,
     /// Normalized event kind.
     pub kind: NormalizedEventKind,

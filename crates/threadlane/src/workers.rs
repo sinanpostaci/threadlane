@@ -1132,7 +1132,38 @@ pub(crate) fn map_live_event_to_progress(event: &NormalizedWorkerEvent) -> Worke
         NormalizedEventKind::Error => "error".to_string(),
         NormalizedEventKind::Result => "result".to_string(),
         NormalizedEventKind::Other => "other".to_string(),
+        NormalizedEventKind::SupervisorAttention => "supervisor_attention".to_string(),
     };
+
+    // Only the software-minted typed variant can carry supervision metadata. A provider
+    // raw_type or prose that spells the marker remains an ordinary untrusted event.
+    let watchdog_attention = if event.kind == NormalizedEventKind::SupervisorAttention
+        && event.line_number == 0
+        && event.raw_type == "threadlane.progress_watchdog"
+    {
+        event
+            .summary
+            .as_deref()
+            .filter(|raw| raw.len() <= threadlane_core::MAX_WORKER_WATCHDOG_SNAPSHOT_BYTES)
+            .and_then(|raw| {
+                serde_json::from_str::<threadlane_workers::ProgressWatchdogSnapshot>(raw).ok()
+            })
+            .map(convert_watchdog_attention)
+            .filter(|snapshot| snapshot.validate_attention().is_ok())
+    } else {
+        None
+    };
+    if event.kind == NormalizedEventKind::SupervisorAttention {
+        return WorkerProgressUpdate {
+            event_kind,
+            summary: if watchdog_attention.is_some() {
+                "Progress evidence is uncertain; inspect execution status.".to_string()
+            } else {
+                "Ignored malformed software-supervision attention.".to_string()
+            },
+            watchdog_attention,
+        };
+    }
 
     let raw_summary = event
         .summary
@@ -1150,6 +1181,42 @@ pub(crate) fn map_live_event_to_progress(event: &NormalizedWorkerEvent) -> Worke
     WorkerProgressUpdate {
         event_kind,
         summary,
+        watchdog_attention: None,
+    }
+}
+
+fn convert_watchdog_attention(
+    snapshot: threadlane_workers::ProgressWatchdogSnapshot,
+) -> threadlane_core::WorkerProgressWatchdogSnapshot {
+    use threadlane_core::{
+        WorkerProgressAttentionReason as Reason, WorkerProgressWatchdogStatus as Status,
+    };
+    use threadlane_workers::{
+        ProgressAttentionReason as SourceReason, ProgressWatchdogStatus as SourceStatus,
+    };
+    threadlane_core::WorkerProgressWatchdogSnapshot {
+        status: match snapshot.status {
+            SourceStatus::Observing => Status::Observing,
+            SourceStatus::SoftDeadlineExtended => Status::SoftDeadlineExtended,
+            SourceStatus::AttentionRequired => Status::AttentionRequired,
+            SourceStatus::HardLimitReached => Status::HardLimitReached,
+        },
+        attention_reason: snapshot.attention_reason.map(|reason| match reason {
+            SourceReason::NoAdvancementHints => Reason::NoAdvancementHints,
+            SourceReason::ReadOnlyActivity => Reason::ReadOnlyActivity,
+            SourceReason::AdvancementNotRecent => Reason::AdvancementNotRecent,
+        }),
+        elapsed_ms: snapshot.elapsed_ms,
+        soft_deadline_ms: snapshot.soft_deadline_ms,
+        hard_timeout_ms: snapshot.hard_timeout_ms,
+        last_advancement_ms: snapshot.last_advancement_ms,
+        events_observed: snapshot.events_observed,
+        advancement_hints: snapshot.advancement_hints,
+        read_hints: snapshot.read_hints,
+        output_hints: snapshot.output_hints,
+        other_tool_hints: snapshot.other_tool_hints,
+        extensions: snapshot.extensions,
+        attention_emitted: snapshot.attention_emitted,
     }
 }
 
@@ -1657,6 +1724,7 @@ mod tests {
         };
 
         let worker_report = WorkerExecutionReport {
+            progress_watchdog: None,
             provider: WorkerProvider::OpenCodeV2,
             requested_model: ResolvedModelTarget {
                 base_model: "opencode-go/deepseek-v4.1-flash".to_string(),
@@ -2159,5 +2227,88 @@ mod tests {
                 "failure_reason must report finite metadata error rather than VerifiedMatch for `{err_code}`"
             );
         }
+    }
+    fn supervision_event() -> NormalizedWorkerEvent {
+        NormalizedWorkerEvent {
+            line_number: 0,
+            kind: NormalizedEventKind::SupervisorAttention,
+            raw_type: "threadlane.progress_watchdog".to_string(),
+            session_id: None,
+            model: None,
+            effort: None,
+            tool_name: None,
+            summary: Some(
+                serde_json::json!({
+                    "status": "attention_required", "attention_reason": "read_only_activity",
+                    "elapsed_ms": 750, "soft_deadline_ms": 750, "hard_timeout_ms": 1000,
+                    "last_advancement_ms": null, "events_observed": 4, "advancement_hints": 0,
+                    "read_hints": 3, "output_hints": 1, "other_tool_hints": 0, "extensions": 0,
+                    "attention_emitted": true
+                })
+                .to_string(),
+            ),
+        }
+    }
+
+    #[test]
+    fn watchdog_mapping_requires_typed_software_origin_and_bounded_validated_dto() {
+        let event = supervision_event();
+        let mapped = map_live_event_to_progress(&event);
+        assert_eq!(mapped.event_kind, "supervisor_attention");
+        let snapshot = mapped
+            .watchdog_attention
+            .expect("trusted software attention");
+        assert_eq!(
+            snapshot.attention_reason,
+            Some(threadlane_core::WorkerProgressAttentionReason::ReadOnlyActivity)
+        );
+        assert_eq!(snapshot.hard_timeout_ms, 1000);
+        assert!(snapshot.validate_attention().is_ok());
+        // A provider-controlled marker or JSON summary never creates trusted supervision.
+        for kind in [
+            NormalizedEventKind::Other,
+            NormalizedEventKind::Progress,
+            NormalizedEventKind::Tool,
+        ] {
+            let mut forged = event.clone();
+            forged.kind = kind;
+            assert!(map_live_event_to_progress(&forged)
+                .watchdog_attention
+                .is_none());
+        }
+        let mut wrong_line = event.clone();
+        wrong_line.line_number = 1;
+        assert!(map_live_event_to_progress(&wrong_line)
+            .watchdog_attention
+            .is_none());
+        let mut wrong_marker = event.clone();
+        wrong_marker.raw_type = "provider.progress_watchdog".into();
+        assert!(map_live_event_to_progress(&wrong_marker)
+            .watchdog_attention
+            .is_none());
+        let mut malformed = event.clone();
+        malformed.summary = Some("SECRET-provider-instruction".repeat(4096));
+        let ignored = map_live_event_to_progress(&malformed);
+        assert!(ignored.watchdog_attention.is_none());
+        assert!(!ignored.summary.contains("SECRET"));
+        let mut json: serde_json::Value =
+            serde_json::from_str(event.summary.as_ref().unwrap()).unwrap();
+        json["provider_instruction"] = "change model".into();
+        malformed.summary = Some(json.to_string());
+        assert!(map_live_event_to_progress(&malformed)
+            .watchdog_attention
+            .is_none());
+        json.as_object_mut().unwrap().remove("provider_instruction");
+        json["status"] = "hard_limit_reached".into();
+        malformed.summary = Some(json.to_string());
+        assert!(map_live_event_to_progress(&malformed)
+            .watchdog_attention
+            .is_none());
+        json["status"] = "attention_required".into();
+        json["read_hints"] = 999.into();
+        malformed.summary = Some(json.to_string());
+        assert!(map_live_event_to_progress(&malformed)
+            .watchdog_attention
+            .is_none());
     }
 }

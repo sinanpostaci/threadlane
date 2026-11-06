@@ -10,7 +10,7 @@ use threadlane::native_tool_output::NativeToolOutputConfig;
 use threadlane_core::WakeupOutcome;
 use tokio::sync::watch;
 
-use crate::coworker_driver::CoworkerDriverPipelineReport;
+use crate::coworker_driver::{CoworkerDriverFatalError, CoworkerDriverPipelineReport};
 use crate::coworker_workflow::{
     sha256_hex, CombinedCandidateStatus, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
     CoworkerJobPhase, CoworkerPipelineStatus, CoworkerTaskStage, OwnedCoworkerControllerSession,
@@ -25,6 +25,8 @@ use crate::{NativeError, NativeErrorCode};
 
 /// Maximum number of persisted notice delivery attempts allowed per job scope.
 pub const MAX_NOTICE_ATTEMPTS: usize = 16;
+// Advisory progress cannot consume the final two shared slots for terminal/fatal notices.
+const MAX_PROGRESS_NOTICE_ATTEMPTS: usize = MAX_NOTICE_ATTEMPTS - 2;
 /// Timeout in milliseconds applied when invoking a coworker notice wakeup.
 pub const NOTICE_TIMEOUT_MS: u64 = 2_000;
 const MAX_NOTICE_STATE_BYTES: usize = 64 * 1024;
@@ -443,6 +445,89 @@ pub fn derive_notice_fingerprint(
     ))
 }
 
+/// Derives a separate deterministic SHA-256 fingerprint for a fatal owner error notice.
+///
+/// Keyed by `(binding_id, thread_uuid, job_id)` under a distinct
+/// domain prefix so fatal owner failure notices are one-per-fatal-fingerprint and never collide
+/// with normal milestone fingerprints.
+pub fn derive_fatal_notice_fingerprint(
+    key: &CoworkerJobOwnershipKey,
+) -> Result<String, NativeError> {
+    key.validate()?;
+    Ok(sha256_hex(
+        format!(
+            "coworker_fatal_notice_fp\0{}\0{}\0{}",
+            key.binding_id, key.thread_uuid, key.job_id
+        )
+        .as_bytes(),
+    ))
+}
+
+// This accepts genuine host snapshots only after their caller used ApprovedHostClient.
+// Scope, immutable approval identity, actual receipt IDs, active state, and the fixed core DTO
+// are checked again here; provider prose and cached controller reports never grant notice authority.
+pub(crate) fn verified_progress_attention(
+    admission: &VerifiedControllerAdmission,
+    snapshot: &threadlane_host::TaskStateSnapshot,
+) -> Option<threadlane_core::WorkerProgressWatchdogSnapshot> {
+    let task = admission
+        .approval
+        .tasks
+        .iter()
+        .find(|task| task.task_id == snapshot.task_id)?;
+    let worker = snapshot.worker.as_ref()?;
+    let attention = worker.progress.watchdog_attention.as_ref()?;
+    attention.validate_attention().ok()?;
+    if admission.runtime_state.stop_requested
+        || snapshot.binding_id != admission.job.binding_id
+        || snapshot.thread_uuid != admission.job.thread_uuid
+        || snapshot.approval_id != admission.approval.approval_id
+        || snapshot.subject_digest != admission.approval.subject_digest
+        || snapshot.task_digest != task.task_digest
+        || snapshot.command_key != task.command_key
+        || snapshot.profile_id != task.profile_id
+        || snapshot.run_id.as_deref() != Some(worker.run_id.as_str())
+        || snapshot.worker_id.as_deref() != Some(worker.worker_id.as_str())
+        || worker.binding_id != snapshot.session_binding_id
+        || !matches!(
+            snapshot.status,
+            threadlane_host::TaskExecutionStatus::Running
+                | threadlane_host::TaskExecutionStatus::CancelRequested
+        )
+        || !matches!(
+            worker.status,
+            threadlane_core::WorkerStatus::Running | threadlane_core::WorkerStatus::CancelRequested
+        )
+        || attention.hard_timeout_ms != admission.approval.budgets.timeout_ms
+    {
+        return None;
+    }
+    Some(attention.clone())
+}
+
+fn derive_progress_notice_fingerprint(
+    key: &CoworkerJobOwnershipKey,
+    task_id: &str,
+    run_id: &str,
+    worker_id: &str,
+) -> Result<String, NativeError> {
+    key.validate()?;
+    for (name, value) in [
+        ("task_id", task_id),
+        ("run_id", run_id),
+        ("worker_id", worker_id),
+    ] {
+        validate_bounded_identifier(value, name, 128)?;
+    }
+    Ok(sha256_hex(
+        format!(
+            "coworker_progress_notice_fp\0{}\0{}\0{}\0{task_id}\0{run_id}\0{worker_id}",
+            key.binding_id, key.thread_uuid, key.job_id
+        )
+        .as_bytes(),
+    ))
+}
+
 /// Verifies that a notice configuration matches the verified key, envelope digest, and repository path.
 pub fn validate_config_identity(
     config: &CoworkerNoticeConfig,
@@ -588,6 +673,135 @@ impl CoworkerNoticeStore {
             .await
     }
 
+    /// Reserves and submits at most one `Attention` wakeup for a verified fatal owner error.
+    ///
+    /// Uses a separate deterministic fatal-error fingerprint and reserve-before-send semantics.
+    /// The wakeup payload remains fixed to the software-owned `job_id` and never embeds error
+    /// or provider prose as instructions.
+    pub async fn notify_fatal_error(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        fatal_error: &CoworkerDriverFatalError,
+    ) -> Result<Option<NoticeReport>, NativeError> {
+        fatal_error.validate()?;
+        let key = session.guard().key().clone();
+        session.guard().validate_before_effect(&key)?;
+        let admission = session.verify_admission()?;
+        // A stop request or terminal task state does not erase an actual owner error.
+        // This attention signal makes no completion or remote-termination claim.
+        let reserved = self.reserve_fatal_attempt(
+            &key,
+            &admission.runtime_state.envelope.envelope_digest,
+            Path::new(&admission.approval.repository_path),
+            fatal_error.job_revision,
+            Some(session.guard()),
+        )?;
+        let (context, attempt, fingerprint, job_revision) = match reserved {
+            ReserveOutcome::MissingConfig => return Ok(None),
+            ReserveOutcome::Completed(report) => return Ok(Some(report)),
+            ReserveOutcome::Reserved {
+                context,
+                attempt,
+                fingerprint,
+                job_revision,
+            } => (context, attempt, fingerprint, job_revision),
+        };
+        session.guard().validate_before_effect(&key)?;
+        let fresh_admission = session.verify_admission()?;
+        if fresh_admission.runtime_state.envelope.envelope_digest
+            != admission.runtime_state.envelope.envelope_digest
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "fatal owner notice admission changed before wakeup invocation",
+            ));
+        }
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
+        session.guard().validate_before_effect(&key)?;
+        let report = self.finalize_attempt(
+            &key,
+            NoticeKind::Attention,
+            job_revision,
+            &fingerprint,
+            &outcome,
+        )?;
+        Ok(Some(report))
+    }
+
+    /// Submits one bounded fixed wakeup for validated progress attention on an active host
+    /// invocation. This crate-private route is called only with ApprovedHostClient snapshots.
+    pub(crate) async fn notify_progress_attention(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        snapshot: &threadlane_host::TaskStateSnapshot,
+    ) -> Result<Option<NoticeReport>, NativeError> {
+        let key = session.guard().key().clone();
+        session.guard().validate_before_effect(&key)?;
+        let admission = session.verify_admission()?;
+        if verified_progress_attention(&admission, snapshot).is_none() {
+            return Ok(None);
+        }
+        let fingerprint = derive_progress_notice_fingerprint(
+            &key,
+            &snapshot.task_id,
+            snapshot.run_id.as_deref().expect("verified run"),
+            snapshot.worker_id.as_deref().expect("verified worker"),
+        )?;
+        let (lock_name, state_name) = scope_filenames(&key)?;
+        let reserved = {
+            let _lock =
+                acquire_cross_process_lock(&self.root_dir, &lock_name, "coworker_notice_lock")?;
+            let Some(mut state) = self.read_state_locked(&state_name)? else {
+                return Ok(None);
+            };
+            validate_config_identity(
+                &state.config,
+                &key,
+                &admission.runtime_state.envelope.envelope_digest,
+                &admission.approval.repository_path,
+            )?;
+            self.reserve_progress_for_fingerprint_locked(
+                &state_name,
+                &mut state,
+                &key,
+                admission.job.job_revision,
+                fingerprint,
+                Some(session.guard()),
+            )?
+        };
+        let (context, attempt, fingerprint, job_revision) = match reserved {
+            ReserveOutcome::MissingConfig => return Ok(None),
+            ReserveOutcome::Completed(report) => return Ok(Some(report)),
+            ReserveOutcome::Reserved {
+                context,
+                attempt,
+                fingerprint,
+                job_revision,
+            } => (context, attempt, fingerprint, job_revision),
+        };
+        session.guard().validate_before_effect(&key)?;
+        let fresh = session.verify_admission()?;
+        if fresh.runtime_state.envelope.envelope_digest
+            != admission.runtime_state.envelope.envelope_digest
+            || verified_progress_attention(&fresh, snapshot).is_none()
+        {
+            // The reserved intent remains uncertain and cannot be replayed after scope drift.
+            return Ok(None);
+        }
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
+        session.guard().validate_before_effect(&key)?;
+        self.finalize_attempt(
+            &key,
+            NoticeKind::Attention,
+            job_revision,
+            &fingerprint,
+            &outcome,
+        )
+        .map(Some)
+    }
+
     async fn notify_inner(
         &self,
         session: &OwnedCoworkerControllerSession,
@@ -654,6 +868,96 @@ impl CoworkerNoticeStore {
                 "coworker job state does not satisfy notice milestone",
             ));
         }
+        let fingerprint = derive_notice_fingerprint(key, kind, job_revision)?;
+        self.reserve_for_fingerprint_locked(
+            &state_name,
+            &mut state,
+            key,
+            kind,
+            job_revision,
+            fingerprint,
+            guard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_fatal_attempt(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        envelope_digest: &str,
+        repository_path: &Path,
+        job_revision: u64,
+        guard: Option<&CoworkerJobOwnershipGuard>,
+    ) -> Result<ReserveOutcome, NativeError> {
+        let (lock_name, state_name) = scope_filenames(key)?;
+        let _lock = acquire_cross_process_lock(&self.root_dir, &lock_name, "coworker_notice_lock")?;
+        let Some(mut state) = self.read_state_locked(&state_name)? else {
+            return Ok(ReserveOutcome::MissingConfig);
+        };
+        validate_config_identity(&state.config, key, envelope_digest, repository_path)?;
+        let fingerprint = derive_fatal_notice_fingerprint(key)?;
+        self.reserve_for_fingerprint_locked(
+            &state_name,
+            &mut state,
+            key,
+            NoticeKind::Attention,
+            job_revision,
+            fingerprint,
+            guard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_progress_for_fingerprint_locked(
+        &self,
+        state_name: &str,
+        state: &mut StoredNoticeState,
+        key: &CoworkerJobOwnershipKey,
+        job_revision: u64,
+        fingerprint: String,
+        guard: Option<&CoworkerJobOwnershipGuard>,
+    ) -> Result<ReserveOutcome, NativeError> {
+        // Existing fingerprints retain the common Intent -> Unknown reconciliation and
+        // deduplication path, including when the progress or global cap is already reached.
+        if state.attempts.len() >= MAX_PROGRESS_NOTICE_ATTEMPTS
+            && !state
+                .attempts
+                .iter()
+                .any(|attempt| attempt.fingerprint == fingerprint)
+        {
+            return Ok(ReserveOutcome::Completed(NoticeReport {
+                attempt_id: None,
+                kind: NoticeKind::Attention,
+                job_revision,
+                fingerprint,
+                status: NoticeDeliveryStatus::CapReached,
+                was_duplicate: false,
+                cap_reached: true,
+                attempt_count: state.attempts.len(),
+            }));
+        }
+        self.reserve_for_fingerprint_locked(
+            state_name,
+            state,
+            key,
+            NoticeKind::Attention,
+            job_revision,
+            fingerprint,
+            guard,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_for_fingerprint_locked(
+        &self,
+        state_name: &str,
+        state: &mut StoredNoticeState,
+        key: &CoworkerJobOwnershipKey,
+        kind: NoticeKind,
+        job_revision: u64,
+        fingerprint: String,
+        guard: Option<&CoworkerJobOwnershipGuard>,
+    ) -> Result<ReserveOutcome, NativeError> {
         let mut dirty = false;
         for entry in &mut state.attempts {
             if entry.status == PersistedAttemptStatus::Intent {
@@ -662,9 +966,8 @@ impl CoworkerNoticeStore {
             }
         }
         if dirty {
-            self.write_state_locked(&state_name, &state)?;
+            self.write_state_locked(state_name, state)?;
         }
-        let fingerprint = derive_notice_fingerprint(key, kind, job_revision)?;
         let count = state.attempts.len();
         if let Some(existing) = state.attempts.iter().find(|a| a.fingerprint == fingerprint) {
             return Ok(ReserveOutcome::Completed(NoticeReport {
@@ -705,7 +1008,7 @@ impl CoworkerNoticeStore {
             fingerprint: fingerprint.clone(),
             status: PersistedAttemptStatus::Intent,
         });
-        self.write_state_locked(&state_name, &state)?;
+        self.write_state_locked(state_name, state)?;
         Ok(ReserveOutcome::Reserved {
             context: Box::new(context),
             attempt,
@@ -1589,6 +1892,110 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fatal_notice_fingerprint_is_separate_and_deduplicates_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, _) = fixture(tmp.path());
+        let normal_fp = derive_notice_fingerprint(&cfg.key, NoticeKind::Attention, 3).unwrap();
+        let fatal_fp = derive_fatal_notice_fingerprint(&cfg.key).unwrap();
+        assert_ne!(normal_fp, fatal_fp);
+
+        let reserved = store
+            .reserve_fatal_attempt(
+                &cfg.key,
+                &cfg.envelope_digest,
+                &cfg.target.project_root,
+                3,
+                None,
+            )
+            .unwrap();
+        let ReserveOutcome::Reserved { fingerprint, .. } = reserved else {
+            panic!("expected reserved fatal attempt");
+        };
+        assert_eq!(fingerprint, fatal_fp);
+
+        // Reopen promotes Intent -> Unknown and refuses automatic replay.
+        let reopened = CoworkerNoticeStore::new(tmp.path().join("store")).unwrap();
+        let dup = reopened
+            .reserve_fatal_attempt(
+                &cfg.key,
+                &cfg.envelope_digest,
+                &cfg.target.project_root,
+                3,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            dup,
+            ReserveOutcome::Completed(NoticeReport {
+                kind: NoticeKind::Attention,
+                status: NoticeDeliveryStatus::Unknown,
+                was_duplicate: true,
+                cap_reached: false,
+                attempt_count: 1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn fatal_notice_rejects_wrong_envelope_or_repository_and_respects_shared_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, snap) = fixture(tmp.path());
+        let wrong_repo = tmp.path().join("other-repository");
+        for (digest, repo) in [
+            ("b".repeat(64), cfg.target.project_root.clone()),
+            (cfg.envelope_digest.clone(), wrong_repo),
+        ] {
+            assert_eq!(
+                store
+                    .reserve_fatal_attempt(&cfg.key, &digest, &repo, 1, None)
+                    .err()
+                    .unwrap()
+                    .code,
+                NativeErrorCode::SecurityViolation
+            );
+        }
+        assert_eq!(
+            CoworkerNoticeStore::inspect(&store.root_dir, &cfg.key, &cfg.envelope_digest)
+                .unwrap()
+                .attempt_count,
+            0
+        );
+        for revision in 1..=MAX_NOTICE_ATTEMPTS as u64 {
+            assert!(matches!(
+                store
+                    .reserve_attempt(
+                        &cfg.key,
+                        &cfg.envelope_digest,
+                        &cfg.target.project_root,
+                        NoticeKind::Complete,
+                        revision,
+                        snap,
+                        None
+                    )
+                    .unwrap(),
+                ReserveOutcome::Reserved { .. }
+            ));
+        }
+        assert!(matches!(
+            store
+                .reserve_fatal_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    99,
+                    None
+                )
+                .unwrap(),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::CapReached,
+                attempt_count: MAX_NOTICE_ATTEMPTS,
+                ..
+            })
+        ));
+    }
+
     fn settled_report(
         cfg: &CoworkerNoticeConfig,
         status: CoworkerPipelineStatus,
@@ -1819,6 +2226,130 @@ mod tests {
             ReserveOutcome::Completed(NoticeReport {
                 status: NoticeDeliveryStatus::Failed,
                 was_duplicate: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn progress_subcap_preserves_fatal_and_terminal_slots_and_unknown_deduplication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, complete) = fixture(tmp.path());
+        let reserve_progress = |store: &CoworkerNoticeStore, invocation: usize| {
+            let (lock_name, state_name) = scope_filenames(&cfg.key).unwrap();
+            let _lock =
+                acquire_cross_process_lock(&store.root_dir, &lock_name, "coworker_notice_lock")
+                    .unwrap();
+            let mut state = store.read_state_locked(&state_name).unwrap().unwrap();
+            let fingerprint = derive_progress_notice_fingerprint(
+                &cfg.key,
+                "task_1",
+                &format!("run_{invocation}"),
+                &format!("worker_{invocation}"),
+            )
+            .unwrap();
+            store
+                .reserve_progress_for_fingerprint_locked(
+                    &state_name,
+                    &mut state,
+                    &cfg.key,
+                    1,
+                    fingerprint,
+                    None,
+                )
+                .unwrap()
+        };
+        for invocation in 0..MAX_PROGRESS_NOTICE_ATTEMPTS {
+            assert!(matches!(
+                reserve_progress(&store, invocation),
+                ReserveOutcome::Reserved { .. }
+            ));
+        }
+        assert!(matches!(
+            reserve_progress(&store, 14),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::CapReached,
+                attempt_count: 14,
+                cap_reached: true,
+                was_duplicate: false,
+                ..
+            })
+        ));
+        // The last progress intent is reconciled as Unknown, not retried at the subcap.
+        drop(store);
+        let store = CoworkerNoticeStore::new(tmp.path().join("store")).unwrap();
+        assert!(matches!(
+            reserve_progress(&store, 13),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::Unknown,
+                attempt_count: 14,
+                was_duplicate: true,
+                cap_reached: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            store
+                .reserve_fatal_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    2,
+                    None
+                )
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+        assert!(matches!(
+            store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Complete,
+                    2,
+                    complete,
+                    None
+                )
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+        assert!(matches!(
+            store
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Complete,
+                    3,
+                    complete,
+                    None
+                )
+                .unwrap(),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::CapReached,
+                attempt_count: 16,
+                cap_reached: true,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reserve_progress(&store, 13),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::Unknown,
+                attempt_count: 16,
+                was_duplicate: true,
+                cap_reached: false,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reserve_progress(&store, 14),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::CapReached,
+                attempt_count: 16,
+                cap_reached: true,
+                was_duplicate: false,
                 ..
             })
         ));

@@ -736,6 +736,112 @@ impl CoworkerDriverStateRecord {
     }
 }
 
+/// Fixed owner lifecycle boundary at which a fatal error was observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoworkerDriverFailureStage {
+    /// Host, socket, or pipeline setup after physical admission.
+    OwnerSetup,
+    /// Owner RPC handling while retaining physical ownership.
+    OwnerRpc,
+    /// Quiescent admission and readiness inspection.
+    QuiescentCheck,
+    /// Controller or full-pipeline step, including result persistence.
+    PipelineTick,
+    /// Graceful shutdown, final state persistence, or status validation while ownership remains held.
+    OwnerTeardown,
+}
+
+/// Bounded software-owned diagnostic for the first fatal owner error.
+/// Raw errors may contain provider output, paths, or credentials and are never persisted here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoworkerDriverFatalError {
+    /// Stable native error code.
+    pub code: NativeErrorCode,
+    /// Owner boundary, not an inferred provider failure stage.
+    pub stage: CoworkerDriverFailureStage,
+    /// Fixed safe diagnostic, never raw provider or error prose.
+    pub message: String,
+    /// First observation time in milliseconds since Unix epoch.
+    pub recorded_at_ms: u64,
+    /// Admitted job revision retained for the stable failure notice.
+    pub job_revision: u64,
+}
+
+impl CoworkerDriverFatalError {
+    fn from_error(
+        error: &NativeError,
+        stage: CoworkerDriverFailureStage,
+        job_revision: u64,
+    ) -> Self {
+        Self {
+            code: error.code,
+            stage,
+            message: safe_owner_failure_message(error).to_string(),
+            recorded_at_ms: current_time_ms().max(1),
+            job_revision,
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), NativeError> {
+        if self.recorded_at_ms == 0
+            || self.job_revision == 0
+            || !SAFE_OWNER_FAILURE_MESSAGES.contains(&self.message.as_str())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "invalid bounded owner failure diagnostic",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const SAFE_OWNER_FAILURE_MESSAGES: &[&str] = &[
+    "Owner execution failed; inspect the recorded error code and stage.",
+    "Task verification rejected a worktree with no changes at the expected commit.",
+    "Task verification rejected the pre-commit diff gate or found no in-scope changes.",
+    "Task worktree manifest does not match the frozen task scope.",
+    "Integration worktree manifest does not match task ownership or run scope.",
+    "Controller lease is inactive or belongs to another physical owner.",
+    "Controller lease changed during task verification.",
+    "Controller lease changed during task review.",
+    "Controller lease changed during job completion.",
+    "Post-commit task worktree verification failed.",
+];
+
+fn safe_owner_failure_message(error: &NativeError) -> &'static str {
+    if error.code != NativeErrorCode::ValidationFailed {
+        return SAFE_OWNER_FAILURE_MESSAGES[0];
+    }
+    match error.message.as_str() {
+        "task worktree has no uncommitted changes to commit at expected pre-commit HEAD" => SAFE_OWNER_FAILURE_MESSAGES[1],
+        "task worktree failed pre-commit diff gate or has no in-scope changes" => SAFE_OWNER_FAILURE_MESSAGES[2],
+        "owned task worktree manifest does not match TaskAttemptExecutionArtifacts or frozen task scope"
+        | "task WorktreeManifest ownership, repository, base_commit, or allowed_write_paths drifted from frozen task scope" => SAFE_OWNER_FAILURE_MESSAGES[3],
+        "integration WorktreeManifest does not match task WorktreeManifest ownership/run scope" => SAFE_OWNER_FAILURE_MESSAGES[4],
+        "ControllerJobRuntimeState driver lease is not active for the current physical owner"
+        | "Controller lease ownership mismatch or lease is no longer active."
+        | "Lease instance_id or expected_lease_epoch does not match current lease owner." => SAFE_OWNER_FAILURE_MESSAGES[5],
+        "controller driver lease changed during task verification" => SAFE_OWNER_FAILURE_MESSAGES[6],
+        "controller driver lease changed during task review stage" => SAFE_OWNER_FAILURE_MESSAGES[7],
+        "controller driver lease changed during job completion" => SAFE_OWNER_FAILURE_MESSAGES[8],
+        "post-commit task worktree verification failed" => SAFE_OWNER_FAILURE_MESSAGES[9],
+        _ => SAFE_OWNER_FAILURE_MESSAGES[0],
+    }
+}
+
+/// Separate from replaceable lifecycle snapshots so setup failures and later stop/reopen
+/// projections cannot erase the first diagnosis. Scope is checked on every read.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredOwnerFailure {
+    key: CoworkerJobOwnershipKey,
+    owner_instance_id: String,
+    fatal_error: CoworkerDriverFatalError,
+}
+
 /// Status and step report returned by `status`, `reconcile`, and `run-owner`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoworkerDriverStatusReport {
@@ -749,6 +855,9 @@ pub struct CoworkerDriverStatusReport {
     pub approval_id: String,
     /// Observed owner state (`live_verified_owner`, `no_active_owner`, `stale_crash_artifact_detected`, etc.).
     pub owner_state: CoworkerDriverOwnerState,
+    /// Durable first fatal owner diagnosis, independent of task completion and stop state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatal_error: Option<CoworkerDriverFatalError>,
     /// Verified live ownership summary when a live owner is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_owner_summary: Option<CoworkerOwnershipSummary>,
@@ -1142,6 +1251,40 @@ impl CoworkerCodeDriver {
         Ok(Some(record))
     }
 
+    /// Reads the bounded first fatal diagnosis without advancing execution or replaying notices.
+    pub fn read_owner_failure_optional(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+    ) -> Result<Option<CoworkerDriverFatalError>, NativeError> {
+        read_owner_failure(self.driver_dir(), key)
+    }
+
+    // Diagnostics must never replace the primary error. Persist before the bounded existing
+    // bridge notice and before draining or releasing physical ownership.
+    async fn report_owner_failure(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        admitted_job_revision: u64,
+        stage: CoworkerDriverFailureStage,
+        error: NativeError,
+    ) -> NativeError {
+        let revision = session
+            .verify_admission()
+            .map_or(admitted_job_revision, |a| a.job.job_revision);
+        let failure = CoworkerDriverFatalError::from_error(&error, stage, revision);
+        // A failed persistence attempt still permits one bounded wakeup, never a replay.
+        let failure = persist_owner_failure(self.driver_dir(), session.guard(), failure.clone())
+            .unwrap_or(failure);
+        if let Ok(store) = crate::coworker_notice::CoworkerNoticeStore::new(
+            crate::coworker_notice::coworker_notice_dir(
+                self.controller.workflow_store().plans_dir(),
+            ),
+        ) {
+            let _ = store.notify_fatal_error(session, &failure).await;
+        }
+        error
+    }
+
     /// Runs the physical owner lifecycle (`run-owner`) for `(binding_id, thread_uuid, job_id)`.
     ///
     /// Acquires the exclusive physical [`OwnedCoworkerControllerSession`], verifies the full
@@ -1183,6 +1326,14 @@ impl CoworkerCodeDriver {
         let initial_prev_state = match self.read_driver_state_optional(&key) {
             Ok(st) => st,
             Err(err) => {
+                let err = self
+                    .report_owner_failure(
+                        &session,
+                        admission.job.job_revision,
+                        CoworkerDriverFailureStage::OwnerSetup,
+                        err,
+                    )
+                    .await;
                 let _ = session.release();
                 return Err(err);
             }
@@ -1195,10 +1346,23 @@ impl CoworkerCodeDriver {
         ) {
             Ok(mode) => mode,
             Err(err) => {
+                // An explicitly requested mode outside the frozen envelope is a caller
+                // refusal, not a new fatal failure of the admitted execution.
                 let _ = session.release();
                 return Err(err);
             }
         };
+
+        // Read-only host gates are admission refusals even for direct run_owner callers.
+        // Keep their original error and do not turn an existing stopped/uncertain host into
+        // a new fatal owner diagnosis. Actual startup/socket/runtime faults remain below.
+        if let Err(err) = self
+            .preflight_host_for_admission(&key, &admission, effective_mode)
+            .await
+        {
+            let _ = session.release();
+            return Err(err);
+        }
 
         // Ensure host readiness before entering the step/RPC loop. If host acquisition fails,
         // release the owned session cleanly before returning the error.
@@ -1208,6 +1372,14 @@ impl CoworkerCodeDriver {
         {
             Ok(host) => host,
             Err(err) => {
+                let err = self
+                    .report_owner_failure(
+                        &session,
+                        admission.job.job_revision,
+                        CoworkerDriverFailureStage::OwnerSetup,
+                        err,
+                    )
+                    .await;
                 let _ = session.release();
                 return Err(err);
             }
@@ -1218,6 +1390,14 @@ impl CoworkerCodeDriver {
         let listener = match bind_private_unix_listener(self.driver_dir(), &sock_file_name) {
             Ok(listener) => listener,
             Err(err) => {
+                let err = self
+                    .report_owner_failure(
+                        &session,
+                        admission.job.job_revision,
+                        CoworkerDriverFailureStage::OwnerSetup,
+                        err,
+                    )
+                    .await;
                 if let Some(handle) = host_session.owned_handle.take() {
                     let _ = handle.shutdown().await;
                 }
@@ -1231,6 +1411,14 @@ impl CoworkerCodeDriver {
                 match CoworkerPipelineService::new(self.controller.clone()) {
                     Ok(svc) => Some(svc),
                     Err(err) => {
+                        let err = self
+                            .report_owner_failure(
+                                &session,
+                                admission.job.job_revision,
+                                CoworkerDriverFailureStage::OwnerSetup,
+                                err,
+                            )
+                            .await;
                         let _ = remove_socket_if_present(&canonical_socket_path);
                         if let Some(handle) = host_session.owned_handle.take() {
                             let _ = handle.shutdown().await;
@@ -1263,6 +1451,14 @@ impl CoworkerCodeDriver {
             }
         }
         if let Some(err) = pipeline_driver_init_err {
+            let err = self
+                .report_owner_failure(
+                    &session,
+                    admission.job.job_revision,
+                    CoworkerDriverFailureStage::OwnerSetup,
+                    err,
+                )
+                .await;
             drop(pipeline_driver);
             let _ = remove_socket_if_present(&canonical_socket_path);
             if let Some(handle) = host_session.owned_handle.take() {
@@ -1323,6 +1519,14 @@ impl CoworkerCodeDriver {
         let initial_overall_status = match initial_state_res {
             Ok(status) => status,
             Err(err) => {
+                let err = self
+                    .report_owner_failure(
+                        &session,
+                        admission.job.job_revision,
+                        CoworkerDriverFailureStage::OwnerSetup,
+                        err,
+                    )
+                    .await;
                 drop(pipeline_driver);
                 let _ = remove_socket_if_present(&canonical_socket_path);
                 if let Some(handle) = host_session.owned_handle.take() {
@@ -1339,6 +1543,7 @@ impl CoworkerCodeDriver {
         let mut immediate_step_requested = false;
         let mut stop_loop = false;
         let mut loop_err: Option<NativeError> = None;
+        let mut failure_stage = CoworkerDriverFailureStage::PipelineTick;
         while !stop_loop {
             let in_flight_count = pipeline_driver
                 .as_ref()
@@ -1475,6 +1680,7 @@ impl CoworkerCodeDriver {
                             ))
                             .await
                             {
+                                failure_stage = CoworkerDriverFailureStage::OwnerRpc;
                                 loop_err = Some(err);
                                 break;
                             }
@@ -1502,6 +1708,7 @@ impl CoworkerCodeDriver {
                         match self.should_step_while_quiescent(&key, now_ms) {
                             Ok(should_step) => should_step,
                             Err(err) => {
+                                failure_stage = CoworkerDriverFailureStage::QuiescentCheck;
                                 loop_err = Some(err);
                                 break;
                             }
@@ -1557,7 +1764,7 @@ impl CoworkerCodeDriver {
                                                     runtime_state.stop_requested = true;
                                                     if runtime_state.stop_or_block_reason.is_none() {
                                                         runtime_state.stop_or_block_reason = Some(
-                                                            format!("owner RPC handler error: {err}"),
+                                                            "owner RPC handler failed; inspect execution_status fatal_error".to_string(),
                                                         );
                                                     }
                                                     Ok(())
@@ -1565,6 +1772,13 @@ impl CoworkerCodeDriver {
                                             );
                                         draining_after_stop = true;
                                         if loop_err.is_none() {
+                                            failure_stage = CoworkerDriverFailureStage::OwnerRpc;
+                                            // The retained tick can finish before this RPC error
+                                            // unwinds. Persist now so it cannot emit a normal
+                                            // milestone notice for the same fatal owner path.
+                                            let failure = CoworkerDriverFatalError::from_error(
+                                                &err, failure_stage, admission.job.job_revision);
+                                            let _ = persist_owner_failure(self.driver_dir(), session.guard(), failure);
                                             loop_err = Some(err);
                                         }
                                     }
@@ -1586,7 +1800,10 @@ impl CoworkerCodeDriver {
                             draining_after_stop = next_draining_after_stop;
                         }
                         Err(err) => {
-                            loop_err = Some(err);
+                            if loop_err.is_none() {
+                                failure_stage = CoworkerDriverFailureStage::PipelineTick;
+                                loop_err = Some(err);
+                            }
                             break;
                         }
                     }
@@ -1612,6 +1829,9 @@ impl CoworkerCodeDriver {
         }
 
         if let Some(err) = loop_err {
+            let err = self
+                .report_owner_failure(&session, admission.job.job_revision, failure_stage, err)
+                .await;
             if let Some(ref mut drv) = pipeline_driver {
                 if drv.in_flight_count() > 0 {
                     let _ = self
@@ -1644,24 +1864,25 @@ impl CoworkerCodeDriver {
         let _ = remove_socket_if_present(&canonical_socket_path);
         drop(listener);
 
-        let prev_state_before_shutdown = self.read_driver_state_optional(&key)?;
-        let mut shutdown_manifest_updated_at_ms: Option<i64> = prev_state_before_shutdown
-            .as_ref()
-            .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms);
-        let mut shutdown_host_instance_id: Option<String> = prev_state_before_shutdown
-            .as_ref()
-            .and_then(|s| s.owner_quiescent_host_instance_id.clone());
-        if let Some(handle) = host_session.owned_handle.take() {
-            let instance_id = handle.instance_id().to_owned();
-            handle.shutdown().await.map_err(map_host_error)?;
-            let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
-            if let Some(post_manifest) =
-                read_host_manifest_optional(&session_dir, &admission.approval)
-                    .map_err(map_host_error)?
-            {
-                if post_manifest.phase == HostPhase::Stopped
-                    && last_step_report.as_ref().is_some_and(|r| {
-                        matches!(
+        let teardown: Result<(), NativeError> = async {
+            let prev_state_before_shutdown = self.read_driver_state_optional(&key)?;
+            let mut shutdown_manifest_updated_at_ms: Option<i64> = prev_state_before_shutdown
+                .as_ref()
+                .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms);
+            let mut shutdown_host_instance_id: Option<String> = prev_state_before_shutdown
+                .as_ref()
+                .and_then(|s| s.owner_quiescent_host_instance_id.clone());
+            if let Some(handle) = host_session.owned_handle.take() {
+                let instance_id = handle.instance_id().to_owned();
+                handle.shutdown().await.map_err(map_host_error)?;
+                let session_dir = self.sessions_dir.join(&admission.approval.approval_id);
+                if let Some(post_manifest) =
+                    read_host_manifest_optional(&session_dir, &admission.approval)
+                        .map_err(map_host_error)?
+                {
+                    if post_manifest.phase == HostPhase::Stopped
+                        && last_step_report.as_ref().is_some_and(|r| {
+                            matches!(
                             r.status,
                             CoworkerControllerPhase1Status::AwaitingChecksOrReview
                                 | CoworkerControllerPhase1Status::AwaitingDependencyAcceptanceOrSeal
@@ -1670,50 +1891,76 @@ impl CoworkerCodeDriver {
                                 | CoworkerControllerPhase1Status::BlockedOrFailed
                                 | CoworkerControllerPhase1Status::Held
                         )
-                    })
-                {
-                    shutdown_manifest_updated_at_ms = Some(post_manifest.updated_at_ms);
-                    shutdown_host_instance_id = post_manifest.instance_id.or(Some(instance_id));
+                        })
+                    {
+                        shutdown_manifest_updated_at_ms = Some(post_manifest.updated_at_ms);
+                        shutdown_host_instance_id = post_manifest.instance_id.or(Some(instance_id));
+                    }
                 }
             }
-        }
 
-        let finished_at_ms = current_time_ms();
-        let owner_summary = session.guard().validate_before_effect(&key)?.clone();
-        if let Some(ref mut pipe_rep) = last_pipeline_report {
-            pipe_rep.draining_in_flight_after_stop = false;
-            pipe_rep.in_flight_stages.clear();
+            let finished_at_ms = current_time_ms();
+            let owner_summary = session.guard().validate_before_effect(&key)?.clone();
+            if let Some(ref mut pipe_rep) = last_pipeline_report {
+                pipe_rep.draining_in_flight_after_stop = false;
+                pipe_rep.in_flight_stages.clear();
+            }
+            let final_overall_status = last_step_report
+                .as_ref()
+                .map_or(initial_overall_status, |r| r.status);
+            let final_state = CoworkerDriverStateRecord {
+                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                binding_id: key.binding_id.clone(),
+                thread_uuid: key.thread_uuid.clone(),
+                job_id: key.job_id.clone(),
+                owner_instance_id: owner_summary.instance_id.clone(),
+                owner_challenge_digest: owner_summary.challenge_digest.clone(),
+                owner_pid_hint: owner_summary.pid_hint,
+                owner_uid: current_effective_uid(),
+                lock_file_identity: owner_summary.lock_file_identity,
+                socket_path: canonical_socket_path.display().to_string(),
+                host_mode: host_session.mode,
+                owner_active: false,
+                graceful_exit_completed: true,
+                owner_quiescent_host_shutdown_updated_at_ms: shutdown_manifest_updated_at_ms,
+                owner_quiescent_host_instance_id: shutdown_host_instance_id,
+                steps_completed,
+                last_overall_status: final_overall_status,
+                last_step_report: last_step_report.clone(),
+                execution_mode: Some(effective_mode),
+                last_pipeline_status: last_pipeline_report.as_ref().map(|r| r.status),
+                last_pipeline_report: last_pipeline_report.clone(),
+                pipeline_boundary: boundary_for_mode(effective_mode),
+                started_at_ms,
+                updated_at_ms: finished_at_ms,
+            };
+            self.write_driver_state(&key, &final_state)?;
+
+            // Validate final status inputs before releasing the guard. A later concurrent failure
+            // after release cannot safely send a notice from this former owner.
+            self.build_readonly_status_report(
+                &key,
+                Some(host_session.mode),
+                last_step_report.clone(),
+            )?;
+            Ok(())
         }
-        let final_overall_status = last_step_report
-            .as_ref()
-            .map_or(initial_overall_status, |r| r.status);
-        let final_state = CoworkerDriverStateRecord {
-            schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
-            binding_id: key.binding_id.clone(),
-            thread_uuid: key.thread_uuid.clone(),
-            job_id: key.job_id.clone(),
-            owner_instance_id: owner_summary.instance_id.clone(),
-            owner_challenge_digest: owner_summary.challenge_digest.clone(),
-            owner_pid_hint: owner_summary.pid_hint,
-            owner_uid: current_effective_uid(),
-            lock_file_identity: owner_summary.lock_file_identity,
-            socket_path: canonical_socket_path.display().to_string(),
-            host_mode: host_session.mode,
-            owner_active: false,
-            graceful_exit_completed: true,
-            owner_quiescent_host_shutdown_updated_at_ms: shutdown_manifest_updated_at_ms,
-            owner_quiescent_host_instance_id: shutdown_host_instance_id,
-            steps_completed,
-            last_overall_status: final_overall_status,
-            last_step_report: last_step_report.clone(),
-            execution_mode: Some(effective_mode),
-            last_pipeline_status: last_pipeline_report.as_ref().map(|r| r.status),
-            last_pipeline_report: last_pipeline_report.clone(),
-            pipeline_boundary: boundary_for_mode(effective_mode),
-            started_at_ms,
-            updated_at_ms: finished_at_ms,
-        };
-        self.write_driver_state(&key, &final_state)?;
+        .await;
+        if let Err(error) = teardown {
+            let error = self
+                .report_owner_failure(
+                    &session,
+                    admission.job.job_revision,
+                    CoworkerDriverFailureStage::OwnerTeardown,
+                    error,
+                )
+                .await;
+            if let Some(handle) = host_session.owned_handle.take() {
+                let _ = handle.shutdown().await;
+            }
+            let _ = session.release();
+            return Err(error);
+        }
 
         session.release()?;
         self.build_readonly_status_report(&key, Some(host_session.mode), last_step_report)
@@ -2175,6 +2422,31 @@ impl CoworkerCodeDriver {
             return Ok(live_report);
         }
         let execution_mode = options.and_then(|o| o.execution_mode);
+        // Match ensure's read-only refusal boundary before entering the owner lifecycle.
+        // run_owner reacquires ownership and verifies admission/readiness again, so this
+        // preflight grants no authority across the release/reacquisition boundary.
+        let session = self.controller.open_owned_session(
+            binding_id,
+            thread_uuid,
+            job_id,
+            current_time_ms(),
+        )?;
+        let preflight: Result<(), NativeError> = async {
+            let admission = session.verify_admission()?;
+            let previous = self.read_driver_state_optional(&key)?;
+            let mode = resolve_effective_execution_mode(
+                execution_mode,
+                previous.as_ref(),
+                &admission.job,
+                &admission.runtime_state,
+            )?;
+            self.preflight_host_for_admission(&key, &admission, mode)
+                .await
+        }
+        .await;
+        let release = session.release();
+        preflight?;
+        release?;
         self.run_owner(
             binding_id,
             thread_uuid,
@@ -2501,7 +2773,7 @@ impl CoworkerCodeDriver {
 
         let prev_state = self.read_driver_state_optional(key)?;
         let mut draining_after_stop = false;
-        let step_report = if host_mode == CoworkerDriverHostMode::QuiescentNoHostRequired {
+        let mut step_report = if host_mode == CoworkerDriverHostMode::QuiescentNoHostRequired {
             let admission = session.verify_admission()?;
             let lease = admission
                 .runtime_state
@@ -2654,6 +2926,39 @@ impl CoworkerCodeDriver {
             session.step(now_ms).await?
         };
         let next_steps_completed = steps_completed.saturating_add(1);
+        let mut progress_snapshots = Vec::new();
+        let admission = session.verify_admission()?;
+        if !admission.runtime_state.stop_requested {
+            let client = ApprovedHostClient::new(
+                Arc::clone(&self.authority),
+                &self.sessions_dir,
+                &key.binding_id,
+                &key.thread_uuid,
+            )
+            .map_err(map_host_error)?;
+            for observation in &mut step_report.tasks {
+                if !matches!(
+                    observation.host_status,
+                    TaskExecutionStatus::Running | TaskExecutionStatus::CancelRequested
+                ) {
+                    continue;
+                }
+                let snapshot = client
+                    .get_task(&admission.approval.approval_id, &observation.task_id)
+                    .await;
+                session.guard().validate_before_effect(key)?;
+                if let Ok(snapshot) = snapshot {
+                    if let Some(attention) =
+                        crate::coworker_notice::verified_progress_attention(&admission, &snapshot)
+                    {
+                        observation.run_id = snapshot.run_id.clone();
+                        observation.worker_id = snapshot.worker_id.clone();
+                        observation.watchdog_attention = Some(attention);
+                        progress_snapshots.push(snapshot);
+                    }
+                }
+            }
+        }
 
         let state_record = CoworkerDriverStateRecord {
             schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
@@ -2685,7 +2990,21 @@ impl CoworkerCodeDriver {
             updated_at_ms: current_time_ms(),
         };
         self.write_driver_state(key, &state_record)?;
+        let failed_during_this_owner = read_owner_failure_record(self.driver_dir(), key)?
+            .is_some_and(|failure| failure.owner_instance_id == state_record.owner_instance_id);
+        if !failed_during_this_owner && !progress_snapshots.is_empty() {
+            if let Ok(store) = crate::coworker_notice::CoworkerNoticeStore::new(
+                crate::coworker_notice::coworker_notice_dir(
+                    self.controller.workflow_store().plans_dir(),
+                ),
+            ) {
+                for snapshot in &progress_snapshots {
+                    let _ = store.notify_progress_attention(session, snapshot).await;
+                }
+            }
+        }
         if let Some(notice_kind) = match last_pipeline_report.as_ref().map(|r| r.status) {
+            _ if failed_during_this_owner => None,
             Some(CoworkerPipelineStatus::Completed) => {
                 Some(crate::coworker_notice::NoticeKind::Complete)
             }
@@ -3629,6 +3948,12 @@ impl CoworkerCodeDriver {
         live_in_flight_stages: Vec<CoworkerPipelineInFlightStageRef>,
         draining_after_stop: bool,
     ) -> Result<CoworkerDriverStatusReport, NativeError> {
+        let step_report = step_report.or_else(|| {
+            self.read_driver_state_optional(key)
+                .ok()
+                .flatten()
+                .and_then(|state| state.last_step_report)
+        });
         let mut inspection = self.inspect_scoped_job_readonly(key)?;
         if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
             filter_live_owned_in_flight_review_reservations(
@@ -3665,12 +3990,27 @@ impl CoworkerCodeDriver {
             &live_in_flight_stages,
         );
 
-        let (overall_status, tasks) = match (&effective_mode, step_report.as_ref()) {
+        let (overall_status, mut tasks) = match (&effective_mode, step_report.as_ref()) {
             (CoworkerDriverExecutionMode::Phase1InitialDispatchOnly, Some(report)) => {
                 (report.status, report.tasks.clone())
             }
             _ => self.synthesize_status_and_tasks(&inspection)?,
         };
+        if let Some(report) = step_report.as_ref() {
+            for task in &mut tasks {
+                task.watchdog_attention = report
+                    .tasks
+                    .iter()
+                    .find(|prior| {
+                        prior.task_id == task.task_id
+                            && prior.run_id.is_some()
+                            && prior.run_id == task.run_id
+                            && prior.worker_id == task.worker_id
+                    })
+                    .and_then(|prior| prior.watchdog_attention.clone())
+                    .filter(|attention| attention.validate_attention().is_ok());
+            }
+        }
         let blocked_on_unknown = has_unresolved_or_unknown_effect(
             &inspection.job,
             &inspection.runtime_state,
@@ -3722,6 +4062,7 @@ impl CoworkerCodeDriver {
             job_id: key.job_id.clone(),
             approval_id: inspection.approval.approval_id,
             owner_state: CoworkerDriverOwnerState::LiveVerifiedOwner,
+            fatal_error: self.read_owner_failure_optional(key)?,
             verified_owner_summary: Some(verified_owner_summary.clone()),
             lease,
             lease_active,
@@ -3824,7 +4165,22 @@ impl CoworkerCodeDriver {
             }
         });
 
-        let (overall_status, tasks) = self.synthesize_status_and_tasks(&inspection)?;
+        let (overall_status, mut tasks) = self.synthesize_status_and_tasks(&inspection)?;
+        if let Some(report) = step_report.as_ref() {
+            for task in &mut tasks {
+                task.watchdog_attention = report
+                    .tasks
+                    .iter()
+                    .find(|prior| {
+                        prior.task_id == task.task_id
+                            && prior.run_id.is_some()
+                            && prior.run_id == task.run_id
+                            && prior.worker_id == task.worker_id
+                    })
+                    .and_then(|prior| prior.watchdog_attention.clone())
+                    .filter(|attention| attention.validate_attention().is_ok());
+            }
+        }
         let blocked_on_unknown = has_unresolved_or_unknown_effect(
             &inspection.job,
             &inspection.runtime_state,
@@ -3860,6 +4216,7 @@ impl CoworkerCodeDriver {
             job_id: key.job_id.clone(),
             approval_id: inspection.approval.approval_id,
             owner_state,
+            fatal_error: self.read_owner_failure_optional(key)?,
             verified_owner_summary: None,
             lease,
             lease_active,
@@ -4402,6 +4759,7 @@ impl CoworkerCodeDriver {
                 task_worktree_id,
                 observed_model,
                 observed_effort,
+                watchdog_attention: None,
                 fenced,
             });
         }
@@ -4472,6 +4830,72 @@ impl CoworkerCodeDriver {
             "unable to locate same-package threadlane-flow binary for detached owner launch.",
         ))
     }
+}
+
+fn owner_failure_filename(key: &CoworkerJobOwnershipKey) -> String {
+    format!("coworker-owner-failure-{}.json", key_digest_tag(key, 32))
+}
+
+fn read_owner_failure(
+    root: &Path,
+    key: &CoworkerJobOwnershipKey,
+) -> Result<Option<CoworkerDriverFatalError>, NativeError> {
+    Ok(read_owner_failure_record(root, key)?.map(|record| record.fatal_error))
+}
+
+fn read_owner_failure_record(
+    root: &Path,
+    key: &CoworkerJobOwnershipKey,
+) -> Result<Option<StoredOwnerFailure>, NativeError> {
+    key.validate()?;
+    let Some(raw) = read_private_file_bounded(
+        &root.join(owner_failure_filename(key)),
+        4_096,
+        "coworker_owner_failure",
+    )?
+    else {
+        return Ok(None);
+    };
+    let record: StoredOwnerFailure = serde_json::from_slice(&raw)
+        .map_err(|err| map_json_error("coworker_owner_failure", err))?;
+    if record.key != *key {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            "owner failure diagnostic scope mismatch",
+        ));
+    }
+    record.fatal_error.validate()?;
+    validate_prefixed_random_id(&record.owner_instance_id, "cwo", "owner failure instance")?;
+    Ok(Some(record))
+}
+
+fn persist_owner_failure(
+    root: &Path,
+    guard: &crate::coworker_workflow::CoworkerJobOwnershipGuard,
+    failure: CoworkerDriverFatalError,
+) -> Result<CoworkerDriverFatalError, NativeError> {
+    let key = guard.key();
+    guard.validate_before_effect(&key)?;
+    // Keep the first diagnosis, while correlating the current failed physical owner so its
+    // retained tick cannot emit a normal milestone notice during fatal-error unwinding.
+    let failure = read_owner_failure(root, &key)?.unwrap_or(failure);
+    failure.validate()?;
+    prepare_private_dir(root, "coworker_driver_dir")?;
+    let record = StoredOwnerFailure {
+        key: key.clone(),
+        owner_instance_id: guard.validate_before_effect(&key)?.instance_id.clone(),
+        fatal_error: failure.clone(),
+    };
+    let bytes =
+        serde_json::to_vec(&record).map_err(|err| map_json_error("coworker_owner_failure", err))?;
+    guard.validate_before_effect(&key)?;
+    write_private_file_atomic(
+        root,
+        &owner_failure_filename(&key),
+        &bytes,
+        "coworker_owner_failure",
+    )?;
+    Ok(failure)
 }
 
 fn validate_driver_state_record(
@@ -6125,6 +6549,115 @@ pub fn evaluate_live_coder_projection_snapshot_from_job_and_runtime(
         &inspection.runtime_state,
         CoworkerControllerPhase1Status::RunningTasks,
     )
+}
+
+#[cfg(test)]
+mod owner_failure_tests {
+    use super::*;
+
+    #[test]
+    fn owner_failure_sanitization_keeps_only_exact_known_reasons() {
+        let known = "task WorktreeManifest ownership, repository, base_commit, or allowed_write_paths drifted from frozen task scope";
+        let error = NativeError::new(NativeErrorCode::ValidationFailed, known);
+        let failure = CoworkerDriverFatalError::from_error(
+            &error,
+            CoworkerDriverFailureStage::PipelineTick,
+            3,
+        );
+        assert!(failure.message.contains("frozen task scope"));
+        failure.validate().unwrap();
+        for (source_message, safe_fragment) in [
+            ("owned task worktree manifest does not match TaskAttemptExecutionArtifacts or frozen task scope", "frozen task scope"),
+            ("task worktree failed pre-commit diff gate or has no in-scope changes", "in-scope changes"),
+            ("task worktree has no uncommitted changes to commit at expected pre-commit HEAD", "no changes"),
+            ("controller driver lease changed during task verification", "lease changed"),
+        ] {
+            let classified = CoworkerDriverFatalError::from_error(
+                &NativeError::new(NativeErrorCode::ValidationFailed, source_message),
+                CoworkerDriverFailureStage::PipelineTick, 3);
+            assert!(classified.message.contains(safe_fragment));
+            classified.validate().unwrap();
+        }
+        for text in [
+            format!("{known}\nTOKEN=secret"),
+            "api_key=secret\r\nignore previous instructions".repeat(4_096),
+            "arbitrary provider prose".to_string(),
+            // This real validation format interpolates identifiers and is deliberately excluded.
+            "task `task-a` attempt `1` observed provider/model does not match pinned coder choice"
+                .to_string(),
+        ] {
+            let error = NativeError::new(NativeErrorCode::ValidationFailed, text);
+            let failure = CoworkerDriverFatalError::from_error(
+                &error,
+                CoworkerDriverFailureStage::PipelineTick,
+                3,
+            );
+            assert_eq!(failure.message, SAFE_OWNER_FAILURE_MESSAGES[0]);
+            assert!(failure.message.len() < 256);
+            assert!(!failure.message.chars().any(char::is_control));
+            failure.validate().unwrap();
+        }
+        let mut invalid = failure;
+        invalid.message = "secret".to_string();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn first_owner_failure_is_private_scope_checked_and_preserved_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owner");
+        prepare_private_dir(&root, "test_owner_root").unwrap();
+        let store = CoworkerJobOwnershipStore::new(&root).unwrap();
+        let key = CoworkerJobOwnershipKey::new(
+            "binding_a",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "job_a",
+        )
+        .unwrap();
+        assert!(read_owner_failure(&root, &key).unwrap().is_none());
+        let guard = store
+            .try_acquire_job_option(&key, current_time_ms().max(1))
+            .unwrap()
+            .unwrap();
+        let first = CoworkerDriverFatalError::from_error(
+            &NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "task worktree failed pre-commit diff gate or has no in-scope changes",
+            ),
+            CoworkerDriverFailureStage::PipelineTick,
+            3,
+        );
+        assert_eq!(
+            persist_owner_failure(&root, &guard, first.clone()).unwrap(),
+            first
+        );
+        let file = root.join(owner_failure_filename(&key));
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(guard);
+        let guard = store
+            .try_acquire_job_option(&key, current_time_ms().max(1))
+            .unwrap()
+            .unwrap();
+        let later = CoworkerDriverFatalError::from_error(
+            &NativeError::new(NativeErrorCode::IoError, "secret"),
+            CoworkerDriverFailureStage::OwnerSetup,
+            9,
+        );
+        assert_eq!(persist_owner_failure(&root, &guard, later).unwrap(), first);
+        assert_eq!(read_owner_failure(&root, &key).unwrap(), Some(first));
+        let other =
+            CoworkerJobOwnershipKey::new("binding_b", &key.thread_uuid, &key.job_id).unwrap();
+        fs::copy(&file, root.join(owner_failure_filename(&other))).unwrap();
+        assert_eq!(
+            read_owner_failure(&root, &other).unwrap_err().code,
+            NativeErrorCode::SecurityViolation
+        );
+        fs::write(&file, vec![b'x'; 4_097]).unwrap();
+        assert!(read_owner_failure(&root, &key).is_err());
+    }
 }
 
 #[cfg(test)]

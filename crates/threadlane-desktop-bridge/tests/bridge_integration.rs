@@ -598,6 +598,7 @@ fn sample_worker_snapshot(
             head_commit: Some("fedcba9876543210fedcba9876543210fedcba98".to_string()),
         },
         progress: WorkerProgressSummary {
+            watchdog_attention: None,
             durable_progress_events: 4,
             coalesced_progress_events: 2,
             dropped_live_events: 0,

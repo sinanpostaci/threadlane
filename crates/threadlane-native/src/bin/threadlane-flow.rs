@@ -837,9 +837,49 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
         Some(parent) => (parent.clone(), Some(generate_observation_id("obsc"))),
         None => (generate_observation_id("obsreq"), None),
     };
-    let mut resolved_plan_id = read_env_plan_id();
-    let mut verified_job_id: Option<String> = None;
-    let mut resolved_approval_id: Option<String> = None;
+    // Resolve once so attribution and execution use the same typed request.
+    let driver_request = match &cli.command {
+        FlowCommand::CodeDriver(command) => {
+            Some(resolve_driver_command_request(command, &binding, &thread))
+        }
+        _ => None,
+    };
+    let driver_correlation = driver_request
+        .as_ref()
+        .and_then(|request| request.as_ref().ok())
+        .and_then(|request| {
+            load_driver_observation_correlation(
+                &registry_dir,
+                &plans_dir,
+                &authority_dir,
+                &binding,
+                &thread,
+                &request.job_id,
+            )
+            .ok()
+        });
+    let mut resolved_plan_id = if driver_request.is_some() {
+        driver_correlation
+            .as_ref()
+            .map(|value| value.plan_id.clone())
+    } else {
+        read_env_plan_id()
+    };
+    let mut verified_job_id = driver_correlation
+        .as_ref()
+        .map(|value| value.job_id.clone());
+    let mut resolved_approval_id = driver_correlation
+        .as_ref()
+        .map(|value| value.approval_id.clone());
+    let project_path = driver_correlation
+        .as_ref()
+        .map(|value| value.project_path.clone());
+    let project_label = project_path.as_deref().and_then(|path| {
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+    });
     let mut resolved_task_id: Option<String> = None;
     let mut resolved_executor: Option<ObservationExecutor> = None;
     let started_at_ms = current_observation_time_ms();
@@ -856,15 +896,15 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 at_ms: started_at_ms,
                 pid: Some(std::process::id()),
                 process_instance: current_process_instance(),
-                project_label: None,
-                project_path: None,
+                project_label: project_label.clone(),
+                project_path: project_path.clone(),
                 binding_id: Some(binding.clone()),
                 thread_uuid: Some(thread.clone()),
                 thread_label: None,
-                job_id: None,
+                job_id: verified_job_id.clone(),
                 plan_id: resolved_plan_id.clone(),
                 task_id: None,
-                approval_id: None,
+                approval_id: resolved_approval_id.clone(),
                 operation: op_name.to_string(),
                 title: op_name.replace('.', " "),
                 state: ObservationCallState::Running,
@@ -1207,8 +1247,7 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                     &sessions_dir,
                     &binding,
                     &thread,
-                    &mut verified_job_id,
-                    &mut resolved_approval_id,
+                    driver_request.expect("code-driver request was resolved above")?,
                 )
                 .await
             }
@@ -1251,8 +1290,8 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 at_ms: finished_at_ms,
                 pid: Some(std::process::id()),
                 process_instance: current_process_instance(),
-                project_label: None,
-                project_path: None,
+                project_label,
+                project_path,
                 binding_id: Some(binding.clone()),
                 thread_uuid: Some(thread),
                 thread_label: None,
@@ -2037,6 +2076,138 @@ fn resolve_coworker_driver_request(
     Ok(req)
 }
 
+// Observation verifies immutable attribution, not permission to execute. It neither
+// acquires controller ownership nor starts/reconciles a host to obtain admission.
+struct DriverObservationCorrelation {
+    job_id: String,
+    plan_id: String,
+    approval_id: String,
+    project_path: String,
+}
+
+fn load_driver_observation_correlation(
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    binding: &str,
+    thread: &str,
+    job_id: &str,
+) -> Result<DriverObservationCorrelation, OperatorCliError> {
+    let store = open_grant_store(plans_dir)?;
+    let job = load_scoped_job(&store, binding, thread, job_id)?;
+    let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
+        OperatorCliError::new("not_configured", "Job has no frozen approval linkage.")
+    })?;
+    let authority = open_authority(registry_dir, plans_dir, authority_dir)?;
+    let approval = authority
+        .get_for_operator(&linkage.approval_id)
+        .map_err(|error| map_authority_error(&error))?;
+    if approval.binding_id != binding || approval.thread_uuid != thread {
+        return Err(OperatorCliError::new(
+            "scope_mismatch",
+            STORED_SCOPE_MISMATCH,
+        ));
+    }
+    linkage
+        .verify_matches_approval(&approval)
+        .map_err(|error| map_native_error(&error, false))?;
+    Ok(DriverObservationCorrelation {
+        job_id: job.job_id,
+        plan_id: linkage.plan_id.clone(),
+        approval_id: linkage.approval_id.clone(),
+        project_path: linkage.project_base.repository_path.clone(),
+    })
+}
+
+fn resolve_driver_command_request(
+    command: &CoworkerDriverCommand,
+    binding: &str,
+    thread: &str,
+) -> Result<CoworkerDriverRequest, OperatorCliError> {
+    let (
+        request,
+        job_id,
+        reason,
+        max_steps,
+        poll_interval_ms,
+        idle_linger_ms,
+        execution_mode,
+        initial_dispatch_only,
+    ) = match command {
+        CoworkerDriverCommand::RunOwner {
+            request,
+            job_id,
+            max_steps,
+            poll_interval_ms,
+            idle_linger_ms,
+            execution_mode,
+            initial_dispatch_only,
+        }
+        | CoworkerDriverCommand::Ensure {
+            request,
+            job_id,
+            max_steps,
+            poll_interval_ms,
+            idle_linger_ms,
+            execution_mode,
+            initial_dispatch_only,
+        } => (
+            request,
+            job_id,
+            None,
+            *max_steps,
+            *poll_interval_ms,
+            *idle_linger_ms,
+            execution_mode.clone(),
+            *initial_dispatch_only,
+        ),
+        CoworkerDriverCommand::Status { request, job_id } => {
+            (request, job_id, None, None, None, None, None, false)
+        }
+        CoworkerDriverCommand::Reconcile {
+            request,
+            job_id,
+            execution_mode,
+            initial_dispatch_only,
+        } => (
+            request,
+            job_id,
+            None,
+            None,
+            None,
+            None,
+            execution_mode.clone(),
+            *initial_dispatch_only,
+        ),
+        CoworkerDriverCommand::Cancel {
+            request,
+            job_id,
+            reason,
+        } => (
+            request,
+            job_id,
+            reason.clone(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        ),
+    };
+    resolve_coworker_driver_request(
+        request.as_deref(),
+        job_id.clone(),
+        reason,
+        max_steps,
+        poll_interval_ms,
+        idle_linger_ms,
+        execution_mode,
+        initial_dispatch_only,
+        binding,
+        thread,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_coworker_driver(
     subcommand: CoworkerDriverCommand,
@@ -2047,8 +2218,7 @@ async fn run_coworker_driver(
     sessions_dir: &Path,
     binding: &str,
     thread: &str,
-    verified_job_id: &mut Option<String>,
-    resolved_approval_id: &mut Option<String>,
+    req: CoworkerDriverRequest,
 ) -> Result<(), OperatorCliError> {
     let driver = CoworkerCodeDriver::open_from_dirs(
         state_dir,
@@ -2060,27 +2230,7 @@ async fn run_coworker_driver(
     .map_err(|error| map_native_error(&error, false))?;
 
     match subcommand {
-        CoworkerDriverCommand::RunOwner {
-            request,
-            job_id,
-            max_steps,
-            poll_interval_ms,
-            idle_linger_ms,
-            execution_mode,
-            initial_dispatch_only,
-        } => {
-            let req = resolve_coworker_driver_request(
-                request.as_deref(),
-                job_id,
-                None,
-                max_steps,
-                poll_interval_ms,
-                idle_linger_ms,
-                execution_mode,
-                initial_dispatch_only,
-                binding,
-                thread,
-            )?;
+        CoworkerDriverCommand::RunOwner { .. } => {
             let options = CoworkerDriverRunOptions {
                 max_steps: req.max_steps.or(DEFAULT_DRIVER_MAX_STEPS),
                 poll_interval_ms: req
@@ -2100,31 +2250,9 @@ async fn run_coworker_driver(
                 "outcome_unknown",
                 MUTATION_SCOPE_MISMATCH,
             )?;
-            *verified_job_id = Some(report.job_id.clone());
-            *resolved_approval_id = Some(report.approval_id.clone());
             write_result(binding, &report, true)
         }
-        CoworkerDriverCommand::Ensure {
-            request,
-            job_id,
-            max_steps,
-            poll_interval_ms,
-            idle_linger_ms,
-            execution_mode,
-            initial_dispatch_only,
-        } => {
-            let req = resolve_coworker_driver_request(
-                request.as_deref(),
-                job_id,
-                None,
-                max_steps,
-                poll_interval_ms,
-                idle_linger_ms,
-                execution_mode,
-                initial_dispatch_only,
-                binding,
-                thread,
-            )?;
+        CoworkerDriverCommand::Ensure { .. } => {
             let options = if req.max_steps.is_some()
                 || req.poll_interval_ms.is_some()
                 || req.idle_linger_ms.is_some()
@@ -2152,23 +2280,9 @@ async fn run_coworker_driver(
                 "outcome_unknown",
                 MUTATION_SCOPE_MISMATCH,
             )?;
-            *verified_job_id = Some(report.status.job_id.clone());
-            *resolved_approval_id = Some(report.status.approval_id.clone());
             write_result(binding, &report, true)
         }
-        CoworkerDriverCommand::Status { request, job_id } => {
-            let req = resolve_coworker_driver_request(
-                request.as_deref(),
-                job_id,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                binding,
-                thread,
-            )?;
+        CoworkerDriverCommand::Status { .. } => {
             let report = driver
                 .status(binding, thread, &req.job_id)
                 .await
@@ -2180,28 +2294,9 @@ async fn run_coworker_driver(
                 "scope_mismatch",
                 STORED_SCOPE_MISMATCH,
             )?;
-            *verified_job_id = Some(report.job_id.clone());
-            *resolved_approval_id = Some(report.approval_id.clone());
             write_result(binding, &report, false)
         }
-        CoworkerDriverCommand::Reconcile {
-            request,
-            job_id,
-            execution_mode,
-            initial_dispatch_only,
-        } => {
-            let req = resolve_coworker_driver_request(
-                request.as_deref(),
-                job_id,
-                None,
-                None,
-                None,
-                None,
-                execution_mode,
-                initial_dispatch_only,
-                binding,
-                thread,
-            )?;
+        CoworkerDriverCommand::Reconcile { .. } => {
             let options = req.execution_mode.map(|mode| CoworkerDriverRunOptions {
                 execution_mode: Some(mode),
                 ..CoworkerDriverRunOptions::default()
@@ -2217,27 +2312,9 @@ async fn run_coworker_driver(
                 "outcome_unknown",
                 MUTATION_SCOPE_MISMATCH,
             )?;
-            *verified_job_id = Some(report.job_id.clone());
-            *resolved_approval_id = Some(report.approval_id.clone());
             write_result(binding, &report, true)
         }
-        CoworkerDriverCommand::Cancel {
-            request,
-            job_id,
-            reason,
-        } => {
-            let req = resolve_coworker_driver_request(
-                request.as_deref(),
-                job_id,
-                reason,
-                None,
-                None,
-                None,
-                None,
-                false,
-                binding,
-                thread,
-            )?;
+        CoworkerDriverCommand::Cancel { .. } => {
             let report = driver
                 .cancel(binding, thread, &req.job_id, req.reason)
                 .await
@@ -2249,8 +2326,6 @@ async fn run_coworker_driver(
                 "outcome_unknown",
                 MUTATION_SCOPE_MISMATCH,
             )?;
-            *verified_job_id = Some(report.job_id.clone());
-            *resolved_approval_id = Some(report.approval_id.clone());
             write_result(binding, &report, true)
         }
     }

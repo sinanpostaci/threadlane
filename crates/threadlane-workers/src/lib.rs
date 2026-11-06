@@ -51,6 +51,8 @@ pub(crate) mod opencode_collector;
 pub mod opencode_metadata;
 /// Session-only provider file permission policies and Antigravity `--settings` builders.
 pub mod permissions;
+/// Advisory progress hints and soft deadlines within the existing hard runtime ceiling.
+pub mod progress_watchdog;
 /// Typed worker specification, execution budgets, policy allowlists, and exact argv builders.
 pub mod spec;
 /// Incremental NDJSON stream parser, normalized events, and requested-vs-observed evidence checks.
@@ -123,6 +125,10 @@ pub use permissions::{
     MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
     OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
     OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
+};
+pub use progress_watchdog::{
+    ProgressAttentionReason, ProgressWatchdog, ProgressWatchdogPolicy, ProgressWatchdogSnapshot,
+    ProgressWatchdogStatus,
 };
 pub use spec::resolve_model_target;
 pub use spec::{

@@ -2844,6 +2844,7 @@ fn build_and_validate_derived_coder_worker_spec(
         )
     })?;
     let budgets = ExecutionBudgets {
+        progress_watchdog: adm.approval.budgets.progress_watchdog.clone(),
         timeout_ms: adm
             .approval
             .budgets

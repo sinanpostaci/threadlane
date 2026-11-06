@@ -70,9 +70,11 @@ pub use protocol::{
     HostControlRuntimeState, HostControlStatusResponse, IdempotentBindingOutcome,
     RearmHostWakeupRequest, RearmHostWakeupResponse, RetryWakeupRequest, RunSummary, ScopedRequest,
     ScopedResponse, StatusResponse, StopIdleHostRequest, WorkerAcceptanceState, WorkerClaim,
-    WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary, WorkerProgressSummary,
-    WorkerProgressUpdate, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
-    WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS, WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
+    WorkerCompletionRecord, WorkerExecutionBinding, WorkerOutcomeSummary,
+    WorkerProgressAttentionReason, WorkerProgressSummary, WorkerProgressUpdate,
+    WorkerProgressWatchdogSnapshot, WorkerProgressWatchdogStatus, WorkerSnapshot, WorkerStatus,
+    WorkerWorktreeSummary, WorkerWorktreeUpdate, MAX_STATUS_RECENT_RUNS,
+    WORKER_EXECUTION_BINDING_SCHEMA_VERSION,
 };
 pub use supervisor::{
     Supervisor, SupervisorConfig, SupervisorHandle, DEFAULT_TICK_INTERVAL_MS, MAX_HTTP_BODY_BYTES,

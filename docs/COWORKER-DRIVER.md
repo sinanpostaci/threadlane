@@ -120,3 +120,25 @@ or `--request <ABS_PATH_TO_0600_JSON>`:
      `CoworkerDerivedCancellationBoundary::OriginalAndDerivedSignalledDirectCheckReviewerClosureDrainedFenced`),
      prevents any new stage dispatch, fences late outputs from promoting to receipts or downstream
      stages, and releases the guard and owned host only after in-flight futures reach `0`.
+
+## Fatal owner diagnostics
+
+Admitted owner setup, RPC, quiescent-check, and pipeline-tick failures record the first
+`fatal_error` in a separate private `0600` scope-checked file before draining or teardown,
+while the physical guard remains valid. The record is bounded to 4 KiB and contains the
+native error code, a fixed owner stage, a safe message, observation time, and admitted
+job revision. Exact known software validation messages map to fixed descriptions;
+arbitrary error/provider prose, paths, credentials, and control characters are excluded.
+Later cancellation or replacement of the owner lifecycle snapshot does not erase it.
+Live and historical driver status and MCP `execution_status` expose the optional record;
+older scopes without one remain compatible.
+
+When the job already has a validated native notice configuration, the fatal path attempts
+one existing-bridge wake-up before draining. The payload contains only the fixed job status
+message directing the Coworker to `execution_status`. A separate fingerprint permits at most
+one fatal attempt per binding/thread/job, including after revision changes, reopening,
+or operator stop. Reservation is durable before transport, shares the existing attempt cap,
+and Intent/Unknown/Failed/Submitted attempts are never replayed automatically. A transport
+receipt means submission only. Neither diagnosis nor notification declares completion,
+acceptance, or remote inference termination. Persistence and notice errors never replace
+the original owner error; diagnostics remain best effort when storage or admission fails.

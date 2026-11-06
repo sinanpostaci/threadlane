@@ -2068,3 +2068,9 @@ async fn automatic_pipeline_enforces_pre_effect_hold_stop_unknown_and_conflictin
 
 #[path = "support/coworker_full_driver.rs"]
 mod coworker_full_driver;
+
+#[path = "support/coworker_owner_failure.rs"]
+mod coworker_owner_failure;
+
+#[path = "support/coworker_progress_attention.rs"]
+mod coworker_progress_attention;

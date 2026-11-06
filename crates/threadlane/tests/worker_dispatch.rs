@@ -94,6 +94,7 @@ fn write_private_workers_config(path: &Path, value: &Value) {
 
 fn default_test_budgets(timeout_ms: u64) -> ExecutionBudgets {
     ExecutionBudgets {
+        progress_watchdog: None,
         timeout_ms,
         max_line_bytes: 32 * 1024,
         max_stdout_bytes: 256 * 1024,
@@ -1831,6 +1832,7 @@ async fn test_stale_callbacks_crash_recovery_unknown_and_shutdown_drop() {
             core.record_worker_progress(
                 &forged_claim,
                 &[WorkerProgressUpdate {
+                    watchdog_attention: None,
                     event_kind: "assistant_message".to_string(),
                     summary: "forged".to_string(),
                 }],

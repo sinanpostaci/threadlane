@@ -91,6 +91,7 @@ fn empty_binding_and_read_only_invariants_across_reopen() {
     core.record_worker_progress(
         &claim,
         &[WorkerProgressUpdate {
+            watchdog_attention: None,
             event_kind: "assistant".to_string(),
             summary: "Inspecting crate".to_string(),
         }],

@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -16,12 +17,14 @@ use crate::fs_safety::{
 };
 use crate::opencode_collector::{self, OpenCodeCollectorContext, OpenCodeCollectorError};
 use crate::opencode_metadata::{OpenCodeMetadataEvidence, OwnedOpenCodeSession};
+use crate::progress_watchdog::{ProgressWatchdog, ProgressWatchdogSnapshot};
 use crate::spec::{
     is_pinned_codex_read_only_argv, AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget,
     WorkerProvider, WorkerSpec,
 };
 use crate::stream::{
-    FieldEvidence, NdjsonStreamParser, NormalizedWorkerEvent, StreamEvidenceSummary,
+    FieldEvidence, NdjsonStreamParser, NormalizedEventKind, NormalizedWorkerEvent,
+    StreamEvidenceSummary,
 };
 
 /// Maximum byte length of the sanitized stderr diagnostic summary in [`WorkerExecutionReport`].
@@ -178,6 +181,9 @@ pub struct WorkerExecutionReport {
     /// Finite static error code when OpenCode v2 session allocation or metadata collection failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_metadata_error: Option<String>,
+    /// Advisory tool-hint supervision, independent of evidence verification and acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_watchdog: Option<ProgressWatchdogSnapshot>,
 }
 
 impl WorkerExecutionReport {
@@ -1022,6 +1028,10 @@ where
     } = inputs;
 
     let start_instant = Instant::now();
+    let watchdog = Arc::new(Mutex::new(ProgressWatchdog::new(
+        budgets.timeout_ms,
+        budgets.progress_watchdog.as_ref(),
+    )?));
     let overall_deadline =
         tokio::time::Instant::from_std(start_instant + budgets.timeout_duration());
     let started_at_ms = current_unix_epoch_ms()?;
@@ -1060,6 +1070,12 @@ where
                     None
                 };
                 if let Some((abort_status, abort_code)) = pre_spawn_abort {
+                    if abort_status == WorkerRunStatus::TimedOut {
+                        watchdog
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .poll(budgets.timeout_ms);
+                    }
                     let empty_parser = NdjsonStreamParser::new_for_provider(
                         provider,
                         resolved_model.clone(),
@@ -1091,6 +1107,12 @@ where
                             evidence: empty_parser.finalize(),
                             opencode_metadata: None,
                             opencode_metadata_error: Some(abort_code.to_string()),
+                            progress_watchdog: Some(
+                                watchdog
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .snapshot(duration_ms),
+                            ),
                         },
                         None,
                     ));
@@ -1098,6 +1120,12 @@ where
             }
             Err(alloc_err) => {
                 let status = map_collector_error_to_run_status(alloc_err);
+                if status == WorkerRunStatus::TimedOut {
+                    watchdog
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .poll(budgets.timeout_ms);
+                }
                 let cleanup_incomplete =
                     matches!(alloc_err, OpenCodeCollectorError::CleanupIncomplete);
                 let empty_parser = NdjsonStreamParser::new_for_provider(
@@ -1131,6 +1159,12 @@ where
                         evidence: empty_parser.finalize(),
                         opencode_metadata: None,
                         opencode_metadata_error: Some(alloc_err.as_str().to_string()),
+                        progress_watchdog: Some(
+                            watchdog
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .snapshot(duration_ms),
+                        ),
                     },
                     None,
                 ));
@@ -1210,7 +1244,12 @@ where
         budgets.clone(),
         overflow_tx.clone(),
         drain_stop_rx.clone(),
-        progress_tx,
+        LiveProgressObserver {
+            progress_tx: progress_tx.clone(),
+            watchdog: Arc::clone(&watchdog),
+            start_instant,
+            dropped_live_events: 0,
+        },
     ));
 
     let mut stderr_handle = tokio::spawn(drain_stderr_incremental(
@@ -1224,6 +1263,7 @@ where
     let mut cancelled = false;
     let mut recorded_overflow: Option<OutputOverflowKind> = None;
     let mut descendants_terminated_after_exit = false;
+    let mut dropped_supervisor_events = 0usize;
     let exit_status: Option<ExitStatus>;
 
     if *cancel_rx.borrow_and_update() {
@@ -1231,12 +1271,37 @@ where
         exit_status = terminate_and_reap_group(pgid, &mut child).await;
     } else if tokio::time::Instant::now() >= overall_deadline {
         timed_out = true;
+        watchdog
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .poll(budgets.timeout_ms);
         exit_status = terminate_and_reap_group(pgid, &mut child).await;
     } else {
         let timeout_sleep = tokio::time::sleep_until(overall_deadline);
         tokio::pin!(timeout_sleep);
 
-        tokio::select! {
+        loop {
+            let next_soft_ms = watchdog
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .next_deadline_ms();
+            let soft_sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(
+                start_instant + Duration::from_millis(next_soft_ms),
+            ));
+            tokio::pin!(soft_sleep);
+            tokio::select! {
+            biased;
+            () = &mut timeout_sleep => {
+                timed_out = true;
+                watchdog.lock().unwrap_or_else(|p| p.into_inner()).poll(budgets.timeout_ms);
+                exit_status = terminate_and_reap_group(pgid, &mut child).await;
+                break;
+            }
+            () = wait_for_cancellation(cancel_rx) => {
+                cancelled = true;
+                exit_status = terminate_and_reap_group(pgid, &mut child).await;
+                break;
+            }
             wait_res = child.wait() => {
                 exit_status = wait_res.ok();
                 descendants_terminated_after_exit =
@@ -1245,18 +1310,32 @@ where
                         &stdout_handle,
                         &stderr_handle,
                     ).await;
+                break;
             }
             Some(overflow_kind) = overflow_rx.recv() => {
                 recorded_overflow = Some(overflow_kind);
                 exit_status = terminate_and_reap_group(pgid, &mut child).await;
+                break;
             }
-            () = &mut timeout_sleep => {
-                timed_out = true;
-                exit_status = terminate_and_reap_group(pgid, &mut child).await;
+            () = &mut soft_sleep => {
+                let elapsed_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+                let attention = watchdog.lock().unwrap_or_else(|p| p.into_inner()).poll(elapsed_ms);
+                if let (Some(snapshot), Some(tx)) = (attention, progress_tx.as_ref()) {
+                    let event = NormalizedWorkerEvent {
+                        line_number: 0,
+                        kind: NormalizedEventKind::SupervisorAttention,
+                        raw_type: "threadlane.progress_watchdog".to_string(),
+                        session_id: None,
+                        model: None,
+                        effort: None,
+                        tool_name: None,
+                        summary: serde_json::to_string(&snapshot).ok(),
+                    };
+                    if tx.try_send(event).is_err() {
+                        dropped_supervisor_events = dropped_supervisor_events.saturating_add(1);
+                    }
+                }
             }
-            () = wait_for_cancellation(cancel_rx) => {
-                cancelled = true;
-                exit_status = terminate_and_reap_group(pgid, &mut child).await;
             }
         }
     }
@@ -1373,6 +1452,16 @@ where
     }
 
     let duration_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+    if status == WorkerRunStatus::TimedOut {
+        watchdog
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .poll(budgets.timeout_ms);
+    }
+    let final_watchdog = watchdog
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .snapshot(duration_ms);
 
     Ok((
         WorkerExecutionReport {
@@ -1393,10 +1482,11 @@ where
             descendants_terminated_after_exit,
             cleanup_incomplete,
             redacted_stderr_summary,
-            dropped_live_events,
+            dropped_live_events: dropped_live_events.saturating_add(dropped_supervisor_events),
             evidence,
             opencode_metadata,
             opencode_metadata_error,
+            progress_watchdog: Some(final_watchdog),
         },
         response_collector,
     ))
@@ -1429,24 +1519,35 @@ struct StdoutDrainOutput {
     dropped_live_events: usize,
 }
 
+struct LiveProgressObserver {
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    watchdog: Arc<Mutex<ProgressWatchdog>>,
+    start_instant: Instant,
+    dropped_live_events: usize,
+}
+
 fn ingest_and_observe_line(
     parser: &mut NdjsonStreamParser,
     response_collector: Option<&mut AdvisoryResponseCollector>,
     raw_line: &[u8],
-    progress_tx: Option<&mpsc::Sender<NormalizedWorkerEvent>>,
-    dropped_live_events: &mut usize,
+    observer: &mut LiveProgressObserver,
 ) {
     if let Some(collector) = response_collector {
         collector.ingest_line(raw_line);
     }
-    if let Some(tx) = progress_tx {
-        if let Some(event) = parser.ingest_line_with_event(raw_line) {
+    if let Some(event) = parser.ingest_line_with_event(raw_line) {
+        let elapsed_ms =
+            u64::try_from(observer.start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+        observer
+            .watchdog
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe(&event, elapsed_ms);
+        if let Some(tx) = &observer.progress_tx {
             if tx.try_send(event).is_err() {
-                *dropped_live_events = dropped_live_events.saturating_add(1);
+                observer.dropped_live_events = observer.dropped_live_events.saturating_add(1);
             }
         }
-    } else {
-        parser.ingest_line(raw_line);
     }
 }
 
@@ -1457,7 +1558,7 @@ async fn drain_stdout_incremental(
     budgets: ExecutionBudgets,
     overflow_tx: mpsc::UnboundedSender<OutputOverflowKind>,
     mut drain_stop_rx: watch::Receiver<bool>,
-    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    mut observer: LiveProgressObserver,
 ) -> StdoutDrainOutput {
     let max_line_bytes = budgets.max_line_bytes;
     let max_stdout_bytes = budgets.max_stdout_bytes;
@@ -1465,7 +1566,6 @@ async fn drain_stdout_incremental(
     let mut line_buf: Vec<u8> = Vec::with_capacity(4096.min(max_line_bytes));
     let mut chunk = [0u8; 4096];
     let mut overflow: Option<OutputOverflowKind> = None;
-    let mut dropped_live_events: usize = 0;
 
     loop {
         let read_res = tokio::select! {
@@ -1479,8 +1579,7 @@ async fn drain_stdout_incremental(
                     &mut parser,
                     response_collector.as_mut(),
                     &line_buf,
-                    progress_tx.as_ref(),
-                    &mut dropped_live_events,
+                    &mut observer,
                 );
                 line_buf.clear();
             }
@@ -1493,8 +1592,7 @@ async fn drain_stdout_incremental(
                         &mut parser,
                         response_collector.as_mut(),
                         &line_buf,
-                        progress_tx.as_ref(),
-                        &mut dropped_live_events,
+                        &mut observer,
                     );
                     line_buf.clear();
                 }
@@ -1531,8 +1629,7 @@ async fn drain_stdout_incremental(
                             &mut parser,
                             response_collector.as_mut(),
                             &line_buf,
-                            progress_tx.as_ref(),
-                            &mut dropped_live_events,
+                            &mut observer,
                         );
                         line_buf.clear();
                     }
@@ -1548,13 +1645,12 @@ async fn drain_stdout_incremental(
         }
     }
 
-    drop(progress_tx);
     StdoutDrainOutput {
         bytes_captured: total_bytes,
         evidence: parser.finalize(),
         response_collector,
         overflow,
-        dropped_live_events,
+        dropped_live_events: observer.dropped_live_events,
     }
 }
 

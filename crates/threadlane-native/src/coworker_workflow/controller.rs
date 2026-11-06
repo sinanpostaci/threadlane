@@ -150,6 +150,10 @@ pub struct CoworkerControllerTaskObservation {
     /// Provider telemetry effort observed on the host worker snapshot, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_effort: Option<String>,
+    /// Sticky software-supervision attention from the genuine host worker snapshot, when
+    /// available. This is advisory progress evidence, never an outcome or model metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_attention: Option<threadlane_core::WorkerProgressWatchdogSnapshot>,
     /// Whether this task was fenced by a hold, stop request, superseding brief, or sibling impact.
     pub fenced: bool,
 }
@@ -2282,6 +2286,10 @@ impl CoworkerControllerService {
                     .and_then(|w| w.worktree.task_worktree_id.clone()),
                 observed_model: snap.worker.as_ref().and_then(|w| w.observed_model.clone()),
                 observed_effort: snap.worker.as_ref().and_then(|w| w.observed_effort.clone()),
+                watchdog_attention: snap
+                    .worker
+                    .as_ref()
+                    .and_then(|w| w.progress.watchdog_attention.clone()),
                 fenced,
             });
         }

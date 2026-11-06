@@ -241,6 +241,110 @@ pub struct WorkerWorktreeSummary {
     pub head_commit: Option<String>,
 }
 
+/// Maximum JSON byte length accepted for a software-supervision attention snapshot.
+pub const MAX_WORKER_WATCHDOG_SNAPSHOT_BYTES: usize = 2048;
+
+/// Fixed software-supervision state, independent of provider claims or task acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerProgressWatchdogStatus {
+    /// The initial advisory deadline has not been reached.
+    Observing,
+    /// A supported recent tool hint extended the advisory deadline.
+    SoftDeadlineExtended,
+    /// Progress evidence is uncertain; execution continues within the hard ceiling.
+    AttentionRequired,
+    /// The existing hard runtime ceiling was reached.
+    HardLimitReached,
+}
+
+/// Fixed advisory reason; no reason proves that an executor is stuck.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerProgressAttentionReason {
+    /// No supported advancement hint was observed.
+    NoAdvancementHints,
+    /// Read-only tool hints were observed without supported advancement hints.
+    ReadOnlyActivity,
+    /// Earlier advancement hints are outside the recent window.
+    AdvancementNotRecent,
+}
+
+/// Core-owned bounded DTO for supervisor-generated progress attention.
+///
+/// Contains no provider prose, paths, prompts, model claims, or execution authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerProgressWatchdogSnapshot {
+    /// Advisory software-supervision state at emission.
+    pub status: WorkerProgressWatchdogStatus,
+    /// Fixed reason for the advisory attention.
+    pub attention_reason: Option<WorkerProgressAttentionReason>,
+    /// Elapsed monotonic invocation time at emission.
+    pub elapsed_ms: u64,
+    /// Advisory deadline within the existing hard ceiling.
+    pub soft_deadline_ms: u64,
+    /// Existing absolute runtime ceiling, never increased by the watchdog.
+    pub hard_timeout_ms: u64,
+    /// Last supported advancement hint time, if observed.
+    pub last_advancement_ms: Option<u64>,
+    /// Count of normalized provider events observed.
+    pub events_observed: u64,
+    /// Supported write, edit, or check hints; not verified file changes or checks.
+    pub advancement_hints: u64,
+    /// Read-only tool hints.
+    pub read_hints: u64,
+    /// Provider output hints, which never extend a deadline.
+    pub output_hints: u64,
+    /// Other tool hints, which never extend a deadline.
+    pub other_tool_hints: u64,
+    /// Number of bounded advisory deadline extensions.
+    pub extensions: u64,
+    /// Whether the invocation attempted its single advisory attention event.
+    pub attention_emitted: bool,
+}
+
+impl WorkerProgressWatchdogSnapshot {
+    /// Validates an attention emitted while execution remains below its hard ceiling.
+    ///
+    /// Final report states are not accepted as live attention events.
+    pub fn validate_attention(&self) -> Result<(), CoreError> {
+        let total_hints = self
+            .advancement_hints
+            .saturating_add(self.read_hints)
+            .saturating_add(self.output_hints)
+            .saturating_add(self.other_tool_hints);
+        let reason_matches = match self.attention_reason {
+            Some(WorkerProgressAttentionReason::NoAdvancementHints) => {
+                self.advancement_hints == 0 && self.read_hints == 0
+            }
+            Some(WorkerProgressAttentionReason::ReadOnlyActivity) => {
+                self.advancement_hints == 0 && self.read_hints > 0
+            }
+            Some(WorkerProgressAttentionReason::AdvancementNotRecent) => self.advancement_hints > 0,
+            None => false,
+        };
+        if self.status != WorkerProgressWatchdogStatus::AttentionRequired
+            || !self.attention_emitted
+            || !reason_matches
+            || self.soft_deadline_ms == 0
+            || self.soft_deadline_ms > self.elapsed_ms
+            || self.elapsed_ms >= self.hard_timeout_ms
+            || self
+                .last_advancement_ms
+                .is_some_and(|last| last > self.elapsed_ms)
+            || (self.advancement_hints > 0) != self.last_advancement_ms.is_some()
+            || total_hints > self.events_observed
+        {
+            return Err(CoreError::Validation {
+                field: "watchdog_attention",
+                reason: "invalid bounded software-supervision attention snapshot".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Bounded live progress counters and latest redacted summary for a worker attempt.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerProgressSummary {
@@ -256,6 +360,10 @@ pub struct WorkerProgressSummary {
     pub last_summary: Option<String>,
     /// Timestamp (ms) of the most recent live progress update.
     pub last_event_at_ms: Option<i64>,
+    /// First validated software-supervision attention for this attempt. Later provider events
+    /// cannot overwrite or clear it; this remains advisory, not a worker outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_attention: Option<WorkerProgressWatchdogSnapshot>,
 }
 
 /// Compact, bounded terminal outcome evidence for a worker attempt.
@@ -428,6 +536,9 @@ pub struct WorkerProgressUpdate {
     pub event_kind: String,
     /// Sanitized summary text for the event.
     pub summary: String,
+    /// Typed software-supervision attention, supplied only by the supervisor event mapper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_attention: Option<WorkerProgressWatchdogSnapshot>,
 }
 
 /// Terminal completion payload submitted by the dispatcher for an active [`WorkerClaim`].
@@ -1133,6 +1244,19 @@ impl Core {
         let started_at_ms = worker.started_at_ms.unwrap_or(valid_now);
 
         for item in updates {
+            if let Some(attention) = &item.watchdog_attention {
+                attention.validate_attention()?;
+                if item.event_kind != "supervisor_attention" {
+                    return Err(CoreError::Validation {
+                        field: "watchdog_attention",
+                        reason: "software-supervision metadata requires a typed supervisor event"
+                            .to_string(),
+                    });
+                }
+                if progress.watchdog_attention.is_none() {
+                    progress.watchdog_attention = Some(attention.clone());
+                }
+            }
             let clean_kind = sanitize_worker_text(&item.event_kind, MAX_ID_LEN);
             let clean_summary = sanitize_worker_text(&item.summary, MAX_WORKER_SUMMARY_TEXT_BYTES);
             if clean_summary.is_empty() {
