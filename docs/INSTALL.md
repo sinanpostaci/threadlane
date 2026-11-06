@@ -12,7 +12,7 @@ checkout; the existing development shells remain the normal development path.
 | Python desktop build wrapper | Ten offline fixture tests pass. |
 | Nix CLI package | Source build passed using the root `Cargo.lock`. Includes `threadlane`, the paired `threadlane-native-mcp` bootstrap, and the trusted `threadlane-context`, `threadlane-workflow`, `threadlane-session`, approval and operator commands. |
 | Nix desktop package | Linux source build passed with the standalone Tauri lockfile, a separately built frontend, and explicit Cargo build subdirectory. The resulting executable's `--help` passed. The latest native window creation was observed; visual human acceptance of the current window is still pending. |
-| GitHub Actions workflow | Manual `workflow_dispatch` source-build matrix added. It has not been dispatched from this checkout, so all three platform results remain unverified. |
+| GitHub Actions workflows | `.github/workflows/ci.yml` runs automatic Linux source validation by calling the reusable packaging workflow. `.github/workflows/packaging.yml` also provides the manual full cross-platform matrix and artifacts. No hosted run of either workflow has been observed yet, so hosted validation remains pending. |
 | Desktop runtime | The standalone M4 Linux binary builds and passes all-target Clippy. The earlier native Wayland preview rendered successfully. Current Tools/Profiles and History browser checks use explicit DEV fixtures; they do not prove native chat pairing. |
 
 The locked npm dependency hash is recorded in:
@@ -38,8 +38,8 @@ files are not part of a flake source tree.
   `cargo`, `rustfmt`, and `clippy`, Node.js 22 with npm, Python 3.10 or newer,
   and the native Tauri libraries for the host platform.
 - Linux Tauri builds need GTK 3, WebKitGTK 4.1, libsoup 3, librsvg, and the
-  usual C/C++ build tools. The manual CI workflow installs the corresponding
-  Ubuntu development packages.
+  usual C/C++ build tools. The packaging workflow installs the corresponding
+  Ubuntu development packages for its Linux jobs.
 
 ## Development shells (unchanged)
 
@@ -156,11 +156,42 @@ They source the actual helper in a controlled POSIX shell with temporary NVIDIA
 driver fixtures; they do not read the real GPU, start a desktop session, or
 touch the network.
 
-## Manual cross-platform CI
+## CI workflows
 
-The workflow `.github/workflows/packaging.yml` is manual-only. Open the
-repository's **Actions** tab, select **Packaging validation (manual)**, and run
-the workflow. It uses a `fail-fast: false` matrix for:
+Two workflows cover source validation. Neither publishes a release, signs an
+artifact, uses repository secrets, creates a system installer, or modifies a
+host. No hosted run has been observed from this checkout, so all hosted results
+remain pending until a real run is recorded here.
+
+### Automatic Linux source validation
+
+`.github/workflows/ci.yml` has the display name **Linux CI**. It runs on pull
+requests targeting `main`, pushes to `main`, and manual dispatch. Its single job
+calls the local reusable workflow `./.github/workflows/packaging.yml` at the same
+revision with:
+
+```yaml
+linux_only: true
+skip_artifacts: true
+```
+
+The run validates `ubuntu-24.04` / `linux-x86_64` only. It keeps the frontend
+`npm ci`, production build, and tests; both Rust workspaces' formatting, Clippy,
+and serial tests; and the offline Python build-wrapper tests. It does not run the
+desktop release wrapper or the CLI release build, and it does not stage or upload
+artifacts. The caller uses `contents: read` permissions and does not inherit
+repository secrets; the called workflow disables checkout credential
+persistence. Its concurrency group is distinct from the packaging workflow's
+group and cancels an older run for the same pull request or ref. There is no path
+filter, so a required check is always scheduled for a matching pull request.
+
+### Manual cross-platform packaging
+
+`.github/workflows/packaging.yml` has the display name **Packaging validation**.
+The same file also supports manual dispatch. Open the repository's **Actions**
+tab, select **Packaging validation**, and run the workflow. Manual dispatch keeps
+the full `fail-fast: false` matrix and uploads artifacts; the reusable inputs are
+only supplied by `ci.yml`.
 
 | Runner | Artifact label |
 | --- | --- |
@@ -183,8 +214,10 @@ The job then runs root workspace formatting, Clippy, and serial tests, followed
 by the standalone `apps/desktop/src-tauri` workspace's formatting, Clippy, and
 serial tests with `CARGO_TARGET_DIR=target/desktop`. That target directory is
 separate from the root workspace's `target/` directory. It finishes with the
-offline packaging tests and the desktop wrapper, and uploads the CLI, desktop
-executable, and frontend bundle as a short-lived workflow artifact.
+offline packaging tests, the desktop release wrapper, the CLI release build,
+artifact staging, and a short-lived workflow artifact upload. The automatic Linux
+caller reuses the same steps but skips only those final release and artifact
+steps.
 
 On a POSIX shell, the equivalent local validation commands are:
 
@@ -198,12 +231,13 @@ cargo test --workspace --locked -- --test-threads=1
 cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
 CARGO_TARGET_DIR=target/desktop cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 CARGO_TARGET_DIR=target/desktop cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_build_desktop.py -v
 ```
 
-The workflow does not publish a release, sign an artifact, use repository
+The workflows do not publish a release, sign an artifact, use repository
 secrets, or create a system installer. The action versions, hosted runner images,
 and dependency installations are written as a reproducible starting point; their
-actual behavior remains unverified until a real dispatch is recorded.
+actual behavior remains unverified until a real run is recorded.
 
 ## Linux runtime notes
 
@@ -241,10 +275,11 @@ remain untested.
 
 | Platform | Nix package | Source/CI build |
 | --- | --- | --- |
-| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. Manual workflow not yet run. |
+| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. Automatic Linux validation and manual packaging have not run on hosted CI. |
 | Linux aarch64 | Defined for CLI and desktop; not built. | No workflow matrix entry yet. |
-| macOS | CLI expression only; desktop Nix package not provided. | Manual workflow entry not yet run. |
-| Windows | No Nix package. | Manual workflow entry not yet run; Windows runtime ACL support remains a separate product concern. |
+| macOS | CLI expression only; desktop Nix package not provided. | Manual packaging-workflow entry has not run on hosted CI. |
+| Windows | No Nix package. | Manual packaging-workflow entry has not run on hosted CI; Windows runtime ACL support remains a separate product concern. |
 
 No successful CLI submission, generated workflow, or Nix expression is evidence
-that a binary was built, installed, run, signed, or released.
+that a binary was built, installed, run, signed, or released. Hosted workflow
+results remain pending until the repository records an actual run.

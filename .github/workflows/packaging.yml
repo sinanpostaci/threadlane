@@ -1,12 +1,25 @@
-name: Packaging validation (manual)
+name: Packaging validation
 
-# Manual-only source-build validation. This workflow does not publish releases,
+# Reusable source-build validation for the automatic Linux checks, and a manual
+# full cross-platform packaging run. This workflow does not publish releases,
 # sign binaries, create installers, use repository secrets, or modify a host.
 # The action tags, hosted runner images, and stable Rust channel below have not
 # been executed from this checkout; record the first real run in docs/INSTALL.md.
 
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      linux_only:
+        description: Validate only the ubuntu-24.04 linux-x86_64 matrix entry.
+        required: false
+        type: boolean
+        default: false
+      skip_artifacts:
+        description: Skip release builds, artifact staging, and artifact upload.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,13 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            label: linux-x86_64
-          - os: macos-14
-            label: macos-aarch64
-          - os: windows-2022
-            label: windows-x86_64
+        include: ${{ fromJSON(inputs.linux_only && '[{"os":"ubuntu-24.04","label":"linux-x86_64"}]' || '[{"os":"ubuntu-24.04","label":"linux-x86_64"},{"os":"macos-14","label":"macos-aarch64"},{"os":"windows-2022","label":"windows-x86_64"}]') }}
 
     env:
       PYTHONDONTWRITEBYTECODE: "1"
@@ -38,6 +45,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -114,12 +123,15 @@ jobs:
         run: python -m unittest discover -s scripts -p test_build_desktop.py -v
 
       - name: Build desktop binary through the packaging wrapper
+        if: ${{ !inputs.skip_artifacts }}
         run: python scripts/build-desktop.py --release --timeout-seconds 3600
 
       - name: Build CLI binary
+        if: ${{ !inputs.skip_artifacts }}
         run: cargo build --release --locked --package threadlane
 
       - name: Stage build artifacts
+        if: ${{ !inputs.skip_artifacts }}
         shell: bash
         run: |
           mkdir -p artifacts
@@ -138,6 +150,7 @@ jobs:
           cp -r apps/desktop/dist artifacts/frontend-dist
 
       - name: Upload build artifacts
+        if: ${{ !inputs.skip_artifacts }}
         uses: actions/upload-artifact@v4
         with:
           name: threadlane-${{ matrix.label }}

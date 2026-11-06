@@ -1,0 +1,32 @@
+name: Linux CI
+
+# Automatic Linux source validation for pull requests and main. The job calls
+# the local reusable packaging workflow from the same revision and disables
+# release builds and artifact upload. Hosted behavior remains unverified until a
+# real run is recorded in docs/INSTALL.md.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-source-validation:
+    name: Linux source validation
+    permissions:
+      contents: read
+    uses: ./.github/workflows/packaging.yml
+    with:
+      linux_only: true
+      skip_artifacts: true
