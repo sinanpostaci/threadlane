@@ -66,7 +66,8 @@ pub enum NativeNotificationDelivery {
     #[default]
     ToolOutput,
     /// Opt-in direct user-message mode: submits `turn/start` with the fixed operator notice when
-    /// `idle`, or `turn/steer` targeting the verified `inProgress` active turn when `active`.
+    /// `idle` or in the documented `systemError` status, or `turn/steer` targeting the verified
+    /// `inProgress` active turn when `active`.
     UserMessageSteer,
 }
 
@@ -770,6 +771,7 @@ struct PreparedExchangeMessages {
 enum ThreadReadStatus {
     Idle,
     Active,
+    SystemError,
 }
 
 #[cfg(unix)]
@@ -778,6 +780,7 @@ impl ThreadReadStatus {
         match self {
             Self::Idle => "idle",
             Self::Active => "active",
+            Self::SystemError => "systemError",
         }
     }
 }
@@ -1389,10 +1392,12 @@ async fn run_single_ws_attempt(
             turns_list_req,
             notice_text,
         } => match thread_status {
-            ThreadReadStatus::Idle => {
+            // A stable systemError target has no in-progress turn for `turn/steer`; use the
+            // ordinary new-user-input `turn/start` route, without model or effort overrides.
+            ThreadReadStatus::Idle | ThreadReadStatus::SystemError => {
                 validate_pre_effect_ready(resolved.as_ref(), ws.get_ref(), shutdown_rx)?;
 
-                // 5. Set uncertainty marker immediately BEFORE attempting idle turn/start write.
+                // 5. Set uncertainty marker immediately BEFORE attempting new-user-input turn/start write.
                 *may_have_written = true;
 
                 ws.send(Message::Text(idle_turn_start_req.clone().into()))
@@ -1795,9 +1800,14 @@ fn validate_thread_read_result(
         Some(Value::Object(map)) => map.get("type").and_then(Value::as_str),
         _ => None,
     };
+    // `systemError` is a documented runtime status, but only user-message delivery may
+    // turn it into a new user-input turn; ToolOutput and unknown statuses stay rejected.
     match status_type {
         Some("idle") => Ok(ThreadReadStatus::Idle),
         Some("active") => Ok(ThreadReadStatus::Active),
+        Some("systemError") if cfg.delivery == NativeNotificationDelivery::UserMessageSteer => {
+            Ok(ThreadReadStatus::SystemError)
+        }
         Some("notLoaded") => Err(ExchangeError::Retryable(
             "native tool-output target thread is not loaded in idle or active status",
         )),

@@ -1966,3 +1966,445 @@ async fn coworker_planning_wakeup_supports_idle_start_active_steer_disconnect_un
         assert!(!*saw_effect_write.lock().await);
     }
 }
+
+async fn serve_expected_refusal_peer(
+    listener: UnixListener,
+    read_thread: Value,
+    resume_thread: Value,
+    saw_effect_write: Arc<Mutex<bool>>,
+) {
+    let (stream, _) = listener.accept().await.expect("accept");
+    let mut ws = accept_hdr_async(stream, validate_upgrade)
+        .await
+        .expect("ws");
+
+    let _ = read_json(&mut ws).await;
+    if ws
+        .send(Message::Text(
+            json!({ "id": 1, "result": {} }).to_string().into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let _ = read_json(&mut ws).await;
+    let _ = read_json(&mut ws).await;
+    if ws
+        .send(Message::Text(
+            json!({ "id": 2, "result": { "thread": read_thread } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let next = tokio::time::timeout(Duration::from_millis(2_000), ws.next()).await;
+    let Ok(Some(Ok(Message::Text(text)))) = next else {
+        return;
+    };
+    let value: Value = serde_json::from_str(&text).expect("json");
+    if value["method"] == "thread/resume" {
+        let _ = ws
+            .send(Message::Text(
+                json!({ "id": 3, "result": { "thread": resume_thread } })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let resume_next = tokio::time::timeout(Duration::from_millis(2_000), ws.next()).await;
+        if let Ok(Some(Ok(Message::Text(next_text)))) = resume_next {
+            let next_value: Value = serde_json::from_str(&next_text).expect("json");
+            if matches!(
+                next_value["method"].as_str(),
+                Some("turn/start" | "turn/steer")
+            ) {
+                *saw_effect_write.lock().await = true;
+            }
+        }
+    } else if matches!(value["method"].as_str(), Some("turn/start" | "turn/steer")) {
+        *saw_effect_write.lock().await = true;
+    }
+}
+
+#[tokio::test]
+async fn coworker_planning_wakeup_accepts_stable_system_error_with_plain_turn_start() {
+    const TEST_COMMAND_ID: &str = "pcm_0123456789abcdef0123456789abcdef";
+    const TEST_NOTIF_ID: &str = "ntf_0123456789abcdef0123456789abcdef";
+    let expected_notice =
+        format_coworker_planning_wakeup_message(TEST_COMMAND_ID).expect("expected notice");
+
+    let env = TestEnv::new();
+    let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+    let cfg = env.coworker_native_config();
+    let expected_cwd = env.project_root.to_string_lossy().to_string();
+    let recorded = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let recorded_clone = Arc::clone(&recorded);
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut ws = accept_hdr_async(stream, validate_upgrade)
+            .await
+            .expect("ws");
+        recorded_clone.lock().await.push(read_json(&mut ws).await);
+        ws.send(Message::Text(
+            json!({ "id": 1, "result": { "serverInfo": { "name": "fake" } } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("init");
+        recorded_clone.lock().await.push(read_json(&mut ws).await);
+        recorded_clone.lock().await.push(read_json(&mut ws).await);
+        ws.send(Message::Text(
+            json!({
+                "id": 2,
+                "result": {
+                    "thread": {
+                        "id": TEST_THREAD_ID,
+                        "cwd": expected_cwd,
+                        "status": { "type": "systemError" }
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("read");
+        recorded_clone.lock().await.push(read_json(&mut ws).await);
+        ws.send(Message::Text(
+            json!({
+                "id": 3,
+                "result": {
+                    "thread": {
+                        "id": TEST_THREAD_ID,
+                        "cwd": expected_cwd,
+                        "status": { "type": "systemError" }
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("resume");
+        recorded_clone.lock().await.push(read_json(&mut ws).await);
+        ws.send(Message::Text(
+            json!({
+                "id": 4,
+                "result": {
+                    "turn": {
+                        "id": TEST_TURN_ID,
+                        "status": { "type": "inProgress" },
+                        "error": null
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("turn/start");
+    });
+
+    let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+    let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+        .expect("planning attempt");
+    let (_tx, mut rx) = watch::channel(false);
+
+    let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+    assert_eq!(outcome, WakeupOutcome::Submitted);
+    assert!(!env.queue_marker.exists());
+    server.await.expect("server");
+
+    let calls = recorded.lock().await;
+    assert_eq!(calls.len(), 5);
+    assert_eq!(
+        calls[0]["params"]["capabilities"],
+        json!({ "experimentalApi": true })
+    );
+    assert_eq!(calls[4]["method"], "turn/start");
+    let params = &calls[4]["params"];
+    assert_eq!(params["threadId"], TEST_THREAD_ID);
+    assert_eq!(
+        params["input"],
+        json!([{ "type": "text", "text": expected_notice }])
+    );
+    assert!(params.get("toolOutput").is_none());
+    assert!(params.get("model").is_none());
+    assert!(params.get("effort").is_none());
+    assert!(params.get("reasoningEffort").is_none());
+}
+
+#[tokio::test]
+async fn coworker_planning_wakeup_system_error_refuses_scope_status_race_and_unknown_status_before_effect(
+) {
+    const TEST_COMMAND_ID: &str = "pcm_0123456789abcdef0123456789abcdef";
+    const TEST_NOTIF_ID: &str = "ntf_0123456789abcdef0123456789abcdef";
+
+    for case in [
+        "systemError wrong thread",
+        "systemError wrong cwd",
+        "systemError wrong thread at resume",
+        "systemError wrong cwd at resume",
+        "systemError changed to idle at resume",
+        "systemError changed to active at resume",
+        "unknown error status",
+    ] {
+        let env = TestEnv::new();
+        let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+        let cfg = env.coworker_native_config();
+        let expected_cwd = env.project_root.to_string_lossy().to_string();
+        let wrong_thread_id = "01968f52-0000-7d51-9914-79d2bc48eb5a";
+        let (read_thread, resume_thread) = match case {
+            "systemError wrong thread" => (
+                json!({
+                    "id": wrong_thread_id,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+                json!({
+                    "id": wrong_thread_id,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+            ),
+            "systemError wrong cwd" => (
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": "/tmp/wrong-system-error-project",
+                    "status": { "type": "systemError" }
+                }),
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": "/tmp/wrong-system-error-project",
+                    "status": { "type": "systemError" }
+                }),
+            ),
+            "systemError wrong thread at resume" => (
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+                json!({
+                    "id": wrong_thread_id,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+            ),
+            "systemError wrong cwd at resume" => (
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": "/tmp/wrong-system-error-resume-project",
+                    "status": { "type": "systemError" }
+                }),
+            ),
+            "systemError changed to idle at resume" => (
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "idle" }
+                }),
+            ),
+            "systemError changed to active at resume" => (
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "systemError" }
+                }),
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "active" }
+                }),
+            ),
+            "unknown error status" => (
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "failed" }
+                }),
+                json!({
+                    "id": TEST_THREAD_ID,
+                    "cwd": expected_cwd,
+                    "status": { "type": "failed" }
+                }),
+            ),
+            _ => unreachable!("known refusal case"),
+        };
+
+        let saw_effect_write = Arc::new(Mutex::new(false));
+        let server = tokio::spawn(serve_expected_refusal_peer(
+            listener,
+            read_thread,
+            resume_thread,
+            Arc::clone(&saw_effect_write),
+        ));
+        let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+        let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+            .expect("planning attempt");
+        let (_tx, mut rx) = watch::channel(false);
+
+        let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+        assert!(
+            matches!(outcome, WakeupOutcome::Failed { .. }),
+            "expected Failed before effect for case {case}, got {outcome:?}"
+        );
+        server.await.expect("server");
+        assert!(
+            !*saw_effect_write.lock().await,
+            "no effect write permitted for case {case}"
+        );
+        assert!(!env.queue_marker.exists());
+    }
+}
+
+#[tokio::test]
+async fn tool_output_delivery_refuses_system_error_before_effect() {
+    let env = TestEnv::new();
+    let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+    let cfg = env.base_native_config();
+    let expected_cwd = env.project_root.to_string_lossy().to_string();
+    let read_thread = json!({
+        "id": TEST_THREAD_ID,
+        "cwd": expected_cwd,
+        "status": { "type": "systemError" }
+    });
+    let resume_thread = json!({
+        "id": TEST_THREAD_ID,
+        "cwd": expected_cwd,
+        "status": { "type": "systemError" }
+    });
+    let saw_effect_write = Arc::new(Mutex::new(false));
+    let server = tokio::spawn(serve_expected_refusal_peer(
+        listener,
+        read_thread,
+        resume_thread,
+        Arc::clone(&saw_effect_write),
+    ));
+
+    let ctx = ApprovedSessionWakeupContext::new(TEST_APPROVAL_ID)
+        .expect("ctx")
+        .with_tool_output_transport(cfg)
+        .expect("transport");
+    let wakeup_cfg = env.wakeup_config(ctx, 5_000);
+    let claim = env.sample_claim();
+    let (_tx, mut rx) = watch::channel(false);
+
+    let outcome = invoke_codex_wakeup(&wakeup_cfg, &claim, &mut rx).await;
+    assert!(
+        matches!(outcome, WakeupOutcome::Failed { .. }),
+        "expected Failed before effect for systemError tool_output, got {outcome:?}"
+    );
+    server.await.expect("server");
+    assert!(!*saw_effect_write.lock().await);
+    assert!(!env.queue_marker.exists());
+}
+
+#[tokio::test]
+async fn coworker_planning_wakeup_system_error_disconnect_after_turn_start_is_unknown_without_retry(
+) {
+    const TEST_COMMAND_ID: &str = "pcm_0123456789abcdef0123456789abcdef";
+    const TEST_NOTIF_ID: &str = "ntf_0123456789abcdef0123456789abcdef";
+
+    let env = TestEnv::new();
+    let listener = UnixListener::bind(&env.socket_path).expect("bind unix socket");
+    let cfg = env.coworker_native_config();
+    let expected_cwd = env.project_root.to_string_lossy().to_string();
+    let effect_writes = Arc::new(Mutex::new(0usize));
+    let effect_writes_clone = Arc::clone(&effect_writes);
+
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let mut ws = accept_hdr_async(stream, validate_upgrade)
+            .await
+            .expect("ws");
+        let _ = read_json(&mut ws).await;
+        let _ = ws
+            .send(Message::Text(
+                json!({ "id": 1, "result": {} }).to_string().into(),
+            ))
+            .await;
+        let _ = read_json(&mut ws).await;
+        let _ = read_json(&mut ws).await;
+        let _ = ws
+            .send(Message::Text(
+                json!({
+                    "id": 2,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "systemError" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+        let _ = read_json(&mut ws).await;
+        let _ = ws
+            .send(Message::Text(
+                json!({
+                    "id": 3,
+                    "result": {
+                        "thread": {
+                            "id": TEST_THREAD_ID,
+                            "cwd": expected_cwd,
+                            "status": { "type": "systemError" }
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await;
+
+        let turn_req = read_json(&mut ws).await;
+        assert_eq!(turn_req["method"], "turn/start");
+        *effect_writes_clone.lock().await += 1;
+
+        let next = tokio::time::timeout(Duration::from_millis(150), ws.next()).await;
+        if let Ok(Some(Ok(Message::Text(text)))) = next {
+            let value: Value = serde_json::from_str(&text).expect("json");
+            if matches!(value["method"].as_str(), Some("turn/start" | "turn/steer")) {
+                *effect_writes_clone.lock().await += 1;
+            }
+        }
+        let _ = ws.close(None).await;
+    });
+
+    let ctx = CoworkerPlanningWakeupContext::new(TEST_COMMAND_ID, cfg).expect("planning ctx");
+    let attempt = CoworkerPlanningWakeupAttempt::new(TEST_COMMAND_ID, TEST_NOTIF_ID)
+        .expect("planning attempt");
+    let (_tx, mut rx) = watch::channel(false);
+
+    let outcome = invoke_coworker_planning_wakeup(&ctx, &attempt, &mut rx).await;
+    assert!(
+        matches!(outcome, WakeupOutcome::Unknown { .. }),
+        "expected Unknown on disconnect after systemError turn/start, got {outcome:?}"
+    );
+    server.await.expect("server");
+    assert_eq!(
+        *effect_writes.lock().await,
+        1,
+        "systemError delivery must not retry after a possible turn/start write"
+    );
+    assert!(!env.queue_marker.exists());
+}
