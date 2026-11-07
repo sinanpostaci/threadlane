@@ -305,6 +305,7 @@ async fn prepare_task_for_derived_correction_with_budgets(
 #[tokio::test]
 async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_verifies_reviews_and_integrates(
 ) {
+    // Heap-allocate nested futures to bound the poll frame of this stack-pinned test.
     let fixture = setup_fixture();
     let required_fixes = vec![
         "Update src/a.rs::a() so it returns 101 instead of 100".to_string(),
@@ -330,13 +331,13 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
         expected_req_key,
         expected_eff_id,
         expected_report_id,
-    } = prepare_task_for_derived_correction(
+    } = Box::pin(prepare_task_for_derived_correction(
         &fixture,
         "brf_corr_exec",
         "plan-corr-exec",
         "task-corr-exec",
         required_fixes,
-    )
+    ))
     .await;
 
     let verifier = CoworkerTaskVerificationService::new(fixture.controller.clone());
@@ -353,10 +354,10 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
         prior_attempt_no: 1,
         now_ms: step_ts + 300,
     };
-    let exec_outcome = correction_exec_service
-        .execute_task_correction(session.guard(), &exec_req)
-        .await
-        .expect("execute_task_correction");
+    let exec_outcome =
+        Box::pin(correction_exec_service.execute_task_correction(session.guard(), &exec_req))
+            .await
+            .expect("execute_task_correction");
 
     assert_eq!(
         exec_outcome.status,
@@ -543,16 +544,15 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
 
     // Repeating execute_task_correction on same session and after session reopen is idempotent
     // without launching another worker process or charging counters.
-    let repeat_same = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 400,
-                ..exec_req.clone()
-            },
-        )
-        .await
-        .expect("repeat execute_task_correction on same session");
+    let repeat_same = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 400,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect("repeat execute_task_correction on same session");
     assert_eq!(
         repeat_same.status,
         CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
@@ -567,16 +567,15 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
         .controller
         .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, step_ts + 500)
         .expect("reopen session");
-    let reopened_exec = correction_exec_service
-        .execute_task_correction(
-            reopened_session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 600,
-                ..exec_req
-            },
-        )
-        .await
-        .expect("reopen execute_task_correction");
+    let reopened_exec = Box::pin(correction_exec_service.execute_task_correction(
+        reopened_session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 600,
+            ..exec_req
+        },
+    ))
+    .await
+    .expect("reopen execute_task_correction");
     assert_eq!(
         reopened_exec.status,
         CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
@@ -587,20 +586,19 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
 
     // Verify derived attempt 2 -> ReadyForReviewer with new committed HEAD, ReviewSubject, and check evidence.
-    let verify_2 = verifier
-        .verify_and_prepare_task_attempt(
-            reopened_session.guard(),
-            &CoworkerTaskVerificationRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                task_id: "task-corr-exec".to_string(),
-                attempt_no: 2,
-                now_ms: step_ts + 700,
-            },
-        )
-        .await
-        .expect("verify_and_prepare_task_attempt attempt 2");
+    let verify_2 = Box::pin(verifier.verify_and_prepare_task_attempt(
+        reopened_session.guard(),
+        &CoworkerTaskVerificationRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: "task-corr-exec".to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 700,
+        },
+    ))
+    .await
+    .expect("verify_and_prepare_task_attempt attempt 2");
     assert_eq!(
         verify_2.status,
         CoworkerTaskVerificationStatus::ReadyForReviewer
@@ -661,23 +659,20 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     )
     .expect("write Accept reviewer response");
 
-    let review_2 = review_service
-        .review_task_attempt(
-            reopened_session.guard(),
-            &CoworkerTaskReviewStageRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                task_id: "task-corr-exec".to_string(),
-                attempt_no: 2,
-                now_ms: step_ts + 800,
-                untrusted_candidate_context: Some(
-                    "Updated src/a.rs::a() to return 101".to_string(),
-                ),
-            },
-        )
-        .await
-        .expect("review_task_attempt attempt 2 Accept");
+    let review_2 = Box::pin(review_service.review_task_attempt(
+        reopened_session.guard(),
+        &CoworkerTaskReviewStageRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: "task-corr-exec".to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 800,
+            untrusted_candidate_context: Some("Updated src/a.rs::a() to return 101".to_string()),
+        },
+    ))
+    .await
+    .expect("review_task_attempt attempt 2 Accept");
     assert_eq!(review_2.status, CoworkerTaskReviewStageStatus::Accepted);
     assert_eq!(review_2.task_stage, CoworkerTaskStage::Accepted);
     assert_eq!(review_2.attempt_no, 2);
@@ -756,8 +751,7 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     );
 
     // Repeated controller step must not reset the derived attempt 2 state back to initial host attempt 1.
-    let post_int_step = reopened_session
-        .step(step_ts + 1_000)
+    let post_int_step = Box::pin(reopened_session.step(step_ts + 1_000))
         .await
         .expect("controller step after attempt 2 integration");
     assert!(post_int_step.dispatched_task_ids.is_empty());
@@ -1188,6 +1182,7 @@ async fn task_correction_held_provider_rejects_duplicate_claim_without_marking_u
 #[tokio::test]
 async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_symlink_and_preserves_conflicting_files(
 ) {
+    // Heap-allocate nested futures to bound the poll frame of this stack-pinned test.
     let fixture = setup_fixture();
     let required_fixes = vec![
         "Update src/a.rs::a() so it returns 101 instead of 100".to_string(),
@@ -1213,13 +1208,13 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
         expected_req_key,
         expected_eff_id,
         expected_report_id: _,
-    } = prepare_task_for_derived_correction(
+    } = Box::pin(prepare_task_for_derived_correction(
         &fixture,
         "brf_corr_recov",
         "plan-corr-recov",
         "task-corr-recov",
         required_fixes,
-    )
+    ))
     .await;
 
     let correction_exec_service =
@@ -1249,10 +1244,10 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     // SecurityViolation without following/overwriting the symlink or launching the provider.
     std::os::unix::fs::symlink(&disposable_symlink_target, &report_path)
         .expect("create pre-existing symlink at report_path");
-    let pre_symlink_err = correction_exec_service
-        .execute_task_correction(session.guard(), &exec_req)
-        .await
-        .expect_err("pre-existing symlink at derived report path must fail closed");
+    let pre_symlink_err =
+        Box::pin(correction_exec_service.execute_task_correction(session.guard(), &exec_req))
+            .await
+            .expect_err("pre-existing symlink at derived report path must fail closed");
     assert_eq!(
         pre_symlink_err.code(),
         NativeErrorCode::SecurityViolation.as_str()
@@ -1281,16 +1276,15 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     fs::write(&report_path, pre_conflict_bytes).expect("write pre-existing conflicting file");
     fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
         .expect("chmod 0600 pre-existing conflicting file");
-    let pre_conflict_err = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 320,
-                ..exec_req.clone()
-            },
-        )
-        .await
-        .expect_err("pre-existing conflicting file at derived report path must fail closed");
+    let pre_conflict_err = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 320,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect_err("pre-existing conflicting file at derived report path must fail closed");
     assert_eq!(
         pre_conflict_err.code(),
         NativeErrorCode::ProtocolError.as_str()
@@ -1319,16 +1313,15 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     fs::remove_file(&report_path).expect("remove disposable pre-existing conflicting file");
 
     // 3. Execute the real derived correction so the legitimate 0600 report is persisted on disk.
-    let exec_outcome = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 350,
-                ..exec_req.clone()
-            },
-        )
-        .await
-        .expect("execute_task_correction succeeds once conflicting file is removed");
+    let exec_outcome = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 350,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect("execute_task_correction succeeds once conflicting file is removed");
     assert_eq!(
         exec_outcome.status,
         CoworkerTaskCorrectionExecuteStatus::ReadyForVerification
@@ -1457,16 +1450,15 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
         .expect("chmod 0600 corrupt report_path");
 
-    let repeat_corrupt_err = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 400,
-                ..exec_req.clone()
-            },
-        )
-        .await
-        .expect_err("repeated execution with corrupt persisted report must fail closed");
+    let repeat_corrupt_err = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 400,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect_err("repeated execution with corrupt persisted report must fail closed");
     assert_eq!(
         repeat_corrupt_err.code(),
         NativeErrorCode::ProtocolError.as_str()
@@ -1478,20 +1470,19 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     );
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 2);
 
-    let verify_corrupt_err = verifier
-        .verify_and_prepare_task_attempt(
-            session.guard(),
-            &CoworkerTaskVerificationRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                task_id: "task-corr-recov".to_string(),
-                attempt_no: 2,
-                now_ms: step_ts + 450,
-            },
-        )
-        .await
-        .expect_err("verification with corrupt persisted report must fail closed");
+    let verify_corrupt_err = Box::pin(verifier.verify_and_prepare_task_attempt(
+        session.guard(),
+        &CoworkerTaskVerificationRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: "task-corr-recov".to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 450,
+        },
+    ))
+    .await
+    .expect_err("verification with corrupt persisted report must fail closed");
     assert_eq!(
         verify_corrupt_err.code(),
         NativeErrorCode::ProtocolError.as_str()
@@ -1512,16 +1503,15 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
         .expect("chmod 0600 tampered report");
 
-    let repeat_tampered_err = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 500,
-                ..exec_req.clone()
-            },
-        )
-        .await
-        .expect_err("repeated execution with tampered report digest must fail closed");
+    let repeat_tampered_err = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 500,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect_err("repeated execution with tampered report digest must fail closed");
     assert_eq!(
         repeat_tampered_err.code(),
         NativeErrorCode::ProtocolError.as_str()
@@ -1531,20 +1521,19 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
         tampered_bytes
     );
 
-    let verify_tampered_err = verifier
-        .verify_and_prepare_task_attempt(
-            session.guard(),
-            &CoworkerTaskVerificationRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                task_id: "task-corr-recov".to_string(),
-                attempt_no: 2,
-                now_ms: step_ts + 550,
-            },
-        )
-        .await
-        .expect_err("verification with tampered report digest must fail closed");
+    let verify_tampered_err = Box::pin(verifier.verify_and_prepare_task_attempt(
+        session.guard(),
+        &CoworkerTaskVerificationRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: "task-corr-recov".to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 550,
+        },
+    ))
+    .await
+    .expect_err("verification with tampered report digest must fail closed");
     assert_eq!(
         verify_tampered_err.code(),
         NativeErrorCode::ProtocolError.as_str()
@@ -1561,34 +1550,32 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     std::os::unix::fs::symlink(&disposable_symlink_target, &report_path)
         .expect("create symlink at report_path");
 
-    let repeat_symlink_err = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 600,
-                ..exec_req.clone()
-            },
-        )
-        .await
-        .expect_err("repeated execution with symlink report must fail closed");
+    let repeat_symlink_err = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 600,
+            ..exec_req.clone()
+        },
+    ))
+    .await
+    .expect_err("repeated execution with symlink report must fail closed");
     assert_eq!(
         repeat_symlink_err.code(),
         NativeErrorCode::SecurityViolation.as_str()
     );
-    let verify_symlink_err = verifier
-        .verify_and_prepare_task_attempt(
-            session.guard(),
-            &CoworkerTaskVerificationRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                task_id: "task-corr-recov".to_string(),
-                attempt_no: 2,
-                now_ms: step_ts + 650,
-            },
-        )
-        .await
-        .expect_err("verification with symlink report must fail closed");
+    let verify_symlink_err = Box::pin(verifier.verify_and_prepare_task_attempt(
+        session.guard(),
+        &CoworkerTaskVerificationRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: "task-corr-recov".to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 650,
+        },
+    ))
+    .await
+    .expect_err("verification with symlink report must fail closed");
     assert_eq!(
         verify_symlink_err.code(),
         NativeErrorCode::SecurityViolation.as_str()
@@ -1603,35 +1590,33 @@ async fn task_correction_artifact_recovery_fails_closed_on_corrupt_missing_or_sy
     fs::remove_file(&report_path).expect("remove symlink so report_path is missing");
     fs::remove_file(&disposable_symlink_target).expect("remove disposable symlink target");
 
-    let repeat_missing_err = correction_exec_service
-        .execute_task_correction(
-            session.guard(),
-            &CoworkerTaskCorrectionExecuteRequest {
-                now_ms: step_ts + 700,
-                ..exec_req
-            },
-        )
-        .await
-        .expect_err("repeated execution with missing persisted report must fail closed");
+    let repeat_missing_err = Box::pin(correction_exec_service.execute_task_correction(
+        session.guard(),
+        &CoworkerTaskCorrectionExecuteRequest {
+            now_ms: step_ts + 700,
+            ..exec_req
+        },
+    ))
+    .await
+    .expect_err("repeated execution with missing persisted report must fail closed");
     assert_eq!(
         repeat_missing_err.code(),
         NativeErrorCode::ProtocolError.as_str()
     );
 
-    let verify_missing_err = verifier
-        .verify_and_prepare_task_attempt(
-            session.guard(),
-            &CoworkerTaskVerificationRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                task_id: "task-corr-recov".to_string(),
-                attempt_no: 2,
-                now_ms: step_ts + 750,
-            },
-        )
-        .await
-        .expect_err("verification with missing persisted report must fail closed");
+    let verify_missing_err = Box::pin(verifier.verify_and_prepare_task_attempt(
+        session.guard(),
+        &CoworkerTaskVerificationRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            task_id: "task-corr-recov".to_string(),
+            attempt_no: 2,
+            now_ms: step_ts + 750,
+        },
+    ))
+    .await
+    .expect_err("verification with missing persisted report must fail closed");
     assert_eq!(
         verify_missing_err.code(),
         NativeErrorCode::ValidationFailed.as_str()

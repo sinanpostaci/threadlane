@@ -7144,18 +7144,18 @@ exit 0
     )
     .expect("write rejected agy_closure_response.json");
 
-    let na_outcome = completion_service
-        .complete_job(
-            na_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: na_job.job_id.clone(),
-                now_ms: 1_700_006_020_000,
-            },
-        )
-        .await
-        .expect("complete_job with rejected Closure verdict");
+    // Heap-allocate nested futures to bound the poll frame of this stack-pinned test.
+    let na_outcome = Box::pin(completion_service.complete_job(
+        na_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: na_job.job_id.clone(),
+            now_ms: 1_700_006_020_000,
+        },
+    ))
+    .await
+    .expect("complete_job with rejected Closure verdict");
     assert_eq!(
         na_outcome.status,
         CoworkerJobCompletionStatus::ClosureNotAccepted
@@ -7259,8 +7259,7 @@ exit 0
         job_id: job.job_id.clone(),
         now_ms: 1_700_006_120_000,
     };
-    let outcome = completion_service
-        .complete_job(session.guard(), &comp_req)
+    let outcome = Box::pin(completion_service.complete_job(session.guard(), &comp_req))
         .await
         .expect("complete_job happy path");
 
@@ -7434,18 +7433,17 @@ exit 0
     // 3. Re-invoke `complete_job` on the same session and after releasing/reopening the session:
     // must reuse the cached `Accepted` verdict and persisted candidate check report without a
     // second `Closure` model invocation, second check execution, or redundant ledger revision bump.
-    let repeat_same_session = completion_service
-        .complete_job(
-            session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                now_ms: 1_700_006_130_000,
-            },
-        )
-        .await
-        .expect("repeat complete_job on same session");
+    let repeat_same_session = Box::pin(completion_service.complete_job(
+        session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            now_ms: 1_700_006_130_000,
+        },
+    ))
+    .await
+    .expect("repeat complete_job on same session");
     assert_eq!(
         repeat_same_session.status,
         CoworkerJobCompletionStatus::Completed
@@ -7491,18 +7489,17 @@ exit 0
         .controller
         .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_006_139_000)
         .expect("reopen session");
-    let repeat_reopen = completion_service
-        .complete_job(
-            reopened_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                now_ms: 1_700_006_140_000,
-            },
-        )
-        .await
-        .expect("repeat complete_job after reopen");
+    let repeat_reopen = Box::pin(completion_service.complete_job(
+        reopened_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            now_ms: 1_700_006_140_000,
+        },
+    ))
+    .await
+    .expect("repeat complete_job after reopen");
     assert_eq!(repeat_reopen.status, CoworkerJobCompletionStatus::Completed);
     assert!(
         repeat_reopen
@@ -7564,18 +7561,17 @@ exit 0
         .controller
         .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 1_700_006_149_000)
         .expect("reopen session for legacy inline closure artifact");
-    let legacy_reopen = completion_service
-        .complete_job(
-            legacy_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id.clone(),
-                now_ms: 1_700_006_150_000,
-            },
-        )
-        .await
-        .expect("complete_job after converting accepted record to valid legacy inline shape");
+    let legacy_reopen = Box::pin(completion_service.complete_job(
+        legacy_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: job.job_id.clone(),
+            now_ms: 1_700_006_150_000,
+        },
+    ))
+    .await
+    .expect("complete_job after converting accepted record to valid legacy inline shape");
     assert_eq!(legacy_reopen.status, CoworkerJobCompletionStatus::Completed);
     assert!(
         legacy_reopen
@@ -7756,18 +7752,18 @@ exit 0
     .await;
 
     let closure_before_fail = read_invocation_count(&closure_count_file);
-    let fail_outcome = completion_service
-        .complete_job(
-            fail_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: fail_job.job_id.clone(),
-                now_ms: 1_700_007_020_000,
-            },
-        )
-        .await
-        .expect("complete_job when combined candidate check fails");
+    // Heap-allocate nested futures to bound the poll frame of this stack-pinned test.
+    let fail_outcome = Box::pin(completion_service.complete_job(
+        fail_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fail_job.job_id.clone(),
+            now_ms: 1_700_007_020_000,
+        },
+    ))
+    .await
+    .expect("complete_job when combined candidate check fails");
 
     assert_eq!(
         fail_outcome.status,
@@ -7942,18 +7938,17 @@ exit 0
         Some(CoworkerTaskStage::Integrated)
     );
 
-    let hold_err = completion_service
-        .complete_job(
-            fence_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: fence_job.job_id.clone(),
-                now_ms: 1_700_007_120_000,
-            },
-        )
-        .await
-        .expect_err("active workflow hold must refuse complete_job pre-effect");
+    let hold_err = Box::pin(completion_service.complete_job(
+        fence_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fence_job.job_id.clone(),
+            now_ms: 1_700_007_120_000,
+        },
+    ))
+    .await
+    .expect_err("active workflow hold must refuse complete_job pre-effect");
     assert_eq!(hold_err.code(), NativeErrorCode::ValidationFailed.as_str());
     assert!(
         !expected_fence_wt_path.exists(),
@@ -8011,18 +8006,17 @@ exit 0
         })
         .expect("set stop_requested = true");
 
-    let stop_err = completion_service
-        .complete_job(
-            fence_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: fence_job.job_id.clone(),
-                now_ms: 1_700_007_122_000,
-            },
-        )
-        .await
-        .expect_err("stop_requested must refuse complete_job pre-effect");
+    let stop_err = Box::pin(completion_service.complete_job(
+        fence_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fence_job.job_id.clone(),
+            now_ms: 1_700_007_122_000,
+        },
+    ))
+    .await
+    .expect_err("stop_requested must refuse complete_job pre-effect");
     assert_eq!(stop_err.code(), NativeErrorCode::ValidationFailed.as_str());
     assert!(!expected_fence_wt_path.exists());
 
@@ -8036,18 +8030,17 @@ exit 0
         })
         .expect("clear stop_requested");
 
-    let agg_fence = completion_service
-        .aggregate_integrated_job(
-            fence_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: fence_job.job_id.clone(),
-                now_ms: 1_700_007_125_000,
-            },
-        )
-        .await
-        .expect("aggregate_integrated_job on fence_job");
+    let agg_fence = Box::pin(completion_service.aggregate_integrated_job(
+        fence_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fence_job.job_id.clone(),
+            now_ms: 1_700_007_125_000,
+        },
+    ))
+    .await
+    .expect("aggregate_integrated_job on fence_job");
     assert!(expected_fence_wt_path.exists());
 
     // 2b. Corrupt the persisted `JobIntegrationReport` artifact on disk after the durable intent
@@ -8059,7 +8052,7 @@ exit 0
         .expect("corrupt persisted JobIntegrationReport on disk");
 
     let closure_before_corrupt = read_invocation_count(&closure_count_file);
-    let corrupt_err = completion_service
+    let corrupt_err = Box::pin(completion_service
         .complete_job(
             fence_session.guard(),
             &CoworkerJobCompletionRequest {
@@ -8068,7 +8061,7 @@ exit 0
                 job_id: fence_job.job_id.clone(),
                 now_ms: 1_700_007_130_000,
             },
-        )
+        ))
         .await
         .expect_err("corrupted persisted JobIntegrationReport must fail closed with AmbiguousWakeupPendingReconciliation");
     assert_eq!(
@@ -8104,20 +8097,17 @@ exit 0
         PendingControllerEffectStatus::EffectUnknown
     );
 
-    let retry_unknown_err = completion_service
-        .complete_job(
-            fence_session.guard(),
-            &CoworkerJobCompletionRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: fence_job.job_id.clone(),
-                now_ms: 1_700_007_135_000,
-            },
-        )
-        .await
-        .expect_err(
-            "repeat complete_job while JobAggregation is EffectUnknown must remain blocked",
-        );
+    let retry_unknown_err = Box::pin(completion_service.complete_job(
+        fence_session.guard(),
+        &CoworkerJobCompletionRequest {
+            binding_id: BINDING_A.to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            job_id: fence_job.job_id.clone(),
+            now_ms: 1_700_007_135_000,
+        },
+    ))
+    .await
+    .expect_err("repeat complete_job while JobAggregation is EffectUnknown must remain blocked");
     assert_eq!(
         retry_unknown_err.code(),
         NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
