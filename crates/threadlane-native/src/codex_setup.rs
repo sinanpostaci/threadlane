@@ -1097,17 +1097,21 @@ fn inspect_threadlane_table(doc: &DocumentMut) -> InspectedTableState {
     };
 
     if let Some(enabled_item) = table_like.get("enabled") {
-        if enabled_item.as_bool() == Some(false) {
-            return InspectedTableState::Disabled;
+        match enabled_item.as_bool() {
+            Some(false) => return InspectedTableState::Disabled,
+            Some(true) => {}
+            None => return InspectedTableState::Conflict,
         }
-        return InspectedTableState::Conflict;
     }
 
     let Some(table) = threadlane_item.as_table() else {
         return InspectedTableState::Conflict;
     };
 
-    if table.len() != 2 || !table.contains_key("command") || !table.contains_key("args") {
+    if table
+        .iter()
+        .any(|(key, _)| !matches!(key, "command" | "args" | "enabled"))
+    {
         return InspectedTableState::Conflict;
     }
 
@@ -2023,7 +2027,7 @@ OTHER_TOKEN = "secret-other-token-999"
     #[test]
     fn disabled_table_remains_disabled_even_if_previously_managed() {
         let tmp = TempDir::new().expect("tempdir");
-        let req = build_fixture_request(tmp.path());
+        let mut req = build_fixture_request(tmp.path());
 
         let first = apply_codex_mcp_setup(&req);
         assert_eq!(first.state, CodexSetupState::Registered);
@@ -2032,6 +2036,10 @@ OTHER_TOKEN = "secret-other-token-999"
         let mut content = fs::read_to_string(&config_path).expect("read config");
         content.push_str("enabled = false\n");
         fs::write(&config_path, &content).expect("write disabled config");
+        req.mcp_executable = write_fake_mcp_binary(
+            &tmp.path().join("bin-v2"),
+            DEFAULT_NATIVE_MCP_EXECUTABLE_NAME,
+        );
 
         let check_report = check_codex_mcp_setup(&req);
         assert_eq!(check_report.state, CodexSetupState::Disabled);
@@ -2147,6 +2155,207 @@ OTHER_TOKEN = "secret-other-token-999"
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(args[1], req.state_dir.to_str().unwrap());
+    }
+
+    #[test]
+    fn explicitly_enabled_owned_upgrade_preserves_enablement_comments_and_receipt_hashes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let mut req = build_fixture_request(tmp.path());
+        assert_eq!(
+            apply_codex_mcp_setup(&req).state,
+            CodexSetupState::Registered
+        );
+        let config_path = req.codex_home.join(CODEX_CONFIG_FILENAME);
+        let receipt_path = req.management_dir.join(CODEX_SETUP_RECEIPT_FILENAME);
+        let old_receipt = fs::read(&receipt_path).unwrap();
+        let original = fs::read_to_string(&config_path).unwrap();
+        let enabled_line = "# Keep explicit enablement\nenabled = true # operator preference\n";
+        let enabled_config =
+            format!("# Keep header\nmodel = \"gpt-5.4\"\n{original}{enabled_line}");
+        fs::write(&config_path, &enabled_config).unwrap();
+        let old_doc: DocumentMut = original.parse().unwrap();
+        let enabled_doc: DocumentMut = enabled_config.parse().unwrap();
+        assert_eq!(
+            inspect_threadlane_table(&old_doc),
+            inspect_threadlane_table(&enabled_doc)
+        );
+
+        req.mcp_executable = write_fake_mcp_binary(
+            &tmp.path().join("bin-v2"),
+            DEFAULT_NATIVE_MCP_EXECUTABLE_NAME,
+        );
+        req.state_dir = tmp.path().join("stores/runtime-v2");
+        let before_check = fs::metadata(&config_path).unwrap();
+        let receipt_before_check = fs::metadata(&receipt_path).unwrap();
+        let checked = check_codex_mcp_setup(&req);
+        assert_eq!(checked.state, CodexSetupState::NotRegistered);
+        assert!(!checked.config_modified);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), enabled_config);
+        assert_eq!(fs::read(&receipt_path).unwrap(), old_receipt);
+        let after_check = fs::metadata(&config_path).unwrap();
+        assert_eq!(before_check.ino(), after_check.ino());
+        assert_eq!(
+            before_check.modified().unwrap(),
+            after_check.modified().unwrap()
+        );
+        assert_eq!(
+            receipt_before_check.modified().unwrap(),
+            fs::metadata(&receipt_path).unwrap().modified().unwrap()
+        );
+
+        let upgraded = apply_codex_mcp_setup(&req);
+        assert_eq!(upgraded.state, CodexSetupState::Registered);
+        assert!(upgraded.registered && upgraded.config_modified && upgraded.restart_required);
+        let updated = fs::read_to_string(&config_path).unwrap();
+        assert!(updated.contains(enabled_line));
+        assert!(updated.starts_with("# Keep header\nmodel = \"gpt-5.4\"\n"));
+        let doc: DocumentMut = updated.parse().unwrap();
+        assert_eq!(
+            doc["mcp_servers"]["threadlane"]["enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            doc["mcp_servers"]["threadlane"]["command"].as_str(),
+            req.mcp_executable.to_str()
+        );
+        assert_eq!(
+            doc["mcp_servers"]["threadlane"]["args"][1].as_str(),
+            req.state_dir.to_str()
+        );
+        let receipt: CodexSetupReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(receipt.schema_version, 1);
+        assert_eq!(
+            inspect_threadlane_table(&doc),
+            InspectedTableState::CandidateManaged {
+                table_sha256: receipt.managed_table_sha256
+            }
+        );
+        let before_reapply = fs::metadata(&config_path).unwrap();
+        let reapplied = apply_codex_mcp_setup(&req);
+        assert_eq!(reapplied.state, CodexSetupState::Unchanged);
+        assert!(!reapplied.config_modified);
+        assert!(!reapplied.restart_required);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), updated);
+        let after_reapply = fs::metadata(&config_path).unwrap();
+        assert_eq!(before_reapply.ino(), after_reapply.ino());
+        assert_eq!(
+            before_reapply.modified().unwrap(),
+            after_reapply.modified().unwrap()
+        );
+    }
+
+    #[test]
+    fn explicitly_enabled_exact_desired_recovery_adopts_receipt_without_rewriting_config() {
+        let tmp = TempDir::new().expect("tempdir");
+        let req = build_fixture_request(tmp.path());
+        assert_eq!(
+            apply_codex_mcp_setup(&req).state,
+            CodexSetupState::Registered
+        );
+        let config_path = req.codex_home.join(CODEX_CONFIG_FILENAME);
+        let receipt_path = req.management_dir.join(CODEX_SETUP_RECEIPT_FILENAME);
+        let receipt = fs::read(&receipt_path).unwrap();
+        let content = format!(
+            "{}enabled = true # preserve\n",
+            fs::read_to_string(&config_path).unwrap()
+        );
+        fs::write(&config_path, &content).unwrap();
+        fs::remove_dir_all(&req.management_dir).unwrap();
+        let before = fs::metadata(&config_path).unwrap();
+        assert_eq!(
+            check_codex_mcp_setup(&req).state,
+            CodexSetupState::Unchanged
+        );
+        assert!(!req.management_dir.exists());
+        let recovered = apply_codex_mcp_setup(&req);
+        assert_eq!(recovered.state, CodexSetupState::Unchanged);
+        assert!(recovered.registered);
+        assert!(!recovered.config_modified && !recovered.restart_required);
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), content);
+        assert_eq!(fs::read(&receipt_path).unwrap(), receipt);
+        let after = fs::metadata(&config_path).unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[test]
+    fn explicitly_enabled_upgrade_rejects_unowned_tampered_and_unknown_settings() {
+        for case in [
+            "missing_receipt",
+            "wrong_digest",
+            "wrong_schema",
+            "wrong_server",
+            "wrong_config",
+            "command",
+            "args",
+            "enabled_string",
+            "enabled_integer",
+            "env",
+            "cwd",
+            "timeout",
+        ] {
+            let tmp = TempDir::new().expect("tempdir");
+            let mut req = build_fixture_request(tmp.path());
+            assert_eq!(
+                apply_codex_mcp_setup(&req).state,
+                CodexSetupState::Registered
+            );
+            let config_path = req.codex_home.join(CODEX_CONFIG_FILENAME);
+            let receipt_path = req.management_dir.join(CODEX_SETUP_RECEIPT_FILENAME);
+            let mut content = format!(
+                "{}enabled = true\n",
+                fs::read_to_string(&config_path).unwrap()
+            );
+            let mut receipt: CodexSetupReceipt =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            let expected = match case {
+                "wrong_schema" | "wrong_server" | "wrong_config" => CodexSetupState::Error,
+                _ => CodexSetupState::Conflict,
+            };
+            match case {
+                "missing_receipt" => fs::remove_file(&receipt_path).unwrap(),
+                "wrong_digest" => receipt.managed_table_sha256 = "0".repeat(64),
+                "wrong_schema" => receipt.schema_version = 99,
+                "wrong_server" => receipt.server_name = "foreign".into(),
+                "wrong_config" => {
+                    receipt.config_path = tmp.path().join("foreign.toml").display().to_string()
+                }
+                "command" => {
+                    content =
+                        content.replace(req.mcp_executable.to_str().unwrap(), "/tmp/manual-mcp")
+                }
+                "args" => {
+                    content = content.replace(req.state_dir.to_str().unwrap(), "/tmp/manual-state")
+                }
+                "enabled_string" => {
+                    content = content.replace("enabled = true", "enabled = \"true\"")
+                }
+                "enabled_integer" => content = content.replace("enabled = true", "enabled = 1"),
+                "env" => content.push_str("env = { CUSTOM_VAR = \"1\" }\n"),
+                "cwd" => content.push_str("cwd = \"/tmp\"\n"),
+                "timeout" => content.push_str("startup_timeout_sec = 10\n"),
+                _ => unreachable!(),
+            }
+            if case != "missing_receipt" {
+                fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            }
+            fs::write(&config_path, &content).unwrap();
+            let receipt_before = fs::read(&receipt_path).ok();
+            req.mcp_executable = write_fake_mcp_binary(
+                &tmp.path().join("bin-v2"),
+                DEFAULT_NATIVE_MCP_EXECUTABLE_NAME,
+            );
+            for report in [check_codex_mcp_setup(&req), apply_codex_mcp_setup(&req)] {
+                assert_eq!(report.state, expected, "{case}");
+                assert!(
+                    !report.registered && !report.config_modified && !report.restart_required,
+                    "{case}"
+                );
+            }
+            assert_eq!(fs::read_to_string(&config_path).unwrap(), content, "{case}");
+            assert_eq!(fs::read(&receipt_path).ok(), receipt_before, "{case}");
+        }
     }
 
     #[test]
