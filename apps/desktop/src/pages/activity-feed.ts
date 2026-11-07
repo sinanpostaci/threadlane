@@ -54,7 +54,6 @@ interface RenderedRow {
   durationEl: HTMLElement | null;
   contextAtMs: number | null;
   elapsedStartedAtMs: number | null;
-  lastView: ActivityRequestView | null;
 }
 
 function recordedTimestampMs(value: number | null | undefined): number | null {
@@ -63,63 +62,75 @@ function recordedTimestampMs(value: number | null | undefined): number | null {
     : null;
 }
 
-function elapsedDurationTexts(view: ActivityRequestView): string[] {
-  const texts: string[] = [];
-  const collect = (
-    duration: ActivityRequestView['duration'],
-    summary: string,
-    detail: string
-  ): void => {
-    if (duration.kind === 'elapsed') {
-      // The compact value is handled by the duration object itself.
-      texts.push(summary, detail);
-    }
-  };
-  collect(view.duration, view.durationSummary, view.durationDetail);
+function durationTextByOwner(view: ActivityRequestView): Map<string, string> {
+  const values = new Map<string, string>();
+  values.set('request', view.durationDetail);
   for (const child of view.children) {
-    collect(child.duration, child.durationSummary, child.durationDetail);
+    values.set(`child:${child.call.id}`, child.durationSummary);
   }
-  return texts;
+  return values;
+}
+
+function sanitizeElapsedDurationText(view: ActivityRequestView): ActivityRequestView {
+  const elapsedOwners = new Set<string>();
+  if (view.duration.kind === 'elapsed') {
+    elapsedOwners.add('request');
+  }
+  for (const child of view.children) {
+    if (child.duration.kind === 'elapsed') {
+      elapsedOwners.add(`child:${child.call.id}`);
+    }
+  }
+  return {
+    ...view,
+    duration:
+      view.duration.kind === 'elapsed'
+        ? { ...view.duration, text: '' }
+        : view.duration,
+    durationSummary:
+      view.duration.kind === 'elapsed' ? '' : view.durationSummary,
+    durationDetail:
+      view.duration.kind === 'elapsed' ? '' : view.durationDetail,
+    children: view.children.map((child) => ({
+      ...child,
+      duration:
+        child.duration.kind === 'elapsed'
+          ? { ...child.duration, text: '' }
+          : child.duration,
+      durationSummary:
+        child.duration.kind === 'elapsed' ? '' : child.durationSummary,
+      durationDetail:
+        child.duration.kind === 'elapsed' ? '' : child.durationDetail,
+    })),
+    timeline: view.timeline.map((event) => ({
+      ...event,
+      lines:
+        event.durationOwnerKey !== null &&
+        event.durationLineIndex !== null &&
+        elapsedOwners.has(event.durationOwnerKey)
+          ? event.lines.map((line, index) =>
+              index === event.durationLineIndex ? '' : line
+            )
+          : event.lines,
+    })),
+  };
 }
 
 /**
  * Running elapsed labels change on every projection without changing any
- * recorded row content. Their exact generated strings are excluded from the
- * row-identity signature so the quotes and detail nodes stay stable.
+ * recorded row content. Only the stable duration line nodes are excluded from
+ * the row-identity signature so the row and detail nodes stay stable.
  */
 function activityRowSignature(
   view: ActivityRequestView,
   parentPresent: boolean,
   stale: boolean
 ): string {
-  const elapsedTexts = new Set(elapsedDurationTexts(view));
-
-  return JSON.stringify(
-    [view, parentPresent, stale],
-    (key, value) => {
-      if (
-        key === 'duration' &&
-        typeof value === 'object' &&
-        value !== null &&
-        (value as { kind?: string }).kind === 'elapsed'
-      ) {
-        return { ...(value as ActivityRequestView['duration']), text: '' };
-      }
-      if (
-        typeof value === 'string' &&
-        (key === 'durationSummary' || key === 'durationDetail') &&
-        elapsedTexts.has(value)
-      ) {
-        return '';
-      }
-      if (Array.isArray(value) && key === 'lines') {
-        return value.map((line: unknown) =>
-          typeof line === 'string' && elapsedTexts.has(line) ? '' : line
-        );
-      }
-      return value;
-    }
-  );
+  return JSON.stringify([
+    sanitizeElapsedDurationText(view),
+    parentPresent,
+    stale,
+  ]);
 }
 
 function selectedFilterValue(select: HTMLSelectElement): string | null {
@@ -905,7 +916,6 @@ export class ActivityFeedPage {
       durationEl: null,
       contextAtMs: null,
       elapsedStartedAtMs: null,
-      lastView: null,
     };
   }
 
@@ -925,8 +935,7 @@ export class ActivityFeedPage {
       if (entry.details.open !== open) {
         entry.details.open = open;
       }
-      this.updateElapsedDurationText(entry, entry.lastView, view);
-      entry.lastView = view;
+      this.updateElapsedDurationText(entry, view);
       const duration = formatCompactDuration(
         view.duration,
         view.durationDetail
@@ -970,45 +979,23 @@ export class ActivityFeedPage {
       view.duration.kind === 'elapsed'
         ? recordedTimestampMs(view.request.started_at_ms)
         : null;
-    entry.lastView = view;
   }
 
   private updateElapsedDurationText(
     entry: RenderedRow,
-    previous: ActivityRequestView | null,
     next: ActivityRequestView
   ): void {
-    if (!previous) {
-      return;
-    }
-    const before = elapsedDurationTexts(previous);
-    const after = elapsedDurationTexts(next);
-    if (before.length !== after.length) {
-      return;
-    }
-    const replacements = new Map<string, string | null>();
-    for (let index = 0; index < before.length; index += 1) {
-      const oldText = before[index]!;
-      const newText = after[index]!;
-      if (oldText === newText) {
+    const values = durationTextByOwner(next);
+    for (const text of entry.details.querySelectorAll<HTMLElement>(
+      '[data-feed-duration-owner]'
+    )) {
+      const owner = text.dataset.feedDurationOwner;
+      if (!owner) {
         continue;
       }
-      const existing = replacements.get(oldText);
-      if (existing === undefined) {
-        replacements.set(oldText, newText);
-      } else if (existing !== newText) {
-        // Ambiguous repeated elapsed values are safer to leave until a full
-        // meaningful row refresh than to rewrite the wrong evidence line.
-        replacements.set(oldText, null);
-      }
-    }
-    if (replacements.size === 0) {
-      return;
-    }
-    for (const text of entry.details.querySelectorAll<HTMLElement>('p')) {
-      const replacement = replacements.get(text.textContent ?? '');
-      if (typeof replacement === 'string' && text.textContent !== replacement) {
-        text.textContent = replacement;
+      const nextText = values.get(owner);
+      if (nextText !== undefined && text.textContent !== nextText) {
+        text.textContent = nextText;
       }
     }
   }
@@ -1223,7 +1210,16 @@ export class ActivityFeedPage {
             { className: 'aq-feed-technical-event' },
             h('p', { className: 'aq-feed-technical-label' }, event.label),
             h('p', {}, event.detail),
-            ...event.lines.map((line) => h('p', {}, line)),
+            ...event.lines.map((line, index) =>
+              h(
+                'p',
+                index === event.durationLineIndex &&
+                  event.durationOwnerKey !== null
+                  ? { 'data-feed-duration-owner': event.durationOwnerKey }
+                  : {},
+                line
+              )
+            ),
             event.note ? h('p', {}, event.note) : null
           )
         )

@@ -163,6 +163,8 @@ export interface ActivityTimelineEventView {
   tone: LifecycleTone;
   detail: string;
   lines: string[];
+  durationOwnerKey: string | null;
+  durationLineIndex: number | null;
   note: string;
   stage: DeliveryStage | null;
 }
@@ -2036,6 +2038,32 @@ function buildChildView(call: ObservationCall, nowMs: number | null): ActivityCh
   };
 }
 
+interface TimelineLineEntry {
+  text: string;
+  durationOwnerKey?: string;
+}
+
+function buildTimelineLines(entries: readonly TimelineLineEntry[]): {
+  lines: string[];
+  durationOwnerKey: string | null;
+  durationLineIndex: number | null;
+} {
+  const lines: string[] = [];
+  let durationOwnerKey: string | null = null;
+  let durationLineIndex: number | null = null;
+  for (const entry of entries) {
+    if (entry.text.length === 0) {
+      continue;
+    }
+    if (entry.durationOwnerKey !== undefined && durationLineIndex === null) {
+      durationOwnerKey = entry.durationOwnerKey;
+      durationLineIndex = lines.length;
+    }
+    lines.push(entry.text);
+  }
+  return { lines, durationOwnerKey, durationLineIndex };
+}
+
 function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventView[] {
   const jobDetail = view.jobLinked
     ? view.jobUnavailable
@@ -2046,31 +2074,43 @@ function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventVi
     view.source?.availability === 'unavailable'
       ? `${view.sourceDetails} · Unavailable`
       : view.sourceDetails;
-  const requestLines = [
-    `Title: ${view.title}`,
-    `Source: ${sourceDetail}`,
-    `Request: ${view.request.source_id} · ${view.request.id}`,
-    `Project: ${view.projectLabel}`,
-    `Job: ${jobDetail}`,
-    `Conversation: ${view.conversationDetails}`,
-    `Root executor: ${view.executorRoleLabel}${
-      view.executorRole !== 'Not reported' &&
-      view.executorRole !== view.executorRoleLabel
-        ? ` · recorded role ${view.executorRole}`
-        : ''
-    } · tool ${view.executorTool} · provider ${view.executorProvider}`,
-    `Root model: requested ${view.requestedModel} · observed ${view.observedModel}`,
-    `Root effort: requested ${view.requestedEffort} · observed ${view.observedEffort}`,
-    view.calledExecutor
-      ? `Called tools/models: ${view.calledExecutor.detail}`
-      : '',
-    `Usage: ${view.usage.detail}`,
-    view.durationDetail,
-    `Delivery: ${view.latestReturn}`,
-    `Child calls: ${view.childCoverage}`,
-    view.parentRequestId ? `Parent request: ${view.parentRequestId}` : '',
-    `Summary: ${view.summary}`,
-  ].filter((line) => line.length > 0);
+  const requestLineResult = buildTimelineLines([
+    { text: `Title: ${view.title}` },
+    { text: `Source: ${sourceDetail}` },
+    { text: `Request: ${view.request.source_id} · ${view.request.id}` },
+    { text: `Project: ${view.projectLabel}` },
+    { text: `Job: ${jobDetail}` },
+    { text: `Conversation: ${view.conversationDetails}` },
+    {
+      text: `Root executor: ${view.executorRoleLabel}${
+        view.executorRole !== 'Not reported' &&
+        view.executorRole !== view.executorRoleLabel
+          ? ` · recorded role ${view.executorRole}`
+          : ''
+      } · tool ${view.executorTool} · provider ${view.executorProvider}`,
+    },
+    {
+      text: `Root model: requested ${view.requestedModel} · observed ${view.observedModel}`,
+    },
+    {
+      text: `Root effort: requested ${view.requestedEffort} · observed ${view.observedEffort}`,
+    },
+    {
+      text: view.calledExecutor
+        ? `Called tools/models: ${view.calledExecutor.detail}`
+        : '',
+    },
+    { text: `Usage: ${view.usage.detail}` },
+    { text: view.durationDetail, durationOwnerKey: 'request' },
+    { text: `Delivery: ${view.latestReturn}` },
+    { text: `Child calls: ${view.childCoverage}` },
+    {
+      text: view.parentRequestId
+        ? `Parent request: ${view.parentRequestId}`
+        : '',
+    },
+    { text: `Summary: ${view.summary}` },
+  ]);
 
   const requestEvent: ActivityTimelineEventView = {
     key: 'request',
@@ -2086,7 +2126,9 @@ function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventVi
     stateLabel: view.stateLabel,
     tone: view.stateTone,
     detail: `Operation: ${formatRecordedOperation(view.operation)}.`,
-    lines: requestLines,
+    lines: requestLineResult.lines,
+    durationOwnerKey: requestLineResult.durationOwnerKey,
+    durationLineIndex: requestLineResult.durationLineIndex,
     note: '',
     stage: null,
   };
@@ -2109,6 +2151,8 @@ function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventVi
         : []),
       `Model: ${view.actorModel} · effort ${view.actorEffort}`,
     ],
+    durationOwnerKey: null,
+    durationLineIndex: null,
     note: '',
     stage: null,
   };
@@ -2124,38 +2168,48 @@ function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventVi
       tone: 'neutral',
       detail: `Recipient: ${delivery.recipient}`,
       lines: [delivery.summary, delivery.note].filter((line) => line.length > 0),
+      durationOwnerKey: null,
+      durationLineIndex: null,
       note: '',
       stage: delivery.stage,
     })
   );
 
   const childEvents: ActivityTimelineEventView[] = view.children.map(
-    (child, index) => ({
-      key: `child:${index}:${child.call.id}`,
-      kind: 'child',
-      atMs:
-        finiteTimestamp(child.call.started_at_ms) ??
-        finiteTimestamp(child.call.finished_at_ms),
-      atValue:
-        child.startedAtValue !== 'Not reported'
-          ? child.startedAtValue
-          : child.finishedAtValue,
-      label: 'Child call',
-      stateLabel: child.stateLabel,
-      tone: child.stateTone,
-      detail: child.title,
-      lines: [
-        `Call: ${child.call.id}`,
-        child.executorSummary,
-        `Model: ${child.modelSummary}`,
-        `Effort: ${child.effortSummary}`,
-        child.durationSummary,
-        child.usage.summary,
-        child.summary,
-      ].filter((line) => line.length > 0),
-      note: '',
-      stage: null,
-    })
+    (child, index) => {
+      const lineResult = buildTimelineLines([
+        { text: `Call: ${child.call.id}` },
+        { text: child.executorSummary },
+        { text: `Model: ${child.modelSummary}` },
+        { text: `Effort: ${child.effortSummary}` },
+        {
+          text: child.durationSummary,
+          durationOwnerKey: `child:${child.call.id}`,
+        },
+        { text: child.usage.summary },
+        { text: child.summary },
+      ]);
+      return {
+        key: `child:${index}:${child.call.id}`,
+        kind: 'child',
+        atMs:
+          finiteTimestamp(child.call.started_at_ms) ??
+          finiteTimestamp(child.call.finished_at_ms),
+        atValue:
+          child.startedAtValue !== 'Not reported'
+            ? child.startedAtValue
+            : child.finishedAtValue,
+        label: 'Child call',
+        stateLabel: child.stateLabel,
+        tone: child.stateTone,
+        detail: child.title,
+        lines: lineResult.lines,
+        durationOwnerKey: lineResult.durationOwnerKey,
+        durationLineIndex: lineResult.durationLineIndex,
+        note: '',
+        stage: null,
+      };
+    }
   );
 
   const ordered = [...deliveryEvents, ...childEvents]

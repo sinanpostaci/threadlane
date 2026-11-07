@@ -3185,4 +3185,115 @@ describe('activity chat labels and local filters', () => {
       null
     );
   });
+
+  it('updates root and child elapsed duration nodes by stable owner identity', async () => {
+    installActivityFeedDom();
+    const { ActivityFeedPage } = await import('./activity-feed.ts');
+    const page = new ActivityFeedPage();
+    const main = new FakeElement('main');
+    main.className = 'aq-main';
+    main.appendChild(page.element as unknown as FakeElement);
+    const pageElement = page.element as unknown as FakeElement;
+
+    const runningRequest = makeRequest({
+      id: 'elapsed-root',
+      title: 'Elapsed root request',
+      state: 'running',
+      duration_ms: null,
+      started_at_ms: NOW_MS - 11_400,
+      finished_at_ms: null,
+      updated_at_ms: NOW_MS,
+      thread_label: 'Elapsed root chat',
+      thread_uuid: 'thread-elapsed-root',
+      children: [
+        makeCall({
+          id: 'elapsed-child',
+          title: 'Elapsed child call',
+          state: 'running',
+          duration_ms: null,
+          started_at_ms: NOW_MS - 10_600,
+          finished_at_ms: null,
+          summary: 'Elapsed 11s',
+        }),
+      ],
+      children_count: 1,
+      delivery: [],
+    });
+    const initialSnapshot = makeSnapshot({
+      generated_at_ms: NOW_MS,
+      requests: [runningRequest],
+    });
+    page.update(initialSnapshot, { scope: null });
+
+    const details = fakeFirstRowDetails(pageElement);
+    assert.ok(details);
+    details.open = true;
+    details.dispatchEvent('toggle');
+
+    const durationNodes = pageElement.querySelectorAll<FakeElement>(
+      '[data-feed-duration-owner]'
+    );
+    const rootDuration = durationNodes.find(
+      (node) => node.dataset.feedDurationOwner === 'request'
+    );
+    const childDuration = durationNodes.find(
+      (node) => node.dataset.feedDurationOwner === 'child:elapsed-child'
+    );
+    assert.ok(rootDuration);
+    assert.ok(childDuration);
+    assert.match(rootDuration.textContent, /^Elapsed 11s/);
+    assert.equal(childDuration.textContent, 'Elapsed 11s');
+
+    const equalParagraphs = pageElement
+      .querySelectorAll<FakeElement>('p')
+      .filter((paragraph) => paragraph.textContent === 'Elapsed 11s');
+    const unrelated = equalParagraphs.find(
+      (paragraph) => paragraph !== childDuration
+    );
+    assert.ok(unrelated);
+    const childEvent = pageElement
+      .querySelectorAll<FakeElement>('.aq-feed-technical-event')
+      .find(
+        (event) =>
+          event.querySelector<FakeElement>('.aq-feed-technical-label')
+            ?.textContent === 'Child call'
+      );
+    assert.ok(childEvent);
+    const childMetadataBefore = childEvent
+      .querySelectorAll<FakeElement>('p')
+      .map((paragraph) => paragraph.textContent);
+
+    const laterSnapshot = makeSnapshot({
+      ...initialSnapshot,
+      generated_at_ms: NOW_MS + 500,
+    });
+    page.update(laterSnapshot, { scope: null });
+
+    assert.equal(fakeFirstRowDetails(pageElement), details);
+    const laterDurationNodes = pageElement.querySelectorAll<FakeElement>(
+      '[data-feed-duration-owner]'
+    );
+    const laterRoot = laterDurationNodes.find(
+      (node) => node.dataset.feedDurationOwner === 'request'
+    );
+    const laterChild = laterDurationNodes.find(
+      (node) => node.dataset.feedDurationOwner === 'child:elapsed-child'
+    );
+    assert.equal(laterRoot, rootDuration);
+    assert.equal(laterChild, childDuration);
+    assert.match(laterRoot?.textContent ?? '', /^Elapsed 12s/);
+    assert.equal(laterChild?.textContent, 'Elapsed 11s');
+    assert.equal(unrelated.textContent, 'Elapsed 11s');
+    assert.deepEqual(
+      childEvent
+        .querySelectorAll<FakeElement>('p')
+        .map((paragraph) => paragraph.textContent),
+      childMetadataBefore
+    );
+    assert.equal(
+      pageElement.querySelector<FakeElement>('[data-feed-duration]')
+        ?.textContent,
+      '12s'
+    );
+  });
 });
