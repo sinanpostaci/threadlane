@@ -18,9 +18,9 @@ use threadlane_workflow::{Difficulty, ToolAdapter, WorkflowRole};
 
 use crate::coworker_workflow::{
     deterministic_prefixed_id, sha256_hex, validate_bounded_text,
-    validate_non_native_worker_choice, validate_unique_id_list, verify_recovery_command_context,
-    ArchitectAdviceRecord, ArchitectConsultationRequestOutcome, ArchitectDecisionStatus,
-    CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobLockState,
+    validate_non_native_worker_choice, validate_unique_id_list, verify_grant_registry_dependencies,
+    verify_recovery_command_context, ArchitectAdviceRecord, ArchitectConsultationRequestOutcome,
+    ArchitectDecisionStatus, CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobLockState,
     CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
     CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerWorkflowStore,
     HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
@@ -2012,16 +2012,8 @@ impl PlanningCommandStore {
             ));
         }
 
-        let reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
-        if reg_snapshot.revision != grant.registry_revision {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "workflow registry revision drifted from standing grant (grant {}, actual {})",
-                    grant.registry_revision, reg_snapshot.revision
-                ),
-            ));
-        }
+        let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
+        let reg_snapshot = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
         let selected_choice = resolve_headless_choice(
             &reg_snapshot,
             grant,

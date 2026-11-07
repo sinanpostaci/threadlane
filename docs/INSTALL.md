@@ -196,8 +196,12 @@ doctest execution on shard 1. The long CLI/driver integration scenario has
 sequential 90s and 300s internal waits. Read-only owned-fixture observations
 confirmed actual stage progression, and the exact test passed under its
 eight-minute exception. This does not establish the root cause of earlier
-hosted timeouts. Hosted sharded runs, manual packaging, macOS/Windows and live
-runtime acceptance remain unqualified.
+hosted timeouts. The sharded Linux layout at checkpoint `e356ed3` subsequently
+passed [hosted run 42343732156](https://github.com/sinanpostaci/threadlane/actions/runs/42343732156)
+in about 10 minutes: all four root-test partitions and the separate
+quality/frontend/Tauri job succeeded. This qualifies that exact Linux source
+checkpoint; later runtime changes need their own validation. Manual packaging,
+macOS/Windows and installed live runtime acceptance remain unqualified.
 
 Local validation covered all **902 default tests** without repeating successful
 cases: 561 passed before a bounded single-group comparison hit its 20-minute
@@ -206,8 +210,8 @@ The one multi-phase driver case reached the initial five-minute limit and then
 passed with the exact eight-minute override (about 306 seconds including command
 setup). The successful test sets are disjoint and cover the complete default
 inventory. The separate doctest command, 12 CI-wrapper tests, 11 packaging-wrapper
-tests and workflow syntax checks also passed. This is local evidence, not a
-successful hosted run of the new layout.
+tests and workflow syntax checks also passed. These local results complement
+the separately qualified hosted checkpoint above.
 
 ### Automatic Linux source validation
 

@@ -9,7 +9,8 @@ use fs2::FileExt;
 use crate::error::RegistryError;
 use crate::types::{
     DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition, RegistryChange,
-    RegistrySnapshot, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+    RegistrySnapshot, RoleAssignment, ScopedModelDependency, ScopedProfileDependencySpec,
+    ScopedToolDependency, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
     MAX_ASSIGNMENTS_PER_PROFILE, MAX_EFFORTS_PER_MODEL, MAX_EFFORT_LEN, MAX_EXECUTABLE_PATH_LEN,
     MAX_ID_LEN, MAX_JS_SAFE_INTEGER, MAX_LABEL_LEN, MAX_MODELS, MAX_MODEL_ARG_LEN, MAX_PROFILES,
     MAX_REGISTRY_FILE_BYTES, MAX_TOOLS, REGISTRY_FILE_NAME, REGISTRY_LOCK_FILE_NAME,
@@ -390,6 +391,210 @@ pub fn resolve_choice(
 
     validate_model_choice(&assignment.choice, &snapshot.models, &snapshot.tools)?;
     Ok(assignment.choice.clone())
+}
+
+impl ScopedProfileDependencySpec {
+    /// Extracts the canonical, self-contained dependency specification for `profile_id` from
+    /// `snapshot`.
+    ///
+    /// Fails closed if `snapshot` is invalid or `profile_id` does not exist in `snapshot`.
+    pub fn from_snapshot(
+        snapshot: &RegistrySnapshot,
+        profile_id: &str,
+    ) -> Result<Self, RegistryError> {
+        validate_snapshot(snapshot)?;
+        validate_identifier(profile_id)?;
+
+        let profile = snapshot
+            .profiles
+            .iter()
+            .find(|candidate| candidate.id == profile_id)
+            .ok_or(RegistryError::NotFound(
+                "Workflow profile not found in registry snapshot.",
+            ))?;
+
+        let mut assignments: Vec<RoleAssignment> = profile
+            .assignments
+            .iter()
+            .filter(|entry| entry.role.is_execution_role())
+            .cloned()
+            .collect();
+        assignments.sort_by(|left, right| {
+            (left.role.as_str(), left.difficulty.map(Difficulty::as_str)).cmp(&(
+                right.role.as_str(),
+                right.difficulty.map(Difficulty::as_str),
+            ))
+        });
+
+        let referenced_model_ids: BTreeSet<&str> = assignments
+            .iter()
+            .map(|entry| entry.choice.model_id.as_str())
+            .collect();
+
+        let mut models = Vec::with_capacity(referenced_model_ids.len());
+        for model_id in referenced_model_ids {
+            let model = snapshot
+                .models
+                .iter()
+                .find(|candidate| candidate.id == model_id)
+                .ok_or(RegistryError::InvalidReference(
+                    "Role assignment references a model that does not exist in the registry.",
+                ))?;
+            models.push(ScopedModelDependency {
+                id: model.id.clone(),
+                tool_id: model.tool_id.clone(),
+                model_arg: model.model_arg.clone(),
+                efforts: model.efforts.clone(),
+                allow_no_effort: model.allow_no_effort,
+            });
+        }
+
+        let referenced_tool_ids: BTreeSet<&str> =
+            models.iter().map(|model| model.tool_id.as_str()).collect();
+
+        let mut tools = Vec::with_capacity(referenced_tool_ids.len());
+        for tool_id in referenced_tool_ids {
+            let tool = snapshot
+                .tools
+                .iter()
+                .find(|candidate| candidate.id == tool_id)
+                .ok_or(RegistryError::InvalidReference(
+                    "Model references a tool that does not exist in the registry.",
+                ))?;
+            tools.push(ScopedToolDependency {
+                id: tool.id.clone(),
+                adapter: tool.adapter,
+                executable_path: tool.executable_path.clone(),
+                enabled: tool.enabled,
+            });
+        }
+
+        let spec = Self {
+            profile_id: profile.id.clone(),
+            assignments,
+            models,
+            tools,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Validates all structural, identifier, canonical ordering, and referential closure
+    /// invariants of this scoped dependency specification.
+    pub fn validate(&self) -> Result<(), RegistryError> {
+        let scoped_snapshot = self.to_scoped_registry_snapshot(0);
+        validate_snapshot(&scoped_snapshot)?;
+
+        for window in self.assignments.windows(2) {
+            let left_key = (
+                window[0].role.as_str(),
+                window[0].difficulty.map(Difficulty::as_str),
+            );
+            let right_key = (
+                window[1].role.as_str(),
+                window[1].difficulty.map(Difficulty::as_str),
+            );
+            if left_key >= right_key {
+                return Err(RegistryError::InvalidInput(
+                    "Scoped profile dependency assignments must be in canonical sorted order.",
+                ));
+            }
+        }
+        if self
+            .assignments
+            .iter()
+            .any(|entry| !entry.role.is_execution_role())
+        {
+            return Err(RegistryError::InvalidInput(
+                "Scoped profile dependency assignments must contain only execution roles.",
+            ));
+        }
+
+        for window in self.models.windows(2) {
+            if window[0].id >= window[1].id {
+                return Err(RegistryError::InvalidInput(
+                    "Scoped profile dependency models must be in canonical sorted order.",
+                ));
+            }
+        }
+        let referenced_models: BTreeSet<&str> = self
+            .assignments
+            .iter()
+            .map(|entry| entry.choice.model_id.as_str())
+            .collect();
+        if self
+            .models
+            .iter()
+            .any(|model| !referenced_models.contains(model.id.as_str()))
+        {
+            return Err(RegistryError::InvalidInput(
+                "Scoped profile dependency specification contains unreferenced models.",
+            ));
+        }
+
+        for window in self.tools.windows(2) {
+            if window[0].id >= window[1].id {
+                return Err(RegistryError::InvalidInput(
+                    "Scoped profile dependency tools must be in canonical sorted order.",
+                ));
+            }
+        }
+        let referenced_tools: BTreeSet<&str> = self
+            .models
+            .iter()
+            .map(|model| model.tool_id.as_str())
+            .collect();
+        if self
+            .tools
+            .iter()
+            .any(|tool| !referenced_tools.contains(tool.id.as_str()))
+        {
+            return Err(RegistryError::InvalidInput(
+                "Scoped profile dependency specification contains unreferenced tools.",
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Synthesizes a minimal [`RegistrySnapshot`] at `provenance_revision` containing only the
+    /// selected profile and its referenced models and tools.
+    pub fn to_scoped_registry_snapshot(&self, provenance_revision: u64) -> RegistrySnapshot {
+        RegistrySnapshot {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            revision: provenance_revision,
+            tools: self
+                .tools
+                .iter()
+                .map(|tool| ToolDefinition {
+                    id: tool.id.clone(),
+                    label: tool.id.clone(),
+                    adapter: tool.adapter,
+                    executable_path: tool.executable_path.clone(),
+                    enabled: tool.enabled,
+                })
+                .collect(),
+            models: self
+                .models
+                .iter()
+                .map(|model| ModelDefinition {
+                    id: model.id.clone(),
+                    tool_id: model.tool_id.clone(),
+                    label: model.id.clone(),
+                    model_arg: model.model_arg.clone(),
+                    efforts: model.efforts.clone(),
+                    allow_no_effort: model.allow_no_effort,
+                })
+                .collect(),
+            profiles: vec![WorkflowProfile {
+                id: self.profile_id.clone(),
+                name: self.profile_id.clone(),
+                assignments: self.assignments.clone(),
+                decision_advisor: None,
+            }],
+            default_profile_id: None,
+        }
+    }
 }
 
 fn apply_change_in_memory(

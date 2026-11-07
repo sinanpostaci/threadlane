@@ -69,12 +69,12 @@ use crate::coworker_observation::{
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, sha256_hex, validate_bounded_text,
     validate_non_native_worker_choice, validate_unique_id_list, validate_unique_text_list,
-    validate_write_scope_at_project_base, write_scope_sets_overlap, ArchitectAdviceRecord,
-    ArchitectContextDependencies, ArchitectDecisionStatus, CanonicalProjectBaseRef,
-    CoworkerJobRecord, PlanningAdviceGrant, PlanningCallBudget, PlanningCallReservation,
-    PlanningReservationStatus, PlanningResultRef, TaskInterfaceOwnershipSpec, WorkBrief,
-    MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING, MAX_CHECK_EVIDENCE_ITEMS, MAX_COWORKER_ID_LEN,
-    MAX_TASKS_PER_JOB, MAX_WORK_BRIEF_ITEMS,
+    validate_write_scope_at_project_base, verify_grant_registry_dependencies,
+    write_scope_sets_overlap, ArchitectAdviceRecord, ArchitectContextDependencies,
+    ArchitectDecisionStatus, CanonicalProjectBaseRef, CoworkerJobRecord, PlanningAdviceGrant,
+    PlanningCallBudget, PlanningCallReservation, PlanningReservationStatus, PlanningResultRef,
+    TaskInterfaceOwnershipSpec, WorkBrief, MAX_ARCHITECT_ADVICE_RECORDS_PER_BINDING,
+    MAX_CHECK_EVIDENCE_ITEMS, MAX_COWORKER_ID_LEN, MAX_TASKS_PER_JOB, MAX_WORK_BRIEF_ITEMS,
 };
 use crate::coworker_workflow::store::{
     CoworkerBindingLedger, CoworkerWorkflowStore, FinalizePlanningCallRequest,
@@ -2045,16 +2045,8 @@ impl CoworkerPlanningService {
             &request.context_dependencies.dependency_file_blobs,
         )?;
 
-        let reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
-        if reg_snapshot.revision != grant.registry_revision {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "workflow registry revision drifted from standing grant (grant {}, actual {})",
-                    grant.registry_revision, reg_snapshot.revision
-                ),
-            ));
-        }
+        let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
+        let reg_snapshot = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
         let (selected_choice, provider, executable_path) = resolve_headless_planning_worker(
             &reg_snapshot,
             grant,
@@ -3379,16 +3371,8 @@ impl CoworkerPlanningService {
             attached_advice.push(adv.clone());
         }
 
-        let reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
-        if reg_snapshot.revision != grant.registry_revision {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "workflow registry revision drifted from standing grant (grant {}, actual {})",
-                    grant.registry_revision, reg_snapshot.revision
-                ),
-            ));
-        }
+        let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
+        let reg_snapshot = verify_grant_registry_dependencies(&live_reg_snapshot, &grant)?;
         let (selected_choice, provider, executable_path) = resolve_headless_planning_worker(
             &reg_snapshot,
             &grant,
@@ -4228,6 +4212,9 @@ impl CoworkerPlanningService {
             Some(output_digest),
         )?;
 
+        let live_reg_snapshot = read_registry_snapshot_readonly(&self.registry_dir)?;
+        let _ = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
+
         let mut plan_tasks = Vec::with_capacity(tasks.len());
         let mut task_interfaces = BTreeMap::new();
         for t in tasks {
@@ -4272,19 +4259,23 @@ impl CoworkerPlanningService {
         );
 
         let plan_summary = workflow
-            .save_draft(SavePlanDraft {
-                command_key: recovery_target
-                    .map_or(command_key, |target| target.command_key.clone()),
-                plan_id: recovery_target.map_or_else(
-                    || request.plan_id.clone(),
-                    |target| Some(target.plan_id.clone()),
-                ),
-                expected_revision: recovery_target.map_or(request.expected_plan_revision, |_| 0),
-                profile_id: grant.profile_id.clone(),
-                profile_revision: grant.registry_revision,
-                summary,
-                tasks: plan_tasks,
-            })
+            .save_draft_with_scoped_proof(
+                SavePlanDraft {
+                    command_key: recovery_target
+                        .map_or(command_key, |target| target.command_key.clone()),
+                    plan_id: recovery_target.map_or_else(
+                        || request.plan_id.clone(),
+                        |target| Some(target.plan_id.clone()),
+                    ),
+                    expected_revision: recovery_target
+                        .map_or(request.expected_plan_revision, |_| 0),
+                    profile_id: grant.profile_id.clone(),
+                    profile_revision: grant.registry_revision,
+                    summary,
+                    tasks: plan_tasks,
+                },
+                grant.scoped_profile_dependency_proof.clone(),
+            )
             .map_err(map_workflow_error)?;
 
         let published_plan = workflow

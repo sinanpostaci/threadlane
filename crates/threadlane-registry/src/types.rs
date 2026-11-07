@@ -565,3 +565,62 @@ pub enum RegistryChange {
         profile_id: Option<String>,
     },
 }
+
+/// Authority-relevant tool properties bound into a [`ScopedProfileDependencySpec`].
+///
+/// Captures the exact execution identity of a referenced tool (`id`, `adapter`,
+/// `executable_path`, and `enabled`) while omitting display-only labels so unrelated
+/// cosmetic label edits do not alter execution semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedToolDependency {
+    /// Unique tool identifier (`[a-zA-Z0-9_-]{1,64}`).
+    pub id: String,
+    /// Execution adapter type.
+    pub adapter: ToolAdapter,
+    /// Optional absolute or configured CLI executable path.
+    pub executable_path: Option<PathBuf>,
+    /// Whether this tool is currently enabled for workflow execution.
+    pub enabled: bool,
+}
+
+/// Authority-relevant model properties bound into a [`ScopedProfileDependencySpec`].
+///
+/// Captures the exact execution identity of a referenced model (`id`, `tool_id`,
+/// `model_arg`, `efforts`, and `allow_no_effort`) while omitting display-only labels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedModelDependency {
+    /// Unique model identifier (`[a-zA-Z0-9_-]{1,64}`).
+    pub id: String,
+    /// Referenced [`ToolDefinition::id`].
+    pub tool_id: String,
+    /// Provider-facing model argument string passed to the adapter.
+    pub model_arg: String,
+    /// Supported reasoning/execution effort levels for this model.
+    pub efforts: Vec<String>,
+    /// Whether the model can be invoked without an explicit effort level (`effort: None`).
+    pub allow_no_effort: bool,
+}
+
+/// Canonical, self-contained snapshot of all authority-relevant registry dependencies for a
+/// single selected [`WorkflowProfile`].
+///
+/// Includes the selected `profile_id`, its canonical execution role assignments, every model
+/// referenced by those assignments, and every tool referenced by those models. Unrelated profiles,
+/// unreferenced models/tools, `default_profile_id`, and cosmetic display labels (`Profile::name`,
+/// `ModelDefinition::label`, `ToolDefinition::label`) are excluded so unrelated registry edits
+/// cannot invalidate an unchanged profile's standing planning authority, while any semantic change
+/// to the selected profile's assignments, models, efforts, or tools is detected deterministically.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedProfileDependencySpec {
+    /// Selected workflow profile identifier.
+    pub profile_id: String,
+    /// Canonical execution role assignments sorted by `(role, difficulty)`.
+    pub assignments: Vec<RoleAssignment>,
+    /// Referenced model definitions sorted by `id`.
+    pub models: Vec<ScopedModelDependency>,
+    /// Referenced tool definitions sorted by `id`.
+    pub tools: Vec<ScopedToolDependency>,
+}

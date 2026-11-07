@@ -15,6 +15,7 @@ use threadlane_plans::{
 use uuid::Uuid;
 
 use crate::error::WorkflowError;
+use crate::types::ScopedProfileDependencyProof;
 
 /// Schema version for persisted per-binding command-key journal files.
 pub const WORKFLOW_JOURNAL_SCHEMA_VERSION: u32 = 1;
@@ -54,6 +55,8 @@ pub(crate) struct CommandJournalEntry {
     pub payload_digest: String,
     #[serde(default)]
     pub plan_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_profile_dependency_proof: Option<ScopedProfileDependencyProof>,
     pub state: CommandJournalState,
 }
 
@@ -68,6 +71,7 @@ impl CommandJournalEntry {
         summary: &str,
         tasks_digest: &str,
         payload_digest: &str,
+        scoped_profile_dependency_proof: Option<&ScopedProfileDependencyProof>,
     ) -> bool {
         self.resolved_plan_id == target_plan_id
             && (expected_revision == self.expected_revision
@@ -77,6 +81,7 @@ impl CommandJournalEntry {
             && self.summary == summary
             && self.tasks_digest == tasks_digest
             && self.payload_digest == payload_digest
+            && self.scoped_profile_dependency_proof.as_ref() == scoped_profile_dependency_proof
     }
 }
 
@@ -106,6 +111,125 @@ impl PersistedCommandJournal {
             .find(|e| e.command_key == command_key)
     }
 
+    pub(crate) fn verified_scoped_profile_dependency_proof(
+        &self,
+        binding_id: &str,
+        revision: &PlanRevision,
+    ) -> Option<&ScopedProfileDependencyProof> {
+        if self.schema_version != WORKFLOW_JOURNAL_SCHEMA_VERSION
+            || self.binding_id != binding_id
+            || revision.binding_id != binding_id
+            || revision.status == PlanStatus::Superseded
+            || validate_plan_revision(revision).is_err()
+            || revision.revision == 0
+            || revision.profile_revision == 0
+            || self.entries.len() > MAX_COMMAND_JOURNAL_ENTRIES
+        {
+            return None;
+        }
+
+        let expected_tasks_digest = compute_tasks_digest(&revision.tasks).ok()?;
+        let mut matched_proof: Option<&ScopedProfileDependencyProof> = None;
+
+        for entry in &self.entries {
+            let touches_plan = entry.resolved_plan_id == revision.plan_id
+                || entry
+                    .explicit_plan_id
+                    .as_deref()
+                    .is_some_and(|id| id == revision.plan_id);
+            if !touches_plan {
+                continue;
+            }
+
+            let touches_revision = entry.target_revision == revision.revision
+                || matches!(
+                    entry.state,
+                    CommandJournalState::Completed {
+                        created_revision,
+                        ..
+                    } if created_revision == revision.revision
+                );
+            if !touches_revision {
+                continue;
+            }
+
+            if entry.resolved_plan_id != revision.plan_id
+                || entry
+                    .explicit_plan_id
+                    .as_deref()
+                    .is_some_and(|id| id != revision.plan_id)
+            {
+                return None;
+            }
+
+            let expected_payload_digest = compute_payload_digest_with_proof(
+                &revision.plan_id,
+                &revision.profile_id,
+                revision.profile_revision,
+                &revision.summary,
+                &revision.tasks,
+                entry.scoped_profile_dependency_proof.as_ref(),
+            )
+            .ok()?;
+
+            match &entry.state {
+                CommandJournalState::Pending => {
+                    return None;
+                }
+                CommandJournalState::Failed => {
+                    if entry.target_revision == revision.revision
+                        && entry.profile_id == revision.profile_id
+                        && entry.profile_revision == revision.profile_revision
+                        && entry.summary == revision.summary
+                        && entry.tasks_digest == expected_tasks_digest
+                        && entry.payload_digest == expected_payload_digest
+                    {
+                        return None;
+                    }
+                }
+                CommandJournalState::Completed {
+                    created_revision,
+                    created_at_ms,
+                    plan_digest,
+                } => {
+                    if matched_proof.is_some() {
+                        return None;
+                    }
+                    if *created_revision != revision.revision
+                        || entry.target_revision != revision.revision
+                        || entry.expected_revision.checked_add(1) != Some(revision.revision)
+                        || *created_at_ms < 0
+                        || entry.profile_id != revision.profile_id
+                        || entry.profile_revision != revision.profile_revision
+                        || entry.summary != revision.summary
+                        || entry.tasks_digest != expected_tasks_digest
+                        || entry.payload_digest != expected_payload_digest
+                    {
+                        return None;
+                    }
+                    let (Some(entry_digest), Some(completed_digest)) =
+                        (entry.plan_digest.as_deref(), plan_digest.as_deref())
+                    else {
+                        return None;
+                    };
+                    if entry_digest != completed_digest || !is_hex_64(completed_digest) {
+                        return None;
+                    }
+                    let proof = entry.scoped_profile_dependency_proof.as_ref()?;
+                    if proof.validate().is_err()
+                        || proof.provenance_revision != revision.profile_revision
+                        || proof.spec.profile_id != revision.profile_id
+                    {
+                        return None;
+                    }
+                    matched_proof = Some(proof);
+                }
+            }
+        }
+
+        matched_proof
+    }
+
     pub(crate) fn verified_historical_plan_digest(
         &self,
         binding_id: &str,
@@ -124,14 +248,6 @@ impl PersistedCommandJournal {
         }
 
         let expected_tasks_digest = compute_tasks_digest(&revision.tasks).ok()?;
-        let expected_payload_digest = compute_payload_digest(
-            &revision.plan_id,
-            &revision.profile_id,
-            revision.profile_revision,
-            &revision.summary,
-            &revision.tasks,
-        )
-        .ok()?;
 
         let mut matched_digest: Option<String> = None;
 
@@ -165,6 +281,16 @@ impl PersistedCommandJournal {
             {
                 return None;
             }
+
+            let expected_payload_digest = compute_payload_digest_with_proof(
+                &revision.plan_id,
+                &revision.profile_id,
+                revision.profile_revision,
+                &revision.summary,
+                &revision.tasks,
+                entry.scoped_profile_dependency_proof.as_ref(),
+            )
+            .ok()?;
 
             match &entry.state {
                 CommandJournalState::Pending => {
@@ -200,6 +326,14 @@ impl PersistedCommandJournal {
                         || entry.payload_digest != expected_payload_digest
                     {
                         return None;
+                    }
+                    if let Some(ref proof) = entry.scoped_profile_dependency_proof {
+                        if proof.validate().is_err()
+                            || proof.provenance_revision != revision.profile_revision
+                            || proof.spec.profile_id != revision.profile_id
+                        {
+                            return None;
+                        }
                     }
                     let (Some(entry_digest), Some(completed_digest)) =
                         (entry.plan_digest.as_deref(), plan_digest.as_deref())
@@ -273,6 +407,37 @@ pub(crate) fn compute_payload_digest(
         tasks,
     );
     sha256_hex_64(&tuple)
+}
+
+pub(crate) fn compute_payload_digest_with_proof(
+    resolved_plan_id: &str,
+    profile_id: &str,
+    profile_revision: u64,
+    summary: &str,
+    tasks: &[PlanTask],
+    scoped_profile_dependency_proof: Option<&ScopedProfileDependencyProof>,
+) -> Result<String, WorkflowError> {
+    match scoped_profile_dependency_proof {
+        None => compute_payload_digest(
+            resolved_plan_id,
+            profile_id,
+            profile_revision,
+            summary,
+            tasks,
+        ),
+        Some(proof) => {
+            let tuple = (
+                "threadlane-workflow:draft-payload:v2",
+                resolved_plan_id,
+                profile_id,
+                profile_revision,
+                summary,
+                tasks,
+                proof,
+            );
+            sha256_hex_64(&tuple)
+        }
+    }
 }
 
 fn sha256_hex_64<T: Serialize + ?Sized>(value: &T) -> Result<String, WorkflowError> {
@@ -628,6 +793,16 @@ fn validate_journal(
             if !is_hex_64(digest) {
                 return Err(WorkflowError::CorruptStore(
                     "Persisted workflow command journal contains a malformed plan_digest.",
+                ));
+            }
+        }
+        if let Some(ref proof) = entry.scoped_profile_dependency_proof {
+            if proof.validate().is_err()
+                || proof.provenance_revision != entry.profile_revision
+                || proof.spec.profile_id != entry.profile_id
+            {
+                return Err(WorkflowError::CorruptStore(
+                    "Persisted workflow command journal contains an invalid scoped profile dependency proof.",
                 ));
             }
         }

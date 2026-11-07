@@ -1632,7 +1632,17 @@ impl CoworkerControllerService {
                     if !fenced_task_ids.contains(&task.task_id) {
                         fenced_task_ids.push(task.task_id.clone());
                     }
-                    return Ok(());
+                    return self.reconcile_fenced_ready_for_review_snapshot(
+                        request,
+                        &current_adm,
+                        approval,
+                        approved_task,
+                        &task,
+                        &command_key,
+                        snapshot,
+                        controller_instance_id,
+                        lease_epoch,
+                    );
                 }
 
                 let evidence = extract_verified_ready_for_review_evidence(
@@ -1823,6 +1833,203 @@ impl CoworkerControllerService {
                 Ok(())
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_fenced_ready_for_review_snapshot(
+        &self,
+        request: &CoworkerControllerStepRequest,
+        current_adm: &VerifiedControllerAdmission,
+        approval: &ApprovalRecord,
+        approved_task: &ApprovedTaskRecord,
+        task: &CoworkerTaskRecord,
+        command_key: &str,
+        snapshot: &TaskStateSnapshot,
+        controller_instance_id: &str,
+        lease_epoch: u64,
+    ) -> Result<(), NativeError> {
+        let existing_outbox =
+            find_task_attempt_outbox(&current_adm.job, &task.task_id, command_key);
+        let has_pending_effect = current_adm
+            .runtime_state
+            .pending_effects
+            .values()
+            .any(|e| e.request_key == command_key);
+        let was_controller_dispatched = existing_outbox.is_some()
+            || has_pending_effect
+            || matches!(
+                task.stage,
+                CoworkerTaskStage::DispatchReserved
+                    | CoworkerTaskStage::Running
+                    | CoworkerTaskStage::Held
+                    | CoworkerTaskStage::EffectUnknown
+            );
+        if !was_controller_dispatched {
+            return Ok(());
+        }
+
+        let evidence = extract_verified_ready_for_review_evidence(
+            approval,
+            approved_task,
+            &task.selected_choice,
+            snapshot,
+        )?;
+
+        if let Some(outbox) = existing_outbox {
+            let fenced_stage = if matches!(
+                task.stage,
+                CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::EffectUnknown
+            ) {
+                CoworkerTaskStage::Running
+            } else {
+                task.stage
+            };
+            if matches!(
+                outbox.status,
+                OutboxDispatchStatus::ReservedBeforeEffect | OutboxDispatchStatus::EffectUnknown
+            ) || task.stage != fenced_stage
+                || task.unresolved_outbox_id.is_some()
+                || outbox.run_id.as_deref() != Some(evidence.run_id.as_str())
+                || outbox.worker_id.as_deref() != Some(evidence.worker_id.as_str())
+            {
+                let resolved_status = if outbox.status == OutboxDispatchStatus::EffectUnknown {
+                    OutboxDispatchStatus::ReconciledConfirmed
+                } else {
+                    OutboxDispatchStatus::DispatchedEffectConfirmed
+                };
+                self.workflow_store
+                    .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+                        binding_id: request.binding_id.clone(),
+                        thread_uuid: request.thread_uuid.clone(),
+                        job_id: request.job_id.clone(),
+                        expected_job_revision: current_adm.job.job_revision,
+                        expected_ledger_revision: None,
+                        outbox_id: outbox.outbox_id,
+                        status: resolved_status,
+                        next_task_stage: fenced_stage,
+                        run_id: Some(evidence.run_id.clone()),
+                        worker_id: Some(evidence.worker_id.clone()),
+                        task_worktree_id: Some(evidence.task_worktree_id.clone()),
+                        head_commit: Some(evidence.head_commit.clone()),
+                        tree_sha: Some(evidence.tree_sha.clone()),
+                        diff_digest: Some(evidence.diff_digest.clone()),
+                        report_artifact_id: Some(evidence.report_artifact_id.clone()),
+                        observed_model: Some(evidence.observed_model.clone()),
+                        observed_effort: evidence.observed_effort.clone(),
+                        receipt_id: None,
+                        diagnostic: None,
+                    })?;
+            }
+        }
+
+        let effect_already_confirmed =
+            current_adm.runtime_state.pending_effects.values().any(|e| {
+                e.request_key == command_key
+                    && e.status == PendingControllerEffectStatus::EffectConfirmed
+                    && e.external_correlation_id.as_deref() == Some(evidence.run_id.as_str())
+            });
+        let artifacts_already_recorded = current_adm
+            .runtime_state
+            .get_attempt_artifacts(&task.task_id, 1)
+            .is_some_and(|a| {
+                a.run_id == evidence.run_id
+                    && a.worker_id == evidence.worker_id
+                    && a.task_worktree_id == evidence.task_worktree_id
+                    && a.observed_model == evidence.observed_model
+                    && a.observed_effort == evidence.observed_effort
+                    && a.committed_head_commit.as_deref() == Some(evidence.head_commit.as_str())
+                    && a.committed_tree_sha.as_deref() == Some(evidence.tree_sha.as_str())
+            });
+
+        if !effect_already_confirmed || !artifacts_already_recorded {
+            self.policy_store.mutate_job_runtime(
+                &request.binding_id,
+                &request.job_id,
+                controller_instance_id,
+                lease_epoch,
+                |state| {
+                    if let Some(eff) = state
+                        .pending_effects
+                        .values_mut()
+                        .find(|e| e.request_key == command_key)
+                    {
+                        if eff.status != PendingControllerEffectStatus::EffectConfirmed {
+                            eff.status = PendingControllerEffectStatus::EffectConfirmed;
+                            eff.external_correlation_id = Some(evidence.run_id.clone());
+                            eff.updated_at_ms = request.now_ms;
+                            state.record_role_completion(WorkflowRole::Coder, evidence.duration_ms);
+                        }
+                    } else {
+                        if state.total_task_attempts_reserved
+                            >= state.envelope.max_total_task_attempts_per_job
+                        {
+                            return Err(NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                format!(
+                                    "job `{}` exhausted max_total_task_attempts_per_job ({})",
+                                    state.job_id, state.envelope.max_total_task_attempts_per_job
+                                ),
+                            ));
+                        }
+                        state.reserve_role_call(WorkflowRole::Coder)?;
+                        state.total_task_attempts_reserved =
+                            state.total_task_attempts_reserved.saturating_add(1);
+                        state.record_role_completion(WorkflowRole::Coder, evidence.duration_ms);
+                        let effect_id = deterministic_prefixed_id(
+                            "threadlane-native:coworker-controller-effect:v1",
+                            "eff",
+                            &[&state.job_id, &task.task_id, command_key],
+                        );
+                        state.pending_effects.insert(
+                            effect_id.clone(),
+                            PendingControllerEffect {
+                                effect_id,
+                                request_key: command_key.to_string(),
+                                job_id: state.job_id.clone(),
+                                task_id: Some(task.task_id.clone()),
+                                attempt_no: Some(1),
+                                kind: PendingControllerEffectKind::CoderDispatch,
+                                status: PendingControllerEffectStatus::EffectConfirmed,
+                                subject_digest: approved_task.task_digest.clone(),
+                                external_correlation_id: Some(evidence.run_id.clone()),
+                                created_at_ms: request.now_ms,
+                                updated_at_ms: request.now_ms,
+                                diagnostic: None,
+                            },
+                        );
+                    }
+                    let artifact_rec = TaskAttemptExecutionArtifacts {
+                        task_id: task.task_id.clone(),
+                        attempt_no: 1,
+                        run_id: evidence.run_id.clone(),
+                        worker_id: evidence.worker_id.clone(),
+                        task_worktree_id: evidence.task_worktree_id.clone(),
+                        integration_worktree_id: evidence.integration_worktree_id.clone(),
+                        execution_base_commit: evidence.execution_base_commit.clone(),
+                        observed_provider: evidence.observed_provider.clone(),
+                        observed_model: evidence.observed_model.clone(),
+                        observed_effort: evidence.observed_effort.clone(),
+                        committed_head_commit: Some(evidence.head_commit.clone()),
+                        committed_tree_sha: Some(evidence.tree_sha.clone()),
+                        candidate_id: None,
+                        check_evidence: Vec::new(),
+                        test_evidence_summary: None,
+                        review_subject: None,
+                        reviewer_response_digest: None,
+                        review_receipt: None,
+                        integration_receipt: None,
+                        is_derived_attempt: false,
+                    };
+                    state.attempt_artifacts.insert(
+                        ControllerJobRuntimeState::artifact_key(&task.task_id, 1),
+                        artifact_rec,
+                    );
+                    Ok(())
+                },
+            )?;
+        }
+
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2181,7 +2388,9 @@ impl CoworkerControllerService {
             if !task_has_derived_attempt_or_post_initial_state(task, &final_adm.runtime_state)
                 && matches!(
                     task.stage,
-                    CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                    CoworkerTaskStage::DispatchReserved
+                        | CoworkerTaskStage::Running
+                        | CoworkerTaskStage::Held
                 )
                 && matches!(
                     snap.status,
@@ -2731,16 +2940,102 @@ pub(crate) fn task_has_derived_attempt_or_post_initial_state(
         })
 }
 
+/// Returns `true` when the task's current `Coder` attempt has already completed and reconciled its
+/// verified terminal execution evidence into [`ControllerJobRuntimeState`], even if workflow stage
+/// promotion to [`CoworkerTaskStage::ReadyForReview`] remains fenced.
+pub(crate) fn has_reconciled_terminal_coder_attempt(
+    task: &CoworkerTaskRecord,
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+) -> bool {
+    let attempt_no = task.current_attempt_no;
+    if attempt_no == 0 || task.unresolved_outbox_id.is_some() {
+        return false;
+    }
+    let has_blocking_coder_outbox = job.outbox.iter().any(|o| {
+        o.task_id == task.task_id
+            && o.attempt_no == attempt_no
+            && o.kind == OutboxDispatchKind::TaskAttemptDispatch
+            && o.status.blocks_replay_and_new_dispatch()
+    });
+    if has_blocking_coder_outbox {
+        return false;
+    }
+    let Some(artifacts) = runtime_state.get_attempt_artifacts(&task.task_id, attempt_no) else {
+        return false;
+    };
+    if artifacts.committed_head_commit.is_none() || artifacts.committed_tree_sha.is_none() {
+        return false;
+    }
+    let Some(attempt_record) = task
+        .attempts
+        .iter()
+        .rfind(|a| a.attempt_no == attempt_no && a.role == WorkflowRole::Coder)
+    else {
+        return false;
+    };
+    if attempt_record.run_id.as_deref() != Some(artifacts.run_id.as_str())
+        || attempt_record.worker_id.as_deref() != Some(artifacts.worker_id.as_str())
+    {
+        return false;
+    }
+    let has_confirmed_matching_outbox = job.outbox.iter().any(|o| {
+        o.outbox_id == attempt_record.outbox_id
+            && o.task_id == task.task_id
+            && o.attempt_no == attempt_no
+            && o.kind == OutboxDispatchKind::TaskAttemptDispatch
+            && matches!(
+                o.status,
+                OutboxDispatchStatus::DispatchedEffectConfirmed
+                    | OutboxDispatchStatus::ReconciledConfirmed
+            )
+            && o.run_id.as_deref() == Some(artifacts.run_id.as_str())
+            && o.worker_id.as_deref() == Some(artifacts.worker_id.as_str())
+    });
+    if !has_confirmed_matching_outbox {
+        return false;
+    }
+    let has_blocking_coder_effect = runtime_state.pending_effects.values().any(|eff| {
+        eff.kind == PendingControllerEffectKind::CoderDispatch
+            && eff.task_id.as_deref() == Some(task.task_id.as_str())
+            && eff.attempt_no == Some(attempt_no)
+            && eff.status.blocks_replay()
+    });
+    if has_blocking_coder_effect {
+        return false;
+    }
+    runtime_state.pending_effects.values().any(|eff| {
+        eff.kind == PendingControllerEffectKind::CoderDispatch
+            && eff.task_id.as_deref() == Some(task.task_id.as_str())
+            && eff.attempt_no == Some(attempt_no)
+            && eff.status == PendingControllerEffectStatus::EffectConfirmed
+    })
+}
+
 pub(crate) fn is_task_coder_execution_active(
     task: &CoworkerTaskRecord,
     job: &CoworkerJobRecord,
     runtime_state: &ControllerJobRuntimeState,
 ) -> bool {
+    let held_coder_attempt_started = task.stage == CoworkerTaskStage::Held
+        && (matches!(
+            task.stage_before_hold,
+            Some(
+                CoworkerTaskStage::DispatchReserved
+                    | CoworkerTaskStage::Running
+                    | CoworkerTaskStage::EffectUnknown
+            )
+        ) || ((task.current_attempt_no > 0 || !task.attempts.is_empty())
+            && !task
+                .candidates
+                .iter()
+                .any(|c| c.attempt_no == task.current_attempt_no)));
     if matches!(
         task.stage,
         CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
-    ) {
-        return true;
+    ) || held_coder_attempt_started
+    {
+        return !has_reconciled_terminal_coder_attempt(task, job, runtime_state);
     }
     let has_active_coder_outbox = job.outbox.iter().any(|o| {
         o.task_id == task.task_id
@@ -2753,32 +3048,17 @@ pub(crate) fn is_task_coder_execution_active(
     if has_active_coder_outbox {
         return true;
     }
-    let has_active_derived_coder_effect = runtime_state.pending_effects.values().any(|eff| {
+    let has_active_coder_effect = runtime_state.pending_effects.values().any(|eff| {
         eff.kind == PendingControllerEffectKind::CoderDispatch
             && eff.task_id.as_deref() == Some(task.task_id.as_str())
-            && eff.attempt_no.is_some_and(|no| no > 1)
             && matches!(
                 eff.status,
                 PendingControllerEffectStatus::ReservedBeforeEffect
                     | PendingControllerEffectStatus::EffectUnknown
             )
     });
-    if has_active_derived_coder_effect {
+    if has_active_coder_effect {
         return true;
-    }
-    if task.stage == CoworkerTaskStage::EffectUnknown {
-        let has_unknown_coder_effect = runtime_state.pending_effects.values().any(|eff| {
-            eff.kind == PendingControllerEffectKind::CoderDispatch
-                && eff.task_id.as_deref() == Some(task.task_id.as_str())
-                && matches!(
-                    eff.status,
-                    PendingControllerEffectStatus::ReservedBeforeEffect
-                        | PendingControllerEffectStatus::EffectUnknown
-                )
-        });
-        if has_unknown_coder_effect {
-            return true;
-        }
     }
     false
 }
@@ -3091,25 +3371,27 @@ fn classify_phase1_status(
     }) {
         return CoworkerControllerPhase1Status::AllTasksIntegrated;
     }
+    let has_unfenced_ready_for_review = job.tasks.iter().any(|t| {
+        !fenced_task_ids.contains(&t.task_id) && t.stage == CoworkerTaskStage::ReadyForReview
+    });
+    let has_active_hold = job.holds.iter().any(|h| h.active)
+        || job.phase == CoworkerJobPhase::Held
+        || job
+            .tasks
+            .iter()
+            .any(|t| t.stage == CoworkerTaskStage::Held || !t.active_hold_ids.is_empty());
     if job.tasks.iter().any(|t| {
         matches!(
             t.stage,
             CoworkerTaskStage::Failed | CoworkerTaskStage::Cancelled | CoworkerTaskStage::Blocked
         )
-    }) && fenced_task_ids.is_empty()
+    }) && !has_unfenced_ready_for_review
+        && !has_active_hold
     {
         return CoworkerControllerPhase1Status::BlockedOrFailed;
     }
-    if !fenced_task_ids.is_empty() || job.holds.iter().any(|h| h.active) {
-        if job
-            .tasks
-            .iter()
-            .any(|t| t.stage == CoworkerTaskStage::ReadyForReview)
-            && job.tasks.iter().any(|t| {
-                !fenced_task_ids.contains(&t.task_id)
-                    && t.stage == CoworkerTaskStage::ReadyForReview
-            })
-        {
+    if !fenced_task_ids.is_empty() || has_active_hold {
+        if has_unfenced_ready_for_review {
             return CoworkerControllerPhase1Status::AwaitingChecksOrReview;
         }
         return CoworkerControllerPhase1Status::Held;

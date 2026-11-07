@@ -30,7 +30,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_workers::{resolve_model_target, validate_sha256_hex_digest, WorkerProvider};
-use threadlane_workflow::{Difficulty, RegistrySnapshot, ToolAdapter, WorkflowRole};
+use threadlane_workflow::{
+    Difficulty, RegistrySnapshot, ScopedProfileDependencyProof, ToolAdapter, WorkflowRole,
+};
 
 use crate::coworker_workflow::contracts::{
     sha256_hex, validate_bounded_text, validate_non_native_worker_choice, CanonicalProjectBaseRef,
@@ -223,6 +225,8 @@ pub struct PlanningGrantPreview {
     pub policy_digest: String,
     /// Concrete frozen headless worker choices resolved for each requested planning/advisory role.
     pub frozen_role_choices: Vec<FrozenPlanningRoleChoice>,
+    /// Canonical scoped profile dependency proof bound at preview preparation time.
+    pub scoped_profile_dependency_proof: ScopedProfileDependencyProof,
     /// Strictly read-only capability envelope.
     pub capabilities: PlanningReadOnlyCapabilities,
     /// Finite call and per-call execution budget.
@@ -305,6 +309,25 @@ impl PlanningGrantPreview {
         sort_frozen_role_choices(&mut canonical_choices);
         validate_role_presence_matches_budget(&canonical_choices, &self.budget)?;
         validate_policy_bound_to_frozen_choices(&self.policy, &canonical_choices)?;
+        self.scoped_profile_dependency_proof
+            .validate()
+            .map_err(|err| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "PlanningGrantPreview.scoped_profile_dependency_proof validation failed: {}",
+                        err.safe_message()
+                    ),
+                )
+            })?;
+        if self.scoped_profile_dependency_proof.provenance_revision != self.registry_revision
+            || self.scoped_profile_dependency_proof.spec.profile_id != self.profile_id
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "PlanningGrantPreview.scoped_profile_dependency_proof provenance_revision or profile_id does not match preview",
+            ));
+        }
 
         let seed = (
             PLANNING_GRANT_PREVIEW_DOMAIN,
@@ -317,6 +340,7 @@ impl PlanningGrantPreview {
             &self.policy_digest,
             &self.policy,
             &canonical_choices,
+            &self.scoped_profile_dependency_proof,
             &self.capabilities,
             &self.budget,
             self.created_at_ms,
@@ -641,6 +665,19 @@ pub fn prepare_planning_grant_preview(
     sort_frozen_role_choices(&mut frozen_role_choices);
     validate_role_presence_matches_budget(&frozen_role_choices, &request.budget)?;
     validate_policy_bound_to_frozen_choices(&request.policy, &frozen_role_choices)?;
+    let scoped_profile_dependency_proof =
+        ScopedProfileDependencyProof::from_snapshot(snapshot, &request.profile_id).map_err(
+            |err| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "failed to build scoped profile dependency proof for profile `{}`: {}",
+                        request.profile_id,
+                        err.safe_message()
+                    ),
+                )
+            },
+        )?;
 
     let mut preview = PlanningGrantPreview {
         status: PlanningGrantPreviewStatus::ProposedCandidateNotGranted,
@@ -654,6 +691,7 @@ pub fn prepare_planning_grant_preview(
         policy: request.policy.clone(),
         policy_digest,
         frozen_role_choices,
+        scoped_profile_dependency_proof,
         capabilities: request.capabilities.clone(),
         budget: request.budget.clone(),
         created_at_ms: request.created_at_ms,
@@ -796,7 +834,10 @@ pub fn record_planning_grant(
         operator_attested: true,
     };
 
-    let grant = store.create_planning_grant(&create_req)?;
+    let grant = store.create_planning_grant_with_scoped_proof(
+        &create_req,
+        Some(live_preview.scoped_profile_dependency_proof),
+    )?;
     let ledger = store.read_binding_ledger(&grant.binding_id)?;
     Ok(PlanningGrantSummary::from_grant(
         &grant,

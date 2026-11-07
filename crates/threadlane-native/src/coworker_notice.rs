@@ -365,9 +365,10 @@ fn snapshot_from_settled_pipeline(
                 snapshot.task_id != task.task_id
                     || snapshot.stage != task.stage
                     || snapshot.attempt_no != task.current_attempt_no.max(1)
-                    || matches!(
-                        task.stage,
-                        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                    || crate::coworker_workflow::is_task_coder_execution_active(
+                        task,
+                        &admission.job,
+                        runtime,
                     )
             })
     {
@@ -526,6 +527,141 @@ fn derive_progress_notice_fingerprint(
         )
         .as_bytes(),
     ))
+}
+
+// This accepts genuine host snapshots only after their caller used ApprovedHostClient.
+// Scope, immutable approval identity, actual receipt IDs, reconciled controller failure state,
+// and terminal worker failure status are verified here; provider prose never enters wakeup text.
+pub(crate) fn verified_failed_task_attention(
+    admission: &VerifiedControllerAdmission,
+    snapshot: &threadlane_host::TaskStateSnapshot,
+) -> Option<(String, String)> {
+    let task = admission
+        .approval
+        .tasks
+        .iter()
+        .find(|task| task.task_id == snapshot.task_id)?;
+    let job_task = admission
+        .job
+        .tasks
+        .iter()
+        .find(|task| task.task_id == snapshot.task_id)?;
+    let worker = snapshot.worker.as_ref()?;
+    if admission.runtime_state.stop_requested
+        || snapshot.binding_id != admission.job.binding_id
+        || snapshot.thread_uuid != admission.job.thread_uuid
+        || snapshot.approval_id != admission.approval.approval_id
+        || snapshot.subject_digest != admission.approval.subject_digest
+        || snapshot.task_digest != task.task_digest
+        || snapshot.command_key != task.command_key
+        || snapshot.profile_id != task.profile_id
+        || snapshot.run_id.as_deref() != Some(worker.run_id.as_str())
+        || snapshot.worker_id.as_deref() != Some(worker.worker_id.as_str())
+        || worker.binding_id != snapshot.session_binding_id
+        || !matches!(
+            snapshot.status,
+            threadlane_host::TaskExecutionStatus::Failed
+                | threadlane_host::TaskExecutionStatus::TimedOut
+        )
+        || !matches!(
+            worker.status,
+            threadlane_core::WorkerStatus::Failed | threadlane_core::WorkerStatus::TimedOut
+        )
+        || !verified_original_failed_attempt_matches(
+            job_task,
+            &admission.runtime_state,
+            &worker.run_id,
+            &worker.worker_id,
+        )
+    {
+        return None;
+    }
+    Some((worker.run_id.clone(), worker.worker_id.clone()))
+}
+
+fn verified_original_failed_attempt_matches(
+    job_task: &crate::coworker_workflow::CoworkerTaskRecord,
+    runtime_state: &crate::coworker_workflow::ControllerJobRuntimeState,
+    worker_run_id: &str,
+    worker_id: &str,
+) -> bool {
+    if job_task.stage != CoworkerTaskStage::Failed
+        || job_task.current_attempt_no != 1
+        || crate::coworker_workflow::task_has_derived_attempt_or_post_initial_state(
+            job_task,
+            runtime_state,
+        )
+    {
+        return false;
+    }
+    let Some(latest_attempt) = job_task.attempts.last() else {
+        return false;
+    };
+    latest_attempt.attempt_no == 1
+        && latest_attempt.role == threadlane_workflow::WorkflowRole::Coder
+        && latest_attempt.run_id.as_deref() == Some(worker_run_id)
+        && latest_attempt.worker_id.as_deref() == Some(worker_id)
+}
+
+fn derive_worker_failure_notice_fingerprint(
+    key: &CoworkerJobOwnershipKey,
+    task_id: &str,
+    run_id: &str,
+    worker_id: &str,
+) -> Result<String, NativeError> {
+    key.validate()?;
+    for (name, value) in [
+        ("task_id", task_id),
+        ("run_id", run_id),
+        ("worker_id", worker_id),
+    ] {
+        validate_bounded_identifier(value, name, 128)?;
+    }
+    Ok(sha256_hex(
+        format!(
+            "coworker_worker_failure_notice_fp\0{}\0{}\0{}\0{task_id}\0{run_id}\0{worker_id}",
+            key.binding_id, key.thread_uuid, key.job_id
+        )
+        .as_bytes(),
+    ))
+}
+
+fn settled_worker_failure_fingerprints(
+    admission: &VerifiedControllerAdmission,
+    key: &CoworkerJobOwnershipKey,
+) -> Vec<String> {
+    let mut fps = Vec::new();
+    for task in &admission.job.tasks {
+        if !matches!(
+            task.stage,
+            CoworkerTaskStage::Failed | CoworkerTaskStage::Blocked
+        ) {
+            continue;
+        }
+        let Some(attempt) = task.attempts.last() else {
+            return Vec::new();
+        };
+        let (Some(run_id), Some(worker_id)) =
+            (attempt.run_id.as_deref(), attempt.worker_id.as_deref())
+        else {
+            return Vec::new();
+        };
+        if !verified_original_failed_attempt_matches(
+            task,
+            &admission.runtime_state,
+            run_id,
+            worker_id,
+        ) {
+            return Vec::new();
+        }
+        let Ok(fp) =
+            derive_worker_failure_notice_fingerprint(key, &task.task_id, run_id, worker_id)
+        else {
+            return Vec::new();
+        };
+        fps.push(fp);
+    }
+    fps
 }
 
 /// Verifies that a notice configuration matches the verified key, envelope digest, and repository path.
@@ -802,6 +938,76 @@ impl CoworkerNoticeStore {
         .map(Some)
     }
 
+    /// Submits one bounded fixed wakeup when a verified host worker fails while the job still
+    /// has active sibling work. This crate-private route is called only with ApprovedHostClient
+    /// snapshots and uses the progress subcap so terminal notice capacity stays reserved.
+    pub(crate) async fn notify_worker_failure_attention(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        snapshot: &threadlane_host::TaskStateSnapshot,
+    ) -> Result<Option<NoticeReport>, NativeError> {
+        let key = session.guard().key().clone();
+        session.guard().validate_before_effect(&key)?;
+        let admission = session.verify_admission()?;
+        let Some((run_id, worker_id)) = verified_failed_task_attention(&admission, snapshot) else {
+            return Ok(None);
+        };
+        let fingerprint =
+            derive_worker_failure_notice_fingerprint(&key, &snapshot.task_id, &run_id, &worker_id)?;
+        let (lock_name, state_name) = scope_filenames(&key)?;
+        let reserved = {
+            let _lock =
+                acquire_cross_process_lock(&self.root_dir, &lock_name, "coworker_notice_lock")?;
+            let Some(mut state) = self.read_state_locked(&state_name)? else {
+                return Ok(None);
+            };
+            validate_config_identity(
+                &state.config,
+                &key,
+                &admission.runtime_state.envelope.envelope_digest,
+                &admission.approval.repository_path,
+            )?;
+            self.reserve_progress_for_fingerprint_locked(
+                &state_name,
+                &mut state,
+                &key,
+                admission.job.job_revision,
+                fingerprint,
+                Some(session.guard()),
+            )?
+        };
+        let (context, attempt, fingerprint, job_revision) = match reserved {
+            ReserveOutcome::MissingConfig => return Ok(None),
+            ReserveOutcome::Completed(report) => return Ok(Some(report)),
+            ReserveOutcome::Reserved {
+                context,
+                attempt,
+                fingerprint,
+                job_revision,
+            } => (context, attempt, fingerprint, job_revision),
+        };
+        session.guard().validate_before_effect(&key)?;
+        let fresh = session.verify_admission()?;
+        if fresh.runtime_state.envelope.envelope_digest
+            != admission.runtime_state.envelope.envelope_digest
+            || verified_failed_task_attention(&fresh, snapshot).is_none()
+        {
+            // The reserved intent remains uncertain and cannot be replayed after scope drift.
+            return Ok(None);
+        }
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
+        session.guard().validate_before_effect(&key)?;
+        self.finalize_attempt(
+            &key,
+            NoticeKind::Attention,
+            job_revision,
+            &fingerprint,
+            &outcome,
+        )
+        .map(Some)
+    }
+
     async fn notify_inner(
         &self,
         session: &OwnedCoworkerControllerSession,
@@ -815,7 +1021,12 @@ impl CoworkerNoticeStore {
             Some(report) => snapshot_from_settled_pipeline(&admission, &key, report)?,
             None => snapshot_from_admission(&admission),
         };
-        let reserved = self.reserve_attempt(
+        let worker_failure_fps = if settled_report.is_none() && kind == NoticeKind::Attention {
+            settled_worker_failure_fingerprints(&admission, &key)
+        } else {
+            Vec::new()
+        };
+        let reserved = self.reserve_attempt_with_worker_failures(
             &key,
             &admission.runtime_state.envelope.envelope_digest,
             Path::new(&admission.approval.repository_path),
@@ -823,6 +1034,7 @@ impl CoworkerNoticeStore {
             admission.job.job_revision,
             snapshot,
             Some(session.guard()),
+            &worker_failure_fps,
         )?;
         let (context, attempt, fingerprint, job_revision) = match reserved {
             ReserveOutcome::MissingConfig => return Ok(None),
@@ -845,6 +1057,7 @@ impl CoworkerNoticeStore {
         Ok(Some(report))
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn reserve_attempt(
         &self,
@@ -855,6 +1068,30 @@ impl CoworkerNoticeStore {
         job_revision: u64,
         snapshot: NoticeMilestoneSnapshot,
         guard: Option<&CoworkerJobOwnershipGuard>,
+    ) -> Result<ReserveOutcome, NativeError> {
+        self.reserve_attempt_with_worker_failures(
+            key,
+            envelope_digest,
+            repository_path,
+            kind,
+            job_revision,
+            snapshot,
+            guard,
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_attempt_with_worker_failures(
+        &self,
+        key: &CoworkerJobOwnershipKey,
+        envelope_digest: &str,
+        repository_path: &Path,
+        kind: NoticeKind,
+        job_revision: u64,
+        snapshot: NoticeMilestoneSnapshot,
+        guard: Option<&CoworkerJobOwnershipGuard>,
+        worker_failure_fps: &[String],
     ) -> Result<ReserveOutcome, NativeError> {
         let (lock_name, state_name) = scope_filenames(key)?;
         let _lock = acquire_cross_process_lock(&self.root_dir, &lock_name, "coworker_notice_lock")?;
@@ -869,6 +1106,59 @@ impl CoworkerNoticeStore {
             ));
         }
         let fingerprint = derive_notice_fingerprint(key, kind, job_revision)?;
+        if kind == NoticeKind::Attention
+            && snapshot.has_attention_task
+            && !snapshot.has_active_hold
+            && !snapshot.has_unknown_effect
+            && !snapshot.has_rejected_closure
+            && snapshot.settled_pipeline_block.is_none()
+            && !worker_failure_fps.is_empty()
+            && !state.attempts.iter().any(|a| a.fingerprint == fingerprint)
+            && worker_failure_fps.iter().all(|fp| {
+                state.attempts.iter().any(|a| {
+                    &a.fingerprint == fp
+                        && matches!(
+                            a.status,
+                            PersistedAttemptStatus::Submitted
+                                | PersistedAttemptStatus::Unknown
+                                | PersistedAttemptStatus::Intent
+                        )
+                })
+            })
+        {
+            let mut dirty = false;
+            for entry in &mut state.attempts {
+                if entry.status == PersistedAttemptStatus::Intent {
+                    entry.status = PersistedAttemptStatus::Unknown;
+                    dirty = true;
+                }
+            }
+            if dirty {
+                self.write_state_locked(&state_name, &state)?;
+            }
+            let count = state.attempts.len();
+            let existing = state
+                .attempts
+                .iter()
+                .rfind(|a| {
+                    worker_failure_fps.contains(&a.fingerprint)
+                        && matches!(
+                            a.status,
+                            PersistedAttemptStatus::Submitted | PersistedAttemptStatus::Unknown
+                        )
+                })
+                .expect("matched worker failure attempt");
+            return Ok(ReserveOutcome::Completed(NoticeReport {
+                attempt_id: Some(existing.attempt_id.clone()),
+                kind,
+                job_revision: existing.job_revision,
+                fingerprint: existing.fingerprint.clone(),
+                status: map_persisted_status(existing.status),
+                was_duplicate: true,
+                cap_reached: false,
+                attempt_count: count,
+            }));
+        }
         self.reserve_for_fingerprint_locked(
             &state_name,
             &mut state,
@@ -2648,6 +2938,201 @@ mod tests {
     }
 
     #[test]
+    fn worker_failure_notice_fingerprint_and_subcap_preserve_terminal_capacity_and_unknown_deduplication(
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, complete) = fixture(tmp.path());
+        let progress_fp =
+            derive_progress_notice_fingerprint(&cfg.key, "task_1", "run_1", "worker_1").unwrap();
+        let failure_fp =
+            derive_worker_failure_notice_fingerprint(&cfg.key, "task_1", "run_1", "worker_1")
+                .unwrap();
+        let milestone_fp = derive_notice_fingerprint(&cfg.key, NoticeKind::Attention, 1).unwrap();
+        assert_ne!(progress_fp, failure_fp);
+        assert_ne!(failure_fp, milestone_fp);
+
+        let reserve_failure = |store: &CoworkerNoticeStore, invocation: usize| {
+            let (lock_name, state_name) = scope_filenames(&cfg.key).unwrap();
+            let _lock =
+                acquire_cross_process_lock(&store.root_dir, &lock_name, "coworker_notice_lock")
+                    .unwrap();
+            let mut state = store.read_state_locked(&state_name).unwrap().unwrap();
+            let fingerprint = derive_worker_failure_notice_fingerprint(
+                &cfg.key,
+                &format!("task_{invocation}"),
+                &format!("run_{invocation}"),
+                &format!("worker_{invocation}"),
+            )
+            .unwrap();
+            store
+                .reserve_progress_for_fingerprint_locked(
+                    &state_name,
+                    &mut state,
+                    &cfg.key,
+                    1,
+                    fingerprint,
+                    None,
+                )
+                .unwrap()
+        };
+
+        for invocation in 0..MAX_PROGRESS_NOTICE_ATTEMPTS {
+            assert!(matches!(
+                reserve_failure(&store, invocation),
+                ReserveOutcome::Reserved { .. }
+            ));
+        }
+        assert!(matches!(
+            reserve_failure(&store, MAX_PROGRESS_NOTICE_ATTEMPTS),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::CapReached,
+                attempt_count: 14,
+                cap_reached: true,
+                was_duplicate: false,
+                ..
+            })
+        ));
+
+        // Reopen promotes the unfinalized worker-failure Intent to Unknown and deduplicates it.
+        let reopened = CoworkerNoticeStore::new(tmp.path().join("store")).unwrap();
+        assert!(matches!(
+            reserve_failure(&reopened, MAX_PROGRESS_NOTICE_ATTEMPTS - 1),
+            ReserveOutcome::Completed(NoticeReport {
+                status: NoticeDeliveryStatus::Unknown,
+                attempt_count: 14,
+                was_duplicate: true,
+                cap_reached: false,
+                ..
+            })
+        ));
+
+        // Reserved terminal milestone slot remains available even after progress/failure subcap is exhausted.
+        assert!(matches!(
+            reopened
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Complete,
+                    2,
+                    complete,
+                    None,
+                )
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+    }
+
+    #[test]
+    fn failed_early_worker_notice_allows_later_settled_attention_while_submitted_and_unknown_deduplicate(
+    ) {
+        for early_outcome in ["failed", "submitted", "unknown"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (store, cfg, baseline) = fixture(tmp.path());
+            let failure_fp =
+                derive_worker_failure_notice_fingerprint(&cfg.key, "task_1", "run_1", "worker_1")
+                    .unwrap();
+            {
+                let (lock_name, state_name) = scope_filenames(&cfg.key).unwrap();
+                let _lock =
+                    acquire_cross_process_lock(&store.root_dir, &lock_name, "coworker_notice_lock")
+                        .unwrap();
+                let mut state = store.read_state_locked(&state_name).unwrap().unwrap();
+                let reserved = store
+                    .reserve_progress_for_fingerprint_locked(
+                        &state_name,
+                        &mut state,
+                        &cfg.key,
+                        1,
+                        failure_fp.clone(),
+                        None,
+                    )
+                    .unwrap();
+                assert!(matches!(reserved, ReserveOutcome::Reserved { .. }));
+            }
+            match early_outcome {
+                "failed" => {
+                    store
+                        .finalize_attempt(
+                            &cfg.key,
+                            NoticeKind::Attention,
+                            1,
+                            &failure_fp,
+                            &WakeupOutcome::Failed {
+                                error: "transport failed".into(),
+                            },
+                        )
+                        .unwrap();
+                }
+                "submitted" => {
+                    store
+                        .finalize_attempt(
+                            &cfg.key,
+                            NoticeKind::Attention,
+                            1,
+                            &failure_fp,
+                            &WakeupOutcome::Submitted,
+                        )
+                        .unwrap();
+                }
+                "unknown" => {}
+                _ => unreachable!(),
+            }
+
+            let settled_snap = NoticeMilestoneSnapshot {
+                phase: CoworkerJobPhase::Executing,
+                has_closure_accepted: false,
+                has_attention_task: true,
+                ..baseline
+            };
+            let settled_outcome = store
+                .reserve_attempt_with_worker_failures(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Attention,
+                    2,
+                    settled_snap,
+                    None,
+                    std::slice::from_ref(&failure_fp),
+                )
+                .unwrap();
+
+            if early_outcome == "failed" {
+                let ReserveOutcome::Reserved {
+                    fingerprint: settled_fp,
+                    ..
+                } = settled_outcome
+                else {
+                    panic!("known-failed early transport send must not suppress later settled attention milestone");
+                };
+                assert_ne!(settled_fp, failure_fp);
+                let (_, state_name) = scope_filenames(&cfg.key).unwrap();
+                let state = store.read_state_locked(&state_name).unwrap().unwrap();
+                assert_eq!(state.attempts.len(), 2);
+                assert_eq!(state.attempts[0].status, PersistedAttemptStatus::Failed);
+                assert_eq!(state.attempts[1].status, PersistedAttemptStatus::Intent);
+            } else {
+                let expected_status = if early_outcome == "submitted" {
+                    NoticeDeliveryStatus::Submitted
+                } else {
+                    NoticeDeliveryStatus::Unknown
+                };
+                assert!(matches!(
+                    settled_outcome,
+                    ReserveOutcome::Completed(NoticeReport {
+                        status,
+                        was_duplicate: true,
+                        cap_reached: false,
+                        attempt_count: 1,
+                        ..
+                    }) if status == expected_status
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn enforces_16_attempt_cap_and_rejects_identity_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
         let (store, cfg, snap) = fixture(tmp.path());
@@ -3984,5 +4469,243 @@ mod tests {
             assert_eq!(dup.diagnostic, None);
             assert_eq!(conn_count.load(Ordering::SeqCst), 1);
         }
+    }
+
+    fn original_failed_attempt_fixture(
+        run_id: &str,
+        worker_id: &str,
+    ) -> (
+        crate::coworker_workflow::CoworkerTaskRecord,
+        crate::coworker_workflow::ControllerJobRuntimeState,
+    ) {
+        // Inert synthetic values for fields not inspected by `verified_original_failed_attempt_matches`;
+        // this pure helper only checks local task/attempt state and never validates an execution envelope
+        // or host receipt authority (which belongs to `verified_failed_task_attention`).
+        let synthetic_choice = crate::profile_flow::SelectedRoleChoice {
+            tool_id: "tool_synthetic".to_string(),
+            adapter: threadlane_workflow::ToolAdapter::CodexCli,
+            route: crate::profile_flow::RoleExecutionRoute::HeadlessWorker,
+            model_id: "model_synthetic".to_string(),
+            model_arg: "model-synthetic".to_string(),
+            effort: None,
+            matched_difficulty: None,
+        };
+        let attempt_1 = crate::coworker_workflow::TaskAttemptRef {
+            attempt_no: 1,
+            role: threadlane_workflow::WorkflowRole::Coder,
+            request_key: "req_1".to_string(),
+            outbox_id: "obx_0123456789abcdef0123456789abcdef".to_string(),
+            run_id: Some(run_id.to_string()),
+            worker_id: Some(worker_id.to_string()),
+            task_worktree_id: None,
+            base_commit: "0".repeat(40),
+            head_commit: None,
+            tree_sha: None,
+            diff_digest: None,
+            report_artifact_id: None,
+            observed_model: None,
+            observed_effort: None,
+        };
+        let task = crate::coworker_workflow::CoworkerTaskRecord {
+            task_id: "task_1".to_string(),
+            task_digest: "a".repeat(64),
+            role: threadlane_workflow::WorkflowRole::Coder,
+            difficulty: threadlane_workflow::Difficulty::Medium,
+            selected_choice: synthetic_choice.clone(),
+            depends_on: Vec::new(),
+            write_paths: Vec::new(),
+            owned_interfaces: Vec::new(),
+            consumed_interfaces: Vec::new(),
+            stage: CoworkerTaskStage::Failed,
+            stage_before_hold: None,
+            current_attempt_no: 1,
+            active_candidate_id: None,
+            accepted_candidate_id: None,
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+            attempts: vec![attempt_1],
+            candidates: Vec::new(),
+            active_hold_ids: Vec::new(),
+            unresolved_outbox_id: None,
+        };
+        let runtime_state = crate::coworker_workflow::ControllerJobRuntimeState {
+            job_id: "job_0123456789abcdef0123456789abcdef".to_string(),
+            runtime_revision: 1,
+            envelope: crate::coworker_workflow::FrozenControllerExecutionEnvelope {
+                schema_version: 1,
+                envelope_id: "env_0123456789abcdef0123456789abcdef".to_string(),
+                binding_id: "binding_1".to_string(),
+                thread_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                job_id: "job_0123456789abcdef0123456789abcdef".to_string(),
+                work_brief_id: "wbr_0123456789abcdef0123456789abcdef".to_string(),
+                work_brief_digest: "b".repeat(64),
+                approval_id: "apr_0123456789abcdef0123456789abcdef".to_string(),
+                approval_subject_digest: "c".repeat(64),
+                plan_id: "pln_0123456789abcdef0123456789abcdef".to_string(),
+                plan_revision: 1,
+                plan_digest: "d".repeat(64),
+                profile_id: "prf_synthetic".to_string(),
+                registry_revision: 1,
+                project_base: crate::coworker_workflow::CanonicalProjectBaseRef {
+                    repository_path: "/tmp/synthetic-repo".to_string(),
+                    base_commit: "0".repeat(40),
+                    base_tree_sha: "1".repeat(40),
+                },
+                policy: crate::profile_flow::ExecutionPolicy {
+                    schema_version: 1,
+                    policy_id: "pol_synthetic".to_string(),
+                    allow_rules: Vec::new(),
+                },
+                policy_digest: "e".repeat(64),
+                task_coder_choices: std::collections::BTreeMap::new(),
+                reviewer_choice: synthetic_choice.clone(),
+                closure_choice: synthetic_choice,
+                role_budgets: std::collections::BTreeMap::new(),
+                max_in_scope_corrections_per_task: 1,
+                max_total_corrections_per_job: 1,
+                max_total_task_attempts_per_job: 2,
+                check_commands: std::collections::BTreeMap::new(),
+                allow_task_worktree_commits: false,
+                allow_run_integration_execution: false,
+                allow_check_failure_corrections: false,
+                default_integration_strategy:
+                    threadlane_operations::IntegrationStrategy::FastForwardOnly,
+                independence_completeness_receipt: None,
+                shadow_jev_policy: None,
+                created_at_ms: 1,
+                operator_attested: false,
+                native_per_call_identity_verified: false,
+                capability_envelope_digest: "f".repeat(64),
+                envelope_digest: "0".repeat(64),
+            },
+            lease: None,
+            role_usage: std::collections::BTreeMap::new(),
+            total_task_attempts_reserved: 1,
+            total_corrections_reserved: 0,
+            derived_attempts: Vec::new(),
+            attempt_artifacts: std::collections::BTreeMap::new(),
+            pending_effects: std::collections::BTreeMap::new(),
+            candidate_check_evidence: Vec::new(),
+            final_candidate_subject: None,
+            closure_attempt_id: None,
+            closure_verdict_id: None,
+            closure_artifacts: std::collections::BTreeMap::new(),
+            shadow_jev_observations: Vec::new(),
+            synced_change_revision: 0,
+            stop_requested: false,
+            stop_or_block_reason: None,
+        };
+        (task, runtime_state)
+    }
+
+    #[test]
+    fn verified_original_failed_attempt_matches_rejects_single_fact_mutations_and_post_initial_history(
+    ) {
+        let run_id = "run_00000000-0000-4000-8000-000000000001";
+        let worker_id = "wrk_00000000-0000-4000-8000-000000000001";
+        let (baseline_task, runtime_state) = original_failed_attempt_fixture(run_id, worker_id);
+
+        assert!(verified_original_failed_attempt_matches(
+            &baseline_task,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut stage_running = baseline_task.clone();
+        stage_running.stage = CoworkerTaskStage::Running;
+        assert!(!verified_original_failed_attempt_matches(
+            &stage_running,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut current_attempt_no_2 = baseline_task.clone();
+        current_attempt_no_2.current_attempt_no = 2;
+        assert!(!verified_original_failed_attempt_matches(
+            &current_attempt_no_2,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut empty_attempts = baseline_task.clone();
+        empty_attempts.attempts.clear();
+        assert!(!verified_original_failed_attempt_matches(
+            &empty_attempts,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut latest_attempt_no_2 = baseline_task.clone();
+        latest_attempt_no_2.attempts[0].attempt_no = 2;
+        assert!(!verified_original_failed_attempt_matches(
+            &latest_attempt_no_2,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut wrong_role_reviewer = baseline_task.clone();
+        wrong_role_reviewer.attempts[0].role = threadlane_workflow::WorkflowRole::Reviewer;
+        assert!(!verified_original_failed_attempt_matches(
+            &wrong_role_reviewer,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut mismatched_run = baseline_task.clone();
+        mismatched_run.attempts[0].run_id =
+            Some("run_00000000-0000-4000-8000-000000000999".to_string());
+        assert!(!verified_original_failed_attempt_matches(
+            &mismatched_run,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut mismatched_worker = baseline_task.clone();
+        mismatched_worker.attempts[0].worker_id =
+            Some("wrk_00000000-0000-4000-8000-000000000999".to_string());
+        assert!(!verified_original_failed_attempt_matches(
+            &mismatched_worker,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut missing_run = baseline_task.clone();
+        missing_run.attempts[0].run_id = None;
+        assert!(!verified_original_failed_attempt_matches(
+            &missing_run,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut missing_worker = baseline_task.clone();
+        missing_worker.attempts[0].worker_id = None;
+        assert!(!verified_original_failed_attempt_matches(
+            &missing_worker,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
+
+        let mut derived_then_original_history = baseline_task.clone();
+        let mut derived_attempt_2 = baseline_task.attempts[0].clone();
+        derived_attempt_2.attempt_no = 2;
+        derived_then_original_history.attempts =
+            vec![derived_attempt_2, baseline_task.attempts[0].clone()];
+        assert!(!verified_original_failed_attempt_matches(
+            &derived_then_original_history,
+            &runtime_state,
+            run_id,
+            worker_id,
+        ));
     }
 }

@@ -104,9 +104,10 @@ pub use git::{
     SANITIZED_GIT_ENV_OVERRIDES, WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
 };
 pub use opencode_metadata::{
-    validate_opencode_metadata, OpenCodeMetadataError, OpenCodeMetadataEvidence,
-    OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
-    MAX_OPENCODE_MESSAGES,
+    validate_opencode_metadata, validate_opencode_metadata_with_diagnostic,
+    OpenCodeMetadataDiagnostic, OpenCodeMetadataError, OpenCodeMetadataEvidence,
+    OpenCodeMetadataStage, OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES,
+    MAX_OPENCODE_INFO_BYTES, MAX_OPENCODE_MESSAGES,
 };
 pub use permissions::{
     build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,

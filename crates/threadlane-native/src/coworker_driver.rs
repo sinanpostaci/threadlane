@@ -2063,6 +2063,8 @@ impl CoworkerCodeDriver {
                 if is_terminal_or_stopped_job(
                     &admission.job,
                     &admission.runtime_state,
+                    &admission.approval.approval_id,
+                    self.controller.workflow_store().plans_dir(),
                     effective_mode,
                 ) {
                     if self
@@ -2111,43 +2113,52 @@ impl CoworkerCodeDriver {
                         let last_step = Some(step_report);
                         last_pipe = pipe_report;
                         drop(pipe_drv);
-                        let owner_summary = session.guard().validate_before_effect(&key)?.clone();
-                        let state_record = CoworkerDriverStateRecord {
-                            schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
-                            binding_id: key.binding_id.clone(),
-                            thread_uuid: key.thread_uuid.clone(),
-                            job_id: key.job_id.clone(),
-                            owner_instance_id: owner_summary.instance_id,
-                            owner_challenge_digest: owner_summary.challenge_digest,
-                            owner_pid_hint: owner_summary.pid_hint,
-                            owner_uid: current_effective_uid(),
-                            lock_file_identity: owner_summary.lock_file_identity,
-                            socket_path: sock_path.display().to_string(),
-                            host_mode: CoworkerDriverHostMode::ReusedVerifiedReadyHost,
-                            owner_active: false,
-                            graceful_exit_completed: true,
-                            owner_quiescent_host_shutdown_updated_at_ms: prev_state
-                                .as_ref()
-                                .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
-                            owner_quiescent_host_instance_id: prev_state
-                                .and_then(|s| s.owner_quiescent_host_instance_id),
-                            steps_completed: 1,
-                            last_overall_status: last_step
-                                .as_ref()
-                                .map_or(CoworkerControllerPhase1Status::Stopped, |r| r.status),
-                            last_step_report: last_step.clone(),
-                            execution_mode: Some(effective_mode),
-                            last_pipeline_status: last_pipe.as_ref().map(|r| r.status),
-                            last_pipeline_report: last_pipe,
-                            pipeline_boundary: boundary_for_mode(effective_mode),
-                            started_at_ms: precheck_now_ms,
-                            updated_at_ms: current_time_ms(),
-                        };
-                        self.write_driver_state(&key, &state_record)?;
-                        return Ok((
+                        let has_active_work = owner_has_active_work(
                             effective_mode,
-                            Some((CoworkerDriverHostMode::ReusedVerifiedReadyHost, last_step)),
-                        ));
+                            last_step.as_ref(),
+                            last_pipe.as_ref(),
+                            0,
+                        );
+                        if !has_active_work {
+                            let owner_summary =
+                                session.guard().validate_before_effect(&key)?.clone();
+                            let state_record = CoworkerDriverStateRecord {
+                                schema_version: COWORKER_DRIVER_STATE_SCHEMA_VERSION,
+                                binding_id: key.binding_id.clone(),
+                                thread_uuid: key.thread_uuid.clone(),
+                                job_id: key.job_id.clone(),
+                                owner_instance_id: owner_summary.instance_id,
+                                owner_challenge_digest: owner_summary.challenge_digest,
+                                owner_pid_hint: owner_summary.pid_hint,
+                                owner_uid: current_effective_uid(),
+                                lock_file_identity: owner_summary.lock_file_identity,
+                                socket_path: sock_path.display().to_string(),
+                                host_mode: CoworkerDriverHostMode::ReusedVerifiedReadyHost,
+                                owner_active: false,
+                                graceful_exit_completed: true,
+                                owner_quiescent_host_shutdown_updated_at_ms: prev_state
+                                    .as_ref()
+                                    .and_then(|s| s.owner_quiescent_host_shutdown_updated_at_ms),
+                                owner_quiescent_host_instance_id: prev_state
+                                    .and_then(|s| s.owner_quiescent_host_instance_id),
+                                steps_completed: 1,
+                                last_overall_status: last_step
+                                    .as_ref()
+                                    .map_or(CoworkerControllerPhase1Status::Stopped, |r| r.status),
+                                last_step_report: last_step.clone(),
+                                execution_mode: Some(effective_mode),
+                                last_pipeline_status: last_pipe.as_ref().map(|r| r.status),
+                                last_pipeline_report: last_pipe,
+                                pipeline_boundary: boundary_for_mode(effective_mode),
+                                started_at_ms: precheck_now_ms,
+                                updated_at_ms: current_time_ms(),
+                            };
+                            self.write_driver_state(&key, &state_record)?;
+                            return Ok((
+                                effective_mode,
+                                Some((CoworkerDriverHostMode::ReusedVerifiedReadyHost, last_step)),
+                            ));
+                        }
                     } else if self.can_skip_host_for_quiescent_job(
                         &key,
                         &admission,
@@ -2894,15 +2905,15 @@ impl CoworkerCodeDriver {
                 .iter()
                 .filter(|t| {
                     matches!(
-                        t.stage,
-                        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
-                    ) || matches!(
                         t.host_status,
                         TaskExecutionStatus::Queued
                             | TaskExecutionStatus::Claimed
                             | TaskExecutionStatus::Running
                             | TaskExecutionStatus::CancelRequested
-                    )
+                    ) || (matches!(
+                        t.stage,
+                        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                    ) && t.host_status != TaskExecutionStatus::ReadyForReview)
                 })
                 .count();
             let cumulative = last_pipeline_report.as_ref();
@@ -2932,8 +2943,11 @@ impl CoworkerCodeDriver {
         };
         let next_steps_completed = steps_completed.saturating_add(1);
         let mut progress_snapshots = Vec::new();
+        let mut failed_task_snapshots = Vec::new();
         let admission = session.verify_admission()?;
-        if !admission.runtime_state.stop_requested {
+        if !admission.runtime_state.stop_requested
+            && host_mode != CoworkerDriverHostMode::QuiescentNoHostRequired
+        {
             let client = ApprovedHostClient::new(
                 Arc::clone(&self.authority),
                 &self.sessions_dir,
@@ -2942,24 +2956,43 @@ impl CoworkerCodeDriver {
             )
             .map_err(map_host_error)?;
             for observation in &mut step_report.tasks {
-                if !matches!(
+                if matches!(
                     observation.host_status,
                     TaskExecutionStatus::Running | TaskExecutionStatus::CancelRequested
                 ) {
-                    continue;
-                }
-                let snapshot = client
-                    .get_task(&admission.approval.approval_id, &observation.task_id)
-                    .await;
-                session.guard().validate_before_effect(key)?;
-                if let Ok(snapshot) = snapshot {
-                    if let Some(attention) =
-                        crate::coworker_notice::verified_progress_attention(&admission, &snapshot)
-                    {
-                        observation.run_id = snapshot.run_id.clone();
-                        observation.worker_id = snapshot.worker_id.clone();
-                        observation.watchdog_attention = Some(attention);
-                        progress_snapshots.push(snapshot);
+                    let snapshot = client
+                        .get_task(&admission.approval.approval_id, &observation.task_id)
+                        .await;
+                    session.guard().validate_before_effect(key)?;
+                    if let Ok(snapshot) = snapshot {
+                        if let Some(attention) = crate::coworker_notice::verified_progress_attention(
+                            &admission, &snapshot,
+                        ) {
+                            observation.run_id = snapshot.run_id.clone();
+                            observation.worker_id = snapshot.worker_id.clone();
+                            observation.watchdog_attention = Some(attention);
+                            progress_snapshots.push(snapshot);
+                        }
+                    }
+                } else if matches!(
+                    observation.stage,
+                    CoworkerTaskStage::Failed | CoworkerTaskStage::Blocked
+                ) && matches!(
+                    observation.host_status,
+                    TaskExecutionStatus::Failed | TaskExecutionStatus::TimedOut
+                ) {
+                    let snapshot = client
+                        .get_task(&admission.approval.approval_id, &observation.task_id)
+                        .await;
+                    session.guard().validate_before_effect(key)?;
+                    if let Ok(snapshot) = snapshot {
+                        if crate::coworker_notice::verified_failed_task_attention(
+                            &admission, &snapshot,
+                        )
+                        .is_some()
+                        {
+                            failed_task_snapshots.push(snapshot);
+                        }
                     }
                 }
             }
@@ -3008,23 +3041,55 @@ impl CoworkerCodeDriver {
                 }
             }
         }
-        if let Some(notice_kind) = match last_pipeline_report.as_ref().map(|r| r.status) {
-            _ if failed_during_this_owner => None,
-            Some(CoworkerPipelineStatus::Completed) => {
-                Some(crate::coworker_notice::NoticeKind::Complete)
-            }
-            Some(CoworkerPipelineStatus::Stopped) => {
-                Some(crate::coworker_notice::NoticeKind::Stopped)
-            }
-            Some(
+        let settled_notice_kind = if failed_during_this_owner {
+            None
+        } else if let Some(ref pipe_report) = last_pipeline_report {
+            match pipe_report.status {
+                CoworkerPipelineStatus::Completed => {
+                    Some(crate::coworker_notice::NoticeKind::Complete)
+                }
+                CoworkerPipelineStatus::Stopped => {
+                    Some(crate::coworker_notice::NoticeKind::Stopped)
+                }
                 CoworkerPipelineStatus::Held
                 | CoworkerPipelineStatus::BlockedOnUnknownEffect
                 | CoworkerPipelineStatus::BlockedOrFailed
                 | CoworkerPipelineStatus::BlockedByFailedChecks
-                | CoworkerPipelineStatus::AwaitingCorrectionExecution,
-            ) => Some(crate::coworker_notice::NoticeKind::Attention),
-            _ => None,
-        } {
+                | CoworkerPipelineStatus::AwaitingCorrectionExecution => {
+                    Some(crate::coworker_notice::NoticeKind::Attention)
+                }
+                CoworkerPipelineStatus::Running => None,
+            }
+        } else {
+            match step_report.status {
+                CoworkerControllerPhase1Status::Stopped => {
+                    Some(crate::coworker_notice::NoticeKind::Stopped)
+                }
+                CoworkerControllerPhase1Status::Held
+                | CoworkerControllerPhase1Status::BlockedOnUnknownEffect
+                | CoworkerControllerPhase1Status::BlockedOrFailed => {
+                    Some(crate::coworker_notice::NoticeKind::Attention)
+                }
+                _ => None,
+            }
+        };
+        if settled_notice_kind.is_none()
+            && !failed_during_this_owner
+            && !failed_task_snapshots.is_empty()
+        {
+            if let Ok(store) = crate::coworker_notice::CoworkerNoticeStore::new(
+                crate::coworker_notice::coworker_notice_dir(
+                    self.controller.workflow_store().plans_dir(),
+                ),
+            ) {
+                for snapshot in &failed_task_snapshots {
+                    let _ = store
+                        .notify_worker_failure_attention(session, snapshot)
+                        .await;
+                }
+            }
+        }
+        if let Some(notice_kind) = settled_notice_kind {
             if let Ok(store) = crate::coworker_notice::CoworkerNoticeStore::new(
                 crate::coworker_notice::coworker_notice_dir(
                     self.controller.workflow_store().plans_dir(),
@@ -3526,9 +3591,17 @@ impl CoworkerCodeDriver {
 
         let job_stopped = admission.runtime_state.stop_requested
             || admission.job.phase == CoworkerJobPhase::Cancelled;
+        let job_settled_blocked_or_failed = !job_stopped
+            && is_settled_blocked_or_failed_job(
+                &admission.job,
+                &admission.runtime_state,
+                &admission.approval.approval_id,
+                self.controller.workflow_store().plans_dir(),
+            );
 
         if execution_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline
             && !job_stopped
+            && !job_settled_blocked_or_failed
             && (admission.job.phase != CoworkerJobPhase::Completed
                 || admission
                     .job
@@ -3550,11 +3623,20 @@ impl CoworkerCodeDriver {
                 return Ok(false);
             }
             match task.stage {
-                CoworkerTaskStage::DispatchReserved
-                | CoworkerTaskStage::Running
-                | CoworkerTaskStage::EffectUnknown => return Ok(false),
+                CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running => {
+                    if !job_settled_blocked_or_failed
+                        || !crate::coworker_workflow::has_reconciled_terminal_coder_attempt(
+                            task,
+                            &admission.job,
+                            &admission.runtime_state,
+                        )
+                    {
+                        return Ok(false);
+                    }
+                }
+                CoworkerTaskStage::EffectUnknown => return Ok(false),
                 CoworkerTaskStage::ReadyToDispatch => {
-                    if !job_stopped {
+                    if !job_stopped && !job_settled_blocked_or_failed {
                         return Ok(false);
                     }
                 }
@@ -3579,13 +3661,27 @@ impl CoworkerCodeDriver {
                         return Ok(false);
                     }
                 }
+                CoworkerTaskStage::Held => {
+                    if crate::coworker_workflow::is_task_coder_execution_active(
+                        task,
+                        &admission.job,
+                        &admission.runtime_state,
+                    ) || ((task.current_attempt_no > 0 || !task.attempts.is_empty())
+                        && !crate::coworker_workflow::has_reconciled_terminal_coder_attempt(
+                            task,
+                            &admission.job,
+                            &admission.runtime_state,
+                        ))
+                    {
+                        return Ok(false);
+                    }
+                }
                 CoworkerTaskStage::PendingDependencies
                 | CoworkerTaskStage::UnderReview
                 | CoworkerTaskStage::CorrectInScopeRequired
                 | CoworkerTaskStage::Accepted
                 | CoworkerTaskStage::IntegrationReserved
                 | CoworkerTaskStage::Integrated
-                | CoworkerTaskStage::Held
                 | CoworkerTaskStage::Blocked
                 | CoworkerTaskStage::Failed
                 | CoworkerTaskStage::Cancelled => {}
@@ -4510,6 +4606,19 @@ impl CoworkerCodeDriver {
             }
         }
 
+        let has_active_coder = phase1_obs.iter().any(|obs| {
+            matches!(
+                obs.host_status,
+                TaskExecutionStatus::Queued
+                    | TaskExecutionStatus::Claimed
+                    | TaskExecutionStatus::Running
+                    | TaskExecutionStatus::CancelRequested
+            ) || (matches!(
+                obs.stage,
+                CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+            ) && obs.host_status != TaskExecutionStatus::ReadyForReview)
+        });
+
         // AllTasksIntegrated is NOT Completed until real subject-bound Closure is accepted and
         // job.phase == CoworkerJobPhase::Completed.
         let status = if inspection.runtime_state.stop_requested
@@ -4522,6 +4631,8 @@ impl CoworkerCodeDriver {
             && accepted_candidate.is_some()
         {
             CoworkerPipelineStatus::Completed
+        } else if has_active_coder || !in_flight_stages.is_empty() {
+            CoworkerPipelineStatus::Running
         } else if !base.failed_check_task_ids.is_empty()
             || base
                 .completion_summary
@@ -4709,9 +4820,21 @@ impl CoworkerCodeDriver {
                 .and_then(|a| a.observed_effort.clone())
                 .or_else(|| latest_attempt.and_then(|a| a.observed_effort.clone()));
 
+            let reconciled_terminal_coder =
+                crate::coworker_workflow::has_reconciled_terminal_coder_attempt(
+                    task,
+                    &inspection.job,
+                    &inspection.runtime_state,
+                );
+            let fenced_terminal_coder = reconciled_terminal_coder
+                && matches!(
+                    task.stage,
+                    CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
+                );
             let fenced = task.stage == CoworkerTaskStage::Held
                 || !task.active_hold_ids.is_empty()
-                || inspection.job.phase == CoworkerJobPhase::Held;
+                || inspection.job.phase == CoworkerJobPhase::Held
+                || fenced_terminal_coder;
             if fenced {
                 fenced_task_ids.push(task.task_id.clone());
             }
@@ -4728,18 +4851,22 @@ impl CoworkerCodeDriver {
                     }
                 }
                 CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running => {
-                    let status = project_cached_running_host_status(
-                        stopped_host,
-                        &task.task_id,
-                        task.current_attempt_no,
-                        &inspection.verified_live_derived_attempts,
-                    );
-                    if status == TaskExecutionStatus::Unknown {
-                        unknown_effect_task_ids.push(task.task_id.clone());
+                    if reconciled_terminal_coder {
+                        TaskExecutionStatus::ReadyForReview
                     } else {
-                        active_running_count += 1;
+                        let status = project_cached_running_host_status(
+                            stopped_host,
+                            &task.task_id,
+                            task.current_attempt_no,
+                            &inspection.verified_live_derived_attempts,
+                        );
+                        if status == TaskExecutionStatus::Unknown {
+                            unknown_effect_task_ids.push(task.task_id.clone());
+                        } else {
+                            active_running_count += 1;
+                        }
+                        status
                     }
-                    status
                 }
                 CoworkerTaskStage::ReadyForReview
                 | CoworkerTaskStage::ReviewReserved
@@ -4749,7 +4876,24 @@ impl CoworkerCodeDriver {
                 | CoworkerTaskStage::IntegrationReserved
                 | CoworkerTaskStage::Integrated => TaskExecutionStatus::ReadyForReview,
                 CoworkerTaskStage::Held => {
-                    if run_id.is_some() {
+                    if crate::coworker_workflow::is_task_coder_execution_active(
+                        task,
+                        &inspection.job,
+                        &inspection.runtime_state,
+                    ) {
+                        let status = project_cached_running_host_status(
+                            stopped_host,
+                            &task.task_id,
+                            task.current_attempt_no,
+                            &inspection.verified_live_derived_attempts,
+                        );
+                        if status == TaskExecutionStatus::Unknown {
+                            unknown_effect_task_ids.push(task.task_id.clone());
+                        } else {
+                            active_running_count += 1;
+                        }
+                        status
+                    } else if run_id.is_some() {
                         TaskExecutionStatus::ReadyForReview
                     } else if !task.depends_on.is_empty() {
                         TaskExecutionStatus::DependencyInputsUnverified
@@ -5373,10 +5517,10 @@ fn report_has_active_work(report: &CoworkerControllerStepReport) -> bool {
                 | TaskExecutionStatus::Claimed
                 | TaskExecutionStatus::Running
                 | TaskExecutionStatus::CancelRequested
-        ) || matches!(
+        ) || (matches!(
             obs.stage,
             CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running
-        )
+        ) && obs.host_status != TaskExecutionStatus::ReadyForReview)
     })
 }
 
@@ -5399,9 +5543,78 @@ const fn is_pipeline_await_status(status: CoworkerControllerPhase1Status) -> boo
     )
 }
 
+fn is_settled_blocked_or_failed_job(
+    job: &CoworkerJobRecord,
+    runtime_state: &ControllerJobRuntimeState,
+    approval_id: &str,
+    plans_dir: &Path,
+) -> bool {
+    if job.tasks.is_empty()
+        || !runtime_state.unresolved_effects().is_empty()
+        || job
+            .outbox
+            .iter()
+            .any(|o| o.status.blocks_replay_and_new_dispatch())
+        || job.tasks.iter().any(|t| t.unresolved_outbox_id.is_some())
+    {
+        return false;
+    }
+    job.tasks.iter().any(|t| {
+        matches!(
+            t.stage,
+            CoworkerTaskStage::Failed | CoworkerTaskStage::Blocked | CoworkerTaskStage::Cancelled
+        )
+    }) && job.tasks.iter().all(|t| match t.stage {
+        CoworkerTaskStage::Failed
+        | CoworkerTaskStage::Blocked
+        | CoworkerTaskStage::Cancelled
+        | CoworkerTaskStage::Accepted
+        | CoworkerTaskStage::Integrated => true,
+        CoworkerTaskStage::Held => {
+            if t.current_attempt_no == 0 && t.attempts.is_empty() {
+                !crate::coworker_workflow::is_task_coder_execution_active(t, job, runtime_state)
+            } else {
+                crate::coworker_workflow::has_reconciled_terminal_coder_attempt(
+                    t,
+                    job,
+                    runtime_state,
+                ) && !crate::coworker_workflow::is_task_coder_execution_active(
+                    t,
+                    job,
+                    runtime_state,
+                )
+            }
+        }
+        CoworkerTaskStage::DispatchReserved | CoworkerTaskStage::Running => {
+            crate::coworker_workflow::has_reconciled_terminal_coder_attempt(t, job, runtime_state)
+                && crate::coworker_workflow::is_task_fenced_by_hold_or_sibling(
+                    t,
+                    job,
+                    runtime_state,
+                    approval_id,
+                    plans_dir,
+                )
+                .unwrap_or(false)
+        }
+        CoworkerTaskStage::PendingDependencies | CoworkerTaskStage::ReadyToDispatch => {
+            crate::coworker_workflow::is_task_fenced_by_hold_or_sibling(
+                t,
+                job,
+                runtime_state,
+                approval_id,
+                plans_dir,
+            )
+            .unwrap_or(false)
+        }
+        _ => false,
+    })
+}
+
 fn is_terminal_or_stopped_job(
     job: &CoworkerJobRecord,
     runtime_state: &ControllerJobRuntimeState,
+    approval_id: &str,
+    plans_dir: &Path,
     mode: CoworkerDriverExecutionMode,
 ) -> bool {
     if runtime_state.stop_requested
@@ -5409,6 +5622,7 @@ fn is_terminal_or_stopped_job(
             job.phase,
             CoworkerJobPhase::Completed | CoworkerJobPhase::Cancelled
         )
+        || is_settled_blocked_or_failed_job(job, runtime_state, approval_id, plans_dir)
     {
         return true;
     }
@@ -5617,22 +5831,27 @@ fn classify_readonly_phase1_status(
     {
         return CoworkerControllerPhase1Status::AllTasksIntegrated;
     }
+    let has_unfenced_ready_for_review = job.tasks.iter().any(|t| {
+        !fenced_task_ids.contains(&t.task_id) && t.stage == CoworkerTaskStage::ReadyForReview
+    });
+    let has_active_hold = job.holds.iter().any(|h| h.active)
+        || job.phase == CoworkerJobPhase::Held
+        || job
+            .tasks
+            .iter()
+            .any(|t| t.stage == CoworkerTaskStage::Held || !t.active_hold_ids.is_empty());
     if job.tasks.iter().any(|t| {
         matches!(
             t.stage,
             CoworkerTaskStage::Failed | CoworkerTaskStage::Cancelled | CoworkerTaskStage::Blocked
         )
-    }) && fenced_task_ids.is_empty()
+    }) && !has_unfenced_ready_for_review
+        && !has_active_hold
     {
         return CoworkerControllerPhase1Status::BlockedOrFailed;
     }
-    if !fenced_task_ids.is_empty()
-        || job.holds.iter().any(|h| h.active)
-        || job.phase == CoworkerJobPhase::Held
-    {
-        if job.tasks.iter().any(|t| {
-            !fenced_task_ids.contains(&t.task_id) && t.stage == CoworkerTaskStage::ReadyForReview
-        }) {
+    if !fenced_task_ids.is_empty() || has_active_hold {
+        if has_unfenced_ready_for_review {
             return CoworkerControllerPhase1Status::AwaitingChecksOrReview;
         }
         return CoworkerControllerPhase1Status::Held;
@@ -6598,9 +6817,10 @@ pub fn evaluate_live_coder_projection_snapshot_from_job_and_runtime(
     let projected_unknown = host_phase == Some(HostPhase::Stopped)
         && !host_lock_held
         && inspection.job.tasks.iter().any(|task| {
-            matches!(
-                task.stage,
-                CoworkerTaskStage::Running | CoworkerTaskStage::DispatchReserved
+            crate::coworker_workflow::is_task_coder_execution_active(
+                task,
+                &inspection.job,
+                &inspection.runtime_state,
             ) && project_cached_running_host_status(
                 true,
                 &task.task_id,
@@ -6795,6 +7015,79 @@ mod live_check_projection_tests {
         assert!(!interrupted
             .iter()
             .any(|stage| reserved_check_matches_live_stage(&final_check, stage)));
+    }
+
+    #[test]
+    fn in_flight_stage_keeps_owner_active_and_not_settled_even_when_sibling_failed() {
+        let settled_tick = CoworkerPipelineTickReport {
+            binding_id: "binding-current".into(),
+            thread_uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            job_id: "job-current".into(),
+            approval_id: "apr-current".into(),
+            job_phase: CoworkerJobPhase::Executing,
+            job_revision: 3,
+            lease_epoch: 1,
+            controller_instance_id: "ctrl-current".into(),
+            status: CoworkerPipelineStatus::BlockedOrFailed,
+            in_flight_stages: Vec::new(),
+            dispatched_task_ids: vec!["task-root-a".into(), "task-root-b".into()],
+            reconciled_ready_for_review_task_ids: Vec::new(),
+            verified_task_ids: Vec::new(),
+            reviewed_task_ids: Vec::new(),
+            integrated_task_ids: Vec::new(),
+            prepared_dependency_task_ids: Vec::new(),
+            promoted_dependency_ready_task_ids: Vec::new(),
+            awaiting_correction_task_ids: Vec::new(),
+            failed_check_task_ids: Vec::new(),
+            fenced_task_ids: vec!["task-root-b".into()],
+            unknown_effect_task_ids: Vec::new(),
+            blocked_or_failed_task_ids: vec!["task-root-a".into()],
+            tasks: Vec::new(),
+            completion_outcome: None,
+        };
+        for kind in [
+            CoworkerPipelineInFlightStageKind::TaskReview,
+            CoworkerPipelineInFlightStageKind::TaskVerification,
+            CoworkerPipelineInFlightStageKind::TaskCorrection,
+        ] {
+            let mut active_tick = settled_tick.clone();
+            active_tick
+                .in_flight_stages
+                .push(CoworkerPipelineInFlightStageRef {
+                    task_id: Some("task-root-b".into()),
+                    attempt_no: Some(1),
+                    kind,
+                });
+            let report = CoworkerDriverPipelineReport::from_tick(&active_tick, false);
+            for in_flight_count in [0, report.in_flight_stages.len()] {
+                assert!(owner_has_active_work(
+                    CoworkerDriverExecutionMode::FullAutomaticPipeline,
+                    None,
+                    Some(&report),
+                    in_flight_count,
+                ));
+                assert!(!owner_is_terminal_or_stopped(
+                    CoworkerDriverExecutionMode::FullAutomaticPipeline,
+                    None,
+                    Some(&report),
+                    in_flight_count,
+                ));
+            }
+        }
+
+        let settled_report = CoworkerDriverPipelineReport::from_tick(&settled_tick, false);
+        assert!(!owner_has_active_work(
+            CoworkerDriverExecutionMode::FullAutomaticPipeline,
+            None,
+            Some(&settled_report),
+            0,
+        ));
+        assert!(owner_is_terminal_or_stopped(
+            CoworkerDriverExecutionMode::FullAutomaticPipeline,
+            None,
+            Some(&settled_report),
+            0,
+        ));
     }
 }
 

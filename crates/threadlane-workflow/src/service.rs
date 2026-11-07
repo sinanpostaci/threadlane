@@ -20,15 +20,15 @@ use crate::cursor::{
 };
 use crate::error::WorkflowError;
 use crate::journal::{
-    compute_payload_digest, compute_tasks_digest, journal_paths_for_binding, read_journal_locked,
-    read_journal_readonly, with_journal_lock, write_journal_locked, CommandJournalEntry,
-    CommandJournalState, PersistedCommandJournal, MAX_COMMAND_JOURNAL_ENTRIES,
+    compute_payload_digest_with_proof, compute_tasks_digest, journal_paths_for_binding,
+    read_journal_locked, read_journal_readonly, with_journal_lock, write_journal_locked,
+    CommandJournalEntry, CommandJournalState, PersistedCommandJournal, MAX_COMMAND_JOURNAL_ENTRIES,
 };
 use crate::types::{
     CatalogDecisionAdvisor, CatalogPage, CatalogProfile, CatalogRoleAssignment, PlanPage,
-    PlanSummary, PlanSummaryPage, PublishedPlanView, SavePlanDraft, TaskExecutionRoute,
-    DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT, DEFAULT_PLAN_TASK_LIMIT, MAX_CATALOG_LIMIT,
-    MAX_MCP_RESPONSE_BYTES, MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
+    PlanSummary, PlanSummaryPage, PublishedPlanView, SavePlanDraft, ScopedProfileDependencyProof,
+    TaskExecutionRoute, DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT, DEFAULT_PLAN_TASK_LIMIT,
+    MAX_CATALOG_LIMIT, MAX_MCP_RESPONSE_BYTES, MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
 };
 
 /// Derives a deterministic, binding-isolated plan identifier (`plan_<32-hex>`) from
@@ -511,11 +511,37 @@ impl ScopedWorkflow {
     ///   of the original saved revision across reopens and intervening edits while rejecting any
     ///   changed payload, target, or revision reuse with `idempotency_conflict`.
     pub fn save_draft(&self, request: SavePlanDraft) -> Result<PlanSummary, WorkflowError> {
+        self.save_draft_with_scoped_proof(request, None)
+    }
+
+    /// Creates or updates a draft plan revision scoped to this binding, optionally binding a
+    /// verified [`ScopedProfileDependencyProof`] into the durable command journal so unrelated
+    /// global registry edits do not invalidate compilation or publication while the selected
+    /// profile dependencies remain unchanged.
+    pub fn save_draft_with_scoped_proof(
+        &self,
+        request: SavePlanDraft,
+        scoped_profile_dependency_proof: Option<ScopedProfileDependencyProof>,
+    ) -> Result<PlanSummary, WorkflowError> {
         validate_identifier("command_key", &request.command_key)?;
         validate_js_safe_revision("expected_revision", request.expected_revision)?;
         validate_identifier("profile_id", &request.profile_id)?;
         validate_js_safe_revision("profile_revision", request.profile_revision)?;
         validate_summary(&request.summary)?;
+
+        if let Some(ref proof) = scoped_profile_dependency_proof {
+            proof.validate()?;
+            if proof.spec.profile_id != request.profile_id {
+                return Err(WorkflowError::InvalidInput(
+                    "Scoped profile dependency proof profile_id does not match draft request.",
+                ));
+            }
+            if proof.provenance_revision != request.profile_revision {
+                return Err(WorkflowError::InvalidInput(
+                    "Scoped profile dependency proof provenance_revision does not match draft request.",
+                ));
+            }
+        }
 
         let explicit_plan_id = match request.plan_id.as_deref() {
             Some(explicit_id) => Some(validate_identifier("plan_id", explicit_id)?),
@@ -528,12 +554,13 @@ impl ScopedWorkflow {
 
         validate_plan_tasks(&target_plan_id, &request.tasks)?;
         let tasks_digest = compute_tasks_digest(&request.tasks)?;
-        let payload_digest = compute_payload_digest(
+        let payload_digest = compute_payload_digest_with_proof(
             &target_plan_id,
             &request.profile_id,
             request.profile_revision,
             &request.summary,
             &request.tasks,
+            scoped_profile_dependency_proof.as_ref(),
         )?;
 
         with_journal_lock(self.plans.dir(), &self.journal_lock_path, |clean_dir| {
@@ -544,10 +571,12 @@ impl ScopedWorkflow {
                 target_plan_id,
                 tasks_digest,
                 payload_digest,
+                scoped_profile_dependency_proof,
             )
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn save_draft_locked(
         &self,
         clean_dir: &Path,
@@ -556,6 +585,7 @@ impl ScopedWorkflow {
         target_plan_id: String,
         tasks_digest: String,
         payload_digest: String,
+        scoped_profile_dependency_proof: Option<ScopedProfileDependencyProof>,
     ) -> Result<PlanSummary, WorkflowError> {
         let mut journal = read_journal_locked(&self.journal_path, &self.binding_id)?;
 
@@ -584,6 +614,7 @@ impl ScopedWorkflow {
                 &request.summary,
                 &tasks_digest,
                 &payload_digest,
+                scoped_profile_dependency_proof.as_ref(),
             ) {
                 return Err(WorkflowError::IdempotencyConflict(
                     "Command key was already used with a different draft payload or target.",
@@ -617,9 +648,13 @@ impl ScopedWorkflow {
                                 let registry_snapshot = self.registry.snapshot()?;
                                 let mut draft_view = persisted_rev.clone();
                                 draft_view.status = PlanStatus::Draft;
-                                preview_draft_compilation(&draft_view, &registry_snapshot)
-                                    .ok()
-                                    .map(|c| c.plan_digest)
+                                resolve_compilation_snapshot(
+                                    &registry_snapshot,
+                                    scoped_profile_dependency_proof.as_ref(),
+                                )
+                                .ok()
+                                .and_then(|snap| preview_draft_compilation(&draft_view, &snap).ok())
+                                .map(|c| c.plan_digest)
                             }
                         };
                         let summary = PlanSummary {
@@ -645,9 +680,15 @@ impl ScopedWorkflow {
                                     let registry_snapshot = self.registry.snapshot()?;
                                     let mut draft_view = persisted_rev.clone();
                                     draft_view.status = PlanStatus::Draft;
-                                    preview_draft_compilation(&draft_view, &registry_snapshot)
-                                        .ok()
-                                        .map(|c| c.plan_digest)
+                                    resolve_compilation_snapshot(
+                                        &registry_snapshot,
+                                        scoped_profile_dependency_proof.as_ref(),
+                                    )
+                                    .ok()
+                                    .and_then(|snap| {
+                                        preview_draft_compilation(&draft_view, &snap).ok()
+                                    })
+                                    .map(|c| c.plan_digest)
                                 }
                             };
                             if let Some(slot) = journal.find_mut(&request.command_key) {
@@ -736,6 +777,19 @@ impl ScopedWorkflow {
         validate_js_safe_revision("revision", next_revision)?;
 
         let registry_snapshot = self.registry.snapshot()?;
+        let compilation_snapshot = match resolve_compilation_snapshot(
+            &registry_snapshot,
+            scoped_profile_dependency_proof.as_ref(),
+        ) {
+            Ok(snap) => snap,
+            Err(err) => {
+                if let Some(slot) = journal.find_mut(&request.command_key) {
+                    slot.state = CommandJournalState::Failed;
+                    let _ = write_journal_locked(clean_dir, &self.journal_path, &journal);
+                }
+                return Err(err);
+            }
+        };
         let preview_revision = PlanRevision {
             plan_id: target_plan_id.clone(),
             binding_id: self.binding_id.clone(),
@@ -747,7 +801,7 @@ impl ScopedWorkflow {
             status: PlanStatus::Draft,
             created_at_ms: 0,
         };
-        let compiled = match preview_draft_compilation(&preview_revision, &registry_snapshot) {
+        let compiled = match preview_draft_compilation(&preview_revision, &compilation_snapshot) {
             Ok(c) => c,
             Err(err) => {
                 if let Some(slot) = journal.find_mut(&request.command_key) {
@@ -773,6 +827,7 @@ impl ScopedWorkflow {
         // Persist `Pending` command intent to the durable per-binding journal BEFORE mutating `PlanStore`.
         if let Some(slot) = journal.find_mut(&request.command_key) {
             slot.plan_digest = Some(compiled.plan_digest.clone());
+            slot.scoped_profile_dependency_proof = scoped_profile_dependency_proof;
             write_journal_locked(clean_dir, &self.journal_path, &journal)?;
         } else {
             if journal.entries.len() >= MAX_COMMAND_JOURNAL_ENTRIES {
@@ -792,6 +847,7 @@ impl ScopedWorkflow {
                 tasks_digest,
                 payload_digest,
                 plan_digest: Some(compiled.plan_digest.clone()),
+                scoped_profile_dependency_proof,
                 state: CommandJournalState::Pending,
             });
             write_journal_locked(clean_dir, &self.journal_path, &journal)?;
@@ -853,9 +909,10 @@ impl ScopedWorkflow {
     /// - Enforces binding ownership; cross-binding or missing plans fail with the identical static
     ///   `not_found` error.
     /// - Rejects `Superseded` or non-current revisions with `stale_revision`.
-    /// - Compiles against the exact pinned `profile_revision` in the global [`RegistryStore`] and
-    ///   verifies the 256 KiB MCP envelope budget **before** mutating [`PlanStore`], preventing
-    ///   partial mutations when a view exceeds the wire budget.
+    /// - Compiles against the exact pinned `profile_revision` in the global [`RegistryStore`] (or
+    ///   against the journal's verified [`ScopedProfileDependencyProof`] when present and current
+    ///   selected dependencies still match) and verifies the 256 KiB MCP envelope budget **before**
+    ///   mutating [`PlanStore`], preventing partial mutations when a view exceeds the wire budget.
     /// - Repeated exact `publish` calls on a current revision already in `Published`, `Received`,
     ///   or `Applied` return its current truthful state and [`threadlane_plans::DeliveryReceipt`]
     ///   without regressing `Received` or `Applied` back to `Published`.
@@ -893,11 +950,18 @@ impl ScopedWorkflow {
         }
 
         let registry_snapshot = self.registry.snapshot()?;
+        let journal_opt =
+            read_journal_readonly(self.plans.dir(), &self.journal_path, &self.binding_id)?;
+        let verified_proof = journal_opt.as_ref().and_then(|journal| {
+            journal.verified_scoped_profile_dependency_proof(&self.binding_id, latest)
+        });
+        let compilation_snapshot =
+            resolve_compilation_snapshot(&registry_snapshot, verified_proof)?;
 
         // If the current revision is already Published, Received, or Applied, return its truthful
         // current state and receipt without regressing status.
         if latest.status.is_active_published() {
-            let compiled = compile_plan_revision(latest, &registry_snapshot)?;
+            let compiled = compile_plan_revision(latest, &compilation_snapshot)?;
             let view = PublishedPlanView::from_compiled(latest, &compiled);
             ensure_mcp_response_budget(&self.binding_id, "publish", &view)?;
             return Ok(view);
@@ -906,7 +970,7 @@ impl ScopedWorkflow {
         // Preview compilation and verify the 256 KiB MCP wire budget BEFORE persisting `Publish`.
         let mut candidate_published = latest.clone();
         candidate_published.status = PlanStatus::Published;
-        let compiled_preview = compile_plan_revision(&candidate_published, &registry_snapshot)?;
+        let compiled_preview = compile_plan_revision(&candidate_published, &compilation_snapshot)?;
         let candidate_view =
             PublishedPlanView::from_compiled(&candidate_published, &compiled_preview);
         ensure_mcp_response_budget(&self.binding_id, "publish", &candidate_view)?;
@@ -919,7 +983,7 @@ impl ScopedWorkflow {
             },
         ) {
             Ok(published_rev) => {
-                let compiled = compile_plan_revision(&published_rev, &registry_snapshot)?;
+                let compiled = compile_plan_revision(&published_rev, &compilation_snapshot)?;
                 let view = PublishedPlanView::from_compiled(&published_rev, &compiled);
                 ensure_mcp_response_budget(&self.binding_id, "publish", &view)?;
                 Ok(view)
@@ -938,7 +1002,7 @@ impl ScopedWorkflow {
                         "Target plan revision is superseded or stale.",
                     ));
                 }
-                let compiled = compile_plan_revision(&refreshed, &registry_snapshot)?;
+                let compiled = compile_plan_revision(&refreshed, &compilation_snapshot)?;
                 let view = PublishedPlanView::from_compiled(&refreshed, &compiled);
                 ensure_mcp_response_budget(&self.binding_id, "publish", &view)?;
                 Ok(view)
@@ -995,6 +1059,16 @@ impl ScopedWorkflow {
     }
 }
 
+fn resolve_compilation_snapshot(
+    live_snapshot: &RegistrySnapshot,
+    scoped_profile_dependency_proof: Option<&ScopedProfileDependencyProof>,
+) -> Result<RegistrySnapshot, WorkflowError> {
+    match scoped_profile_dependency_proof {
+        Some(proof) => proof.verify_against_live_snapshot(live_snapshot),
+        None => Ok(live_snapshot.clone()),
+    }
+}
+
 fn build_plan_summary_readonly(
     revision: &PlanRevision,
     registry_snapshot: &RegistrySnapshot,
@@ -1025,10 +1099,30 @@ fn build_plan_summary_readonly(
         } else {
             None
         }
+    } else if let Ok(compiled) = preview_draft_compilation(revision, registry_snapshot) {
+        Some(compiled.plan_digest)
+    } else if revision.binding_id == binding_id
+        && revision.profile_revision > 0
+        && revision.profile_revision <= registry_snapshot.revision
+    {
+        let journal_opt = cached_journal.get_or_insert_with(|| {
+            read_journal_readonly(plans_dir, journal_path, binding_id)
+                .ok()
+                .flatten()
+        });
+        journal_opt
+            .as_ref()
+            .and_then(|journal| {
+                journal.verified_scoped_profile_dependency_proof(binding_id, revision)
+            })
+            .and_then(|proof| proof.verify_against_live_snapshot(registry_snapshot).ok())
+            .and_then(|scoped_snapshot| {
+                preview_draft_compilation(revision, &scoped_snapshot)
+                    .ok()
+                    .map(|compiled| compiled.plan_digest)
+            })
     } else {
-        preview_draft_compilation(revision, registry_snapshot)
-            .ok()
-            .map(|compiled| compiled.plan_digest)
+        None
     };
     PlanSummary::from_revision(revision, plan_digest)
 }

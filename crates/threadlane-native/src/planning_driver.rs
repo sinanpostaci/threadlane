@@ -12,9 +12,10 @@ use serde::{Deserialize, Serialize};
 use threadlane_workflow::{PlanStatus, ScopedWorkflow, WorkflowRole};
 
 use crate::coworker_workflow::{
-    ArchitectConsultationRequestOutcome, CanonicalProjectBaseRef, CoworkerJobLockState,
-    CoworkerJobOwnershipGuard, CoworkerOwnershipSummary, CoworkerPlanningService,
-    CoworkerWorkflowStore, HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanOutcome,
+    verify_grant_registry_dependencies, ArchitectConsultationRequestOutcome,
+    CanonicalProjectBaseRef, CoworkerJobLockState, CoworkerJobOwnershipGuard,
+    CoworkerOwnershipSummary, CoworkerPlanningService, CoworkerWorkflowStore,
+    HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanOutcome,
     OrchestratorPlanningDecision, PersistedPlanningCallArtifact, PlanningAdviceGrant,
     PlanningArtifactOutcomeKind, PlanningGrantStatus, PlanningReservationStatus,
     StructuredOrchestratorOutput, MAX_COWORKER_ID_LEN, MAX_ORCHESTRATOR_ARCHITECT_ROUNDS,
@@ -1819,13 +1820,8 @@ fn validate_queued_command_ready_for_launch(
             "standing planning grant is no longer active or within budget",
         ));
     }
-    let reg_snapshot = read_registry_snapshot_readonly(command_store.registry_dir())?;
-    if reg_snapshot.revision != grant.registry_revision {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "workflow registry revision drifted from standing grant",
-        ));
-    }
+    let live_reg_snapshot = read_registry_snapshot_readonly(command_store.registry_dir())?;
+    let _ = verify_grant_registry_dependencies(&live_reg_snapshot, grant)?;
     cmd.call_project_base.verify_live_repository()?;
 
     if let PlanningCommandPayload::Orchestrator(req) = &cmd.payload {

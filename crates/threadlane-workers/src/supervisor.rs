@@ -15,8 +15,13 @@ use crate::error::WorkerError;
 use crate::fs_safety::{
     ensure_platform_supported, sanitize_and_redact, validate_existing_canonical_dir,
 };
-use crate::opencode_collector::{self, OpenCodeCollectorContext, OpenCodeCollectorError};
-use crate::opencode_metadata::{OpenCodeMetadataEvidence, OwnedOpenCodeSession};
+use crate::opencode_collector::{
+    self, OpenCodeCollectorContext, OpenCodeCollectorDiagnostic, OpenCodeCollectorError,
+};
+use crate::opencode_metadata::{
+    OpenCodeMetadataDiagnostic, OpenCodeMetadataEvidence, OpenCodeMetadataStage,
+    OwnedOpenCodeSession,
+};
 use crate::progress_watchdog::{ProgressWatchdog, ProgressWatchdogSnapshot};
 use crate::spec::{
     is_pinned_codex_read_only_argv, AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget,
@@ -178,7 +183,8 @@ pub struct WorkerExecutionReport {
     /// Compact allowlisted OpenCode v2 session metadata evidence, when collected and validated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_metadata: Option<OpenCodeMetadataEvidence>,
-    /// Finite static error code when OpenCode v2 session allocation or metadata collection failed.
+    /// Finite static error code (or stage-qualified `invalid_metadata:<stage>` code) when
+    /// OpenCode v2 session allocation or metadata collection failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_metadata_error: Option<String>,
     /// Advisory tool-hint supervision, independent of evidence verification and acceptance.
@@ -526,6 +532,50 @@ impl WorkerExecutionReport {
             && self.opencode_metadata.is_none();
 
         stream_complete || self.validated_opencode_metadata().is_some()
+    }
+
+    /// Parses [`Self::opencode_metadata_error`] into a typed [`OpenCodeMetadataDiagnostic`] when
+    /// it matches a known metadata validator error code or stage-qualified
+    /// `invalid_metadata:<stage>` code.
+    ///
+    /// Legacy `"invalid_metadata"` values decode with `stage: None` (unknown/unavailable detail),
+    /// never an invented stage.
+    #[must_use]
+    pub fn opencode_metadata_diagnostic(&self) -> Option<OpenCodeMetadataDiagnostic> {
+        let raw = self.opencode_metadata_error.as_deref()?;
+        OpenCodeMetadataDiagnostic::from_error_code(raw)
+    }
+
+    /// Returns the finite [`OpenCodeMetadataStage`] when [`Self::opencode_metadata_error`] encodes
+    /// a stage-qualified `invalid_metadata:<stage>` diagnostic.
+    ///
+    /// Returns `None` for legacy undifferentiated `"invalid_metadata"` reports and for semantic
+    /// error codes that already identify the failure cause without a stage suffix.
+    #[must_use]
+    pub fn opencode_metadata_stage(&self) -> Option<OpenCodeMetadataStage> {
+        let raw = self.opencode_metadata_error.as_deref()?;
+        OpenCodeCollectorDiagnostic::from_error_code(raw).and_then(|diag| diag.stage)
+    }
+
+    /// Returns the verified finite `'static` error literal for [`Self::opencode_metadata_error`].
+    ///
+    /// If a deserialized report contains an unrecognized string in `opencode_metadata_error`, this
+    /// method falls back to `"invalid_metadata"` so untrusted or arbitrary strings never escape.
+    #[must_use]
+    pub fn sanitized_opencode_metadata_error(&self) -> Option<&'static str> {
+        let raw = self.opencode_metadata_error.as_deref()?;
+        Some(
+            OpenCodeCollectorDiagnostic::from_error_code(raw)
+                .map_or("invalid_metadata", |diag| diag.as_str()),
+        )
+    }
+
+    /// Formats a privacy-safe failure reason from [`Self::sanitized_opencode_metadata_error`] when
+    /// OpenCode v2 session allocation or metadata verification failed.
+    #[must_use]
+    pub fn opencode_metadata_failure_reason(&self) -> Option<String> {
+        self.sanitized_opencode_metadata_error()
+            .map(|code| format!("OpenCode session metadata verification failed ({code})"))
     }
 }
 
@@ -1054,7 +1104,7 @@ where
             started_at_ms,
             max_stderr_bytes: budgets.max_stderr_bytes,
         };
-        match opencode_collector::allocate(&ctx, &resolved_model, cancel_rx).await {
+        match opencode_collector::allocate_with_diagnostic(&ctx, &resolved_model, cancel_rx).await {
             Ok(owned) => {
                 constructed_argv = rebuild_argv_with_session(&owned.session_id)?;
                 effective_session_id = Some(owned.session_id.clone());
@@ -1118,7 +1168,8 @@ where
                     ));
                 }
             }
-            Err(alloc_err) => {
+            Err(alloc_diag) => {
+                let alloc_err = alloc_diag.error;
                 let status = map_collector_error_to_run_status(alloc_err);
                 if status == WorkerRunStatus::TimedOut {
                     watchdog
@@ -1158,7 +1209,7 @@ where
                         dropped_live_events: 0,
                         evidence: empty_parser.finalize(),
                         opencode_metadata: None,
-                        opencode_metadata_error: Some(alloc_err.as_str().to_string()),
+                        opencode_metadata_error: Some(alloc_diag.as_str().to_string()),
                         progress_watchdog: Some(
                             watchdog
                                 .lock()
@@ -1435,17 +1486,25 @@ where
             signal,
             &evidence,
         ) {
-            match opencode_collector::collect(ctx, owned, &resolved_model, cancel_rx).await {
+            match opencode_collector::collect_with_diagnostic(
+                ctx,
+                owned,
+                &resolved_model,
+                cancel_rx,
+            )
+            .await
+            {
                 Ok(meta) => {
                     opencode_metadata = Some(meta);
                     status = WorkerRunStatus::Succeeded;
                 }
-                Err(collect_err) => {
+                Err(collect_diag) => {
+                    let collect_err = collect_diag.error;
                     if matches!(collect_err, OpenCodeCollectorError::CleanupIncomplete) {
                         cleanup_incomplete = true;
                     }
                     status = map_collector_error_to_run_status(collect_err);
-                    opencode_metadata_error = Some(collect_err.as_str().to_string());
+                    opencode_metadata_error = Some(collect_diag.as_str().to_string());
                 }
             }
         }
@@ -1946,5 +2005,408 @@ fn map_collector_error_to_run_status(err: OpenCodeCollectorError) -> WorkerRunSt
         | OpenCodeCollectorError::NonZeroExit
         | OpenCodeCollectorError::InvalidMetadata
         | OpenCodeCollectorError::StaleSession => WorkerRunStatus::NonZeroExit,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::opencode_metadata::OpenCodeMetadataError;
+    use crate::permissions::WorkerFilePermissions;
+    use crate::spec::ExecutionBudgets;
+
+    fn sample_report_with_metadata_error(
+        opencode_metadata_error: Option<&str>,
+    ) -> WorkerExecutionReport {
+        let target = ResolvedModelTarget {
+            base_model: "opencode-go/deepseek-v4.1-flash".to_string(),
+            effort: Some("max".to_string()),
+            cli_model_arg: "opencode-go/deepseek-v4.1-flash#max".to_string(),
+        };
+        let parser = NdjsonStreamParser::new_for_provider(
+            WorkerProvider::OpenCodeV2,
+            target.clone(),
+            Some("ses_owned_123".to_string()),
+            16,
+        );
+        WorkerExecutionReport {
+            provider: WorkerProvider::OpenCodeV2,
+            requested_model: target,
+            requested_session_id: None,
+            allocated_session_id: Some("ses_owned_123".to_string()),
+            constructed_argv: Vec::new(),
+            working_directory: PathBuf::from("/tmp"),
+            status: WorkerRunStatus::NonZeroExit,
+            exit_code: Some(0),
+            signal: None,
+            process_group_id: Some(42),
+            duration_ms: 10,
+            stdout_bytes_captured: 0,
+            stderr_bytes_captured: 0,
+            overflow: None,
+            descendants_terminated_after_exit: false,
+            cleanup_incomplete: false,
+            redacted_stderr_summary: None,
+            dropped_live_events: 0,
+            evidence: parser.finalize(),
+            opencode_metadata: None,
+            opencode_metadata_error: opencode_metadata_error.map(str::to_string),
+            progress_watchdog: None,
+        }
+    }
+
+    #[test]
+    fn report_opencode_metadata_diagnostic_helpers_handle_legacy_staged_semantic_and_untrusted_values(
+    ) {
+        // 1. None when no metadata error is recorded.
+        let clean = sample_report_with_metadata_error(None);
+        assert_eq!(clean.opencode_metadata_diagnostic(), None);
+        assert_eq!(clean.opencode_metadata_stage(), None);
+        assert_eq!(clean.sanitized_opencode_metadata_error(), None);
+        assert_eq!(clean.opencode_metadata_failure_reason(), None);
+
+        // 2. Legacy undifferentiated `invalid_metadata` remains readable with `stage: None`.
+        let legacy = sample_report_with_metadata_error(Some("invalid_metadata"));
+        assert_eq!(
+            legacy.opencode_metadata_diagnostic(),
+            Some(OpenCodeMetadataDiagnostic {
+                error: OpenCodeMetadataError::InvalidMetadata,
+                stage: None,
+            })
+        );
+        assert_eq!(legacy.opencode_metadata_stage(), None);
+        assert_eq!(
+            legacy.sanitized_opencode_metadata_error(),
+            Some("invalid_metadata")
+        );
+        assert_eq!(
+            legacy.opencode_metadata_failure_reason().as_deref(),
+            Some("OpenCode session metadata verification failed (invalid_metadata)")
+        );
+        assert!(legacy.validated_opencode_metadata().is_none());
+        assert!(!legacy.has_complete_natural_completion_evidence());
+
+        // 3. Every finite stage round-trips through `WorkerExecutionReport`.
+        for stage in OpenCodeMetadataStage::ALL {
+            let code = stage.qualified_error_code();
+            let staged = sample_report_with_metadata_error(Some(code));
+            assert_eq!(
+                staged.opencode_metadata_diagnostic(),
+                Some(OpenCodeMetadataDiagnostic {
+                    error: OpenCodeMetadataError::InvalidMetadata,
+                    stage: Some(stage),
+                })
+            );
+            assert_eq!(staged.opencode_metadata_stage(), Some(stage));
+            assert_eq!(staged.sanitized_opencode_metadata_error(), Some(code));
+            assert_eq!(
+                staged.opencode_metadata_failure_reason(),
+                Some(format!(
+                    "OpenCode session metadata verification failed ({code})"
+                ))
+            );
+            assert!(staged.validated_opencode_metadata().is_none());
+            assert!(!staged.has_complete_natural_completion_evidence());
+        }
+
+        // 4. Semantic validator/collector codes preserve their exact code with `stage: None`.
+        for semantic in [
+            "output_overflow",
+            "ownership_mismatch",
+            "stale_session",
+            "missing_model",
+            "model_mismatch",
+            "missing_effort",
+            "effort_mismatch",
+            "missing_completion",
+            "provider_error",
+            "cleanup_incomplete",
+            "timed_out",
+            "cancelled",
+        ] {
+            let report = sample_report_with_metadata_error(Some(semantic));
+            assert_eq!(report.opencode_metadata_stage(), None);
+            assert_eq!(report.sanitized_opencode_metadata_error(), Some(semantic));
+            assert_eq!(
+                report.opencode_metadata_failure_reason(),
+                Some(format!(
+                    "OpenCode session metadata verification failed ({semantic})"
+                ))
+            );
+        }
+
+        // 5. Untrusted/unrecognized strings never escape through sanitized helpers.
+        for untrusted in [
+            "invalid_metadata:SENTINEL_UNTRUSTED_STAGE",
+            "raw_payload:SENTINEL_SECRET_TOKEN",
+            "ownership_mismatch:info_response_json",
+        ] {
+            let tampered = sample_report_with_metadata_error(Some(untrusted));
+            assert_eq!(tampered.opencode_metadata_diagnostic(), None);
+            assert_eq!(tampered.opencode_metadata_stage(), None);
+            assert_eq!(
+                tampered.sanitized_opencode_metadata_error(),
+                Some("invalid_metadata")
+            );
+            let reason = tampered
+                .opencode_metadata_failure_reason()
+                .expect("failure reason");
+            assert_eq!(
+                reason,
+                "OpenCode session metadata verification failed (invalid_metadata)"
+            );
+            assert!(!reason.contains("SENTINEL"));
+        }
+    }
+
+    #[tokio::test]
+    async fn run_worker_propagates_staged_opencode_metadata_diagnostics_and_preserves_semantic_failures(
+    ) {
+        let temp = tempfile::Builder::new()
+            .prefix("tl-sup-oc-diag-")
+            .tempdir()
+            .expect("create tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonicalize tempdir");
+        let bin_dir = root.join("bin");
+        let repo_dir = root.join("repo");
+        let work_area = root.join("work-area");
+        fs::create_dir_all(&bin_dir).expect("create bin");
+        fs::create_dir_all(&repo_dir).expect("create repo");
+        fs::create_dir_all(&work_area).expect("create work area");
+        #[cfg(unix)]
+        {
+            for dir in [&root, &bin_dir, &repo_dir, &work_area] {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+                    .expect("chmod test dir");
+            }
+        }
+
+        let mode_path = root.join("mode.txt");
+        let created_ms_path = root.join("created_ms.txt");
+        let staging_bin_path = bin_dir.join("fake-opencode.tmp");
+        let bin_path = bin_dir.join("fake-opencode");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+MODE="$(cat "{}")"
+CREATED_MS_FILE="{}"
+
+if [ "${{1:-}}" = "api" ] && [ "${{2:-}}" = "--standalone" ] && [ "${{3:-}}" = "session.create" ]; then
+    if [ "$MODE" = "create_bad_json" ]; then
+        printf 'corrupt-create SENTINEL_SUP_CREATE\n'
+        exit 0
+    fi
+    NOW_S="$(date +%s)"
+    CREATED_MS=$((NOW_S * 1000 + 2000))
+    printf '%s\n' "$CREATED_MS" > "$CREATED_MS_FILE"
+    printf '{{"data":{{"id":"ses_owned_123","location":{{"directory":"%s"}},"time":{{"created":%s}}}}}}\n' "$(pwd)" "$CREATED_MS"
+    exit 0
+fi
+
+if [ "${{1:-}}" = "--standalone" ] && [ "${{2:-}}" = "run" ]; then
+    printf '{{"type":"step_start","sessionID":"ses_owned_123"}}\n'
+    exit 0
+fi
+
+CREATED_MS="$(cat "$CREATED_MS_FILE")"
+MSG_CREATED_MS=$((CREATED_MS + 20))
+MSG_COMPLETED_MS=$((CREATED_MS + 30))
+IDLE_MS=$((CREATED_MS + 40))
+
+if [ "${{1:-}}" = "api" ] && [ "${{2:-}}" = "--standalone" ] && [ "${{3:-}}" = "session.get" ]; then
+    case "$MODE" in
+        info_bad_json)
+            printf 'corrupt-info SENTINEL_SUP_INFO\n'
+            exit 0
+            ;;
+        bad_timestamps)
+            printf '{{"data":{{"id":"ses_owned_123","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":"SENTINEL_BAD_IDLE"}}}}}}\n' "$(pwd)" "$CREATED_MS" "$IDLE_MS"
+            exit 0
+            ;;
+        *)
+            printf '{{"data":{{"id":"ses_owned_123","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}}}}\n' "$(pwd)" "$CREATED_MS" "$IDLE_MS" "$IDLE_MS"
+            exit 0
+            ;;
+    esac
+fi
+
+if [ "${{1:-}}" = "session" ] && [ "${{2:-}}" = "export" ]; then
+    case "$MODE" in
+        valid_baseline|info_bad_json|bad_timestamps)
+            printf '{{"info":{{"id":"ses_owned_123","outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":"stop","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"time":{{"created":%s,"completed":%s}}}}]}}\n' "$CREATED_MS" "$IDLE_MS" "$IDLE_MS" "$MSG_CREATED_MS" "$MSG_COMPLETED_MS"
+            exit 0
+            ;;
+        export_bad_json)
+            printf '{{corrupt-export SENTINEL_SUP_EXPORT\n'
+            exit 0
+            ;;
+        bad_message_envelope)
+            printf '{{"info":{{"id":"ses_owned_123","outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_a_1","sessionID":"ses_owned_123","info":{{"role":"assistant","content":"SENTINEL_NESTED_CONTENT"}}}}]}}\n' "$CREATED_MS" "$IDLE_MS" "$IDLE_MS"
+            exit 0
+            ;;
+        bad_assistant_target)
+            printf '{{"info":{{"id":"ses_owned_123","outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":"stop","model":{{"providerID":"opencode-go","id":"deepseek SENTINEL_UNSAFE_MODEL","variant":"max"}},"time":{{"created":%s,"completed":%s}}}}]}}\n' "$CREATED_MS" "$IDLE_MS" "$IDLE_MS" "$MSG_CREATED_MS" "$MSG_COMPLETED_MS"
+            exit 0
+            ;;
+        bad_terminal_completion)
+            printf '{{"info":{{"id":"ses_owned_123","outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":{{"reason":"SENTINEL_BAD_FINISH"}},"model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"time":{{"created":%s,"completed":%s}}}}]}}\n' "$CREATED_MS" "$IDLE_MS" "$IDLE_MS" "$MSG_CREATED_MS" "$MSG_COMPLETED_MS"
+            exit 0
+            ;;
+        semantic_model_mismatch)
+            printf '{{"info":{{"id":"ses_owned_123","outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":"stop","model":{{"providerID":"opencode-go","id":"other-model-SENTINEL","variant":"max"}},"time":{{"created":%s,"completed":%s}}}}]}}\n' "$CREATED_MS" "$IDLE_MS" "$IDLE_MS" "$MSG_CREATED_MS" "$MSG_COMPLETED_MS"
+            exit 0
+            ;;
+        semantic_missing_completion)
+            printf '{{"info":{{"id":"ses_owned_123","outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}},"messages":[{{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":"length","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"time":{{"created":%s,"completed":%s}}}}]}}\n' "$CREATED_MS" "$IDLE_MS" "$IDLE_MS" "$MSG_CREATED_MS" "$MSG_COMPLETED_MS"
+            exit 0
+            ;;
+    esac
+fi
+
+exit 99
+"#,
+            mode_path.display(),
+            created_ms_path.display()
+        );
+        {
+            use std::io::Write;
+            let mut file = fs::File::create(&staging_bin_path).expect("create script");
+            #[cfg(unix)]
+            {
+                file.set_permissions(fs::Permissions::from_mode(0o700))
+                    .expect("set script permissions");
+            }
+            file.write_all(script.as_bytes()).expect("write script");
+            file.sync_all().expect("sync script");
+        }
+        fs::rename(&staging_bin_path, &bin_path).expect("rename script into place");
+
+        let mut allowed_write_paths = BTreeSet::new();
+        allowed_write_paths.insert("docs/ROADMAP.md".to_string());
+        let spec = WorkerSpec {
+            provider: WorkerProvider::OpenCodeV2,
+            executable: bin_path,
+            model: "opencode-go/deepseek-v4.1-flash#max".to_string(),
+            effort: Some("max".to_string()),
+            allowed_models: BTreeSet::new(),
+            session_id: None,
+            standalone: true,
+            repository_path: repo_dir.clone(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            work_area_root: work_area,
+            allowed_write_paths,
+            prompt: "diagnostic test".to_string(),
+            file_permissions: WorkerFilePermissions::Inherit,
+            budgets: ExecutionBudgets::default(),
+        };
+
+        fs::write(&mode_path, "valid_baseline").expect("write baseline mode");
+        let baseline_report = run_worker(&spec, &repo_dir)
+            .await
+            .expect("run_worker baseline");
+        assert_eq!(baseline_report.status, WorkerRunStatus::Succeeded);
+        assert!(baseline_report.opencode_metadata_error.is_none());
+        assert!(baseline_report.validated_opencode_metadata().is_some());
+        assert!(baseline_report.has_complete_natural_completion_evidence());
+
+        let cases = [
+            (
+                "create_bad_json",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:create_response_json",
+                Some(OpenCodeMetadataStage::CreateResponseJson),
+            ),
+            (
+                "info_bad_json",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:info_response_json",
+                Some(OpenCodeMetadataStage::InfoResponseJson),
+            ),
+            (
+                "export_bad_json",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:export_json",
+                Some(OpenCodeMetadataStage::ExportJson),
+            ),
+            (
+                "bad_timestamps",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:timestamps",
+                Some(OpenCodeMetadataStage::Timestamps),
+            ),
+            (
+                "bad_message_envelope",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:message_envelope",
+                Some(OpenCodeMetadataStage::MessageEnvelope),
+            ),
+            (
+                "bad_assistant_target",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:assistant_target",
+                Some(OpenCodeMetadataStage::AssistantTarget),
+            ),
+            (
+                "bad_terminal_completion",
+                WorkerRunStatus::NonZeroExit,
+                "invalid_metadata:terminal_completion",
+                Some(OpenCodeMetadataStage::TerminalCompletion),
+            ),
+            (
+                "semantic_model_mismatch",
+                WorkerRunStatus::ModelMismatch,
+                "model_mismatch",
+                None,
+            ),
+            (
+                "semantic_missing_completion",
+                WorkerRunStatus::MissingResultEvidence,
+                "missing_completion",
+                None,
+            ),
+        ];
+
+        for (mode, expected_status, expected_code, expected_stage) in cases {
+            fs::write(&mode_path, mode).expect("write mode");
+            let report = run_worker(&spec, &repo_dir).await.expect("run_worker");
+            assert_eq!(report.status, expected_status, "mode={mode}");
+            assert_eq!(
+                report.opencode_metadata_error.as_deref(),
+                Some(expected_code),
+                "mode={mode}"
+            );
+            assert_eq!(
+                report.opencode_metadata_stage(),
+                expected_stage,
+                "mode={mode}"
+            );
+            assert_eq!(
+                report.sanitized_opencode_metadata_error(),
+                Some(expected_code),
+                "mode={mode}"
+            );
+            let reason = report
+                .opencode_metadata_failure_reason()
+                .expect("failure reason");
+            assert_eq!(
+                reason,
+                format!("OpenCode session metadata verification failed ({expected_code})"),
+                "mode={mode}"
+            );
+            assert!(!reason.contains("SENTINEL"), "mode={mode}");
+            assert!(
+                report.validated_opencode_metadata().is_none(),
+                "mode={mode}"
+            );
+            assert!(
+                !report.has_complete_natural_completion_evidence(),
+                "mode={mode}"
+            );
+        }
     }
 }

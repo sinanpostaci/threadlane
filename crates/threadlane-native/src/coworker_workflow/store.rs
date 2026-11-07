@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
 use threadlane_authority::{AuthorityError, AuthorityStore};
 use threadlane_workers::{validate_exact_40_hex_sha, validate_sha256_hex_digest};
-use threadlane_workflow::{Difficulty, WorkflowRole};
+use threadlane_workflow::{Difficulty, ScopedProfileDependencyProof, WorkflowRole};
 
 use crate::coworker_workflow::contracts::{
     deterministic_prefixed_id, prove_task_independence, validate_bounded_text,
@@ -952,6 +952,16 @@ impl CoworkerWorkflowStore {
         &self,
         request: &CreatePlanningGrantRequest,
     ) -> Result<PlanningAdviceGrant, NativeError> {
+        self.create_planning_grant_with_scoped_proof(request, None)
+    }
+
+    /// Creates and persists a scoped read-only [`PlanningAdviceGrant`] with an optional canonical
+    /// [`ScopedProfileDependencyProof`] bound to its identity and idempotency checks.
+    pub fn create_planning_grant_with_scoped_proof(
+        &self,
+        request: &CreatePlanningGrantRequest,
+        scoped_profile_dependency_proof: Option<ScopedProfileDependencyProof>,
+    ) -> Result<PlanningAdviceGrant, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.request_key, "request_key", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.profile_id, "profile_id", MAX_COWORKER_ID_LEN)?;
@@ -963,16 +973,29 @@ impl CoworkerWorkflowStore {
         }
         request.project_base.verify_live_repository()?;
         let policy_digest = request.policy.digest()?;
-        let grant_id = deterministic_prefixed_id(
-            "threadlane-native:coworker-planning-grant:v1",
-            "pgr",
-            &[
-                &request.binding_id,
-                &request.thread_uuid,
-                &request.request_key,
-                &policy_digest,
-            ],
-        );
+        let grant_id = match &scoped_profile_dependency_proof {
+            Some(proof) => deterministic_prefixed_id(
+                "threadlane-native:coworker-planning-grant:v2",
+                "pgr",
+                &[
+                    &request.binding_id,
+                    &request.thread_uuid,
+                    &request.request_key,
+                    &policy_digest,
+                    &proof.dependency_digest,
+                ],
+            ),
+            None => deterministic_prefixed_id(
+                "threadlane-native:coworker-planning-grant:v1",
+                "pgr",
+                &[
+                    &request.binding_id,
+                    &request.thread_uuid,
+                    &request.request_key,
+                    &policy_digest,
+                ],
+            ),
+        };
 
         let candidate_grant = PlanningAdviceGrant {
             grant_id,
@@ -994,6 +1017,7 @@ impl CoworkerWorkflowStore {
             revoked_reason: None,
             operator_attested: request.operator_attested,
             native_per_call_identity_verified: false,
+            scoped_profile_dependency_proof,
             reservations: Vec::new(),
         };
         candidate_grant.validate()?;
@@ -1018,6 +1042,8 @@ impl CoworkerWorkflowStore {
                         && existing.budget == candidate_grant.budget
                         && existing.created_at_ms == candidate_grant.created_at_ms
                         && existing.expires_at_ms == candidate_grant.expires_at_ms
+                        && existing.scoped_profile_dependency_proof
+                            == candidate_grant.scoped_profile_dependency_proof
                     {
                         return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting(
                             existing.clone(),

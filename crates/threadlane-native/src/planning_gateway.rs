@@ -44,11 +44,11 @@ use crate::coworker_grants::{
 };
 use crate::coworker_workflow::{
     deterministic_prefixed_id, validate_bounded_text, validate_non_native_worker_choice,
-    validate_unique_id_list, validate_unique_text_list, ArchitectAdviceRecord,
-    ArchitectConsultationRequestOutcome, ArchitectContextDependencies, ArchitectDecisionStatus,
-    CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobPhase, CoworkerJobRecord,
-    CoworkerPlanningService, CoworkerTaskStage, CoworkerWorkflowStore, CreateCoworkerJobRequest,
-    HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
+    validate_unique_id_list, validate_unique_text_list, verify_grant_registry_dependencies,
+    ArchitectAdviceRecord, ArchitectConsultationRequestOutcome, ArchitectContextDependencies,
+    ArchitectDecisionStatus, CanonicalProjectBaseRef, CoworkerBindingLedger, CoworkerJobPhase,
+    CoworkerJobRecord, CoworkerPlanningService, CoworkerTaskStage, CoworkerWorkflowStore,
+    CreateCoworkerJobRequest, HumanClarificationRequestOutcome, OrchestrateWorkBriefPlanRequest,
     PersistedPlanningCallArtifact, PlanningAdviceGrant, PlanningArtifactOutcomeKind,
     PlanningGrantStatus, PlanningResultRef, PriorArchitectAdviceContext, RunArchitectAdviceRequest,
     StructuredArchitectAdviceOutput, StructuredOrchestratorOutput, WorkBrief, WorkBriefKind,
@@ -2590,12 +2590,12 @@ fn can_resolve_headless_architect_for_grant(
     grant: &PlanningAdviceGrant,
     difficulty: Option<Difficulty>,
 ) -> bool {
-    let Ok(reg_snapshot) = read_registry_snapshot_readonly(registry_dir) else {
+    let Ok(live_reg_snapshot) = read_registry_snapshot_readonly(registry_dir) else {
         return false;
     };
-    if reg_snapshot.revision != grant.registry_revision {
+    let Ok(reg_snapshot) = verify_grant_registry_dependencies(&live_reg_snapshot, grant) else {
         return false;
-    }
+    };
     let Ok(report) = preflight(
         &reg_snapshot,
         &PreflightRequest {

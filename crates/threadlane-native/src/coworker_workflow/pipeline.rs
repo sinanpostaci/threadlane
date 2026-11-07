@@ -29,10 +29,11 @@ use super::contracts::{
     OutboxDispatchStatus, ReviewVerdictOutcome, MAX_ATTEMPTS_PER_TASK, MAX_COWORKER_ID_LEN,
 };
 use super::controller::{
-    count_active_coder_executions, is_task_coder_execution_active,
-    is_task_fenced_by_hold_or_sibling, task_has_derived_attempt_or_post_initial_state,
-    CoworkerControllerService, CoworkerControllerStepReport, CoworkerControllerStepRequest,
-    OwnedCoworkerControllerSession, VerifiedControllerAdmission,
+    count_active_coder_executions, has_reconciled_terminal_coder_attempt,
+    is_task_coder_execution_active, is_task_fenced_by_hold_or_sibling,
+    task_has_derived_attempt_or_post_initial_state, CoworkerControllerService,
+    CoworkerControllerStepReport, CoworkerControllerStepRequest, OwnedCoworkerControllerSession,
+    VerifiedControllerAdmission,
 };
 use super::controller_policy::{
     deterministic_controller_instance_id, ControllerJobRuntimeState, PendingControllerEffectKind,
@@ -1895,6 +1896,15 @@ impl<'g> CoworkerPipelineDriver<'g> {
                 &task.task_id,
                 attempt_no,
             )?;
+            let has_reconciled_terminal_coder =
+                has_reconciled_terminal_coder_attempt(task, &adm.job, &adm.runtime_state);
+            let fenced_initial_coder = has_reconciled_terminal_coder
+                && matches!(
+                    task.stage,
+                    CoworkerTaskStage::DispatchReserved
+                        | CoworkerTaskStage::Running
+                        | CoworkerTaskStage::Held
+                );
 
             let fenced = if task.stage == CoworkerTaskStage::Integrated {
                 adm.runtime_state.stop_requested
@@ -1909,6 +1919,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
                     })
             } else {
                 has_fenced_late_derived
+                    || fenced_initial_coder
                     || is_task_fenced_in_pipeline(
                         task,
                         &job_for_fence,

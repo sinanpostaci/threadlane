@@ -1,10 +1,21 @@
 use std::fmt;
+use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use threadlane_plans::{
-    CompiledPlan, CompiledTask, DeliveryReceipt, PlanRevision, PlanStatus, PlanTask,
+    validate_js_safe_revision, CompiledPlan, CompiledTask, DeliveryReceipt, PlanRevision,
+    PlanStatus, PlanTask,
 };
-use threadlane_registry::{DecisionAdvisorMode, Difficulty, ToolAdapter, WorkflowRole};
+use threadlane_registry::{
+    DecisionAdvisorMode, Difficulty, RegistryError, RegistrySnapshot, ScopedProfileDependencySpec,
+    ToolAdapter, WorkflowRole,
+};
+
+use crate::error::WorkflowError;
+
+/// Schema version for [`ScopedProfileDependencyProof`].
+pub const SCOPED_PROFILE_DEPENDENCY_PROOF_SCHEMA_VERSION: u32 = 1;
 
 /// Default page size limit for [`crate::ScopedWorkflow::catalog`].
 pub const DEFAULT_CATALOG_LIMIT: usize = 20;
@@ -382,5 +393,159 @@ impl PublishedPlanView {
             receipt,
             tasks,
         }
+    }
+}
+
+/// Durable, integrity-bound proof of a selected profile's authority-relevant registry
+/// dependencies at a provenance `RegistrySnapshot::revision`.
+///
+/// Binds the canonical [`ScopedProfileDependencySpec`] and `provenance_revision` under a
+/// 64-character lowercase hex SHA-256 `dependency_digest` so persisted planning grants and
+/// previews can verify both self-integrity and semantic equivalence against later
+/// [`RegistrySnapshot`] revisions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopedProfileDependencyProof {
+    /// Schema version (`1`).
+    pub schema_version: u32,
+    /// Original `RegistrySnapshot::revision` when the authority was previewed/recorded.
+    pub provenance_revision: u64,
+    /// Canonical dependency specification for the selected workflow profile.
+    pub spec: ScopedProfileDependencySpec,
+    /// 64-character lowercase hex SHA-256 digest over `(schema_version, provenance_revision, spec)`.
+    pub dependency_digest: String,
+}
+
+impl ScopedProfileDependencyProof {
+    /// Computes the canonical 64-character lowercase hex SHA-256 digest over
+    /// `(schema_version, provenance_revision, spec)`.
+    pub fn compute_digest(
+        schema_version: u32,
+        provenance_revision: u64,
+        spec: &ScopedProfileDependencySpec,
+    ) -> Result<String, WorkflowError> {
+        let payload = serde_json::to_vec(&(
+            "threadlane-workflow:scoped_profile_dependency_proof:v1",
+            schema_version,
+            provenance_revision,
+            spec,
+        ))
+        .map_err(|_| {
+            WorkflowError::Serialization(
+                "Failed to serialize scoped profile dependency proof payload.",
+            )
+        })?;
+        let digest = Sha256::digest(&payload);
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            let _ = write!(&mut hex, "{byte:02x}");
+        }
+        Ok(hex)
+    }
+
+    /// Constructs and validates a [`ScopedProfileDependencyProof`] for `profile_id` from `snapshot`.
+    pub fn from_snapshot(
+        snapshot: &RegistrySnapshot,
+        profile_id: &str,
+    ) -> Result<Self, WorkflowError> {
+        if snapshot.revision == 0 {
+            return Err(WorkflowError::InvalidInput(
+                "Scoped profile dependency provenance revision must be at least 1.",
+            ));
+        }
+        validate_js_safe_revision("provenance_revision", snapshot.revision)?;
+        let spec = ScopedProfileDependencySpec::from_snapshot(snapshot, profile_id)?;
+        let dependency_digest = Self::compute_digest(
+            SCOPED_PROFILE_DEPENDENCY_PROOF_SCHEMA_VERSION,
+            snapshot.revision,
+            &spec,
+        )?;
+        let proof = Self {
+            schema_version: SCOPED_PROFILE_DEPENDENCY_PROOF_SCHEMA_VERSION,
+            provenance_revision: snapshot.revision,
+            spec,
+            dependency_digest,
+        };
+        proof.validate()?;
+        Ok(proof)
+    }
+
+    /// Validates the schema version, provenance revision, canonical dependency specification,
+    /// and SHA-256 `dependency_digest` integrity of this proof.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.schema_version != SCOPED_PROFILE_DEPENDENCY_PROOF_SCHEMA_VERSION {
+            return Err(WorkflowError::InvalidInput(
+                "Unsupported scoped profile dependency proof schema version.",
+            ));
+        }
+        if self.provenance_revision == 0 {
+            return Err(WorkflowError::InvalidInput(
+                "Scoped profile dependency provenance revision must be at least 1.",
+            ));
+        }
+        validate_js_safe_revision("provenance_revision", self.provenance_revision)?;
+        self.spec.validate()?;
+        if self.dependency_digest.len() != 64
+            || !self
+                .dependency_digest
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err(WorkflowError::InvalidInput(
+                "Scoped profile dependency digest must be 64 lowercase hex characters.",
+            ));
+        }
+        let expected_digest =
+            Self::compute_digest(self.schema_version, self.provenance_revision, &self.spec)?;
+        if self.dependency_digest != expected_digest {
+            return Err(WorkflowError::InvalidInput(
+                "Scoped profile dependency proof digest mismatch.",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates `self` and verifies that `live_snapshot` preserves identical authority-relevant
+    /// dependencies for `self.spec.profile_id` at `live_snapshot.revision >= self.provenance_revision`.
+    ///
+    /// On success, returns a minimal [`RegistrySnapshot`] pinned to `self.provenance_revision`
+    /// containing only the verified profile and its referenced models and tools.
+    pub fn verify_against_live_snapshot(
+        &self,
+        live_snapshot: &RegistrySnapshot,
+    ) -> Result<RegistrySnapshot, WorkflowError> {
+        self.validate()?;
+        if live_snapshot.revision < self.provenance_revision {
+            return Err(WorkflowError::StaleRevision(
+                "Live registry revision is older than scoped profile dependency provenance revision.",
+            ));
+        }
+        let live_spec = match ScopedProfileDependencySpec::from_snapshot(
+            live_snapshot,
+            &self.spec.profile_id,
+        ) {
+            Ok(spec) => spec,
+            Err(RegistryError::NotFound(_)) => {
+                return Err(WorkflowError::StaleRevision(
+                    "Selected workflow profile was deleted after authority was granted.",
+                ));
+            }
+            Err(err) => return Err(WorkflowError::from(err)),
+        };
+        if live_spec != self.spec {
+            return Err(WorkflowError::StaleRevision(
+                "Selected workflow profile dependencies drifted from standing authority.",
+            ));
+        }
+        let live_digest =
+            Self::compute_digest(self.schema_version, self.provenance_revision, &live_spec)?;
+        if live_digest != self.dependency_digest {
+            return Err(WorkflowError::StaleRevision(
+                "Selected workflow profile dependency digest drifted from standing authority.",
+            ));
+        }
+        Ok(self
+            .spec
+            .to_scoped_registry_snapshot(self.provenance_revision))
     }
 }

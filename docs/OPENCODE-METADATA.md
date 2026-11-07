@@ -38,6 +38,45 @@ count and terminal assistant ID, plus the fixed labels
 retain prompts, content, reasoning, titles, tool bodies, error prose or paths.
 Errors contain finite static codes, rather than copied provider data.
 
+### Stage-qualified failure diagnostics
+
+`validate_opencode_metadata` preserves its `Result<OpenCodeMetadataEvidence, OpenCodeMetadataError>`
+signature, while `validate_opencode_metadata_with_diagnostic` returns
+`OpenCodeMetadataDiagnostic` (`error` plus optional `OpenCodeMetadataStage`).
+Semantic error codes that already identify the failure (`output_overflow`,
+`ownership_mismatch`, `stale_session`, `missing_model`, `model_mismatch`,
+`missing_effort`, `effort_mismatch`, `missing_completion`, `provider_error`,
+`nonzero_exit`, `timed_out`, `cancelled`, `cleanup_incomplete`, `spawn_failed`,
+`invalid_context`, `unsupported_platform`) keep `stage: None` and their exact
+code string.
+
+When session creation or metadata validation fails with `invalid_metadata`, the
+collector and validator attach one finite `OpenCodeMetadataStage` and encode
+`WorkerExecutionReport::opencode_metadata_error` as `invalid_metadata:<stage>`:
+
+- `caller_contract`: invalid software-supplied session ID, non-canonical working directory, or unparseable/unsafe requested `provider/model` or `effort` target.
+- `create_response_json`: `api --standalone session.create` stdout is not a top-level JSON object.
+- `create_response_envelope`: `api --standalone session.create` is missing `data`, a safe `data.id`, `data.location.directory`, or `data.time.created`.
+- `info_response_json`: `api --standalone session.get` stdout is not a top-level JSON object.
+- `info_response_envelope`: `api --standalone session.get` is missing the `data` object.
+- `export_json`: `session export --standalone --sanitize` stdout is not a top-level JSON object.
+- `export_envelope`: `session export --standalone --sanitize` is missing the `info` object or `messages` array.
+- `identity_workdir`: missing or non-string `id` in `info.data` or `export.info`, or missing/non-object `location` or non-string `location.directory` in `info.data`.
+- `timestamps`: missing `time`/`time.created` in `info.data` or `export.info`, non-integer `created`/`idle`/`completed` timestamps, or mismatched `created` between `info.data` and `export.info`.
+- `message_envelope`: non-object message entry, legacy nested `messages[].info.role` shape, missing/non-string message `type`, missing/non-string or unsafe message `id`, or duplicate message `id`.
+- `assistant_target`: non-string `model.variant` or unsafe `model.providerID`, `model.id`, or `model.variant` identifier.
+- `terminal_completion`: malformed non-string assistant `finish` field (while missing/non-`succeeded` `outcome`, missing/non-`stop` `finish`, and `completed > idle` remain `missing_completion`, and zero assistant messages remains `missing_model`).
+
+Diagnostics never persist or echo raw JSON, text, titles, content, reasoning,
+URLs, paths, IDs, tokens, or arbitrary provider error strings. Legacy
+undifferentiated `invalid_metadata` reports remain readable via
+`OpenCodeMetadataDiagnostic::from_error_code` and
+`WorkerExecutionReport::opencode_metadata_diagnostic` with `stage: None`
+(unknown/unavailable detail, never an invented stage). Stage diagnostics improve
+future failure provenance; they do not prove the exact predicate or timing cause
+of a historical `invalid_metadata` pilot whose rejected payload was intentionally
+not retained, and they do not turn a failed run into success or authorize replay.
+
 This is CLI-reported metadata, not cloud attestation. Parser tests alone do not
 establish live provider compatibility.
 
@@ -71,7 +110,10 @@ automatically accept or merge a patch.
 
 ## Validation
 
-Thirteen synthetic test cases cover valid records and parameterized negative
-cases, including schema, ownership, staleness, model/effort, completion, budget,
-duplicate-ID and output-allowlist failures. The validator is also included in the
-workspace test gate. No real conversation is necessary to run these tests.
+Synthetic unit and subprocess tests cover valid records and parameterized
+negative cases, including finite `invalid_metadata:<stage>` provenance, legacy
+`invalid_metadata` compatibility (`stage: None`), sentinel non-leakage, ownership,
+staleness, model/effort, completion, budget, duplicate-ID and output-allowlist
+failures across the validator, collector, and supervisor. The validator is also
+included in the workspace test gate. No real conversation is necessary to run
+these tests.

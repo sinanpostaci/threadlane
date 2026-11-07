@@ -2356,3 +2356,714 @@ async fn codex_sol_xhigh_orchestrator_planning_command_executes_replays_without_
     assert_eq!(usage.cache_read_tokens, Some(320));
     assert_eq!(usage.total_tokens, Some(1830));
 }
+
+#[tokio::test]
+async fn proof_bound_grant_allows_unrelated_profile_deletion_before_and_during_call_and_replays_idempotently(
+) {
+    use threadlane_native::coworker_grants::{
+        prepare_planning_grant_preview_with_store, record_planning_grant,
+        LocalOperatorGrantAttestation, PreparePlanningGrantRequest, RecordPlanningGrantRequest,
+    };
+    use threadlane_native::profile_flow::RolePreflightRequest;
+    use threadlane_native::{
+        EnqueuePlanningCommandRequest, PlanningCommandDriver, PlanningCommandStore,
+    };
+
+    let fx = OrchestratorTestFixture::new();
+
+    // Seed an unrelated tool, model, and profile before preparing the proof-bound grant.
+    let snap0 = fx.registry.snapshot().expect("snapshot 0");
+    let snap1 = fx
+        .registry
+        .apply(
+            snap0.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-unused".to_string(),
+                    label: "Unused Tool".to_string(),
+                    adapter: ToolAdapter::Antigravity,
+                    executable_path: Some(fx.root_dir.join("bin/fake-agy")),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert tool-unused");
+    let snap2 = fx
+        .registry
+        .apply(
+            snap1.revision,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-unused".to_string(),
+                    tool_id: "tool-unused".to_string(),
+                    label: "Unused Model".to_string(),
+                    model_arg: "unused-model-v1".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .expect("upsert model-unused");
+    let grant_snap = fx
+        .registry
+        .apply(
+            snap2.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-unused".to_string(),
+                    name: "Unused Profile".to_string(),
+                    assignments: vec![RoleAssignment {
+                        role: WorkflowRole::Coder,
+                        difficulty: None,
+                        choice: ModelChoice {
+                            model_id: "model-unused".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    }],
+                },
+            },
+        )
+        .expect("upsert profile-unused");
+
+    let prepare_req = PreparePlanningGrantRequest {
+        request_key: "prep_proof_bound_grant_1".to_string(),
+        binding_id: BINDING_ID.to_string(),
+        thread_uuid: THREAD_UUID.to_string(),
+        repository_path: fx.repo_dir.clone(),
+        base_commit: fx.project_base.base_commit.clone(),
+        expected_base_tree_sha: Some(fx.project_base.base_tree_sha.clone()),
+        profile_id: "profile-main".to_string(),
+        expected_registry_revision: Some(grant_snap.revision),
+        roles: vec![
+            RolePreflightRequest {
+                role: WorkflowRole::Orchestrator,
+                difficulty: None,
+            },
+            RolePreflightRequest {
+                role: WorkflowRole::Architect,
+                difficulty: None,
+            },
+        ],
+        policy: OrchestratorTestFixture::default_policy(),
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 4,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        created_at_ms: 1_700_000_000_000,
+        expires_at_ms: 1_800_000_000_000,
+    };
+    let preview = prepare_planning_grant_preview_with_store(&fx.store, &grant_snap, &prepare_req)
+        .expect("prepare proof-bound grant preview");
+    let confirmed_digest = preview.preview_digest.clone();
+    let grant_summary = record_planning_grant(
+        &fx.store,
+        &grant_snap,
+        &RecordPlanningGrantRequest {
+            request_key: "prep_proof_bound_grant_1".to_string(),
+            expected_ledger_revision: None,
+            preview,
+            confirmed_preview_digest: confirmed_digest,
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect("record proof-bound grant");
+
+    // Metadata summary must never leak scoped_profile_dependency_proof or hidden executable paths.
+    let summary_json = serde_json::to_string(&grant_summary).expect("serialize grant summary");
+    assert!(
+        !summary_json.contains("scoped_profile_dependency_proof")
+            && !summary_json.contains("fake-agy"),
+        "PlanningGrantSummary must not expose scoped_profile_dependency_proof or executable_path"
+    );
+
+    // Unrelated profile deletion and upsert BEFORE the call advances the global registry revision.
+    let after_del = fx
+        .registry
+        .apply(
+            grant_snap.revision,
+            RegistryChange::DeleteProfile {
+                profile_id: "profile-unused".to_string(),
+            },
+        )
+        .expect("delete unrelated profile before call");
+    let after_upsert = fx
+        .registry
+        .apply(
+            after_del.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-other".to_string(),
+                    name: "Other Unrelated Profile".to_string(),
+                    assignments: vec![RoleAssignment {
+                        role: WorkflowRole::Coder,
+                        difficulty: None,
+                        choice: ModelChoice {
+                            model_id: "model-unused".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    }],
+                },
+            },
+        )
+        .expect("upsert another unrelated profile before call");
+    assert!(after_upsert.revision > grant_summary.registry_revision);
+
+    let job = fx.create_initial_job(
+        "job_proof_bound_isolated_1",
+        vec![
+            "Implement binary frame header parser in src/parser.rs".to_string(),
+            "Add frame counter helper in src/metrics.rs".to_string(),
+            "Wire batch exporter in src/exporter.rs to consume parsed frames".to_string(),
+        ],
+        Vec::new(),
+        Vec::new(),
+    );
+
+    // Configure a mid-flight hook so that an unrelated profile deletion + upsert also happens
+    // while the Orchestrator fake provider call is in flight, before plan save/publish/linkage.
+    let in_flight_marker = fx.agy_prompts_dir.join("in_flight_unrelated.marker");
+    let resume_marker = fx.agy_prompts_dir.join("resume_unrelated.marker");
+    let hook_script = format!(
+        "#!/bin/sh\nset -eu\n: > \"{}\"\ni=0\nwhile [ ! -f \"{}\" ] && [ \"$i\" -lt 250 ]; do\n  sleep 0.02\n  i=$((i + 1))\ndone\n",
+        in_flight_marker.display(),
+        resume_marker.display(),
+    );
+    fs::write(fx.agy_prompts_dir.join("hook_1.sh"), hook_script).expect("write hook_1.sh");
+    fx.write_custom_call_response(
+        1,
+        r#"{"outcome":"plan","schema_version":1,"summary":"Compile parser and exporter DAG under proof-bound grant.","tasks":[{"task_id":"task_parse","title":"Implement binary frame header parser","description":"Parse binary frames in src/parser.rs and expose ParsedFrame.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]},{"task_id":"task_export","title":"Wire batch exporter","description":"Consume iface_parsed_frame in src/exporter.rs.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":[],"consumed_interfaces":["iface_parsed_frame"]}],"check_suggestions":[{"check_id":"chk_unit","command_summary":"cargo test","required":true}]}"#,
+        false,
+    );
+
+    let commands = receipt_command_store(&fx);
+    let orch_req = OrchestratorTestFixture::plan_req(
+        &grant_summary.grant_id,
+        &job.job_id,
+        "orch_proof_bound_isolated_1",
+        0,
+    );
+    let enqueued = commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            orch_req.clone(),
+        ))
+        .expect("enqueue command succeeds despite unrelated profile deletion/upsert");
+
+    let driver = PlanningCommandDriver::new(commands.clone(), fx.service.clone())
+        .expect("create planning command driver");
+
+    let mid_flight_unrelated_edit = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !in_flight_marker.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for in-flight marker"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let cur = fx.registry.snapshot().expect("mid-flight snapshot");
+        let mid1 = fx
+            .registry
+            .apply(
+                cur.revision,
+                RegistryChange::DeleteProfile {
+                    profile_id: "profile-other".to_string(),
+                },
+            )
+            .expect("delete unrelated profile-other mid-flight");
+        fx.registry
+            .apply(
+                mid1.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: None,
+                        id: "profile-midflight".to_string(),
+                        name: "Midflight Unrelated Profile".to_string(),
+                        assignments: vec![RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-unused".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        }],
+                    },
+                },
+            )
+            .expect("upsert unrelated profile-midflight during call");
+        fs::write(&resume_marker, "go").expect("write resume marker");
+    };
+
+    let (exec_res, ()) = tokio::join!(
+        driver.execute_command(BINDING_ID, THREAD_UUID, &enqueued.command_id),
+        mid_flight_unrelated_edit
+    );
+    let exec_report =
+        exec_res.expect("driver execution succeeds with unrelated mid-flight registry edits");
+    assert!(!exec_report.was_already_completed);
+    assert_eq!(fx.invocation_count(), 1);
+    assert_eq!(
+        exec_report.command.status,
+        threadlane_native::PlanningCommandStatus::Completed
+    );
+
+    let ledger = fx.store.read_binding_ledger(BINDING_ID).expect("ledger");
+    let updated_job = ledger
+        .jobs
+        .iter()
+        .find(|j| j.job_id == job.job_id)
+        .expect("updated job");
+    let planning_result = updated_job
+        .planning_result
+        .as_ref()
+        .expect("linked planning result")
+        .clone();
+    assert_eq!(planning_result.plan_revision, 1);
+    assert_eq!(
+        planning_result.registry_revision,
+        grant_summary.registry_revision
+    );
+
+    // Mutate an unrelated profile again AFTER publication and verify ordinary retrieval paths.
+    let post_pub_snap = fx.registry.snapshot().expect("post-publish snapshot");
+    fx.registry
+        .apply(
+            post_pub_snap.revision,
+            RegistryChange::DeleteProfile {
+                profile_id: "profile-midflight".to_string(),
+            },
+        )
+        .expect("delete unrelated profile-midflight after publication");
+
+    let fetched_plan = fx
+        .workflow
+        .get_plan(&planning_result.plan_id, None, None, None)
+        .expect("get_plan succeeds after unrelated post-publish registry edit");
+    assert_eq!(fetched_plan.header.revision, 1);
+    assert_eq!(
+        fetched_plan.header.profile_revision,
+        grant_summary.registry_revision
+    );
+
+    let listed = fx
+        .workflow
+        .list_plans(None, None)
+        .expect("list_plans succeeds after unrelated post-publish registry edit");
+    assert_eq!(listed.plans.len(), 1);
+    assert_eq!(listed.plans[0].plan_id, planning_result.plan_id);
+
+    let readonly_summary = ScopedWorkflow::read_plan_summary_readonly_at(
+        &fx.registry_dir,
+        &fx.plans_dir,
+        BINDING_ID,
+        &planning_result.plan_id,
+        1,
+    )
+    .expect("read_plan_summary_readonly_at succeeds after unrelated registry edit");
+    assert_eq!(readonly_summary.revision, 1);
+    assert_eq!(
+        readonly_summary.profile_revision,
+        grant_summary.registry_revision
+    );
+
+    // Reopen stores and verify idempotent replay across both driver and direct service calls.
+    let (reopened_store, reopened_service, reopened_wf) = fx.reopen_all();
+    let reopened_commands = PlanningCommandStore::open_existing(
+        commands.commands_dir(),
+        reopened_store,
+        &fx.registry_dir,
+    )
+    .expect("reopen command store")
+    .with_artifacts_dir(&fx.artifacts_dir)
+    .expect("configure artifacts dir");
+    let reopened_driver = PlanningCommandDriver::new(reopened_commands, reopened_service.clone())
+        .expect("reopen planning command driver");
+    let replayed_cmd = reopened_driver
+        .execute_command(BINDING_ID, THREAD_UUID, &enqueued.command_id)
+        .await
+        .expect("replaying completed command after reopen succeeds");
+    assert!(replayed_cmd.was_already_completed);
+    assert!(!replayed_cmd.reconciled_from_existing);
+    assert_eq!(
+        replayed_cmd.command.result_ref,
+        exec_report.command.result_ref
+    );
+    assert_eq!(fx.invocation_count(), 1);
+
+    let threadlane_native::PlanningCommandPayload::Orchestrator(mut frozen_orch_req) =
+        enqueued.payload.clone()
+    else {
+        unreachable!("expected Orchestrator payload");
+    };
+    frozen_orch_req.request_key = enqueued.service_request_key.clone();
+    frozen_orch_req.current_time_ms = enqueued.enqueued_at_ms;
+    let replayed_orch = reopened_service
+        .orchestrate_brief_to_plan(&reopened_wf, &frozen_orch_req)
+        .await
+        .expect("replaying orchestrate_brief_to_plan after reopen succeeds");
+    assert_eq!(fx.invocation_count(), 1);
+    assert_eq!(
+        replayed_orch
+            .require_published_plan()
+            .expect("replayed published plan")
+            .planning_result,
+        planning_result
+    );
+}
+
+#[tokio::test]
+async fn proof_bound_grant_rejects_selected_dependency_drift_before_call_and_mid_flight_and_tampered_or_legacy_grants(
+) {
+    use threadlane_native::coworker_grants::{
+        prepare_planning_grant_preview_with_store, record_planning_grant,
+        LocalOperatorGrantAttestation, PreparePlanningGrantRequest, RecordPlanningGrantRequest,
+    };
+    use threadlane_native::profile_flow::RolePreflightRequest;
+    use threadlane_native::EnqueuePlanningCommandRequest;
+
+    let fx = OrchestratorTestFixture::new();
+    let base_snap = fx.registry.snapshot().expect("base snapshot");
+
+    let prepare_req = PreparePlanningGrantRequest {
+        request_key: "prep_proof_drift_1".to_string(),
+        binding_id: BINDING_ID.to_string(),
+        thread_uuid: THREAD_UUID.to_string(),
+        repository_path: fx.repo_dir.clone(),
+        base_commit: fx.project_base.base_commit.clone(),
+        expected_base_tree_sha: Some(fx.project_base.base_tree_sha.clone()),
+        profile_id: "profile-main".to_string(),
+        expected_registry_revision: Some(base_snap.revision),
+        roles: vec![
+            RolePreflightRequest {
+                role: WorkflowRole::Orchestrator,
+                difficulty: None,
+            },
+            RolePreflightRequest {
+                role: WorkflowRole::Architect,
+                difficulty: None,
+            },
+        ],
+        policy: OrchestratorTestFixture::default_policy(),
+        capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: PlanningCallBudget {
+            max_total_calls: 8,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 4,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        created_at_ms: 1_700_000_000_000,
+        expires_at_ms: 1_800_000_000_000,
+    };
+    let preview = prepare_planning_grant_preview_with_store(&fx.store, &base_snap, &prepare_req)
+        .expect("prepare preview");
+
+    // 1. Tampered preview proof must fail closed on record_planning_grant.
+    let mut tampered_preview = preview.clone();
+    tampered_preview
+        .scoped_profile_dependency_proof
+        .spec
+        .profile_id = "profile-tampered".to_string();
+    let tamper_err = record_planning_grant(
+        &fx.store,
+        &base_snap,
+        &RecordPlanningGrantRequest {
+            request_key: "prep_proof_drift_1".to_string(),
+            expected_ledger_revision: None,
+            preview: tampered_preview,
+            confirmed_preview_digest: preview.preview_digest.clone(),
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect_err("tampered preview proof must be rejected");
+    assert_eq!(tamper_err.code, NativeErrorCode::ValidationFailed);
+
+    // 2. Stale preview recording when registry revision has advanced must fail closed.
+    let unrelated_snap = fx
+        .registry
+        .apply(
+            base_snap.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-unrelated".to_string(),
+                    name: "Unrelated Profile".to_string(),
+                    assignments: vec![RoleAssignment {
+                        role: WorkflowRole::Coder,
+                        difficulty: None,
+                        choice: ModelChoice {
+                            model_id: "model-argon".to_string(),
+                            effort: Some("high".to_string()),
+                        },
+                    }],
+                },
+            },
+        )
+        .expect("upsert unrelated profile");
+    let stale_preview_err = record_planning_grant(
+        &fx.store,
+        &unrelated_snap,
+        &RecordPlanningGrantRequest {
+            request_key: "prep_proof_drift_1".to_string(),
+            expected_ledger_revision: None,
+            preview: preview.clone(),
+            confirmed_preview_digest: preview.preview_digest.clone(),
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect_err("recording a preview against a newer registry revision must fail closed");
+    assert_eq!(stale_preview_err.code, NativeErrorCode::ValidationFailed);
+
+    // Prepare and record a fresh proof-bound grant at `unrelated_snap`.
+    let mut prepare_req2 = prepare_req.clone();
+    prepare_req2.request_key = "prep_proof_drift_2".to_string();
+    prepare_req2.expected_registry_revision = Some(unrelated_snap.revision);
+    let preview2 =
+        prepare_planning_grant_preview_with_store(&fx.store, &unrelated_snap, &prepare_req2)
+            .expect("prepare preview 2");
+    let confirmed_digest2 = preview2.preview_digest.clone();
+    let grant_summary = record_planning_grant(
+        &fx.store,
+        &unrelated_snap,
+        &RecordPlanningGrantRequest {
+            request_key: "prep_proof_drift_2".to_string(),
+            expected_ledger_revision: None,
+            preview: preview2,
+            confirmed_preview_digest: confirmed_digest2,
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect("record proof-bound grant 2");
+
+    let job = fx.create_initial_job(
+        "job_proof_drift_1",
+        vec!["Implement binary frame header parser in src/parser.rs".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+    let commands = receipt_command_store(&fx);
+    let original_profile = unrelated_snap.profiles[0].clone();
+    let original_model = unrelated_snap.models[0].clone();
+    let original_tool = unrelated_snap.tools[0].clone();
+
+    // 3a. Selected model config drift before call must reject.
+    let mut drifted_model = original_model.clone();
+    drifted_model.model_arg = "gemini-4-argon-low".to_string();
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::UpsertModels {
+                models: vec![drifted_model],
+            },
+        )
+        .expect("drift model-argon");
+    let req_model_drift = OrchestratorTestFixture::plan_req(
+        &grant_summary.grant_id,
+        &job.job_id,
+        "orch_model_drift",
+        0,
+    );
+    assert_eq!(
+        commands
+            .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+                req_model_drift.clone(),
+            ))
+            .expect_err("enqueue must reject selected model drift")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_model_drift)
+            .await
+            .expect_err("orchestrate must reject selected model drift")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(fx.invocation_count(), 0);
+
+    // Restore model-argon, then test selected tool disablement before call.
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::UpsertModels {
+                models: vec![original_model.clone()],
+            },
+        )
+        .expect("restore model-argon");
+    let mut disabled_tool = original_tool.clone();
+    disabled_tool.enabled = false;
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::UpsertTool {
+                tool: disabled_tool,
+            },
+        )
+        .expect("disable tool-agy");
+    let req_tool_drift = OrchestratorTestFixture::plan_req(
+        &grant_summary.grant_id,
+        &job.job_id,
+        "orch_tool_drift",
+        0,
+    );
+    assert_eq!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_tool_drift)
+            .await
+            .expect_err("orchestrate must reject selected tool disablement")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(fx.invocation_count(), 0);
+
+    // Restore tool-agy, then test selected profile deletion before call.
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::UpsertTool {
+                tool: original_tool.clone(),
+            },
+        )
+        .expect("restore tool-agy");
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::DeleteProfile {
+                profile_id: "profile-main".to_string(),
+            },
+        )
+        .expect("delete profile-main");
+    let req_prof_del = OrchestratorTestFixture::plan_req(
+        &grant_summary.grant_id,
+        &job.job_id,
+        "orch_prof_deleted",
+        0,
+    );
+    assert_eq!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_prof_del)
+            .await
+            .expect_err("orchestrate must reject deleted selected profile")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(fx.invocation_count(), 0);
+
+    // Restore profile-main and verify mid-flight selected dependency drift refuses publication/linkage.
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::UpsertProfile {
+                profile: original_profile.clone(),
+            },
+        )
+        .expect("restore profile-main");
+
+    let in_flight_marker = fx.agy_prompts_dir.join("in_flight_selected_drift.marker");
+    let resume_marker = fx.agy_prompts_dir.join("resume_selected_drift.marker");
+    let hook_script = format!(
+        "#!/bin/sh\nset -eu\n: > \"{}\"\ni=0\nwhile [ ! -f \"{}\" ] && [ \"$i\" -lt 250 ]; do\n  sleep 0.02\n  i=$((i + 1))\ndone\n",
+        in_flight_marker.display(),
+        resume_marker.display(),
+    );
+    fs::write(fx.agy_prompts_dir.join("hook_1.sh"), hook_script).expect("write hook_1.sh");
+    fx.write_custom_call_response(
+        1,
+        r#"{"outcome":"plan","schema_version":1,"summary":"Plan compiled before mid-flight selected profile drift.","tasks":[{"task_id":"task_parse","title":"Implement binary frame header parser","description":"Parse binary frames in src/parser.rs.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"]}]}"#,
+        false,
+    );
+    let req_mid_drift = OrchestratorTestFixture::plan_req(
+        &grant_summary.grant_id,
+        &job.job_id,
+        "orch_mid_selected_drift",
+        0,
+    );
+    let mid_flight_selected_drift = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !in_flight_marker.exists() {
+            assert!(Instant::now() < deadline, "timed out waiting for marker");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut drifted_profile = original_profile.clone();
+        drifted_profile
+            .assignments
+            .retain(|a| a.role != WorkflowRole::Coder);
+        let cur = fx.registry.snapshot().expect("mid-flight snap");
+        fx.registry
+            .apply(
+                cur.revision,
+                RegistryChange::UpsertProfile {
+                    profile: drifted_profile,
+                },
+            )
+            .expect("mutate selected profile assignments mid-flight");
+        fs::write(&resume_marker, "go").expect("write resume marker");
+    };
+    let (mid_res, ()) = tokio::join!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_mid_drift),
+        mid_flight_selected_drift
+    );
+    assert_eq!(
+        mid_res
+            .expect_err("mid-flight selected profile drift must refuse plan publication/linkage")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(fx.invocation_count(), 1);
+    assert!(fx
+        .workflow
+        .list_plans(None, None)
+        .expect("list plans")
+        .plans
+        .is_empty());
+
+    // Restore profile-main, then verify legacy proof-less grants still enforce strict global revision equality.
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::UpsertProfile {
+                profile: original_profile,
+            },
+        )
+        .expect("restore profile-main after mid-flight test");
+    let legacy_grant = fx.create_default_grant("grant_legacy_proofless_1");
+    assert!(legacy_grant.scoped_profile_dependency_proof.is_none());
+    let rev = fx.registry.snapshot().expect("snap").revision;
+    fx.registry
+        .apply(
+            rev,
+            RegistryChange::DeleteProfile {
+                profile_id: "profile-unrelated".to_string(),
+            },
+        )
+        .expect("delete unrelated profile after legacy grant");
+    let req_legacy = OrchestratorTestFixture::plan_req(
+        &legacy_grant.grant_id,
+        &job.job_id,
+        "orch_legacy_proofless_drift",
+        0,
+    );
+    assert_eq!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_legacy)
+            .await
+            .expect_err("legacy grant without proof must strictly reject global registry drift")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    assert_eq!(fx.invocation_count(), 1);
+}

@@ -47,7 +47,8 @@ use threadlane_workers::{
     DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
 use threadlane_workflow::{
-    validate_registry_identifier, Difficulty, PlanStatus, ToolAdapter, WorkflowRole,
+    validate_registry_identifier, Difficulty, PlanStatus, RegistrySnapshot,
+    ScopedProfileDependencyProof, ToolAdapter, WorkflowRole,
 };
 
 use crate::error::{NativeError, NativeErrorCode};
@@ -761,11 +762,45 @@ pub struct PlanningAdviceGrant {
     pub operator_attested: bool,
     /// Must be `false`: local grant creation never claims verified per-call native identity.
     pub native_per_call_identity_verified: bool,
+    /// Optional canonical scoped profile dependency proof bound at grant preview/recording time.
+    ///
+    /// Legacy grants recorded without this proof (`None`) retain strict global `registry_revision`
+    /// equality enforcement before effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoped_profile_dependency_proof: Option<ScopedProfileDependencyProof>,
     /// Durable call reservations recorded under this grant.
     pub reservations: Vec<PlanningCallReservation>,
 }
 
 impl PlanningAdviceGrant {
+    /// Computes the deterministic expected `grant_id` (`pgr_<32hex>`) for this grant's identity
+    /// and optional [`ScopedProfileDependencyProof`].
+    pub fn compute_expected_grant_id(&self) -> String {
+        match &self.scoped_profile_dependency_proof {
+            Some(proof) => deterministic_prefixed_id(
+                "threadlane-native:coworker-planning-grant:v2",
+                "pgr",
+                &[
+                    &self.binding_id,
+                    &self.thread_uuid,
+                    &self.create_request_key,
+                    &self.policy_digest,
+                    &proof.dependency_digest,
+                ],
+            ),
+            None => deterministic_prefixed_id(
+                "threadlane-native:coworker-planning-grant:v1",
+                "pgr",
+                &[
+                    &self.binding_id,
+                    &self.thread_uuid,
+                    &self.create_request_key,
+                    &self.policy_digest,
+                ],
+            ),
+        }
+    }
+
     /// Validates the grant's scope, policy role restrictions, read-only capabilities, budget, and usage consistency.
     pub fn validate(&self) -> Result<(), NativeError> {
         validate_bounded_identifier(&self.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
@@ -789,6 +824,32 @@ impl PlanningAdviceGrant {
                 NativeErrorCode::ValidationFailed,
                 "PlanningAdviceGrant.policy_digest does not match policy.digest()",
             ));
+        }
+        if let Some(ref proof) = self.scoped_profile_dependency_proof {
+            proof.validate().map_err(|err| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "PlanningAdviceGrant.scoped_profile_dependency_proof validation failed: {}",
+                        err.safe_message()
+                    ),
+                )
+            })?;
+            if proof.provenance_revision != self.registry_revision
+                || proof.spec.profile_id != self.profile_id
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PlanningAdviceGrant.scoped_profile_dependency_proof provenance_revision or profile_id does not match grant",
+                ));
+            }
+            let expected_grant_id = self.compute_expected_grant_id();
+            if !constant_time_str_eq(&self.grant_id, &expected_grant_id) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "PlanningAdviceGrant.grant_id does not match bound scoped_profile_dependency_proof digest",
+                ));
+            }
         }
         if self.policy.allow_rules.is_empty() {
             return Err(NativeError::new(
@@ -977,6 +1038,49 @@ impl PlanningAdviceGrant {
             ));
         }
         Ok(())
+    }
+}
+
+/// Verifies that `live_snapshot` still satisfies `grant`'s selected profile dependencies, returning
+/// a verified [`RegistrySnapshot`] at `grant.registry_revision`.
+///
+/// - When `grant.scoped_profile_dependency_proof` is `Some(proof)`, validates the proof against
+///   `grant.profile_id`, `grant.registry_revision`, and `grant.grant_id` and verifies that the
+///   selected profile, all referenced models, and all referenced tools in `live_snapshot` still
+///   match the proof without being invalidated by unrelated profile or unreferenced model/tool edits.
+/// - When `grant.scoped_profile_dependency_proof` is `None` (legacy grant record), enforces strict
+///   global `live_snapshot.revision == grant.registry_revision` equality.
+pub fn verify_grant_registry_dependencies(
+    live_snapshot: &RegistrySnapshot,
+    grant: &PlanningAdviceGrant,
+) -> Result<RegistrySnapshot, NativeError> {
+    grant.validate()?;
+    match &grant.scoped_profile_dependency_proof {
+        Some(proof) => proof.verify_against_live_snapshot(live_snapshot).map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "grant `{}` profile `{}` dependencies drifted from registry_revision {} in live registry (current revision {}): {}",
+                    grant.grant_id,
+                    grant.profile_id,
+                    grant.registry_revision,
+                    live_snapshot.revision,
+                    err.safe_message()
+                ),
+            )
+        }),
+        None => {
+            if live_snapshot.revision != grant.registry_revision {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "live registry_revision {} drifted from grant registry_revision {}",
+                        live_snapshot.revision, grant.registry_revision
+                    ),
+                ));
+            }
+            Ok(live_snapshot.clone())
+        }
     }
 }
 

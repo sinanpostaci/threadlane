@@ -52,15 +52,17 @@ pub use threadlane_plans::{
 pub use threadlane_registry::{resolve_choice, validate_registry_identifier};
 pub use threadlane_registry::{
     DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition, RegistryChange,
-    RegistryError, RegistrySnapshot, RegistryStore, RoleAssignment, ToolAdapter, ToolDefinition,
+    RegistryError, RegistrySnapshot, RegistryStore, RoleAssignment, ScopedModelDependency,
+    ScopedProfileDependencySpec, ScopedToolDependency, ToolAdapter, ToolDefinition,
     WorkflowProfile, WorkflowRole,
 };
 pub use types::{
     CatalogAssignment, CatalogDecisionAdvisor, CatalogPage, CatalogProfile, CatalogRoleAssignment,
     PlanHeader, PlanPage, PlanSummary, PlanSummaryPage, PublicTaskRoute, PublishedPlanView,
-    SavePlanDraft, TaskExecutionRoute, TaskRoute, DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT,
-    DEFAULT_PLAN_TASK_LIMIT, MAX_CATALOG_LIMIT, MAX_CURSOR_LEN, MAX_MCP_RESPONSE_BYTES,
-    MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
+    SavePlanDraft, ScopedProfileDependencyProof, TaskExecutionRoute, TaskRoute,
+    DEFAULT_CATALOG_LIMIT, DEFAULT_PLAN_LIST_LIMIT, DEFAULT_PLAN_TASK_LIMIT, MAX_CATALOG_LIMIT,
+    MAX_CURSOR_LEN, MAX_MCP_RESPONSE_BYTES, MAX_PLAN_LIST_LIMIT, MAX_PLAN_TASK_LIMIT,
+    SCOPED_PROFILE_DEPENDENCY_PROOF_SCHEMA_VERSION,
 };
 
 #[cfg(test)]
@@ -1342,6 +1344,7 @@ mod tests {
             tasks_digest: tasks_digest_before,
             payload_digest: payload_digest_before,
             plan_digest: None,
+            scoped_profile_dependency_proof: None,
             state: CommandJournalState::Pending,
         });
         with_journal_lock(
@@ -1430,6 +1433,7 @@ mod tests {
             )
             .expect("payload digest"),
             plan_digest: None,
+            scoped_profile_dependency_proof: None,
             state: CommandJournalState::Pending,
         });
         with_journal_lock(
@@ -1507,6 +1511,7 @@ mod tests {
             )
             .expect("payload digest"),
             plan_digest: None,
+            scoped_profile_dependency_proof: None,
             state: CommandJournalState::Pending,
         });
         with_journal_lock(
@@ -2337,6 +2342,7 @@ mod tests {
                 tasks_digest: td.clone(),
                 payload_digest: pd,
                 plan_digest: None,
+                scoped_profile_dependency_proof: None,
                 state: CommandJournalState::Failed,
             });
         }
@@ -3265,6 +3271,227 @@ mod tests {
         assert_eq!(
             restored_page.header.plan_digest.as_deref(),
             Some(original_digest.as_str())
+        );
+    }
+
+    #[test]
+    fn scoped_profile_dependency_proof_isolates_draft_save_publish_and_retrieval_from_unrelated_registry_edits_while_rejecting_selected_drift(
+    ) {
+        let (_tmp, registry, plans, base_rev) = setup_stores();
+        let seeded_alt = registry
+            .apply(
+                base_rev,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "alt-profile".to_string(),
+                        name: "Alternate Unrelated Profile".to_string(),
+                        assignments: vec![RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "deepseek-flash".to_string(),
+                                effort: Some("max".to_string()),
+                            },
+                        }],
+                        decision_advisor: None,
+                    },
+                },
+            )
+            .expect("seed unrelated alt-profile");
+        let reg_rev = seeded_alt.revision;
+        let wf = ScopedWorkflow::new(
+            Arc::clone(&registry),
+            Arc::clone(&plans),
+            "binding-1".into(),
+        )
+        .expect("create workflow");
+
+        let snapshot_v0 = registry.snapshot().expect("snapshot v0");
+        assert_eq!(snapshot_v0.revision, reg_rev);
+        let proof = ScopedProfileDependencyProof::from_snapshot(&snapshot_v0, "default-profile")
+            .expect("create scoped dependency proof");
+        proof.validate().expect("proof validates");
+
+        // 1. Delete an unrelated profile (`alt-profile`) and upsert another unrelated profile (`unused-profile`),
+        // advancing global registry revision twice before saving or publishing the draft.
+        let s1 = registry
+            .apply(
+                reg_rev,
+                RegistryChange::DeleteProfile {
+                    profile_id: "alt-profile".to_string(),
+                },
+            )
+            .expect("delete unrelated alt-profile");
+        let s2 = registry
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        id: "unused-profile".to_string(),
+                        name: "Unused Profile".to_string(),
+                        assignments: vec![RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "deepseek-flash".to_string(),
+                                effort: Some("max".to_string()),
+                            },
+                        }],
+                        decision_advisor: None,
+                    },
+                },
+            )
+            .expect("upsert unrelated unused-profile");
+        assert_eq!(s2.revision, reg_rev + 2);
+
+        let tasks = vec![sample_task(
+            "t1",
+            WorkflowRole::Coder,
+            Difficulty::Hard,
+            &[],
+            &["crates/threadlane-workflow/src/service.rs"],
+            "Implement scoped profile dependency proof verification",
+        )];
+
+        // Without a scoped proof, saving against `reg_rev` fails with `profile_revision_mismatch`.
+        let legacy_err = wf
+            .save_draft(SavePlanDraft {
+                command_key: "cmd-legacy-no-proof".to_string(),
+                plan_id: Some("plan-legacy-no-proof".to_string()),
+                expected_revision: 0,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Legacy draft without proof".to_string(),
+                tasks: tasks.clone(),
+            })
+            .expect_err("legacy save_draft without proof must reject global revision drift");
+        assert_eq!(legacy_err.code(), "profile_revision_mismatch");
+
+        // Tampered proof is rejected before mutating PlanStore.
+        let mut tampered_proof = proof.clone();
+        tampered_proof.dependency_digest = "0".repeat(64);
+        let tampered_err = wf
+            .save_draft_with_scoped_proof(
+                SavePlanDraft {
+                    command_key: "cmd-tampered-proof".to_string(),
+                    plan_id: Some("plan-tampered-proof".to_string()),
+                    expected_revision: 0,
+                    profile_id: "default-profile".to_string(),
+                    profile_revision: reg_rev,
+                    summary: "Tampered proof draft".to_string(),
+                    tasks: tasks.clone(),
+                },
+                Some(tampered_proof),
+            )
+            .expect_err("tampered proof must be rejected");
+        assert_eq!(tampered_err.code(), "invalid_input");
+
+        // With a valid scoped proof, saving against original provenance `reg_rev` succeeds despite
+        // unrelated profile deletions/upserts, and preserves `profile_revision == reg_rev`.
+        let draft = wf
+            .save_draft_with_scoped_proof(
+                SavePlanDraft {
+                    command_key: "cmd-scoped-v1".to_string(),
+                    plan_id: Some("plan-scoped-v1".to_string()),
+                    expected_revision: 0,
+                    profile_id: "default-profile".to_string(),
+                    profile_revision: reg_rev,
+                    summary: "Scoped proof draft summary".to_string(),
+                    tasks: tasks.clone(),
+                },
+                Some(proof.clone()),
+            )
+            .expect("save_draft_with_scoped_proof succeeds after unrelated profile changes");
+        assert_eq!(draft.profile_revision, reg_rev);
+        let expected_digest = draft.plan_digest.clone().expect("compiled plan_digest");
+
+        // Delete `unused-profile` between draft save and publish; `get_plan`, `list_plans`, and `publish`
+        // all succeed and preserve `profile_revision == reg_rev` and `expected_digest`.
+        let s3 = registry
+            .apply(
+                s2.revision,
+                RegistryChange::DeleteProfile {
+                    profile_id: "unused-profile".to_string(),
+                },
+            )
+            .expect("delete unused-profile before publish");
+        assert_eq!(s3.revision, reg_rev + 3);
+
+        let draft_page = wf
+            .get_plan("plan-scoped-v1", Some(1), None, None)
+            .expect("get_plan on scoped draft");
+        assert_eq!(
+            draft_page.header.plan_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+
+        let published = wf
+            .publish("plan-scoped-v1", 1)
+            .expect("publish succeeds with verified scoped proof after unrelated registry changes");
+        assert_eq!(published.header.status, PlanStatus::Published);
+        assert_eq!(published.header.profile_revision, reg_rev);
+        assert_eq!(
+            published.header.plan_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+
+        let pub_page = wf
+            .get_plan("plan-scoped-v1", Some(1), None, None)
+            .expect("get_plan on published scoped plan");
+        assert_eq!(
+            pub_page.header.plan_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+        let readonly_summary = ScopedWorkflow::read_plan_summary_readonly_at(
+            registry.config_dir(),
+            plans.dir(),
+            "binding-1",
+            "plan-scoped-v1",
+            1,
+        )
+        .expect("read_plan_summary_readonly_at on published scoped plan");
+        assert_eq!(
+            readonly_summary.plan_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+
+        // 2. Save a second draft (`plan-scoped-drift`) with `proof`, then mutate a selected tool dependency
+        // (`agy` enabled -> false) before publishing: `publish` must reject with `stale_revision`
+        // and leave the draft unpublished.
+        wf.save_draft_with_scoped_proof(
+            SavePlanDraft {
+                command_key: "cmd-scoped-drift".to_string(),
+                plan_id: Some("plan-scoped-drift".to_string()),
+                expected_revision: 0,
+                profile_id: "default-profile".to_string(),
+                profile_revision: reg_rev,
+                summary: "Draft before selected tool change".to_string(),
+                tasks,
+            },
+            Some(proof),
+        )
+        .expect("save second scoped draft");
+
+        registry
+            .apply(
+                s3.revision,
+                RegistryChange::UpsertTool {
+                    tool: sample_tool("agy", ToolAdapter::Antigravity, false),
+                },
+            )
+            .expect("disable selected agy tool");
+
+        let drift_pub_err = wf
+            .publish("plan-scoped-drift", 1)
+            .expect_err("publish must fail when selected profile tool dependency changed");
+        assert_eq!(drift_pub_err.code(), "stale_revision");
+        assert_eq!(
+            plans
+                .latest_revision("plan-scoped-drift")
+                .expect("latest")
+                .expect("exists")
+                .status,
+            PlanStatus::Draft
         );
     }
 }

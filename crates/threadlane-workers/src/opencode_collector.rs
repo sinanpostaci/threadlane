@@ -39,8 +39,9 @@ use tokio::time::Instant;
 
 use crate::fs_safety::ensure_platform_supported;
 use crate::opencode_metadata::{
-    validate_opencode_metadata, OpenCodeMetadataError, OpenCodeMetadataEvidence,
-    OwnedOpenCodeSession, MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
+    validate_opencode_metadata_with_diagnostic, OpenCodeMetadataDiagnostic, OpenCodeMetadataError,
+    OpenCodeMetadataEvidence, OpenCodeMetadataStage, OwnedOpenCodeSession,
+    MAX_OPENCODE_EXPORT_BYTES, MAX_OPENCODE_INFO_BYTES,
 };
 use crate::spec::{ResolvedModelTarget, MAX_IDENTIFIER_LEN, MAX_STDERR_BYTES};
 use crate::supervisor::{
@@ -166,6 +167,86 @@ impl From<OpenCodeMetadataError> for OpenCodeCollectorError {
     }
 }
 
+/// Privacy-safe OpenCode v2 collector failure pairing a coarse
+/// [`OpenCodeCollectorError`] with an optional finite [`OpenCodeMetadataStage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OpenCodeCollectorDiagnostic {
+    /// Coarse collector or metadata validation error category.
+    pub(crate) error: OpenCodeCollectorError,
+    /// Finite validation stage when available (`None` for transport errors or legacy undifferentiated `invalid_metadata`).
+    pub(crate) stage: Option<OpenCodeMetadataStage>,
+}
+
+impl OpenCodeCollectorDiagnostic {
+    /// Creates a collector diagnostic for `error` without a validation stage.
+    pub(crate) const fn from_error(error: OpenCodeCollectorError) -> Self {
+        Self { error, stage: None }
+    }
+
+    /// Creates an [`OpenCodeCollectorError::InvalidMetadata`] diagnostic qualified by `stage`.
+    pub(crate) const fn invalid_metadata(stage: OpenCodeMetadataStage) -> Self {
+        Self {
+            error: OpenCodeCollectorError::InvalidMetadata,
+            stage: Some(stage),
+        }
+    }
+
+    /// Returns the finite machine-readable error code.
+    ///
+    /// Preserves existing semantic error codes (`output_overflow`, `ownership_mismatch`,
+    /// `stale_session`, `missing_model`, `model_mismatch`, `missing_effort`, `effort_mismatch`,
+    /// `missing_completion`, `provider_error`, `nonzero_exit`, `timed_out`, `cancelled`,
+    /// `cleanup_incomplete`, `spawn_failed`, `invalid_context`, `unsupported_platform`),
+    /// emits `"invalid_metadata:<stage>"` when `error == InvalidMetadata` and `stage` is `Some`,
+    /// and emits `"invalid_metadata"` when `stage` is `None`.
+    pub(crate) fn as_str(&self) -> &'static str {
+        match (self.error, self.stage) {
+            (OpenCodeCollectorError::InvalidMetadata, Some(stage)) => stage.qualified_error_code(),
+            (error, _) => error.as_str(),
+        }
+    }
+
+    /// Parses a stored collector/metadata error code into a structured [`OpenCodeCollectorDiagnostic`],
+    /// preserving legacy undifferentiated `"invalid_metadata"` with `stage: None` and rejecting
+    /// unrecognized strings.
+    pub(crate) fn from_error_code(raw: &str) -> Option<Self> {
+        if let Some(meta_diag) = OpenCodeMetadataDiagnostic::from_error_code(raw) {
+            return Some(Self::from(meta_diag));
+        }
+        match raw {
+            "unsupported_platform" => Some(Self::from_error(
+                OpenCodeCollectorError::UnsupportedPlatform,
+            )),
+            "invalid_context" => Some(Self::from_error(OpenCodeCollectorError::InvalidContext)),
+            "spawn_failed" => Some(Self::from_error(OpenCodeCollectorError::SpawnFailed)),
+            "cancelled" => Some(Self::from_error(OpenCodeCollectorError::Cancelled)),
+            "timed_out" => Some(Self::from_error(OpenCodeCollectorError::TimedOut)),
+            "cleanup_incomplete" => {
+                Some(Self::from_error(OpenCodeCollectorError::CleanupIncomplete))
+            }
+            "nonzero_exit" => Some(Self::from_error(OpenCodeCollectorError::NonZeroExit)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for OpenCodeCollectorDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for OpenCodeCollectorDiagnostic {}
+
+impl From<OpenCodeMetadataDiagnostic> for OpenCodeCollectorDiagnostic {
+    fn from(diagnostic: OpenCodeMetadataDiagnostic) -> Self {
+        Self {
+            error: OpenCodeCollectorError::from(diagnostic.error),
+            stage: diagnostic.stage,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct SessionCreateEnvelope {
     data: SessionCreateData,
@@ -192,20 +273,37 @@ struct SessionCreateTime {
 ///
 /// Executes `api --standalone session.create --data <JSON>` under Unix process-group supervision
 /// and validates the returned session identifier, canonical working directory, and creation time.
+#[cfg(test)]
 pub(crate) async fn allocate(
     context: &OpenCodeCollectorContext,
     resolved_model: &ResolvedModelTarget,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<OwnedOpenCodeSession, OpenCodeCollectorError> {
-    let workdir_str = validate_context(context)?;
-    let argv = build_session_create_argv(workdir_str, resolved_model)?;
+    allocate_with_diagnostic(context, resolved_model, cancel_rx)
+        .await
+        .map_err(|diagnostic| diagnostic.error)
+}
 
-    let create_stdout =
-        run_metadata_command(context, &argv, MAX_OPENCODE_CREATE_BYTES, cancel_rx).await?;
-    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
+/// Allocates a fresh software-owned OpenCode v2 session before launching the worker run,
+/// returning a stage-qualified [`OpenCodeCollectorDiagnostic`] on failure.
+pub(crate) async fn allocate_with_diagnostic(
+    context: &OpenCodeCollectorContext,
+    resolved_model: &ResolvedModelTarget,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<OwnedOpenCodeSession, OpenCodeCollectorDiagnostic> {
+    let workdir_str = validate_context(context).map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let argv = build_session_create_argv(workdir_str, resolved_model)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+
+    let create_stdout = run_metadata_command(context, &argv, MAX_OPENCODE_CREATE_BYTES, cancel_rx)
+        .await
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
 
     let owned = parse_and_validate_created_session(&create_stdout, context, workdir_str)?;
-    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     Ok(owned)
 }
 
@@ -213,31 +311,58 @@ pub(crate) async fn allocate(
 ///
 /// Executes `api --standalone session.get --param sessionID=<ID>` followed by
 /// `session export --standalone --sanitize <ID>`, checking cancellation and the overall deadline
-/// before each phase, and validates both responses in memory via [`validate_opencode_metadata`].
+/// before each phase, and validates both responses in memory.
+#[cfg(test)]
 pub(crate) async fn collect(
     context: &OpenCodeCollectorContext,
     owned: &OwnedOpenCodeSession,
     resolved_model: &ResolvedModelTarget,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<OpenCodeMetadataEvidence, OpenCodeCollectorError> {
-    let workdir_str = validate_context(context)?;
-    let _ = split_and_validate_model_target(resolved_model)?;
+    collect_with_diagnostic(context, owned, resolved_model, cancel_rx)
+        .await
+        .map_err(|diagnostic| diagnostic.error)
+}
+
+/// Collects and validates authoritative OpenCode v2 session metadata for an [`OwnedOpenCodeSession`],
+/// returning a stage-qualified [`OpenCodeCollectorDiagnostic`] on failure.
+pub(crate) async fn collect_with_diagnostic(
+    context: &OpenCodeCollectorContext,
+    owned: &OwnedOpenCodeSession,
+    resolved_model: &ResolvedModelTarget,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<OpenCodeMetadataEvidence, OpenCodeCollectorDiagnostic> {
+    let workdir_str = validate_context(context).map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let _ = split_and_validate_model_target(resolved_model)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     validate_owned_against_context(owned, context, workdir_str)?;
 
-    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     let get_argv = build_session_get_argv(&owned.session_id)?;
-    let info_bytes =
-        run_metadata_command(context, &get_argv, MAX_OPENCODE_INFO_BYTES, cancel_rx).await?;
+    let info_bytes = run_metadata_command(context, &get_argv, MAX_OPENCODE_INFO_BYTES, cancel_rx)
+        .await
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
 
-    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     let export_argv = build_session_export_argv(&owned.session_id)?;
     let export_bytes =
-        run_metadata_command(context, &export_argv, MAX_OPENCODE_EXPORT_BYTES, cancel_rx).await?;
+        run_metadata_command(context, &export_argv, MAX_OPENCODE_EXPORT_BYTES, cancel_rx)
+            .await
+            .map_err(OpenCodeCollectorDiagnostic::from_error)?;
 
-    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
-    let evidence = validate_opencode_metadata(owned, &info_bytes, &export_bytes, resolved_model)
-        .map_err(OpenCodeCollectorError::from)?;
-    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let evidence = validate_opencode_metadata_with_diagnostic(
+        owned,
+        &info_bytes,
+        &export_bytes,
+        resolved_model,
+    )
+    .map_err(OpenCodeCollectorDiagnostic::from)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
     Ok(evidence)
 }
 
@@ -287,9 +412,11 @@ pub(crate) fn build_session_create_argv(
 /// Builds the fixed public argv for `api --standalone session.get --param sessionID=<ID>`.
 pub(crate) fn build_session_get_argv(
     session_id: &str,
-) -> Result<Vec<String>, OpenCodeCollectorError> {
+) -> Result<Vec<String>, OpenCodeCollectorDiagnostic> {
     if !is_safe_identifier(session_id) {
-        return Err(OpenCodeCollectorError::InvalidMetadata);
+        return Err(OpenCodeCollectorDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
     Ok(vec![
         "api".to_string(),
@@ -303,9 +430,11 @@ pub(crate) fn build_session_get_argv(
 /// Builds the fixed public argv for `session export --standalone --sanitize <ID>`.
 pub(crate) fn build_session_export_argv(
     session_id: &str,
-) -> Result<Vec<String>, OpenCodeCollectorError> {
+) -> Result<Vec<String>, OpenCodeCollectorDiagnostic> {
     if !is_safe_identifier(session_id) {
-        return Err(OpenCodeCollectorError::InvalidMetadata);
+        return Err(OpenCodeCollectorDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
     Ok(vec![
         "session".to_string(),
@@ -320,22 +449,38 @@ fn parse_and_validate_created_session(
     bytes: &[u8],
     context: &OpenCodeCollectorContext,
     expected_workdir: &str,
-) -> Result<OwnedOpenCodeSession, OpenCodeCollectorError> {
+) -> Result<OwnedOpenCodeSession, OpenCodeCollectorDiagnostic> {
     if bytes.len() > MAX_OPENCODE_CREATE_BYTES {
-        return Err(OpenCodeCollectorError::OutputOverflow);
+        return Err(OpenCodeCollectorDiagnostic::from_error(
+            OpenCodeCollectorError::OutputOverflow,
+        ));
     }
 
-    let envelope: SessionCreateEnvelope =
-        serde_json::from_slice(bytes).map_err(|_| OpenCodeCollectorError::InvalidMetadata)?;
+    let root: Value = serde_json::from_slice(bytes).map_err(|_| {
+        OpenCodeCollectorDiagnostic::invalid_metadata(OpenCodeMetadataStage::CreateResponseJson)
+    })?;
+    if !root.is_object() {
+        return Err(OpenCodeCollectorDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CreateResponseJson,
+        ));
+    }
+
+    let envelope: SessionCreateEnvelope = serde_json::from_slice(bytes).map_err(|_| {
+        OpenCodeCollectorDiagnostic::invalid_metadata(OpenCodeMetadataStage::CreateResponseEnvelope)
+    })?;
 
     if !is_safe_identifier(&envelope.data.id) {
-        return Err(OpenCodeCollectorError::InvalidMetadata);
+        return Err(OpenCodeCollectorDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CreateResponseEnvelope,
+        ));
     }
 
     if !is_clean_absolute_path(&envelope.data.location.directory)
         || envelope.data.location.directory != expected_workdir
     {
-        return Err(OpenCodeCollectorError::OwnershipMismatch);
+        return Err(OpenCodeCollectorDiagnostic::from_error(
+            OpenCodeCollectorError::OwnershipMismatch,
+        ));
     }
 
     let created_ms = envelope.data.time.created;
@@ -346,7 +491,9 @@ fn parse_and_validate_created_session(
         || created_ms > max_allowed_created_ms
         || created_ms > i64::MAX as u64
     {
-        return Err(OpenCodeCollectorError::StaleSession);
+        return Err(OpenCodeCollectorDiagnostic::from_error(
+            OpenCodeCollectorError::StaleSession,
+        ));
     }
 
     Ok(OwnedOpenCodeSession {
@@ -396,19 +543,24 @@ fn validate_owned_against_context(
     owned: &OwnedOpenCodeSession,
     context: &OpenCodeCollectorContext,
     expected_workdir: &str,
-) -> Result<(), OpenCodeCollectorError> {
+) -> Result<(), OpenCodeCollectorDiagnostic> {
     if !is_safe_identifier(&owned.session_id) {
-        return Err(OpenCodeCollectorError::InvalidMetadata);
+        return Err(OpenCodeCollectorDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
-    let owned_workdir = owned
-        .canonical_workdir
-        .to_str()
-        .ok_or(OpenCodeCollectorError::InvalidMetadata)?;
+    let owned_workdir = owned.canonical_workdir.to_str().ok_or_else(|| {
+        OpenCodeCollectorDiagnostic::invalid_metadata(OpenCodeMetadataStage::CallerContract)
+    })?;
     if !is_clean_absolute_path(owned_workdir) || owned_workdir != expected_workdir {
-        return Err(OpenCodeCollectorError::OwnershipMismatch);
+        return Err(OpenCodeCollectorDiagnostic::from_error(
+            OpenCodeCollectorError::OwnershipMismatch,
+        ));
     }
     if owned.started_at_ms < context.started_at_ms || owned.started_at_ms > i64::MAX as u64 {
-        return Err(OpenCodeCollectorError::StaleSession);
+        return Err(OpenCodeCollectorDiagnostic::from_error(
+            OpenCodeCollectorError::StaleSession,
+        ));
     }
     Ok(())
 }
@@ -1242,5 +1394,368 @@ exit 99
             "lingering descendant must be terminated and reaped"
         );
         assert_eq!(fixture.invocations().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collector_diagnostics_distinguish_create_info_export_and_metadata_stages_without_leaking_sentinels(
+    ) {
+        let script = r#"#!/bin/sh
+set -eu
+LOG_FILE="$(dirname "$0")/invocations.log"
+MODE_FILE="$(dirname "$0")/mode.txt"
+printf '%s\n' "$*" >> "$LOG_FILE"
+MODE="$(cat "$MODE_FILE")"
+
+if [ "${1:-}" = "api" ] && [ "${2:-}" = "--standalone" ] && [ "${3:-}" = "session.create" ]; then
+    case "$MODE" in
+        create_bad_json)
+            printf 'not-json SENTINEL_CREATE_RAW sk-secret-create\n'
+            exit 0
+            ;;
+        create_bad_envelope)
+            printf '{"data":{"id":"   ","title":"SENTINEL_CREATE_TITLE","location":{"directory":"%s"},"time":{"created":1500}}}\n' "$(pwd)"
+            exit 0
+            ;;
+        create_wrong_dir)
+            printf '{"data":{"id":"ses_owned_123","location":{"directory":"/tmp/SENTINEL_WRONG_PATH"},"time":{"created":1500}}}\n'
+            exit 0
+            ;;
+    esac
+fi
+
+if [ "${1:-}" = "api" ] && [ "${2:-}" = "--standalone" ] && [ "${3:-}" = "session.get" ]; then
+    case "$MODE" in
+        info_bad_json)
+            printf 'corrupt-info SENTINEL_INFO_RAW https://secret.example/internal\n'
+            exit 0
+            ;;
+        info_bad_envelope)
+            printf '{"unexpected":"SENTINEL_INFO_ENVELOPE"}\n'
+            exit 0
+            ;;
+        export_bad_json|export_bad_envelope|terminal_bad_finish)
+            printf '{"data":{"id":"ses_owned_123","location":{"directory":"%s"},"outcome":"succeeded","time":{"created":1500,"updated":2600,"idle":2600}}}\n' "$(pwd)"
+            exit 0
+            ;;
+    esac
+fi
+
+if [ "${1:-}" = "session" ] && [ "${2:-}" = "export" ]; then
+    case "$MODE" in
+        info_bad_json|info_bad_envelope)
+            printf '{"info":{"id":"ses_owned_123","outcome":"succeeded","time":{"created":1500,"updated":2600,"idle":2600}},"messages":[{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":"stop","model":{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"},"time":{"created":1700,"completed":2500}}]}\n'
+            exit 0
+            ;;
+        export_bad_json)
+            printf '{corrupt export SENTINEL_EXPORT_RAW\n'
+            exit 0
+            ;;
+        export_bad_envelope)
+            printf '{"info":{"id":"ses_owned_123","outcome":"succeeded","time":{"created":1500,"updated":2600,"idle":2600}},"messages":"SENTINEL_EXPORT_ENVELOPE"}\n'
+            exit 0
+            ;;
+        terminal_bad_finish)
+            printf '{"info":{"id":"ses_owned_123","outcome":"succeeded","time":{"created":1500,"updated":2600,"idle":2600}},"messages":[{"id":"msg_a_1","sessionID":"ses_owned_123","type":"assistant","finish":{"reason":"SENTINEL_FINISH_OBJ"},"model":{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"},"time":{"created":1700,"completed":2500}}]}\n'
+            exit 0
+            ;;
+    esac
+fi
+
+exit 99
+"#;
+        let fixture = TestFixture::new(script);
+        let mode_path = fixture.root_dir.join("mode.txt");
+        let target = expected_model_target();
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let owned = OwnedOpenCodeSession {
+            session_id: "ses_owned_123".to_string(),
+            canonical_workdir: fixture.workdir.clone(),
+            started_at_ms: 1_000,
+        };
+        let sentinels = [
+            "SENTINEL_CREATE_RAW",
+            "sk-secret-create",
+            "SENTINEL_CREATE_TITLE",
+            "SENTINEL_WRONG_PATH",
+            "SENTINEL_INFO_RAW",
+            "https://secret.example/internal",
+            "SENTINEL_INFO_ENVELOPE",
+            "SENTINEL_FINISH_OBJ",
+            "SENTINEL_EXPORT_RAW",
+            "SENTINEL_EXPORT_ENVELOPE",
+            "ses_owned_123",
+        ];
+
+        // 1. Create response invalid JSON -> create_response_json stage.
+        fs::write(&mode_path, "create_bad_json").expect("write mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = allocate_with_diagnostic(&ctx, &target, &mut cancel_rx)
+            .await
+            .expect_err("create bad json must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::CreateResponseJson));
+        assert_eq!(diag.as_str(), "invalid_metadata:create_response_json");
+        for sentinel in sentinels {
+            assert!(!diag.as_str().contains(sentinel));
+            assert!(!diag.to_string().contains(sentinel));
+        }
+
+        // 2. Create response invalid envelope -> create_response_envelope stage.
+        fs::write(&mode_path, "create_bad_envelope").expect("write mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = allocate_with_diagnostic(&ctx, &target, &mut cancel_rx)
+            .await
+            .expect_err("create bad envelope must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(
+            diag.stage,
+            Some(OpenCodeMetadataStage::CreateResponseEnvelope)
+        );
+        assert_eq!(diag.as_str(), "invalid_metadata:create_response_envelope");
+
+        // 3. Create wrong directory preserves semantic ownership_mismatch without stage suffix.
+        fs::write(&mode_path, "create_wrong_dir").expect("write mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = allocate_with_diagnostic(&ctx, &target, &mut cancel_rx)
+            .await
+            .expect_err("create wrong dir must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::OwnershipMismatch);
+        assert_eq!(diag.stage, None);
+        assert_eq!(diag.as_str(), "ownership_mismatch");
+
+        // 4. Collect caller contract rejection before subprocess launch.
+        let _ = fs::remove_file(&fixture.log_path);
+        let mut bad_owned = owned.clone();
+        bad_owned.session_id = "-flag_injection".to_string();
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &bad_owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("invalid session id must fail caller contract");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::CallerContract));
+        assert_eq!(diag.as_str(), "invalid_metadata:caller_contract");
+        assert!(fixture.invocations().is_empty());
+
+        // 5. Collect info_response_json stage (runs both session.get and export before validation).
+        fs::write(&mode_path, "info_bad_json").expect("write mode");
+        let _ = fs::remove_file(&fixture.log_path);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("info bad json must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::InfoResponseJson));
+        assert_eq!(diag.as_str(), "invalid_metadata:info_response_json");
+        assert_eq!(fixture.invocations().len(), 2);
+        for sentinel in sentinels {
+            assert!(!diag.as_str().contains(sentinel));
+            assert!(!diag.to_string().contains(sentinel));
+        }
+
+        // 6. Collect info_response_envelope stage.
+        fs::write(&mode_path, "info_bad_envelope").expect("write mode");
+        let _ = fs::remove_file(&fixture.log_path);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("info bad envelope must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(
+            diag.stage,
+            Some(OpenCodeMetadataStage::InfoResponseEnvelope)
+        );
+        assert_eq!(diag.as_str(), "invalid_metadata:info_response_envelope");
+        assert_eq!(fixture.invocations().len(), 2);
+
+        // 7. Collect export_json stage.
+        fs::write(&mode_path, "export_bad_json").expect("write mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("export bad json must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::ExportJson));
+        assert_eq!(diag.as_str(), "invalid_metadata:export_json");
+        for sentinel in sentinels {
+            assert!(!diag.as_str().contains(sentinel));
+            assert!(!diag.to_string().contains(sentinel));
+        }
+
+        // 8. Collect export_envelope stage.
+        fs::write(&mode_path, "export_bad_envelope").expect("write mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("export bad envelope must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::ExportEnvelope));
+        assert_eq!(diag.as_str(), "invalid_metadata:export_envelope");
+
+        // 9. Collect terminal_completion stage.
+        fs::write(&mode_path, "terminal_bad_finish").expect("write mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("terminal bad finish must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::TerminalCompletion));
+        assert_eq!(diag.as_str(), "invalid_metadata:terminal_completion");
+        for sentinel in sentinels {
+            assert!(!diag.as_str().contains(sentinel));
+            assert!(!diag.to_string().contains(sentinel));
+        }
+
+        // 10. Legacy and stage-qualified collector error codes decode safely.
+        assert_eq!(
+            OpenCodeCollectorDiagnostic::from_error_code("invalid_metadata"),
+            Some(OpenCodeCollectorDiagnostic {
+                error: OpenCodeCollectorError::InvalidMetadata,
+                stage: None,
+            })
+        );
+        assert_eq!(
+            OpenCodeCollectorDiagnostic::from_error_code("invalid_metadata:export_json"),
+            Some(OpenCodeCollectorDiagnostic {
+                error: OpenCodeCollectorError::InvalidMetadata,
+                stage: Some(OpenCodeMetadataStage::ExportJson),
+            })
+        );
+        assert_eq!(
+            OpenCodeCollectorDiagnostic::from_error_code("invalid_metadata:unknown_stage"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn create_session_rejects_duplicate_known_fields_from_raw_bytes_without_collapsing() {
+        let script = r#"#!/bin/sh
+set -eu
+MODE="$(cat "$(dirname "$0")/mode.txt")"
+WORKDIR="$(pwd)"
+
+if [ "${1:-}" = "api" ] && [ "${2:-}" = "--standalone" ] && [ "${3:-}" = "session.create" ]; then
+    case "$MODE" in
+        dup_data)
+            printf '{"data":{"id":"../bad_first_SENTINEL","location":{"directory":"/tmp/wrong_first_SENTINEL"},"time":{"created":100}},"data":{"id":"ses_owned_123","location":{"directory":"%s"},"time":{"created":1050}}}\n' "$WORKDIR"
+            exit 0
+            ;;
+        dup_id)
+            printf '{"data":{"id":"../bad_first_SENTINEL","id":"ses_owned_123","location":{"directory":"%s"},"time":{"created":1050}}}\n' "$WORKDIR"
+            exit 0
+            ;;
+        dup_location_directory)
+            printf '{"data":{"id":"ses_owned_123","location":{"directory":"/tmp/wrong_first_SENTINEL","directory":"%s"},"time":{"created":1050}}}\n' "$WORKDIR"
+            exit 0
+            ;;
+        dup_time_created)
+            printf '{"data":{"id":"ses_owned_123","location":{"directory":"%s"},"time":{"created":100,"created":1050}}}\n' "$WORKDIR"
+            exit 0
+            ;;
+        non_object_root)
+            printf '[{"data":{"id":"ses_owned_123","location":{"directory":"%s"},"time":{"created":1050}}}]\n' "$WORKDIR"
+            exit 0
+            ;;
+        valid_with_unknown_fields)
+            printf '{"extra_root":"ignored","data":{"id":"ses_owned_123","title":"ignored","extra_dup":1,"extra_dup":2,"location":{"directory":"%s","extra_loc":"ignored"},"time":{"created":1050,"updated":1050}}}\n' "$WORKDIR"
+            exit 0
+            ;;
+    esac
+fi
+
+exit 99
+"#;
+        let fixture = TestFixture::new(script);
+        let mode_path = fixture.root_dir.join("mode.txt");
+        let target = expected_model_target();
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let workdir_str = fixture.workdir.to_str().expect("utf-8 workdir");
+
+        let duplicate_fixtures = [
+            (
+                "dup_data",
+                format!(
+                    r#"{{"data":{{"id":"../bad_first_SENTINEL","location":{{"directory":"/tmp/wrong_first_SENTINEL"}},"time":{{"created":100}}}},"data":{{"id":"ses_owned_123","location":{{"directory":"{workdir_str}"}},"time":{{"created":1050}}}}}}"#
+                ),
+            ),
+            (
+                "dup_id",
+                format!(
+                    r#"{{"data":{{"id":"../bad_first_SENTINEL","id":"ses_owned_123","location":{{"directory":"{workdir_str}"}},"time":{{"created":1050}}}}}}"#
+                ),
+            ),
+            (
+                "dup_location_directory",
+                format!(
+                    r#"{{"data":{{"id":"ses_owned_123","location":{{"directory":"/tmp/wrong_first_SENTINEL","directory":"{workdir_str}"}},"time":{{"created":1050}}}}}}"#
+                ),
+            ),
+            (
+                "dup_time_created",
+                format!(
+                    r#"{{"data":{{"id":"ses_owned_123","location":{{"directory":"{workdir_str}"}},"time":{{"created":100,"created":1050}}}}}}"#
+                ),
+            ),
+        ];
+
+        for (mode, raw_json) in &duplicate_fixtures {
+            let direct_diag =
+                parse_and_validate_created_session(raw_json.as_bytes(), &ctx, workdir_str)
+                    .expect_err("duplicate known field in raw JSON must fail");
+            assert_eq!(direct_diag.error, OpenCodeCollectorError::InvalidMetadata);
+            assert_eq!(
+                direct_diag.stage,
+                Some(OpenCodeMetadataStage::CreateResponseEnvelope)
+            );
+            assert_eq!(
+                direct_diag.as_str(),
+                "invalid_metadata:create_response_envelope"
+            );
+
+            fs::write(&mode_path, mode).expect("write duplicate mode");
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let diag = allocate_with_diagnostic(&ctx, &target, &mut cancel_rx)
+                .await
+                .expect_err("allocate_with_diagnostic must reject duplicate known field");
+            assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+            assert_eq!(
+                diag.stage,
+                Some(OpenCodeMetadataStage::CreateResponseEnvelope)
+            );
+            assert_eq!(diag.as_str(), "invalid_metadata:create_response_envelope");
+            assert!(!diag.to_string().contains("duplicate field"));
+            assert!(!format!("{diag:?}").contains("duplicate field"));
+            assert!(!diag.to_string().contains("SENTINEL"));
+            assert!(!format!("{diag:?}").contains("SENTINEL"));
+
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let coarse_err = allocate(&ctx, &target, &mut cancel_rx)
+                .await
+                .expect_err("allocate must reject duplicate known field");
+            assert_eq!(coarse_err, OpenCodeCollectorError::InvalidMetadata);
+        }
+
+        // Non-object root JSON remains classified at CreateResponseJson.
+        fs::write(&mode_path, "non_object_root").expect("write non_object_root mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let root_diag = allocate_with_diagnostic(&ctx, &target, &mut cancel_rx)
+            .await
+            .expect_err("non-object root must fail at CreateResponseJson");
+        assert_eq!(root_diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(
+            root_diag.stage,
+            Some(OpenCodeMetadataStage::CreateResponseJson)
+        );
+        assert_eq!(root_diag.as_str(), "invalid_metadata:create_response_json");
+
+        // Unrelated unknown fields remain ignored on a valid create envelope.
+        fs::write(&mode_path, "valid_with_unknown_fields")
+            .expect("write valid_with_unknown_fields mode");
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let owned = allocate_with_diagnostic(&ctx, &target, &mut cancel_rx)
+            .await
+            .expect("valid create envelope with unrelated unknown fields should succeed");
+        assert_eq!(owned.session_id, "ses_owned_123");
+        assert_eq!(owned.canonical_workdir, fixture.workdir);
+        assert_eq!(owned.started_at_ms, 1_000);
     }
 }

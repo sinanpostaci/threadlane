@@ -117,7 +117,236 @@ impl fmt::Display for OpenCodeMetadataError {
 
 impl std::error::Error for OpenCodeMetadataError {}
 
+/// Finite, software-owned validation stage for OpenCode v2 metadata diagnostics.
+///
+/// Variants carry no raw JSON, transcript text, titles, content, reasoning, URLs,
+/// filesystem paths, identifiers, tokens, or provider error strings. Safe machine-readable
+/// literals are exposed only through [`Self::as_str`] and [`Self::qualified_error_code`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenCodeMetadataStage {
+    /// Trusted caller inputs (`OwnedOpenCodeSession` or `ResolvedModelTarget`) failed identifier or canonical path validation.
+    CallerContract,
+    /// `session.create` stdout was not valid JSON or not a top-level JSON object.
+    CreateResponseJson,
+    /// `session.create` JSON root was missing a valid `data` envelope or required session creation fields.
+    CreateResponseEnvelope,
+    /// `session.get` (`info_response`) was not valid JSON or not a top-level JSON object.
+    InfoResponseJson,
+    /// `session.get` (`info_response`) JSON root was missing the `data` object envelope.
+    InfoResponseEnvelope,
+    /// `session export --standalone --sanitize` (`sanitized_export`) was not valid JSON or not a top-level JSON object.
+    ExportJson,
+    /// `sanitized_export` JSON root was missing the `info` object or `messages` array envelope.
+    ExportEnvelope,
+    /// Session `id` or `location.directory` field was missing or had an invalid JSON type in `info` or `export.info`.
+    IdentityWorkdir,
+    /// Session or assistant timestamp (`time`, `time.created`, `time.idle`, `time.completed`) was missing, non-integer, or inconsistent between `info` and `export.info`.
+    Timestamps,
+    /// An entry in `export.messages` was not a JSON object, lacked a string `type`, had a non-string or unsafe `id`, or reused a duplicate message `id`.
+    MessageEnvelope,
+    /// An assistant `model.providerID`, `model.id`, or `model.variant` field had an invalid JSON type or failed safe identifier validation.
+    AssistantTarget,
+    /// Terminal completion check (`outcome`, assistant count, final `finish`, or `time.idle` ordering) failed.
+    TerminalCompletion,
+}
+
+impl OpenCodeMetadataStage {
+    /// All finite validation stages in canonical declaration order.
+    pub const ALL: [Self; 12] = [
+        Self::CallerContract,
+        Self::CreateResponseJson,
+        Self::CreateResponseEnvelope,
+        Self::InfoResponseJson,
+        Self::InfoResponseEnvelope,
+        Self::ExportJson,
+        Self::ExportEnvelope,
+        Self::IdentityWorkdir,
+        Self::Timestamps,
+        Self::MessageEnvelope,
+        Self::AssistantTarget,
+        Self::TerminalCompletion,
+    ];
+
+    /// Returns the finite `snake_case` stage code.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::CallerContract => "caller_contract",
+            Self::CreateResponseJson => "create_response_json",
+            Self::CreateResponseEnvelope => "create_response_envelope",
+            Self::InfoResponseJson => "info_response_json",
+            Self::InfoResponseEnvelope => "info_response_envelope",
+            Self::ExportJson => "export_json",
+            Self::ExportEnvelope => "export_envelope",
+            Self::IdentityWorkdir => "identity_workdir",
+            Self::Timestamps => "timestamps",
+            Self::MessageEnvelope => "message_envelope",
+            Self::AssistantTarget => "assistant_target",
+            Self::TerminalCompletion => "terminal_completion",
+        }
+    }
+
+    /// Returns the fixed stage-qualified `invalid_metadata:<stage>` error code.
+    pub const fn qualified_error_code(&self) -> &'static str {
+        match self {
+            Self::CallerContract => "invalid_metadata:caller_contract",
+            Self::CreateResponseJson => "invalid_metadata:create_response_json",
+            Self::CreateResponseEnvelope => "invalid_metadata:create_response_envelope",
+            Self::InfoResponseJson => "invalid_metadata:info_response_json",
+            Self::InfoResponseEnvelope => "invalid_metadata:info_response_envelope",
+            Self::ExportJson => "invalid_metadata:export_json",
+            Self::ExportEnvelope => "invalid_metadata:export_envelope",
+            Self::IdentityWorkdir => "invalid_metadata:identity_workdir",
+            Self::Timestamps => "invalid_metadata:timestamps",
+            Self::MessageEnvelope => "invalid_metadata:message_envelope",
+            Self::AssistantTarget => "invalid_metadata:assistant_target",
+            Self::TerminalCompletion => "invalid_metadata:terminal_completion",
+        }
+    }
+
+    /// Parses a canonical `snake_case` stage literal, returning `None` for any unknown string.
+    pub fn from_code(raw: &str) -> Option<Self> {
+        match raw {
+            "caller_contract" => Some(Self::CallerContract),
+            "create_response_json" => Some(Self::CreateResponseJson),
+            "create_response_envelope" => Some(Self::CreateResponseEnvelope),
+            "info_response_json" => Some(Self::InfoResponseJson),
+            "info_response_envelope" => Some(Self::InfoResponseEnvelope),
+            "export_json" => Some(Self::ExportJson),
+            "export_envelope" => Some(Self::ExportEnvelope),
+            "identity_workdir" => Some(Self::IdentityWorkdir),
+            "timestamps" => Some(Self::Timestamps),
+            "message_envelope" => Some(Self::MessageEnvelope),
+            "assistant_target" => Some(Self::AssistantTarget),
+            "terminal_completion" => Some(Self::TerminalCompletion),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for OpenCodeMetadataStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Privacy-safe OpenCode v2 metadata validation failure pairing a coarse
+/// [`OpenCodeMetadataError`] with an optional finite [`OpenCodeMetadataStage`].
+///
+/// Contains only fixed software-owned enum values. Legacy undifferentiated `"invalid_metadata"`
+/// reports remain readable via [`Self::from_error_code`] with `stage: None` (unknown/unavailable
+/// stage detail, never an invented cause).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpenCodeMetadataDiagnostic {
+    /// Coarse semantic metadata validation error category.
+    pub error: OpenCodeMetadataError,
+    /// Finite validation stage when available (`None` for legacy undifferentiated `invalid_metadata` reports or un-staged errors).
+    pub stage: Option<OpenCodeMetadataStage>,
+}
+
+impl OpenCodeMetadataDiagnostic {
+    /// Creates a diagnostic pairing `error` with an optional finite `stage`.
+    pub const fn new(error: OpenCodeMetadataError, stage: Option<OpenCodeMetadataStage>) -> Self {
+        Self { error, stage }
+    }
+
+    /// Creates a diagnostic for `error` without a specific stage (`stage: None`).
+    pub const fn from_error(error: OpenCodeMetadataError) -> Self {
+        Self { error, stage: None }
+    }
+
+    /// Creates a diagnostic pairing `error` with `stage`.
+    pub const fn staged(error: OpenCodeMetadataError, stage: OpenCodeMetadataStage) -> Self {
+        Self {
+            error,
+            stage: Some(stage),
+        }
+    }
+
+    /// Creates an [`OpenCodeMetadataError::InvalidMetadata`] diagnostic qualified by `stage`.
+    pub const fn invalid_metadata(stage: OpenCodeMetadataStage) -> Self {
+        Self {
+            error: OpenCodeMetadataError::InvalidMetadata,
+            stage: Some(stage),
+        }
+    }
+
+    /// Returns the finite machine-readable error code.
+    ///
+    /// Preserves existing semantic error codes (`output_overflow`, `ownership_mismatch`,
+    /// `stale_session`, `missing_model`, `model_mismatch`, `missing_effort`, `effort_mismatch`,
+    /// `missing_completion`, `provider_error`), emits `"invalid_metadata:<stage>"` when
+    /// `error == InvalidMetadata` and `stage` is `Some`, and emits `"invalid_metadata"` for
+    /// legacy undifferentiated `InvalidMetadata` (`stage: None`).
+    pub fn as_str(&self) -> &'static str {
+        match (self.error, self.stage) {
+            (OpenCodeMetadataError::InvalidMetadata, Some(stage)) => stage.qualified_error_code(),
+            (error, _) => error.as_str(),
+        }
+    }
+
+    /// Parses a stored metadata error code into a structured [`OpenCodeMetadataDiagnostic`].
+    ///
+    /// - `"invalid_metadata"` decodes with `error: InvalidMetadata` and `stage: None`
+    ///   (preserving legacy reports with unknown/unavailable stage detail, never an invented cause).
+    /// - `"invalid_metadata:<stage>"` decodes only known finite [`OpenCodeMetadataStage`] literals.
+    /// - Semantic error codes decode with their corresponding [`OpenCodeMetadataError`] and `stage: None`.
+    /// - Any unrecognized or arbitrary string returns `None`.
+    pub fn from_error_code(raw: &str) -> Option<Self> {
+        if let Some(stage_raw) = raw.strip_prefix("invalid_metadata:") {
+            return OpenCodeMetadataStage::from_code(stage_raw).map(Self::invalid_metadata);
+        }
+        match raw {
+            "output_overflow" => Some(Self::from_error(OpenCodeMetadataError::OutputOverflow)),
+            "invalid_metadata" => Some(Self::from_error(OpenCodeMetadataError::InvalidMetadata)),
+            "ownership_mismatch" => {
+                Some(Self::from_error(OpenCodeMetadataError::OwnershipMismatch))
+            }
+            "stale_session" => Some(Self::from_error(OpenCodeMetadataError::StaleSession)),
+            "missing_model" => Some(Self::from_error(OpenCodeMetadataError::MissingModel)),
+            "model_mismatch" => Some(Self::from_error(OpenCodeMetadataError::ModelMismatch)),
+            "missing_effort" => Some(Self::from_error(OpenCodeMetadataError::MissingEffort)),
+            "effort_mismatch" => Some(Self::from_error(OpenCodeMetadataError::EffortMismatch)),
+            "missing_completion" => {
+                Some(Self::from_error(OpenCodeMetadataError::MissingCompletion))
+            }
+            "provider_error" => Some(Self::from_error(OpenCodeMetadataError::ProviderError)),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for OpenCodeMetadataDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for OpenCodeMetadataDiagnostic {}
+
+impl From<OpenCodeMetadataDiagnostic> for OpenCodeMetadataError {
+    fn from(diagnostic: OpenCodeMetadataDiagnostic) -> Self {
+        diagnostic.error
+    }
+}
+
 /// Validates synthetic OpenCode v2 metadata and returns compact allowlisted evidence.
+///
+/// Preserves the coarse [`OpenCodeMetadataError`] return signature for callers that do not
+/// inspect stage-level provenance. Call [`validate_opencode_metadata_with_diagnostic`] for
+/// stage-qualified [`OpenCodeMetadataDiagnostic`] results.
+pub fn validate_opencode_metadata(
+    owned: &OwnedOpenCodeSession,
+    info_response: &[u8],
+    sanitized_export: &[u8],
+    expected: &ResolvedModelTarget,
+) -> Result<OpenCodeMetadataEvidence, OpenCodeMetadataError> {
+    validate_opencode_metadata_with_diagnostic(owned, info_response, sanitized_export, expected)
+        .map_err(|diagnostic| diagnostic.error)
+}
+
+/// Validates synthetic OpenCode v2 metadata and returns compact allowlisted evidence or a
+/// finite, privacy-safe [`OpenCodeMetadataDiagnostic`].
 ///
 /// The inputs are the exact info transport (`{ "data": Session.Info }`) and the exact sanitized
 /// CLI transfer (`{ "info": Session.Info, "messages": [...] }`). Unknown/private fields are
@@ -130,38 +359,52 @@ impl std::error::Error for OpenCodeMetadataError {}
 ///
 /// Both session outcomes must be the exact JSON string `succeeded`. The real-info idle timestamp
 /// is read only from `info.time.idle` and must not precede any retained assistant completion.
-pub fn validate_opencode_metadata(
+pub fn validate_opencode_metadata_with_diagnostic(
     owned: &OwnedOpenCodeSession,
     info_response: &[u8],
     sanitized_export: &[u8],
     expected: &ResolvedModelTarget,
-) -> Result<OpenCodeMetadataEvidence, OpenCodeMetadataError> {
+) -> Result<OpenCodeMetadataEvidence, OpenCodeMetadataDiagnostic> {
     if info_response.len() > MAX_OPENCODE_INFO_BYTES {
-        return Err(OpenCodeMetadataError::OutputOverflow);
+        return Err(OpenCodeMetadataDiagnostic::from_error(
+            OpenCodeMetadataError::OutputOverflow,
+        ));
     }
     if sanitized_export.len() > MAX_OPENCODE_EXPORT_BYTES {
-        return Err(OpenCodeMetadataError::OutputOverflow);
+        return Err(OpenCodeMetadataDiagnostic::from_error(
+            OpenCodeMetadataError::OutputOverflow,
+        ));
     }
 
     let owned_workdir = validate_owned_session(owned)?;
 
-    let info_root = parse_object(info_response)?;
+    let info_root = parse_object(info_response, OpenCodeMetadataStage::InfoResponseJson)?;
     let info = info_root
         .get("data")
         .and_then(Value::as_object)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        .ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(
+                OpenCodeMetadataStage::InfoResponseEnvelope,
+            )
+        })?;
 
-    let export_root = parse_object(sanitized_export)?;
+    let export_root = parse_object(sanitized_export, OpenCodeMetadataStage::ExportJson)?;
     let export_info = export_root
         .get("info")
         .and_then(Value::as_object)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        .ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::ExportEnvelope)
+        })?;
     let messages = export_root
         .get("messages")
         .and_then(Value::as_array)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        .ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::ExportEnvelope)
+        })?;
     if messages.len() > MAX_OPENCODE_MESSAGES {
-        return Err(OpenCodeMetadataError::OutputOverflow);
+        return Err(OpenCodeMetadataDiagnostic::from_error(
+            OpenCodeMetadataError::OutputOverflow,
+        ));
     }
 
     validate_identity(info, export_info, owned)?;
@@ -170,14 +413,22 @@ pub fn validate_opencode_metadata(
     let info_created_ms = session_created_ms(info)?;
     let export_created_ms = session_created_ms(export_info)?;
     if info_created_ms != export_created_ms {
-        return Err(OpenCodeMetadataError::InvalidMetadata);
+        return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::Timestamps,
+        ));
     }
     if info_created_ms < owned.started_at_ms {
-        return Err(OpenCodeMetadataError::StaleSession);
+        return Err(OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::StaleSession,
+            OpenCodeMetadataStage::Timestamps,
+        ));
     }
 
     if !session_outcome_succeeded(info) || !session_outcome_succeeded(export_info) {
-        return Err(OpenCodeMetadataError::MissingCompletion);
+        return Err(OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataStage::TerminalCompletion,
+        ));
     }
 
     validate_message_envelopes(messages)?;
@@ -188,7 +439,9 @@ pub fn validate_opencode_metadata(
         .as_deref()
         .is_some_and(|effort| !is_safe_identifier(effort))
     {
-        return Err(OpenCodeMetadataError::InvalidMetadata);
+        return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
 
     let mut assistant_message_count = 0usize;
@@ -199,23 +452,28 @@ pub fn validate_opencode_metadata(
     let mut observed_effort: Option<String> = None;
 
     for message in messages {
-        let message = message
-            .as_object()
-            .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
-        let message_type = message
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        let message = message.as_object().ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::MessageEnvelope)
+        })?;
+        let message_type = message.get("type").and_then(Value::as_str).ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::MessageEnvelope)
+        })?;
 
         match message.get("sessionID") {
             None => {}
             Some(value) if value.is_null() => {}
             Some(value) => {
-                let supplied_session_id = value
-                    .as_str()
-                    .ok_or(OpenCodeMetadataError::OwnershipMismatch)?;
+                let supplied_session_id = value.as_str().ok_or_else(|| {
+                    OpenCodeMetadataDiagnostic::staged(
+                        OpenCodeMetadataError::OwnershipMismatch,
+                        OpenCodeMetadataStage::IdentityWorkdir,
+                    )
+                })?;
                 if supplied_session_id != owned.session_id {
-                    return Err(OpenCodeMetadataError::OwnershipMismatch);
+                    return Err(OpenCodeMetadataDiagnostic::staged(
+                        OpenCodeMetadataError::OwnershipMismatch,
+                        OpenCodeMetadataStage::IdentityWorkdir,
+                    ));
                 }
             }
         }
@@ -224,90 +482,156 @@ pub fn validate_opencode_metadata(
             continue;
         }
 
-        let message_id = message
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        let message_id = message.get("id").and_then(Value::as_str).ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::MessageEnvelope)
+        })?;
         if !is_safe_identifier(message_id) {
-            return Err(OpenCodeMetadataError::InvalidMetadata);
+            return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+                OpenCodeMetadataStage::MessageEnvelope,
+            ));
         }
 
         if message
             .get("error")
             .is_some_and(|error_value| !error_value.is_null())
         {
-            return Err(OpenCodeMetadataError::ProviderError);
+            return Err(OpenCodeMetadataDiagnostic::from_error(
+                OpenCodeMetadataError::ProviderError,
+            ));
         }
 
         let time = message
             .get("time")
             .and_then(Value::as_object)
-            .ok_or(OpenCodeMetadataError::MissingCompletion)?;
+            .ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingCompletion,
+                    OpenCodeMetadataStage::Timestamps,
+                )
+            })?;
         let created_ms = required_timestamp(
             time.get("created"),
-            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataDiagnostic::staged(
+                OpenCodeMetadataError::MissingCompletion,
+                OpenCodeMetadataStage::Timestamps,
+            ),
         )?;
         let completed_ms = required_timestamp(
             time.get("completed"),
-            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataDiagnostic::staged(
+                OpenCodeMetadataError::MissingCompletion,
+                OpenCodeMetadataStage::Timestamps,
+            ),
         )?;
         if completed_ms < created_ms {
-            return Err(OpenCodeMetadataError::MissingCompletion);
+            return Err(OpenCodeMetadataDiagnostic::staged(
+                OpenCodeMetadataError::MissingCompletion,
+                OpenCodeMetadataStage::Timestamps,
+            ));
         }
         if created_ms < info_created_ms {
-            return Err(OpenCodeMetadataError::StaleSession);
+            return Err(OpenCodeMetadataDiagnostic::staged(
+                OpenCodeMetadataError::StaleSession,
+                OpenCodeMetadataStage::Timestamps,
+            ));
         }
         max_assistant_completed_ms = max_assistant_completed_ms.max(completed_ms);
 
         let model = message
             .get("model")
             .and_then(Value::as_object)
-            .ok_or(OpenCodeMetadataError::MissingModel)?;
+            .ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingModel,
+                    OpenCodeMetadataStage::AssistantTarget,
+                )
+            })?;
         let provider_id = model
             .get("providerID")
-            .ok_or(OpenCodeMetadataError::MissingModel)?
+            .ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingModel,
+                    OpenCodeMetadataStage::AssistantTarget,
+                )
+            })?
             .as_str()
-            .ok_or(OpenCodeMetadataError::MissingModel)?;
+            .ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingModel,
+                    OpenCodeMetadataStage::AssistantTarget,
+                )
+            })?;
         let model_id = model
             .get("id")
-            .ok_or(OpenCodeMetadataError::MissingModel)?
+            .ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingModel,
+                    OpenCodeMetadataStage::AssistantTarget,
+                )
+            })?
             .as_str()
-            .ok_or(OpenCodeMetadataError::MissingModel)?;
+            .ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingModel,
+                    OpenCodeMetadataStage::AssistantTarget,
+                )
+            })?;
         let variant = match model.get("variant") {
             None => None,
             Some(value) if value.is_null() => None,
-            Some(value) => Some(
-                value
-                    .as_str()
-                    .ok_or(OpenCodeMetadataError::InvalidMetadata)?,
-            ),
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::AssistantTarget)
+            })?),
         };
 
         if !is_safe_identifier(provider_id) || !is_safe_model_identifier(model_id) {
-            return Err(OpenCodeMetadataError::InvalidMetadata);
+            return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+                OpenCodeMetadataStage::AssistantTarget,
+            ));
         }
         if variant.is_some_and(|value| !is_safe_identifier(value)) {
-            return Err(OpenCodeMetadataError::InvalidMetadata);
+            return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+                OpenCodeMetadataStage::AssistantTarget,
+            ));
         }
 
         if provider_id != expected_provider || model_id != expected_model {
-            return Err(OpenCodeMetadataError::ModelMismatch);
+            return Err(OpenCodeMetadataDiagnostic::staged(
+                OpenCodeMetadataError::ModelMismatch,
+                OpenCodeMetadataStage::AssistantTarget,
+            ));
         }
         match (expected.effort.as_deref(), variant) {
-            (Some(_), None) => return Err(OpenCodeMetadataError::MissingEffort),
+            (Some(_), None) => {
+                return Err(OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::MissingEffort,
+                    OpenCodeMetadataStage::AssistantTarget,
+                ));
+            }
             (Some(expected_effort), Some(observed_variant))
                 if expected_effort != observed_variant =>
             {
-                return Err(OpenCodeMetadataError::EffortMismatch);
+                return Err(OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::EffortMismatch,
+                    OpenCodeMetadataStage::AssistantTarget,
+                ));
             }
-            (None, Some(_)) => return Err(OpenCodeMetadataError::EffortMismatch),
+            (None, Some(_)) => {
+                return Err(OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::EffortMismatch,
+                    OpenCodeMetadataStage::AssistantTarget,
+                ));
+            }
             _ => {}
         }
 
         let model_string = format!("{provider_id}/{model_id}");
         if let Some(previous) = observed_model.as_ref() {
             if previous.as_str() != model_string.as_str() {
-                return Err(OpenCodeMetadataError::ModelMismatch);
+                return Err(OpenCodeMetadataDiagnostic::staged(
+                    OpenCodeMetadataError::ModelMismatch,
+                    OpenCodeMetadataStage::AssistantTarget,
+                ));
             }
         } else {
             observed_model = Some(model_string);
@@ -316,22 +640,46 @@ pub fn validate_opencode_metadata(
             observed_effort = variant.map(|value| value.to_string());
         }
 
-        let finish = message.get("finish").and_then(Value::as_str);
+        let finish = match message.get("finish") {
+            None => None,
+            Some(value) if value.is_null() => None,
+            Some(value) => Some(value.as_str().ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::invalid_metadata(
+                    OpenCodeMetadataStage::TerminalCompletion,
+                )
+            })?),
+        };
 
         assistant_message_count += 1;
         terminal_message_id = Some(message_id.to_string());
         terminal_finish = finish.map(|value| value.to_string());
     }
 
-    let terminal_message_id = terminal_message_id.ok_or(OpenCodeMetadataError::MissingModel)?;
-    let observed_model = observed_model.ok_or(OpenCodeMetadataError::MissingModel)?;
+    let terminal_message_id = terminal_message_id.ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingModel,
+            OpenCodeMetadataStage::TerminalCompletion,
+        )
+    })?;
+    let observed_model = observed_model.ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingModel,
+            OpenCodeMetadataStage::TerminalCompletion,
+        )
+    })?;
     if terminal_finish.as_deref() != Some("stop") {
-        return Err(OpenCodeMetadataError::MissingCompletion);
+        return Err(OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataStage::TerminalCompletion,
+        ));
     }
 
     let idle_ms = session_idle_ms(info)?;
     if idle_ms < info_created_ms || idle_ms < max_assistant_completed_ms {
-        return Err(OpenCodeMetadataError::MissingCompletion);
+        return Err(OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataStage::TerminalCompletion,
+        ));
     }
 
     Ok(OpenCodeMetadataEvidence {
@@ -345,25 +693,33 @@ pub fn validate_opencode_metadata(
     })
 }
 
-fn parse_object(bytes: &[u8]) -> Result<Map<String, Value>, OpenCodeMetadataError> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| OpenCodeMetadataError::InvalidMetadata)?;
+fn parse_object(
+    bytes: &[u8],
+    stage: OpenCodeMetadataStage,
+) -> Result<Map<String, Value>, OpenCodeMetadataDiagnostic> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| OpenCodeMetadataDiagnostic::invalid_metadata(stage))?;
     match value {
         Value::Object(map) => Ok(map),
-        _ => Err(OpenCodeMetadataError::InvalidMetadata),
+        _ => Err(OpenCodeMetadataDiagnostic::invalid_metadata(stage)),
     }
 }
 
-fn validate_owned_session(owned: &OwnedOpenCodeSession) -> Result<&str, OpenCodeMetadataError> {
+fn validate_owned_session(
+    owned: &OwnedOpenCodeSession,
+) -> Result<&str, OpenCodeMetadataDiagnostic> {
     if !is_safe_identifier(&owned.session_id) || !owned.canonical_workdir.is_absolute() {
-        return Err(OpenCodeMetadataError::InvalidMetadata);
+        return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
-    let workdir = owned
-        .canonical_workdir
-        .to_str()
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+    let workdir = owned.canonical_workdir.to_str().ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::CallerContract)
+    })?;
     if !is_clean_absolute_path(workdir) {
-        return Err(OpenCodeMetadataError::InvalidMetadata);
+        return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
     Ok(workdir)
 }
@@ -372,17 +728,21 @@ fn validate_identity(
     info: &Map<String, Value>,
     export_info: &Map<String, Value>,
     owned: &OwnedOpenCodeSession,
-) -> Result<(), OpenCodeMetadataError> {
-    let info_id = info
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+) -> Result<(), OpenCodeMetadataDiagnostic> {
+    let info_id = info.get("id").and_then(Value::as_str).ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::IdentityWorkdir)
+    })?;
     let export_id = export_info
         .get("id")
         .and_then(Value::as_str)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        .ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::IdentityWorkdir)
+        })?;
     if info_id != owned.session_id || export_id != owned.session_id {
-        return Err(OpenCodeMetadataError::OwnershipMismatch);
+        return Err(OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::OwnershipMismatch,
+            OpenCodeMetadataStage::IdentityWorkdir,
+        ));
     }
     Ok(())
 }
@@ -390,37 +750,48 @@ fn validate_identity(
 fn validate_real_workdir(
     info: &Map<String, Value>,
     owned_workdir: &str,
-) -> Result<(), OpenCodeMetadataError> {
+) -> Result<(), OpenCodeMetadataDiagnostic> {
     let location = info
         .get("location")
         .and_then(Value::as_object)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        .ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::IdentityWorkdir)
+        })?;
     let directory = location
         .get("directory")
         .and_then(Value::as_str)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        .ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::IdentityWorkdir)
+        })?;
     if !is_clean_absolute_path(directory) || directory != owned_workdir {
-        return Err(OpenCodeMetadataError::OwnershipMismatch);
+        return Err(OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::OwnershipMismatch,
+            OpenCodeMetadataStage::IdentityWorkdir,
+        ));
     }
     Ok(())
 }
 
-fn session_created_ms(info: &Map<String, Value>) -> Result<u64, OpenCodeMetadataError> {
-    let time = info
-        .get("time")
-        .and_then(Value::as_object)
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
-    required_timestamp(time.get("created"), OpenCodeMetadataError::InvalidMetadata)
+fn session_created_ms(info: &Map<String, Value>) -> Result<u64, OpenCodeMetadataDiagnostic> {
+    let time = info.get("time").and_then(Value::as_object).ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::Timestamps)
+    })?;
+    required_timestamp(
+        time.get("created"),
+        OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::Timestamps),
+    )
 }
 
 fn required_timestamp(
     value: Option<&Value>,
-    missing_error: OpenCodeMetadataError,
-) -> Result<u64, OpenCodeMetadataError> {
+    missing_error: OpenCodeMetadataDiagnostic,
+) -> Result<u64, OpenCodeMetadataDiagnostic> {
     match value {
         None => Err(missing_error),
         Some(value) if value.is_null() => Err(missing_error),
-        Some(value) => value.as_u64().ok_or(OpenCodeMetadataError::InvalidMetadata),
+        Some(value) => value.as_u64().ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::Timestamps)
+        }),
     }
 }
 
@@ -431,30 +802,39 @@ fn session_outcome_succeeded(info: &Map<String, Value>) -> bool {
 }
 
 // The contract gives the real info an idle timestamp; `time.idle` is that authoritative field.
-fn session_idle_ms(info: &Map<String, Value>) -> Result<u64, OpenCodeMetadataError> {
-    let time = info
-        .get("time")
-        .and_then(Value::as_object)
-        .ok_or(OpenCodeMetadataError::MissingCompletion)?;
-    required_timestamp(time.get("idle"), OpenCodeMetadataError::MissingCompletion)
+fn session_idle_ms(info: &Map<String, Value>) -> Result<u64, OpenCodeMetadataDiagnostic> {
+    let time = info.get("time").and_then(Value::as_object).ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataStage::TerminalCompletion,
+        )
+    })?;
+    required_timestamp(
+        time.get("idle"),
+        OpenCodeMetadataDiagnostic::staged(
+            OpenCodeMetadataError::MissingCompletion,
+            OpenCodeMetadataStage::TerminalCompletion,
+        ),
+    )
 }
 
-fn validate_message_envelopes(messages: &[Value]) -> Result<(), OpenCodeMetadataError> {
+fn validate_message_envelopes(messages: &[Value]) -> Result<(), OpenCodeMetadataDiagnostic> {
     let mut message_ids = BTreeSet::new();
     for message in messages {
-        let message = message
-            .as_object()
-            .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
-        message
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+        let message = message.as_object().ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::MessageEnvelope)
+        })?;
+        message.get("type").and_then(Value::as_str).ok_or_else(|| {
+            OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::MessageEnvelope)
+        })?;
         if let Some(id_value) = message.get("id") {
-            let message_id = id_value
-                .as_str()
-                .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+            let message_id = id_value.as_str().ok_or_else(|| {
+                OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::MessageEnvelope)
+            })?;
             if !message_ids.insert(message_id.to_string()) {
-                return Err(OpenCodeMetadataError::InvalidMetadata);
+                return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+                    OpenCodeMetadataStage::MessageEnvelope,
+                ));
             }
         }
     }
@@ -463,16 +843,19 @@ fn validate_message_envelopes(messages: &[Value]) -> Result<(), OpenCodeMetadata
 
 fn split_expected_target(
     expected: &ResolvedModelTarget,
-) -> Result<(&str, &str), OpenCodeMetadataError> {
+) -> Result<(&str, &str), OpenCodeMetadataDiagnostic> {
     if expected.base_model.len() > MAX_IDENTIFIER_LEN {
-        return Err(OpenCodeMetadataError::InvalidMetadata);
+        return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
-    let (provider_id, model_id) = expected
-        .base_model
-        .split_once('/')
-        .ok_or(OpenCodeMetadataError::InvalidMetadata)?;
+    let (provider_id, model_id) = expected.base_model.split_once('/').ok_or_else(|| {
+        OpenCodeMetadataDiagnostic::invalid_metadata(OpenCodeMetadataStage::CallerContract)
+    })?;
     if !is_safe_identifier(provider_id) || !is_safe_model_identifier(model_id) {
-        return Err(OpenCodeMetadataError::InvalidMetadata);
+        return Err(OpenCodeMetadataDiagnostic::invalid_metadata(
+            OpenCodeMetadataStage::CallerContract,
+        ));
     }
     Ok((provider_id, model_id))
 }
@@ -1363,5 +1746,284 @@ mod tests {
             run(&info, &export).unwrap_err(),
             OpenCodeMetadataError::MissingCompletion
         );
+    }
+
+    fn run_with_diagnostic(
+        info: &Value,
+        export: &Value,
+    ) -> Result<OpenCodeMetadataEvidence, OpenCodeMetadataDiagnostic> {
+        let info_bytes = serde_json::to_vec(info).expect("serialize info");
+        let export_bytes = serde_json::to_vec(export).expect("serialize export");
+        validate_opencode_metadata_with_diagnostic(
+            &owned(),
+            &info_bytes,
+            &export_bytes,
+            &expected(),
+        )
+    }
+
+    #[test]
+    fn diagnostic_stages_distinguish_malformed_categories_and_never_echo_sentinels() {
+        let sentinel = "PRIVATE_DIAGNOSTIC_SENTINEL_TOKEN_PATH_/tmp/secret_https://example.invalid";
+        let info_bytes = serde_json::to_vec(&info_document()).expect("info bytes");
+        let export_bytes = serde_json::to_vec(&export_document()).expect("export bytes");
+
+        // 1. Caller contract stage (unsafe session ID, relative workdir, malformed target/effort).
+        let mut bad_owned = owned();
+        bad_owned.session_id = format!("ses_{sentinel}");
+        let diag = validate_opencode_metadata_with_diagnostic(
+            &bad_owned,
+            &info_bytes,
+            &export_bytes,
+            &expected(),
+        )
+        .unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::CallerContract));
+        assert_eq!(diag.as_str(), "invalid_metadata:caller_contract");
+        assert!(!diag.to_string().contains("PRIVATE_"));
+        assert!(!format!("{diag:?}").contains("PRIVATE_"));
+
+        let mut bad_target = expected();
+        bad_target.effort = Some(format!("max {sentinel}"));
+        let diag = validate_opencode_metadata_with_diagnostic(
+            &owned(),
+            &info_bytes,
+            &export_bytes,
+            &bad_target,
+        )
+        .unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::CallerContract));
+        assert_eq!(diag.as_str(), "invalid_metadata:caller_contract");
+
+        // 2. Info response JSON stage (syntax error, non-object root, deep nesting).
+        for raw_info in [
+            format!("not-json-{sentinel}").into_bytes(),
+            format!("[\"{sentinel}\"]").into_bytes(),
+        ] {
+            let diag = validate_opencode_metadata_with_diagnostic(
+                &owned(),
+                &raw_info,
+                &export_bytes,
+                &expected(),
+            )
+            .unwrap_err();
+            assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+            assert_eq!(diag.stage, Some(OpenCodeMetadataStage::InfoResponseJson));
+            assert_eq!(diag.as_str(), "invalid_metadata:info_response_json");
+            assert!(!diag.to_string().contains("PRIVATE_"));
+            assert!(!format!("{diag:?}").contains("PRIVATE_"));
+        }
+
+        // 3. Info response envelope stage (missing or non-object `data`).
+        for bad_info_env in [json!({ "error": sentinel }), json!({ "data": [sentinel] })] {
+            let diag = run_with_diagnostic(&bad_info_env, &export_document()).unwrap_err();
+            assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+            assert_eq!(
+                diag.stage,
+                Some(OpenCodeMetadataStage::InfoResponseEnvelope)
+            );
+            assert_eq!(diag.as_str(), "invalid_metadata:info_response_envelope");
+            assert!(!diag.to_string().contains("PRIVATE_"));
+            assert!(!format!("{diag:?}").contains("PRIVATE_"));
+        }
+
+        // 4. Export JSON stage (syntax error, non-object root).
+        for raw_export in [
+            format!("not-json-{sentinel}").into_bytes(),
+            format!("[\"{sentinel}\"]").into_bytes(),
+        ] {
+            let diag = validate_opencode_metadata_with_diagnostic(
+                &owned(),
+                &info_bytes,
+                &raw_export,
+                &expected(),
+            )
+            .unwrap_err();
+            assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+            assert_eq!(diag.stage, Some(OpenCodeMetadataStage::ExportJson));
+            assert_eq!(diag.as_str(), "invalid_metadata:export_json");
+            assert!(!diag.to_string().contains("PRIVATE_"));
+            assert!(!format!("{diag:?}").contains("PRIVATE_"));
+        }
+
+        // 5. Export envelope stage (missing/non-object `info` or missing/non-array `messages`).
+        let mut no_export_info = export_document();
+        remove_key(&mut no_export_info, "info");
+        no_export_info["secret"] = json!(sentinel);
+        let diag = run_with_diagnostic(&info_document(), &no_export_info).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::ExportEnvelope));
+        assert_eq!(diag.as_str(), "invalid_metadata:export_envelope");
+
+        let mut bad_messages_env = export_document();
+        bad_messages_env["messages"] = json!({ "leak": sentinel });
+        let diag = run_with_diagnostic(&info_document(), &bad_messages_env).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::ExportEnvelope));
+        assert_eq!(diag.as_str(), "invalid_metadata:export_envelope");
+
+        // 6. Identity / workdir stage (missing/non-string `id` or `location.directory`).
+        let mut missing_info_id = info_document();
+        missing_info_id["data"]["id"] = json!({ "leak": sentinel });
+        let diag = run_with_diagnostic(&missing_info_id, &export_document()).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::IdentityWorkdir));
+        assert_eq!(diag.as_str(), "invalid_metadata:identity_workdir");
+
+        let mut missing_dir = info_document();
+        missing_dir["data"]["location"]["directory"] = json!(42);
+        let diag = run_with_diagnostic(&missing_dir, &export_document()).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::IdentityWorkdir));
+        assert_eq!(diag.as_str(), "invalid_metadata:identity_workdir");
+
+        // 7. Timestamps stage (missing/non-u64 created/idle/completed or mismatched created).
+        let mut mismatched_created = export_document();
+        mismatched_created["info"]["time"]["created"] = json!(2_001);
+        let diag = run_with_diagnostic(&info_document(), &mismatched_created).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::Timestamps));
+        assert_eq!(diag.as_str(), "invalid_metadata:timestamps");
+
+        let mut bad_idle_type = info_document();
+        bad_idle_type["data"]["time"]["idle"] = json!(sentinel);
+        let diag = run_with_diagnostic(&bad_idle_type, &export_document()).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::Timestamps));
+        assert_eq!(diag.as_str(), "invalid_metadata:timestamps");
+
+        let mut bad_asst_completed_type = export_document();
+        bad_asst_completed_type["messages"][0]["time"]["completed"] = json!(sentinel);
+        let diag = run_with_diagnostic(&info_document(), &bad_asst_completed_type).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::Timestamps));
+        assert_eq!(diag.as_str(), "invalid_metadata:timestamps");
+
+        // 8. Message envelope stage (non-object entry, missing type, unsafe or duplicate ID).
+        let mut dup_id = export_document();
+        dup_id["messages"][1]["id"] = dup_id["messages"][0]["id"].clone();
+        let diag = run_with_diagnostic(&info_document(), &dup_id).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::MessageEnvelope));
+        assert_eq!(diag.as_str(), "invalid_metadata:message_envelope");
+
+        let mut unsafe_asst_id = export_document();
+        unsafe_asst_id["messages"][0]["id"] = json!(format!("msg/{sentinel}"));
+        let diag = run_with_diagnostic(&info_document(), &unsafe_asst_id).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::MessageEnvelope));
+        assert_eq!(diag.as_str(), "invalid_metadata:message_envelope");
+
+        // 9. Assistant target stage (non-string variant or unsafe provider/model/variant identifier).
+        let mut bad_variant_type = export_document();
+        bad_variant_type["messages"][0]["model"]["variant"] = json!({ "secret": sentinel });
+        let diag = run_with_diagnostic(&info_document(), &bad_variant_type).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::AssistantTarget));
+        assert_eq!(diag.as_str(), "invalid_metadata:assistant_target");
+
+        let mut unsafe_model_id = export_document();
+        unsafe_model_id["messages"][0]["model"]["id"] = json!(format!("deepseek {sentinel}"));
+        let diag = run_with_diagnostic(&info_document(), &unsafe_model_id).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::AssistantTarget));
+        assert_eq!(diag.as_str(), "invalid_metadata:assistant_target");
+        assert!(!diag.to_string().contains("PRIVATE_"));
+        assert!(!format!("{diag:?}").contains("PRIVATE_"));
+
+        // 10. Terminal completion stage (malformed non-string assistant `finish`).
+        let mut bad_finish_type = export_document();
+        bad_finish_type["messages"][1]["finish"] = json!({ "reason": sentinel });
+        let diag = run_with_diagnostic(&info_document(), &bad_finish_type).unwrap_err();
+        assert_eq!(diag.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::TerminalCompletion));
+        assert_eq!(diag.as_str(), "invalid_metadata:terminal_completion");
+        assert!(!diag.to_string().contains("PRIVATE_"));
+        assert!(!format!("{diag:?}").contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn legacy_invalid_metadata_and_semantic_codes_round_trip_without_inventing_stage() {
+        let legacy = OpenCodeMetadataDiagnostic::from_error_code("invalid_metadata")
+            .expect("legacy invalid_metadata must remain readable");
+        assert_eq!(legacy.error, OpenCodeMetadataError::InvalidMetadata);
+        assert_eq!(
+            legacy.stage, None,
+            "legacy invalid_metadata must not invent a stage cause"
+        );
+        assert_eq!(legacy.as_str(), "invalid_metadata");
+
+        let all_stages = [
+            (OpenCodeMetadataStage::CallerContract, "caller_contract"),
+            (
+                OpenCodeMetadataStage::CreateResponseJson,
+                "create_response_json",
+            ),
+            (
+                OpenCodeMetadataStage::CreateResponseEnvelope,
+                "create_response_envelope",
+            ),
+            (
+                OpenCodeMetadataStage::InfoResponseJson,
+                "info_response_json",
+            ),
+            (
+                OpenCodeMetadataStage::InfoResponseEnvelope,
+                "info_response_envelope",
+            ),
+            (OpenCodeMetadataStage::ExportJson, "export_json"),
+            (OpenCodeMetadataStage::ExportEnvelope, "export_envelope"),
+            (OpenCodeMetadataStage::IdentityWorkdir, "identity_workdir"),
+            (OpenCodeMetadataStage::Timestamps, "timestamps"),
+            (OpenCodeMetadataStage::MessageEnvelope, "message_envelope"),
+            (OpenCodeMetadataStage::AssistantTarget, "assistant_target"),
+            (
+                OpenCodeMetadataStage::TerminalCompletion,
+                "terminal_completion",
+            ),
+        ];
+        for (stage, stage_str) in all_stages {
+            assert_eq!(stage.as_str(), stage_str);
+            let expected_qualified = format!("invalid_metadata:{stage_str}");
+            assert_eq!(stage.qualified_error_code(), expected_qualified);
+            let diag = OpenCodeMetadataDiagnostic::invalid_metadata(stage);
+            assert_eq!(diag.as_str(), expected_qualified);
+            let parsed = OpenCodeMetadataDiagnostic::from_error_code(diag.as_str())
+                .expect("parse qualified stage code");
+            assert_eq!(parsed, diag);
+        }
+
+        // Semantic non-InvalidMetadata errors preserve their exact coarse wire code in `as_str()`.
+        let mut wrong_owner = info_document();
+        wrong_owner["data"]["id"] = json!("ses_other");
+        let owner_diag = run_with_diagnostic(&wrong_owner, &export_document()).unwrap_err();
+        assert_eq!(owner_diag.error, OpenCodeMetadataError::OwnershipMismatch);
+        assert_eq!(
+            owner_diag.stage,
+            Some(OpenCodeMetadataStage::IdentityWorkdir)
+        );
+        assert_eq!(owner_diag.as_str(), "ownership_mismatch");
+
+        let mut incomplete = export_document();
+        incomplete["messages"][1]["finish"] = json!("tool-calls");
+        let incomplete_diag = run_with_diagnostic(&info_document(), &incomplete).unwrap_err();
+        assert_eq!(
+            incomplete_diag.error,
+            OpenCodeMetadataError::MissingCompletion
+        );
+        assert_eq!(
+            incomplete_diag.stage,
+            Some(OpenCodeMetadataStage::TerminalCompletion)
+        );
+        assert_eq!(incomplete_diag.as_str(), "missing_completion");
+
+        // Arbitrary or untrusted strings are rejected by `from_error_code`.
+        assert!(
+            OpenCodeMetadataDiagnostic::from_error_code("invalid_metadata:unknown_stage").is_none()
+        );
+        assert!(OpenCodeMetadataDiagnostic::from_error_code("invalid_metadata:").is_none());
+        assert!(OpenCodeMetadataDiagnostic::from_error_code("arbitrary_secret").is_none());
     }
 }

@@ -23,7 +23,8 @@ pub use error::RegistryError;
 pub use store::{resolve_choice, validate_registry_identifier, RegistryStore};
 pub use types::{
     DecisionAdvisor, DecisionAdvisorMode, Difficulty, ModelChoice, ModelDefinition, RegistryChange,
-    RegistrySnapshot, RoleAssignment, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
+    RegistrySnapshot, RoleAssignment, ScopedModelDependency, ScopedProfileDependencySpec,
+    ScopedToolDependency, ToolAdapter, ToolDefinition, WorkflowProfile, WorkflowRole,
     MAX_ASSIGNMENTS_PER_PROFILE, MAX_EFFORTS_PER_MODEL, MAX_EFFORT_LEN, MAX_EXECUTABLE_PATH_LEN,
     MAX_ID_LEN, MAX_JS_SAFE_INTEGER, MAX_LABEL_LEN, MAX_MODELS, MAX_MODEL_ARG_LEN, MAX_PROFILES,
     MAX_REGISTRY_FILE_BYTES, MAX_TOOLS, REGISTRY_FILE_NAME, REGISTRY_LOCK_FILE_NAME,

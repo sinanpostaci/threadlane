@@ -23,7 +23,7 @@ Linux release. Historical pilot reports remain evidence for their exact scope.
 | Order | Package | Acceptance |
 | --- | --- | --- |
 | 1 | Historical status reliability | Publishing revision 2 does not break read-only inspection of completed revision 1. Historical integrity stays verified without making the old revision executable. Tampering and wrong-scope reads remain rejected. |
-| 2 | Settled-block notifications | Failed checks and correction waits produce a durable, deduplicated attention notice. Unknown sends are reconciled rather than replayed. Completion still requires one accepted Closure. |
+| 2 | Settled-block notifications | Failed workers, failed checks and correction waits produce a durable, deduplicated attention notice without waiting on a cached `Running` sibling; terminal sibling evidence is reconciled under the failure fence so the owner settles cleanly without promoting fenced work. Unknown sends are reconciled rather than replayed. Completion still requires one accepted Closure. |
 | Parallel with 1 and 2 | Complete normal validation | Every frontend test file is discovered, failures propagate, and zero discovered tests fail. Standalone desktop Rust tests and Clippy have explicit validation commands. |
 | 3 | Persistence and interruption safety | Directory-sync failures are not silently reported as success. Post-rename uncertainty preserves visible state and stops effectful advancement. Restart reuses proven receipts and never blindly repeats provider calls. |
 | 4 | Installed workflow acceptance | The exact installed package and approved profile complete a small real job, including parallel roots, a dependent task, verification, review, integration and one Closure. Results return to the original chat. |
