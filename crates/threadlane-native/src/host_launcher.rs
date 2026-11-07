@@ -1519,6 +1519,21 @@ where
     }
 }
 
+/// Test-only access to the production startup-deadline helper so focused tests can bound an
+/// already-entered authenticated probe without duplicating timeout semantics.
+#[cfg(test)]
+pub(crate) async fn run_within_startup_deadline_for_test<T, Fut>(
+    startup_deadline: Instant,
+    approval_id: &str,
+    last_observed_phase: Option<HostPhase>,
+    fut: Fut,
+) -> Result<T, HostError>
+where
+    Fut: std::future::Future<Output = Result<T, HostError>>,
+{
+    run_within_startup_deadline(startup_deadline, approval_id, last_observed_phase, fut).await
+}
+
 async fn run_enrollment_recheck_within_deadline<F>(
     startup_deadline: Instant,
     trusted_binding_id: &str,

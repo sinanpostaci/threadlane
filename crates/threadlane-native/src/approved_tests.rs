@@ -22,8 +22,8 @@ use threadlane_core::{
 use threadlane_host::{
     ensure_private_dir, read_host_launch_intent_optional, write_host_launch_intent,
     write_host_manifest, ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, HostCli,
-    HostCommand, HostLaunchIntentLock, HostLaunchIntentStatus, HostNotificationSummary, HostPhase,
-    HostSessionLock, HostSessionManifest, HostSessionSummary, TaskExecutionStatus,
+    HostCommand, HostError, HostLaunchIntentLock, HostLaunchIntentStatus, HostNotificationSummary,
+    HostPhase, HostSessionLock, HostSessionManifest, HostSessionSummary, TaskExecutionStatus,
     TaskStateSnapshot, APPROVED_EVENT_BATCH_MAX_BYTES, APPROVED_EVENT_BATCH_MAX_EVENTS,
     HOST_MANIFEST_FILENAME, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
@@ -4567,6 +4567,45 @@ async fn codex_first_delayed_launcher_timeout_durable_intent_and_cross_coordinat
 
 #[tokio::test]
 async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_deadline() {
+    struct HangingListener {
+        addr: std::net::SocketAddr,
+        accepted: Arc<AtomicUsize>,
+        accepted_rx: tokio::sync::watch::Receiver<usize>,
+        accept_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl HangingListener {
+        async fn shutdown(self) {
+            self.accept_task.abort();
+            let _ = self.accept_task.await;
+        }
+    }
+
+    fn spawn_hanging_listener() -> HangingListener {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind hanging listener");
+        let addr = listener.local_addr().expect("local_addr");
+        listener.set_nonblocking(true).expect("set_nonblocking");
+        let tokio_listener =
+            tokio::net::TcpListener::from_std(listener).expect("tokio TcpListener");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_bg = Arc::clone(&accepted);
+        let (accepted_tx, accepted_rx) = tokio::sync::watch::channel(0usize);
+        let accept_task = tokio::spawn(async move {
+            let mut held_sockets = Vec::new();
+            while let Ok((socket, _)) = tokio_listener.accept().await {
+                let count = accepted_bg.fetch_add(1, Ordering::SeqCst) + 1;
+                let _ = accepted_tx.send(count);
+                held_sockets.push(socket);
+            }
+        });
+        HangingListener {
+            addr,
+            accepted,
+            accepted_rx,
+            accept_task,
+        }
+    }
+
     let fixture = setup_approved_mcp_fixture().await;
 
     let (rev, digest) = create_published_plan(
@@ -4592,24 +4631,7 @@ async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_dead
 
     // Bind a local TCP listener that accepts connections and holds them open without sending HTTP
     // bytes, simulating a slow/unresponsive authenticated supervisor endpoint on a Ready manifest.
-    let hanging_listener =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("bind hanging listener");
-    let hanging_addr = hanging_listener.local_addr().expect("local_addr");
-    hanging_listener
-        .set_nonblocking(true)
-        .expect("set_nonblocking");
-    let tokio_listener =
-        tokio::net::TcpListener::from_std(hanging_listener).expect("tokio TcpListener");
-    let accepted_connections = Arc::new(AtomicUsize::new(0));
-    let accepted_connections_bg = Arc::clone(&accepted_connections);
-    let accept_task = tokio::spawn(async move {
-        let mut held_sockets = Vec::new();
-        while let Ok((socket, _)) = tokio_listener.accept().await {
-            accepted_connections_bg.fetch_add(1, Ordering::SeqCst);
-            held_sockets.push(socket);
-            tokio::time::sleep(Duration::from_secs(10)).await;
-        }
-    });
+    let listener_a = spawn_hanging_listener();
 
     let session_dir = ensure_private_dir(&fixture.sessions_dir.join(&approval.approval_id))
         .expect("create session dir");
@@ -4617,20 +4639,23 @@ async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_dead
         ensure_private_dir(&session_dir.join(RUNTIME_STATE_SUBDIR)).expect("create runtime-state");
     ensure_private_dir(&session_dir.join(WORK_AREA_SUBDIR)).expect("create work-area");
     let descriptor_path = runtime_state_dir.join("supervisor.json");
-    let descriptor_json = json!({
-        "version": 1,
-        "host": "127.0.0.1",
-        "port": hanging_addr.port(),
-        "pid": std::process::id(),
-        "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-    });
-    fs::write(
-        &descriptor_path,
-        serde_json::to_vec_pretty(&descriptor_json).unwrap(),
-    )
-    .expect("write supervisor.json");
-    fs::set_permissions(&descriptor_path, fs::Permissions::from_mode(0o600))
-        .expect("chmod 0600 supervisor.json");
+    let write_descriptor = |port: u16| {
+        let descriptor_json = json!({
+            "version": 1,
+            "host": "127.0.0.1",
+            "port": port,
+            "pid": std::process::id(),
+            "token": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        });
+        fs::write(
+            &descriptor_path,
+            serde_json::to_vec_pretty(&descriptor_json).unwrap(),
+        )
+        .expect("write supervisor.json");
+        fs::set_permissions(&descriptor_path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 0600 supervisor.json");
+    };
+    write_descriptor(listener_a.addr.port());
 
     let ready_manifest = HostSessionManifest::from_approval_record(
         &record,
@@ -4653,9 +4678,10 @@ async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_dead
     let spy_pid = fixture.root.join("spy-slow-pid.txt");
     write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
 
+    let startup_timeout = Duration::from_millis(250);
     let policy = ApprovedHostLauncherPolicy::new(&spy_exe)
         .expect("valid policy")
-        .with_startup_timeout(Duration::from_millis(250))
+        .with_startup_timeout(startup_timeout)
         .expect("250ms startup timeout");
     let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
         .expect("create mcp")
@@ -4664,6 +4690,9 @@ async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_dead
         .expect("attach launcher policy");
     enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
 
+    // Phase 1: End-to-end MCP call. Under load, blocking preflight may consume the whole 250ms
+    // budget before any authenticated socket is attempted, so acceptance is not an invariant.
+    // The timeout must still fire near the outer budget and must never spawn a host process.
     let started = Instant::now();
     let probe_err = mcp
         .invoke_tool_json(
@@ -4677,14 +4706,15 @@ async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_dead
         .await
         .expect_err("hanging authenticated probe must time out at outer startup deadline");
     let elapsed = started.elapsed();
+    listener_a.shutdown().await;
 
     assert_eq!(
         probe_err.structured_content.unwrap()["error"]["code"],
         "host_not_ready"
     );
     assert!(
-        accepted_connections.load(Ordering::SeqCst) >= 1,
-        "authenticated readiness probe must have connected to the hanging supervisor listener"
+        elapsed >= Duration::from_millis(200),
+        "outer startup timeout must expire near the 250ms budget even when preflight is slow (elapsed: {elapsed:?})"
     );
     assert!(
         elapsed < Duration::from_millis(1500),
@@ -4696,7 +4726,214 @@ async fn codex_first_slow_authenticated_probe_enforces_strict_outer_startup_dead
         "AttachReady timeout must not spawn a host process"
     );
 
-    accept_task.abort();
+    // Phase 2: Prepare a fresh hanging endpoint and start the real authenticated client probe
+    // before measurement. Once a socket is accepted, the same production deadline helper must
+    // cut the in-flight probe off at its 250ms boundary.
+    let listener_b = spawn_hanging_listener();
+    write_descriptor(listener_b.addr.port());
+
+    let probe_client = threadlane_host::ApprovedHostClient::new(
+        Arc::clone(&fixture.authority),
+        &fixture.sessions_dir,
+        &fixture.binding_a,
+        THREAD_UUID_A,
+    )
+    .expect("probe client");
+    let probe_summary = probe_client
+        .session_summary(&approval.approval_id)
+        .expect("cached Ready summary for authenticated probe");
+    assert_eq!(probe_summary.phase, HostPhase::Ready);
+    assert!(probe_summary.gates.supervisor_authenticated_ready);
+    let probe_sessions = fixture.sessions_dir.clone();
+    let probe_record = record.clone();
+    let probe_binding = fixture.binding_a.clone();
+    let accepted_before_probe = listener_b.accepted.load(Ordering::SeqCst);
+    let mut accepted_watch = listener_b.accepted_rx.clone();
+    let mut probe_task = tokio::spawn(async move {
+        crate::host_launcher::verify_live_authenticated_ready_summary(
+            &probe_client,
+            probe_summary,
+            &probe_sessions,
+            &probe_record,
+            &probe_binding,
+            THREAD_UUID_A,
+        )
+        .await
+    });
+
+    let handshake = tokio::time::timeout(Duration::from_secs(5), async move {
+        loop {
+            let accepted_count = *accepted_watch.borrow();
+            if accepted_count > accepted_before_probe {
+                return true;
+            }
+            if accepted_watch.changed().await.is_err() {
+                return false;
+            }
+        }
+    })
+    .await;
+    let handshake_ok = matches!(handshake, Ok(true));
+
+    let mut probe_elapsed = Duration::ZERO;
+    let probe_res = if handshake_ok {
+        let probe_started = Instant::now();
+        let res = crate::host_launcher::run_within_startup_deadline_for_test(
+            probe_started + startup_timeout,
+            &approval.approval_id,
+            Some(HostPhase::Ready),
+            async {
+                match (&mut probe_task).await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(err)) => Err(err),
+                    Err(join_err) => Err(HostError::Io {
+                        operation: "join slow authenticated probe".to_string(),
+                        reason: join_err.to_string(),
+                    }),
+                }
+            },
+        )
+        .await;
+        probe_elapsed = probe_started.elapsed();
+        Some(res)
+    } else {
+        None
+    };
+
+    probe_task.abort();
+    let _ = probe_task.await;
+    let accepted_after_probe = listener_b.accepted.load(Ordering::SeqCst);
+    listener_b.shutdown().await;
+
+    assert!(
+        handshake_ok,
+        "authenticated readiness probe must have connected to the hanging supervisor listener"
+    );
+    let probe_res = probe_res.expect("authenticated probe must be measured after the handshake");
+    let probe_err = probe_res
+        .expect_err("entered hanging authenticated probe must be cut off by the outer deadline");
+    assert_eq!(probe_err.code(), "host_not_ready");
+    assert!(
+        probe_elapsed >= Duration::from_millis(200),
+        "entered authenticated probe must be cut off near the 250ms startup deadline (elapsed: {probe_elapsed:?})"
+    );
+    assert!(
+        probe_elapsed < Duration::from_millis(1500),
+        "entered authenticated probe must be bounded by the 250ms startup deadline (elapsed: {probe_elapsed:?})"
+    );
+    assert!(
+        accepted_after_probe > accepted_before_probe,
+        "authenticated readiness probe must have connected to the hanging supervisor listener"
+    );
+    assert_eq!(
+        read_invocation_count(&spy_count),
+        0,
+        "deadline cutoff of an entered authenticated probe must not spawn a host process"
+    );
+}
+
+#[test]
+fn codex_first_outer_startup_deadline_bounds_blocked_preflight_and_never_spawns() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .expect("build current-thread runtime with one blocking thread");
+    runtime.block_on(async {
+        let fixture = setup_approved_mcp_fixture().await;
+
+        let (rev, digest) = create_published_plan(
+            &fixture,
+            "plan-blocked-preflight",
+            &fixture.binding_a,
+            default_plan_tasks("Blocked preflight deadline test"),
+        );
+        let approval = approve_published_plan(
+            &fixture,
+            "plan-blocked-preflight",
+            rev,
+            &digest,
+            &fixture.binding_a,
+            THREAD_UUID_A,
+            vec!["task-root-agy".to_string()],
+            1_700_000_900_000,
+        );
+
+        let spy_exe = fixture.root.join("bin/spy-blocked-preflight");
+        let spy_count = fixture.root.join("spy-blocked-preflight-count.txt");
+        let spy_argv = fixture.root.join("spy-blocked-preflight-argv.txt");
+        let spy_pid = fixture.root.join("spy-blocked-preflight-pid.txt");
+        write_spy_host_script(&spy_exe, &spy_count, &spy_argv, &spy_pid, 0, None);
+
+        let policy = ApprovedHostLauncherPolicy::new(&spy_exe)
+            .expect("valid policy")
+            .with_startup_timeout(Duration::from_millis(250))
+            .expect("250ms startup timeout");
+        let mcp = PairedMcpServer::new(&fixture.state_dir, fixture.pairing_store.clone())
+            .expect("create mcp")
+            .with_host_stores(Arc::clone(&fixture.authority), &fixture.sessions_dir)
+            .with_host_launcher_policy(policy)
+            .expect("attach launcher policy");
+        enroll_server(&fixture, &mcp, &fixture.binding_a, THREAD_UUID_A).await;
+
+        // Occupy the runtime's only blocking thread after enrollment so the outer 250ms
+        // deadline expires during preflight before any host launch or authenticated socket.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        struct BlockerRelease(std::sync::mpsc::Sender<()>);
+        impl Drop for BlockerRelease {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let release_guard = BlockerRelease(release_tx);
+        let blocker = tokio::task::spawn_blocking(move || {
+            let _ = ready_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("blocked preflight must become ready")
+            .expect("blocked preflight ready signal");
+
+        let started = Instant::now();
+        let err = mcp
+            .invoke_tool_json(
+                "start_approved_task",
+                json!({
+                    "approval_id": approval.approval_id,
+                    "task_id": "task-root-agy"
+                }),
+                None,
+            )
+            .await
+            .expect_err("blocked preflight must time out at the outer startup deadline");
+        let elapsed = started.elapsed();
+
+        drop(release_guard);
+        tokio::time::timeout(Duration::from_secs(1), blocker)
+            .await
+            .expect("blocking preflight must be released")
+            .expect("blocking preflight task must not panic");
+
+        assert_eq!(
+            err.structured_content.unwrap()["error"]["code"],
+            "host_not_ready"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "outer startup deadline must expire near its 250ms budget while preflight is blocked (elapsed: {elapsed:?})"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "blocked preflight must remain bounded by the 250ms startup deadline (elapsed: {elapsed:?})"
+        );
+        assert_eq!(
+            read_invocation_count(&spy_count),
+            0,
+            "blocked preflight timeout must not spawn a host process"
+        );
+    });
 }
 
 #[tokio::test]
