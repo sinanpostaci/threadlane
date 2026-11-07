@@ -1157,3 +1157,212 @@ exit 1
         );
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+// Keep raw FD operations confined to the synthetic abrupt-exit child.
+#[allow(unsafe_code)]
+fn abrupt_nonblocking_export_integration_child_entrypoint() {
+    let Some(payload_path) = std::env::var_os("THREADLANE_ITEST_ABRUPT_PAYLOAD_PATH") else {
+        return;
+    };
+    let result_path = std::env::var_os("THREADLANE_ITEST_ABRUPT_RESULT_PATH")
+        .expect("THREADLANE_ITEST_ABRUPT_RESULT_PATH must be set");
+    let payload = fs::read(&payload_path).expect("read abrupt integration payload");
+
+    // SAFETY: fd 3 was duplicated from child stdout by the wrapper script; restore to fd 1,
+    // query pre-spawn pipe capacity, set non-blocking mode, perform a single write, and exit.
+    unsafe {
+        if libc::dup2(3, libc::STDOUT_FILENO) < 0 {
+            libc::_exit(91);
+        }
+        let _ = libc::close(3);
+
+        let pipe_sz = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETPIPE_SZ);
+        let flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
+        if flags < 0
+            || libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+        {
+            libc::_exit(92);
+        }
+
+        let write_rc = libc::write(libc::STDOUT_FILENO, payload.as_ptr().cast(), payload.len());
+        let _ = fs::write(
+            &result_path,
+            format!("write_rc={write_rc} pipe_sz={pipe_sz}\n"),
+        );
+        libc::_exit(0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn owned_opencode_run_propagates_large_abrupt_nonblocking_export_evidence_and_rejects_truncation(
+) {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (repo_dir, work_area, workdir) = setup_test_env(temp.path());
+    let log_path = temp.path().join("invocations-large-export.log");
+    let payload_path = temp.path().join("large-export-payload.json");
+    let result_path = temp.path().join("large-export-result.txt");
+    let base_ts = current_epoch_ms().saturating_add(15_000);
+    let workdir_str = workdir.to_str().expect("utf8 workdir");
+    let test_bin = std::env::current_exe().expect("current test binary");
+    let test_bin_str = test_bin.to_str().expect("utf8 test binary");
+    let sentinel = "RAW_LARGE_EXPORT_SENTINEL_DO_NOT_LEAK_888";
+    let target_export_len: usize = 131_097;
+
+    let prefix = format!(
+        r#"{{"info":{{"id":"ses_owned_large","title":"{sentinel}_TITLE","location":{{"directory":"{workdir_str}"}},"outcome":"succeeded","time":{{"created":{base_ts},"updated":{updated},"idle":{idle}}}}},"messages":[{{"id":"msg_user_1","sessionID":"ses_owned_large","type":"user","time":{{"created":{user_ts}}},"parts":[{{"type":"text","text":"{sentinel}_PROMPT:"#,
+        updated = base_ts + 20,
+        idle = base_ts + 30,
+        user_ts = base_ts + 5,
+    );
+    let suffix = format!(
+        r#""}}]}},{{"id":"msg_ast_large_1","sessionID":"ses_owned_large","type":"assistant","model":{{"providerID":"opencode-go","id":"deepseek-v4.1-flash","variant":"max"}},"finish":"stop","time":{{"created":{ast_created},"completed":{ast_completed}}},"parts":[{{"type":"text","text":"{sentinel}_BODY"}}]}} ]}}"#,
+        ast_created = base_ts + 10,
+        ast_completed = base_ts + 20,
+    );
+    let pad_len = target_export_len - prefix.len() - suffix.len();
+    let full_export_json = format!("{prefix}{}{suffix}", "p".repeat(pad_len));
+    assert_eq!(full_export_json.len(), target_export_len);
+    fs::write(&payload_path, full_export_json.as_bytes()).expect("write full_export_json");
+
+    let script_body = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+LOG="{log}"
+WORKDIR="{workdir}"
+BASE_TS={base_ts}
+
+if [[ "${{1:-}}" == "api" && "${{2:-}}" == "--standalone" && "${{3:-}}" == "session.create" ]]; then
+  echo "create" >> "$LOG"
+  printf '{{"data":{{"id":"ses_owned_large","location":{{"directory":"%s"}},"time":{{"created":%s}}}}}}\n' "$WORKDIR" "$BASE_TS"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "--standalone" && "${{2:-}}" == "run" ]]; then
+  shift
+  SID=""
+  while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--session" ]]; then
+      SID="$2"
+      shift 2
+    else
+      shift
+    fi
+  done
+  echo "run:$SID" >> "$LOG"
+  printf '{{"type":"step_start","sessionID":"%s","part":{{"type":"step-start"}}}}\n' "$SID"
+  printf '{{"type":"text","sessionID":"%s","part":{{"type":"text","text":"completed task"}}}}\n' "$SID"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "api" && "${{2:-}}" == "--standalone" && "${{3:-}}" == "session.get" ]]; then
+  PARAM="${{5:-}}"
+  SID="${{PARAM#sessionID=}}"
+  echo "get:$SID" >> "$LOG"
+  printf '{{"data":{{"id":"%s","location":{{"directory":"%s"}},"outcome":"succeeded","time":{{"created":%s,"updated":%s,"idle":%s}}}}}}\n' \
+    "$SID" "$WORKDIR" "$BASE_TS" "$((BASE_TS + 20))" "$((BASE_TS + 30))"
+  exit 0
+fi
+
+if [[ "${{1:-}}" == "session" && "${{2:-}}" == "export" ]]; then
+  SID="${{5:-}}"
+  echo "export:$SID" >> "$LOG"
+  exec 3>&1 1>/dev/null 2>/dev/null
+  export THREADLANE_ITEST_ABRUPT_PAYLOAD_PATH="{payload}"
+  export THREADLANE_ITEST_ABRUPT_RESULT_PATH="{result}"
+  exec "{test_bin}" abrupt_nonblocking_export_integration_child_entrypoint --nocapture
+fi
+
+echo "unexpected:$*" >> "$LOG"
+exit 2
+"#,
+        log = log_path.display(),
+        workdir = workdir_str,
+        base_ts = base_ts,
+        payload = payload_path.display(),
+        result = result_path.display(),
+        test_bin = test_bin_str,
+    );
+
+    let executable = write_executable_script(temp.path(), "fake-opencode-large", &script_body);
+    let spec = make_opencode_spec(executable, repo_dir, work_area, None);
+
+    // 1. Complete 131_097-byte abrupt nonblocking export succeeds and supplements worker report.
+    let report = run_worker(&spec, &workdir).await.expect("run_worker");
+    assert_eq!(report.status, WorkerRunStatus::Succeeded);
+    assert_eq!(
+        report.allocated_session_id.as_deref(),
+        Some("ses_owned_large")
+    );
+    assert!(report.has_complete_natural_completion_evidence());
+    assert!(report.has_satisfied_model_evidence());
+    assert!(report.has_satisfied_effort_evidence());
+    assert!(report.has_satisfied_session_evidence());
+    assert!(report.has_satisfied_result_evidence());
+    assert_eq!(
+        report.effective_observed_model(),
+        Some("opencode-go/deepseek-v4.1-flash")
+    );
+    assert_eq!(report.effective_observed_effort(), Some("max"));
+    assert!(report.opencode_metadata_error.is_none());
+
+    let meta = report
+        .opencode_metadata
+        .as_ref()
+        .expect("opencode_metadata present");
+    assert_eq!(meta.session_id, "ses_owned_large");
+    assert_eq!(meta.observed_model, "opencode-go/deepseek-v4.1-flash");
+    assert_eq!(meta.observed_effort.as_deref(), Some("max"));
+    assert_eq!(meta.assistant_message_count, 1);
+    assert_eq!(meta.terminal_message_id, "msg_ast_large_1");
+
+    let result_text = fs::read_to_string(&result_path).expect("read abrupt child result");
+    assert!(
+        result_text.contains("write_rc=131097 "),
+        "expected single nonblocking write of 131097 bytes, got `{result_text}`"
+    );
+
+    let serialized = serde_json::to_string(&report).expect("serialize report");
+    assert!(!serialized.contains(sentinel));
+    assert!(!serialized.contains("pppppp"));
+
+    assert_eq!(
+        read_invocations(&log_path),
+        vec![
+            "create".to_string(),
+            "run:ses_owned_large".to_string(),
+            "get:ses_owned_large".to_string(),
+            "export:ses_owned_large".to_string(),
+        ]
+    );
+
+    // 2. Truncated 65_536-byte export payload fails report validation at `invalid_metadata:export_json`
+    // and never replays inference or leaks raw content.
+    let _ = fs::remove_file(&log_path);
+    let _ = fs::remove_file(&result_path);
+    fs::write(&payload_path, &full_export_json.as_bytes()[..65_536])
+        .expect("write truncated 64k export");
+    let failed_report = run_worker(&spec, &workdir)
+        .await
+        .expect("run_worker on truncated export");
+    assert_eq!(failed_report.status, WorkerRunStatus::NonZeroExit);
+    assert!(!failed_report.has_complete_natural_completion_evidence());
+    assert!(failed_report.opencode_metadata.is_none());
+    assert_eq!(
+        failed_report.opencode_metadata_error.as_deref(),
+        Some("invalid_metadata:export_json")
+    );
+    let failed_serialized = serde_json::to_string(&failed_report).expect("serialize report");
+    assert!(!failed_serialized.contains(sentinel));
+    assert_eq!(
+        read_invocations(&log_path),
+        vec![
+            "create".to_string(),
+            "run:ses_owned_large".to_string(),
+            "get:ses_owned_large".to_string(),
+            "export:ses_owned_large".to_string(),
+        ]
+    );
+}

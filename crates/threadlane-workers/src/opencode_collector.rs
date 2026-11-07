@@ -18,14 +18,20 @@
 //!
 //! Every metadata command runs without a shell in its own Unix process group (`process_group(0)`),
 //! with `stdin` set to null, `kill_on_drop(true)`, the exact canonical working directory, and the
-//! exact per-child environment overrides used by the model run. Both `stdout` and `stderr` are
-//! drained concurrently under strict byte caps (`64 KiB` for `session.create`/`session.get`,
-//! `1 MiB` for `session export`, and `context.max_stderr_bytes` for `stderr` which is discarded).
+//! exact per-child environment overrides used by the model run. On Linux, each metadata command
+//! prepares a dedicated `O_CLOEXEC` `stdout` pipe before spawning the child and sizes/verifies its
+//! kernel pipe capacity via `F_SETPIPE_SZ`/`F_GETPIPE_SZ` to hold at least `max_stdout_bytes`
+//! (`64 KiB` for `session.create`/`session.get` and `1 MiB` for `session export`). Both `stdout`
+//! and `stderr` are drained concurrently under strict byte caps (`64 KiB` for
+//! `session.create`/`session.get`, `1 MiB` for `session export`, and `context.max_stderr_bytes`
+//! for `stderr` which is discarded).
 //! Cancellation, timeouts (`<= 10s` per command and bounded by the overall run deadline), or
 //! output overflows immediately terminate and reap the entire owned Unix process group. Any
 //! lingering descendant process or cleanup uncertainty prevents evidence acceptance.
 
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -609,12 +615,33 @@ async fn run_metadata_command(
     max_stdout_bytes: usize,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<Vec<u8>, OpenCodeCollectorError> {
+    run_metadata_command_with_pipe_config(
+        context,
+        argv,
+        max_stdout_bytes,
+        max_stdout_bytes,
+        #[cfg(all(test, target_os = "linux"))]
+        None,
+        cancel_rx,
+    )
+    .await
+}
+
+async fn run_metadata_command_with_pipe_config(
+    context: &OpenCodeCollectorContext,
+    argv: &[String],
+    max_stdout_bytes: usize,
+    pipe_capacity_bytes: usize,
+    #[cfg(all(test, target_os = "linux"))] pre_read_sync_socket: Option<&tokio::net::UnixDatagram>,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<Vec<u8>, OpenCodeCollectorError> {
     let command_deadline = check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)?;
 
-    let mut child = spawn_isolated_child(context, argv).await?;
+    let (mut child, stdout_pipe) = spawn_isolated_child(context, argv, pipe_capacity_bytes).await?;
     let child_pid = match child.id() {
         Some(pid) => pid,
         None => {
+            drop(stdout_pipe);
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(OpenCodeCollectorError::SpawnFailed);
@@ -623,6 +650,7 @@ async fn run_metadata_command(
     let pgid = match i32::try_from(child_pid) {
         Ok(id) => id,
         Err(_) => {
+            drop(stdout_pipe);
             let _ = child.kill().await;
             let _ = child.wait().await;
             return Err(OpenCodeCollectorError::SpawnFailed);
@@ -630,6 +658,7 @@ async fn run_metadata_command(
     };
 
     if !is_isolated_process_group(pgid) {
+        drop(stdout_pipe);
         let _ = child.kill().await;
         let _ = child.wait().await;
         return Err(OpenCodeCollectorError::SpawnFailed);
@@ -637,14 +666,24 @@ async fn run_metadata_command(
 
     let mut pgroup_guard = ProcessGroupGuard::new(pgid);
 
-    let Some(stdout_pipe) = child.stdout.take() else {
-        let _ = terminate_and_reap_group(pgid, &mut child).await;
-        return Err(OpenCodeCollectorError::SpawnFailed);
-    };
     let Some(stderr_pipe) = child.stderr.take() else {
+        drop(stdout_pipe);
         let _ = terminate_and_reap_group(pgid, &mut child).await;
         return Err(OpenCodeCollectorError::SpawnFailed);
     };
+
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(socket) = pre_read_sync_socket {
+        if wait_for_pre_read_sync(socket, &mut child, command_deadline)
+            .await
+            .is_err()
+        {
+            drop(stdout_pipe);
+            drop(stderr_pipe);
+            let _ = terminate_and_reap_group(pgid, &mut child).await;
+            return Err(OpenCodeCollectorError::SpawnFailed);
+        }
+    }
 
     let (overflow_tx, mut overflow_rx) = mpsc::unbounded_channel::<()>();
     let (drain_stop_tx, drain_stop_rx) = watch::channel(false);
@@ -781,10 +820,198 @@ async fn run_metadata_command(
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+async fn wait_for_pre_read_sync(
+    socket: &tokio::net::UnixDatagram,
+    child: &mut tokio::process::Child,
+    command_deadline: Instant,
+) -> Result<(), OpenCodeCollectorError> {
+    // Async socket readiness and child waiting are cancellation-safe: a timeout leaves no
+    // blocking thread behind. Waiting for exit also proves that stdout reading is postponed
+    // until after the producer's single nonblocking write and immediate exit.
+    let deadline = command_deadline.min(Instant::now() + Duration::from_secs(5));
+    let handshake = async {
+        let mut marker = [0u8; 2];
+        let len = socket
+            .recv(&mut marker)
+            .await
+            .map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+        if &marker[..len] != b"1" {
+            return Err(OpenCodeCollectorError::SpawnFailed);
+        }
+        let status = child
+            .wait()
+            .await
+            .map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+        if !status.success() {
+            return Err(OpenCodeCollectorError::SpawnFailed);
+        }
+        Ok(())
+    };
+    tokio::time::timeout_at(deadline, handshake)
+        .await
+        .map_err(|_| OpenCodeCollectorError::SpawnFailed)?
+}
+
+#[cfg(all(test, target_os = "linux"))]
+async fn collect_with_export_transport_test_hook(
+    context: &OpenCodeCollectorContext,
+    owned: &OwnedOpenCodeSession,
+    resolved_model: &ResolvedModelTarget,
+    export_pipe_capacity_bytes: usize,
+    export_pre_read_sync_socket: Option<&tokio::net::UnixDatagram>,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<OpenCodeMetadataEvidence, OpenCodeCollectorDiagnostic> {
+    let workdir_str = validate_context(context).map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let _ = split_and_validate_model_target(resolved_model)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    validate_owned_against_context(owned, context, workdir_str)?;
+
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let get_argv = build_session_get_argv(&owned.session_id)?;
+    let info_bytes = run_metadata_command(context, &get_argv, MAX_OPENCODE_INFO_BYTES, cancel_rx)
+        .await
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let export_argv = build_session_export_argv(&owned.session_id)?;
+    let export_bytes = run_metadata_command_with_pipe_config(
+        context,
+        &export_argv,
+        MAX_OPENCODE_EXPORT_BYTES,
+        export_pipe_capacity_bytes,
+        export_pre_read_sync_socket,
+        cancel_rx,
+    )
+    .await
+    .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    let evidence = validate_opencode_metadata_with_diagnostic(
+        owned,
+        &info_bytes,
+        &export_bytes,
+        resolved_model,
+    )
+    .map_err(OpenCodeCollectorDiagnostic::from)?;
+    check_not_cancelled_or_expired(context.overall_deadline, cancel_rx)
+        .map_err(OpenCodeCollectorDiagnostic::from_error)?;
+    Ok(evidence)
+}
+
+/// Creates a dedicated anonymous pipe for a metadata command's `stdout` on Linux and sizes/verifies
+/// its kernel buffer to hold at least `min_capacity_bytes` before the child process is spawned.
+///
+/// Both descriptors are created atomically with `O_CLOEXEC` so the read end is never inherited by
+/// the child across `execve`, and both are immediately wrapped in [`OwnedFd`] so any capacity or
+/// `fcntl` error closes both descriptors before returning [`OpenCodeCollectorError::SpawnFailed`].
+#[cfg(target_os = "linux")]
+// Linux pipe sizing has no safe standard-library API; keep the FD FFI exception local.
+#[allow(unsafe_code)]
+fn prepare_linux_metadata_stdout_pipe(
+    min_capacity_bytes: usize,
+) -> Result<(OwnedFd, OwnedFd, usize), OpenCodeCollectorError> {
+    if min_capacity_bytes == 0 {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+    let requested_capacity = libc::c_int::try_from(min_capacity_bytes)
+        .map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+    // SAFETY: `fds` is a valid 2-element `c_int` buffer; `O_CLOEXEC` atomically marks both ends close-on-exec.
+    let pipe_rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if pipe_rc != 0 || fds[0] < 0 || fds[1] < 0 {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+
+    // SAFETY: `pipe2` succeeded and returned two fresh, valid, unowned file descriptors.
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    // SAFETY: `pipe2` succeeded and returned two fresh, valid, unowned file descriptors.
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+
+    // SAFETY: `write_fd` is a valid open pipe descriptor owned by `write_fd`.
+    let set_rc =
+        unsafe { libc::fcntl(write_fd.as_raw_fd(), libc::F_SETPIPE_SZ, requested_capacity) };
+    if set_rc < 0 {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+    let set_capacity = usize::try_from(set_rc).map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    if set_capacity < min_capacity_bytes {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+
+    // SAFETY: `read_fd` is a valid open pipe descriptor owned by `read_fd`.
+    let get_rc = unsafe { libc::fcntl(read_fd.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    if get_rc < 0 {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+    let verified_capacity =
+        usize::try_from(get_rc).map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    if verified_capacity < min_capacity_bytes {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+
+    Ok((read_fd, write_fd, verified_capacity))
+}
+
+#[cfg(target_os = "linux")]
 async fn spawn_isolated_child(
     context: &OpenCodeCollectorContext,
     argv: &[String],
-) -> Result<tokio::process::Child, OpenCodeCollectorError> {
+    pipe_capacity_bytes: usize,
+) -> Result<(tokio::process::Child, tokio::process::ChildStdout), OpenCodeCollectorError> {
+    let (stdout_read_fd, stdout_write_fd, _verified_capacity) =
+        prepare_linux_metadata_stdout_pipe(pipe_capacity_bytes)?;
+
+    let mut cmd = Command::new(&context.executable);
+    cmd.args(argv)
+        .envs(
+            context
+                .child_env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+        .current_dir(&context.canonical_workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout_write_fd))
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    cmd.process_group(0);
+
+    let spawn_res = cmd.spawn();
+    drop(cmd);
+    let mut child = spawn_res.map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+
+    let std_stdout = std::process::ChildStdout::from(stdout_read_fd);
+    let stdout_pipe = match tokio::process::ChildStdout::from_std(std_stdout) {
+        Ok(pipe) => pipe,
+        Err(_) => {
+            if let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) {
+                let _ = terminate_and_reap_group(pid, &mut child).await;
+            } else {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
+            return Err(OpenCodeCollectorError::SpawnFailed);
+        }
+    };
+
+    Ok((child, stdout_pipe))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn spawn_isolated_child(
+    context: &OpenCodeCollectorContext,
+    argv: &[String],
+    pipe_capacity_bytes: usize,
+) -> Result<(tokio::process::Child, tokio::process::ChildStdout), OpenCodeCollectorError> {
+    if pipe_capacity_bytes == 0 {
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    }
+
     let mut cmd = Command::new(&context.executable);
     cmd.args(argv)
         .envs(
@@ -804,7 +1031,16 @@ async fn spawn_isolated_child(
         cmd.process_group(0);
     }
 
-    cmd.spawn().map_err(|_| OpenCodeCollectorError::SpawnFailed)
+    let mut child = cmd
+        .spawn()
+        .map_err(|_| OpenCodeCollectorError::SpawnFailed)?;
+    let Some(stdout_pipe) = child.stdout.take() else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(OpenCodeCollectorError::SpawnFailed);
+    };
+
+    Ok((child, stdout_pipe))
 }
 
 async fn drain_stdout_bounded(
@@ -1757,5 +1993,465 @@ exit 99
         assert_eq!(owned.session_id, "ses_owned_123");
         assert_eq!(owned.canonical_workdir, fixture.workdir);
         assert_eq!(owned.started_at_ms, 1_000);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn count_open_fds_matching_stdout_pipe_inode() -> usize {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(stdout_meta) = fs::metadata("/proc/self/fd/1") else {
+            return 0;
+        };
+        let target_dev = stdout_meta.dev();
+        let target_ino = stdout_meta.ino();
+        let Ok(entries) = fs::read_dir("/proc/self/fd") else {
+            return 0;
+        };
+        let mut matches = 0usize;
+        for entry in entries.flatten() {
+            if let Ok(meta) = fs::metadata(entry.path()) {
+                if meta.dev() == target_dev && meta.ino() == target_ino {
+                    matches += 1;
+                }
+            }
+        }
+        matches
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    // Only this synthetic child needs raw descriptor operations and an unflushed exit.
+    #[allow(unsafe_code)]
+    fn abrupt_nonblocking_export_child_entrypoint() {
+        let Some(payload_path) = std::env::var_os("THREADLANE_TEST_ABRUPT_PAYLOAD_PATH") else {
+            return;
+        };
+        let result_path = std::env::var_os("THREADLANE_TEST_ABRUPT_RESULT_PATH")
+            .expect("THREADLANE_TEST_ABRUPT_RESULT_PATH must be set");
+        let ready_socket = std::env::var_os("THREADLANE_TEST_ABRUPT_READY_SOCKET");
+
+        let payload = fs::read(&payload_path).expect("read abrupt payload file");
+
+        // Restore the metadata stdout pipe from fd 3 onto STDOUT_FILENO (fd 1) and close fd 3.
+        // SAFETY: fd 3 was duplicated from the child's initial stdout by the wrapper script.
+        unsafe {
+            if libc::dup2(3, libc::STDOUT_FILENO) < 0 {
+                libc::_exit(91);
+            }
+            let _ = libc::close(3);
+        }
+
+        // Verify that the child's stdout pipe was already sized before spawn and that no extra
+        // descriptor for this pipe (such as the parent's read end) leaked across execve.
+        // SAFETY: `STDOUT_FILENO` is valid and open.
+        let child_pipe_sz = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETPIPE_SZ) };
+        let pipe_fds = count_open_fds_matching_stdout_pipe_inode();
+
+        // SAFETY: `STDOUT_FILENO` is valid and open; set non-blocking mode and perform one write.
+        let write_rc = unsafe {
+            let flags = libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL);
+            if flags < 0 {
+                libc::_exit(92);
+            }
+            if libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+                libc::_exit(93);
+            }
+            libc::write(libc::STDOUT_FILENO, payload.as_ptr().cast(), payload.len())
+        };
+
+        let _ = fs::write(
+            &result_path,
+            format!("write_rc={write_rc} pipe_sz={child_pipe_sz} pipe_fds={pipe_fds}\n"),
+        );
+
+        if let Some(socket_path) = ready_socket {
+            let socket = std::os::unix::net::UnixDatagram::unbound().expect("child sync socket");
+            socket
+                .send_to(b"1", socket_path)
+                .expect("signal completed nonblocking write");
+        }
+
+        // SAFETY: Immediate process exit without stdio flushing, matching abrupt CLI termination.
+        unsafe {
+            libc::_exit(0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    // Inspect the kernel's FD flags and capacity without broadening the crate's unsafe boundary.
+    #[allow(unsafe_code)]
+    fn linux_metadata_stdout_pipe_presizes_verifies_cloexec_and_rejects_invalid_capacity() {
+        for target_capacity in [
+            MAX_OPENCODE_CREATE_BYTES,
+            MAX_OPENCODE_INFO_BYTES,
+            MAX_OPENCODE_EXPORT_BYTES,
+        ] {
+            let (read_fd, write_fd, verified_capacity) =
+                prepare_linux_metadata_stdout_pipe(target_capacity)
+                    .expect("prepare_linux_metadata_stdout_pipe should succeed");
+            assert!(
+                verified_capacity >= target_capacity,
+                "verified capacity {verified_capacity} must be >= {target_capacity}"
+            );
+
+            // SAFETY: `read_fd` and `write_fd` are valid open descriptors owned by `OwnedFd`.
+            unsafe {
+                let read_sz = libc::fcntl(read_fd.as_raw_fd(), libc::F_GETPIPE_SZ);
+                let write_sz = libc::fcntl(write_fd.as_raw_fd(), libc::F_GETPIPE_SZ);
+                assert_eq!(usize::try_from(read_sz).unwrap(), verified_capacity);
+                assert_eq!(usize::try_from(write_sz).unwrap(), verified_capacity);
+
+                let read_fd_flags = libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFD);
+                let write_fd_flags = libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFD);
+                assert_ne!(read_fd_flags & libc::FD_CLOEXEC, 0);
+                assert_ne!(write_fd_flags & libc::FD_CLOEXEC, 0);
+
+                let read_fl_flags = libc::fcntl(read_fd.as_raw_fd(), libc::F_GETFL);
+                let write_fl_flags = libc::fcntl(write_fd.as_raw_fd(), libc::F_GETFL);
+                assert_eq!(read_fl_flags & libc::O_NONBLOCK, 0);
+                assert_eq!(write_fl_flags & libc::O_NONBLOCK, 0);
+            }
+        }
+
+        assert_eq!(
+            prepare_linux_metadata_stdout_pipe(0).unwrap_err(),
+            OpenCodeCollectorError::SpawnFailed
+        );
+        assert_eq!(
+            prepare_linux_metadata_stdout_pipe(usize::try_from(libc::c_int::MAX).unwrap())
+                .unwrap_err(),
+            OpenCodeCollectorError::SpawnFailed
+        );
+        assert_eq!(
+            prepare_linux_metadata_stdout_pipe((libc::c_int::MAX as usize).saturating_add(1))
+                .unwrap_err(),
+            OpenCodeCollectorError::SpawnFailed
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn pre_read_sync_without_child_signal_is_bounded_and_reaps_child() {
+        for child_action in ["exit 97", "exec sleep 60"] {
+            let script = format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > \"$(dirname \"$0\")/child.pid\"\n{child_action}\n"
+            );
+            let fixture = TestFixture::new(&script);
+            let socket = tokio::net::UnixDatagram::bind(fixture.root_dir.join("ready.sock"))
+                .expect("bind private sync socket");
+            let context = fixture.context(Duration::from_millis(300), 1_000);
+            let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                run_metadata_command_with_pipe_config(
+                    &context,
+                    &[],
+                    MAX_OPENCODE_EXPORT_BYTES,
+                    MAX_OPENCODE_EXPORT_BYTES,
+                    Some(&socket),
+                    &mut cancel_rx,
+                ),
+            )
+            .await
+            .expect("missing handshake must not hang collection or runtime shutdown");
+            assert_eq!(result, Err(OpenCodeCollectorError::SpawnFailed));
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid: u32 = fs::read_to_string(fixture.root_dir.join("child.pid"))
+                .expect("child started before handshake timeout")
+                .parse()
+                .expect("numeric synthetic child pid");
+            assert!(!is_process_alive(pid), "synthetic child must be reaped");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn build_padded_sanitized_export_json(
+        workdir_str: &str,
+        session_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        variant: &str,
+        sentinel: &str,
+        target_len: usize,
+    ) -> String {
+        let prefix = format!(
+            r#"{{"info":{{"id":"{session_id}","outcome":"succeeded","location":{{"directory":"{workdir_str}"}},"time":{{"created":1050,"updated":1200,"idle":1200}}}},"messages":[{{"id":"msg_user_1","type":"user","sessionID":"{session_id}","parts":[{{"type":"text","text":"{sentinel}:"#
+        );
+        let suffix = format!(
+            r#""}}]}},{{"id":"msg_asst_1","type":"assistant","sessionID":"{session_id}","finish":"stop","time":{{"created":1060,"completed":1150}},"model":{{"providerID":"{provider_id}","id":"{model_id}","variant":"{variant}"}},"parts":[{{"type":"text","text":"sanitized assistant output"}}]}} ]}}"#
+        );
+        assert!(
+            target_len > prefix.len() + suffix.len(),
+            "target_len must exceed prefix + suffix length"
+        );
+        let pad_len = target_len - prefix.len() - suffix.len();
+        let payload = format!("{prefix}{}{suffix}", "x".repeat(pad_len));
+        assert_eq!(payload.len(), target_len);
+        payload
+    }
+
+    #[cfg(target_os = "linux")]
+    fn parse_abrupt_child_result(raw: &str) -> (isize, i32, usize) {
+        let mut write_rc: Option<isize> = None;
+        let mut pipe_sz: Option<i32> = None;
+        let mut pipe_fds: Option<usize> = None;
+        for token in raw.split_whitespace() {
+            if let Some(val) = token.strip_prefix("write_rc=") {
+                write_rc = val.parse().ok();
+            } else if let Some(val) = token.strip_prefix("pipe_sz=") {
+                pipe_sz = val.parse().ok();
+            } else if let Some(val) = token.strip_prefix("pipe_fds=") {
+                pipe_fds = val.parse().ok();
+            }
+        }
+        (
+            write_rc.expect("write_rc present"),
+            pipe_sz.expect("pipe_sz present"),
+            pipe_fds.expect("pipe_fds present"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn large_sanitized_export_from_abrupt_nonblocking_producer_succeeds_with_presized_pipe_and_postponed_reader(
+    ) {
+        let test_bin = std::env::current_exe().expect("current test binary path");
+        let test_bin_str = test_bin.to_str().expect("utf-8 test binary path");
+        let sentinel = "SENTINEL_LARGE_EXPORT_PADDING_SECRET_777";
+        let target_export_len: usize = 131_097;
+
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+ROOT_DIR="$(dirname "$0")"
+LOG_FILE="$ROOT_DIR/invocations.log"
+printf '%s\n' "$*" >> "$LOG_FILE"
+
+if [ "${{1:-}}" = "api" ] && [ "${{2:-}}" = "--standalone" ] && [ "${{3:-}}" = "session.get" ]; then
+    cat <<EOF
+{{"data":{{"id":"ses_owned_123","outcome":"succeeded","location":{{"directory":"$(pwd)"}},"time":{{"created":1050,"updated":1200,"idle":1200}}}}}}
+EOF
+    exit 0
+fi
+
+if [ "${{1:-}}" = "session" ] && [ "${{2:-}}" = "export" ] && [ "${{3:-}}" = "--standalone" ] && [ "${{4:-}}" = "--sanitize" ]; then
+    MODE="$(cat "$ROOT_DIR/mode.txt")"
+    if [ "$MODE" = "overflow" ]; then
+        dd if=/dev/zero bs=1024 count=1025 2>/dev/null | tr '\0' 'a'
+        exit 0
+    fi
+    exec 3>&1 1>/dev/null 2>/dev/null
+    export THREADLANE_TEST_ABRUPT_PAYLOAD_PATH="$ROOT_DIR/export_payload.json"
+    export THREADLANE_TEST_ABRUPT_RESULT_PATH="$ROOT_DIR/abrupt_result.txt"
+    if [ -S "$ROOT_DIR/ready.sock" ]; then
+        export THREADLANE_TEST_ABRUPT_READY_SOCKET="$ROOT_DIR/ready.sock"
+    fi
+    exec "{test_bin_str}" abrupt_nonblocking_export_child_entrypoint --nocapture
+fi
+
+exit 99
+"#
+        );
+
+        let fixture = TestFixture::new(&script);
+        let workdir_str = fixture.workdir.to_str().expect("utf-8 workdir");
+        let mode_path = fixture.root_dir.join("mode.txt");
+        let payload_path = fixture.root_dir.join("export_payload.json");
+        let result_path = fixture.root_dir.join("abrupt_result.txt");
+        let socket_path = fixture.root_dir.join("ready.sock");
+
+        let valid_export = build_padded_sanitized_export_json(
+            workdir_str,
+            "ses_owned_123",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+            "max",
+            sentinel,
+            target_export_len,
+        );
+        assert_eq!(valid_export.len(), 131_097);
+        fs::write(&payload_path, valid_export.as_bytes()).expect("write valid_export");
+        fs::write(&mode_path, "abrupt").expect("write abrupt mode");
+
+        let sync_socket = tokio::net::UnixDatagram::bind(&socket_path)
+            .expect("bind private pre-read sync socket");
+
+        let target = expected_model_target();
+        let owned = OwnedOpenCodeSession {
+            session_id: "ses_owned_123".to_string(),
+            canonical_workdir: fixture.workdir.clone(),
+            started_at_ms: 1_000,
+        };
+
+        // 1. With pipe pre-sized to 65_536 before spawn and parent reading postponed until after
+        // the child completes its single nonblocking write and exits 0, only 65_536 bytes fit in
+        // the pipe buffer and the truncated JSON is rejected at `export_json`.
+        let _ = fs::remove_file(&result_path);
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let truncated_diag = collect_with_export_transport_test_hook(
+            &ctx,
+            &owned,
+            &target,
+            65_536,
+            Some(&sync_socket),
+            &mut cancel_rx,
+        )
+        .await
+        .expect_err("64 KiB pipe must truncate 131097-byte write when reader waits");
+        assert_eq!(
+            truncated_diag.error,
+            OpenCodeCollectorError::InvalidMetadata
+        );
+        assert_eq!(
+            truncated_diag.stage,
+            Some(OpenCodeMetadataStage::ExportJson)
+        );
+        assert_eq!(truncated_diag.as_str(), "invalid_metadata:export_json");
+        assert!(!truncated_diag.to_string().contains(sentinel));
+
+        let (write_rc_64k, pipe_sz_64k, pipe_fds_64k) = parse_abrupt_child_result(
+            &fs::read_to_string(&result_path).expect("read 64k abrupt result"),
+        );
+        assert_eq!(write_rc_64k, 65_536);
+        assert_eq!(pipe_sz_64k, 65_536);
+        assert_eq!(pipe_fds_64k, 1, "child must not inherit parent read fd");
+
+        // 2. With pipe pre-sized to MAX_OPENCODE_EXPORT_BYTES (1_048_576) BEFORE spawn and the
+        // exact same postponed reader handshake, the child's single nonblocking write buffers all
+        // 131_097 bytes and exits 0 before the parent reads a single byte, and collection succeeds.
+        let _ = fs::remove_file(&result_path);
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let evidence = collect_with_export_transport_test_hook(
+            &ctx,
+            &owned,
+            &target,
+            MAX_OPENCODE_EXPORT_BYTES,
+            Some(&sync_socket),
+            &mut cancel_rx,
+        )
+        .await
+        .expect("1 MiB pre-sized pipe must capture full 131097-byte nonblocking export");
+        assert_eq!(evidence.source, "opencode_sanitized_session_export");
+        assert_eq!(evidence.strength, "cli_reported_per_assistant");
+        assert_eq!(evidence.session_id, "ses_owned_123");
+        assert_eq!(evidence.observed_model, "opencode-go/deepseek-v4.1-flash");
+        assert_eq!(evidence.observed_effort.as_deref(), Some("max"));
+        assert_eq!(evidence.assistant_message_count, 1);
+        assert_eq!(evidence.terminal_message_id, "msg_asst_1");
+
+        let (write_rc_1m, pipe_sz_1m, pipe_fds_1m) = parse_abrupt_child_result(
+            &fs::read_to_string(&result_path).expect("read 1M abrupt result"),
+        );
+        assert_eq!(
+            usize::try_from(write_rc_1m).unwrap(),
+            target_export_len,
+            "single nonblocking write must transfer all 131097 bytes into pre-sized pipe"
+        );
+        assert!(
+            usize::try_from(pipe_sz_1m).unwrap() >= MAX_OPENCODE_EXPORT_BYTES,
+            "child stdout pipe capacity at startup must be >= 1 MiB"
+        );
+        assert_eq!(pipe_fds_1m, 1, "child must not inherit parent read fd");
+
+        // 3. Production `collect_with_diagnostic` and `collect` succeed directly against the
+        // abrupt nonblocking producer and never retain padding or sentinel text.
+        drop(sync_socket);
+        fs::remove_file(&socket_path).expect("remove sync socket for normal production collect");
+        let _ = fs::remove_file(&result_path);
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let prod_evidence = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect("production collect_with_diagnostic should succeed on 131097-byte export");
+        assert_eq!(prod_evidence, evidence);
+        let serialized = serde_json::to_string(&prod_evidence).expect("serialize evidence");
+        assert!(!serialized.contains(sentinel));
+        assert!(!serialized.contains("xxxx"));
+
+        let (write_rc_prod, pipe_sz_prod, pipe_fds_prod) = parse_abrupt_child_result(
+            &fs::read_to_string(&result_path).expect("read prod abrupt result"),
+        );
+        assert_eq!(usize::try_from(write_rc_prod).unwrap(), target_export_len);
+        assert!(usize::try_from(pipe_sz_prod).unwrap() >= MAX_OPENCODE_EXPORT_BYTES);
+        assert_eq!(pipe_fds_prod, 1);
+
+        // 4. Truncated >64KiB payload (90_000 bytes) is still rejected at `export_json`.
+        fs::write(&payload_path, &valid_export.as_bytes()[..90_000])
+            .expect("write truncated 90k export");
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("truncated 90k export must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::InvalidMetadata);
+        assert_eq!(diag.stage, Some(OpenCodeMetadataStage::ExportJson));
+        assert!(!diag.to_string().contains(sentinel));
+
+        // 5. >64KiB valid JSON exports with wrong session ID, wrong model, or wrong effort are
+        // rejected with their exact semantic errors.
+        let wrong_id_export = build_padded_sanitized_export_json(
+            workdir_str,
+            "ses_other_999",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+            "max",
+            sentinel,
+            target_export_len,
+        );
+        fs::write(&payload_path, wrong_id_export.as_bytes()).expect("write wrong_id_export");
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("wrong session id in >64KiB export must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::OwnershipMismatch);
+
+        let wrong_model_export = build_padded_sanitized_export_json(
+            workdir_str,
+            "ses_owned_123",
+            "opencode-go",
+            "wrong-model",
+            "max",
+            sentinel,
+            target_export_len,
+        );
+        fs::write(&payload_path, wrong_model_export.as_bytes()).expect("write wrong_model_export");
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("wrong model in >64KiB export must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::ModelMismatch);
+
+        let wrong_effort_export = build_padded_sanitized_export_json(
+            workdir_str,
+            "ses_owned_123",
+            "opencode-go",
+            "deepseek-v4.1-flash",
+            "low",
+            sentinel,
+            target_export_len,
+        );
+        fs::write(&payload_path, wrong_effort_export.as_bytes())
+            .expect("write wrong_effort_export");
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err("wrong effort in >64KiB export must fail");
+        assert_eq!(diag.error, OpenCodeCollectorError::EffortMismatch);
+
+        // 6. Over-budget export (> 1 MiB) is rejected with `OutputOverflow`.
+        fs::write(&mode_path, "overflow").expect("write overflow mode");
+        let ctx = fixture.context(Duration::from_secs(5), 1_000);
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let diag = collect_with_diagnostic(&ctx, &owned, &target, &mut cancel_rx)
+            .await
+            .expect_err(">1 MiB export must fail with OutputOverflow");
+        assert_eq!(diag.error, OpenCodeCollectorError::OutputOverflow);
+        assert_eq!(diag.as_str(), "output_overflow");
     }
 }
