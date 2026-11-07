@@ -3,6 +3,7 @@ import Module from 'node:module';
 import { describe, it } from 'node:test';
 
 import {
+  DIFFICULTIES,
   EXECUTION_ROLES,
   WORKFLOW_ROLES,
   createEmptyRegistrySnapshot,
@@ -83,6 +84,7 @@ class FakeElement extends FakeNode {
   scrollLeft = 0;
   selectionStart: number | null = null;
   selectionEnd: number | null = null;
+  lastFocusOptions: unknown = undefined;
   readonly isConnected = true;
   private readonly datasetStore: Record<string, string> = {};
   readonly dataset: Record<string, string>;
@@ -195,7 +197,18 @@ class FakeElement extends FakeNode {
     }
   }
 
-  focus(_options?: unknown): void {}
+  focus(options?: unknown): void {
+    if (this.disabled) {
+      return;
+    }
+    this.lastFocusOptions = options;
+    const doc = (globalThis as unknown as {
+      document?: { activeElement: unknown };
+    }).document;
+    if (doc) {
+      doc.activeElement = this;
+    }
+  }
 
   setSelectionRange(start: number, end: number): void {
     this.selectionStart = start;
@@ -353,6 +366,86 @@ function makeSnapshot(profiles: WorkflowProfile[] = []): RegistrySnapshot {
     models: [makeModel()],
     profiles,
     default_profile_id: profiles[0]?.id ?? null,
+  };
+}
+
+function makeOverrideResetSnapshot(profile: WorkflowProfile): RegistrySnapshot {
+  return {
+    ...makeSnapshot([profile]),
+    tools: [
+      makeTool({
+        id: 'opencode-go',
+        label: 'OpenCode Go',
+        adapter: 'opencode_v2',
+      }),
+    ],
+    models: [
+      makeModel({
+        id: 'deepseek-v4.1-flash',
+        tool_id: 'opencode-go',
+        label: 'DeepSeek v4.1 Flash',
+        model_arg: 'opencode-go/deepseek-v4.1-flash',
+        efforts: ['max'],
+        allow_no_effort: false,
+      }),
+      makeModel({
+        id: 'gpt-6-luna',
+        tool_id: 'opencode-go',
+        label: 'GPT-6 Luna',
+        model_arg: 'opencode-go/gpt-6-luna',
+        efforts: ['high', 'max'],
+        allow_no_effort: false,
+      }),
+    ],
+  };
+}
+
+function makePendingFamilySnapshot(profile: WorkflowProfile): RegistrySnapshot {
+  return {
+    ...makeSnapshot([profile]),
+    tools: [
+      makeTool({
+        id: 'agy',
+        label: 'Antigravity CLI',
+        adapter: 'antigravity',
+      }),
+    ],
+    models: [
+      makeModel(),
+      makeModel({
+        id: 'gemini-argon-high',
+        label: 'Gemini 4 Argon (high)',
+        model_arg: 'gemini-4-argon-high',
+        efforts: ['high'],
+        allow_no_effort: false,
+      }),
+    ],
+  };
+}
+
+function makeCoderOverrides(
+  modelId: string = 'gpt-6-luna',
+  effort: string | null = 'high'
+): RoleAssignment[] {
+  return DIFFICULTIES.map((difficulty): RoleAssignment => ({
+    role: 'coder',
+    difficulty,
+    choice: { model_id: modelId, effort },
+  }));
+}
+
+function makeOverrideProfile(
+  id: string,
+  name: string,
+  overrides: RoleAssignment[]
+): WorkflowProfile {
+  return {
+    id,
+    name,
+    assignments: [
+      ...makeFiveRoleAssignments('deepseek-v4.1-flash', 'max'),
+      ...overrides,
+    ],
   };
 }
 
@@ -559,6 +652,413 @@ describe('profiles coworker native model simplification', () => {
     assert.equal(draftStatus.textContent.includes('5/5 role defaults'), true);
     assert.equal(draftStatus.textContent.includes('1 difficulty overrides'), true);
     assert.equal(draftStatus.textContent.includes('6 assignments'), true);
+
+    page.dispose();
+  });
+});
+
+describe('profile difficulty override reset', () => {
+  it('clears all four difficulty overrides in the draft while retaining the role default', () => {
+    const profile = makeOverrideProfile('profile-override-reset', 'Override Reset', [
+      ...makeCoderOverrides(),
+      {
+        role: 'reviewer',
+        difficulty: 'easy',
+        choice: { model_id: 'gpt-6-luna', effort: 'high' },
+      },
+    ]);
+    const snapshot = makeOverrideResetSnapshot(profile);
+    const page = new ProfilesPage(() => {});
+    let root = page.render(snapshot) as unknown as FakeElement;
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const coderFieldset = root.querySelector('[data-profile-role="coder"]');
+    assert.ok(coderFieldset, 'expected coder role editor');
+    assert.equal(
+      coderFieldset.querySelector('legend')?.textContent.includes('Worker'),
+      true,
+      'expected the canonical coder role to be presented as Worker'
+    );
+    const coderOverrides = coderFieldset.querySelector('details');
+    assert.ok(coderOverrides, 'expected coder difficulty overrides');
+    coderOverrides.open = true;
+    coderOverrides.dispatchEvent('toggle');
+
+    const clearButton = root.querySelector('[data-focus-key="clear-overrides-coder"]');
+    assert.ok(clearButton, 'expected coder difficulty override reset action');
+    assert.equal(clearButton.getAttribute('type'), 'button');
+    assert.equal(clearButton.disabled, false);
+    assert.equal(
+      clearButton.getAttribute('aria-label'),
+      'Clear all difficulty overrides for Worker'
+    );
+
+    const coderCount = root.querySelector('[data-override-count="coder"]');
+    assert.ok(coderCount, 'expected coder override count');
+    assert.equal(coderCount.textContent, '4 assigned');
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'deepseek-v4.1-flash'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:default"]')?.value,
+      'max'
+    );
+    for (const difficulty of DIFFICULTIES) {
+      assert.equal(
+        root.querySelector(`[data-model-key="coder:${difficulty}"]`)?.value,
+        'gpt-6-luna'
+      );
+      assert.equal(
+        root.querySelector(`[data-effort-key="coder:${difficulty}"]`)?.value,
+        'high'
+      );
+    }
+    assert.equal(
+      root.querySelector('[data-model-key="reviewer:easy"]')?.value,
+      'gpt-6-luna'
+    );
+
+    clearButton.click();
+
+    assert.equal(
+      page.render(snapshot),
+      root,
+      'clearing overrides must not rebuild the page'
+    );
+    assert.equal(coderOverrides.open, true, 'expanded override details must stay open');
+    assert.equal(coderCount.textContent, '0 assigned');
+    assert.equal(clearButton.disabled, true);
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'deepseek-v4.1-flash'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:default"]')?.value,
+      'max'
+    );
+    for (const difficulty of DIFFICULTIES) {
+      const model = root.querySelector(`[data-model-key="coder:${difficulty}"]`);
+      const effort = root.querySelector(`[data-effort-key="coder:${difficulty}"]`);
+      assert.ok(model, `expected coder ${difficulty} model selector`);
+      assert.ok(effort, `expected coder ${difficulty} effort selector`);
+      assert.equal(model.value, '');
+      assert.equal(effort.value, '');
+      assert.equal(effort.disabled, true);
+    }
+    assert.equal(
+      root.querySelector('[data-model-key="reviewer:easy"]')?.value,
+      'gpt-6-luna'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="reviewer:easy"]')?.value,
+      'high'
+    );
+    assert.equal(
+      root.querySelector('[data-override-count="reviewer"]')?.textContent,
+      '1 assigned'
+    );
+
+    const draftStatus = root.querySelector('[data-draft-status]');
+    assert.ok(draftStatus, 'expected draft status in editor');
+    assert.equal(draftStatus.textContent.includes('6 assignments'), true);
+    assert.equal(draftStatus.textContent.includes('1 difficulty overrides'), true);
+    assert.equal(
+      root.textContent.includes('5 difficulty overrides · 10 assignments'),
+      true
+    );
+
+    const save = root.querySelector('[data-focus-key="save-profile"]');
+    assert.ok(save, 'expected save action');
+    assert.equal(save.disabled, false);
+    assert.equal(save.textContent, 'Save changes');
+    assert.equal(root.querySelector('[role="alert"]'), null);
+    assert.equal(root.textContent.includes('bridge_disconnected'), false);
+
+    page.dispose();
+  });
+
+  it('keeps incomplete pending-family overrides visible and clears them without stealing focus or saving', () => {
+    const profile: WorkflowProfile = {
+      id: 'profile-pending-family',
+      name: 'Pending Family',
+      assignments: [
+        ...makeFiveRoleAssignments('gemini-argon', 'high'),
+        {
+          role: 'coder',
+          difficulty: 'hard',
+          choice: { model_id: 'gemini-argon', effort: 'medium' },
+        },
+        {
+          role: 'reviewer',
+          difficulty: 'easy',
+          choice: { model_id: 'gemini-argon-high', effort: 'high' },
+        },
+      ],
+    };
+    const snapshot = makePendingFamilySnapshot(profile);
+    const page = new ProfilesPage(() => {});
+    let root = page.render(snapshot) as unknown as FakeElement;
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const defaultModel = root.querySelector('[data-model-key="coder:default"]');
+    assert.ok(defaultModel, 'expected coder default model selector');
+    defaultModel.focus({ preventScroll: true });
+
+    const mediumModel = root.querySelector('[data-model-key="coder:medium"]');
+    assert.ok(mediumModel, 'expected coder medium override model selector');
+    const familyOption = mediumModel
+      .querySelectorAll('option')
+      .find((option) => option.textContent === 'Gemini 4 Argon');
+    assert.ok(familyOption, 'expected encoded model family option');
+    const familyKey = familyOption.getAttribute('value');
+    assert.ok(familyKey, 'expected encoded model family value');
+    mediumModel.value = familyKey;
+    mediumModel.dispatchEvent('change');
+
+    const activeAfterRefresh = (
+      globalThis as unknown as { document: { activeElement: FakeElement | null } }
+    ).document.activeElement;
+    assert.equal(
+      activeAfterRefresh,
+      defaultModel,
+      'ordinary refresh must not steal focus'
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="coder:medium"]')?.value,
+      familyKey
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:medium"]')?.value,
+      ''
+    );
+    assert.equal(
+      root.querySelector('[data-override-count="coder"]')?.textContent,
+      '2 assigned'
+    );
+    const draftStatus = root.querySelector('[data-draft-status]');
+    assert.ok(draftStatus, 'expected draft status in editor');
+    assert.equal(draftStatus.textContent.includes('3 difficulty overrides'), true);
+    assert.equal(draftStatus.textContent.includes('7 assignments'), true);
+
+    const clearButton = root.querySelector('[data-focus-key="clear-overrides-coder"]');
+    assert.ok(clearButton, 'expected coder difficulty override reset action');
+    assert.equal(clearButton.disabled, false);
+    clearButton.focus({ preventScroll: true });
+    clearButton.click();
+
+    assert.equal(
+      root.querySelector('[data-override-count="coder"]')?.textContent,
+      '0 assigned'
+    );
+    assert.equal(clearButton.disabled, true);
+    assert.equal(root.querySelector('[data-model-key="coder:medium"]')?.value, '');
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:medium"]')?.disabled,
+      true
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'gemini-argon'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:default"]')?.value,
+      'high'
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="reviewer:easy"]')?.value,
+      familyKey
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="reviewer:easy"]')?.value,
+      'high'
+    );
+    assert.equal(
+      root.querySelector('[data-override-count="reviewer"]')?.textContent,
+      '1 assigned'
+    );
+
+    const resetDefault = root.querySelector('[data-model-key="coder:default"]');
+    assert.ok(resetDefault, 'expected coder default model selector after reset');
+    const activeAfterReset = (
+      globalThis as unknown as { document: { activeElement: FakeElement | null } }
+    ).document.activeElement;
+    assert.equal(
+      activeAfterReset,
+      resetDefault,
+      'reset must move focus to the role default model'
+    );
+    assert.deepEqual(resetDefault.lastFocusOptions, { preventScroll: true });
+    assert.equal(root.querySelector('[role="alert"]'), null);
+    assert.equal(root.textContent.includes('bridge_disconnected'), false);
+
+    root.querySelector('[data-focus-key="cancel-profile"]')?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(root.querySelector('[role="alert"]'), null);
+    assert.equal(root.textContent.includes('bridge_disconnected'), false);
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(
+      root.querySelector('[data-model-key="coder:hard"]')?.value,
+      'gemini-argon'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:hard"]')?.value,
+      'medium'
+    );
+    assert.equal(root.querySelector('[data-model-key="coder:medium"]')?.value, '');
+    assert.equal(
+      root.querySelector('[data-override-count="coder"]')?.textContent,
+      '1 assigned'
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="reviewer:easy"]')?.value,
+      familyKey
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="reviewer:easy"]')?.value,
+      'high'
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'gemini-argon'
+    );
+
+    page.dispose();
+  });
+
+  it('preserves existing overrides when only the role default changes and disables an empty reset', () => {
+    const profile = makeOverrideProfile('profile-default-change', 'Default Change', [
+      {
+        role: 'coder',
+        difficulty: 'easy',
+        choice: { model_id: 'deepseek-v4.1-flash', effort: 'max' },
+      },
+    ]);
+    const snapshot = makeOverrideResetSnapshot(profile);
+    const page = new ProfilesPage(() => {});
+    let root = page.render(snapshot) as unknown as FakeElement;
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const defaultModel = root.querySelector('[data-model-key="coder:default"]');
+    assert.ok(defaultModel, 'expected coder default model selector');
+    assert.equal(defaultModel.value, 'deepseek-v4.1-flash');
+    defaultModel.value = 'gpt-6-luna';
+    defaultModel.dispatchEvent('change');
+
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'gpt-6-luna'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:default"]')?.value,
+      'max'
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="coder:easy"]')?.value,
+      'deepseek-v4.1-flash'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:easy"]')?.value,
+      'max'
+    );
+    assert.equal(
+      root.querySelector('[data-override-count="coder"]')?.textContent,
+      '1 assigned'
+    );
+
+    const clearButton = root.querySelector('[data-focus-key="clear-overrides-coder"]');
+    assert.ok(clearButton, 'expected coder difficulty override reset action');
+    assert.equal(clearButton.disabled, false);
+    clearButton.click();
+
+    assert.equal(
+      root.querySelector('[data-model-key="coder:easy"]')?.value,
+      ''
+    );
+    assert.equal(
+      root.querySelector('[data-override-count="coder"]')?.textContent,
+      '0 assigned'
+    );
+    assert.equal(clearButton.disabled, true);
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'gpt-6-luna'
+    );
+    assert.equal(
+      root.querySelector('[data-effort-key="coder:default"]')?.value,
+      'max'
+    );
+
+    clearButton.click();
+    assert.equal(
+      root.querySelector('[data-override-count="coder"]')?.textContent,
+      '0 assigned'
+    );
+    assert.equal(
+      root.querySelector('[data-model-key="coder:default"]')?.value,
+      'gpt-6-luna'
+    );
+
+    page.dispose();
+  });
+
+  it('disables override clearing while a save is pending', async () => {
+    const profile = makeOverrideProfile('profile-busy-reset', 'Busy Reset', [
+      ...makeCoderOverrides(),
+    ]);
+    const snapshot = makeOverrideResetSnapshot(profile);
+    const page = new ProfilesPage(() => {});
+    let root = page.render(snapshot) as unknown as FakeElement;
+
+    root.querySelector(`[data-focus-key="edit-${profile.id}"]`)?.click();
+    root = page.render(snapshot) as unknown as FakeElement;
+
+    const clearButton = root.querySelector('[data-focus-key="clear-overrides-coder"]');
+    assert.ok(clearButton, 'expected coder difficulty override reset action');
+    assert.equal(clearButton.disabled, false);
+    const save = root.querySelector('[data-focus-key="save-profile"]');
+    assert.ok(save, 'expected save action');
+
+    save.click();
+
+    const pendingRoot = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(pendingRoot.getAttribute('aria-busy'), 'true');
+    assert.equal(
+      pendingRoot.querySelector('[data-focus-key="save-profile"]')?.textContent,
+      'Saving...'
+    );
+    const pendingClear = pendingRoot.querySelector(
+      '[data-focus-key="clear-overrides-coder"]'
+    );
+    assert.ok(pendingClear, 'expected pending coder override reset action');
+    assert.equal(pendingClear.disabled, true);
+    pendingClear.click();
+    assert.equal(
+      pendingRoot.querySelector('[data-override-count="coder"]')?.textContent,
+      '4 assigned'
+    );
+
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const settledRoot = page.render(snapshot) as unknown as FakeElement;
+    assert.equal(settledRoot.textContent.includes('bridge_disconnected'), true);
+    const settledClear = settledRoot.querySelector(
+      '[data-focus-key="clear-overrides-coder"]'
+    );
+    assert.ok(settledClear, 'expected settled coder override reset action');
+    assert.equal(settledClear.disabled, false);
+    assert.equal(
+      settledRoot.querySelector('[data-override-count="coder"]')?.textContent,
+      '4 assigned'
+    );
 
     page.dispose();
   });

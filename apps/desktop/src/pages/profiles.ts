@@ -22,6 +22,7 @@ import {
   EXECUTION_ROLES,
   WORKFLOW_ROLES,
   isApiToolAdapter,
+  workflowRoleLabel,
   type DecisionAdvisor,
   type Difficulty,
   type ModelDefinition,
@@ -39,15 +40,6 @@ export const PROFILE_EXECUTION_ROLES: readonly WorkflowRole[] = [...EXECUTION_RO
 const ROLES: readonly WorkflowRole[] = PROFILE_EXECUTION_ROLES;
 
 const DIFFICULTIES: readonly Difficulty[] = ['easy', 'medium', 'hard', 'extreme'];
-
-const ROLE_LABELS: Record<WorkflowRole, string> = {
-  follower: 'Follower',
-  orchestrator: 'Orchestrator',
-  architect: 'Architect',
-  coder: 'Coder',
-  reviewer: 'Reviewer',
-  closure: 'Closure',
-};
 
 const DIFFICULTY_LABELS: Record<Difficulty, string> = {
   easy: 'Easy',
@@ -481,6 +473,10 @@ function slotLabel(slot: Slot): string {
   return slot === 'default' ? 'role default' : `${DIFFICULTY_LABELS[slot]} override`;
 }
 
+function hasDifficultyOverride(cell: Choice): boolean {
+  return Boolean(cell.model_id || cell.pending_family || cell.effort !== null);
+}
+
 function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnalysis {
   const issues = validateTable(index, draft.assignments);
   const advisor = validateDecisionAdvisor(
@@ -488,7 +484,7 @@ function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnaly
     draft.decisionAdvisor
   );
   const errors = issues.map(
-    (issue) => `${ROLE_LABELS[issue.role]} ${slotLabel(issue.slot)}: ${issue.message}`
+    (issue) => `${workflowRoleLabel(issue.role)} ${slotLabel(issue.slot)}: ${issue.message}`
   );
   if (advisor.state === 'invalid') {
     errors.push(`Decision advisor: ${advisor.issue.message}`);
@@ -508,11 +504,7 @@ function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnaly
 
   const missingDefaults = ROLES.filter((role) => !draft.assignments[role].default.model_id);
   const unassignedRoles = ROLES.filter((role) =>
-    SLOTS.every(
-      (slot) =>
-        !draft.assignments[role][slot].model_id &&
-        !draft.assignments[role][slot].pending_family
-    )
+    SLOTS.every((slot) => !hasDifficultyOverride(draft.assignments[role][slot]))
   );
   let assignmentCount = 0;
   let overrideCount = 0;
@@ -521,9 +513,9 @@ function analyzeWithIndex(index: RegistryIndex, draft: ProfileDraft): DraftAnaly
     for (const slot of SLOTS) {
       if (draft.assignments[role][slot].model_id) {
         assignmentCount += 1;
-        if (slot !== 'default') {
-          overrideCount += 1;
-        }
+      }
+      if (slot !== 'default' && hasDifficultyOverride(draft.assignments[role][slot])) {
+        overrideCount += 1;
       }
     }
   }
@@ -558,9 +550,9 @@ export function summarizeProfile(
     for (const slot of SLOTS) {
       if (table[role][slot].model_id) {
         assignmentCount += 1;
-        if (slot !== 'default') {
-          overrideCount += 1;
-        }
+      }
+      if (slot !== 'default' && hasDifficultyOverride(table[role][slot])) {
+        overrideCount += 1;
       }
     }
   }
@@ -768,7 +760,7 @@ function buildDraftStatus(
         'p',
         { class: 'aq-profiles-note' },
         h('strong', {}, 'Missing role defaults: '),
-        analysis.missingDefaults.map((role) => ROLE_LABELS[role]).join(', ')
+        analysis.missingDefaults.map((role) => workflowRoleLabel(role)).join(', ')
       )
     );
   }
@@ -778,7 +770,7 @@ function buildDraftStatus(
         'p',
         { class: 'aq-profiles-note', 'data-tone': 'muted' },
         h('strong', {}, 'No assignments yet: '),
-        analysis.unassignedRoles.map((role) => ROLE_LABELS[role]).join(', ')
+        analysis.unassignedRoles.map((role) => workflowRoleLabel(role)).join(', ')
       )
     );
   }
@@ -1167,7 +1159,7 @@ export class ProfilesPage {
     const busy = this.pending !== null;
     const isDefault = snapshot.default_profile_id === profile.id;
     const isConfirming = this.confirmDeleteId === profile.id;
-    const missing = summary.missingDefaults.map((role) => ROLE_LABELS[role]).join(', ');
+    const missing = summary.missingDefaults.map((role) => workflowRoleLabel(role)).join(', ');
     const visibleIssues = summary.issues.slice(0, 2);
     const advisorIssue =
       summary.advisor.state === 'invalid' ? summary.advisor.issue : null;
@@ -1243,7 +1235,7 @@ export class ProfilesPage {
               h(
                 'li',
                 {},
-                `${ROLE_LABELS[issue.role]} ${slotLabel(issue.slot)}: ${issue.message}`
+                `${workflowRoleLabel(issue.role)} ${slotLabel(issue.slot)}: ${issue.message}`
               )
             ),
             summary.issues.length > visibleIssues.length
@@ -1700,9 +1692,10 @@ export class ProfilesPage {
     busy: boolean
   ): HTMLElement {
     const state = roleState(analysis, draft.assignments, role);
-    const overrideCount = DIFFICULTIES.filter(
-      (slot) => draft.assignments[role][slot].model_id
+    const overrideCount = DIFFICULTIES.filter((slot) =>
+      hasDifficultyOverride(draft.assignments[role][slot])
     ).length;
+    const hasOverrides = overrideCount > 0;
     const overrides = h('details', {
       class: 'aq-profiles-overrides',
     }) as HTMLDetailsElement;
@@ -1742,7 +1735,7 @@ export class ProfilesPage {
       h(
         'legend',
         {},
-        h('span', {}, ROLE_LABELS[role]),
+        h('span', {}, workflowRoleLabel(role)),
         h(
           'span',
           {
@@ -1754,6 +1747,25 @@ export class ProfilesPage {
         )
       ),
       this.buildChoiceRow(role, 'default', busy),
+      h(
+        'div',
+        { class: 'aq-profiles-overrides-toolbar' },
+        h(
+          'p',
+          { class: 'aq-profiles-overrides-note' },
+          'Difficulty overrides take precedence over the role default.'
+        ),
+        button(
+          'Clear difficulty overrides',
+          () => this.clearOverrides(role),
+          {
+            className: 'aq-profiles-link',
+            disabled: busy || !hasOverrides,
+            focusKey: `clear-overrides-${role}`,
+            ariaLabel: `Clear all difficulty overrides for ${workflowRoleLabel(role)}`,
+          }
+        )
+      ),
       overrides
     );
   }
@@ -1789,7 +1801,7 @@ export class ProfilesPage {
           className: 'aq-profiles-link',
           disabled: busy,
           focusKey: `clear-${role}-${slot}`,
-          ariaLabel: `Clear ${ROLE_LABELS[role]} ${label}`,
+          ariaLabel: `Clear ${workflowRoleLabel(role)} ${label}`,
         }
       )
     );
@@ -1806,7 +1818,7 @@ export class ProfilesPage {
     const hasAssignableModels = index?.groups.some((group) => group.families.length > 0) ?? false;
     const select = h('select', {
       class: 'aq-profiles-select',
-      'aria-label': `${ROLE_LABELS[role]} ${slotLabel(slot)} model`,
+      'aria-label': `${workflowRoleLabel(role)} ${slotLabel(slot)} model`,
       'data-model-key': key,
       'data-focus-key': `model-${role}-${slot}`,
     });
@@ -1904,7 +1916,7 @@ export class ProfilesPage {
       : null;
     const select = h('select', {
       class: 'aq-profiles-select',
-      'aria-label': `${ROLE_LABELS[role]} ${slotLabel(slot)} effort`,
+      'aria-label': `${workflowRoleLabel(role)} ${slotLabel(slot)} effort`,
       'data-effort-key': `${role}:${slot}`,
       'data-focus-key': `effort-${role}-${slot}`,
     });
@@ -2060,9 +2072,10 @@ export class ProfilesPage {
     for (const role of ROLES) {
       const state = roleState(analysis, this.draft.assignments, role);
       const assignments = this.draft.assignments;
-      const overrideCount = DIFFICULTIES.filter(
-        (slot) => assignments[role][slot].model_id
+      const overrideCount = DIFFICULTIES.filter((slot) =>
+        hasDifficultyOverride(assignments[role][slot])
       ).length;
+      const hasOverrides = overrideCount > 0;
       const fieldset = this.root.querySelector<HTMLElement>(
         `[data-profile-role="${role}"]`
       );
@@ -2083,6 +2096,12 @@ export class ProfilesPage {
         count.textContent = `${overrideCount} assigned`;
         count.dataset.tone = overrideCount > 0 ? 'accent' : 'muted';
       }
+      const clearOverrides = this.root.querySelector<HTMLButtonElement>(
+        `[data-focus-key="clear-overrides-${role}"]`
+      );
+      if (clearOverrides) {
+        clearOverrides.disabled = this.pending !== null || !hasOverrides;
+      }
     }
   }
 
@@ -2102,6 +2121,45 @@ export class ProfilesPage {
     }
     this.syncEffort(role, slot);
     this.refreshDraftStatus();
+  }
+
+  private clearOverrides(role: WorkflowRole): void {
+    if (!this.root || !this.draft || this.pending !== null) {
+      return;
+    }
+    const root = this.root;
+    const resetButton = root.querySelector<HTMLButtonElement>(
+      `[data-focus-key="clear-overrides-${role}"]`
+    );
+    const restoreFocus =
+      resetButton !== null &&
+      typeof document !== 'undefined' &&
+      document.activeElement === resetButton;
+    const assignments = this.draft.assignments;
+    if (
+      !DIFFICULTIES.some((slot) => hasDifficultyOverride(assignments[role][slot]))
+    ) {
+      return;
+    }
+    for (const slot of DIFFICULTIES) {
+      const cell = assignments[role][slot];
+      cell.model_id = '';
+      cell.effort = null;
+      cell.pending_family = null;
+      const select = root.querySelector<HTMLSelectElement>(
+        `[data-model-key="${role}:${slot}"]`
+      );
+      if (select) {
+        select.value = '';
+      }
+      this.syncEffort(role, slot);
+    }
+    this.refreshDraftStatus();
+    if (restoreFocus) {
+      root
+        .querySelector<HTMLSelectElement>(`[data-model-key="${role}:default"]`)
+        ?.focus({ preventScroll: true });
+    }
   }
 
   private beginCreate(): void {

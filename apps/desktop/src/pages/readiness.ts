@@ -5,6 +5,7 @@ import {
   isApiToolAdapter,
   isExecutionRole,
   isWorkflowRole,
+  workflowRoleLabel,
   type Difficulty,
   type ModelDefinition,
   type RegistrySnapshot,
@@ -17,8 +18,6 @@ import {
 } from '../registry/types.ts';
 import type { ToolVersionScanState } from '../registry/tool-versions.ts';
 
-
-
 const AGENT_TOOL_ADAPTERS: ReadonlySet<ToolAdapter> = new Set([
   'codex_cli',
   'opencode_v2',
@@ -26,15 +25,6 @@ const AGENT_TOOL_ADAPTERS: ReadonlySet<ToolAdapter> = new Set([
 ]);
 
 const REQUIRED_ROLE_COUNT = EXECUTION_ROLES.length;
-
-const ROLE_LABELS: Record<WorkflowRole, string> = {
-  follower: 'Follower',
-  orchestrator: 'Orchestrator',
-  architect: 'Architect',
-  coder: 'Coder',
-  reviewer: 'Reviewer',
-  closure: 'Closure',
-};
 
 export type ReadinessCheckId =
   | 'agent-tools'
@@ -167,7 +157,7 @@ function isLegacyFollowerAssignment(assignment: RoleAssignment): boolean {
 }
 
 function roleLabel(value: string): string {
-  return isWorkflowRole(value) ? ROLE_LABELS[value] : 'Unknown role';
+  return isWorkflowRole(value) ? workflowRoleLabel(value) : 'Unknown role';
 }
 
 function slotLabel(difficulty: Difficulty | null | undefined): string {
@@ -593,7 +583,7 @@ function projectProfiles(
     const missingText =
       defaultEvaluation.missingDefaults.length > 0
         ? `${defaultEvaluation.name} is missing role defaults: ${defaultEvaluation.missingDefaults
-            .map((role) => ROLE_LABELS[role])
+            .map((role) => workflowRoleLabel(role))
             .join(', ')}.`
         : '';
     const issueText =
@@ -634,7 +624,7 @@ function projectProfiles(
     const descriptions = otherPartial.map(
       (evaluation) =>
         `${evaluation.name} (missing ${evaluation.missingDefaults
-          .map((role) => ROLE_LABELS[role])
+          .map((role) => workflowRoleLabel(role))
           .join(', ')})`
     );
     return makeCheck(
@@ -753,7 +743,7 @@ export function projectReadinessChecklist(
     state: evaluation.state,
     defaultCount: REQUIRED_ROLE_COUNT - evaluation.missingDefaults.length,
     requiredDefaultCount: REQUIRED_ROLE_COUNT,
-    missingDefaults: evaluation.missingDefaults.map((role) => ROLE_LABELS[role]),
+    missingDefaults: evaluation.missingDefaults.map((role) => workflowRoleLabel(role)),
     issueCount: evaluation.issues.length,
   }));
   const defaultEvaluation = evaluations.find((evaluation) => evaluation.isDefault) ?? null;

@@ -11,6 +11,7 @@ import {
   resolve_choice,
   validatePlanTasksDag,
   WORKFLOW_ROLES,
+  workflowRoleLabel,
   type DeliveryReceipt,
   type Difficulty,
   type PlanRevision,
@@ -1447,7 +1448,7 @@ export class PlansPage {
         disabled: busy,
       },
       ...WORKFLOW_ROLES.map((r) =>
-        h('option', { value: r, selected: r === task.role }, r)
+        h('option', { value: r, selected: r === task.role }, workflowRoleLabel(r))
       )
     );
     roleSelect.addEventListener('change', () => {
@@ -2390,7 +2391,7 @@ export class PlansPage {
         h(
           'span',
           undefined,
-          `${providerLabel} (${task.tool_label}) · ${task.model_label} [${task.model_arg}] · effort: ${effortLabel} · ${task.role}/${task.difficulty}`
+          `${providerLabel} (${task.tool_label}) · ${task.model_label} [${task.model_arg}] · effort: ${effortLabel} · ${workflowRoleLabel(task.role)}/${task.difficulty}`
         )
       ),
       h('pre', { className: 'aq-plan-approval-task-instruction' }, task.instruction),

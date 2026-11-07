@@ -639,6 +639,24 @@
   color: var(--aq-accent);
 }
 
+.aq-profiles-overrides-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 2px 10px;
+  min-width: 0;
+  padding: 1px 2px;
+}
+
+.aq-profiles-overrides-note {
+  margin: 0;
+  color: var(--aq-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
 .aq-profiles-overrides-body {
   display: grid;
   gap: 6px;

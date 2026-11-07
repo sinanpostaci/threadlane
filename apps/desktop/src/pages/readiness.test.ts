@@ -433,11 +433,11 @@ describe('local readiness projection', () => {
     assert.equal(checkById(projection, 'models').state, 'ready');
     assert.equal(profiles.state, 'attention');
     assert.match(profiles.summary, /partial/i);
-    assert.match(profiles.detail, /Coder/);
+    assert.match(profiles.detail, /Worker/);
     assert.match(profiles.detail, /overrides do not replace/i);
     assert.equal(projection.complete, false);
     assert.equal(projection.readyCount, 4);
-    assert.deepEqual(projection.profiles[0].missingDefaults, ['Coder']);
+    assert.deepEqual(projection.profiles[0].missingDefaults, ['Worker']);
     assert.equal(projection.profiles[0].defaultCount, 4);
     assert.equal(projection.profiles[0].requiredDefaultCount, 5);
     assert.equal(projection.profiles[0].issueCount, 0);
@@ -685,7 +685,7 @@ describe('local readiness projection', () => {
     const overrideProjection = projectReadinessChecklist(invalidOverrideInput);
     assert.equal(overrideProjection.complete, false);
     assert.equal(checkById(overrideProjection, 'models').state, 'blocked');
-    assert.match(checkById(overrideProjection, 'models').detail, /Coder Hard override/);
+    assert.match(checkById(overrideProjection, 'models').detail, /Worker Hard override/);
     assert.match(checkById(overrideProjection, 'models').detail, /does not list/);
     assert.equal(checkById(overrideProjection, 'profiles').state, 'blocked');
     assert.equal(overrideProjection.profiles[0].state, 'invalid');

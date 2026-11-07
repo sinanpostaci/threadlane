@@ -89,6 +89,23 @@ export function isExecutionRole(value: string): value is ExecutionWorkflowRole {
 
 export const isExecutionWorkflowRole = isExecutionRole;
 
+/**
+ * Presentation-only labels for canonical workflow roles. These labels never
+ * change persisted workflow role values, IPC payloads, digests, or validation.
+ */
+const WORKFLOW_ROLE_PRESENTATION_LABELS: Record<WorkflowRole, string> = {
+  follower: 'Follower',
+  orchestrator: 'Orchestrator',
+  architect: 'Architect',
+  coder: 'Worker',
+  reviewer: 'Reviewer',
+  closure: 'Closure',
+};
+
+export function workflowRoleLabel(role: WorkflowRole): string {
+  return WORKFLOW_ROLE_PRESENTATION_LABELS[role];
+}
+
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'extreme';
 
 export const DIFFICULTIES: readonly Difficulty[] = [
