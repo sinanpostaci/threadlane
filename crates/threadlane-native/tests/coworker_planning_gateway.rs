@@ -431,6 +431,18 @@ async fn invoke_mcp_err_code(mcp: &PairedMcpServer, tool: &str, args: Value) -> 
         .to_string()
 }
 
+fn format_command_detail_context(detail: &PlanningCommandDetailResponse) -> String {
+    format!(
+        "command_id={} role={:?} status={:?} pending_reconciliation={} diagnostic={:?} result_ref={:?}",
+        detail.command_id,
+        detail.role,
+        detail.status,
+        detail.pending_reconciliation,
+        detail.diagnostic,
+        detail.result_ref,
+    )
+}
+
 #[tokio::test]
 async fn coworker_planning_tools_advertised_routing_guards_and_readonly_status_absence() {
     let mut fixture = GatewayFixture::start().await;
@@ -743,6 +755,7 @@ async fn wait_for_command_completion(
     mcp: &PairedMcpServer,
     command_id: &str,
 ) -> PlanningCommandDetailResponse {
+    let mut last_detail = None;
     for _ in 0..100 {
         let detail: PlanningCommandDetailResponse =
             invoke_mcp_ok(mcp, "planning_command", json!({ "command_id": command_id })).await;
@@ -751,9 +764,16 @@ async fn wait_for_command_completion(
         {
             return detail;
         }
+        last_detail = Some(detail);
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
-    panic!("timed out waiting for planning command `{command_id}` to reach terminal status");
+    let last_context = last_detail.as_ref().map_or_else(
+        || "<no poll result>".to_string(),
+        format_command_detail_context,
+    );
+    panic!(
+        "timed out waiting for planning command `{command_id}` to reach terminal status; last={last_context}"
+    );
 }
 
 #[tokio::test]
@@ -812,7 +832,12 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     // Release the held fake worker and wait for completion.
     fs::write(&fixture.release_path, b"release\n").expect("release held worker");
     let arch_detail = wait_for_command_completion(&mcp, &submit_arch.command_id).await;
-    assert_eq!(arch_detail.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        arch_detail.status,
+        PlanningCommandStatus::Completed,
+        "arch_detail did not complete cleanly: {}",
+        format_command_detail_context(&arch_detail)
+    );
     assert!(!arch_detail.pending_reconciliation);
     assert_eq!(
         arch_detail
@@ -827,7 +852,15 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     let repeat_arch: PlanningCommandSubmissionResponse =
         invoke_mcp_ok(&mcp, "consult_architect", consult_args).await;
     assert_eq!(repeat_arch.command_id, submit_arch.command_id);
-    assert_eq!(repeat_arch.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        repeat_arch.status,
+        PlanningCommandStatus::Completed,
+        "repeat_arch did not preserve Completed status: command_id={} status={:?} submission_status={:?} diagnostic={:?}",
+        repeat_arch.command_id,
+        repeat_arch.status,
+        repeat_arch.submission_status,
+        repeat_arch.command.diagnostic
+    );
     assert_eq!(
         repeat_arch.submission_status,
         PlanningCommandStartStatus::AlreadyCompleted
@@ -858,7 +891,12 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     )
     .await;
     let clarify_detail = wait_for_command_completion(&mcp, &clarify_submit.command_id).await;
-    assert_eq!(clarify_detail.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        clarify_detail.status,
+        PlanningCommandStatus::Completed,
+        "clarify_detail did not complete cleanly: {}",
+        format_command_detail_context(&clarify_detail)
+    );
     assert!(matches!(
         clarify_detail.result_ref,
         Some(PlanningCommandResultRef::OrchestratorRequiresHumanClarification { .. })
@@ -887,7 +925,12 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     )
     .await;
     let plan_detail = wait_for_command_completion(&mcp, &plan_submit.command_id).await;
-    assert_eq!(plan_detail.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        plan_detail.status,
+        PlanningCommandStatus::Completed,
+        "plan_detail did not complete cleanly: {}",
+        format_command_detail_context(&plan_detail)
+    );
     let orch_summary = plan_detail
         .orchestrator_plan_summary
         .as_ref()
@@ -924,6 +967,12 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
     )
     .await;
     let update_detail = wait_for_command_completion(&mcp, &update_submit.command_id).await;
+    assert_eq!(
+        update_detail.status,
+        PlanningCommandStatus::Completed,
+        "update_detail did not complete cleanly: {}",
+        format_command_detail_context(&update_detail)
+    );
     assert_eq!(
         update_detail
             .orchestrator_plan_summary
@@ -1154,7 +1203,12 @@ async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_archi
     )
     .await;
     let zero_detail = wait_for_command_completion(&mcp, &zero_submit.command_id).await;
-    assert_eq!(zero_detail.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        zero_detail.status,
+        PlanningCommandStatus::Completed,
+        "zero_detail did not complete cleanly: {}",
+        format_command_detail_context(&zero_detail)
+    );
     assert!(matches!(
         zero_detail.result_ref,
         Some(PlanningCommandResultRef::OrchestratorRequiresArchitectAdvice { .. })
@@ -1199,7 +1253,12 @@ async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_archi
     let auto_submit: PlanningCommandSubmissionResponse =
         invoke_mcp_ok(&mcp, "request_technical_plan", omitted_args.clone()).await;
     let auto_detail = wait_for_command_completion(&mcp, &auto_submit.command_id).await;
-    assert_eq!(auto_detail.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        auto_detail.status,
+        PlanningCommandStatus::Completed,
+        "auto_detail did not complete cleanly: {}",
+        format_command_detail_context(&auto_detail)
+    );
     assert!(matches!(
         auto_detail.result_ref,
         Some(PlanningCommandResultRef::OrchestratorPlan { .. })
@@ -1318,7 +1377,12 @@ async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_archi
     )
     .await;
     let no_arch_detail = wait_for_command_completion(&mcp, &no_arch_submit.command_id).await;
-    assert_eq!(no_arch_detail.status, PlanningCommandStatus::Completed);
+    assert_eq!(
+        no_arch_detail.status,
+        PlanningCommandStatus::Completed,
+        "no_arch_detail did not complete cleanly: {}",
+        format_command_detail_context(&no_arch_detail)
+    );
     assert!(matches!(
         no_arch_detail.result_ref,
         Some(PlanningCommandResultRef::OrchestratorRequiresArchitectAdvice { .. })
@@ -1528,7 +1592,12 @@ async fn detached_cli_planning_completion_notifies_private_websocket_peer_once()
         assert!(!text.contains("toolOutput"));
 
         let detail = wait_for_command_completion(&mcp, &command.command_id).await;
-        assert_eq!(detail.status, PlanningCommandStatus::Completed);
+        assert_eq!(
+            detail.status,
+            PlanningCommandStatus::Completed,
+            "detached notice consult detail did not complete cleanly: {}",
+            format_command_detail_context(&detail)
+        );
         assert!(!detail.pending_reconciliation);
         assert_eq!(
             detail

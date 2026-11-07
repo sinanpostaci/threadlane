@@ -886,6 +886,8 @@ enum CommandLedgerTxOutcome<T> {
 const ABANDONED_RUNNING_DIAGNOSTIC: &str =
     "running planning command owner lock was released before recording a terminal outcome; outcome is unknown pending artifact/receipt reconciliation";
 
+const MAX_READ_LEDGER_REVALIDATION_ATTEMPTS: usize = 8;
+
 impl PlanningCommandStore {
     /// Opens a [`PlanningCommandStore`] over an existing private (`0700`) `commands_dir` without
     /// creating directories, state files, or lockfiles.
@@ -978,29 +980,61 @@ impl PlanningCommandStore {
     /// Never creates directories, state files, or lockfiles. Any persisted `Running` command whose
     /// live [`CoworkerJobOwnershipGuard`] kernel lock is no longer held by its recorded
     /// `owner_summary.instance_id` is surfaced as [`PlanningCommandStatus::Unknown`] with
-    /// `pending_reconciliation = true`.
+    /// `pending_reconciliation = true`, after revalidating that the persisted ledger revision and
+    /// content did not advance while the owner lock was probed.
     pub fn read_binding_ledger(
         &self,
         binding_id: &str,
     ) -> Result<PlanningCommandBindingLedger, NativeError> {
+        self.read_binding_ledger_with_probe_hook(binding_id, |_, _| Ok(()))
+    }
+
+    fn read_binding_ledger_with_probe_hook<H>(
+        &self,
+        binding_id: &str,
+        mut before_owner_probe: H,
+    ) -> Result<PlanningCommandBindingLedger, NativeError>
+    where
+        H: FnMut(usize, &PlanningCommandRecord) -> Result<(), NativeError>,
+    {
         validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         let _ = validate_existing_private_store_dir(&self.commands_dir, "planning_commands_dir")?;
         let path = self.ledger_path_for_binding(binding_id)?;
-        let Some(mut ledger) = self.read_ledger_unlocked(binding_id, &path)? else {
+        let Some(mut current) = self.read_ledger_unlocked(binding_id, &path)? else {
             return PlanningCommandBindingLedger::empty(binding_id);
         };
-        for cmd in &mut ledger.commands {
-            if cmd.status == PlanningCommandStatus::Running
-                && !self.is_running_owner_still_active(cmd)?
-            {
-                cmd.status = PlanningCommandStatus::Unknown;
-                cmd.pending_reconciliation = true;
-                if cmd.diagnostic.is_none() {
-                    cmd.diagnostic = Some(ABANDONED_RUNNING_DIAGNOSTIC.to_string());
+        for attempt in 0..MAX_READ_LEDGER_REVALIDATION_ATTEMPTS {
+            let mut projected = current.clone();
+            let mut saw_inactive_running = false;
+            for cmd in &mut projected.commands {
+                if cmd.status == PlanningCommandStatus::Running {
+                    before_owner_probe(attempt, cmd)?;
+                    if !self.is_running_owner_still_active(cmd)? {
+                        saw_inactive_running = true;
+                        cmd.status = PlanningCommandStatus::Unknown;
+                        cmd.pending_reconciliation = true;
+                        if cmd.diagnostic.is_none() {
+                            cmd.diagnostic = Some(ABANDONED_RUNNING_DIAGNOSTIC.to_string());
+                        }
+                    }
                 }
             }
+            if !saw_inactive_running {
+                return Ok(projected);
+            }
+            let Some(rechecked) = self.read_ledger_unlocked(binding_id, &path)? else {
+                return PlanningCommandBindingLedger::empty(binding_id);
+            };
+            if rechecked.revision == current.revision && rechecked == current {
+                projected.validate(binding_id)?;
+                return Ok(projected);
+            }
+            current = rechecked;
         }
-        Ok(ledger)
+        Err(NativeError::new(
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+            "planning command ledger changed continuously while revalidating inactive Running owner state",
+        ))
     }
 
     /// Pure read-only lookup of a command by `(binding_id, thread_uuid, command_id)`.
@@ -3328,4 +3362,476 @@ pub fn current_wall_clock_ms() -> Result<u64, NativeError> {
             "wall-clock millisecond timestamp overflow",
         )
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+    use threadlane_workers::run_sanitized_git;
+    use threadlane_workflow::{
+        ModelChoice, ModelDefinition, RegistryChange, RegistryStore, RoleAssignment,
+        ToolDefinition, WorkflowProfile,
+    };
+
+    use super::*;
+    use crate::coworker_workflow::{
+        ArchitectContextDependencies, CreatePlanningGrantRequest, PlanningCallBudget,
+        PlanningReadOnlyCapabilities,
+    };
+    use crate::planning_driver::open_planning_driver_for_plans_dir;
+    use crate::{ExecutionPolicy, PolicyAllowRule, EXECUTION_POLICY_SCHEMA_VERSION};
+
+    const TEST_BINDING_ID: &str = "binding-cmd-race";
+    const TEST_THREAD_UUID: &str = "0196ed00-0000-7000-8000-0000000000c1";
+    const TEST_PROFILE_ID: &str = "profile-cmd-race";
+    const TEST_TOOL_ID: &str = "tool-agy";
+    const TEST_MODEL_ID: &str = "model-argon";
+
+    fn create_private_dir(path: &Path) {
+        fs::create_dir_all(path).expect("create private directory");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    }
+
+    fn init_git_repo(repo_dir: &Path) -> CanonicalProjectBaseRef {
+        fs::create_dir_all(repo_dir.join("src")).expect("create repo src");
+        fs::write(
+            repo_dir.join("src/lib.rs"),
+            "pub fn planning_race_seed() -> u32 { 7 }\n",
+        )
+        .expect("write src/lib.rs");
+
+        for args in [
+            &["init", "--quiet"][..],
+            &["config", "user.email", "test@threadlane.local"][..],
+            &["config", "user.name", "Threadlane Test"][..],
+            &["add", "."][..],
+            &["commit", "-m", "initial commit", "--quiet"][..],
+        ] {
+            run_sanitized_git(repo_dir, args, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+                .expect("git init step");
+        }
+        let commit = resolve_exact_commit_sha(repo_dir, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve HEAD commit");
+        let tree = resolve_exact_tree_sha(repo_dir, &commit, DEFAULT_GIT_COMMAND_TIMEOUT_MS)
+            .expect("resolve HEAD tree");
+        CanonicalProjectBaseRef {
+            repository_path: repo_dir.to_string_lossy().into_owned(),
+            base_commit: commit,
+            base_tree_sha: tree,
+        }
+    }
+
+    fn write_counting_architect_worker(script_path: &Path, counter_path: &Path) {
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf 'invoked\n' >> '{}'
+printf '{{"event":"init","init":{{"session_id":"agy-cmd-race-1","model":"gemini-4-argon-high"}}}}\n'
+RESPONSE_JSON='{{\"schema_version\":1,\"decision_summary\":\"Keep strict planning command boundary\",\"rationale\":\"Verify completed command result against stored advice, reservation, and private artifact.\",\"recommended_write_paths\":[\"src/lib.rs\"],\"interface_contracts\":{{\"iface_gateway\":\"Stable contract v1\"}},\"open_questions\":[]}}'
+printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$RESPONSE_JSON"
+exit 0
+"#,
+            counter_path.display(),
+        );
+        fs::write(script_path, script).expect("write fake worker");
+        fs::set_permissions(script_path, fs::Permissions::from_mode(0o700))
+            .expect("chmod fake worker 0700");
+    }
+
+    fn test_policy() -> ExecutionPolicy {
+        ExecutionPolicy {
+            schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+            policy_id: "policy-cmd-race-test".to_string(),
+            allow_rules: vec![PolicyAllowRule {
+                tool_id: TEST_TOOL_ID.to_string(),
+                model_id: TEST_MODEL_ID.to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn read_binding_ledger_revalidates_completed_command_on_owner_unlock_race_and_preserves_abandoned_unknown(
+    ) {
+        let tmp = TempDir::new().expect("create tempdir");
+        let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod root 0700");
+
+        let repo_dir = root.join("repo");
+        let project_base = init_git_repo(&repo_dir);
+
+        let bin_dir = root.join("bin");
+        create_private_dir(&bin_dir);
+        let fake_worker_path = bin_dir.join("fake-agy");
+        let worker_counter = root.join("worker-invoked");
+        write_counting_architect_worker(&fake_worker_path, &worker_counter);
+
+        let registry_dir = root.join("registry-store");
+        let plans_dir = root.join("plans-store");
+        create_private_dir(&registry_dir);
+        create_private_dir(&plans_dir);
+
+        let registry = RegistryStore::open(&registry_dir).expect("open registry store");
+        let s1 = registry
+            .apply(
+                0,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: TEST_TOOL_ID.to_string(),
+                        label: "Antigravity race fixture".to_string(),
+                        adapter: ToolAdapter::Antigravity,
+                        executable_path: Some(fake_worker_path),
+                        enabled: true,
+                    },
+                },
+            )
+            .expect("upsert tool");
+        let s2 = registry
+            .apply(
+                s1.revision,
+                RegistryChange::UpsertModel {
+                    model: ModelDefinition {
+                        id: TEST_MODEL_ID.to_string(),
+                        tool_id: TEST_TOOL_ID.to_string(),
+                        label: "Gemini 4 Argon High".to_string(),
+                        model_arg: "gemini-4-argon-high".to_string(),
+                        efforts: vec!["high".to_string()],
+                        allow_no_effort: false,
+                    },
+                },
+            )
+            .expect("upsert model");
+        registry
+            .apply(
+                s2.revision,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: None,
+                        id: TEST_PROFILE_ID.to_string(),
+                        name: "Command race fixture profile".to_string(),
+                        assignments: vec![
+                            RoleAssignment {
+                                role: WorkflowRole::Orchestrator,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: TEST_MODEL_ID.to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Architect,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: TEST_MODEL_ID.to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Coder,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: TEST_MODEL_ID.to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                        ],
+                    },
+                },
+            )
+            .expect("upsert profile");
+        let registry_lock = registry_dir.join("registry.lock");
+        if registry_lock.exists() {
+            fs::remove_file(&registry_lock).expect("remove initial registry.lock");
+        }
+
+        let driver =
+            open_planning_driver_for_plans_dir(&plans_dir, &registry_dir).expect("open driver");
+        let store = driver.command_store().clone();
+        let service = driver.service().clone();
+
+        let now_ms = current_wall_clock_ms().expect("wall clock");
+        let grant = store
+            .workflow_store()
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: TEST_BINDING_ID.to_string(),
+                thread_uuid: TEST_THREAD_UUID.to_string(),
+                request_key: "grant-cmd-race-1".to_string(),
+                expected_ledger_revision: None,
+                project_base: project_base.clone(),
+                profile_id: TEST_PROFILE_ID.to_string(),
+                registry_revision: 3,
+                policy: test_policy(),
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 6,
+                    max_orchestrator_calls: 4,
+                    max_architect_calls: 2,
+                    max_timeout_ms_per_call: 60_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms: now_ms.saturating_sub(1_000),
+                expires_at_ms: now_ms + 600_000,
+                operator_attested: true,
+            })
+            .expect("create planning grant");
+
+        let dependency_file_blobs = CoworkerPlanningService::compute_dependency_file_blobs(
+            &project_base,
+            &["src/lib.rs".to_string()],
+        )
+        .expect("compute dependency blobs");
+        let context_dependencies = ArchitectContextDependencies {
+            project_base: project_base.clone(),
+            work_brief_digest: sha256_hex(b"cmd-race-brief"),
+            plan_digest: None,
+            policy_digest: grant.policy_digest.clone(),
+            dependency_file_blobs,
+            interface_ownership_digests: BTreeMap::new(),
+            accepted_predecessor_trees: BTreeMap::new(),
+        };
+
+        let queued_completed = store
+            .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+                RunArchitectAdviceRequest {
+                    binding_id: TEST_BINDING_ID.to_string(),
+                    thread_uuid: TEST_THREAD_UUID.to_string(),
+                    grant_id: grant.grant_id.clone(),
+                    request_key: "req-arch-race-completed".to_string(),
+                    expected_ledger_revision: None,
+                    difficulty: Some(Difficulty::Hard),
+                    context_dependencies: context_dependencies.clone(),
+                    question_summary: "Verify read_binding_ledger revalidation across unlock race"
+                        .to_string(),
+                    prior_advice_context: Vec::new(),
+                    accept_into_brief: false,
+                    current_time_ms: current_wall_clock_ms().expect("clock"),
+                },
+            ))
+            .expect("enqueue command 1");
+        assert_eq!(queued_completed.status, PlanningCommandStatus::Queued);
+
+        let key1 = queued_completed.ownership_key().expect("ownership key 1");
+        let guard1 = store
+            .ownership_store()
+            .try_acquire_job(&key1, current_wall_clock_ms().expect("clock"))
+            .expect("try_acquire_job 1")
+            .into_guard()
+            .expect("guard 1");
+        let running1 = store
+            .claim_running(
+                &guard1,
+                TEST_BINDING_ID,
+                TEST_THREAD_UUID,
+                &queued_completed.command_id,
+                None,
+            )
+            .expect("claim_running 1");
+        assert_eq!(running1.status, PlanningCommandStatus::Running);
+
+        let PlanningCommandPayload::Architect(mut arch_req) = running1.payload.clone() else {
+            panic!("expected Architect payload");
+        };
+        arch_req.request_key = running1.service_request_key.clone();
+        arch_req.current_time_ms = current_wall_clock_ms().expect("clock");
+        let outcome = service
+            .obtain_architect_advice(&arch_req)
+            .await
+            .expect("obtain_architect_advice");
+        let result_ref = PlanningCommandResultRef::ArchitectAdvice {
+            advice_id: outcome.record.advice_id.clone(),
+            reservation_id: outcome.reservation_id.clone(),
+            report_artifact_id: outcome
+                .record
+                .report_artifact_id
+                .clone()
+                .expect("report_artifact_id"),
+            context_digest: outcome.record.context_digest.clone(),
+            decision_digest: outcome.record.decision_digest.clone(),
+            reused_existing: outcome.reused_existing,
+            artifact_verified: false,
+        };
+
+        // Deterministically force completion commit + owner guard unlock between the first
+        // snapshot read (at revision 2 where running1 is Running) and the owner lock probe.
+        let guard_slot = RefCell::new(Some(guard1));
+        let result_slot = RefCell::new(Some(result_ref));
+        let mut probe_hook_invocations = 0usize;
+        let revalidated = store
+            .read_binding_ledger_with_probe_hook(TEST_BINDING_ID, |attempt, probed_cmd| {
+                probe_hook_invocations += 1;
+                assert_eq!(attempt, 0);
+                assert_eq!(probed_cmd.command_id, queued_completed.command_id);
+                assert_eq!(probed_cmd.status, PlanningCommandStatus::Running);
+                let live_guard = guard_slot
+                    .borrow_mut()
+                    .take()
+                    .expect("live guard present on attempt 0");
+                let pending_result = result_slot
+                    .borrow_mut()
+                    .take()
+                    .expect("result_ref present on attempt 0");
+                let completed = store
+                    .record_completed(
+                        &live_guard,
+                        TEST_BINDING_ID,
+                        TEST_THREAD_UUID,
+                        &queued_completed.command_id,
+                        pending_result,
+                        None,
+                    )
+                    .expect("record_completed inside snapshot-to-probe window");
+                assert_eq!(completed.status, PlanningCommandStatus::Completed);
+                drop(live_guard);
+                Ok(())
+            })
+            .expect("read_binding_ledger_with_probe_hook must revalidate to Completed");
+
+        assert_eq!(probe_hook_invocations, 1);
+        assert_eq!(revalidated.revision, 3);
+        assert_eq!(revalidated.commands.len(), 1);
+        let observed = &revalidated.commands[0];
+        assert_eq!(observed.command_id, queued_completed.command_id);
+        assert_eq!(observed.status, PlanningCommandStatus::Completed);
+        assert!(!observed.pending_reconciliation);
+        assert_eq!(observed.diagnostic, None);
+
+        let verified_ref = store
+            .verify_completed_command(observed)
+            .expect("verify_completed_command after race revalidation");
+        assert!(matches!(
+            verified_ref,
+            PlanningCommandResultRef::ArchitectAdvice {
+                artifact_verified: true,
+                ..
+            }
+        ));
+
+        let fetched = store
+            .get_command(
+                TEST_BINDING_ID,
+                TEST_THREAD_UUID,
+                &queued_completed.command_id,
+            )
+            .expect("get_command")
+            .expect("completed command present");
+        assert_eq!(fetched.status, PlanningCommandStatus::Completed);
+        assert!(!fetched.pending_reconciliation);
+
+        let provider_calls = fs::read_to_string(&worker_counter)
+            .expect("read worker counter")
+            .lines()
+            .count();
+        assert_eq!(
+            provider_calls, 1,
+            "revalidation must not trigger any extra provider call"
+        );
+
+        // Now verify that an actual crashed/absent-owner Running command still projects Unknown
+        // without mutating the persisted ledger or creating lockfiles on read.
+        let queued_abandoned = store
+            .enqueue_command(&EnqueuePlanningCommandRequest::from_architect(
+                RunArchitectAdviceRequest {
+                    binding_id: TEST_BINDING_ID.to_string(),
+                    thread_uuid: TEST_THREAD_UUID.to_string(),
+                    grant_id: grant.grant_id.clone(),
+                    request_key: "req-arch-race-abandoned".to_string(),
+                    expected_ledger_revision: None,
+                    difficulty: Some(Difficulty::Hard),
+                    context_dependencies,
+                    question_summary: "Verify genuine abandoned Running still projects Unknown"
+                        .to_string(),
+                    prior_advice_context: Vec::new(),
+                    accept_into_brief: false,
+                    current_time_ms: current_wall_clock_ms().expect("clock"),
+                },
+            ))
+            .expect("enqueue command 2");
+        let key2 = queued_abandoned.ownership_key().expect("ownership key 2");
+        let guard2 = store
+            .ownership_store()
+            .try_acquire_job(&key2, current_wall_clock_ms().expect("clock"))
+            .expect("try_acquire_job 2")
+            .into_guard()
+            .expect("guard 2");
+        let running2 = store
+            .claim_running(
+                &guard2,
+                TEST_BINDING_ID,
+                TEST_THREAD_UUID,
+                &queued_abandoned.command_id,
+                None,
+            )
+            .expect("claim_running 2");
+        assert_eq!(running2.status, PlanningCommandStatus::Running);
+        drop(guard2);
+
+        let lock_path = store
+            .lock_path_for_binding(TEST_BINDING_ID)
+            .expect("lock path");
+        if lock_path.exists() {
+            fs::remove_file(&lock_path).expect("remove command ledger lock before read test");
+        }
+
+        let projected_abandoned = store
+            .get_command(
+                TEST_BINDING_ID,
+                TEST_THREAD_UUID,
+                &queued_abandoned.command_id,
+            )
+            .expect("get_command abandoned")
+            .expect("abandoned command present");
+        assert_eq!(projected_abandoned.status, PlanningCommandStatus::Unknown);
+        assert!(projected_abandoned.pending_reconciliation);
+        assert_eq!(
+            projected_abandoned.diagnostic.as_deref(),
+            Some(ABANDONED_RUNNING_DIAGNOSTIC)
+        );
+        assert!(
+            !lock_path.exists(),
+            "read-only projection must not create a command ledger lockfile"
+        );
+
+        let ledger_path = store
+            .ledger_path_for_binding(TEST_BINDING_ID)
+            .expect("ledger path");
+        let raw_on_disk = store
+            .read_ledger_unlocked(TEST_BINDING_ID, &ledger_path)
+            .expect("read raw ledger")
+            .expect("raw ledger exists");
+        assert_eq!(
+            raw_on_disk.commands[1].status,
+            PlanningCommandStatus::Running
+        );
+
+        let provider_calls_after = fs::read_to_string(&worker_counter)
+            .expect("read worker counter")
+            .lines()
+            .count();
+        assert_eq!(provider_calls_after, 1);
+
+        // Continuous ledger revision churn across MAX_READ_LEDGER_REVALIDATION_ATTEMPTS while
+        // an inactive Running projection is pending must fail closed.
+        let churn_err = store
+            .read_binding_ledger_with_probe_hook(TEST_BINDING_ID, |_attempt, probed_cmd| {
+                assert_eq!(probed_cmd.command_id, queued_abandoned.command_id);
+                let mut latest = store
+                    .read_ledger_unlocked(TEST_BINDING_ID, &ledger_path)?
+                    .expect("raw ledger present");
+                latest.revision += 1;
+                store.write_ledger_unlocked(TEST_BINDING_ID, &latest)
+            })
+            .expect_err("continuous revision churn must fail closed");
+        assert_eq!(
+            churn_err.code,
+            NativeErrorCode::AmbiguousWakeupPendingReconciliation
+        );
+    }
 }
