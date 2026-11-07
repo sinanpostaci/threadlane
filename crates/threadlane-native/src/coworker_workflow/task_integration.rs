@@ -12,7 +12,7 @@ use threadlane_operations::{
 };
 use threadlane_workers::{
     is_commit_ancestor, is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha,
-    resolve_exact_tree_sha, WorkerFilePermissions, WorkerProvider, WorktreeKind, WorktreeManifest,
+    resolve_exact_tree_sha, WorkerFilePermissions, WorktreeKind, WorktreeManifest,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
 
@@ -284,6 +284,7 @@ pub fn integrate_accepted_task(
         .join(WORK_AREA_SUBDIR);
 
     let (task_manifest, int_manifest) = load_and_verify_owned_manifests(
+        plans_dir,
         &work_area_root,
         &adm,
         &candidate_task,
@@ -1025,7 +1026,7 @@ fn finalize_verified_integration_after_effect(
                 tree_sha: Some(verified_int_receipt.integrated_tree_sha.clone()),
                 diff_digest: Some(accepted_candidate.diff_digest.clone()),
                 report_artifact_id: None,
-                observed_model: Some(artifacts.observed_model.clone()),
+                observed_model: artifacts.observed_model.clone(),
                 observed_effort: artifacts.observed_effort.clone(),
                 receipt_id: Some(verified_int_receipt.receipt_id.clone()),
                 diagnostic: None,
@@ -1339,15 +1340,10 @@ fn verify_live_task_integration_admission(
             "TaskAttemptExecutionArtifacts has invalid task_id, attempt_no, run_id, worker_id, or worktree_id",
         ));
     }
-    if artifacts.observed_model != candidate_task.selected_choice.model_arg
-        || artifacts.observed_model != approved_task.base_model
-        || approved_task.provider.map(WorkerProvider::as_str)
-            != Some(artifacts.observed_provider.as_str())
-        || artifacts.observed_effort != candidate_task.selected_choice.effort
-    {
+    if !artifacts.has_matching_coder_evidence(&approved_task, &candidate_task.selected_choice) {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            "TaskAttemptExecutionArtifacts observed provider/model/effort does not match frozen coder choice",
+            "Coder launch or observed evidence does not match the frozen task",
         ));
     }
     if artifacts.committed_head_commit.as_deref() != Some(accepted_candidate.head_commit.as_str())
@@ -1420,6 +1416,7 @@ fn verify_live_task_integration_admission(
 }
 
 fn load_and_verify_owned_manifests(
+    plans_dir: &Path,
     work_area_root: &Path,
     adm: &VerifiedControllerAdmission,
     candidate_task: &CoworkerTaskRecord,
@@ -1485,6 +1482,7 @@ fn load_and_verify_owned_manifests(
         ));
     }
 
+    artifacts.verify_coder_manifest_evidence(approved_task, &task_manifest, plans_dir)?;
     Ok((task_manifest, int_manifest))
 }
 
@@ -1572,8 +1570,7 @@ fn load_and_verify_accepted_review_proofs(
         || runtime_subject.policy.requested_model.as_deref()
             != Some(candidate_task.selected_choice.model_arg.as_str())
         || runtime_subject.policy.requested_effort != candidate_task.selected_choice.effort
-        || runtime_subject.policy.observed_model.as_deref()
-            != Some(artifacts.observed_model.as_str())
+        || runtime_subject.policy.observed_model.as_deref() != artifacts.observed_model.as_deref()
         || runtime_subject.policy.observed_effort != artifacts.observed_effort
         || runtime_subject.policy.file_permissions != expected_file_perms
         || runtime_subject.policy.require_effort_evidence

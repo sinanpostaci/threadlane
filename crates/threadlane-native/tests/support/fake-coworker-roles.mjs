@@ -14,6 +14,7 @@ if (!stateDir) {
 }
 
 const args = process.argv.slice(3);
+const codexTask = args[0] === "--no-daemon" && args[1] === "exec";
 let model = "";
 let effort = "";
 let mode = "";
@@ -336,6 +337,8 @@ if (mode === "plan") {
 }
 
 // Execution mode (`--mode` != `plan`): Coder task execution in owned worktree (`process.cwd()`).
+if (codexTask) prompt = args.at(-1);
+
 const coderSeq = withStateLock(() => incrementCounterUnlocked("agy_coder_count.txt"));
 const coderSessionId = `sess-agy-coder-${coderSeq}`;
 
@@ -347,7 +350,12 @@ const initEvent = {
 if (effort) {
   initEvent.effort = effort;
 }
-process.stdout.write(`${JSON.stringify(initEvent)}\n`);
+if (codexTask) {
+  process.stdout.write(`${JSON.stringify({type: "thread.started", thread_id: coderSessionId})}\n`);
+  process.stdout.write(`${JSON.stringify({type: "turn.started"})}\n`);
+} else {
+  process.stdout.write(`${JSON.stringify(initEvent)}\n`);
+}
 
 const worktreeDir = process.cwd();
 const srcDir = path.join(worktreeDir, "src");
@@ -413,4 +421,4 @@ const resultEvent = {
 if (effort) {
   resultEvent.effort = effort;
 }
-process.stdout.write(`${JSON.stringify(resultEvent)}\n`);
+process.stdout.write(`${JSON.stringify(codexTask ? {type: "turn.completed", usage: {input_tokens: 10, output_tokens: 5}} : resultEvent)}\n`);

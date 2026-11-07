@@ -20,7 +20,7 @@ use threadlane_operations::{
     verify_dependency_predecessor_proof, DependencyPredecessorCandidate, OperationsError,
 };
 use threadlane_plans::PlanStore;
-use threadlane_registry::{RegistryStore, ToolAdapter};
+use threadlane_registry::RegistryStore;
 use threadlane_workers::{
     is_commit_ancestor, load_and_verify_manifest, read_dependency_input, DependencyInputSeal,
     DependencyPredecessorInput, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
@@ -886,7 +886,7 @@ impl ApprovedHostClient {
                 task_id: request.task_id.clone(),
             })?;
 
-        if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        if !task.is_frozen_headless_worker() {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
                 task_id: task.task_id.clone(),
@@ -1053,7 +1053,7 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        if !task.is_frozen_headless_worker() {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
                 task_id: task.task_id.clone(),
@@ -1383,7 +1383,7 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        if !task.is_frozen_headless_worker() {
             let status = TaskExecutionStatus::NativeRouteRequired;
             let lifecycle = Some(project_task_lifecycle(
                 &session.record,
@@ -1563,7 +1563,7 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        if !task.is_frozen_headless_worker() {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
                 task_id: task.task_id.clone(),
@@ -1920,7 +1920,7 @@ impl ApprovedHostClient {
                 task_id: task_id.to_string(),
             })?;
 
-        if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+        if !task.is_frozen_headless_worker() {
             return Err(HostError::NativeRouteRequired {
                 approval_id: record.approval_id.clone(),
                 task_id: task.task_id.clone(),
@@ -2112,7 +2112,7 @@ impl ApprovedHostClient {
                 adapter: pred_task.adapter,
             });
         };
-        if pred_task.adapter == ToolAdapter::CodexCli {
+        if !pred_task.is_frozen_headless_worker() {
             return Err(HostError::NativeRouteRequired {
                 approval_id: session.record.approval_id.clone(),
                 task_id: pred_task.task_id.clone(),
@@ -2255,7 +2255,12 @@ impl ApprovedHostClient {
             || outcome.timed_out
             || outcome.cancelled
             || outcome.exit_code != Some(0)
-            || worker.observed_model.as_deref() != Some(pred_task.base_model.as_str())
+            || !crate::lifecycle::verify_worker_model_evidence(
+                &session.record,
+                &session.session_dir,
+                pred_task,
+                &worker,
+            )
         {
             return Err(HostError::DependencyInputsUnverified {
                 approval_id: session.record.approval_id.clone(),
@@ -2264,7 +2269,9 @@ impl ApprovedHostClient {
             });
         }
         if let Some(ref expected_effort) = pred_task.effort {
-            if worker.observed_effort.as_deref() != Some(expected_effort.as_str()) {
+            if pred_provider != threadlane_workers::WorkerProvider::CodexCli
+                && worker.observed_effort.as_deref() != Some(expected_effort.as_str())
+            {
                 return Err(HostError::DependencyInputsUnverified {
                     approval_id: session.record.approval_id.clone(),
                     task_id: pred_task.task_id.clone(),

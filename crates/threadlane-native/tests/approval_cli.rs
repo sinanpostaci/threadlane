@@ -1340,3 +1340,193 @@ async fn authority_operator_helpers_preview_read_only_and_rebuild_before_duplica
     drop(store);
     fx.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fixed_scope_flags_enforce_binding_thread_and_project_root_before_ledger_effects() {
+    let mut fx = ApprovalFixture::start().await;
+    let intent_path = fx.write_request("fixed-scope-intent.json", &fx.intent());
+
+    // Partial fixed-scope flags (--binding without --thread, or --project-root without --binding/--thread) fail closed.
+    let partial_binding_only = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        fx.binding_id.clone(),
+        "prepare".to_string(),
+        "--request".to_string(),
+        intent_path.to_string_lossy().into_owned(),
+    ];
+    let partial_err = expect_failure(
+        &fx.run_cli(&partial_binding_only).await,
+        "partial --binding without --thread",
+    );
+    assert_eq!(partial_err.code, "invalid_input");
+
+    let partial_project_only = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--project-root".to_string(),
+        fx.repo.to_string_lossy().into_owned(),
+        "prepare".to_string(),
+        "--request".to_string(),
+        intent_path.to_string_lossy().into_owned(),
+    ];
+    let partial_proj_err = expect_failure(
+        &fx.run_cli(&partial_project_only).await,
+        "partial --project-root without --binding/--thread",
+    );
+    assert_eq!(partial_proj_err.code, "invalid_input");
+
+    // Fixed --binding mismatch with request binding_id is rejected before ledger effects.
+    let wrong_binding_args = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        "bnd_other_chat".to_string(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--project-root".to_string(),
+        fx.repo.to_string_lossy().into_owned(),
+        "prepare".to_string(),
+        "--request".to_string(),
+        intent_path.to_string_lossy().into_owned(),
+    ];
+    let wrong_binding_err = expect_failure(
+        &fx.run_cli(&wrong_binding_args).await,
+        "fixed --binding mismatch with request",
+    );
+    assert_eq!(wrong_binding_err.code, "binding_mismatch");
+
+    // Fixed --thread mismatch with request thread_uuid is rejected before ledger effects.
+    let wrong_thread_args = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        fx.binding_id.clone(),
+        "--thread".to_string(),
+        OTHER_THREAD_UUID.to_string(),
+        "--project-root".to_string(),
+        fx.repo.to_string_lossy().into_owned(),
+        "prepare".to_string(),
+        "--request".to_string(),
+        intent_path.to_string_lossy().into_owned(),
+    ];
+    let wrong_thread_err = expect_failure(
+        &fx.run_cli(&wrong_thread_args).await,
+        "fixed --thread mismatch with request",
+    );
+    assert_eq!(wrong_thread_err.code, "thread_uuid_mismatch");
+
+    // Fixed --project-root mismatch with request repository_path is rejected before ledger effects.
+    let other_repo = fx.root.join("other-repo");
+    let _other_commit = init_disposable_repo(&other_repo);
+    let wrong_repo_args = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        fx.binding_id.clone(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--project-root".to_string(),
+        other_repo.to_string_lossy().into_owned(),
+        "prepare".to_string(),
+        "--request".to_string(),
+        intent_path.to_string_lossy().into_owned(),
+    ];
+    let wrong_repo_err = expect_failure(
+        &fx.run_cli(&wrong_repo_args).await,
+        "fixed --project-root mismatch with request repository_path",
+    );
+    assert_eq!(wrong_repo_err.code, "invalid_repository");
+    fx.assert_no_approval_artifacts();
+
+    // Matching fixed scope succeeds for prepare and record.
+    let matching_prepare_args = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        fx.binding_id.clone(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--project-root".to_string(),
+        fx.repo.to_string_lossy().into_owned(),
+        "prepare".to_string(),
+        "--request".to_string(),
+        intent_path.to_string_lossy().into_owned(),
+    ];
+    let preview: OperatorApprovalPreview = parse_success(
+        &fx.run_cli(&matching_prepare_args).await,
+        "matching fixed-scope prepare",
+    );
+    let req_path = fx.write_request("fixed-scope-request.json", &preview.request);
+
+    let matching_record_args = vec![
+        "--state-dir".to_string(),
+        fx.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fx.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fx.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fx.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        fx.binding_id.clone(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--project-root".to_string(),
+        fx.repo.to_string_lossy().into_owned(),
+        "record".to_string(),
+        "--request".to_string(),
+        req_path.to_string_lossy().into_owned(),
+        "--confirm-subject".to_string(),
+        preview.subject_digest.clone(),
+        "--confirm-thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--operator-approved".to_string(),
+    ];
+    let summary: ApprovalSummary = parse_success(
+        &fx.run_cli(&matching_record_args).await,
+        "matching fixed-scope record",
+    );
+    assert_eq!(summary.subject_digest, preview.subject_digest);
+    assert_eq!(fx.approval_count(), 1);
+    fx.assert_no_worker_invocation();
+
+    fx.shutdown().await;
+}

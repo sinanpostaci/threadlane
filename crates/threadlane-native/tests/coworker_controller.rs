@@ -1424,6 +1424,8 @@ fn accept_and_integrate_completed_root_task(
 
     let policy = ReviewPolicyBinding {
         policy_id: "policy-coworker-exec".to_string(),
+        codex_launch_report: None,
+        codex_source_report_sha256: None,
         requested_provider: Some("antigravity".to_string()),
         requested_model: Some("gemini-4-argon-high".to_string()),
         requested_effort: Some("high".to_string()),
@@ -2406,7 +2408,10 @@ async fn assert_initial_coder_verification(opencode: bool) {
                     .get(&ControllerJobRuntimeState::artifact_key("task-verify-a", 1))
                     .unwrap();
                 assert_eq!(artifact.observed_provider, "opencode_v2");
-                assert_eq!(artifact.observed_model, "opencode-go/deepseek-v4.1-flash");
+                assert_eq!(
+                    artifact.observed_model.as_deref(),
+                    Some("opencode-go/deepseek-v4.1-flash")
+                );
                 assert_eq!(artifact.observed_effort.as_deref(), Some("max"));
                 assert_eq!(
                     artifact.committed_head_commit.as_deref(),

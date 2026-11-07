@@ -56,6 +56,12 @@ pub struct ReviewPolicyBinding {
     /// Observed effort or variant verified from worker stream telemetry, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_effort: Option<String>,
+    /// Bounded sanitized Codex TaskFiles launch proof, separate from runtime telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_launch_report: Option<threadlane_workers::WorkerExecutionReport>,
+    /// Digest of the immutable private source TaskExecutionReport or derived execution artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_source_report_sha256: Option<String>,
     /// Provider file permissions mode used for the task.
     #[serde(default)]
     pub file_permissions: WorkerFilePermissions,
@@ -66,6 +72,72 @@ pub struct ReviewPolicyBinding {
 }
 
 impl ReviewPolicyBinding {
+    /// Whether exact preventive TaskFiles pins and complete Codex lifecycle prove this target.
+    /// This never manufactures runtime-observed model or effort values.
+    pub fn has_verified_codex_task_launch(&self) -> bool {
+        let Some(report) = self.codex_launch_report.as_ref() else {
+            return false;
+        };
+        self.requested_provider.as_deref() == Some("codex_cli")
+            && self.file_permissions == WorkerFilePermissions::TaskFiles
+            && report.provider == threadlane_workers::WorkerProvider::CodexCli
+            && report
+                .executed_executable
+                .as_ref()
+                .is_some_and(|p| p.is_absolute())
+            && self.codex_source_report_sha256.as_deref().is_some_and(|v| {
+                validate_sha256_hex_digest(v, "codex_source_report_sha256").is_ok()
+            })
+            && self.requested_model.as_deref() == Some(report.requested_model.base_model.as_str())
+            && self.requested_effort == report.requested_model.effort
+            && self.observed_model.as_deref() == report.effective_observed_model()
+            && self.observed_effort.as_deref() == report.effective_observed_effort()
+            && report.has_pinned_codex_task_files_launch_config()
+            && report.has_complete_natural_completion_evidence()
+            && report.status == WorkerRunStatus::Succeeded
+            && report.evidence.retained_events.is_empty()
+            && report.redacted_stderr_summary.is_none()
+            && report
+                .constructed_argv
+                .last()
+                .is_some_and(|v| v == "[redacted task instruction]")
+    }
+
+    fn verify_codex_scope(
+        &self,
+        checkout: &Path,
+        allowed: &BTreeSet<String>,
+    ) -> Result<(), OperationsError> {
+        if let Some(report) = self.codex_launch_report.as_ref() {
+            let expected: std::collections::BTreeMap<String, threadlane_workers::WriteScopeKind> =
+                allowed
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.trim_end_matches('/').to_string(),
+                            if p.ends_with('/') {
+                                threadlane_workers::WriteScopeKind::DirectorySubtree
+                            } else {
+                                threadlane_workers::WriteScopeKind::ExactFile
+                            },
+                        )
+                    })
+                    .collect();
+            if !self.has_verified_codex_task_launch()
+                || report.working_directory != checkout
+                || threadlane_workers::extract_pinned_codex_task_files_write_scopes(
+                    &report.constructed_argv,
+                    &report.requested_model,
+                )
+                .as_ref()
+                    != Some(&expected)
+            {
+                return Err(OperationsError::UncertainWorkerOutcome("Codex TaskFiles launch proof does not match review worktree or finite write scope".to_string()));
+            }
+        }
+        Ok(())
+    }
+
     /// Validates all identifiers in the policy binding and enforces policy compliance
     /// when `enforce_satisfaction` is `true`.
     pub fn validate(&self, enforce_satisfaction: bool) -> Result<(), OperationsError> {
@@ -86,6 +158,17 @@ impl ReviewPolicyBinding {
             validate_simple_identifier(obs_effort, "observed_effort")?;
         }
 
+        let codex_launch = self.has_verified_codex_task_launch();
+        if (self.codex_launch_report.is_some()
+            || self.codex_source_report_sha256.is_some()
+            || (self.requested_provider.as_deref() == Some("codex_cli")
+                && self.file_permissions == WorkerFilePermissions::TaskFiles))
+            && !codex_launch
+        {
+            return Err(OperationsError::UncertainWorkerOutcome(
+                "invalid Codex TaskFiles launch proof".to_string(),
+            ));
+        }
         if enforce_satisfaction {
             if let Some(ref req_model) = self.requested_model {
                 match self.observed_model.as_deref() {
@@ -95,6 +178,7 @@ impl ReviewPolicyBinding {
                             "observed_model `{obs}` does not match requested_model `{req_model}`"
                         )));
                     }
+                    None if codex_launch => {}
                     None => {
                         return Err(OperationsError::UncertainWorkerOutcome(format!(
                             "missing observed_model evidence for requested_model `{req_model}`"
@@ -111,6 +195,7 @@ impl ReviewPolicyBinding {
                                 "observed_effort `{obs}` does not match requested_effort `{req_effort}`"
                             )));
                         }
+                        None if codex_launch => {}
                         None => {
                             return Err(OperationsError::UncertainWorkerOutcome(format!(
                                 "missing observed_effort evidence for requested_effort `{req_effort}` while require_effort_evidence is true"
@@ -377,6 +462,8 @@ impl ReviewSubject {
             ));
         }
         self.policy.validate(false)?;
+        self.policy
+            .verify_codex_scope(&self.task_checkout_path, &self.allowed_write_paths)?;
         self.test_evidence.validate(false)?;
 
         let computed = self.compute_digest()?;
@@ -534,6 +621,14 @@ impl ReviewReceipt {
         self.policy.validate(true).map_err(|err| {
             OperationsError::ReceiptInvalidated(format!("receipt policy unsatisfied: {err}"))
         })?;
+        self.policy.verify_codex_scope(
+            &self
+                .work_area_root
+                .join(threadlane_workers::CHECKOUTS_SUBDIR)
+                .join("tasks")
+                .join(&self.task_worktree_id),
+            &self.allowed_write_paths,
+        )?;
         self.test_evidence
             .validate(self.policy.require_passing_tests)
             .map_err(|err| {

@@ -2051,7 +2051,14 @@ impl CoworkerWorkflowStore {
                         "missing A1 preflight selected choice for approved task",
                     )
                 })?;
-            validate_non_native_worker_choice(approved_task.role, outcome)?;
+            if !approved_task.is_frozen_headless_worker() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "task lacks frozen headless worker authority",
+                ));
+            }
+            let outcome = crate::profile_flow::normalize_coder_choice(outcome)?;
+            validate_non_native_worker_choice(approved_task.role, &outcome)?;
             if outcome.tool_id != approved_task.tool_id
                 || outcome.adapter != approved_task.adapter
                 || outcome.model_id != approved_task.model_id

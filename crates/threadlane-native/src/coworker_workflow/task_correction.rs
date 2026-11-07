@@ -1642,52 +1642,12 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
         ));
     }
 
-    let expected_coder_provider = match candidate_task.selected_choice.adapter {
-        ToolAdapter::Antigravity => WorkerProvider::Antigravity,
-        ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
-        _ => {
-            return Err(NativeError::new(
-                NativeErrorCode::UnsupportedCapability,
-                "unsupported Coder adapter on candidate_task.selected_choice",
-            ));
-        }
-    };
-    let resolved_coder_target = resolve_model_target(
-        expected_coder_provider,
-        &candidate_task.selected_choice.model_arg,
-        candidate_task.selected_choice.effort.as_deref(),
-    )
-    .map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!("invalid frozen Coder model target: {err}"),
-        )
-    })?;
-    if (prior_artifacts.observed_model != resolved_coder_target.base_model
-        && prior_artifacts.observed_model != candidate_task.selected_choice.model_arg)
-        || resolved_coder_target.base_model != approved_task.base_model
-        || resolved_coder_target.effort != approved_task.effort
-        || approved_task.provider != Some(expected_coder_provider)
-        || prior_artifacts.observed_provider != expected_coder_provider.as_str()
+    if !prior_artifacts.has_matching_coder_evidence(approved_task, &candidate_task.selected_choice)
     {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            format!(
-                "task `{}` attempt `{prior_attempt_no}` observed provider/model does not match frozen Coder choice",
-                candidate_task.task_id
-            ),
+            "prior Coder launch or observed evidence does not match the frozen task",
         ));
-    }
-    if let Some(ref exp_effort) = resolved_coder_target.effort {
-        if prior_artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()) {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "task `{}` attempt `{prior_attempt_no}` observed_effort does not match frozen Coder effort `{exp_effort}`",
-                    candidate_task.task_id
-                ),
-            ));
-        }
     }
 
     let expected_base_commit = if candidate_task.depends_on.is_empty() {
@@ -2184,6 +2144,8 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
     }
 
     // Independently validate full persisted check execution reports against the candidate subject.
+    prior_artifacts.verify_coder_manifest_evidence(approved_task, &task_manifest, plans_dir)?;
+
     let expected_check_subject = FrozenCheckSubject {
         binding_id: request.binding_id.clone(),
         thread_uuid: request.thread_uuid.clone(),
@@ -2297,7 +2259,7 @@ pub(crate) fn verify_prior_attempt_and_persisted_reviewer_report_with_live_check
                 != Some(approved_task.base_model.as_str()))
         || review_subject.policy.requested_effort != candidate_task.selected_choice.effort
         || review_subject.policy.observed_model.as_deref()
-            != Some(prior_artifacts.observed_model.as_str())
+            != prior_artifacts.observed_model.as_deref()
         || review_subject.policy.observed_effort != prior_artifacts.observed_effort
         || !review_subject.policy.require_passing_tests
     {
@@ -3514,52 +3476,12 @@ pub(crate) fn verify_prior_attempt_and_persisted_failed_check_reports_with_live_
         )?;
     }
 
-    let expected_coder_provider = match candidate_task.selected_choice.adapter {
-        ToolAdapter::Antigravity => WorkerProvider::Antigravity,
-        ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
-        _ => {
-            return Err(NativeError::new(
-                NativeErrorCode::UnsupportedCapability,
-                "unsupported Coder adapter on candidate_task.selected_choice",
-            ));
-        }
-    };
-    let resolved_coder_target = resolve_model_target(
-        expected_coder_provider,
-        &candidate_task.selected_choice.model_arg,
-        candidate_task.selected_choice.effort.as_deref(),
-    )
-    .map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!("invalid frozen Coder model target: {err}"),
-        )
-    })?;
-    if (prior_artifacts.observed_model != resolved_coder_target.base_model
-        && prior_artifacts.observed_model != candidate_task.selected_choice.model_arg)
-        || resolved_coder_target.base_model != approved_task.base_model
-        || resolved_coder_target.effort != approved_task.effort
-        || approved_task.provider != Some(expected_coder_provider)
-        || prior_artifacts.observed_provider != expected_coder_provider.as_str()
+    if !prior_artifacts.has_matching_coder_evidence(approved_task, &candidate_task.selected_choice)
     {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            format!(
-                "task `{}` attempt `{prior_attempt_no}` observed provider/model does not match frozen Coder choice",
-                candidate_task.task_id
-            ),
+            "prior Coder launch or observed evidence does not match the frozen task",
         ));
-    }
-    if let Some(ref exp_effort) = resolved_coder_target.effort {
-        if prior_artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()) {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "task `{}` attempt `{prior_attempt_no}` observed_effort does not match frozen Coder effort `{exp_effort}`",
-                    candidate_task.task_id
-                ),
-            ));
-        }
     }
 
     let expected_base_commit = if candidate_task.depends_on.is_empty() {
@@ -3740,6 +3662,8 @@ pub(crate) fn verify_prior_attempt_and_persisted_failed_check_reports_with_live_
             "owned RunIntegration WorktreeManifest does not match task WorktreeManifest ownership/run scope",
         ));
     }
+
+    prior_artifacts.verify_coder_manifest_evidence(approved_task, &task_manifest, plans_dir)?;
 
     let expected_check_subject = FrozenCheckSubject {
         binding_id: request.binding_id.clone(),
@@ -4103,10 +4027,12 @@ pub(crate) fn verify_prior_attempt_and_persisted_failed_check_reports_with_live_
         };
         let readonly_policy = ReviewPolicyBinding {
             policy_id: adm.runtime_state.envelope.policy.policy_id.clone(),
+            codex_launch_report: prior_artifacts.codex_launch_report.clone(),
+            codex_source_report_sha256: prior_artifacts.codex_source_report_sha256.clone(),
             requested_provider: approved_task.provider.map(|p| p.as_str().to_string()),
             requested_model: Some(approved_task.base_model.clone()),
             requested_effort: candidate_task.selected_choice.effort.clone(),
-            observed_model: Some(prior_artifacts.observed_model.clone()),
+            observed_model: prior_artifacts.observed_model.clone(),
             observed_effort: prior_artifacts.observed_effort.clone(),
             file_permissions: approved_task
                 .file_permissions

@@ -16,13 +16,15 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-02.v1`).
+fetch the same shared guide and version (`2026-11-07.v1`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
 rules or state are uncertain, refetch `operating_guide` (or run `threadlane guide`
 on the trusted-local CLI route) and then refresh live scoped state and revisions
-(`status`, `list-plans` / `get-plan`, `session` / `task`) without a polling loop.
+(`status`, `coworker_status`, `list_plans`, `list_approvals`, and—only when
+actual IDs exist—`get_plan`, `approved_session`, and `approved_task`) without a
+polling loop.
 
 ## Setup and planning
 
@@ -30,7 +32,21 @@ On the managed Linux Codex desktop route, call the no-argument
 `connect_current_chat` MCP tool on first use, then `operating_guide`. It verifies
 the current MCP process's parent against the existing private desktop endpoint,
 cross-checks the request's thread hint against that thread's connection identity,
-and reuses or creates the durable binding. It may start the baseline control
+and reuses or creates the durable binding. When all five private stores and the
+canonical same-package `threadlane-context` binary are configured and validated,
+`connect_current_chat` also exports a private `0600` per-chat operator context
+under `<pairing_dir>/operator-contexts/` and returns additive `operator_context`
+metadata (`available: true`, `context_path`, `context_router_executable`,
+`route: "trusted_local_operator"`, `native_per_call_identity_verified: false`;
+or `available: false` with `code` and `message` when unconfigured).
+On a fresh chat without an active planning grant or execution approval:
+
+1. Before any planning model use, run `<context_router_executable> --context <context_path> flow grant-prepare --request <private_json>` and present the concrete planning permission preview to the human.
+2. Only after explicit human approval of that preview in chat, record the grant via `<context_router_executable> --context <context_path> flow grant-record --request <private_json> --confirm-preview <PREVIEW_SHA256> --operator-approved`.
+3. Request the actual `Orchestrator` technical plan (`prepare_work`, `request_technical_plan`, `planning_command`), prepare the concrete authority scope preview via `<context_router_executable> --context <context_path> approve prepare --request <private_json>` before requesting human execution approval, and present the plan together with that preview's resolved model/effort, write scopes/files, base commit, `subject_digest`, and planned execution-policy budgets to the human.
+4. Only after exact human execution approval of that presented scope in chat, record that preview (`approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`), then preview/record the matching frozen execution envelope (`flow coworker-execution preview` / `record`) and start only that approved execution (`start_execution`).
+
+It may start the baseline control
 supervisor with no workers or notifications; approved hosts are not resumed.
 Later scoped MCP calls must carry the same host-provided thread ID. Missing or
 conflicting IDs are refused. This local route trusts the OS user and verified

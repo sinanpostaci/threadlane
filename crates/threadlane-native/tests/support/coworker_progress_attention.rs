@@ -682,7 +682,10 @@ fn failed_root_delivers_early_attention_while_sibling_runs_then_fenced_sibling_c
                 .expect("completed fenced sibling must persist inspectable attempt artifacts");
             assert!(artifacts_b.committed_head_commit.is_some());
             assert!(artifacts_b.committed_tree_sha.is_some());
-            assert_eq!(artifacts_b.observed_model.as_str(), "gemini-4-argon-high");
+            assert_eq!(
+                artifacts_b.observed_model.as_deref(),
+                Some("gemini-4-argon-high")
+            );
             assert_eq!(artifacts_b.observed_effort.as_deref(), Some("high"));
             assert!(artifacts_b.review_subject.is_none());
             assert!(artifacts_b.review_receipt.is_none());
@@ -1404,7 +1407,10 @@ fn held_running_sibling_prevents_premature_quiescent_settlement_until_terminal_r
             .expect("Held sibling terminal receipt must persist inspectable attempt artifacts");
         assert!(artifacts_b.committed_head_commit.is_some());
         assert!(artifacts_b.committed_tree_sha.is_some());
-        assert_eq!(artifacts_b.observed_model.as_str(), "gemini-4-argon-high");
+        assert_eq!(
+            artifacts_b.observed_model.as_deref(),
+            Some("gemini-4-argon-high")
+        );
         assert_eq!(artifacts_b.observed_effort.as_deref(), Some("high"));
         assert!(artifacts_b.review_subject.is_none());
         assert!(artifacts_b.review_receipt.is_none());

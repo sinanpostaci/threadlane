@@ -679,6 +679,8 @@ fn commit_review_and_integrate_task_in_work_area(
 
     let policy = ReviewPolicyBinding {
         policy_id: "policy-coworker-exec".to_string(),
+        codex_launch_report: None,
+        codex_source_report_sha256: None,
         requested_provider: Some("antigravity".to_string()),
         requested_model: Some("gemini-4-argon-high".to_string()),
         requested_effort: Some("high".to_string()),
@@ -2066,6 +2068,8 @@ fn commit_review_and_integrate_worker_run_task(
 
     let policy = ReviewPolicyBinding {
         policy_id: "policy-coworker-exec".to_string(),
+        codex_launch_report: None,
+        codex_source_report_sha256: None,
         requested_provider: Some("antigravity".to_string()),
         requested_model: Some("gemini-4-argon-high".to_string()),
         requested_effort: Some("high".to_string()),

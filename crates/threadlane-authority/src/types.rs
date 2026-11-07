@@ -134,9 +134,9 @@ pub struct ApprovedTaskRecord {
     pub tool_id: String,
     /// Tool adapter kind (`antigravity`, `opencode_v2`, or `codex_cli`).
     pub adapter: ToolAdapter,
-    /// Headless worker provider (`Some(Antigravity | OpenCodeV2)` for worker tasks, `None` for `codex_cli`).
+    /// Frozen headless worker provider; `None` preserves manual/legacy native routes.
     pub provider: Option<WorkerProvider>,
-    /// Canonical non-symlink regular executable path resolved once at approval time for worker tasks (`None` for `codex_cli`).
+    /// Canonical non-symlink regular executable path resolved once at approval time for worker tasks (`None` for manual native routes).
     pub canonical_executable: Option<PathBuf>,
     /// Registry model definition identifier.
     pub model_id: String,
@@ -146,11 +146,11 @@ pub struct ApprovedTaskRecord {
     pub base_model: String,
     /// Frozen reasoning effort or variant (`Some(...)` or `None`).
     pub effort: Option<String>,
-    /// Exact CLI `--model` argument string for headless worker tasks (`None` for `codex_cli`).
+    /// Exact CLI `--model` argument string for headless worker tasks (`None` for manual native routes).
     pub cli_model_arg: Option<String>,
-    /// Frozen `--standalone` flag for headless worker tasks (`Some(true)` for `opencode_v2`, `Some(false)` for `antigravity`, `None` for `codex_cli`).
+    /// Frozen `--standalone` flag for headless worker tasks (`Some(true)` for `opencode_v2`, `Some(false)` for `antigravity`/`codex_cli`, `None` for manual native routes).
     pub standalone: Option<bool>,
-    /// Frozen file permission policy for headless worker tasks (`Some(TaskFiles)` for `antigravity` and `opencode_v2`, `None` for `codex_cli`).
+    /// Frozen file permission policy for headless worker tasks (`Some(TaskFiles)` for headless workers, `None` for manual native routes).
     pub file_permissions: Option<WorkerFilePermissions>,
     /// Upstream dependency task identifiers retained as metadata.
     pub depends_on: Vec<String>,
@@ -158,10 +158,115 @@ pub struct ApprovedTaskRecord {
     pub allowed_write_paths: Vec<String>,
     /// 64-character lowercase hex SHA-256 digest of the compiled task specification.
     pub task_digest: String,
-    /// Deterministic worker profile identifier (`<= 64` chars) for headless worker tasks (`None` for `codex_cli`).
+    /// Deterministic worker profile identifier (`<= 64` chars) for headless worker tasks (`None` for manual native routes).
     pub profile_id: Option<String>,
-    /// Deterministic idempotency command key for headless worker tasks (`None` for `codex_cli`).
+    /// Deterministic idempotency command key for headless worker tasks (`None` for manual native routes).
     pub command_key: Option<String>,
+}
+
+impl ApprovedTaskRecord {
+    /// Verify actual Codex launch pins against this frozen task and its execution worktree.
+    /// Missing runtime telemetry remains missing; supplied telemetry must still match.
+    pub fn matches_codex_task_launch_report(
+        &self,
+        report: &threadlane_workers::WorkerExecutionReport,
+        checkout: &std::path::Path,
+        execution_base: &str,
+    ) -> bool {
+        if !self.is_frozen_headless_worker()
+            || self.provider != Some(WorkerProvider::CodexCli)
+            || report.provider != WorkerProvider::CodexCli
+            || report.executed_executable != self.canonical_executable
+            || report.working_directory != checkout
+            || report.requested_session_id.is_some()
+            || report.allocated_session_id.is_some()
+            || !report.has_pinned_codex_task_files_launch_config()
+            || !report.has_complete_natural_completion_evidence()
+            || report.status != threadlane_workers::WorkerRunStatus::Succeeded
+        {
+            return false;
+        }
+        let Ok(target) = threadlane_workers::resolve_model_target(
+            WorkerProvider::CodexCli,
+            &self.model_arg,
+            self.effort.as_deref(),
+        ) else {
+            return false;
+        };
+        if report.requested_model != target
+            || report
+                .effective_observed_model()
+                .is_some_and(|v| v != target.base_model)
+            || report
+                .effective_observed_effort()
+                .is_some_and(|v| Some(v) != target.effort.as_deref())
+        {
+            return false;
+        }
+        let paths = self.allowed_write_paths.iter().cloned().collect();
+        let Ok(scopes) = threadlane_workers::resolve_allowed_write_scopes_at_base(
+            checkout,
+            execution_base,
+            &paths,
+            threadlane_workers::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        ) else {
+            return false;
+        };
+        let frozen_scopes: std::collections::BTreeMap<_, _> = self
+            .allowed_write_paths
+            .iter()
+            .map(|p| {
+                (
+                    p.trim_end_matches('/').to_string(),
+                    if p.ends_with('/') {
+                        threadlane_workers::WriteScopeKind::DirectorySubtree
+                    } else {
+                        threadlane_workers::WriteScopeKind::ExactFile
+                    },
+                )
+            })
+            .collect();
+        if scopes != frozen_scopes {
+            return false;
+        }
+        threadlane_workers::extract_pinned_codex_task_files_write_scopes(
+            &report.constructed_argv,
+            &target,
+        )
+        .as_ref()
+            == Some(&scopes)
+    }
+
+    /// True only for a complete frozen headless contract. Legacy native records stay native.
+    pub fn is_frozen_headless_worker(&self) -> bool {
+        let Some(provider) = self.provider else {
+            return false;
+        };
+        let expected_adapter = match provider {
+            WorkerProvider::Antigravity => ToolAdapter::Antigravity,
+            WorkerProvider::OpenCodeV2 => ToolAdapter::OpencodeV2,
+            WorkerProvider::CodexCli => ToolAdapter::CodexCli,
+        };
+        let Ok(target) = threadlane_workers::resolve_model_target(
+            provider,
+            &self.model_arg,
+            self.effort.as_deref(),
+        ) else {
+            return false;
+        };
+        self.adapter == expected_adapter
+            && (provider != WorkerProvider::CodexCli || self.role == WorkflowRole::Coder)
+            && self
+                .canonical_executable
+                .as_ref()
+                .is_some_and(|p| p.is_absolute())
+            && self.base_model == target.base_model
+            && self.effort == target.effort
+            && self.cli_model_arg.as_deref() == Some(target.cli_model_arg.as_str())
+            && self.standalone == Some(provider == WorkerProvider::OpenCodeV2)
+            && self.file_permissions == Some(WorkerFilePermissions::TaskFiles)
+            && !self.allowed_write_paths.is_empty()
+    }
 }
 
 /// Private operator-only preview produced by [`crate::AuthorityStore::prepare_for_operator`]

@@ -28,3 +28,8 @@ store-failure-output = true
 [[profile.ci.overrides]]
 filter = "binary_id(=threadlane-native::coworker_pipeline) & test(=coworker_full_driver::cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed)"
 slow-timeout = { period = "30s", terminate-after = 16 }
+
+# The Codex Coder variant uses the same bounded multi-phase pipeline helper.
+[[profile.ci.overrides]]
+filter = "binary_id(=threadlane-native::coworker_pipeline) & test(=coworker_full_driver::codex_luna_full_frozen_pipeline_parallel_roots_correction_dependent_and_single_closure)"
+slow-timeout = { period = "30s", terminate-after = 16 }

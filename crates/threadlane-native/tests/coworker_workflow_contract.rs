@@ -3544,7 +3544,7 @@ fn namespaced_coder_model_id_admitted_in_contract_and_job_binding_while_invalid_
     }
 
     // 3. Generic bounded-identifier validation on tool_id and effort remains strict (rejects '/'),
-    // and Follower / NativeHandoff / CodexCli Coder rejections remain intact.
+    // and Follower / NativeHandoff / invalid CodexCli target rejections remain intact.
     let mut bad_tool_id_choice = namespaced_coder_choice.clone();
     bad_tool_id_choice.tool_id = "tool/oc".to_string();
     assert_eq!(
@@ -3583,7 +3583,7 @@ fn namespaced_coder_model_id_admitted_in_contract_and_job_binding_while_invalid_
     codex_coder_choice.adapter = ToolAdapter::CodexCli;
     assert_eq!(
         validate_non_native_worker_choice(WorkflowRole::Coder, &codex_coder_choice)
-            .expect_err("CodexCli Coder must still be rejected")
+            .expect_err("an OpenCode namespaced target is invalid for Codex Coder")
             .code(),
         NativeErrorCode::ValidationFailed.as_str()
     );

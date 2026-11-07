@@ -1435,8 +1435,8 @@ fn codex_advisory_normalization_preserves_native_preflight_and_restricts_to_read
         assert!(validate_non_native_worker_choice(readonly_role, &missing_effort).is_err());
     }
 
-    // 3. Follower and Coder are strictly refused by both normalize_read_only_advisory_choice and
-    //    validate_non_native_worker_choice (even if route is forged to HeadlessWorker).
+    // 3. Follower and Coder remain outside advisory normalization. Only the separate
+    //    exactly-admitted controller Coder route normalizes a Coder choice.
     for non_advisory_role in [WorkflowRole::Follower, WorkflowRole::Coder] {
         assert!(!is_read_only_advisory_worker_role(non_advisory_role));
         let raw = report
@@ -1453,9 +1453,36 @@ fn codex_advisory_normalization_preserves_native_preflight_and_restricts_to_read
 
         let mut forged_headless = raw.clone();
         forged_headless.route = RoleExecutionRoute::HeadlessWorker;
-        let err = validate_non_native_worker_choice(non_advisory_role, &forged_headless)
-            .expect_err("forged HeadlessWorker Codex choice for Follower/Coder must be rejected");
-        assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+        if non_advisory_role == WorkflowRole::Follower {
+            let err = validate_non_native_worker_choice(non_advisory_role, &forged_headless)
+                .expect_err("Follower never becomes a worker");
+            assert_eq!(err.error_code(), NativeErrorCode::ValidationFailed);
+        } else {
+            let normalized = threadlane_native::profile_flow::normalize_coder_choice(raw).unwrap();
+            assert_eq!(normalized, forged_headless);
+            validate_non_native_worker_choice(WorkflowRole::Coder, &normalized).unwrap();
+            assert_eq!(normalized.model_arg, "gpt-6.1-sol");
+            assert_eq!(normalized.effort.as_deref(), Some("xhigh"));
+            for (model, effort) in [("gpt-6-luna", "max"), ("gpt-6.1-sol", "high")] {
+                let mut explicit = raw.clone();
+                explicit.model_arg = model.to_string();
+                explicit.effort = Some(effort.to_string());
+                let normalized =
+                    threadlane_native::profile_flow::normalize_coder_choice(&explicit).unwrap();
+                assert_eq!(normalized.model_arg, model);
+                assert_eq!(normalized.effort.as_deref(), Some(effort));
+            }
+            let mut invalid_route = raw.clone();
+            invalid_route.route = RoleExecutionRoute::Unsupported;
+            assert!(
+                threadlane_native::profile_flow::normalize_coder_choice(&invalid_route).is_err()
+            );
+            let mut invalid = raw.clone();
+            invalid.effort = None;
+            assert!(threadlane_native::profile_flow::normalize_coder_choice(&invalid).is_err());
+            invalid.effort = Some("invalid effort".to_string());
+            assert!(threadlane_native::profile_flow::normalize_coder_choice(&invalid).is_err());
+        }
     }
 
     // 4. Already-headless Antigravity / OpenCode choices remain unchanged.

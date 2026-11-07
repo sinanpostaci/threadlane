@@ -7,9 +7,17 @@ read-only Coworker planning and architectural advice grants
 
 ## Authority and provenance boundary
 
-Every command requires the existing fixed global store and target flags:
+Every command requires the existing fixed global store and target flags (either
+directly or via `threadlane-context --context /absolute/private/context.json flow <subcommand> ...`,
+including the per-chat `operator_context` exported on a verified managed
+`connect_current_chat`):
 
 ```sh
+# Via the bound context router:
+threadlane-context --context /absolute/private/context.json \
+  flow <subcommand> ...
+
+# Or directly with explicit store and target flags:
 threadlane-flow \
   --state-dir /absolute/private/runtime \
   --registry-dir /absolute/private/registry \

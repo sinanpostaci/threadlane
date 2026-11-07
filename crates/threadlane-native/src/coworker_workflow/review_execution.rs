@@ -467,7 +467,7 @@ impl TaskReviewExecutionReport {
 
                 let verified_resp = self
                     .structured_execution
-                    .validate_verified_response(self.max_response_bytes)
+                    .validate_persisted_verified_response(self.max_response_bytes)
                     .map_err(map_worker_error_to_native)?;
                 let recomputed = parse_and_verify(&verified_resp.text, &self.expected_identity)?;
                 let Some(ref verdict) = self.verified_verdict else {

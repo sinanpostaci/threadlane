@@ -562,15 +562,38 @@ impl AdvisoryStructuredExecution {
     /// under `max_response_bytes` while remaining coherent with `execution` (provider, line bounds,
     /// effort evidence source, session binding, and OpenCode metadata).
     ///
-    /// Callers reloading persisted or cached private advisory artifacts must pass their exact
-    /// frozen per-call/grant `max_response_bytes` limit here.
+    /// This strict entry point requires current execution evidence. Historical persisted reports
+    /// use [`Self::validate_persisted_verified_response`] with their exact frozen byte limit.
     pub fn validate_verified_response(
         &self,
         max_response_bytes: usize,
     ) -> Result<&BoundedAdvisoryResponse, WorkerError> {
-        if self.execution.status != WorkerRunStatus::Succeeded
-            || !self.execution.has_complete_natural_completion_evidence()
-        {
+        self.validate_verified_response_internal(max_response_bytes, false)
+    }
+
+    /// Validates a persisted or cached advisory artifact under its exact frozen response budget.
+    ///
+    /// Applies the same response integrity, framing, session, usage and execution-coherence
+    /// checks as [`Self::validate_verified_response`], with a narrow compatibility path for
+    /// historical read-only Codex reports lacking both current execution markers. The caller
+    /// must verify the persisted artifact's own provenance and integrity. This method does not
+    /// authorize fresh collection or execution, and it does not synthesize missing evidence.
+    pub fn validate_persisted_verified_response(
+        &self,
+        max_response_bytes: usize,
+    ) -> Result<&BoundedAdvisoryResponse, WorkerError> {
+        self.validate_verified_response_internal(max_response_bytes, true)
+    }
+
+    fn validate_verified_response_internal(
+        &self,
+        max_response_bytes: usize,
+        allow_legacy_codex_advisory: bool,
+    ) -> Result<&BoundedAdvisoryResponse, WorkerError> {
+        let complete = self.execution.has_complete_natural_completion_evidence()
+            || (allow_legacy_codex_advisory
+                && self.execution.has_complete_legacy_codex_advisory_evidence());
+        if self.execution.status != WorkerRunStatus::Succeeded || !complete {
             return Err(WorkerError::InvalidSpec(
                 "advisory execution does not have complete natural completion evidence".to_string(),
             ));
@@ -693,7 +716,7 @@ impl AdvisoryStructuredExecution {
     ///
     /// Note: When reloading persisted or cached private advisory artifacts, callers must also
     /// reapply their exact frozen per-call/grant byte limit via
-    /// [`Self::validate_verified_response`] or [`BoundedAdvisoryResponse::validate_integrity`].
+    /// [`Self::validate_persisted_verified_response`].
     #[must_use]
     pub fn has_verified_response(&self) -> bool {
         self.validate_verified_response(MAX_ADVISORY_RESPONSE_BYTES)
@@ -705,7 +728,7 @@ impl AdvisoryStructuredExecution {
     ///
     /// Note: When reloading persisted or cached private advisory artifacts, callers must also
     /// reapply their exact frozen per-call/grant byte limit via
-    /// [`Self::validate_verified_response`] or [`BoundedAdvisoryResponse::validate_integrity`].
+    /// [`Self::validate_persisted_verified_response`].
     #[must_use]
     pub fn verified_response(&self) -> Option<&BoundedAdvisoryResponse> {
         self.validate_verified_response(MAX_ADVISORY_RESPONSE_BYTES)

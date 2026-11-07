@@ -1742,7 +1742,7 @@ impl PairedMcpServer {
     /// Connects the current managed-desktop chat after independent thread-scoped verification.
     #[tool(
         name = "connect_current_chat",
-        description = "Connect this Codex chat to Threadlane automatically using the managed local desktop connection. Call once on first use, then operating_guide. Takes no IDs or paths. Creates or reuses a chat binding; does not approve or dispatch work. Unsupported hosts return a connection error.",
+        description = "Connect this Codex chat to Threadlane automatically using the managed local desktop connection. Call once on first use, then operating_guide. Takes no IDs or paths. Creates or reuses a chat binding and, when workflow/host stores and the canonical sibling threadlane-context router are configured and validated, exports a per-chat private v1 trusted-local operator context without approving or dispatching work. Unsupported hosts return a connection error.",
         annotations(
             title = "Connect Current Chat",
             read_only_hint = false,
@@ -1761,8 +1761,27 @@ impl PairedMcpServer {
             let identity = self
                 .pairing_store
                 .inspect_epoch(&self.connection_nonce, &self.epoch_id)?;
+            let context_config = crate::context_export::OperatorContextServerConfig {
+                pairing_dir: self.pairing_store.dir(),
+                state_dir: &self.state_dir,
+                workflow_stores: self
+                    .workflow_stores
+                    .as_ref()
+                    .map(|w| (w.registry.config_dir(), w.plans.dir())),
+                host_stores: self
+                    .host_stores
+                    .as_ref()
+                    .map(|h| (h.authority.dir(), h.sessions_dir.as_path())),
+                sibling_anchor_exe: self.sibling_anchor_exe.as_deref(),
+            };
             self.automatic_pairing
-                .connect(hint, &self.state_dir, &self.pairing_store, &identity)
+                .connect_with_context_config(
+                    hint,
+                    &self.state_dir,
+                    &self.pairing_store,
+                    &identity,
+                    context_config,
+                )
                 .await
         }
         .await
@@ -1804,7 +1823,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-06.v2) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes bounded historical fatal_error and advisory original-host Coder progress-attention limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-07.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes bounded historical fatal_error and advisory original-host Coder progress-attention limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,

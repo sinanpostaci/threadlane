@@ -1097,7 +1097,9 @@ fn verify_receipt_policy_matches_frozen_task(
                 policy.requested_effort
             )));
         }
-        if !policy.require_effort_evidence || policy.observed_effort.as_deref() != Some(req_effort)
+        if !policy.require_effort_evidence
+            || (policy.observed_effort.as_deref() != Some(req_effort)
+                && !policy.has_verified_codex_task_launch())
         {
             return Err(OperationsError::UncertainWorkerOutcome(format!(
                 "predecessor `{logical_task_id}` review receipt is missing verified observed_effort `{req_effort}`"

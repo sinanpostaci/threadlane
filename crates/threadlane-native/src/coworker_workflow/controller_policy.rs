@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use threadlane_authority::validation::validate_canonical_thread_uuid;
-use threadlane_authority::{ApprovalRecord, AuthorityStore};
+use threadlane_authority::{ApprovalRecord, ApprovedTaskRecord, AuthorityStore};
 use threadlane_operations::{
     FinalCandidateSubject, IntegrationReceipt, IntegrationStrategy, ReviewReceipt, ReviewSubject,
     TestEvidenceSummary,
@@ -22,7 +22,7 @@ use threadlane_workers::{
     DEFAULT_TIMEOUT_MS, MAX_ADVISORY_RESPONSE_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
     MAX_TIMEOUT_MS,
 };
-use threadlane_workflow::{DecisionAdvisorMode, ToolAdapter, WorkflowRole};
+use threadlane_workflow::{DecisionAdvisorMode, WorkflowRole};
 
 use crate::conversation_change::UnresolvedBlockingChange;
 use crate::error::{NativeError, NativeErrorCode};
@@ -34,7 +34,7 @@ use crate::fs_safety::{
 };
 use crate::profile_flow::{
     normalize_read_only_advisory_choice, preflight, ExecutionPolicy, PreflightRequest,
-    RoleExecutionRoute, RolePreflightRequest, SelectedRoleChoice,
+    RolePreflightRequest, SelectedRoleChoice,
 };
 
 use super::checks::{
@@ -3533,7 +3533,17 @@ pub struct TaskAttemptExecutionArtifacts {
     /// Observed provider identifier from verified worker stream telemetry.
     pub observed_provider: String,
     /// Observed model identifier from verified worker stream telemetry.
-    pub observed_model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_model: Option<String>,
+    /// Verified Codex TaskFiles launch evidence, distinct from absent runtime telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_launch_report: Option<WorkerExecutionReport>,
+    /// Digest of the immutable private source execution report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_source_report_sha256: Option<String>,
+    /// Derived execution sidecar effect identifier; absent for original host worker reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_source_effect_id: Option<String>,
     /// Observed reasoning effort from verified worker stream telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_effort: Option<String>,
@@ -3566,6 +3576,178 @@ pub struct TaskAttemptExecutionArtifacts {
     pub integration_receipt: Option<IntegrationReceipt>,
     /// Whether this attempt was executed via a [`DerivedTaskAttemptReceipt`].
     pub is_derived_attempt: bool,
+}
+
+/// Keep private downstream Codex evidence finite and independent of worker prose.
+pub(crate) fn compact_codex_launch_report(report: &WorkerExecutionReport) -> WorkerExecutionReport {
+    let mut compact = report.clone();
+    compact.evidence.retained_events.clear();
+    compact.redacted_stderr_summary = None;
+    if let Some(prompt) = compact.constructed_argv.last_mut() {
+        *prompt = "[redacted task instruction]".to_string();
+    }
+    compact
+}
+
+impl TaskAttemptExecutionArtifacts {
+    /// Validate provider/model evidence against the complete frozen task contract.
+    pub fn has_matching_coder_evidence(
+        &self,
+        task: &ApprovedTaskRecord,
+        choice: &SelectedRoleChoice,
+    ) -> bool {
+        let Some(provider) = task.provider else {
+            return false;
+        };
+        if !task.is_frozen_headless_worker()
+            || task.adapter != choice.adapter
+            || task.tool_id != choice.tool_id
+            || task.model_id != choice.model_id
+            || task.model_arg != choice.model_arg
+            || task.effort != choice.effort
+            || self.observed_provider != provider.as_str()
+        {
+            return false;
+        }
+        if provider == threadlane_workers::WorkerProvider::CodexCli {
+            let Some(report) = self.codex_launch_report.as_ref() else {
+                return false;
+            };
+            self.codex_source_report_sha256.as_deref().is_some_and(|d| {
+                validate_sha256_hex_digest(d, "codex_source_report_sha256").is_ok()
+            }) && task.matches_codex_task_launch_report(
+                report,
+                &report.working_directory,
+                &self.execution_base_commit,
+            ) && report
+                .working_directory
+                .file_name()
+                .and_then(|v| v.to_str())
+                == Some(self.task_worktree_id.as_str())
+                && self.observed_model.as_deref() == report.effective_observed_model()
+                && self.observed_effort.as_deref() == report.effective_observed_effort()
+        } else {
+            self.codex_launch_report.is_none()
+                && self.codex_source_report_sha256.is_none()
+                && self.codex_source_effect_id.is_none()
+                && self.observed_model.as_deref().is_some_and(|v| {
+                    v == task.base_model || Some(v) == task.cli_model_arg.as_deref()
+                })
+                && task
+                    .effort
+                    .as_deref()
+                    .is_none_or(|v| self.observed_effort.as_deref() == Some(v))
+        }
+    }
+
+    /// Bind retained launch evidence to the independently verified owned execution checkout.
+    pub fn verify_coder_manifest_evidence(
+        &self,
+        task: &ApprovedTaskRecord,
+        manifest: &threadlane_workers::WorktreeManifest,
+        plans_dir: &Path,
+    ) -> Result<(), NativeError> {
+        if let Some(report) = self.codex_launch_report.as_ref() {
+            if !self.is_derived_attempt {
+                let session_dir = manifest.work_area_root.parent().ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "missing owned session directory",
+                    )
+                })?;
+                let source_path = session_dir
+                    .join("runtime-state/worker_reports")
+                    .join(format!("art_{}.json", self.worker_id));
+                let bytes = crate::fs_safety::read_private_file_bounded(
+                    &source_path,
+                    16 * 1024 * 1024,
+                    "immutable Codex task report",
+                )?
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "immutable Codex task report is missing",
+                    )
+                })?;
+                let source: threadlane_workers::TaskExecutionReport =
+                    serde_json::from_slice(&bytes).map_err(|_| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "invalid immutable Codex task report",
+                        )
+                    })?;
+                if self.codex_source_report_sha256.as_deref() != Some(sha256_hex(&bytes).as_str())
+                    || compact_codex_launch_report(&source.worker_report) != *report
+                    || source.manifest.worktree_id != manifest.worktree_id
+                    || source.manifest.repository_path != manifest.repository_path
+                    || source.manifest.work_area_root != manifest.work_area_root
+                    || source.manifest.checkout_path != manifest.checkout_path
+                    || source.manifest.base_commit != manifest.base_commit
+                    || source.manifest.allowed_write_paths != manifest.allowed_write_paths
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Codex launch proof does not match immutable source report and scope",
+                    ));
+                }
+            }
+            if self.is_derived_attempt {
+                let effect_id = self.codex_source_effect_id.as_deref().ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "derived Codex source effect is missing",
+                    )
+                })?;
+                let source =
+                    super::task_correction_execution::read_persisted_derived_task_execution_report(
+                        plans_dir, effect_id,
+                    )?
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "derived Codex source report is missing",
+                        )
+                    })?;
+                if self.codex_source_report_sha256.as_deref()
+                    != Some(source.artifact_digest.as_str())
+                    || compact_codex_launch_report(&source.execution_report.worker_report)
+                        != *report
+                    || source.task_id != self.task_id
+                    || source.attempt_no != self.attempt_no
+                    || source.task_digest != task.task_digest
+                    || source.task_worktree_id != self.task_worktree_id
+                    || source.integration_worktree_id != self.integration_worktree_id
+                    || source.execution_base_commit != self.execution_base_commit
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "derived Codex launch proof does not match immutable source and scope",
+                    ));
+                }
+            } else if self.codex_source_effect_id.is_some() {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "original Codex attempt carries derived source identity",
+                ));
+            }
+            if !task.matches_codex_task_launch_report(
+                report,
+                &manifest.checkout_path,
+                &manifest.base_commit,
+            ) {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Codex launch evidence does not match owned task manifest",
+                ));
+            }
+        } else if task.provider == Some(threadlane_workers::WorkerProvider::CodexCli) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Codex launch evidence is missing",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Complete durable controller runtime state for a single [`CoworkerJobRecord`].
@@ -4806,10 +4988,7 @@ pub fn verify_live_approval_and_registry(
     let mut role_reqs = Vec::new();
     let mut seen_roles = BTreeSet::new();
     for task in &approval.tasks {
-        if task.adapter == ToolAdapter::CodexCli
-            || RoleExecutionRoute::from_adapter(task.adapter) != RoleExecutionRoute::HeadlessWorker
-            || task.role != WorkflowRole::Coder
-        {
+        if !task.is_frozen_headless_worker() || task.role != WorkflowRole::Coder {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "Approved task uses an unsupported or native-only execution route for headless Coder execution.",

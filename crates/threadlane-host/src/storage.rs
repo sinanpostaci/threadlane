@@ -13,7 +13,6 @@ use threadlane_authority::{
     build_approved_worker_profile_config, ApprovalRecord, ApprovedTaskRecord,
 };
 use threadlane_core::WorkerExecutionBinding;
-use threadlane_registry::ToolAdapter;
 use uuid::Uuid;
 
 use crate::error::HostError;
@@ -2005,7 +2004,7 @@ pub(crate) fn verify_all_transitive_predecessors_in_approval(
                     "task `{current_id}` depends on task `{dep_id}` which is missing from frozen approval record"
                 ));
             };
-            if dep_task.provider.is_none() || dep_task.adapter == ToolAdapter::CodexCli {
+            if !dep_task.is_frozen_headless_worker() {
                 return Err(format!(
                     "predecessor task `{dep_id}` uses manual native route `{}` and cannot produce worker dependency receipts",
                     dep_task.adapter
@@ -2160,7 +2159,7 @@ fn validate_single_intent(
             intent.task_id
         )));
     };
-    if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+    if !task.is_frozen_headless_worker() {
         return Err(corrupt(format!(
             "dispatch intent references manual native route task `{}`",
             intent.task_id
@@ -2223,7 +2222,7 @@ fn validate_single_receipt(
             receipt.task_id
         )));
     };
-    if task.provider.is_none() || task.adapter == ToolAdapter::CodexCli {
+    if !task.is_frozen_headless_worker() {
         return Err(corrupt(format!(
             "receipt references manual native route task `{}`",
             receipt.task_id

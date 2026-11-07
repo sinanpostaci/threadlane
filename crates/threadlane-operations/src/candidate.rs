@@ -903,7 +903,8 @@ pub fn inspect_final_candidate_readonly(
         if let Some(ref exp_effort) = task_input.expected_effort {
             if review_receipt.policy.requested_effort.as_deref() != Some(exp_effort.as_str())
                 || !review_receipt.policy.require_effort_evidence
-                || review_receipt.policy.observed_effort.as_deref() != Some(exp_effort.as_str())
+                || (review_receipt.policy.observed_effort.as_deref() != Some(exp_effort.as_str())
+                    && !review_receipt.policy.has_verified_codex_task_launch())
             {
                 return Err(OperationsError::UncertainWorkerOutcome(format!(
                     "predecessor task `{}` review receipt is missing verified effort `{exp_effort}`",

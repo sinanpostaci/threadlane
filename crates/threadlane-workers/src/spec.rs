@@ -11,18 +11,23 @@ use crate::fs_safety::{
 };
 pub use crate::permissions::{
     build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
-    build_opencode_config_content, build_opencode_config_content_json,
-    evaluate_antigravity_settings, evaluate_opencode_rules, validate_advisory_provider_and_mode,
-    validate_advisory_read_only_workdir, validate_codex_advisory_workdir,
-    AntigravityPermissionsBlock, AntigravitySessionSettings, OpenCodeAgentConfig,
-    OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule, OpenCodeRuleEffect,
-    WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
+    build_codex_task_files_permission_profile_config,
+    build_codex_task_files_permission_profile_config_for_scopes, build_opencode_config_content,
+    build_opencode_config_content_json, evaluate_antigravity_settings,
+    evaluate_codex_task_files_permission_profile_config, evaluate_opencode_rules,
+    is_unsafe_codex_toml_scope_char, parse_and_validate_codex_task_files_permission_profile_config,
+    validate_advisory_provider_and_mode, validate_advisory_read_only_workdir,
+    validate_codex_advisory_workdir, validate_codex_task_files_scope_str,
+    validate_codex_task_files_workdir, AntigravityPermissionsBlock, AntigravitySessionSettings,
+    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
+    OpenCodeRuleEffect, WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
     AGY_PROTECTED_READ_DENY_PATTERNS, CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN,
     CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH, CODEX_ADVISORY_MAX_WORKDIR_DEPTH,
-    CODEX_ADVISORY_MAX_WORKDIR_ENTRIES, CODEX_PROJECT_CONFIG_MARKERS, MAX_OPENCODE_CONFIG_BYTES,
-    MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
-    OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
-    OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
+    CODEX_ADVISORY_MAX_WORKDIR_ENTRIES, CODEX_PROJECT_CONFIG_MARKERS,
+    CODEX_TASK_FILES_PERMISSION_PROFILE_NAME, CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS,
+    MAX_OPENCODE_CONFIG_BYTES, MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS,
+    OPENCODE_CONFIG_ENV_VAR, OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS,
+    OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS, OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
 };
 use crate::permissions::{
     build_antigravity_task_files_settings_json_for_scopes, validate_permission_pattern_path,
@@ -114,7 +119,7 @@ pub enum WorkerProvider {
         alias = "opencode"
     )]
     OpenCodeV2,
-    /// OpenAI Codex (`codex`) CLI in read-only non-interactive `exec --json --ephemeral` advisory mode.
+    /// OpenAI Codex (`codex`) CLI in non-interactive scoped-task or read-only advisory mode.
     #[serde(rename = "codex_cli", alias = "codex-cli", alias = "codex")]
     CodexCli,
 }
@@ -410,23 +415,29 @@ impl WorkerSpec {
                 }
             }
             WorkerProvider::CodexCli => {
-                if self.file_permissions != WorkerFilePermissions::ReadOnly {
+                if self.session_id.is_some() {
+                    return Err(WorkerError::InvalidSpec(
+                        "`session_id` (`--session`) is only supported for provider `opencode_v2`; `codex_cli` worker runs must use `--ephemeral`"
+                            .to_string(),
+                    ));
+                }
+                if self.standalone {
+                    return Err(WorkerError::InvalidSpec(
+                        "`standalone` (`--standalone`) is only supported for provider `opencode_v2`"
+                            .to_string(),
+                    ));
+                }
+                if self.file_permissions == WorkerFilePermissions::Inherit {
                     return Err(WorkerError::UnsupportedCapability {
                         provider: self.provider.as_str().to_string(),
                         capability: format!(
                             "worker_file_permissions:{}",
                             self.file_permissions.as_str()
                         ),
-                        reason: format!(
-                            "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`; mutable `{}` worker invocations are not supported",
-                            self.file_permissions.as_str()
-                        ),
+                        reason: "provider `codex_cli` refuses unrestricted `file_permissions: inherit`; mutable Codex worker invocations require `file_permissions: task_files` with explicit approved write scopes"
+                            .to_string(),
                     });
                 }
-                return Err(WorkerError::InvalidSpec(
-                    "provider `codex_cli` supports only read-only advisory execution via `AdvisoryWorkerSpec` with zero write scopes; `WorkerSpec` mutable task worktree execution is not supported"
-                        .to_string(),
-                ));
             }
         }
 
@@ -451,13 +462,22 @@ impl WorkerSpec {
 
         validate_prompt(&self.prompt)?;
         let constructed_argv = self.build_argv_from_resolved(&resolved_model, None);
-        let workdir_argv_resolution_required = self.provider == WorkerProvider::Antigravity
-            && self.file_permissions.requires_workdir_argv();
+        let workdir_argv_resolution_required = matches!(
+            self.provider,
+            WorkerProvider::Antigravity | WorkerProvider::CodexCli
+        ) && self.file_permissions.requires_workdir_argv();
         let argv_resolution_note = workdir_argv_resolution_required.then(|| {
-            format!(
-                "file_permissions is `{}`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.",
-                self.file_permissions.as_str()
-            )
+            match self.provider {
+                WorkerProvider::CodexCli => format!(
+                    "file_permissions is `{}`; `constructed_argv` is the static base preview without `-c permissions.{}=...`, which is resolved from the canonical task working directory and base commit via `WorkerSpec::build_argv_for_workdir`.",
+                    self.file_permissions.as_str(),
+                    CODEX_TASK_FILES_PERMISSION_PROFILE_NAME
+                ),
+                _ => format!(
+                    "file_permissions is `{}`; `constructed_argv` is the static base preview without `--settings`, which is resolved from the canonical task working directory via `WorkerSpec::build_argv_for_workdir`.",
+                    self.file_permissions.as_str()
+                ),
+            }
         });
 
         Ok(SpecValidationReport {
@@ -578,15 +598,44 @@ impl WorkerSpec {
                 let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
                 None
             }
-            (WorkerProvider::CodexCli, _) => {
+            (WorkerProvider::CodexCli, WorkerFilePermissions::TaskFiles) => {
+                let resolved_write_scopes = crate::git::resolve_allowed_write_scopes_at_base(
+                    &report.canonical_repository_path,
+                    &self.base_commit,
+                    &self.allowed_write_paths,
+                    crate::git::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+                )?;
+                for entry in &self.allowed_write_paths {
+                    let (clean, expected_kind) = match entry.strip_suffix('/') {
+                        Some(clean) => (clean, WriteScopeKind::DirectorySubtree),
+                        None => (entry.as_str(), WriteScopeKind::ExactFile),
+                    };
+                    if resolved_write_scopes.get(clean) != Some(&expected_kind) {
+                        return Err(WorkerError::InvalidSpec(format!(
+                            "Codex write scope `{entry}` changed kind at base_commit; directory scopes require an explicit trailing `/`"
+                        )));
+                    }
+                }
+                Some(build_codex_task_files_permission_profile_config_for_scopes(
+                    &canonical_workdir,
+                    &resolved_write_scopes,
+                )?)
+            }
+            (WorkerProvider::CodexCli, WorkerFilePermissions::Inherit) => {
                 return Err(WorkerError::UnsupportedCapability {
                     provider: self.provider.as_str().to_string(),
                     capability: format!(
                         "worker_file_permissions:{}",
                         self.file_permissions.as_str()
                     ),
-                    reason: "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`".to_string(),
+                    reason: "provider `codex_cli` refuses unrestricted `file_permissions: inherit`; mutable Codex worker invocations require `file_permissions: task_files` with explicit approved write scopes".to_string(),
                 });
+            }
+            (WorkerProvider::CodexCli, WorkerFilePermissions::ReadOnly) => {
+                return Err(WorkerError::InvalidSpec(
+                    "`file_permissions: read_only` requires `AdvisoryWorkerSpec` with zero write scopes; `WorkerSpec` is only for mutable task worktrees (`inherit` or `task_files`)"
+                        .to_string(),
+                ));
             }
         };
         Ok(self.build_argv_from_resolved(&report.resolved_model, settings_json))
@@ -659,14 +708,10 @@ impl WorkerSpec {
                 let config_json = self.build_opencode_config_for_workdir(&canonical_workdir)?;
                 Ok(vec![(OPENCODE_CONFIG_ENV_VAR.to_string(), config_json)])
             }
-            WorkerProvider::CodexCli => Err(WorkerError::UnsupportedCapability {
-                provider: self.provider.as_str().to_string(),
-                capability: format!(
-                    "worker_file_permissions:{}",
-                    self.file_permissions.as_str()
-                ),
-                reason: "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`".to_string(),
-            }),
+            WorkerProvider::CodexCli => {
+                validate_codex_task_files_workdir(&canonical_workdir)?;
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -1101,12 +1146,15 @@ fn build_provider_argv_from_resolved(
                 .effort
                 .as_deref()
                 .expect("CodexCli effort is verified during model target resolution");
-            let mut argv = Vec::with_capacity(19 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2 + 2);
+            let mut argv = Vec::with_capacity(20 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2 + 2);
             argv.push("--no-daemon".to_string());
             argv.push("exec".to_string());
             argv.push("--json".to_string());
             argv.push("--ephemeral".to_string());
             argv.push("--ignore-user-config".to_string());
+            if antigravity_mode != "plan" {
+                argv.push("--ignore-rules".to_string());
+            }
             argv.push("--model".to_string());
             argv.push(resolved.cli_model_arg.clone());
             argv.push("-c".to_string());
@@ -1115,12 +1163,26 @@ fn build_provider_argv_from_resolved(
             argv.push("approval_policy=\"never\"".to_string());
             argv.push("-c".to_string());
             argv.push("model_provider=\"openai\"".to_string());
-            argv.push("-c".to_string());
-            argv.push(format!(
-                "default_permissions=\"{CODEX_ADVISORY_PERMISSION_PROFILE_NAME}\""
-            ));
-            argv.push("-c".to_string());
-            argv.push(CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG.to_string());
+            if let Some(profile_config) = settings_json {
+                argv.push("-c".to_string());
+                argv.push(format!(
+                    "default_permissions=\"{CODEX_TASK_FILES_PERMISSION_PROFILE_NAME}\""
+                ));
+                argv.push("-c".to_string());
+                argv.push(profile_config);
+            } else if antigravity_mode == "plan" {
+                argv.push("-c".to_string());
+                argv.push(format!(
+                    "default_permissions=\"{CODEX_ADVISORY_PERMISSION_PROFILE_NAME}\""
+                ));
+                argv.push("-c".to_string());
+                argv.push(CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG.to_string());
+            } else {
+                argv.push("-c".to_string());
+                argv.push(format!(
+                    "default_permissions=\"{CODEX_TASK_FILES_PERMISSION_PROFILE_NAME}\""
+                ));
+            }
             argv.push("-c".to_string());
             argv.push("web_search=\"disabled\"".to_string());
             for feature in CODEX_ADVISORY_DISABLED_FEATURES {
@@ -1189,6 +1251,83 @@ pub fn is_pinned_codex_read_only_argv(argv: &[String], resolved: &ResolvedModelT
     argv[sep_idx] == "--"
         && !argv[sep_idx + 1].trim().is_empty()
         && !argv[sep_idx + 1].contains('\0')
+}
+
+/// Validates and extracts the exact repository-relative write scopes from a launch-pinned
+/// `codex` `TaskFiles` argument vector (`--ignore-rules`,
+/// `default_permissions="threadlane-task-files"`, and a valid
+/// `permissions.threadlane-task-files={...}` inline config).
+///
+/// Returns `None` if any element of `argv`, `resolved`, the disabled feature set, or the
+/// inline permission profile config fails strict validation.
+#[must_use]
+pub fn extract_pinned_codex_task_files_write_scopes(
+    argv: &[String],
+    resolved: &ResolvedModelTarget,
+) -> Option<BTreeMap<String, WriteScopeKind>> {
+    let effort = resolved.effort.as_deref()?;
+    if validate_simple_identifier(&resolved.base_model, "model").is_err()
+        || validate_simple_identifier(effort, "effort").is_err()
+        || resolved.cli_model_arg != resolved.base_model
+    {
+        return None;
+    }
+    let expected_len = 20 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2 + 2;
+    if argv.len() != expected_len {
+        return None;
+    }
+    let expected_effort_cfg = format!("model_reasoning_effort=\"{effort}\"");
+    let expected_default_perms =
+        format!("default_permissions=\"{CODEX_TASK_FILES_PERMISSION_PROFILE_NAME}\"");
+    if !(argv[0] == "--no-daemon"
+        && argv[1] == "exec"
+        && argv[2] == "--json"
+        && argv[3] == "--ephemeral"
+        && argv[4] == "--ignore-user-config"
+        && argv[5] == "--ignore-rules"
+        && argv[6] == "--model"
+        && argv[7] == resolved.cli_model_arg
+        && argv[8] == "-c"
+        && argv[9] == expected_effort_cfg
+        && argv[10] == "-c"
+        && argv[11] == "approval_policy=\"never\""
+        && argv[12] == "-c"
+        && argv[13] == "model_provider=\"openai\""
+        && argv[14] == "-c"
+        && argv[15] == expected_default_perms
+        && argv[16] == "-c"
+        && argv[18] == "-c"
+        && argv[19] == "web_search=\"disabled\"")
+    {
+        return None;
+    }
+    let write_scopes =
+        parse_and_validate_codex_task_files_permission_profile_config(&argv[17]).ok()?;
+    for (idx, feature) in CODEX_ADVISORY_DISABLED_FEATURES.iter().enumerate() {
+        let base = 20 + idx * 2;
+        if argv[base] != "--disable" || argv[base + 1] != *feature {
+            return None;
+        }
+    }
+    let sep_idx = 20 + CODEX_ADVISORY_DISABLED_FEATURES.len() * 2;
+    if argv[sep_idx] != "--"
+        || argv[sep_idx + 1].trim().is_empty()
+        || argv[sep_idx + 1].contains('\0')
+    {
+        return None;
+    }
+    Some(write_scopes)
+}
+
+/// Returns `true` if `argv` matches the exact mutable `codex` `TaskFiles` argument vector
+/// pinned to `resolved` (`--no-daemon exec --json --ephemeral --ignore-user-config --ignore-rules --model <model>`,
+/// `-c` overrides for `model_reasoning_effort`, `approval_policy="never"`, `model_provider="openai"`,
+/// `default_permissions="threadlane-task-files"`, a validated `permissions.threadlane-task-files={...}`
+/// inline profile with finite write scopes and all protected deny rules, `web_search="disabled"`,
+/// all [`CODEX_ADVISORY_DISABLED_FEATURES`] `--disable` pairs, `--`, and a non-empty prompt).
+#[must_use]
+pub fn is_pinned_codex_task_files_argv(argv: &[String], resolved: &ResolvedModelTarget) -> bool {
+    extract_pinned_codex_task_files_write_scopes(argv, resolved).is_some()
 }
 
 /// Resolves and validates a provider-specific model and effort/variant target from the three

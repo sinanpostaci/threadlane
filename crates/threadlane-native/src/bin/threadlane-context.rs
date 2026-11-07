@@ -6,8 +6,8 @@
 //! Validates a private (`0600`) version-1 operator context JSON file, verifies the bound
 //! `(binding_id, thread_uuid)` target against the live authenticated local supervisor, and
 //! either emits a bounded `check` verification envelope or invokes the canonical sibling
-//! `threadlane-workflow`, `threadlane-session`, `threadlane-flow`, or `threadlane-advice` binary
-//! directly via `argv` (never a shell).
+//! `threadlane-workflow`, `threadlane-session`, `threadlane-flow`, `threadlane-approve`, or
+//! `threadlane-advice` binary directly via `argv` (never a shell).
 //!
 //! ## Security and Authority Boundaries
 //!
@@ -19,13 +19,13 @@
 //!   and XDG fields) is never granted authority to choose executables or override bound stores.
 //!   When `cli_package` is present, its `bin` directory must match the current executable's
 //!   canonical sibling directory.
-//! - **Canonical sibling execution only**: `workflow`, `session`, `flow`, and `advice` resolve only
-//!   the canonical `threadlane-workflow`, `threadlane-session`, `threadlane-flow`, or
-//!   `threadlane-advice` regular executable in the current binary's canonical parent directory,
-//!   rejecting missing, symlink, non-regular, or non-executable targets.
-//! - **Context-free family help**: `help workflow`, `help session`, `help flow`, and `help advice`
-//!   execute only the canonical same-package sibling with a single fixed `--help` argument, without
-//!   reading a context, validating stores, or contacting a supervisor.
+//! - **Canonical sibling execution only**: `workflow`, `session`, `flow`, `approve`, and `advice`
+//!   resolve only the canonical `threadlane-workflow`, `threadlane-session`, `threadlane-flow`,
+//!   `threadlane-approve`, or `threadlane-advice` regular executable in the current binary's
+//!   canonical parent directory, rejecting missing, symlink, non-regular, or non-executable targets.
+//! - **Context-free family help**: `help workflow`, `help session`, `help flow`, `help approve`, and
+//!   `help advice` execute only the canonical same-package sibling with a single fixed `--help`
+//!   argument, without reading a context, validating stores, or contacting a supervisor.
 //! - **Locked scope flags**: Bound store directories, `--cache-dir`, `--project-root`,
 //!   `--context-id`, `--binding`, `--thread`, and `--context` come exclusively from the private
 //!   context file; forwarded overrides (including `=` forms and repeated flags) are rejected before
@@ -58,6 +58,7 @@ const TRUSTED_LOCAL_OPERATOR_ROUTE: &str = "trusted_local_operator";
 const WORKFLOW_BINARY_NAME: &str = "threadlane-workflow";
 const SESSION_BINARY_NAME: &str = "threadlane-session";
 const FLOW_BINARY_NAME: &str = "threadlane-flow";
+const APPROVE_BINARY_NAME: &str = "threadlane-approve";
 const ADVICE_BINARY_NAME: &str = "threadlane-advice";
 const ADVICE_CACHE_DIR_NAME: &str = "advice-cache";
 
@@ -69,10 +70,12 @@ USAGE:
     threadlane-context --context <ABS_PRIVATE_JSON> workflow <WORKFLOW_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> session <SESSION_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> flow <FLOW_ARGS>...
+    threadlane-context --context <ABS_PRIVATE_JSON> approve <APPROVE_ARGS>...
     threadlane-context --context <ABS_PRIVATE_JSON> advice <ADVICE_ARGS>...
     threadlane-context help workflow
     threadlane-context help session
     threadlane-context help flow
+    threadlane-context help approve
     threadlane-context help advice
     threadlane-context --help | -h | help
     threadlane-context --version | -V
@@ -82,8 +85,9 @@ FAMILIES:
     workflow    Invoke canonical sibling threadlane-workflow with context-bound scope flags
     session     Invoke canonical sibling threadlane-session with context-bound scope flags
     flow        Invoke canonical sibling threadlane-flow with the same five stores, binding, and thread as session
+    approve     Invoke canonical sibling threadlane-approve with context-bound stores, binding, thread, and project root
     advice      Invoke canonical sibling threadlane-advice with context-bound registry, cache, project root, and context ID
-    help        Display outer help, or context-free sibling help for workflow/session/flow/advice
+    help        Display outer help, or context-free sibling help for workflow/session/flow/approve/advice
 ";
 
 const PROTECTED_OVERRIDE_FLAGS: &[&str] = &[
@@ -117,6 +121,7 @@ enum ChildFamily {
     Workflow,
     Session,
     Flow,
+    Approve,
     Advice,
 }
 
@@ -126,6 +131,7 @@ impl ChildFamily {
             Self::Workflow => WORKFLOW_BINARY_NAME,
             Self::Session => SESSION_BINARY_NAME,
             Self::Flow => FLOW_BINARY_NAME,
+            Self::Approve => APPROVE_BINARY_NAME,
             Self::Advice => ADVICE_BINARY_NAME,
         }
     }
@@ -135,6 +141,7 @@ impl ChildFamily {
             Self::Workflow => "workflow",
             Self::Session => "session",
             Self::Flow => "flow",
+            Self::Approve => "approve",
             Self::Advice => "advice",
         }
     }
@@ -480,7 +487,7 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
     if args[0] == "help" {
         if args.len() != 2 {
             return Err(OperatorCliError::invalid_input(
-                "help command family accepts exactly one of workflow, session, flow, or advice",
+                "help command family accepts exactly one of workflow, session, flow, approve, or advice",
             ));
         }
         return match args[1] {
@@ -493,11 +500,14 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
             "flow" => Ok(OuterParseAction::DisplaySiblingHelp {
                 family: ChildFamily::Flow,
             }),
+            "approve" => Ok(OuterParseAction::DisplaySiblingHelp {
+                family: ChildFamily::Approve,
+            }),
             "advice" => Ok(OuterParseAction::DisplaySiblingHelp {
                 family: ChildFamily::Advice,
             }),
             _ => Err(OperatorCliError::invalid_input(
-                "unsupported help family; only workflow, session, flow, and advice are supported",
+                "unsupported help family; only workflow, session, flow, approve, and advice are supported",
             )),
         };
     }
@@ -581,6 +591,18 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
                 inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
             }
         }
+        "approve" => {
+            if rest.is_empty() {
+                return Err(OperatorCliError::invalid_input(
+                    "approve command family requires subcommand arguments",
+                ));
+            }
+            reject_protected_overrides(rest)?;
+            ContextCommand::Forward {
+                family: ChildFamily::Approve,
+                inner_args: rest.iter().map(|s| (*s).to_string()).collect(),
+            }
+        }
         "advice" => {
             if rest.is_empty() {
                 return Err(OperatorCliError::invalid_input(
@@ -600,7 +622,7 @@ fn parse_outer_args(raw_args: &[OsString]) -> Result<OuterParseAction, OperatorC
         }
         _ => {
             return Err(OperatorCliError::invalid_input(
-                "unsupported command family; only check, workflow, session, flow, and advice are supported",
+                "unsupported command family; only check, workflow, session, flow, approve, and advice are supported",
             ));
         }
     };
@@ -1330,6 +1352,29 @@ fn build_child_args(
         return args;
     }
 
+    if family == ChildFamily::Approve {
+        let mut args = Vec::with_capacity(14 + inner_args.len());
+        args.push(OsString::from("--state-dir"));
+        args.push(validated.stores.state_dir.as_os_str().to_os_string());
+        args.push(OsString::from("--registry-dir"));
+        args.push(validated.stores.registry_dir.as_os_str().to_os_string());
+        args.push(OsString::from("--plans-dir"));
+        args.push(validated.stores.plans_dir.as_os_str().to_os_string());
+        args.push(OsString::from("--authority-dir"));
+        args.push(validated.stores.authority_dir.as_os_str().to_os_string());
+        args.push(OsString::from("--binding"));
+        args.push(OsString::from(&validated.binding_id));
+        args.push(OsString::from("--thread"));
+        args.push(OsString::from(&validated.thread_uuid));
+        args.push(OsString::from("--project-root"));
+        args.push(validated.project_root.as_os_str().to_os_string());
+
+        for arg in inner_args {
+            args.push(OsString::from(arg));
+        }
+        return args;
+    }
+
     let mut args = Vec::with_capacity(14 + inner_args.len());
     args.push(OsString::from("--state-dir"));
     args.push(validated.stores.state_dir.as_os_str().to_os_string());
@@ -1492,6 +1537,30 @@ mod tests {
             }
         );
 
+        let approve = parse_outer_args(&[
+            OsString::from("--context"),
+            OsString::from("/tmp/context.json"),
+            OsString::from("approve"),
+            OsString::from("prepare"),
+            OsString::from("--request"),
+            OsString::from("/tmp/approve-request.json"),
+        ])
+        .expect("parse approve");
+        assert_eq!(
+            approve,
+            OuterParseAction::Execute {
+                context_path: PathBuf::from("/tmp/context.json"),
+                command: ContextCommand::Forward {
+                    family: ChildFamily::Approve,
+                    inner_args: vec![
+                        "prepare".to_string(),
+                        "--request".to_string(),
+                        "/tmp/approve-request.json".to_string(),
+                    ],
+                },
+            }
+        );
+
         let advice = parse_outer_args(&[
             OsString::from("--context"),
             OsString::from("/tmp/context.json"),
@@ -1527,8 +1596,8 @@ mod tests {
         .expect_err("non-utf8 must fail");
         assert_eq!(bad_utf8.code, "invalid_input");
 
-        // Unsupported families (approve, host, operator) are rejected.
-        for unsupported in ["approve", "host", "operator"] {
+        // Unsupported families (host, operator) are rejected.
+        for unsupported in ["host", "operator"] {
             let err = parse_outer_args(&[
                 OsString::from("--context"),
                 OsString::from("/tmp/context.json"),
@@ -1540,11 +1609,12 @@ mod tests {
         }
 
         // Protected flags in inner_args (separate and equals forms) are rejected for every
-        // forwarding family, including flow and advice.
+        // forwarding family, including flow, approve, and advice.
         for (family, inner) in [
             ("workflow", "catalog"),
             ("session", "session"),
             ("flow", "fixture-command"),
+            ("approve", "prepare"),
             ("advice", "preview"),
         ] {
             for bad_flag in [
@@ -1649,6 +1719,7 @@ mod tests {
             ("workflow", ChildFamily::Workflow),
             ("session", ChildFamily::Session),
             ("flow", ChildFamily::Flow),
+            ("approve", ChildFamily::Approve),
             ("advice", ChildFamily::Advice),
         ] {
             let parsed = parse_outer_args(&[OsString::from("help"), OsString::from(family_token)])
@@ -1663,12 +1734,12 @@ mod tests {
 
         let invalid_help_forms: &[&[&str]] = &[
             &["help", "check"],
-            &["help", "approve"],
             &["help", "host"],
             &["help", "operator"],
             &["help", "unknown"],
             &["help", "workflow=ignored"],
             &["help", "flow=ignored"],
+            &["help", "approve=ignored"],
             &["help", "advice=ignored"],
             &["help", "--help"],
             &["help", "-h"],
@@ -1678,10 +1749,13 @@ mod tests {
             &["help", "session", "--help"],
             &["help", "flow", "extra"],
             &["help", "flow", "--help"],
+            &["help", "approve", "extra"],
+            &["help", "approve", "--help"],
             &["help", "advice", "extra"],
             &["help", "advice", "--help"],
             &["help", "workflow", "--state-dir=/tmp/other"],
             &["help", "flow", "--state-dir=/tmp/other"],
+            &["help", "approve", "--state-dir=/tmp/other"],
             &["help", "advice", "--cache-dir=/tmp/other"],
             &["help", "advice", "--context-id=other"],
         ];
@@ -1695,6 +1769,7 @@ mod tests {
             &["--context", "/tmp/context.json", "help", "workflow"],
             &["--context=/tmp/context.json", "help", "session"],
             &["--context", "/tmp/context.json", "help", "flow"],
+            &["--context", "/tmp/context.json", "help", "approve"],
             &["--context", "/tmp/context.json", "help", "advice"],
             &["--context=/tmp/context.json", "help", "advice"],
             &["--context", "/tmp/context.json", "help"],
@@ -1722,6 +1797,38 @@ mod tests {
             current_bin_dir: PathBuf::from("/abs/pkg/bin"),
             cli_package_pinned: true,
         };
+
+        let approve_args = build_child_args(
+            &validated,
+            ChildFamily::Approve,
+            &[
+                "prepare".to_string(),
+                "--request".to_string(),
+                "/abs/approve-intent.json".to_string(),
+            ],
+        );
+        assert_eq!(
+            approve_args,
+            vec![
+                OsString::from("--state-dir"),
+                OsString::from("/abs/stores/state"),
+                OsString::from("--registry-dir"),
+                OsString::from("/abs/stores/registry"),
+                OsString::from("--plans-dir"),
+                OsString::from("/abs/stores/plans"),
+                OsString::from("--authority-dir"),
+                OsString::from("/abs/stores/authority"),
+                OsString::from("--binding"),
+                OsString::from("bnd_123"),
+                OsString::from("--thread"),
+                OsString::from("0196ed00-0000-7000-8000-0000000000a1"),
+                OsString::from("--project-root"),
+                OsString::from("/abs/project"),
+                OsString::from("prepare"),
+                OsString::from("--request"),
+                OsString::from("/abs/approve-intent.json"),
+            ]
+        );
 
         let advice_args = build_child_args(
             &validated,

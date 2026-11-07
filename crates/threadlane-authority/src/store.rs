@@ -927,7 +927,10 @@ impl AuthorityStore {
                 standalone,
                 file_permissions,
             ) = match compiled_task.adapter {
-                ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 => {
+                ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
+                    if compiled_task.adapter != ToolAdapter::CodexCli
+                        || compiled_task.role == threadlane_registry::WorkflowRole::Coder =>
+                {
                     executable_profile_count += 1;
                     if executable_profile_count > MAX_EXECUTABLE_PROFILES_PER_APPROVAL {
                         return Err(AuthorityError::validation(
@@ -1309,6 +1312,15 @@ pub fn build_approved_worker_profile_config(
     work_area_root: &Path,
     store_path_label: &Path,
 ) -> Result<WorkerProfileConfig, AuthorityError> {
+    if !task.is_frozen_headless_worker() {
+        return Err(AuthorityError::CorruptStore {
+            path: store_path_label.display().to_string(),
+            reason: format!(
+                "worker task `{}` has incomplete frozen execution pins",
+                task.task_id
+            ),
+        });
+    }
     let provider = task.provider.ok_or_else(|| AuthorityError::CorruptStore {
         path: store_path_label.display().to_string(),
         reason: format!("worker task `{}` is missing provider", task.task_id),

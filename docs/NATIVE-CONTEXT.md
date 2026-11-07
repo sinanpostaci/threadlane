@@ -1,10 +1,11 @@
 # Packaged operator context command
 
-Date: 2026-10-31; advice family added 2026-11-01. This document describes
+Date: 2026-10-31; advice family added 2026-11-01; approve family and verified
+managed per-chat export added 2026-11-07. This document describes
 `threadlane-context`, the packaged trusted local operator context command in
-`threadlane-native`. It routes everyday workflow, approved-session, flow, and
-Jev shadow-advice CLI invocations through an existing private version-1 context
-JSON file without shells or ad-hoc wrapper scripts.
+`threadlane-native`. It routes everyday workflow, approved-session, flow, scope
+approval, and Jev shadow-advice CLI invocations through a private version-1
+context JSON file without shells or ad-hoc wrapper scripts.
 
 ## Authority boundary
 
@@ -15,26 +16,58 @@ local control plane. It does **not** authenticate per-call native chat identity
 (`native_per_call_identity_verified: false`), establish automatic two-chat
 routing, or grant human scope approval (`human_approval_verified: false`).
 
-- Operational context commands are `check`, `workflow`, `session`, `flow`, and
-  `advice`. Context-free `help workflow`, `help session`, `help flow`, and
-  `help advice` expose sibling help only.
+- Operational context commands are `check`, `workflow`, `session`, `flow`,
+  `approve`, and `advice`. Context-free `help workflow`, `help session`,
+  `help flow`, `help approve`, and `help advice` expose sibling help only.
 - The `flow` family is an additional forwarding surface for the
   `threadlane-flow` package sibling. It adds no scheduling, automatic routing,
   native identity, or human approval authority; the sibling owns its own
   behavior and remains subject to the same explicit operator boundaries.
+- The `approve` family forwards to the canonical `threadlane-approve` package
+  sibling with locked `--state-dir`, `--registry-dir`, `--plans-dir`,
+  `--authority-dir`, `--binding`, `--thread`, and `--project-root` flags.
+  `threadlane-approve` enforces the bound `binding_id`, `thread_uuid` (and
+  `--confirm-thread`), and `project_root` (`repository_path`) against the
+  decoded request file before any ledger effect, so replacing a request file
+  cannot route a different chat or repository through a checked context.
 - The `advice` family forwards to the `threadlane-advice` sibling. It adds no
   automatic classification or plan/profile/model change: the sibling records
   advisory-only shadow output for explicit commands. Only the sibling's
   `classify` subcommand may create the derived private advice cache; the context
   router never creates it. See [Jev shadow advice](JEV-SHADOW.md).
-- Scope approval (`threadlane-approve`), host startup (`threadlane-host`), and
-  review/integration (`threadlane-operator`) remain separate explicit operator
-  commands and are not exposed as context pass-through families.
+- Host startup (`threadlane-host`) and review/integration (`threadlane-operator`)
+  remain separate explicit operator commands and are not exposed as context
+  pass-through families.
 - The context router itself performs no setup/import wizard, store creation,
   permission repair, daemon startup, MCP registration, model change, or provider
   call. A forwarded sibling may perform its own explicit operation;
   for example, `threadlane-advice classify` may call Jev and create its derived
   cache.
+
+## Automatic per-chat export on `connect_current_chat`
+
+After independently verified managed desktop auto-pairing (`connect_current_chat`),
+`PairedMcpServer` exports a per-chat private version-1 context file under the
+owned `0700` pairing child directory `<pairing_dir>/operator-contexts/` when all
+five private `0700` stores (`state_dir`, `registry_dir`, `plans_dir`,
+`authority_dir`, `sessions_dir`) and the canonical same-package
+`threadlane-context` sibling executable are configured and validated:
+
+- `project_root` is derived exclusively from the verified parent/thread `cwd`
+  evidence, `binding_id` and `thread_uuid` from verified enrollment, and `stores`
+  from server configuration—never from caller-supplied arguments.
+- Each file is written atomically with `0600` permissions as
+  `context-<binding_tag>-<package_content_tag>.json`, scoped by
+  `(binding_id, thread_uuid, context_router_executable, content_sha256)`.
+- Repeated identical `connect_current_chat` calls reuse the existing `0600` file
+  without rewriting (`reused_existing: true`). Package or store changes produce
+  a distinct filename and never overwrite unexpected files or mix chats.
+- Exported files contain only scope and store configuration metadata (`route:
+  "trusted_local_operator"`, `native_per_call_identity_verified: false`), never
+  bearer tokens, operator credentials, raw conversations, or human approval
+  claims. When stores or sibling binaries are unconfigured, `operator_context`
+  reports `available: false` with a truthful `code` and `message` while
+  ordinary `connect_current_chat` enrollment remains compatible.
 
 ## Commands
 
@@ -43,18 +76,19 @@ running supervisor.
 
 ### Context-free family help
 
-The four exact offline family help commands are:
+The five exact offline family help commands are:
 
 ```sh
 threadlane-context help workflow
 threadlane-context help session
 threadlane-context help flow
+threadlane-context help approve
 threadlane-context help advice
 ```
 
-All four forms succeed without a context file or a running supervisor. Each
+All five forms succeed without a context file or a running supervisor. Each
 command resolves only the canonical `threadlane-workflow`, `threadlane-session`,
-`threadlane-flow`, or `threadlane-advice` executable in the current binary's
+`threadlane-flow`, `threadlane-approve`, or `threadlane-advice` executable in the current binary's
 canonical parent directory and passes exactly one fixed `--help` argument. The
 sibling's own help text is written through inherited stdio. `PATH` is never
 consulted, and missing, symlink, non-regular, or non-executable package siblings
@@ -65,8 +99,7 @@ child is invoked.
 These offline forms are not operational context validation: they do not read or
 validate a context file, stores, package pin, or live binding, and they do not
 contact the supervisor. They are also not approval, do not start a supervisor
-or host, and make no native identity or authorization claim; scope approval
-remains a separate `threadlane-approve` operation.
+or host, and make no native identity or authorization claim.
 
 ### Operational invocations
 
@@ -80,6 +113,9 @@ threadlane-context --context /absolute/private/context.json \
 
 threadlane-context --context /absolute/private/context.json \
   session session --approval-id apr_0123456789abcdef0123456789abcdef
+
+threadlane-context --context /absolute/private/context.json \
+  approve prepare --request /absolute/private/approve-intent.json
 
 threadlane-context --context /absolute/private/context.json \
   advice classify --request /absolute/private/request.json
@@ -111,9 +147,15 @@ threadlane-context --context /absolute/private/context.json \
   five context-bound stores as `session` (`--state-dir`, `--registry-dir`,
   `--plans-dir`, `--authority-dir`, and `--sessions-dir`) plus the `--binding`
   and `--thread` flags, and forwards `<args...>` directly via `argv`.
-  As with workflow, session, and advice, the private context and live binding
-  are validated before child invocation; the router does not interpret or
+  As with workflow, session, approve, and advice, the private context and live
+  binding are validated before child invocation; the router does not interpret or
   schedule any flow subcommand.
+- `approve <args...>` resolves only the canonical `threadlane-approve` executable
+  in the current binary's canonical parent directory, prepends `--state-dir`,
+  `--registry-dir`, `--plans-dir`, `--authority-dir`, `--binding`, `--thread`,
+  and `--project-root` in that order, and forwards `<args...>` directly via
+  `argv`. The child enforces the bound `binding_id`, `thread_uuid`, and
+  `project_root` against the decoded request file before any ledger effect.
 - `advice <args...>` resolves only the canonical `threadlane-advice` executable
   in the current binary's canonical parent directory, prepends exactly
   `--registry-dir` (from `stores.registry_dir`), `--cache-dir` (the

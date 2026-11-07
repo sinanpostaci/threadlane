@@ -242,14 +242,10 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
         WorkerErrorCode::InvalidSpec
     );
 
-    // 7. Reject mutable WorkerSpec for CodexCli across all permission modes before process effect
+    // 7. Reject Inherit and ReadOnly on WorkerSpec for CodexCli before process effect; allow TaskFiles
     for (mode, write_paths) in [
         (
             WorkerFilePermissions::Inherit,
-            BTreeSet::from(["src/lib.rs".to_string()]),
-        ),
-        (
-            WorkerFilePermissions::TaskFiles,
             BTreeSet::from(["src/lib.rs".to_string()]),
         ),
         (
@@ -276,7 +272,7 @@ fn codex_cli_exact_argv_permission_profile_and_mutable_or_invalid_spec_refusals(
         };
         let err = worker_spec
             .validate()
-            .expect_err("mutable WorkerSpec must reject CodexCli");
+            .expect_err("WorkerSpec must reject Inherit and ReadOnly for CodexCli");
         if mode != WorkerFilePermissions::ReadOnly {
             assert_eq!(err.code(), WorkerErrorCode::UnsupportedCapability);
         } else {

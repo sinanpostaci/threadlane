@@ -62,7 +62,6 @@ use crate::coworker_observation::{
 use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::{
     constant_time_str_eq, read_private_file_bounded, validate_bounded_identifier,
-    validate_executable_path,
 };
 use crate::profile_flow::{
     preflight, PreflightBlockReason, PreflightRequest, RoleExecutionRoute, RolePreflightRequest,
@@ -917,6 +916,7 @@ impl PersistedDerivedTaskExecutionArtifact {
         let expected_provider = match receipt.coder_choice.adapter {
             ToolAdapter::Antigravity => WorkerProvider::Antigravity,
             ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+            ToolAdapter::CodexCli => WorkerProvider::CodexCli,
             _ => {
                 return Err(NativeError::new(
                     NativeErrorCode::UnsupportedCapability,
@@ -939,12 +939,23 @@ impl PersistedDerivedTaskExecutionArtifact {
         if self.execution_report.worker_report.provider != expected_provider
             || self.observed_provider != expected_provider.as_str()
             || approved_task.provider != Some(expected_provider)
-            || self
-                .execution_report
-                .worker_report
-                .effective_observed_model()
-                != Some(resolved_target.base_model.as_str())
-            || self.observed_model.as_deref() != Some(resolved_target.base_model.as_str())
+            || (expected_provider != WorkerProvider::CodexCli
+                && self
+                    .execution_report
+                    .worker_report
+                    .effective_observed_model()
+                    != Some(resolved_target.base_model.as_str()))
+            || self.observed_model.as_deref()
+                != self
+                    .execution_report
+                    .worker_report
+                    .effective_observed_model()
+            || (expected_provider == WorkerProvider::CodexCli
+                && !approved_task.matches_codex_task_launch_report(
+                    &self.execution_report.worker_report,
+                    &self.execution_report.manifest.checkout_path,
+                    &receipt.execution_base_commit,
+                ))
             || resolved_target.base_model != approved_task.base_model
             || resolved_target.effort != approved_task.effort
             || approved_task.cli_model_arg.as_deref()
@@ -957,12 +968,17 @@ impl PersistedDerivedTaskExecutionArtifact {
         }
 
         if let Some(ref exp_effort) = resolved_target.effort {
-            if self
-                .execution_report
-                .worker_report
-                .effective_observed_effort()
-                != Some(exp_effort.as_str())
-                || self.observed_effort.as_deref() != Some(exp_effort.as_str())
+            if (expected_provider != WorkerProvider::CodexCli
+                && self
+                    .execution_report
+                    .worker_report
+                    .effective_observed_effort()
+                    != Some(exp_effort.as_str()))
+                || self.observed_effort.as_deref()
+                    != self
+                        .execution_report
+                        .worker_report
+                        .effective_observed_effort()
             {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
@@ -1419,6 +1435,7 @@ struct ClaimedDerivedExecutionContext {
     recorded_verdict: StructuredReviewVerdict,
     task_manifest: WorktreeManifest,
     expected_provider: WorkerProvider,
+    approved_task: ApprovedTaskRecord,
     resolved_model_target: ResolvedModelTarget,
     worker_spec: WorkerSpec,
     pre_execution_head_commit: String,
@@ -2504,6 +2521,7 @@ fn prepare_or_claim_derived_coder_execution(
             recorded_verdict,
             task_manifest,
             expected_provider,
+            approved_task: approved_task.clone(),
             resolved_model_target,
             worker_spec,
             pre_execution_head_commit,
@@ -2648,7 +2666,7 @@ fn build_and_validate_derived_coder_worker_spec(
     if coder_choice.route != RoleExecutionRoute::HeadlessWorker
         || !matches!(
             coder_choice.adapter,
-            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2
+            ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 | ToolAdapter::CodexCli
         )
     {
         return Err(NativeError::new(
@@ -2731,7 +2749,12 @@ fn build_and_validate_derived_coder_worker_spec(
             format!("Coder preflight blocked: {}", outcome.detail),
         ));
     }
-    if outcome.selected.as_ref() != Some(coder_choice) {
+    let live_choice = outcome
+        .selected
+        .as_ref()
+        .map(crate::profile_flow::normalize_coder_choice)
+        .transpose()?;
+    if live_choice.as_ref() != Some(coder_choice) {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             "live registry Coder resolution does not match frozen task coder_choice",
@@ -2760,25 +2783,13 @@ fn build_and_validate_derived_coder_worker_spec(
             ),
         ));
     }
-    let raw_executable = tool_def.executable_path.as_ref().ok_or_else(|| {
-        NativeError::new(
-            NativeErrorCode::UnsupportedCapability,
-            format!(
-                "frozen Coder tool `{}` has no configured headless executable_path",
-                coder_choice.tool_id
-            ),
-        )
-    })?;
-    let executable = validate_executable_path(raw_executable).map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::UnsupportedCapability,
-            format!(
-                "frozen Coder tool `{}` executable is unavailable: {}",
-                coder_choice.tool_id,
-                err.message()
-            ),
-        )
-    })?;
+    let (_, executable) = threadlane_authority::resolve_and_validate_worker_executable(
+        &tool_def.id,
+        &candidate_task.task_id,
+        tool_def.adapter,
+        tool_def.executable_path.as_deref(),
+    )
+    .map_err(|e| NativeError::new(NativeErrorCode::ValidationFailed, e.to_string()))?;
     let Some(ref approved_exec) = approved_task.canonical_executable else {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
@@ -2795,6 +2806,7 @@ fn build_and_validate_derived_coder_worker_spec(
     let provider = match coder_choice.adapter {
         ToolAdapter::Antigravity => WorkerProvider::Antigravity,
         ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        ToolAdapter::CodexCli => WorkerProvider::CodexCli,
         _ => {
             return Err(NativeError::new(
                 NativeErrorCode::UnsupportedCapability,
@@ -3408,8 +3420,15 @@ fn classify_derived_execution_outcome(
     }
 
     if worker_report.provider != ctx.expected_provider
-        || worker_report.effective_observed_model()
-            != Some(ctx.resolved_model_target.base_model.as_str())
+        || (ctx.expected_provider != WorkerProvider::CodexCli
+            && worker_report.effective_observed_model()
+                != Some(ctx.resolved_model_target.base_model.as_str()))
+        || (ctx.expected_provider == WorkerProvider::CodexCli
+            && !ctx.approved_task.matches_codex_task_launch_report(
+                worker_report,
+                &ctx.task_manifest.checkout_path,
+                &ctx.receipt.execution_base_commit,
+            ))
     {
         return (
             CoworkerTaskCorrectionExecuteStatus::FailedTerminal,
@@ -3423,7 +3442,9 @@ fn classify_derived_execution_outcome(
     }
 
     if let Some(ref exp_effort) = ctx.resolved_model_target.effort {
-        if worker_report.effective_observed_effort() != Some(exp_effort.as_str()) {
+        if ctx.expected_provider != WorkerProvider::CodexCli
+            && worker_report.effective_observed_effort() != Some(exp_effort.as_str())
+        {
             return (
                 CoworkerTaskCorrectionExecuteStatus::FailedTerminal,
                 false,
@@ -3789,7 +3810,7 @@ fn apply_persisted_derived_report_to_stores(
             || existing.integration_worktree_id != receipt.integration_worktree_id
             || existing.execution_base_commit != receipt.execution_base_commit
             || existing.observed_provider != artifact.observed_provider
-            || Some(existing.observed_model.as_str()) != artifact.observed_model.as_deref()
+            || existing.observed_model != artifact.observed_model
             || existing.observed_effort != artifact.observed_effort
         {
             return Err(NativeError::new(
@@ -3854,12 +3875,13 @@ fn apply_persisted_derived_report_to_stores(
         }
     }
 
-    let observed_model = artifact.observed_model.clone().ok_or_else(|| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "ReadyForVerification derived artifact is missing observed_model",
-        )
-    })?;
+    let observed_model = artifact.observed_model.clone();
+    let codex_launch_report =
+        (artifact.execution_report.worker_report.provider == WorkerProvider::CodexCli).then(|| {
+            super::controller_policy::compact_codex_launch_report(
+                &artifact.execution_report.worker_report,
+            )
+        });
 
     let derived_attempt_artifacts = TaskAttemptExecutionArtifacts {
         task_id: request.task_id.clone(),
@@ -3872,6 +3894,13 @@ fn apply_persisted_derived_report_to_stores(
         execution_base_commit: receipt.execution_base_commit.clone(),
         observed_provider: artifact.observed_provider.clone(),
         observed_model: observed_model.clone(),
+        codex_source_report_sha256: codex_launch_report
+            .as_ref()
+            .map(|_| artifact.artifact_digest.clone()),
+        codex_source_effect_id: codex_launch_report
+            .as_ref()
+            .map(|_| artifact.effect_id.clone()),
+        codex_launch_report,
         observed_effort: artifact.observed_effort.clone(),
         committed_head_commit: None,
         committed_tree_sha: None,
@@ -3959,7 +3988,7 @@ fn apply_persisted_derived_report_to_stores(
                 tree_sha: Some(artifact.post_execution_tree_sha.clone()),
                 diff_digest: Some(artifact.base_diff_digest.clone()),
                 report_artifact_id: Some(artifact.report_artifact_id.clone()),
-                observed_model: Some(observed_model),
+                observed_model,
                 observed_effort: artifact.observed_effort.clone(),
                 receipt_id: Some(receipt.receipt_id.clone()),
                 diagnostic: None,

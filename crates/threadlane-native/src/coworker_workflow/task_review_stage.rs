@@ -1189,29 +1189,11 @@ fn verify_preserved_candidate_and_live_subject(
             ));
         }
     }
-    if artifacts.observed_model != candidate_task.selected_choice.model_arg
-        || artifacts.observed_model != approved_task.base_model
-        || approved_task.provider.map(WorkerProvider::as_str)
-            != Some(artifacts.observed_provider.as_str())
-    {
+    if !artifacts.has_matching_coder_evidence(approved_task, &candidate_task.selected_choice) {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            format!(
-                "task `{}` attempt `{attempt_no}` observed provider/model does not match pinned coder choice",
-                candidate_task.task_id
-            ),
+            "Coder launch or observed evidence does not match the frozen task",
         ));
-    }
-    if let Some(ref exp_effort) = candidate_task.selected_choice.effort {
-        if artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()) {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "task `{}` attempt `{attempt_no}` observed_effort does not match pinned effort `{exp_effort}`",
-                    candidate_task.task_id
-                ),
-            ));
-        }
     }
     let expected_base_commit = if candidate_task.depends_on.is_empty() {
         adm.linkage.project_base.base_commit.clone()
@@ -1360,6 +1342,8 @@ fn verify_preserved_candidate_and_live_subject(
         ));
     }
 
+    artifacts.verify_coder_manifest_evidence(approved_task, &manifest, plans_dir)?;
+
     let expected_check_subject = FrozenCheckSubject {
         binding_id: request.binding_id.clone(),
         thread_uuid: request.thread_uuid.clone(),
@@ -1477,8 +1461,7 @@ fn verify_preserved_candidate_and_live_subject(
         || review_subject.policy.requested_model.as_deref()
             != Some(candidate_task.selected_choice.model_arg.as_str())
         || review_subject.policy.requested_effort != candidate_task.selected_choice.effort
-        || review_subject.policy.observed_model.as_deref()
-            != Some(artifacts.observed_model.as_str())
+        || review_subject.policy.observed_model.as_deref() != artifacts.observed_model.as_deref()
         || review_subject.policy.observed_effort != artifacts.observed_effort
         || !review_subject.policy.require_passing_tests
     {

@@ -404,7 +404,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
                     expected_job_revision: job.job_revision,
                     expected_ledger_revision: None,
                     approval_id: approval_summary.approval_id.clone(),
-                    policy: execution_policy(),
+                    policy: pipeline_execution_policy(fixture),
                     controller_envelope: Some(cap_env),
                     task_interfaces,
                 },
@@ -430,7 +430,7 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
             thread_uuid: thread_uuid.to_string(),
             job_id: bound_job.job_id.clone(),
             expected_job_revision: bound_job.job_revision,
-            policy: execution_policy(),
+            policy: pipeline_execution_policy(fixture),
             reviewer_choice: headless_argon_choice(Difficulty::Hard),
             closure_choice: headless_argon_choice(Difficulty::Extreme),
             role_budgets,
@@ -466,12 +466,94 @@ async fn create_planned_approved_and_frozen_pipeline_job_for_scope(
     .await
 }
 
+fn configure_codex_coder(fixture: &PipelineTestFixture) {
+    let snapshot = fixture.registry.snapshot().unwrap();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Offline Codex Coder".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(fixture.fake_agy_exe.clone()),
+                    enabled: true,
+                },
+            },
+        )
+        .unwrap();
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 1,
+            RegistryChange::UpsertModels {
+                models: vec![ModelDefinition {
+                    id: "model-luna".to_string(),
+                    tool_id: "tool-codex".to_string(),
+                    label: "Luna fixture".to_string(),
+                    model_arg: "gpt-6-luna".to_string(),
+                    efforts: vec!["max".to_string()],
+                    allow_no_effort: false,
+                }],
+            },
+        )
+        .unwrap();
+    let mut profile = snapshot.profiles[0].clone();
+    for assignment in &mut profile.assignments {
+        if assignment.role == WorkflowRole::Coder {
+            assignment.choice = ModelChoice {
+                model_id: "model-luna".to_string(),
+                effort: Some("max".to_string()),
+            };
+        }
+    }
+    fixture
+        .registry
+        .apply(
+            snapshot.revision + 2,
+            RegistryChange::UpsertProfile { profile },
+        )
+        .unwrap();
+}
+
+fn pipeline_execution_policy(fixture: &PipelineTestFixture) -> ExecutionPolicy {
+    let mut policy = execution_policy();
+    if fixture
+        .registry
+        .snapshot()
+        .unwrap()
+        .models
+        .iter()
+        .any(|m| m.id == "model-luna")
+    {
+        policy.allow_rules.push(PolicyAllowRule {
+            tool_id: "tool-codex".to_string(),
+            model_id: "model-luna".to_string(),
+            efforts: vec!["max".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Coder],
+        });
+    }
+    policy
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(clippy::too_many_lines)]
 async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed(
 ) {
+    assert_full_pipeline(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn codex_luna_full_frozen_pipeline_parallel_roots_correction_dependent_and_single_closure() {
+    assert_full_pipeline(true).await;
+}
+
+#[allow(clippy::too_many_lines)]
+async fn assert_full_pipeline(codex: bool) {
     Box::pin(async {
         let fixture = setup_fixture();
+        if codex { configure_codex_coder(&fixture); }
         let state_dir = fixture.root.join("runtime");
         fs::create_dir_all(&state_dir).expect("create runtime state_dir");
         fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o700))
@@ -1023,6 +1105,63 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
             NoticeDeliveryStatus::Submitted
         );
         assert_eq!(notice_effect_count.load(Ordering::SeqCst), 1);
+
+        if codex {
+            let approval = fixture.authority.get_for_operator(&approval_id).unwrap();
+            assert!(approval.tasks.iter().all(|t| t.is_frozen_headless_worker() && t.provider == Some(threadlane_workers::WorkerProvider::CodexCli)));
+            let runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
+            assert_eq!(runtime.attempt_artifacts.len(), 4);
+            let session_dir = fixture.sessions_dir.join(&approval_id);
+            let state = threadlane_core::observation::read_core_state_readonly(&session_dir.join("runtime-state/state.db")).unwrap();
+            for row in &state.workers {
+                let worker = row.to_worker_snapshot().expect("complete worker snapshot");
+                let task = approval.tasks.iter().find(|t| t.profile_id.as_deref() == Some(worker.profile_id.as_str())).unwrap();
+                threadlane_host::load_verified_codex_task_report(&approval, &session_dir, task, &worker).unwrap();
+                let mut foreign = approval.clone(); foreign.repository_path = fixture.root.clone();
+                assert!(threadlane_host::load_verified_codex_task_report(&foreign, &session_dir, task, &worker).is_err());
+                let mut wrong_worker = worker.clone(); wrong_worker.run_id = "run_foreign".to_string();
+                assert!(threadlane_host::load_verified_codex_task_report(&approval, &session_dir, task, &wrong_worker).is_err());
+                let mut wrong_worker = worker.clone(); wrong_worker.profile_digest = "a".repeat(64);
+                assert!(threadlane_host::load_verified_codex_task_report(&approval, &session_dir, task, &wrong_worker).is_err());
+                let mut wrong_scope = task.clone(); wrong_scope.allowed_write_paths = vec!["src/".to_string()];
+                assert!(threadlane_host::load_verified_codex_task_report(&approval, &session_dir, &wrong_scope, &worker).is_err());
+                let mut missing = worker.clone(); missing.outcome.as_mut().unwrap().report_artifact_id = None;
+                assert!(threadlane_host::load_verified_codex_task_report(&approval, &session_dir, task, &missing).is_err());
+            }
+            for artifact in runtime.attempt_artifacts.values() {
+                assert_eq!(artifact.observed_model, None);
+                assert_eq!(artifact.observed_effort, None);
+                let report = artifact.codex_launch_report.as_ref().expect("separate launch evidence");
+                assert!(report.evidence.retained_events.is_empty());
+                assert!(report.redacted_stderr_summary.is_none());
+                let task = approval.tasks.iter().find(|t| t.task_id == artifact.task_id).unwrap();
+                let choice = runtime.envelope.task_coder_choices.get(&artifact.task_id).unwrap();
+                assert!(artifact.has_matching_coder_evidence(task, choice));
+                let subject = artifact.review_subject.as_ref().expect("reviewed task subject");
+                assert!(subject.policy.has_verified_codex_task_launch());
+                assert_eq!(subject.policy.observed_model, None);
+                subject.verify_integrity().unwrap();
+                if let Some(receipt) = artifact.review_receipt.as_ref() {
+                    assert!(receipt.policy.has_verified_codex_task_launch());
+                    assert_eq!(receipt.policy.observed_model, None);
+                    receipt.verify_integrity().unwrap();
+                } else {
+                    assert_eq!((&*artifact.task_id, artifact.attempt_no), ("task-root-a", 1));
+                }
+                let manifest = threadlane_workers::load_and_verify_manifest(&subject.work_area_root, &artifact.task_worktree_id).unwrap();
+                artifact.verify_coder_manifest_evidence(task, &manifest, &fixture.plans_dir).unwrap();
+                let mut wrong_source = artifact.clone(); wrong_source.codex_source_report_sha256 = Some("a".repeat(64));
+                assert!(wrong_source.verify_coder_manifest_evidence(task, &manifest, &fixture.plans_dir).is_err());
+                let mut missing = artifact.clone(); missing.codex_launch_report = None;
+                assert!(!missing.has_matching_coder_evidence(task, choice));
+                let mut wrong = artifact.clone(); wrong.codex_launch_report.as_mut().unwrap().requested_model.base_model = "gpt-wrong".to_string();
+                assert!(!wrong.has_matching_coder_evidence(task, choice));
+                let mut wrong = artifact.clone(); wrong.codex_launch_report.as_mut().unwrap().executed_executable = Some(PathBuf::from("/wrong/executable"));
+                assert!(!wrong.has_matching_coder_evidence(task, choice));
+                let mut wrong = artifact.clone(); wrong.codex_launch_report.as_mut().unwrap().constructed_argv[17] = report.constructed_argv[17].replace("src/a.rs", "src/");
+                if wrong.codex_launch_report != artifact.codex_launch_report { assert!(!wrong.has_matching_coder_evidence(task, choice)); }
+            }
+        }
 
         // Reconstruct only the dependent task's fenced, pre-verification boundary from its
         // genuine retained initial Coder and dependency-preparation records. Never persist it.

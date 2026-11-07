@@ -104,16 +104,24 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
      (`WorkflowRole::Orchestrator`, `WorkflowRole::Architect`, `WorkflowRole::Reviewer`, and
      `WorkflowRole::Closure`) when an explicit reasoning effort is configured and validated by
      `threadlane_workers::resolve_model_target(WorkerProvider::CodexCli, ...)`.
-   - `WorkflowRole::Follower` and `WorkflowRole::Coder` never normalize to headless `CodexCli`
-     workers, and saved profiles or catalog entries never grant authority without an explicit
+   - The approved Coworker controller path separately uses `normalize_coder_choice` after exact
+     role/policy preflight. New Codex Coder approvals freeze provider, canonical executable,
+     model/effort, `standalone=false`, TaskFiles permissions and finite write scopes into their
+     subject digest. The host accepts only these complete frozen contracts; persisted
+     `provider=None` native records retain their original digest and manual semantics.
+     `WorkflowRole::Follower` remains native. Saved profiles or catalog entries never grant authority without an explicit
      `ExecutionPolicy` and the required `PlanningAdviceGrant` or
      `FrozenControllerCapabilityEnvelope` gate.
    - Because Linux `codex exec --json` does not emit runtime model or effort telemetry on stdout,
-     read-only `CodexCli` review and closure evidence records the verified pinned launch
+     `CodexCli` Coder, review and closure evidence records the verified pinned launch
      configuration explicitly and separately from runtime-observed stream telemetry: absent
      observed model/effort remains `None` with no `requested -> observed` fallback, while legacy
      `Antigravity` and `OpencodeV2` runtime telemetry requirements remain strict. See
-     [`docs/CODEX-ADVISORY.md`](CODEX-ADVISORY.md).
+     [`docs/CODEX-ADVISORY.md`](CODEX-ADVISORY.md) and [`docs/CODEX-CODER.md`](CODEX-CODER.md).
+     Coder execution retains an immutable private source report and a compact sanitized launch
+     proof with its digest. The original/dependent task and derived correction paths verify the
+     exact launch against frozen authority and owned worktree scope. Passing checks, Reviewer
+     receipts, integration and one Closure remain mandatory; a launch pin never accepts work.
 5. **Explicit approvals and separately started hosts**:
    - Creating a cycle requires an existing frozen [`ApprovalRecord`] from
      `threadlane-approve`.
@@ -210,3 +218,18 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
 A sealed receipt without its corresponding worker snapshot is insufficient for
 reconciliation. The handoff remains unresolved until matching worker evidence
 becomes available; missing telemetry is never converted into completion.
+
+## Codex Coder acceptance boundary
+
+The frozen controller path supports explicitly selected Codex CLI models and reasoning efforts
+(for example `gpt-6-luna` / `max`) for original tasks, dependency-bound tasks and authorized
+in-scope corrections. This does not change the native Coworker model, installed profiles or
+manual role-flow handoff semantics. Future-call profile adoption is a separate follow-up.
+
+Linux offline fixtures exercise the full pipeline with deterministic subprocesses, including
+parallel roots, a rejected original candidate, one correction, dependent input receipts, checks,
+Reviewer acceptance, integration and one Closure. Live provider/sandbox qualification and
+non-Linux acceptance remain pending. The private launch evidence records actual executable,
+exact finite permission/model pins and complete lifecycle evidence separately from absent
+runtime model/effort telemetry. Its retained events and prompt/stderr text are removed, and its
+source report digest is rechecked before verification, review, integration and correction.

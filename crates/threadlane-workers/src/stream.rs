@@ -186,6 +186,42 @@ pub struct StreamTokenUsage {
     pub reasoning_output_tokens: Option<u64>,
 }
 
+/// Bounded single-turn lifecycle verification state for [`WorkerProvider::CodexCli`] `codex exec --json` streams.
+///
+/// Tracks the required `thread.started -> turn.started -> [item.*] -> turn.completed` lifecycle
+/// in O(1) state without relying on `retained_events` (which is bounded by `max_events` and may
+/// drop intermediate events).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CodexTurnLifecycleEvidence {
+    /// Count of `thread.started` events observed in the stream.
+    pub thread_started_count: usize,
+    /// Count of `turn.started` events observed in the stream.
+    pub turn_started_count: usize,
+    /// Count of `turn.completed` events observed in the stream.
+    pub turn_completed_count: usize,
+    /// Count of `item.*` (`item.started`, `item.updated`, `item.completed`) events observed in the stream.
+    pub item_events_count: usize,
+    /// Count of events observed after the first terminal `turn.completed` event.
+    pub trailing_events_after_completion_count: usize,
+    /// First lifecycle framing, ordering, or truncation violation observed in the stream, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub violation: Option<String>,
+}
+
+impl CodexTurnLifecycleEvidence {
+    /// Returns `true` if the stream observed an exact single `thread.started -> turn.started -> turn.completed`
+    /// sequence with zero framing, ordering, or truncation violations and zero trailing events after
+    /// `turn.completed`.
+    #[must_use]
+    pub fn is_valid_completed_turn(&self) -> bool {
+        self.thread_started_count == 1
+            && self.turn_started_count == 1
+            && self.turn_completed_count == 1
+            && self.trailing_events_after_completion_count == 0
+            && self.violation.is_none()
+    }
+}
+
 /// Aggregated evidence and normalized events parsed from a worker's stdout NDJSON stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamEvidenceSummary {
@@ -221,6 +257,9 @@ pub struct StreamEvidenceSummary {
     /// Never fabricated when the provider stream omits usage metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_usage: Option<StreamTokenUsage>,
+    /// Bounded single-turn lifecycle verification state for [`WorkerProvider::CodexCli`] streams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_turn_lifecycle: Option<CodexTurnLifecycleEvidence>,
     /// Provider error events observed in the stream.
     pub provider_errors: Vec<ProviderErrorEvidence>,
     /// Count of non-fatal step/tool errors observed during intermediate steps (`step_update` / `tool_result`).
@@ -232,6 +271,18 @@ pub struct StreamEvidenceSummary {
     pub retained_events: Vec<NormalizedWorkerEvent>,
     /// Number of valid events dropped from `retained_events` due to `max_events` budget.
     pub dropped_events_count: usize,
+}
+
+impl StreamEvidenceSummary {
+    /// Returns `true` if [`Self::codex_turn_lifecycle`] is present and verified as a complete
+    /// single-turn `thread.started -> turn.started -> turn.completed` sequence with no framing,
+    /// ordering, truncation, or trailing-event violations.
+    #[must_use]
+    pub fn has_valid_codex_turn_lifecycle(&self) -> bool {
+        self.codex_turn_lifecycle
+            .as_ref()
+            .is_some_and(CodexTurnLifecycleEvidence::is_valid_completed_turn)
+    }
 }
 
 /// Incremental stateful parser for Antigravity, OpenCode v2, and Codex CLI NDJSON streams.
@@ -254,6 +305,9 @@ pub struct NdjsonStreamParser {
     observed_session_id: Option<String>,
     session_conflict: Option<String>,
     observed_usage: Option<StreamTokenUsage>,
+    codex_turn_lifecycle: CodexTurnLifecycleEvidence,
+    codex_in_turn: bool,
+    saw_codex_event: bool,
     provider_errors: Vec<ProviderErrorEvidence>,
     recoverable_step_errors_count: usize,
     blocked_events: Vec<BlockedEvidence>,
@@ -293,6 +347,9 @@ impl NdjsonStreamParser {
             observed_session_id: None,
             session_conflict: None,
             observed_usage: None,
+            codex_turn_lifecycle: CodexTurnLifecycleEvidence::default(),
+            codex_in_turn: false,
+            saw_codex_event: false,
             provider_errors: Vec::new(),
             recoverable_step_errors_count: 0,
             blocked_events: Vec::new(),
@@ -441,7 +498,12 @@ impl NdjsonStreamParser {
         };
 
         let session_id = extract_session_id(obj);
-        if event_type == "thread.started" && session_id.is_none() && self.session_conflict.is_none()
+        if event_type == "thread.started"
+            && obj
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id.trim().is_empty())
+            && self.session_conflict.is_none()
         {
             self.session_conflict = Some(
                 "Codex `thread.started` event is missing a valid non-empty string `thread_id`"
@@ -519,6 +581,22 @@ impl NdjsonStreamParser {
                     }
                 }
             }
+        }
+
+        let is_codex_event = self.provider == Some(WorkerProvider::CodexCli)
+            || matches!(
+                event_type,
+                "thread.started"
+                    | "turn.started"
+                    | "item.started"
+                    | "item.updated"
+                    | "item.completed"
+                    | "turn.completed"
+                    | "turn.failed"
+            );
+        if is_codex_event {
+            self.saw_codex_event = true;
+            self.observe_codex_lifecycle_event(obj, event_type, session_id.as_deref());
         }
 
         // 1. Check for permission or user-input block first (including `denied_actions`)
@@ -607,28 +685,47 @@ impl NdjsonStreamParser {
         self.record_observed_event_effort(event_effort.as_deref(), event_effort_source);
 
         // 3. Classify Init, Result, Tool, Progress, or Other.
-        let is_init = is_init_event(obj, event_type, subtype);
+        let is_init = if is_codex_event {
+            event_type == "thread.started"
+                && session_id.is_some()
+                && self.codex_turn_lifecycle.thread_started_count == 1
+                && self.codex_turn_lifecycle.turn_started_count == 0
+                && self.codex_turn_lifecycle.turn_completed_count == 0
+                && self.codex_turn_lifecycle.item_events_count == 0
+        } else {
+            is_init_event(obj, event_type, subtype)
+        };
         if is_init {
             self.saw_init_event = true;
         }
 
-        let mut is_result = is_result_event(obj, event_type, subtype);
+        let mut is_result = if is_codex_event {
+            event_type == "turn.completed" && is_result_event(obj, event_type, subtype)
+        } else {
+            is_result_event(obj, event_type, subtype)
+        };
         if event_type.eq_ignore_ascii_case("turn.completed") {
             match extract_genuine_turn_usage(obj) {
                 Ok(Some(usage)) => {
-                    if is_result {
+                    if is_result && self.codex_turn_lifecycle.is_valid_completed_turn() {
                         self.observed_usage = Some(usage);
                     }
                 }
                 Ok(None) => {}
                 Err(err) => {
                     is_result = false;
+                    self.record_codex_lifecycle_violation(format!(
+                        "malformed `usage` on `turn.completed`: {err}"
+                    ));
                     self.record_malformed(
                         line_number,
                         format!("malformed `usage` on `turn.completed`: {err}"),
                         &raw_type,
                     );
                 }
+            }
+            if !self.codex_turn_lifecycle.is_valid_completed_turn() {
+                is_result = false;
             }
         }
         if is_result {
@@ -702,6 +799,253 @@ impl NdjsonStreamParser {
         }
     }
 
+    fn record_codex_lifecycle_violation(&mut self, detail: impl Into<String>) {
+        if self.codex_turn_lifecycle.violation.is_none() {
+            self.codex_turn_lifecycle.violation = Some(sanitize_and_redact(
+                &detail.into(),
+                MAX_DIAGNOSTIC_SUMMARY_BYTES,
+            ));
+        }
+    }
+
+    fn observe_codex_lifecycle_event(
+        &mut self,
+        obj: &Map<String, Value>,
+        event_type: &str,
+        session_id: Option<&str>,
+    ) {
+        for key in ["thread_id", "session_id", "sessionID", "conversation_id"] {
+            if let Some(value) = obj.get(key) {
+                let valid_id = value.as_str().filter(|id| {
+                    !id.trim().is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+                });
+                if valid_id.is_none()
+                    || valid_id.map(str::trim) != session_id
+                    || valid_id.map(str::trim) != self.observed_session_id.as_deref()
+                {
+                    self.session_conflict = Some(
+                        "Codex stream contains invalid or conflicting identity fields".to_string(),
+                    );
+                    self.record_codex_lifecycle_violation(
+                        "Codex stream contains invalid or conflicting identity fields",
+                    );
+                }
+            }
+        }
+        if let (Some(ty), Some(ev)) = (
+            obj.get("type").and_then(Value::as_str),
+            obj.get("event").and_then(Value::as_str),
+        ) {
+            if ty != ev {
+                self.record_codex_lifecycle_violation(format!(
+                    "conflicting Codex `type` (`{ty}`) and `event` (`{ev}`) fields"
+                ));
+            }
+        }
+
+        if self.codex_turn_lifecycle.turn_completed_count > 0 {
+            self.codex_turn_lifecycle
+                .trailing_events_after_completion_count = self
+                .codex_turn_lifecycle
+                .trailing_events_after_completion_count
+                .saturating_add(1);
+            match event_type {
+                "thread.started" => {
+                    self.codex_turn_lifecycle.thread_started_count = self
+                        .codex_turn_lifecycle
+                        .thread_started_count
+                        .saturating_add(1);
+                    if self.session_conflict.is_none() {
+                        self.session_conflict = Some(
+                            "Codex `thread.started` event occurred after terminal `turn.completed`"
+                                .to_string(),
+                        );
+                    }
+                }
+                "turn.started" => {
+                    self.codex_turn_lifecycle.turn_started_count = self
+                        .codex_turn_lifecycle
+                        .turn_started_count
+                        .saturating_add(1);
+                }
+                "turn.completed" => {
+                    self.codex_turn_lifecycle.turn_completed_count = self
+                        .codex_turn_lifecycle
+                        .turn_completed_count
+                        .saturating_add(1);
+                }
+                "item.started" | "item.updated" | "item.completed" => {
+                    self.codex_turn_lifecycle.item_events_count = self
+                        .codex_turn_lifecycle
+                        .item_events_count
+                        .saturating_add(1);
+                }
+                _ => {}
+            }
+            self.record_codex_lifecycle_violation(format!(
+                "Codex stream emitted `{event_type}` after terminal `turn.completed`"
+            ));
+            return;
+        }
+
+        match event_type {
+            "thread.started" => {
+                self.codex_turn_lifecycle.thread_started_count = self
+                    .codex_turn_lifecycle
+                    .thread_started_count
+                    .saturating_add(1);
+                if self.codex_turn_lifecycle.thread_started_count > 1 {
+                    if self.session_conflict.is_none() {
+                        self.session_conflict = Some(
+                            "duplicate Codex `thread.started` event observed in stream".to_string(),
+                        );
+                    }
+                    self.record_codex_lifecycle_violation(
+                        "Codex stream emitted duplicate `thread.started` events",
+                    );
+                }
+                if self.codex_turn_lifecycle.turn_started_count > 0
+                    || self.codex_turn_lifecycle.item_events_count > 0
+                {
+                    if self.session_conflict.is_none() {
+                        self.session_conflict = Some(
+                            "Codex `thread.started` event occurred after turn or item events"
+                                .to_string(),
+                        );
+                    }
+                    self.record_codex_lifecycle_violation(
+                        "Codex `thread.started` event occurred out of order after turn or item events",
+                    );
+                }
+                if session_id.is_none() {
+                    self.record_codex_lifecycle_violation(
+                        "Codex `thread.started` event is missing a valid `thread_id`",
+                    );
+                }
+            }
+            "turn.started" => {
+                self.codex_turn_lifecycle.turn_started_count = self
+                    .codex_turn_lifecycle
+                    .turn_started_count
+                    .saturating_add(1);
+                if self.codex_turn_lifecycle.thread_started_count == 0 {
+                    if self.session_conflict.is_none() {
+                        self.session_conflict = Some(
+                            "Codex `turn.started` event was not preceded by `thread.started`"
+                                .to_string(),
+                        );
+                    }
+                    self.record_codex_lifecycle_violation(
+                        "Codex `turn.started` event was not preceded by `thread.started`",
+                    );
+                } else if self.codex_turn_lifecycle.turn_started_count > 1 || self.codex_in_turn {
+                    self.record_codex_lifecycle_violation(
+                        "Codex stream emitted duplicate or nested `turn.started` event",
+                    );
+                } else {
+                    self.codex_in_turn = true;
+                }
+            }
+            "item.started" | "item.updated" | "item.completed" => {
+                self.codex_turn_lifecycle.item_events_count = self
+                    .codex_turn_lifecycle
+                    .item_events_count
+                    .saturating_add(1);
+                if self.codex_turn_lifecycle.thread_started_count == 0 {
+                    if self.session_conflict.is_none() {
+                        self.session_conflict = Some(format!(
+                            "Codex `{event_type}` event occurred before `thread.started`"
+                        ));
+                    }
+                    self.record_codex_lifecycle_violation(format!(
+                        "Codex `{event_type}` event occurred before `thread.started`"
+                    ));
+                } else if self.codex_turn_lifecycle.turn_started_count != 1 || !self.codex_in_turn {
+                    self.record_codex_lifecycle_violation(format!(
+                        "Codex `{event_type}` event occurred outside an active `turn.started` frame"
+                    ));
+                }
+                let Some(item_obj) = obj.get("item").and_then(Value::as_object) else {
+                    self.record_codex_lifecycle_violation(format!(
+                        "Codex `{event_type}` event is missing `item` object"
+                    ));
+                    return;
+                };
+                if item_obj
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.trim().is_empty())
+                {
+                    self.record_codex_lifecycle_violation(format!(
+                        "Codex `{event_type}` event is missing non-empty string `item.type`"
+                    ));
+                }
+                if item_obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.trim().is_empty())
+                {
+                    self.record_codex_lifecycle_violation(
+                        "Codex item event is missing non-empty string `item.id`",
+                    );
+                }
+                if has_codex_partial_or_truncation_markers(obj, Some(item_obj)) {
+                    self.record_codex_lifecycle_violation(format!(
+                        "Codex `{event_type}` event carries partial, delta, or truncated markers"
+                    ));
+                }
+            }
+            "turn.completed" => {
+                self.codex_turn_lifecycle.turn_completed_count = self
+                    .codex_turn_lifecycle
+                    .turn_completed_count
+                    .saturating_add(1);
+                if self.codex_turn_lifecycle.thread_started_count == 0 {
+                    if self.session_conflict.is_none() {
+                        self.session_conflict = Some(
+                            "Codex `turn.completed` event was not preceded by `thread.started`"
+                                .to_string(),
+                        );
+                    }
+                    self.record_codex_lifecycle_violation(
+                        "Codex `turn.completed` event was not preceded by `thread.started`",
+                    );
+                } else if self.codex_turn_lifecycle.turn_started_count != 1 || !self.codex_in_turn {
+                    self.record_codex_lifecycle_violation(
+                        "Codex `turn.completed` event was not preceded by an active `turn.started`",
+                    );
+                }
+                if has_codex_partial_or_truncation_markers(obj, None) {
+                    self.record_codex_lifecycle_violation(
+                        "Codex `turn.completed` event reported partial, delta, or truncated output",
+                    );
+                }
+                if obj.get("status").is_some_and(|value| !value.is_string()) {
+                    self.record_codex_lifecycle_violation(
+                        "Codex terminal status must be a string when present",
+                    );
+                }
+                self.codex_in_turn = false;
+            }
+            "turn.failed" | "error" => {
+                self.codex_in_turn = false;
+                self.record_codex_lifecycle_violation(format!(
+                    "Codex stream emitted error event `{event_type}`"
+                ));
+            }
+            other => {
+                if self.provider == Some(WorkerProvider::CodexCli)
+                    && detect_blocked_event(obj, event_type, None).is_none()
+                    && detect_error_event(obj, event_type, None).is_none()
+                {
+                    self.record_codex_lifecycle_violation(format!(
+                        "unsupported Codex stream event type `{other}`"
+                    ));
+                }
+            }
+        }
+    }
+
     fn retain_event(
         &mut self,
         event: NormalizedWorkerEvent,
@@ -723,6 +1067,51 @@ impl NdjsonStreamParser {
 
     /// Finalizes stream parsing and computes requested-vs-observed evidence verification.
     pub fn finalize(mut self) -> StreamEvidenceSummary {
+        let is_codex_stream =
+            self.provider == Some(WorkerProvider::CodexCli) || self.saw_codex_event;
+        if is_codex_stream {
+            if self.malformed_lines_count > 0
+                || !self.provider_errors.is_empty()
+                || !self.blocked_events.is_empty()
+                || self.session_conflict.is_some()
+            {
+                self.record_codex_lifecycle_violation(
+                    "Codex stream contains malformed, error, blocked, or conflicting identity evidence",
+                );
+            }
+            if !self.saw_result_event {
+                self.record_codex_lifecycle_violation(
+                    "Codex stream lacks valid terminal completion evidence",
+                );
+            }
+            if self.codex_turn_lifecycle.thread_started_count != 1 {
+                self.saw_init_event = false;
+                if self.total_lines > 0 && self.session_conflict.is_none() {
+                    self.session_conflict = Some(
+                        "Codex stream did not emit an exact single `thread.started` event"
+                            .to_string(),
+                    );
+                }
+                self.record_codex_lifecycle_violation(
+                    "Codex stream did not emit an exact single `thread.started` event",
+                );
+            }
+            if self.codex_turn_lifecycle.turn_started_count == 0 {
+                self.record_codex_lifecycle_violation(
+                    "Codex stream did not emit a `turn.started` event",
+                );
+            }
+            if self.codex_turn_lifecycle.turn_completed_count == 0 {
+                self.record_codex_lifecycle_violation(
+                    "Codex stream exited without a terminal `turn.completed` event",
+                );
+            }
+            if !self.codex_turn_lifecycle.is_valid_completed_turn() {
+                self.saw_result_event = false;
+                self.observed_usage = None;
+            }
+        }
+
         if self.observed_effort_source == Some(EffortEvidenceSource::AntigravityCatalogModelVariant)
             && self.model_conflict.is_some()
             && self.effort_conflict.is_none()
@@ -767,6 +1156,7 @@ impl NdjsonStreamParser {
             session_evidence,
             observed_session_id: self.observed_session_id,
             observed_usage: self.observed_usage,
+            codex_turn_lifecycle: is_codex_stream.then_some(self.codex_turn_lifecycle),
             provider_errors: self.provider_errors,
             recoverable_step_errors_count: self.recoverable_step_errors_count,
             blocked_events: self.blocked_events,
@@ -1544,6 +1934,16 @@ fn detect_error_event(
         .to_ascii_lowercase();
 
     let nested_item = obj.get("item").and_then(Value::as_object);
+    let nested_item_status = nested_item
+        .and_then(|i| i.get("status").or_else(|| i.get("state")))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let nested_item_type = nested_item
+        .and_then(|i| i.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
     let has_error_field = has_object_error_field(obj)
         || nested_res.is_some_and(has_object_error_field)
         || nested_item.is_some_and(has_object_error_field);
@@ -1552,14 +1952,20 @@ fn detect_error_event(
         || et == "turn.failed"
         || st == "error"
         || st == "error_during_execution"
+        || nested_item_type == "error"
         || matches!(status.as_str(), "error" | "failed" | "failure")
         || matches!(
             nested_res_status.as_str(),
             "error" | "failed" | "failure" | "cancelled" | "canceled" | "aborted"
         )
+        || matches!(
+            nested_item_status.as_str(),
+            "error" | "failed" | "failure" | "cancelled" | "canceled" | "aborted"
+        )
         || part_reason == "error"
         || obj.get("is_error") == Some(&Value::Bool(true))
         || nested_res.and_then(|r| r.get("is_error")) == Some(&Value::Bool(true))
+        || nested_item.and_then(|i| i.get("is_error")) == Some(&Value::Bool(true))
         || (has_error_field && obj.get("is_error") != Some(&Value::Bool(false)));
 
     if !is_error {
@@ -1701,6 +2107,49 @@ fn is_result_event(obj: &Map<String, Value>, event_type: &str, subtype: Option<&
         );
     }
 
+    false
+}
+
+fn has_codex_partial_or_truncation_markers(
+    obj: &Map<String, Value>,
+    nested_item: Option<&Map<String, Value>>,
+) -> bool {
+    for scope in [Some(obj), nested_item].into_iter().flatten() {
+        if scope.contains_key("delta")
+            || scope.get("partial") == Some(&Value::Bool(true))
+            || scope.get("incomplete") == Some(&Value::Bool(true))
+            || scope.get("truncated") == Some(&Value::Bool(true))
+        {
+            return true;
+        }
+        for key in [
+            "stop_reason",
+            "finish_reason",
+            "finished_reason",
+            "reason",
+            "status",
+            "incomplete_reason",
+        ] {
+            if let Some(raw) = scope.get(key).and_then(Value::as_str) {
+                let lowered = raw.trim().to_ascii_lowercase();
+                if matches!(
+                    lowered.as_str(),
+                    "length"
+                        | "max_tokens"
+                        | "max_output_tokens"
+                        | "truncated"
+                        | "incomplete"
+                        | "partial"
+                        | "interrupted"
+                        | "cancelled"
+                        | "canceled"
+                        | "aborted"
+                ) {
+                    return true;
+                }
+            }
+        }
+    }
     false
 }
 

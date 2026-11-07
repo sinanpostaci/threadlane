@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::WorkerError;
 use crate::fs_safety::{validate_absolute_no_symlink_components, validate_existing_canonical_dir};
 use crate::spec::{
-    is_control_config_path, validate_repo_relative_path, validate_simple_identifier,
-    ResolvedModelTarget, WorkerProvider, WriteScopeKind,
+    is_control_config_path, is_path_allowed_by_scopes, validate_repo_relative_path,
+    validate_simple_identifier, ResolvedModelTarget, WorkerProvider, WriteScopeKind,
 };
 
 /// Documented Antigravity CLI read permission action identifier.
@@ -158,8 +158,51 @@ pub const MAX_TASK_FILES_SETTINGS_BYTES: usize = 65_536;
 /// configuration (`65_536` bytes / 64 KiB).
 pub const MAX_OPENCODE_CONFIG_BYTES: usize = 65_536;
 
+/// Session-only named permission profile selected for [`WorkerProvider::CodexCli`] mutable `TaskFiles` runs.
+pub const CODEX_TASK_FILES_PERMISSION_PROFILE_NAME: &str = "threadlane-task-files";
+
+/// Protected repository, secret, hook, and agent/toolchain control patterns explicitly set to
+/// `"deny"` inside `:workspace_roots` for [`WorkerProvider::CodexCli`] [`WorkerFilePermissions::TaskFiles`].
+pub const CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS: &[&str] = &[
+    "**/.env",
+    "**/.env.*",
+    "**/codex.toml",
+    "**/.codex.toml",
+    "**/.git",
+    "**/.git/**",
+    "**/.codex",
+    "**/.codex/**",
+    "**/.agents",
+    "**/.agents/**",
+    "**/.aws",
+    "**/.aws/**",
+    "**/.gemini",
+    "**/.gemini/**",
+    "**/.opencode",
+    "**/.opencode/**",
+    "**/.claude",
+    "**/.claude/**",
+    "**/opencode.json",
+    "**/opencode.jsonc",
+    "**/AGENTS.md",
+    "**/agents.md",
+    "**/CLAUDE.md",
+    "**/claude.md",
+    "**/.gitignore",
+    "**/.gitattributes",
+    "**/.gitmodules",
+    ".github",
+    ".github/**",
+    "**/.github",
+    "**/.github/**",
+    ".cargo/config",
+    ".cargo/config.toml",
+    "**/.cargo/config",
+    "**/.cargo/config.toml",
+];
+
 /// Project-local Codex configuration and hook path names that must not exist in or above a
-/// [`WorkerProvider::CodexCli`] read-only advisory working directory.
+/// [`WorkerProvider::CodexCli`] read-only advisory or `TaskFiles` working directory.
 ///
 /// Because `--ignore-user-config` ignores user-level configuration (`~/.codex/config.toml`)
 /// while project-local `.codex/` directories or `codex.toml` files in the checkout hierarchy
@@ -364,11 +407,12 @@ impl WorkerFilePermissions {
     /// `allowed_write_paths` satisfies the mode's invariants:
     /// - When `self` is [`WorkerFilePermissions::ReadOnly`], `allowed_write_paths` **must be empty**
     ///   (zero write scopes).
-    /// - When `self` is [`WorkerFilePermissions::Inherit`] or [`WorkerFilePermissions::TaskFiles`],
-    ///   `provider` must support mutable worker execution (`antigravity` or `opencode_v2`;
-    ///   `codex_cli` is rejected with [`WorkerError::UnsupportedCapability`]) and
-    ///   `allowed_write_paths` must be non-empty, within finite `TaskFiles` bounds, free of
-    ///   protected control paths, and free of unsafe glob/rule metacharacters.
+    /// - When `self` is [`WorkerFilePermissions::Inherit`], `provider` must be `antigravity` or
+    ///   `opencode_v2` (`codex_cli` rejects `inherit` with [`WorkerError::UnsupportedCapability`]).
+    /// - When `self` is [`WorkerFilePermissions::TaskFiles`], `provider` may be `antigravity`,
+    ///   `opencode_v2`, or `codex_cli`, and `allowed_write_paths` must be non-empty, within finite
+    ///   `TaskFiles` bounds, free of protected control paths, and free of unsafe glob/rule
+    ///   metacharacters.
     pub fn validate_for_provider_and_paths(
         self,
         provider: WorkerProvider,
@@ -385,14 +429,11 @@ impl WorkerFilePermissions {
             return Ok(());
         }
 
-        if provider == WorkerProvider::CodexCli {
+        if provider == WorkerProvider::CodexCli && self == Self::Inherit {
             return Err(WorkerError::UnsupportedCapability {
                 provider: provider.as_str().to_string(),
                 capability: format!("worker_file_permissions:{}", self.as_str()),
-                reason: format!(
-                    "provider `codex_cli` supports only `file_permissions: read_only` advisory invocations via `AdvisoryWorkerSpec`; mutable `{}` worker invocations are not supported",
-                    self.as_str()
-                ),
+                reason: "provider `codex_cli` does not support `file_permissions: inherit`; mutable Codex worker invocations require `file_permissions: task_files` and advisory invocations require `file_permissions: read_only`".to_string(),
             });
         }
 
@@ -419,6 +460,9 @@ impl WorkerFilePermissions {
             }
             if self == Self::TaskFiles {
                 validate_permission_pattern_str(path_entry, "allowed_write_paths entry")?;
+                if provider == WorkerProvider::CodexCli {
+                    validate_codex_task_files_scope_str(path_entry, "allowed_write_paths entry")?;
+                }
             }
         }
 
@@ -558,6 +602,44 @@ pub fn is_unsafe_permission_pattern_char(ch: char) -> bool {
     ch.is_control() || matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\\')
 }
 
+/// Returns `true` if `ch` is an unsafe glob/rule metacharacter or a TOML inline-table /
+/// quoted-string delimiter (`"`, `'`, `,`, `=`, `:`, `;`, `#`, `` ` ``, or whitespace) that must
+/// not appear in a `codex_cli` `TaskFiles` write scope path.
+#[must_use]
+pub fn is_unsafe_codex_toml_scope_char(ch: char) -> bool {
+    is_unsafe_permission_pattern_char(ch)
+        || ch.is_whitespace()
+        || matches!(ch, '"' | '\'' | ',' | '=' | ':' | ';' | '#' | '`')
+}
+
+/// Validates that `value` contains no unsafe glob/rule metacharacters or TOML inline-table /
+/// quoted-string delimiters when interpolated into `permissions.threadlane-task-files={...}`.
+pub fn validate_codex_task_files_scope_str(value: &str, label: &str) -> Result<(), WorkerError> {
+    validate_permission_pattern_str(value, label)?;
+    let clean_value = value.strip_suffix('/').unwrap_or(value);
+    if is_control_config_path(clean_value)
+        || CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS
+            .iter()
+            .any(|pattern| opencode_glob_matches(pattern, clean_value))
+    {
+        return Err(WorkerError::InvalidSpec(format!(
+            "{label} targets protected Codex task control or secret paths"
+        )));
+    }
+    if Path::new(value).components().count() > CODEX_ADVISORY_MAX_WORKDIR_DEPTH {
+        return Err(WorkerError::InvalidSpec(format!(
+            "{label} exceeds the Codex permission profile maximum path depth of {CODEX_ADVISORY_MAX_WORKDIR_DEPTH}"
+        )));
+    }
+    if let Some(bad_char) = value.chars().find(|&c| is_unsafe_codex_toml_scope_char(c)) {
+        return Err(WorkerError::InvalidSpec(format!(
+            "{label} `{value}` contains unsupported TOML or permission delimiter character `{}` for `codex_cli` `task_files`",
+            bad_char.escape_default()
+        )));
+    }
+    Ok(())
+}
+
 /// Validates that `value` is non-empty and contains no ambiguous glob/rule metacharacters
 /// (`*`, `?`, `[`, `]`, `{`, `}`, `(`, `)`, `\`) or control characters.
 pub fn validate_permission_pattern_str(value: &str, label: &str) -> Result<(), WorkerError> {
@@ -628,6 +710,355 @@ pub fn validate_codex_advisory_workdir(working_directory: &Path) -> Result<PathB
     ensure_no_codex_project_config_in_hierarchy(&canonical_workdir)?;
     validate_codex_advisory_workdir_tree(&canonical_workdir)?;
     Ok(canonical_workdir)
+}
+
+/// Validates `working_directory` for a [`WorkerProvider::CodexCli`] [`WorkerFilePermissions::TaskFiles`]
+/// mutable task worktree invocation.
+///
+/// Enforces the same canonical non-root directory, symlink-free, metacharacter-free,
+/// project-config-marker-free (`.codex`, `codex.toml`, `.codex.toml` in `working_directory` or
+/// enclosing project ancestors), and bounded depth/entry preflight invariants
+/// ([`CODEX_ADVISORY_MAX_WORKDIR_DEPTH`] = `62` paired with `glob_scan_max_depth = 64` and
+/// [`CODEX_ADVISORY_MAX_WORKDIR_ENTRIES`] = `32_768`) as [`validate_codex_advisory_workdir`].
+pub fn validate_codex_task_files_workdir(working_directory: &Path) -> Result<PathBuf, WorkerError> {
+    let (canonical_workdir, _) = validate_read_only_canonical_workdir(working_directory)?;
+    ensure_no_codex_project_config_in_hierarchy(&canonical_workdir)?;
+    validate_codex_advisory_workdir_tree(&canonical_workdir)?;
+    Ok(canonical_workdir)
+}
+
+/// Builds the session-only TOML inline table `-c` override defining
+/// `permissions.threadlane-task-files={...}` for [`WorkerProvider::CodexCli`]
+/// [`WorkerFilePermissions::TaskFiles`] from an existing canonical task `working_directory` and
+/// validated `allowed_write_paths` using explicit trailing-slash directory syntax.
+///
+/// - Explicit directory entries ending with a trailing `/` resolve to
+///   [`WriteScopeKind::DirectorySubtree`] and grant `"<dir>"="write"` and `"<dir>/**"="write"`.
+/// - Bare entries without a trailing `/` resolve to [`WriteScopeKind::ExactFile`] and grant
+///   **only** `"<file>"="write"` (failing closed if the bare path already exists on disk as a
+///   directory).
+pub fn build_codex_task_files_permission_profile_config(
+    working_directory: &Path,
+    allowed_write_paths: &BTreeSet<String>,
+) -> Result<String, WorkerError> {
+    let canonical_workdir = validate_codex_task_files_workdir(working_directory)?;
+    WorkerFilePermissions::TaskFiles
+        .validate_for_provider_and_paths(WorkerProvider::CodexCli, allowed_write_paths)?;
+
+    let mut resolved_write_scopes = BTreeMap::new();
+    for entry in allowed_write_paths {
+        let (clean_entry, kind) = match entry.strip_suffix('/') {
+            Some(stripped) => (stripped.to_string(), WriteScopeKind::DirectorySubtree),
+            None => {
+                let joined = canonical_workdir.join(entry);
+                if let Ok(meta) = fs::symlink_metadata(&joined) {
+                    if meta.file_type().is_dir() {
+                        return Err(WorkerError::InvalidSpec(format!(
+                            "allowed_write_paths bare entry `{entry}` targets existing directory `{}`; Codex directory write scopes must end with `/`",
+                            joined.display()
+                        )));
+                    }
+                }
+                (entry.clone(), WriteScopeKind::ExactFile)
+            }
+        };
+        resolved_write_scopes
+            .entry(clean_entry)
+            .and_modify(|existing| {
+                if kind == WriteScopeKind::DirectorySubtree {
+                    *existing = WriteScopeKind::DirectorySubtree;
+                }
+            })
+            .or_insert(kind);
+    }
+
+    build_codex_task_files_permission_profile_config_for_scopes(
+        &canonical_workdir,
+        &resolved_write_scopes,
+    )
+}
+
+/// Builds the session-only TOML inline table `-c` override defining
+/// `permissions.threadlane-task-files={...}` for [`WorkerProvider::CodexCli`]
+/// [`WorkerFilePermissions::TaskFiles`] from an existing canonical task `working_directory` and
+/// resolved repository-relative [`WriteScopeKind`] entries.
+///
+/// Scopes filesystem reads to `:minimal`, `/nix/store`, and `.` (`"."="read"`) inside
+/// `:workspace_roots` with `glob_scan_max_depth=64`, grants `"write"` only to the exact approved
+/// repository-relative files (`"<file>"="write"`) and directory subtrees (`"<dir>"="write"`,
+/// `"<dir>/**"="write"`), preserves explicit `"deny"` rules for all
+/// [`CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS`], and disables network access
+/// (`"network"={"enabled"=false}`). Never grants blanket workspace writes (`"."="write"`) and
+/// never combines named permission profiles with legacy `--sandbox` flags.
+pub fn build_codex_task_files_permission_profile_config_for_scopes(
+    working_directory: &Path,
+    resolved_write_scopes: &BTreeMap<String, WriteScopeKind>,
+) -> Result<String, WorkerError> {
+    let canonical_workdir = validate_codex_task_files_workdir(working_directory)?;
+    if resolved_write_scopes.is_empty() {
+        return Err(WorkerError::InvalidSpec(
+            "allowed_write_paths must contain at least one repository-relative path".to_string(),
+        ));
+    }
+    if resolved_write_scopes.len() > MAX_TASK_FILES_WRITE_PATHS {
+        return Err(WorkerError::InvalidSpec(format!(
+            "allowed_write_paths contains {} entries, which exceeds the maximum of {MAX_TASK_FILES_WRITE_PATHS} entries permitted when `file_permissions` is `task_files`",
+            resolved_write_scopes.len()
+        )));
+    }
+
+    let mut normalized_scopes = BTreeMap::new();
+    for (raw_entry, &scope_kind) in resolved_write_scopes {
+        validate_repo_relative_path(raw_entry, "allowed_write_paths entry")?;
+        let clean_entry = raw_entry.strip_suffix('/').unwrap_or(raw_entry.as_str());
+        if clean_entry.is_empty() || is_control_config_path(clean_entry) {
+            return Err(WorkerError::InvalidSpec(format!(
+                "allowed_write_paths entry `{raw_entry}` targets protected repository or agent control configuration"
+            )));
+        }
+        validate_codex_task_files_scope_str(clean_entry, "allowed_write_paths entry")?;
+
+        let joined_target = canonical_workdir.join(clean_entry);
+        let _ = validate_absolute_no_symlink_components(
+            &joined_target,
+            "task_files allowed_write_paths target",
+        )?;
+        if let Ok(meta) = fs::symlink_metadata(&joined_target) {
+            if meta.file_type().is_symlink() {
+                return Err(WorkerError::SecurityViolation(format!(
+                    "allowed_write_paths target `{}` must not be a symbolic link",
+                    joined_target.display()
+                )));
+            }
+            if scope_kind == WriteScopeKind::DirectorySubtree && !meta.file_type().is_dir() {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "allowed_write_paths directory entry `{clean_entry}/` targets existing non-directory `{}`",
+                    joined_target.display()
+                )));
+            }
+            if scope_kind == WriteScopeKind::ExactFile && meta.file_type().is_dir() {
+                return Err(WorkerError::InvalidSpec(format!(
+                    "allowed_write_paths exact-file entry `{clean_entry}` targets existing directory `{}`",
+                    joined_target.display()
+                )));
+            }
+        }
+        normalized_scopes.insert(clean_entry.to_string(), scope_kind);
+    }
+
+    let config =
+        format_codex_task_files_permission_profile_config_from_normalized(&normalized_scopes);
+    if config.len() > MAX_TASK_FILES_SETTINGS_BYTES {
+        return Err(WorkerError::InvalidSpec(format!(
+            "serialized `codex_cli` `task_files` permission profile config ({} bytes) exceeds maximum of {MAX_TASK_FILES_SETTINGS_BYTES} bytes",
+            config.len()
+        )));
+    }
+    Ok(config)
+}
+
+fn format_codex_task_files_permission_profile_config_from_normalized(
+    normalized_scopes: &BTreeMap<String, WriteScopeKind>,
+) -> String {
+    let mut workspace_rules = Vec::with_capacity(
+        1 + normalized_scopes.len() * 2 + CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS.len(),
+    );
+    workspace_rules.push("\".\"=\"read\"".to_string());
+    for (clean_entry, &scope_kind) in normalized_scopes {
+        workspace_rules.push(format!("\"{clean_entry}\"=\"write\""));
+        if scope_kind == WriteScopeKind::DirectorySubtree {
+            workspace_rules.push(format!("\"{clean_entry}/**\"=\"write\""));
+        }
+    }
+    for pattern in CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS {
+        workspace_rules.push(format!("\"{pattern}\"=\"deny\""));
+    }
+    format!(
+        "permissions.{CODEX_TASK_FILES_PERMISSION_PROFILE_NAME}={{\"filesystem\"={{\"glob_scan_max_depth\"={CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH},\":minimal\"=\"read\",\":workspace_roots\"={{{}}},\"/nix/store\"=\"read\"}},\"network\"={{\"enabled\"=false}}}}",
+        workspace_rules.join(",")
+    )
+}
+
+/// Strictly parses and validates a `permissions.threadlane-task-files={...}` inline TOML `-c`
+/// argument, returning its normalized repository-relative [`WriteScopeKind`] map if and only if:
+/// 1. It uses the exact `threadlane-task-files` profile framing (`glob_scan_max_depth=64`,
+///    `:minimal="read"`, `"."="read"`, `/nix/store="read"`, `"network"={"enabled"=false}`);
+/// 2. It contains between `1` and [`MAX_TASK_FILES_WRITE_PATHS`] validated, non-protected,
+///    metacharacter-free repository-relative write scopes in canonical sorted order;
+/// 3. It retains every protected deny pattern in [`CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS`]; and
+/// 4. Re-serializing the parsed scopes reproduces `config_arg` byte-for-byte.
+pub fn parse_and_validate_codex_task_files_permission_profile_config(
+    config_arg: &str,
+) -> Result<BTreeMap<String, WriteScopeKind>, WorkerError> {
+    if config_arg.is_empty() || config_arg.len() > MAX_TASK_FILES_SETTINGS_BYTES {
+        return Err(WorkerError::InvalidSpec(
+            "invalid `codex_cli` `task_files` permission profile config byte length".to_string(),
+        ));
+    }
+    let expected_prefix = format!(
+        "permissions.{CODEX_TASK_FILES_PERMISSION_PROFILE_NAME}={{\"filesystem\"={{\"glob_scan_max_depth\"={CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH},\":minimal\"=\"read\",\":workspace_roots\"={{\".\"=\"read\","
+    );
+    let mut deny_rules = Vec::with_capacity(CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS.len());
+    for pattern in CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS {
+        deny_rules.push(format!("\"{pattern}\"=\"deny\""));
+    }
+    let expected_suffix = format!(
+        ",{}}},\"/nix/store\"=\"read\"}},\"network\"={{\"enabled\"=false}}}}",
+        deny_rules.join(",")
+    );
+
+    let Some(after_prefix) = config_arg.strip_prefix(&expected_prefix) else {
+        return Err(WorkerError::InvalidSpec(
+            "`codex_cli` `task_files` permission profile config is missing required prefix"
+                .to_string(),
+        ));
+    };
+    let Some(write_section) = after_prefix.strip_suffix(&expected_suffix) else {
+        return Err(WorkerError::InvalidSpec(
+            "`codex_cli` `task_files` permission profile config is missing required protected deny rules or network=false suffix".to_string(),
+        ));
+    };
+    if write_section.is_empty() {
+        return Err(WorkerError::InvalidSpec(
+            "`codex_cli` `task_files` permission profile config must contain at least one write rule"
+                .to_string(),
+        ));
+    }
+
+    let raw_tokens: Vec<&str> = write_section.split(',').collect();
+    let mut scopes = BTreeMap::new();
+    let mut prev_clean: Option<String> = None;
+    let mut idx = 0usize;
+
+    while idx < raw_tokens.len() {
+        let token = raw_tokens[idx];
+        let Some(quoted_key) = token.strip_suffix("=\"write\"") else {
+            return Err(WorkerError::InvalidSpec(format!(
+                "invalid write rule `{token}` in `codex_cli` `task_files` permission profile"
+            )));
+        };
+        let Some(clean_key) = quoted_key
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+        else {
+            return Err(WorkerError::InvalidSpec(format!(
+                "unquoted write rule key in `{token}`"
+            )));
+        };
+        if clean_key.ends_with("/**") {
+            return Err(WorkerError::InvalidSpec(format!(
+                "orphan descendant write rule `{clean_key}` without preceding exact directory rule"
+            )));
+        }
+        validate_repo_relative_path(clean_key, "allowed_write_paths entry")?;
+        if clean_key.ends_with('/') || is_control_config_path(clean_key) {
+            return Err(WorkerError::InvalidSpec(format!(
+                "disallowed write scope `{clean_key}` in `codex_cli` `task_files` permission profile"
+            )));
+        }
+        validate_codex_task_files_scope_str(clean_key, "allowed_write_paths entry")?;
+
+        if let Some(ref prev) = prev_clean {
+            if clean_key <= prev.as_str() {
+                return Err(WorkerError::InvalidSpec(
+                    "write scopes in `codex_cli` `task_files` permission profile must be strictly sorted and unique"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let descendant_token = format!("\"{clean_key}/**\"=\"write\"");
+        let scope_kind = if raw_tokens.get(idx + 1) == Some(&descendant_token.as_str()) {
+            idx += 2;
+            WriteScopeKind::DirectorySubtree
+        } else {
+            idx += 1;
+            WriteScopeKind::ExactFile
+        };
+        prev_clean = Some(clean_key.to_string());
+        scopes.insert(clean_key.to_string(), scope_kind);
+    }
+
+    if scopes.is_empty() || scopes.len() > MAX_TASK_FILES_WRITE_PATHS {
+        return Err(WorkerError::InvalidSpec(
+            "write scope count in `codex_cli` `task_files` permission profile is out of bounds"
+                .to_string(),
+        ));
+    }
+
+    let canonical_rendered =
+        format_codex_task_files_permission_profile_config_from_normalized(&scopes);
+    if canonical_rendered != config_arg {
+        return Err(WorkerError::InvalidSpec(
+            "`codex_cli` `task_files` permission profile config does not match canonical rendering"
+                .to_string(),
+        ));
+    }
+
+    Ok(scopes)
+}
+
+/// Deterministically evaluates a validated `permissions.threadlane-task-files={...}` fixture
+/// configuration for `(action, resource)` where `action` is `"read"`, `"write"` (or `"edit"`),
+/// or `"network"`:
+/// - `"network"` always evaluates to [`OpenCodeRuleEffect::Deny`].
+/// - External, absolute, or `..` traversal resources for `"read"` or `"write"` inside the
+///   workspace evaluate to [`OpenCodeRuleEffect::Deny`].
+/// - Any resource matching [`CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS`] or
+///   [`is_control_config_path`] evaluates to [`OpenCodeRuleEffect::Deny`] for both `"read"` and
+///   `"write"`.
+/// - For `"read"`, clean repository-relative non-protected paths evaluate to
+///   [`OpenCodeRuleEffect::Allow`].
+/// - For `"write"` / `"edit"`, clean repository-relative non-protected paths evaluate to
+///   [`OpenCodeRuleEffect::Allow`] if and only if covered by the parsed [`WriteScopeKind`] map
+///   ([`is_path_allowed_by_scopes`]).
+///
+/// Note: This evaluates our generated `permissions.threadlane-task-files` fixture structure for
+/// unit tests; it does not claim live external CLI sandbox enforcement.
+pub fn evaluate_codex_task_files_permission_profile_config(
+    config_arg: &str,
+    action: &str,
+    resource: &str,
+) -> Result<OpenCodeRuleEffect, WorkerError> {
+    let scopes = parse_and_validate_codex_task_files_permission_profile_config(config_arg)?;
+    if action == "network" {
+        return Ok(OpenCodeRuleEffect::Deny);
+    }
+    if action == "read"
+        && (resource == "/nix/store" || resource.starts_with("/nix/store/"))
+        && !resource.contains('\0')
+        && !resource.contains('\\')
+        && !Path::new(resource).components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::CurDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Ok(OpenCodeRuleEffect::Allow);
+    }
+    let normalized_resource = resource.strip_prefix("./").unwrap_or(resource);
+    if is_external_or_traversal_resource(normalized_resource)
+        || validate_repo_relative_path(normalized_resource, "resource").is_err()
+        || is_control_config_path(normalized_resource)
+        || CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS
+            .iter()
+            .any(|pat| opencode_glob_matches(pat, normalized_resource))
+    {
+        return Ok(OpenCodeRuleEffect::Deny);
+    }
+
+    match action {
+        "read" => Ok(OpenCodeRuleEffect::Allow),
+        "write" | "edit" => {
+            if is_path_allowed_by_scopes(normalized_resource, &scopes) {
+                Ok(OpenCodeRuleEffect::Allow)
+            } else {
+                Ok(OpenCodeRuleEffect::Deny)
+            }
+        }
+        _ => Ok(OpenCodeRuleEffect::Deny),
+    }
 }
 
 fn validate_codex_advisory_workdir_tree(canonical_workdir: &Path) -> Result<(), WorkerError> {

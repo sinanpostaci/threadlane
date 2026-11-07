@@ -260,6 +260,7 @@ pub async fn prepare_task_attempt_for_review(
         .join(&adm.approval.approval_id)
         .join(WORK_AREA_SUBDIR);
     let manifest = load_and_verify_owned_task_manifest(
+        plans_dir,
         &work_area_root,
         &adm,
         &candidate_task,
@@ -421,10 +422,12 @@ pub async fn prepare_task_attempt_for_review(
 
     let review_policy = ReviewPolicyBinding {
         policy_id: post_adm.runtime_state.envelope.policy.policy_id.clone(),
+        codex_launch_report: post_artifacts.codex_launch_report.clone(),
+        codex_source_report_sha256: post_artifacts.codex_source_report_sha256.clone(),
         requested_provider: post_approved_task.provider.map(|p| p.as_str().to_string()),
         requested_model: Some(post_approved_task.base_model.clone()),
         requested_effort: post_task.selected_choice.effort.clone(),
-        observed_model: Some(post_artifacts.observed_model.clone()),
+        observed_model: post_artifacts.observed_model.clone(),
         observed_effort: post_artifacts.observed_effort.clone(),
         file_permissions: post_approved_task
             .file_permissions
@@ -787,6 +790,7 @@ fn verify_live_task_verification_gate(
     let expected_coder_provider = match candidate_task.selected_choice.adapter {
         ToolAdapter::Antigravity => WorkerProvider::Antigravity,
         ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        ToolAdapter::CodexCli => WorkerProvider::CodexCli,
         _ => {
             return Err(NativeError::new(
                 NativeErrorCode::UnsupportedCapability,
@@ -805,8 +809,13 @@ fn verify_live_task_verification_gate(
             format!("invalid frozen Coder model target: {err}"),
         )
     })?;
-    if (artifacts.observed_model != resolved_coder_target.base_model
-        && artifacts.observed_model != candidate_task.selected_choice.model_arg)
+    if (expected_coder_provider != WorkerProvider::CodexCli
+        && artifacts.observed_model.as_deref() != Some(resolved_coder_target.base_model.as_str())
+        && artifacts.observed_model.as_deref()
+            != Some(candidate_task.selected_choice.model_arg.as_str()))
+        || artifacts.observed_model.as_deref().is_some_and(|v| {
+            v != resolved_coder_target.base_model && v != candidate_task.selected_choice.model_arg
+        })
         || resolved_coder_target.base_model != approved_task.base_model
         || resolved_coder_target.effort != approved_task.effort
         || approved_task.provider != Some(expected_coder_provider)
@@ -821,7 +830,13 @@ fn verify_live_task_verification_gate(
         ));
     }
     if let Some(ref exp_effort) = resolved_coder_target.effort {
-        if artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()) {
+        if (expected_coder_provider != WorkerProvider::CodexCli
+            && artifacts.observed_effort.as_deref() != Some(exp_effort.as_str()))
+            || artifacts
+                .observed_effort
+                .as_deref()
+                .is_some_and(|v| v != exp_effort)
+        {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 format!(
@@ -1057,6 +1072,14 @@ fn verify_derived_attempt_for_task_verification(
         || artifacts.task_worktree_id != receipt.task_worktree_id
         || artifacts.integration_worktree_id != receipt.integration_worktree_id
         || artifacts.execution_base_commit != receipt.execution_base_commit
+        || artifacts.codex_launch_report.as_ref().is_some_and(|r| {
+            r != &super::controller_policy::compact_codex_launch_report(
+                &persisted_derived.execution_report.worker_report,
+            )
+        })
+        || (approved_task.provider == Some(WorkerProvider::CodexCli)
+            && artifacts.codex_source_report_sha256.as_deref()
+                != Some(persisted_derived.artifact_digest.as_str()))
     {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
@@ -1068,6 +1091,7 @@ fn verify_derived_attempt_for_task_verification(
 }
 
 fn load_and_verify_owned_task_manifest(
+    plans_dir: &Path,
     work_area_root: &Path,
     adm: &VerifiedControllerAdmission,
     candidate_task: &CoworkerTaskRecord,
@@ -1128,6 +1152,32 @@ fn load_and_verify_owned_task_manifest(
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             "task WorktreeManifest ownership, repository, base_commit, or allowed_write_paths drifted from frozen task scope",
+        ));
+    }
+    artifacts.verify_coder_manifest_evidence(approved_task, &manifest, plans_dir)?;
+    if approved_task.provider == Some(WorkerProvider::CodexCli) {
+        let report = artifacts.codex_launch_report.as_ref().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Codex task artifact lacks verified launch evidence",
+            )
+        })?;
+        if !approved_task.matches_codex_task_launch_report(
+            report,
+            &manifest.checkout_path,
+            &manifest.base_commit,
+        ) || artifacts.observed_model.as_deref() != report.effective_observed_model()
+            || artifacts.observed_effort.as_deref() != report.effective_observed_effort()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Codex task launch report does not match frozen scope or observed telemetry",
+            ));
+        }
+    } else if artifacts.codex_launch_report.is_some() {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "non-Codex task artifact carries foreign launch evidence",
         ));
     }
     let primary_clean =

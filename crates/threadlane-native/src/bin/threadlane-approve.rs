@@ -54,6 +54,27 @@ const OUTCOME_UNKNOWN_CODE: &str = "outcome_unknown";
     about = "Trusted local operator CLI for preparing and recording workflow scope approvals"
 )]
 struct Cli {
+    /// Normalized absolute path to the private running supervisor state directory (`supervisor.json`).
+    #[arg(long = "state-dir", value_name = "ABS", global = true)]
+    state_dir: Option<PathBuf>,
+    /// Normalized absolute path to the private global workflow registry store directory (`registry.json`).
+    #[arg(long = "registry-dir", value_name = "ABS", global = true)]
+    registry_dir: Option<PathBuf>,
+    /// Normalized absolute path to the private workflow plan store directory (`plans.json`).
+    #[arg(long = "plans-dir", value_name = "ABS", global = true)]
+    plans_dir: Option<PathBuf>,
+    /// Normalized absolute path to the private operator approval authority store directory (`approvals.json`).
+    #[arg(long = "authority-dir", value_name = "ABS", global = true)]
+    authority_dir: Option<PathBuf>,
+    /// Optional fixed binding_id scope enforced against the decoded approval request.
+    #[arg(long = "binding", value_name = "BINDING_ID", global = true)]
+    binding: Option<String>,
+    /// Optional fixed canonical lowercase hyphenated non-nil thread_uuid scope enforced against the decoded approval request.
+    #[arg(long = "thread", value_name = "THREAD_UUID", global = true)]
+    thread: Option<String>,
+    /// Optional fixed canonical repository project root enforced against the decoded approval request `repository_path`.
+    #[arg(long = "project-root", value_name = "ABS", global = true)]
+    project_root: Option<PathBuf>,
     #[command(subcommand)]
     command: ApproveCommand,
 }
@@ -63,36 +84,12 @@ struct Cli {
 enum ApproveCommand {
     /// Prepare and validate a read-only `OperatorApprovalPreview` from a private `OperatorApprovalIntent` JSON file.
     Prepare {
-        /// Normalized absolute path to the private running supervisor state directory (`supervisor.json`).
-        #[arg(long = "state-dir", value_name = "ABS")]
-        state_dir: PathBuf,
-        /// Normalized absolute path to the private global workflow registry store directory (`registry.json`).
-        #[arg(long = "registry-dir", value_name = "ABS")]
-        registry_dir: PathBuf,
-        /// Normalized absolute path to the private workflow plan store directory (`plans.json`).
-        #[arg(long = "plans-dir", value_name = "ABS")]
-        plans_dir: PathBuf,
-        /// Normalized absolute path to the private operator approval authority store directory (`approvals.json`).
-        #[arg(long = "authority-dir", value_name = "ABS")]
-        authority_dir: PathBuf,
         /// Normalized absolute path to the private JSON request file (`OperatorApprovalIntent`).
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
         request: PathBuf,
     },
     /// Validate and persist a confirmed `OperatorApprovalRequest` into `approvals.json`.
     Record {
-        /// Normalized absolute path to the private running supervisor state directory (`supervisor.json`).
-        #[arg(long = "state-dir", value_name = "ABS")]
-        state_dir: PathBuf,
-        /// Normalized absolute path to the private global workflow registry store directory (`registry.json`).
-        #[arg(long = "registry-dir", value_name = "ABS")]
-        registry_dir: PathBuf,
-        /// Normalized absolute path to the private workflow plan store directory (`plans.json`).
-        #[arg(long = "plans-dir", value_name = "ABS")]
-        plans_dir: PathBuf,
-        /// Normalized absolute path to the private operator approval authority store directory (`approvals.json`).
-        #[arg(long = "authority-dir", value_name = "ABS")]
-        authority_dir: PathBuf,
         /// Normalized absolute path to the private JSON request file (`OperatorApprovalRequest`).
         #[arg(long = "request", value_name = "ABS_PRIVATE_JSON")]
         request: PathBuf,
@@ -342,22 +339,32 @@ async fn main() -> ExitCode {
 async fn run(cli: Cli) -> Result<(), CliError> {
     ensure_platform_supported().map_err(|e| CliError::from_native(&e))?;
 
+    let (state_dir, registry_dir, plans_dir, authority_dir) = resolve_store_dir_args(&cli)?;
+    let raw_binding = cli.binding.as_deref();
+    let raw_thread = cli.thread.as_deref();
+    let raw_project_root = cli.project_root.as_deref();
+
     match cli.command {
-        ApproveCommand::Prepare {
-            state_dir,
-            registry_dir,
-            plans_dir,
-            authority_dir,
-            request,
-        } => {
+        ApproveCommand::Prepare { request } => {
             let dirs =
                 validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
+            let fixed_scope =
+                resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
             let intent: OperatorApprovalIntent = load_request_json(&request)?;
 
             let binding_id = validate_identifier("binding_id", &intent.binding_id)
                 .map_err(|e| CliError::from_authority(&e))?;
             let thread_uuid = validate_canonical_thread_uuid("thread_uuid", &intent.thread_uuid)
                 .map_err(|e| CliError::from_authority(&e))?;
+            if let Some(ref fixed) = fixed_scope {
+                enforce_fixed_scope_on_request(
+                    fixed,
+                    &binding_id,
+                    &thread_uuid,
+                    &intent.repository_path,
+                    None,
+                )?;
+            }
             validate_repo_non_overlap_with_state_dir(&intent.repository_path, &dirs.state_dir)?;
 
             let supervisor = SupervisorClient::from_state_dir(&dirs.state_dir)
@@ -369,6 +376,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 .prepare_for_operator(intent)
                 .map_err(|e| CliError::from_authority(&e))?;
 
+            if let Some(ref fixed) = fixed_scope {
+                enforce_fixed_scope_on_request(
+                    fixed,
+                    &preview.request.binding_id,
+                    &preview.request.thread_uuid,
+                    &preview.request.repository_path,
+                    None,
+                )?;
+            }
+
             verify_live_binding(
                 &supervisor,
                 &preview.request.binding_id,
@@ -379,10 +396,6 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             write_stdout_json(&preview, false)
         }
         ApproveCommand::Record {
-            state_dir,
-            registry_dir,
-            plans_dir,
-            authority_dir,
             request,
             confirm_subject,
             confirm_thread,
@@ -401,6 +414,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
 
             let dirs =
                 validate_four_store_dirs(&state_dir, &registry_dir, &plans_dir, &authority_dir)?;
+            let fixed_scope =
+                resolve_fixed_scope(raw_binding, raw_thread, raw_project_root, &dirs)?;
+            if let Some(ref fixed) = fixed_scope {
+                if checked_confirm_thread != fixed.thread_uuid {
+                    return Err(CliError::thread_uuid_mismatch(
+                        "confirmation --confirm-thread does not match fixed context --thread scope",
+                    ));
+                }
+            }
             let req: OperatorApprovalRequest = load_request_json(&request)?;
 
             let binding_id = validate_identifier("binding_id", &req.binding_id)
@@ -411,6 +433,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                 return Err(CliError::thread_uuid_mismatch(
                     "confirmation --confirm-thread does not match request thread_uuid",
                 ));
+            }
+            if let Some(ref fixed) = fixed_scope {
+                enforce_fixed_scope_on_request(
+                    fixed,
+                    &binding_id,
+                    &thread_uuid,
+                    &req.repository_path,
+                    Some(&checked_confirm_thread),
+                )?;
             }
             validate_repo_non_overlap_with_state_dir(&req.repository_path, &dirs.state_dir)?;
 
@@ -428,6 +459,15 @@ async fn run(cli: Cli) -> Result<(), CliError> {
                     "confirmed subject digest is invalid or did not match the compiled approval subject",
                 ));
             }
+            if let Some(ref fixed) = fixed_scope {
+                enforce_fixed_scope_on_request(
+                    fixed,
+                    &preview.request.binding_id,
+                    &preview.request.thread_uuid,
+                    &preview.request.repository_path,
+                    Some(&checked_confirm_thread),
+                )?;
+            }
 
             verify_live_binding(&supervisor, &binding_id, &thread_uuid).await?;
 
@@ -438,6 +478,218 @@ async fn run(cli: Cli) -> Result<(), CliError> {
             write_stdout_json(&summary, true)
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FixedApprovalScope {
+    binding_id: String,
+    thread_uuid: String,
+    project_root: Option<PathBuf>,
+}
+
+fn resolve_store_dir_args(cli: &Cli) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf), CliError> {
+    let (Some(state_dir), Some(registry_dir), Some(plans_dir), Some(authority_dir)) = (
+        cli.state_dir.clone(),
+        cli.registry_dir.clone(),
+        cli.plans_dir.clone(),
+        cli.authority_dir.clone(),
+    ) else {
+        return Err(CliError::invalid_input(
+            "invalid or missing command-line arguments",
+        ));
+    };
+    Ok((state_dir, registry_dir, plans_dir, authority_dir))
+}
+
+fn resolve_fixed_scope(
+    binding: Option<&str>,
+    thread: Option<&str>,
+    project_root: Option<&Path>,
+    dirs: &ValidatedStoreDirs,
+) -> Result<Option<FixedApprovalScope>, CliError> {
+    if binding.is_none() && thread.is_none() && project_root.is_none() {
+        return Ok(None);
+    }
+
+    let (Some(raw_binding), Some(raw_thread)) = (binding, thread) else {
+        return Err(CliError::invalid_input(
+            "fixed-scope flags require both --binding and --thread",
+        ));
+    };
+
+    let binding_id =
+        validate_identifier("binding_id", raw_binding).map_err(|e| CliError::from_authority(&e))?;
+    let thread_uuid = validate_canonical_thread_uuid("thread_uuid", raw_thread)
+        .map_err(|e| CliError::from_authority(&e))?;
+    let clean_project_root = match project_root {
+        Some(path) => Some(validate_existing_canonical_project_root(path, dirs)?),
+        None => None,
+    };
+
+    Ok(Some(FixedApprovalScope {
+        binding_id,
+        thread_uuid,
+        project_root: clean_project_root,
+    }))
+}
+
+#[cfg(unix)]
+fn validate_existing_canonical_project_root(
+    path: &Path,
+    dirs: &ValidatedStoreDirs,
+) -> Result<PathBuf, CliError> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let raw_bytes = path.as_os_str().as_bytes();
+    if raw_bytes.is_empty() || !path.is_absolute() || raw_bytes.ends_with(b"/") {
+        return Err(CliError::invalid_input(
+            "project-root path must be a normalized absolute directory path",
+        ));
+    }
+
+    let _ = validate_absolute_no_symlink_components(path, "project root")
+        .map_err(|e| CliError::from_native(&e))?;
+
+    let mut normal_parts: Vec<&OsStr> = Vec::new();
+    let mut saw_root = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir if !saw_root && normal_parts.is_empty() => {
+                saw_root = true;
+            }
+            Component::Normal(part) if saw_root && !part.is_empty() => {
+                normal_parts.push(part);
+            }
+            Component::CurDir | Component::ParentDir => {
+                return Err(CliError::security_violation(
+                    "project-root path must not contain relative or traversal components",
+                ));
+            }
+            _ => {
+                return Err(CliError::invalid_input(
+                    "project-root path must be a normalized absolute directory path",
+                ));
+            }
+        }
+    }
+
+    if !saw_root || normal_parts.is_empty() {
+        return Err(CliError::invalid_input(
+            "project-root path must be a normalized absolute directory path",
+        ));
+    }
+
+    let mut reconstructed = PathBuf::from("/");
+    for part in &normal_parts {
+        reconstructed.push(part);
+    }
+    if reconstructed.as_os_str() != path.as_os_str() {
+        return Err(CliError::invalid_input(
+            "project-root path must be normalized without redundant separators or `.` segments",
+        ));
+    }
+
+    let mut current = PathBuf::from("/");
+    for part in &normal_parts {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(CliError::security_violation(
+                        "project-root path must not contain symlinks",
+                    ));
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(CliError::security_violation(
+                        "project-root path component is not a directory",
+                    ));
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Err(CliError::invalid_input(
+                    "project-root directory does not exist",
+                ));
+            }
+            Err(_) => {
+                return Err(CliError::new(
+                    "io",
+                    "failed to inspect project-root directory metadata",
+                ));
+            }
+        }
+    }
+
+    let canonical = fs::canonicalize(&reconstructed)
+        .map_err(|_| CliError::security_violation("failed to canonicalize project-root path"))?;
+    if canonical != reconstructed {
+        return Err(CliError::security_violation(
+            "project-root path is not canonical",
+        ));
+    }
+
+    for store_dir in [
+        &dirs.state_dir,
+        &dirs.registry_dir,
+        &dirs.plans_dir,
+        &dirs.authority_dir,
+    ] {
+        if &canonical == store_dir
+            || canonical.starts_with(store_dir)
+            || store_dir.starts_with(&canonical)
+        {
+            return Err(CliError::security_violation(
+                "project-root must not match or overlap any private store directory",
+            ));
+        }
+    }
+
+    Ok(canonical)
+}
+
+#[cfg(not(unix))]
+fn validate_existing_canonical_project_root(
+    _path: &Path,
+    _dirs: &ValidatedStoreDirs,
+) -> Result<PathBuf, CliError> {
+    Err(CliError::new(
+        "unsupported_platform",
+        "threadlane-approve is only supported on Unix platforms",
+    ))
+}
+
+fn enforce_fixed_scope_on_request(
+    fixed: &FixedApprovalScope,
+    request_binding_id: &str,
+    request_thread_uuid: &str,
+    request_repository_path: &Path,
+    confirm_thread_uuid: Option<&str>,
+) -> Result<(), CliError> {
+    if request_binding_id != fixed.binding_id {
+        return Err(CliError::binding_mismatch(
+            "request binding_id does not match fixed context --binding scope",
+        ));
+    }
+    if request_thread_uuid != fixed.thread_uuid {
+        return Err(CliError::thread_uuid_mismatch(
+            "request thread_uuid does not match fixed context --thread scope",
+        ));
+    }
+    if let Some(confirm_thread) = confirm_thread_uuid {
+        if confirm_thread != fixed.thread_uuid {
+            return Err(CliError::thread_uuid_mismatch(
+                "confirmation --confirm-thread does not match fixed context --thread scope",
+            ));
+        }
+    }
+    if let Some(ref project_root) = fixed.project_root {
+        if request_repository_path != project_root.as_path() {
+            return Err(CliError::new(
+                "invalid_repository",
+                "request repository_path does not match fixed context --project-root scope",
+            ));
+        }
+    }
+    Ok(())
 }
 
 struct ValidatedStoreDirs {
@@ -935,4 +1187,131 @@ fn emit_error(err: &CliError) {
         );
     }
     let _ = stderr.flush();
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_legacy_subcommand_flags_and_context_routed_global_flags() {
+        let legacy = Cli::try_parse_from([
+            "threadlane-approve",
+            "prepare",
+            "--state-dir",
+            "/abs/state",
+            "--registry-dir",
+            "/abs/registry",
+            "--plans-dir",
+            "/abs/plans",
+            "--authority-dir",
+            "/abs/authority",
+            "--request",
+            "/abs/req.json",
+        ])
+        .expect("parse legacy prepare flags");
+        assert_eq!(
+            resolve_store_dir_args(&legacy).expect("resolve store dirs"),
+            (
+                PathBuf::from("/abs/state"),
+                PathBuf::from("/abs/registry"),
+                PathBuf::from("/abs/plans"),
+                PathBuf::from("/abs/authority"),
+            )
+        );
+        assert!(legacy.binding.is_none());
+        assert!(legacy.thread.is_none());
+        assert!(legacy.project_root.is_none());
+
+        let routed = Cli::try_parse_from([
+            "threadlane-approve",
+            "--state-dir",
+            "/abs/state",
+            "--registry-dir",
+            "/abs/registry",
+            "--plans-dir",
+            "/abs/plans",
+            "--authority-dir",
+            "/abs/authority",
+            "--binding",
+            "bnd_test_1",
+            "--thread",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--project-root",
+            "/abs/repo",
+            "record",
+            "--request",
+            "/abs/req.json",
+            "--confirm-subject",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--confirm-thread",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--operator-approved",
+        ])
+        .expect("parse context-routed record flags");
+        assert_eq!(routed.binding.as_deref(), Some("bnd_test_1"));
+        assert_eq!(
+            routed.thread.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(routed.project_root.as_deref(), Some(Path::new("/abs/repo")));
+    }
+
+    #[test]
+    fn fixed_scope_enforces_binding_thread_confirm_thread_and_project_root() {
+        let fixed = FixedApprovalScope {
+            binding_id: "bnd_chat_a".to_string(),
+            thread_uuid: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            project_root: Some(PathBuf::from("/abs/repo_a")),
+        };
+
+        enforce_fixed_scope_on_request(
+            &fixed,
+            "bnd_chat_a",
+            "550e8400-e29b-41d4-a716-446655440000",
+            Path::new("/abs/repo_a"),
+            Some("550e8400-e29b-41d4-a716-446655440000"),
+        )
+        .expect("matching request scope succeeds");
+
+        let wrong_binding = enforce_fixed_scope_on_request(
+            &fixed,
+            "bnd_chat_b",
+            "550e8400-e29b-41d4-a716-446655440000",
+            Path::new("/abs/repo_a"),
+            None,
+        )
+        .expect_err("wrong binding must fail");
+        assert_eq!(wrong_binding.code, "binding_mismatch");
+
+        let wrong_thread = enforce_fixed_scope_on_request(
+            &fixed,
+            "bnd_chat_a",
+            "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+            Path::new("/abs/repo_a"),
+            None,
+        )
+        .expect_err("wrong thread must fail");
+        assert_eq!(wrong_thread.code, "thread_uuid_mismatch");
+
+        let wrong_confirm = enforce_fixed_scope_on_request(
+            &fixed,
+            "bnd_chat_a",
+            "550e8400-e29b-41d4-a716-446655440000",
+            Path::new("/abs/repo_a"),
+            Some("6ba7b810-9dad-11d1-80b4-00c04fd430c8"),
+        )
+        .expect_err("wrong confirm thread must fail");
+        assert_eq!(wrong_confirm.code, "thread_uuid_mismatch");
+
+        let wrong_repo = enforce_fixed_scope_on_request(
+            &fixed,
+            "bnd_chat_a",
+            "550e8400-e29b-41d4-a716-446655440000",
+            Path::new("/abs/repo_b"),
+            None,
+        )
+        .expect_err("wrong repository_path must fail");
+        assert_eq!(wrong_repo.code, "invalid_repository");
+    }
 }

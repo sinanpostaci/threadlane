@@ -420,10 +420,10 @@ impl WorkBrief {
 }
 
 /// Enforces that a role and resolved choice represent a supported headless worker model, never
-/// conversational `Follower`, `native_handoff`, or a `CodexCli` `Coder`.
+/// conversational `Follower` or `native_handoff`.
 ///
 /// Normalized `CodexCli` headless choices (`route == HeadlessWorker`) are permitted **only** for
-/// read-only advisory roles (`Orchestrator`, `Architect`, `Reviewer`, `Closure`) with an explicit
+/// read-only advisory roles (`Orchestrator`, `Architect`, `Reviewer`, `Closure`) and frozen Coder choices with an explicit
 /// reasoning effort validated by [`resolve_model_target`] (`WorkerProvider::CodexCli`).
 pub fn validate_non_native_worker_choice(
     role: WorkflowRole,
@@ -460,16 +460,16 @@ pub fn validate_non_native_worker_choice(
     match choice.adapter {
         ToolAdapter::Antigravity | ToolAdapter::OpencodeV2 => Ok(()),
         ToolAdapter::CodexCli => {
-            if !is_read_only_advisory_worker_role(role) {
+            if role != WorkflowRole::Coder && !is_read_only_advisory_worker_role(role) {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "native Coworker (codex_cli) cannot execute as a headless Coder or Follower worker",
+                    "native Coworker cannot execute as a headless Follower worker",
                 ));
             }
             if choice.effort.is_none() {
                 return Err(NativeError::new(
                     NativeErrorCode::ValidationFailed,
-                    "headless CodexCli read-only advisory worker requires an explicit reasoning effort",
+                    "headless CodexCli worker requires an explicit reasoning effort",
                 ));
             }
             let resolved = resolve_model_target(

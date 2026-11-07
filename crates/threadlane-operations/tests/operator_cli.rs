@@ -252,6 +252,8 @@ fn assert_workspace_unchanged(fx: &Fixture, before: &WorkspaceSnapshot, context:
 fn strict_policy() -> ReviewPolicyBinding {
     ReviewPolicyBinding {
         policy_id: "m5a-operator-cli-strict-policy".to_string(),
+        codex_launch_report: None,
+        codex_source_report_sha256: None,
         requested_provider: Some("fixture-provider".to_string()),
         requested_model: Some("fixture-model-1".to_string()),
         requested_effort: Some("high".to_string()),

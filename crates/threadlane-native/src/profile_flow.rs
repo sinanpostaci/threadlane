@@ -322,6 +322,51 @@ pub const fn is_read_only_advisory_worker_role(role: WorkflowRole) -> bool {
     )
 }
 
+/// Normalize an exactly policy-admitted Coder choice for the approved controller path.
+/// Generic preflight and manual role-flow routes retain their native handoff semantics.
+pub fn normalize_coder_choice(
+    choice: &SelectedRoleChoice,
+) -> Result<SelectedRoleChoice, NativeError> {
+    let provider = match choice.adapter {
+        ToolAdapter::CodexCli => WorkerProvider::CodexCli,
+        ToolAdapter::Antigravity => WorkerProvider::Antigravity,
+        ToolAdapter::OpencodeV2 => WorkerProvider::OpenCodeV2,
+        _ => {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedCapability,
+                "Coder choice is not a supported headless worker",
+            ))
+        }
+    };
+    validate_registry_id(&choice.tool_id, "selected_choice.tool_id")?;
+    validate_registry_id(&choice.model_id, "selected_choice.model_id")?;
+    if (provider != WorkerProvider::CodexCli && choice.route != RoleExecutionRoute::HeadlessWorker)
+        || (provider == WorkerProvider::CodexCli
+            && (choice.effort.is_none() || choice.route == RoleExecutionRoute::Unsupported))
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "Coder route or explicit effort is missing",
+        ));
+    }
+    let target = resolve_model_target(provider, &choice.model_arg, choice.effort.as_deref())
+        .map_err(|e| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("invalid Coder target: {e}"),
+            )
+        })?;
+    if target.effort != choice.effort {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "Coder effort does not match the exact resolved target",
+        ));
+    }
+    let mut normalized = choice.clone();
+    normalized.route = RoleExecutionRoute::HeadlessWorker;
+    Ok(normalized)
+}
+
 /// Normalizes a preflight-resolved [`SelectedRoleChoice`] for read-only advisory worker execution.
 ///
 /// Preserves generic [`RoleExecutionRoute::from_adapter`] and [`preflight`] semantics (`CodexCli`

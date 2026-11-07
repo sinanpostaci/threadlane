@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use threadlane::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus};
@@ -23,8 +24,132 @@ use crate::types::{
     TaskEvidenceVerificationStatus, TaskExecutionStatus, TaskIntegrationLifecycleStatus,
     TaskLifecycleProjection, TaskReviewLifecycleStatus, TaskRunReceipt,
     VerifiedIntegrationReceiptSummary, VerifiedReviewReceiptSummary, MAX_LIFECYCLE_DETAIL_BYTES,
-    MAX_RECEIPT_SCAN_ENTRIES, WORK_AREA_SUBDIR,
+    MAX_RECEIPT_SCAN_ENTRIES, RUNTIME_STATE_SUBDIR, WORK_AREA_SUBDIR,
 };
+
+/// Load an immutable private Codex task report and verify its launch, snapshot and scope pins.
+/// This is trusted-local evidence, never a requested-to-observed telemetry substitution.
+pub fn load_verified_codex_task_report(
+    record: &ApprovalRecord,
+    session_dir: &Path,
+    task: &ApprovedTaskRecord,
+    worker: &WorkerSnapshot,
+) -> Result<threadlane_workers::TaskExecutionReport, String> {
+    use threadlane_workers::{TaskExecutionReport, WorkAcceptanceState};
+    if !task.is_frozen_headless_worker()
+        || task.provider != Some(threadlane_workers::WorkerProvider::CodexCli)
+    {
+        return Err("task has no frozen Codex worker authority".to_string());
+    }
+    let artifact_id = format!("art_{}", worker.worker_id);
+    if worker
+        .outcome
+        .as_ref()
+        .and_then(|o| o.report_artifact_id.as_deref())
+        != Some(artifact_id.as_str())
+        || crate::storage::validate_identifier("artifact_id", &artifact_id).is_err()
+    {
+        return Err("worker has no matching immutable report artifact".to_string());
+    }
+    let artifact_dir = session_dir
+        .join(RUNTIME_STATE_SUBDIR)
+        .join("worker_reports");
+    crate::storage::verify_existing_private_dir(&artifact_dir).map_err(|e| e.to_string())?;
+    let path = artifact_dir.join(format!("{artifact_id}.json"));
+    ensure_no_symlink_components(&path).map_err(|e| e.to_string())?;
+    let meta = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if !meta.is_file() || meta.len() > 16 * 1024 * 1024 {
+        return Err("invalid bounded worker report file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent_meta = fs::metadata(&artifact_dir).map_err(|e| e.to_string())?;
+        if meta.permissions().mode() & 0o777 != 0o600 || meta.uid() != parent_meta.uid() {
+            return Err("worker report must be private and owned by its store owner".to_string());
+        }
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(&path)
+        .map_err(|e| e.to_string())?
+        .take(16 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 16 * 1024 * 1024 {
+        return Err("worker report exceeds byte limit".to_string());
+    }
+    let report: TaskExecutionReport = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    let profile = crate::storage::build_validated_task_profile(
+        record,
+        &worker.binding_id,
+        &session_dir.join(WORK_AREA_SUBDIR),
+        task,
+    )?;
+    let manifest = load_and_verify_manifest(
+        &session_dir.join(WORK_AREA_SUBDIR),
+        &report.manifest.worktree_id,
+    )
+    .map_err(|e| e.to_string())?;
+    if manifest.kind != WorktreeKind::Task
+        || manifest.repository_path != record.repository_path
+        || manifest.work_area_root != session_dir.join(WORK_AREA_SUBDIR)
+        || manifest.run_id != crate::client::compact_worktree_tag(&worker.run_id, "r")
+        || manifest.task_id.as_deref()
+            != Some(crate::client::compact_worktree_tag(&worker.worker_id, "w").as_str())
+        || manifest.worktree_id != worker.worktree.task_worktree_id.as_deref().unwrap_or("")
+        || manifest.checkout_path.to_str() != worker.worktree.task_worktree_path.as_deref()
+        || report.manifest.worktree_id != manifest.worktree_id
+        || report.manifest.repository_path != manifest.repository_path
+        || report.manifest.checkout_path != manifest.checkout_path
+        || report.manifest.work_area_root != manifest.work_area_root
+        || report.manifest.run_id != manifest.run_id
+        || report.manifest.base_commit != manifest.base_commit
+        || report.manifest.allowed_write_paths != manifest.allowed_write_paths
+        || manifest.base_commit != worker.worktree.base_commit
+        || manifest.allowed_write_paths != task.allowed_write_paths.iter().cloned().collect()
+        || worker.profile_id != profile.profile_id
+        || worker.profile_digest != profile.profile_digest
+        || worker.requested_model != task.base_model
+        || Some(worker.requested_effort.as_str()) != task.effort.as_deref()
+        || worker.instruction != task.instruction
+        || worker.provider != "codex_cli"
+        || worker.status != WorkerStatus::Completed
+        || worker.observed_model.as_deref() != report.worker_report.effective_observed_model()
+        || worker.observed_effort.as_deref() != report.worker_report.effective_observed_effort()
+        || !task.matches_codex_task_launch_report(
+            &report.worker_report,
+            &manifest.checkout_path,
+            &manifest.base_commit,
+        )
+        || !report.diff_gate.passed
+        || !report.diff_gate.evidence_complete
+        || !report.diff_gate.violations.is_empty()
+        || report.overall_acceptance_state != WorkAcceptanceState::DiffGatePassedPendingReview
+    {
+        return Err(
+            "Codex worker report does not match the frozen profile, snapshot or worktree"
+                .to_string(),
+        );
+    }
+    Ok(report)
+}
+
+pub(crate) fn verify_worker_model_evidence(
+    record: &ApprovalRecord,
+    session_dir: &Path,
+    task: &ApprovedTaskRecord,
+    worker: &WorkerSnapshot,
+) -> bool {
+    if task.provider == Some(threadlane_workers::WorkerProvider::CodexCli) {
+        load_verified_codex_task_report(record, session_dir, task, worker).is_ok()
+    } else {
+        worker.observed_model.as_deref() == Some(task.base_model.as_str())
+            && task
+                .effort
+                .as_deref()
+                .is_none_or(|effort| worker.observed_effort.as_deref() == Some(effort))
+    }
+}
 
 /// Projects the truthful, read-only review and integration lifecycle for a task snapshot.
 ///
@@ -81,7 +206,7 @@ pub fn project_task_lifecycle(
         || worker.profile_id != run_receipt.profile_id
         || worker.provider != provider.as_str()
         || worker.requested_model != task.base_model
-        || worker.observed_model.as_deref() != Some(task.base_model.as_str())
+        || !verify_worker_model_evidence(record, session_dir, task, worker)
         || worker.instruction != task.instruction
         || worker.status != WorkerStatus::Completed
     {
@@ -95,7 +220,8 @@ pub fn project_task_lifecycle(
 
     if let Some(ref expected_effort) = task.effort {
         if worker.requested_effort != *expected_effort
-            || worker.observed_effort.as_deref() != Some(expected_effort.as_str())
+            || (task.provider != Some(threadlane_workers::WorkerProvider::CodexCli)
+                && worker.observed_effort.as_deref() != Some(expected_effort.as_str()))
         {
             return invalidated_projection(
                 false,
@@ -941,14 +1067,16 @@ fn verify_policy_matches_frozen_task(
         return Err("Review receipt requested_provider does not match frozen task provider.");
     }
     if policy.requested_model.as_deref() != Some(expected_model)
-        || policy.observed_model.as_deref() != Some(expected_model)
+        || (policy.observed_model.as_deref() != Some(expected_model)
+            && !policy.has_verified_codex_task_launch())
     {
         return Err("Review receipt model evidence does not match frozen task model.");
     }
     if let Some(req_effort) = expected_effort {
         if policy.requested_effort.as_deref() != Some(req_effort)
             || !policy.require_effort_evidence
-            || policy.observed_effort.as_deref() != Some(req_effort)
+            || (policy.observed_effort.as_deref() != Some(req_effort)
+                && !policy.has_verified_codex_task_launch())
         {
             return Err("Review receipt effort evidence does not match frozen task effort.");
         }

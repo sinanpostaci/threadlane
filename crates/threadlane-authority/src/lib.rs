@@ -2416,4 +2416,164 @@ mod tests {
             AuthorityError::Validation { ref field, .. } if field == "expected_subject_digest"
         ));
     }
+    #[test]
+    fn codex_coder_preview_freezes_complete_pins_and_legacy_native_records_stay_native() {
+        let fixture = setup_fixture();
+        let snap = fixture.registry.snapshot().unwrap();
+        fixture
+            .registry
+            .apply(
+                snap.revision,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-codex".to_string(),
+                        label: "Offline Codex".to_string(),
+                        adapter: ToolAdapter::CodexCli,
+                        executable_path: Some(fixture.fake_agy_exe.clone()),
+                        enabled: true,
+                    },
+                },
+            )
+            .unwrap();
+        fixture
+            .registry
+            .apply(
+                snap.revision + 1,
+                RegistryChange::UpsertModels {
+                    models: vec![ModelDefinition {
+                        id: "model-luna".to_string(),
+                        tool_id: "tool-codex".to_string(),
+                        label: "Luna".to_string(),
+                        model_arg: "gpt-6-luna".to_string(),
+                        efforts: vec!["max".to_string()],
+                        allow_no_effort: false,
+                    }],
+                },
+            )
+            .unwrap();
+        let mut profile = snap.profiles[0].clone();
+        for assignment in &mut profile.assignments {
+            if assignment.role == WorkflowRole::Coder {
+                assignment.choice = ModelChoice {
+                    model_id: "model-luna".to_string(),
+                    effort: Some("max".to_string()),
+                };
+            }
+        }
+        fixture
+            .registry
+            .apply(snap.revision + 2, RegistryChange::UpsertProfile { profile })
+            .unwrap();
+        let revision = fixture.registry.snapshot().unwrap().revision;
+        let (plan_revision, digest) = save_and_publish_plan(
+            &fixture,
+            "plan-codex",
+            "binding-1",
+            revision,
+            vec![PlanTask {
+                id: "task-codex".to_string(),
+                title: "Codex task".to_string(),
+                instruction: "Edit the approved file".to_string(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Easy,
+                depends_on: vec![],
+                allowed_write_paths: vec!["src/lib.rs".to_string()],
+            }],
+        );
+        let request = OperatorApprovalRequest {
+            binding_id: "binding-1".to_string(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            plan_id: "plan-codex".to_string(),
+            plan_revision,
+            expected_registry_revision: revision,
+            expected_plan_digest: digest,
+            repository_path: fixture.repo_dir.clone(),
+            base_commit: fixture.base_commit.clone(),
+            approved_task_ids: vec!["task-codex".to_string()],
+            approved_write_paths: vec!["src/lib.rs".to_string()],
+            max_parallel: 1,
+            budgets: ExecutionBudgets::default(),
+        };
+        let preview = fixture
+            .authority
+            .preview_for_operator(request.clone())
+            .unwrap();
+        assert!(preview.tasks[0].is_frozen_headless_worker());
+        assert_eq!(preview.tasks[0].provider, Some(WorkerProvider::CodexCli));
+        assert_eq!(preview.tasks[0].standalone, Some(false));
+        assert_eq!(preview.tasks[0].base_model, "gpt-6-luna");
+        let summary = fixture.authority.approve(request).unwrap();
+        assert_eq!(summary.worker_profile_count, 1);
+        let record = fixture
+            .authority
+            .get_for_operator(&summary.approval_id)
+            .unwrap();
+        let materialized = fixture
+            .authority
+            .materialize(
+                &summary.approval_id,
+                &sample_binding("bnd_codex", THREAD_UUID_A),
+                &fixture.root.join("codex-work-area"),
+            )
+            .unwrap();
+        assert_eq!(materialized.task_dispatch.len(), 1);
+        assert!(materialized.native_routes.is_empty());
+        assert_eq!(
+            materialized.workers.unwrap().profiles[0].spec.provider,
+            WorkerProvider::CodexCli
+        );
+        for corrupt in 0..5 {
+            let mut task = record.tasks[0].clone();
+            match corrupt {
+                0 => task.canonical_executable = None,
+                1 => task.cli_model_arg = None,
+                2 => task.standalone = None,
+                3 => task.file_permissions = None,
+                _ => task.provider = Some(WorkerProvider::OpenCodeV2),
+            }
+            assert!(!task.is_frozen_headless_worker());
+        }
+        // Real-shaped pre-package Codex Coder approvals had no worker pins. Their existing
+        // digest algorithm and read-only integrity remain valid; no worker authority is inferred.
+        let mut legacy = record;
+        let task = &mut legacy.tasks[0];
+        task.provider = None;
+        task.canonical_executable = None;
+        task.cli_model_arg = None;
+        task.standalone = None;
+        task.file_permissions = None;
+        task.profile_id = None;
+        task.command_key = None;
+        legacy.subject_digest = compute_record_subject_digest(&legacy).unwrap();
+        legacy.approval_id = derive_approval_id(&legacy.subject_digest);
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        let decoded: ApprovalRecord = serde_json::from_slice(&bytes).unwrap();
+        validation::verify_approval_record_integrity(&decoded, fixture.authority.approvals_path())
+            .unwrap();
+        assert_eq!(
+            compute_record_subject_digest(&decoded).unwrap(),
+            legacy.subject_digest
+        );
+        assert!(!decoded.tasks[0].is_frozen_headless_worker());
+        let mut disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(fixture.authority.approvals_path()).unwrap()).unwrap();
+        let entries = disk["approvals"].as_array_mut().unwrap();
+        *entries = vec![serde_json::to_value(&legacy).unwrap()];
+        fs::write(
+            fixture.authority.approvals_path(),
+            serde_json::to_vec(&disk).unwrap(),
+        )
+        .unwrap();
+        let native = fixture
+            .authority
+            .materialize(
+                &legacy.approval_id,
+                &sample_binding("bnd_legacy", THREAD_UUID_A),
+                &fixture.root.join("legacy-work-area"),
+            )
+            .unwrap();
+        assert!(native.workers.is_none());
+        assert!(native.task_dispatch.is_empty());
+        assert_eq!(native.native_routes.len(), 1);
+    }
 }

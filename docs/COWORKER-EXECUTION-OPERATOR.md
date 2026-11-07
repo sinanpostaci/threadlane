@@ -85,3 +85,13 @@ The `--request <ABS>` file must be a private (`0600`) JSON object (`#[serde(deny
   - `grant_record_rejects_file_only_attestation_digest_mismatch_and_wrong_scope`
   - `grant_record_list_get_and_revoke_lifecycle_with_cas_and_stale_registry_refusal`
 - **`crates/threadlane-native/src/bin/threadlane-flow.rs` unit tests**: `cli_parses_coworker_execution_subcommands_with_global_flags` and `cli_parses_grant_subcommands_with_global_flags`.
+
+### Approved Codex Coder tasks
+
+A newly approved complete Codex CLI Coder contract can run through the same frozen controller
+pipeline as the other supported CLI Coders. The trusted preview must include the canonical
+executable, model/effort, TaskFiles scope and provider pins. Saved profiles are not execution
+authority. Legacy `provider=None` approvals remain manual native routes. Missing runtime
+model/effort telemetry stays unknown; exact verified launch evidence and its private source
+digest are carried separately through checks, review receipts, dependencies and integration.
+See [Codex Coder](CODEX-CODER.md) for the launch and qualification boundaries.

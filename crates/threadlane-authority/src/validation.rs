@@ -390,6 +390,7 @@ pub fn resolve_and_validate_worker_executable(
     let (provider, default_bin_name) = match adapter {
         ToolAdapter::Antigravity => (WorkerProvider::Antigravity, "agy"),
         ToolAdapter::OpencodeV2 => (WorkerProvider::OpenCodeV2, "opencode"),
+        ToolAdapter::CodexCli => (WorkerProvider::CodexCli, "codex"),
         _ => {
             return Err(AuthorityError::UnsupportedTaskAdapter {
                 plan_id: String::new(),
@@ -1202,6 +1203,33 @@ fn verify_task_record_structure(
                 ),
             });
         }
+    }
+
+    // Provider=None is the persisted legacy native route. Never infer worker authority from
+    // its adapter/model. New worker records must carry all digest-bound execution pins.
+    if task.provider.is_some() && !task.is_frozen_headless_worker() {
+        return Err(AuthorityError::CorruptStore {
+            path: store_path.display().to_string(),
+            reason: format!(
+                "approval `{approval_id}` task `{}` has incomplete or mismatched worker pins",
+                task.task_id
+            ),
+        });
+    }
+    if task.provider.is_none()
+        && (task.adapter != ToolAdapter::CodexCli
+            || task.canonical_executable.is_some()
+            || task.cli_model_arg.is_some()
+            || task.standalone.is_some()
+            || task.file_permissions.is_some())
+    {
+        return Err(AuthorityError::CorruptStore {
+            path: store_path.display().to_string(),
+            reason: format!(
+                "approval `{approval_id}` task `{}` has mixed native/worker pins",
+                task.task_id
+            ),
+        });
     }
 
     let computed_instruction_digest = sha256_hex(task.instruction.as_bytes());

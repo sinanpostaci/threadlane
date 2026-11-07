@@ -30,6 +30,8 @@ mod auto_pair;
 pub mod client;
 /// Safe startup and CLI registration helper for `mcp_servers.threadlane` in Codex `config.toml`.
 pub mod codex_setup;
+/// Safe per-chat v1 trusted-local operator context export for verified managed desktop chats.
+pub mod context_export;
 /// Opt-in local operator helper for the Threadlane control-plane supervisor.
 pub mod control_runtime;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
@@ -103,6 +105,13 @@ pub use codex_setup::{
     CodexSetupState, CODEX_CONFIG_FILENAME, CODEX_SETUP_LOCK_FILENAME,
     CODEX_SETUP_RECEIPT_FILENAME, DEFAULT_NATIVE_MCP_EXECUTABLE_NAME, MAX_SETUP_PATH_BYTES,
     MAX_SETUP_RECEIPT_BYTES, THREADLANE_CLI_XDG_STATE_HOME_ENV,
+};
+pub use context_export::{
+    bootstrap_verified_operator_context, deterministic_context_filename,
+    export_verified_operator_context, ExportedOperatorContext, ExportedPrivateContextStoresV1,
+    ExportedPrivateContextV1, OperatorContextBootstrap, OperatorContextExportRequest,
+    OperatorContextServerConfig, CONTEXT_ROUTER_BINARY_NAME, OPERATOR_CONTEXTS_DIR_NAME,
+    OPERATOR_CONTEXT_SCHEMA_VERSION, TRUSTED_LOCAL_OPERATOR_ROUTE,
 };
 pub use control_runtime::{
     build_control_runtime_serve_args, ensure_control_runtime,

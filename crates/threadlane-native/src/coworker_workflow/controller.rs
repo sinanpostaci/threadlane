@@ -47,7 +47,7 @@ use threadlane_workers::{
     resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
     DEFAULT_GIT_COMMAND_TIMEOUT_MS,
 };
-use threadlane_workflow::{ToolAdapter, WorkflowRole};
+use threadlane_workflow::WorkflowRole;
 
 use crate::conversation_change::ConversationChangeStore;
 use crate::error::{NativeError, NativeErrorCode};
@@ -1646,6 +1646,7 @@ impl CoworkerControllerService {
                 }
 
                 let evidence = extract_verified_ready_for_review_evidence(
+                    &self.sessions_dir,
                     approval,
                     approved_task,
                     &task.selected_choice,
@@ -1684,7 +1685,7 @@ impl CoworkerControllerService {
                         tree_sha: Some(evidence.tree_sha.clone()),
                         diff_digest: Some(evidence.diff_digest.clone()),
                         report_artifact_id: Some(evidence.report_artifact_id.clone()),
-                        observed_model: Some(evidence.observed_model.clone()),
+                        observed_model: evidence.observed_model.clone(),
                         observed_effort: evidence.observed_effort.clone(),
                         receipt_id: None,
                         diagnostic: None,
@@ -1721,6 +1722,9 @@ impl CoworkerControllerService {
                             execution_base_commit: evidence.execution_base_commit.clone(),
                             observed_provider: evidence.observed_provider.clone(),
                             observed_model: evidence.observed_model.clone(),
+                            codex_launch_report: evidence.codex_launch_report.clone(),
+                            codex_source_report_sha256: evidence.codex_source_report_sha256.clone(),
+                            codex_source_effect_id: None,
                             observed_effort: evidence.observed_effort.clone(),
                             committed_head_commit: Some(evidence.head_commit.clone()),
                             committed_tree_sha: Some(evidence.tree_sha.clone()),
@@ -1869,6 +1873,7 @@ impl CoworkerControllerService {
         }
 
         let evidence = extract_verified_ready_for_review_evidence(
+            &self.sessions_dir,
             approval,
             approved_task,
             &task.selected_choice,
@@ -1914,7 +1919,7 @@ impl CoworkerControllerService {
                         tree_sha: Some(evidence.tree_sha.clone()),
                         diff_digest: Some(evidence.diff_digest.clone()),
                         report_artifact_id: Some(evidence.report_artifact_id.clone()),
-                        observed_model: Some(evidence.observed_model.clone()),
+                        observed_model: evidence.observed_model.clone(),
                         observed_effort: evidence.observed_effort.clone(),
                         receipt_id: None,
                         diagnostic: None,
@@ -2008,6 +2013,9 @@ impl CoworkerControllerService {
                         execution_base_commit: evidence.execution_base_commit.clone(),
                         observed_provider: evidence.observed_provider.clone(),
                         observed_model: evidence.observed_model.clone(),
+                        codex_launch_report: evidence.codex_launch_report.clone(),
+                        codex_source_report_sha256: evidence.codex_source_report_sha256.clone(),
+                        codex_source_effect_id: None,
                         observed_effort: evidence.observed_effort.clone(),
                         committed_head_commit: Some(evidence.head_commit.clone()),
                         committed_tree_sha: Some(evidence.tree_sha.clone()),
@@ -2581,12 +2589,15 @@ struct VerifiedReadyForReviewEvidence {
     tree_sha: String,
     diff_digest: String,
     report_artifact_id: String,
-    observed_model: String,
+    observed_model: Option<String>,
+    codex_launch_report: Option<threadlane_workers::WorkerExecutionReport>,
+    codex_source_report_sha256: Option<String>,
     observed_effort: Option<String>,
     duration_ms: u64,
 }
 
 fn extract_verified_ready_for_review_evidence(
+    sessions_dir: &Path,
     approval: &ApprovalRecord,
     approved_task: &ApprovedTaskRecord,
     selected_choice: &SelectedRoleChoice,
@@ -2627,33 +2638,57 @@ fn extract_verified_ready_for_review_evidence(
         ));
     }
 
-    let observed_model = worker.observed_model.clone().ok_or_else(|| {
-        NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            format!(
-                "worker `{worker_id}` for task `{}` is missing observed_model telemetry",
-                approved_task.task_id
-            ),
-        )
-    })?;
-    if observed_model != selected_choice.model_arg || observed_model != approved_task.base_model {
+    let source_report =
+        if approved_task.provider == Some(threadlane_workers::WorkerProvider::CodexCli) {
+            Some(
+                threadlane_host::load_verified_codex_task_report(
+                    approval,
+                    &sessions_dir.join(&approval.approval_id),
+                    approved_task,
+                    worker,
+                )
+                .map_err(|e| NativeError::new(NativeErrorCode::ValidationFailed, e))?,
+            )
+        } else {
+            None
+        };
+    let codex_source_report_sha256 = source_report
+        .as_ref()
+        .map(|r| serde_json::to_vec(r).map(|bytes| sha256_hex(&bytes)))
+        .transpose()
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "failed to digest immutable worker report",
+            )
+        })?;
+    let codex_launch_report = source_report
+        .as_ref()
+        .map(|r| super::controller_policy::compact_codex_launch_report(&r.worker_report));
+    let observed_model = worker.observed_model.clone();
+    if selected_choice.model_arg != approved_task.base_model
+        || (codex_launch_report.is_none()
+            && observed_model.as_deref() != Some(approved_task.base_model.as_str()))
+        || observed_model
+            .as_deref()
+            .is_some_and(|v| v != approved_task.base_model)
+    {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
-            format!(
-                "worker `{worker_id}` observed_model `{observed_model}` does not match pinned model_arg `{}`",
-                selected_choice.model_arg
-            ),
+            "worker model evidence does not match the frozen Coder choice",
         ));
     }
-
     if let Some(ref expected_effort) = selected_choice.effort {
-        if worker.observed_effort.as_deref() != Some(expected_effort.as_str()) {
+        if (codex_launch_report.is_none()
+            && worker.observed_effort.as_deref() != Some(expected_effort.as_str()))
+            || worker
+                .observed_effort
+                .as_deref()
+                .is_some_and(|v| v != expected_effort)
+        {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
-                format!(
-                    "worker `{worker_id}` observed_effort `{:?}` does not match pinned effort `{expected_effort}`",
-                    worker.observed_effort
-                ),
+                "worker effort evidence does not match the frozen Coder choice",
             ));
         }
     }
@@ -2747,6 +2782,8 @@ fn extract_verified_ready_for_review_evidence(
         diff_digest,
         report_artifact_id,
         observed_model,
+        codex_launch_report,
+        codex_source_report_sha256,
         observed_effort: worker.observed_effort.clone(),
         duration_ms,
     })
@@ -2765,7 +2802,7 @@ fn verify_approved_task_matches_coder_choice(
             ),
         ));
     }
-    if approved_task.adapter == ToolAdapter::CodexCli || approved_task.provider.is_none() {
+    if !approved_task.is_frozen_headless_worker() {
         return Err(NativeError::new(
             NativeErrorCode::UnsupportedCapability,
             format!(

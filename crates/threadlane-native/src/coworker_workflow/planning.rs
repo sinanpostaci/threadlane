@@ -1390,7 +1390,7 @@ impl PersistedPlanningCallArtifact {
                     response_error: None,
                 };
                 structured_exec
-                    .validate_verified_response(self.max_output_bytes_per_call)
+                    .validate_persisted_verified_response(self.max_output_bytes_per_call)
                     .map_err(|_| {
                         NativeError::new(
                             NativeErrorCode::ProtocolError,
@@ -1490,7 +1490,7 @@ impl PersistedPlanningCallArtifact {
                     response_error: None,
                 };
                 structured_exec
-                    .validate_verified_response(self.max_output_bytes_per_call)
+                    .validate_persisted_verified_response(self.max_output_bytes_per_call)
                     .map_err(|_| {
                         NativeError::new(
                             NativeErrorCode::ProtocolError,

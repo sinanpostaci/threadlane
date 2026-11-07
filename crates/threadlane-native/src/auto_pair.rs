@@ -14,6 +14,10 @@ use threadlane_core::observation::VerifiedMcpObservationContext;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::context_export::{
+    bootstrap_verified_operator_context, OperatorContextBootstrap, OperatorContextExportRequest,
+    OperatorContextServerConfig,
+};
 use crate::fs_safety::constant_time_str_eq;
 use crate::{
     ensure_control_runtime, verify_thread_hint_candidate, ConnectionIdentity, NativeClient,
@@ -86,6 +90,7 @@ pub(crate) struct AutomaticPairingResult {
     binding_created: bool,
     conversation_role: &'static str,
     native_per_call_identity_verified: bool,
+    operator_context: OperatorContextBootstrap,
 }
 
 pub(crate) fn parse_thread_hint(value: Option<&str>) -> Result<String, NativeError> {
@@ -478,12 +483,13 @@ impl AutomaticPairing {
             .cloned()
     }
 
-    pub(crate) async fn connect(
+    pub(crate) async fn connect_with_context_config(
         &self,
         hint: String,
         state_dir: &Path,
         store: &PairingStore,
         identity: &ConnectionIdentity,
+        context_config: OperatorContextServerConfig<'_>,
     ) -> Result<AutomaticPairingResult, NativeError> {
         let operation = async {
             let _guard = self.coordinator.lock().await;
@@ -540,7 +546,7 @@ impl AutomaticPairing {
                     "Cannot locate the Threadlane package",
                 )
             })?;
-            let executable = own_exe
+            let default_executable = own_exe
                 .parent()
                 .ok_or_else(|| {
                     NativeError::new(
@@ -549,6 +555,14 @@ impl AutomaticPairing {
                     )
                 })?
                 .join("threadlane");
+            let executable = match context_config
+                .sibling_anchor_exe
+                .and_then(Path::parent)
+                .map(|dir| dir.join("threadlane"))
+            {
+                Some(candidate) if candidate.exists() => candidate,
+                _ => default_executable,
+            };
             ensure_control_runtime(state_dir, &executable, Duration::from_secs(5)).await?;
             let supervisor = SupervisorClient::from_state_dir(state_dir).map_err(|_| {
                 NativeError::new(
@@ -627,6 +641,13 @@ impl AutomaticPairing {
                 reconnect,
                 backend_pid,
             );
+            let operator_context =
+                bootstrap_verified_operator_context(&OperatorContextExportRequest {
+                    binding_id: &enrolled.binding_id,
+                    thread_uuid: &enrolled.thread_id,
+                    verified_project_root: &verified_cwd,
+                    server_config: context_config,
+                });
             Ok(AutomaticPairingResult {
                 connected: true,
                 binding_id: enrolled.binding_id,
@@ -634,6 +655,7 @@ impl AutomaticPairing {
                 binding_created: binding.created,
                 conversation_role: "coworker",
                 native_per_call_identity_verified: false,
+                operator_context,
             })
         };
         tokio::time::timeout(Duration::from_secs(25), operation)
@@ -774,10 +796,27 @@ mod tests {
             binding_created: true,
             conversation_role: "coworker",
             native_per_call_identity_verified: false,
+            operator_context: OperatorContextBootstrap::unavailable(&NativeError::new(
+                NativeErrorCode::NotConfigured,
+                "not configured in unit test",
+            )),
         })
         .expect("serialize AutomaticPairingResult");
         assert_eq!(result_json["conversation_role"], "coworker");
         assert_eq!(result_json["native_per_call_identity_verified"], false);
+        assert_eq!(result_json["operator_context"]["available"], false);
+        assert_eq!(
+            result_json["operator_context"]["route"],
+            "trusted_local_operator"
+        );
+        assert_eq!(
+            result_json["operator_context"]["native_per_call_identity_verified"],
+            false
+        );
+        assert_eq!(
+            result_json["operator_context"]["human_approval_verified"],
+            false
+        );
     }
 
     #[tokio::test]

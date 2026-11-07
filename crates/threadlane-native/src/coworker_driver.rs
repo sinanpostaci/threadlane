@@ -4814,7 +4814,7 @@ impl CoworkerCodeDriver {
                 .map(|a| a.task_worktree_id.clone())
                 .or_else(|| latest_attempt.and_then(|a| a.task_worktree_id.clone()));
             let observed_model = artifact
-                .map(|a| a.observed_model.clone())
+                .and_then(|a| a.observed_model.clone())
                 .or_else(|| latest_attempt.and_then(|a| a.observed_model.clone()));
             let observed_effort = artifact
                 .and_then(|a| a.observed_effort.clone())

@@ -3465,6 +3465,8 @@ exit 0
         task_worktree_id: pred_task_manifest.worktree_id.clone(),
         policy: ReviewPolicyBinding {
             policy_id: "prof_root".to_string(),
+            codex_launch_report: None,
+            codex_source_report_sha256: None,
             requested_provider: Some("antigravity".to_string()),
             requested_model: Some("gemini-4-argon-high".to_string()),
             requested_effort: Some("high".to_string()),

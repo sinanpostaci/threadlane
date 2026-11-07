@@ -658,7 +658,7 @@ fn validate_task_files_profile_paths(
 ) -> Result<(), Error> {
     if !matches!(
         provider,
-        WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2
+        WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 | WorkerProvider::CodexCli
     ) {
         return Err(Error::InvalidConfig(format!(
             "profile `{profile_id}`: `file_permissions: \"task_files\"` is only supported for providers `antigravity` and `opencode_v2`"
@@ -1619,7 +1619,18 @@ fn write_private_report_artifact(
 
     // Never persist raw prompt argv in the local report artifact.
     let mut sanitized_report = report.clone();
-    sanitized_report.worker_report.constructed_argv.clear();
+    if report.worker_report.provider == WorkerProvider::CodexCli
+        && report
+            .worker_report
+            .has_pinned_codex_task_files_launch_config()
+    {
+        // Retain the finite preventive permission/model pins, never the private prompt.
+        if let Some(prompt) = sanitized_report.worker_report.constructed_argv.last_mut() {
+            *prompt = "[redacted task instruction]".to_string();
+        }
+    } else {
+        sanitized_report.worker_report.constructed_argv.clear();
+    }
 
     let payload = serde_json::to_vec(&sanitized_report).ok()?;
     if payload.len() > MAX_LOCAL_REPORT_ARTIFACT_BYTES {
@@ -1725,6 +1736,7 @@ mod tests {
 
         let worker_report = WorkerExecutionReport {
             progress_watchdog: None,
+            executed_executable: None,
             provider: WorkerProvider::OpenCodeV2,
             requested_model: ResolvedModelTarget {
                 base_model: "opencode-go/deepseek-v4.1-flash".to_string(),
@@ -1775,6 +1787,7 @@ mod tests {
                 },
                 observed_session_id: Some("ses_owned_001".to_string()),
                 observed_usage: None,
+                codex_turn_lifecycle: None,
                 provider_errors: Vec::new(),
                 recoverable_step_errors_count: 0,
                 blocked_events: Vec::new(),

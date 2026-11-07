@@ -9,7 +9,7 @@
 //!
 //! ## Key Boundaries and Invariants
 //!
-//! - **Explicit trusted inputs**: Provider (`antigravity`, `opencode_v2`, or read-only advisory
+//! - **Explicit trusted inputs**: Provider (`antigravity`, `opencode_v2`, or scoped-task/read-only
 //!   `codex_cli`), absolute non-symlink executable path, exact requested model and effort/variant,
 //!   canonical repository path, base commit, private work area, and allowed repository-relative
 //!   write paths are validated before launch.
@@ -112,17 +112,24 @@ pub use opencode_metadata::{
 pub use permissions::{
     build_antigravity_read_only_settings, build_antigravity_read_only_settings_json,
     build_antigravity_task_files_settings_json,
-    build_antigravity_task_files_settings_json_for_scopes, build_opencode_config_content,
-    build_opencode_config_content_json, evaluate_antigravity_settings, evaluate_opencode_rules,
-    is_unsafe_permission_pattern_char, validate_advisory_provider_and_mode,
-    validate_advisory_read_only_workdir, validate_codex_advisory_workdir,
-    validate_permission_pattern_path, validate_permission_pattern_str, AntigravityPermissionsBlock,
-    AntigravitySessionSettings, OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject,
-    OpenCodePermissionRule, OpenCodeRuleEffect, WorkerFilePermissions,
-    AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS, AGY_PROTECTED_READ_DENY_PATTERNS,
-    AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS, CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN,
-    CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH, CODEX_ADVISORY_MAX_WORKDIR_DEPTH,
-    CODEX_ADVISORY_MAX_WORKDIR_ENTRIES, CODEX_PROJECT_CONFIG_MARKERS, MAX_OPENCODE_CONFIG_BYTES,
+    build_antigravity_task_files_settings_json_for_scopes,
+    build_codex_task_files_permission_profile_config,
+    build_codex_task_files_permission_profile_config_for_scopes, build_opencode_config_content,
+    build_opencode_config_content_json, evaluate_antigravity_settings,
+    evaluate_codex_task_files_permission_profile_config, evaluate_opencode_rules,
+    is_unsafe_codex_toml_scope_char, is_unsafe_permission_pattern_char,
+    parse_and_validate_codex_task_files_permission_profile_config,
+    validate_advisory_provider_and_mode, validate_advisory_read_only_workdir,
+    validate_codex_advisory_workdir, validate_codex_task_files_scope_str,
+    validate_codex_task_files_workdir, validate_permission_pattern_path,
+    validate_permission_pattern_str, AntigravityPermissionsBlock, AntigravitySessionSettings,
+    OpenCodeAgentConfig, OpenCodeConfigContent, OpenCodeModelObject, OpenCodePermissionRule,
+    OpenCodeRuleEffect, WorkerFilePermissions, AGY_DENIED_EXECUTION_AND_DELEGATION_TOOLS,
+    AGY_PROTECTED_READ_DENY_PATTERNS, AGY_READ_PERMISSION_TOOL, AGY_WRITE_PERMISSION_TOOLS,
+    CODEX_ADVISORY_GLOB_SCAN_DEPTH_MARGIN, CODEX_ADVISORY_GLOB_SCAN_MAX_DEPTH,
+    CODEX_ADVISORY_MAX_WORKDIR_DEPTH, CODEX_ADVISORY_MAX_WORKDIR_ENTRIES,
+    CODEX_PROJECT_CONFIG_MARKERS, CODEX_TASK_FILES_PERMISSION_PROFILE_NAME,
+    CODEX_TASK_FILES_PROTECTED_DENY_PATTERNS, MAX_OPENCODE_CONFIG_BYTES,
     MAX_TASK_FILES_SETTINGS_BYTES, MAX_TASK_FILES_WRITE_PATHS, OPENCODE_CONFIG_ENV_VAR,
     OPENCODE_DEFAULT_AGENT, OPENCODE_PINNED_AGENTS, OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS,
     OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
@@ -133,8 +140,9 @@ pub use progress_watchdog::{
 };
 pub use spec::resolve_model_target;
 pub use spec::{
-    is_control_config_path, is_path_allowed, is_path_allowed_by_scopes, is_path_allowed_syntactic,
-    is_pinned_codex_read_only_argv, validate_commit_ref, validate_repo_relative_path,
+    extract_pinned_codex_task_files_write_scopes, is_control_config_path, is_path_allowed,
+    is_path_allowed_by_scopes, is_path_allowed_syntactic, is_pinned_codex_read_only_argv,
+    is_pinned_codex_task_files_argv, validate_commit_ref, validate_repo_relative_path,
     validate_simple_identifier, AdvisorySpecValidationReport, AdvisoryWorkerSpec, ExecutionBudgets,
     ResolvedModelTarget, SpecValidationReport, WorkerPolicy, WorkerProvider, WorkerSpec,
     WriteScopeKind, CODEX_ADVISORY_DISABLED_FEATURES, CODEX_ADVISORY_PERMISSION_PROFILE_CONFIG,
@@ -144,9 +152,9 @@ pub use spec::{
     MAX_STDOUT_BYTES, MAX_TIMEOUT_MS,
 };
 pub use stream::{
-    BlockedEvidence, BlockedKind, EffortEvidenceSource, FieldEvidence, MalformedLineDiagnostic,
-    NdjsonStreamParser, NormalizedEventKind, NormalizedWorkerEvent, ProviderErrorEvidence,
-    StreamEvidenceSummary, StreamTokenUsage,
+    BlockedEvidence, BlockedKind, CodexTurnLifecycleEvidence, EffortEvidenceSource, FieldEvidence,
+    MalformedLineDiagnostic, NdjsonStreamParser, NormalizedEventKind, NormalizedWorkerEvent,
+    ProviderErrorEvidence, StreamEvidenceSummary, StreamTokenUsage,
 };
 pub use supervisor::{
     is_process_alive, is_process_group_alive, run_advisory_worker, run_advisory_worker_with_cancel,

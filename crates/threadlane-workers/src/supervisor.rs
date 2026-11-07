@@ -24,8 +24,8 @@ use crate::opencode_metadata::{
 };
 use crate::progress_watchdog::{ProgressWatchdog, ProgressWatchdogSnapshot};
 use crate::spec::{
-    is_pinned_codex_read_only_argv, AdvisoryWorkerSpec, ExecutionBudgets, ResolvedModelTarget,
-    WorkerProvider, WorkerSpec,
+    is_pinned_codex_read_only_argv, is_pinned_codex_task_files_argv, AdvisoryWorkerSpec,
+    ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec,
 };
 use crate::stream::{
     FieldEvidence, NdjsonStreamParser, NormalizedEventKind, NormalizedWorkerEvent,
@@ -134,6 +134,9 @@ impl WorkerRunStatus {
 pub struct WorkerExecutionReport {
     /// Provider executed.
     pub provider: WorkerProvider,
+    /// Canonical executable actually selected for the supervised launch (absent in legacy reports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_executable: Option<PathBuf>,
     /// Requested model and effort/variant target.
     pub requested_model: ResolvedModelTarget,
     /// Requested session ID, if any.
@@ -332,9 +335,19 @@ impl WorkerExecutionReport {
     ///
     /// Because Codex CLI `exec --json` does not emit runtime model or reasoning-effort telemetry
     /// in its JSONL event stream, this launch-pinned configuration check provides requested-only
-    /// launch evidence for `CodexCli` without fabricating `effective_observed_model()` or
-    /// `effective_observed_effort()` and without relaxing strict observed evidence rules for
-    /// [`WorkerProvider::Antigravity`] or [`WorkerProvider::OpenCodeV2`].
+    /// Returns `true` if `self` is a [`WorkerProvider::CodexCli`] run whose constructed launch
+    /// argument vector matches the exact read-only advisory launch configuration pinned to
+    /// `self.requested_model` (`--no-daemon exec --json --ephemeral --ignore-user-config --model`,
+    /// `-c` overrides for `model_reasoning_effort`, `approval_policy="never"`,
+    /// `model_provider="openai"`, `default_permissions="threadlane-advisory"`,
+    /// `permissions.threadlane-advisory={...}`, `web_search="disabled"`, and all disabled feature
+    /// flags).
+    ///
+    /// Note: `codex exec --json` does not emit runtime model or effort strings in its JSONL event
+    /// stream. This helper exposes the verified launch-configuration pin separately from stream
+    /// observations so callers can verify launch evidence for `CodexCli` without fabricating
+    /// `effective_observed_model()` or `effective_observed_effort()` and without relaxing strict
+    /// observed evidence rules for [`WorkerProvider::Antigravity`] or [`WorkerProvider::OpenCodeV2`].
     #[must_use]
     pub fn has_pinned_codex_read_only_launch_config(&self) -> bool {
         self.provider == WorkerProvider::CodexCli
@@ -345,9 +358,54 @@ impl WorkerExecutionReport {
             && is_pinned_codex_read_only_argv(&self.constructed_argv, &self.requested_model)
     }
 
+    /// Returns `true` if `self` is a [`WorkerProvider::CodexCli`] mutable task-worktree run whose
+    /// constructed launch argument vector matches the exact `TaskFiles` launch configuration
+    /// pinned to `self.requested_model` (`--no-daemon exec --json --ephemeral --ignore-user-config --model`,
+    /// `-c` overrides for `model_reasoning_effort`, `approval_policy="never"`,
+    /// `model_provider="openai"`, `default_permissions="threadlane-task-files"`, a validated
+    /// `permissions.threadlane-task-files={...}` inline profile with finite write scopes and all
+    /// protected deny rules, `web_search="disabled"`, and all disabled feature flags).
+    ///
+    /// Like [`Self::has_pinned_codex_read_only_launch_config`], this verifies the exact launch pin
+    /// separately from runtime stream observations (`effective_observed_model()` and
+    /// `effective_observed_effort()` remain `None` when absent from the JSONL stream).
+    #[must_use]
+    pub fn has_pinned_codex_task_files_launch_config(&self) -> bool {
+        self.provider == WorkerProvider::CodexCli
+            && self.requested_session_id.is_none()
+            && self.allocated_session_id.is_none()
+            && self.opencode_metadata.is_none()
+            && self.opencode_metadata_error.is_none()
+            && is_pinned_codex_task_files_argv(&self.constructed_argv, &self.requested_model)
+    }
+
+    /// Returns `true` if `self` has a verified [`WorkerProvider::CodexCli`] launch-configuration
+    /// pin (either read-only advisory `threadlane-advisory` or mutable task-files
+    /// `threadlane-task-files`).
+    #[must_use]
+    pub fn has_pinned_codex_launch_config(&self) -> bool {
+        self.has_pinned_codex_read_only_launch_config()
+            || self.has_pinned_codex_task_files_launch_config()
+    }
+
+    /// Returns the explicit launch-pin evidence label when `self` is a launch-pinned
+    /// [`WorkerProvider::CodexCli`] run (`"codex_read_only_launch_pin"` or
+    /// `"codex_task_files_launch_pin"`), or `None` otherwise.
+    #[must_use]
+    pub fn codex_launch_pin_evidence_mode(&self) -> Option<&'static str> {
+        if self.has_pinned_codex_read_only_launch_config() {
+            Some("codex_read_only_launch_pin")
+        } else if self.has_pinned_codex_task_files_launch_config() {
+            Some("codex_task_files_launch_pin")
+        } else {
+            None
+        }
+    }
+
     /// Returns `true` if model evidence is satisfied by the stream, by validated OpenCode v2
-    /// session metadata, or (for [`WorkerProvider::CodexCli`] read-only advisory runs) by an
-    /// exact pinned launch configuration without any stream model conflict.
+    /// session metadata, or (for [`WorkerProvider::CodexCli`] runs) by an exact pinned launch
+    /// configuration (`threadlane-advisory` or `threadlane-task-files`) without any stream model
+    /// conflict.
     pub fn has_satisfied_model_evidence(&self) -> bool {
         if matches!(self.evidence.model_evidence, FieldEvidence::Mismatch { .. })
             || matches!(
@@ -378,14 +436,15 @@ impl WorkerExecutionReport {
             return true;
         }
         if self.provider == WorkerProvider::CodexCli {
-            return self.has_pinned_codex_read_only_launch_config();
+            return self.has_pinned_codex_launch_config();
         }
         self.validated_opencode_metadata().is_some()
     }
 
     /// Returns `true` if effort/variant evidence is satisfied by the stream, by validated
-    /// OpenCode v2 session metadata, or (for [`WorkerProvider::CodexCli`] read-only advisory
-    /// runs) by an exact pinned launch configuration without any stream effort conflict.
+    /// OpenCode v2 session metadata, or (for [`WorkerProvider::CodexCli`] runs) by an exact
+    /// pinned launch configuration (`threadlane-advisory` or `threadlane-task-files`) without any
+    /// stream effort conflict.
     pub fn has_satisfied_effort_evidence(&self) -> bool {
         if matches!(
             self.evidence.effort_evidence,
@@ -427,7 +486,7 @@ impl WorkerExecutionReport {
             return true;
         }
         if self.provider == WorkerProvider::CodexCli {
-            return self.has_pinned_codex_read_only_launch_config();
+            return self.has_pinned_codex_launch_config();
         }
         self.validated_opencode_metadata().is_some()
     }
@@ -442,7 +501,13 @@ impl WorkerExecutionReport {
             return false;
         }
         if self.provider == WorkerProvider::CodexCli
-            && (!self.evidence.saw_init_event || self.evidence.observed_session_id.is_none())
+            && (!self.evidence.saw_init_event
+                || self.evidence.observed_session_id.is_none()
+                || !self
+                    .evidence
+                    .codex_turn_lifecycle
+                    .as_ref()
+                    .is_some_and(|lc| lc.thread_started_count == 1))
         {
             return false;
         }
@@ -464,6 +529,11 @@ impl WorkerExecutionReport {
     pub fn has_satisfied_result_evidence(&self) -> bool {
         if self.validated_opencode_metadata().is_some() {
             return true;
+        }
+        if self.provider == WorkerProvider::CodexCli
+            && !self.evidence.has_valid_codex_turn_lifecycle()
+        {
+            return false;
         }
         self.evidence.saw_result_event
             && self.status != WorkerRunStatus::MissingResultEvidence
@@ -491,11 +561,48 @@ impl WorkerExecutionReport {
             && matches!(self.evidence.effort_evidence, FieldEvidence::Missing { .. })
     }
 
+    /// Checks historical read-only Codex advisory completion for persisted artifact validation.
+    ///
+    /// This compatibility predicate requires the exact read-only launch pin and the absence of
+    /// both current execution markers (`executed_executable` and `codex_turn_lifecycle`). It
+    /// preserves clean process, model/effort, session and terminal-result checks without inventing
+    /// lifecycle or observed telemetry. It never admits mutable `TaskFiles` launches. Callers
+    /// must establish persisted artifact integrity separately and must not use this predicate to
+    /// collect fresh execution evidence; current runs require
+    /// [`Self::has_complete_natural_completion_evidence`].
+    #[must_use]
+    pub fn has_complete_legacy_codex_advisory_evidence(&self) -> bool {
+        self.executed_executable.is_none()
+            && self.evidence.codex_turn_lifecycle.is_none()
+            && self.has_pinned_codex_read_only_launch_config()
+            && self.status == WorkerRunStatus::Succeeded
+            && self.exit_code == Some(0)
+            && self.signal.is_none()
+            && !self.cleanup_incomplete
+            && self.overflow.is_none()
+            && self.evidence.blocked_events.is_empty()
+            && self.evidence.provider_errors.is_empty()
+            && self.evidence.malformed_lines_count == 0
+            && !matches!(self.evidence.model_evidence, FieldEvidence::Mismatch { .. })
+            && !matches!(
+                self.evidence.effort_evidence,
+                FieldEvidence::Mismatch { .. }
+            )
+            && self.evidence.saw_init_event
+            && self
+                .evidence
+                .observed_session_id
+                .as_deref()
+                .is_some_and(|id| !id.trim().is_empty())
+            && self.evidence.session_evidence.is_satisfied()
+            && self.evidence.saw_result_event
+    }
+
     /// Returns `true` if the worker exited 0 cleanly without timeout, overflow, cleanup issues,
     /// blocked events, provider errors, malformed lines, or metadata errors, and has complete
     /// model, effort, session, and completion evidence from the stream, from validated
     /// OpenCode v2 session metadata on an owned session run, or from a launch-pinned
-    /// [`WorkerProvider::CodexCli`] read-only advisory run with verified thread and turn
+    /// [`WorkerProvider::CodexCli`] scoped-task or read-only advisory run with verified thread and turn
     /// completion evidence.
     pub fn has_complete_natural_completion_evidence(&self) -> bool {
         if self.exit_code != Some(0)
@@ -512,7 +619,8 @@ impl WorkerExecutionReport {
         }
 
         if self.provider == WorkerProvider::CodexCli {
-            return self.has_pinned_codex_read_only_launch_config()
+            return self.status == WorkerRunStatus::Succeeded
+                && self.has_pinned_codex_launch_config()
                 && !matches!(self.evidence.model_evidence, FieldEvidence::Mismatch { .. })
                 && !matches!(
                     self.evidence.effort_evidence,
@@ -521,7 +629,8 @@ impl WorkerExecutionReport {
                 && self.evidence.saw_init_event
                 && self.evidence.observed_session_id.is_some()
                 && self.evidence.session_evidence.is_satisfied()
-                && self.evidence.saw_result_event;
+                && self.evidence.saw_result_event
+                && self.evidence.has_valid_codex_turn_lifecycle();
         }
 
         let stream_complete = self.evidence.model_evidence.is_satisfied()
@@ -1137,6 +1246,7 @@ where
                     return Ok((
                         WorkerExecutionReport {
                             provider,
+                            executed_executable: Some(canonical_executable.clone()),
                             requested_model: resolved_model,
                             requested_session_id,
                             allocated_session_id,
@@ -1190,6 +1300,7 @@ where
                 return Ok((
                     WorkerExecutionReport {
                         provider,
+                        executed_executable: Some(canonical_executable.clone()),
                         requested_model: resolved_model,
                         requested_session_id,
                         allocated_session_id: None,
@@ -1525,6 +1636,7 @@ where
     Ok((
         WorkerExecutionReport {
             provider,
+            executed_executable: Some(canonical_executable.clone()),
             requested_model: resolved_model,
             requested_session_id,
             allocated_session_id,
@@ -1920,10 +2032,18 @@ fn classify_run_status(
         return WorkerRunStatus::SessionMismatch;
     }
     if provider == WorkerProvider::CodexCli {
-        if !is_pinned_codex_read_only_argv(constructed_argv, resolved_model) {
+        if !(is_pinned_codex_read_only_argv(constructed_argv, resolved_model)
+            || is_pinned_codex_task_files_argv(constructed_argv, resolved_model))
+        {
             return WorkerRunStatus::MissingModelEvidence;
         }
-        if !evidence.saw_result_event {
+        if !evidence.saw_result_event || !evidence.has_valid_codex_turn_lifecycle() {
+            if !evidence.saw_init_event
+                || evidence.observed_session_id.is_none()
+                || !evidence.session_evidence.is_satisfied()
+            {
+                return WorkerRunStatus::SessionMismatch;
+            }
             return WorkerRunStatus::MissingResultEvidence;
         }
         if !evidence.saw_init_event
@@ -2036,6 +2156,7 @@ mod tests {
         );
         WorkerExecutionReport {
             provider: WorkerProvider::OpenCodeV2,
+            executed_executable: None,
             requested_model: target,
             requested_session_id: None,
             allocated_session_id: Some("ses_owned_123".to_string()),

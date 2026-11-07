@@ -47,9 +47,24 @@ a separate explicit action.
 ## Commands
 
 All paths must be absolute and normalized. The four store directories must be
-canonical, private, pairwise distinct and non-overlapping.
+canonical, private, pairwise distinct and non-overlapping. Store flags
+(`--state-dir`, `--registry-dir`, `--plans-dir`, `--authority-dir`) and optional
+paired fixed-scope flags (`--binding`, `--thread`, and optional `--project-root`)
+are accepted either before or after the subcommand. When routed through
+`threadlane-context --context <ABS_PRIVATE_JSON> approve <prepare|record> ...`,
+the context router always supplies the four bound stores plus `--binding`,
+`--thread`, and `--project-root` from the verified context, and `threadlane-approve`
+enforces those fixed values against the decoded `OperatorApprovalIntent` or
+`OperatorApprovalRequest` (`binding_id`, `thread_uuid`, `--confirm-thread`, and
+`repository_path`) before any ledger effect so request-file replacement cannot
+route a different chat or repository through a checked context.
 
 ```sh
+# Via context router (recommended when operator_context is available):
+threadlane-context --context /absolute/private/context.json \
+  approve prepare --request /absolute/private/intent.json
+
+# Direct unscoped legacy invocation:
 threadlane-approve prepare \
   --state-dir /absolute/private/runtime \
   --registry-dir /absolute/private/registry \

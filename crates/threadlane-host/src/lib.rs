@@ -55,7 +55,7 @@ pub use cli::{
 pub use client::ApprovedHostClient;
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
-pub use lifecycle::project_task_lifecycle;
+pub use lifecycle::{load_verified_codex_task_report, project_task_lifecycle};
 pub use storage::{
     derive_ack_command_key, derive_cancel_command_key, ensure_fresh_session_dir_locked,
     ensure_no_symlink_components, ensure_private_dir,
@@ -4845,6 +4845,8 @@ exit 0
 
         let policy = ReviewPolicyBinding {
             policy_id: format!("policy-{}", task_snap.task_id),
+            codex_launch_report: None,
+            codex_source_report_sha256: None,
             requested_provider: Some(provider.as_str().to_string()),
             requested_model: Some(worker_snap.requested_model.clone()),
             requested_effort: Some(worker_snap.requested_effort.clone()),
@@ -7066,6 +7068,8 @@ exit 0
 
         let policy = ReviewPolicyBinding {
             policy_id: "policy-task-root-agy".to_string(),
+            codex_launch_report: None,
+            codex_source_report_sha256: None,
             requested_provider: Some("antigravity".to_string()),
             requested_model: Some(worker_snap.requested_model.clone()),
             requested_effort: Some(worker_snap.requested_effort.clone()),
@@ -7397,6 +7401,8 @@ exit 0
 
         let policy = ReviewPolicyBinding {
             policy_id: "policy-task-a".to_string(),
+            codex_launch_report: None,
+            codex_source_report_sha256: None,
             requested_provider: Some("antigravity".to_string()),
             requested_model: Some(worker_snap.requested_model.clone()),
             requested_effort: Some(worker_snap.requested_effort.clone()),

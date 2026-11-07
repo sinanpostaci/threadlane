@@ -545,6 +545,8 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("threadlane-context"));
         assert!(stdout.contains("--context <ABS_PRIVATE_JSON>"));
+        assert!(stdout.contains("approve <APPROVE_ARGS>..."));
+        assert!(stdout.contains("help approve"));
         assert!(stdout.contains("advice <ADVICE_ARGS>..."));
         assert!(stdout.contains("help advice"));
     }
@@ -564,8 +566,8 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
     let missing_ctx = run_bin(bin, &["check"]).await;
     assert_error_code(&missing_ctx, "invalid_input");
 
-    // Unsupported command families (approve, host, operator) must be rejected without pass-through.
-    for family in ["approve", "host", "operator", "unknown-family"] {
+    // Unsupported command families (host, operator) must be rejected without pass-through.
+    for family in ["host", "operator", "unknown-family"] {
         let out = run_bin(
             bin,
             &["--context", "/tmp/nonexistent.json", family, "status"],
@@ -574,7 +576,7 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
         assert_error_code(&out, "invalid_input");
     }
 
-    // Extra arguments after `check` or missing arguments after `workflow`/`session`/`flow`/`advice`.
+    // Extra arguments after `check` or missing arguments after `workflow`/`session`/`flow`/`approve`/`advice`.
     let extra_check = run_bin(
         bin,
         &[
@@ -595,6 +597,9 @@ async fn outer_help_and_version_succeed_without_context_or_runtime_and_invalid_s
 
     let empty_flow = run_bin(bin, &["--context", "/tmp/nonexistent.json", "flow"]).await;
     assert_error_code(&empty_flow, "invalid_input");
+
+    let empty_approve = run_bin(bin, &["--context", "/tmp/nonexistent.json", "approve"]).await;
+    assert_error_code(&empty_approve, "invalid_input");
 
     let empty_advice = run_bin(bin, &["--context", "/tmp/nonexistent.json", "advice"]).await;
     assert_error_code(&empty_advice, "invalid_input");
@@ -768,22 +773,26 @@ async fn family_help_rejects_invalid_forms_before_child_and_preserves_sibling_re
 
     let invalid_help_forms: &[&[&str]] = &[
         &["help", "check"],
-        &["help", "approve"],
         &["help", "host"],
         &["help", "operator"],
         &["help", "unknown-family"],
         &["help", "workflow=ignored"],
+        &["help", "approve=ignored"],
         &["help", "--help"],
         &["help", "-h"],
         &["help", "workflow", "extra"],
+        &["help", "approve", "extra"],
         &["help", "workflow", SECRET_SENTINEL],
         &["help", "session", "--help"],
+        &["help", "approve", "--help"],
         &["help", "workflow", "--help"],
         &["help", "workflow", "--state-dir=/tmp/other"],
+        &["help", "approve", "--state-dir=/tmp/other"],
         &["help", "session", "--thread", OTHER_THREAD_UUID],
         &["help", "--context", ctx_str],
         &["help", ctx_eq.as_str()],
         &["--context", ctx_str, "help", "workflow"],
+        &["--context", ctx_str, "help", "approve"],
         &[ctx_eq.as_str(), "help", "session"],
     ];
     for args in invalid_help_forms {
@@ -2831,6 +2840,571 @@ async fn missing_or_unsafe_sibling_and_child_help_failure_and_signal_outcome_unk
         1,
         "signal-terminated child must be invoked exactly once without replay"
     );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn offline_approve_help_and_approve_forwarding_with_scope_and_protected_flag_refusals() {
+    let mut fixture = ContextFixture::start().await;
+    let ctx_path = fixture.write_private_context(
+        "approve-forward-context.json",
+        &fixture.valid_context_json(),
+    );
+    let ctx_str = ctx_path.to_str().expect("utf8 context path");
+
+    let hostile_dir = fixture.root.join("hostile-approve-path-bin");
+    fs::create_dir_all(&hostile_dir).expect("create hostile approve PATH directory");
+    fs::set_permissions(&hostile_dir, fs::Permissions::from_mode(0o755))
+        .expect("chmod hostile approve PATH directory 0755");
+    let hostile_marker = fixture.root.join("hostile-approve-child.marker");
+    let hostile_script = format!(
+        "#!/bin/sh\nprintf 'hostile-path' > \"{}\"\nexit 0\n",
+        hostile_marker.display()
+    );
+    write_executable_script(&hostile_dir, "threadlane-approve", &hostile_script, 0o755);
+    let hostile_path = hostile_dir
+        .to_str()
+        .expect("utf8 hostile approve PATH directory");
+
+    // Missing package `threadlane-approve` sibling fails closed with `not_configured` without PATH fallback.
+    let missing_help =
+        run_bin_with_path(&fixture.context_bin, &["help", "approve"], hostile_path).await;
+    assert_error_code(&missing_help, "not_configured");
+    assert!(!hostile_marker.exists());
+
+    let approve_marker = fixture.root.join("approve-forward-argv.marker");
+    write_argv_recording_sibling(&fixture.pkg_bin_dir, "threadlane-approve", &approve_marker);
+
+    let inner = ["prepare", "--request", "/tmp/approve-intent.json"];
+    let mut approve_args = vec!["--context", ctx_str, "approve"];
+    approve_args.extend(inner);
+    let forward_out = run_bin_with_path(&fixture.context_bin, &approve_args, hostile_path).await;
+    assert!(
+        forward_out.status.success(),
+        "approve forwarding failed: {}",
+        String::from_utf8_lossy(&forward_out.stderr)
+    );
+    assert!(forward_out.stderr.is_empty());
+    assert!(!hostile_marker.exists());
+
+    let expected_approve_scope = vec![
+        "--state-dir".to_string(),
+        fixture.state_dir.to_string_lossy().into_owned(),
+        "--registry-dir".to_string(),
+        fixture.registry_dir.to_string_lossy().into_owned(),
+        "--plans-dir".to_string(),
+        fixture.plans_dir.to_string_lossy().into_owned(),
+        "--authority-dir".to_string(),
+        fixture.authority_dir.to_string_lossy().into_owned(),
+        "--binding".to_string(),
+        fixture.binding_id.clone(),
+        "--thread".to_string(),
+        THREAD_UUID.to_string(),
+        "--project-root".to_string(),
+        fixture.project_root.to_string_lossy().into_owned(),
+    ];
+    assert_eq!(
+        read_argv_marker(&approve_marker),
+        expected_recorded_argv(&expected_approve_scope, &inner)
+    );
+
+    // Protected overrides on `approve` are rejected before child invocation.
+    let _ = fs::remove_file(&approve_marker);
+    for bad_override in [
+        "--state-dir=/tmp/other",
+        "--authority-dir=/tmp/other",
+        "--binding=bnd_other",
+        &format!("--thread={OTHER_THREAD_UUID}"),
+        "--project-root=/tmp/other",
+    ] {
+        let out = run_bin(
+            &fixture.context_bin,
+            &[
+                "--context",
+                ctx_str,
+                "approve",
+                "prepare",
+                "--request",
+                "/tmp/approve-intent.json",
+                bad_override,
+            ],
+        )
+        .await;
+        assert_error_code(&out, "invalid_input");
+        assert!(
+            !approve_marker.exists(),
+            "protected override {bad_override} must not invoke threadlane-approve"
+        );
+    }
+
+    // Offline `help approve` succeeds after supervisor shutdown without reading context.
+    fixture.shutdown().await;
+    let help_out =
+        run_bin_with_path(&fixture.context_bin, &["help", "approve"], hostile_path).await;
+    assert!(help_out.status.success());
+    assert!(help_out.stderr.is_empty());
+    assert_eq!(
+        read_argv_marker(&approve_marker),
+        vec!["1".to_string(), "--help".to_string()]
+    );
+    assert!(!hostile_marker.exists());
+}
+
+#[tokio::test]
+async fn exported_operator_context_admits_planning_grant_and_scope_approval_with_strict_scope_guards(
+) {
+    use threadlane_native::context_export::{
+        export_verified_operator_context, OperatorContextExportRequest, OperatorContextServerConfig,
+    };
+
+    let mut fixture = ContextFixture::start().await;
+
+    // Stage the real compiled `threadlane-flow` and `threadlane-approve` sibling binaries.
+    copy_executable_atomic(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-flow")),
+        &fixture.pkg_bin_dir,
+        "threadlane-flow",
+    );
+    copy_executable_atomic(
+        Path::new(env!("CARGO_BIN_EXE_threadlane-approve")),
+        &fixture.pkg_bin_dir,
+        "threadlane-approve",
+    );
+
+    // Create a second independent chat binding in the live supervisor.
+    let sup_client =
+        SupervisorClient::from_state_dir(&fixture.state_dir).expect("connect supervisor client");
+    let binding_b = sup_client
+        .create_binding(OTHER_THREAD_UUID, "second-verified-chat")
+        .await
+        .expect("create second chat binding");
+
+    let other_project_root = fixture.root.join("other-project-repo");
+    let _other_commit = init_disposable_repo(&other_project_root);
+    fs::set_permissions(&other_project_root, fs::Permissions::from_mode(0o755))
+        .expect("chmod other_project_root 0755");
+
+    let pairing_dir = fixture.root.join("pairing-store");
+    fs::create_dir_all(&pairing_dir).expect("create pairing_dir");
+    fs::set_permissions(&pairing_dir, fs::Permissions::from_mode(0o700))
+        .expect("chmod pairing_dir 0700");
+
+    let server_cfg = OperatorContextServerConfig {
+        pairing_dir: &pairing_dir,
+        state_dir: &fixture.state_dir,
+        workflow_stores: Some((&fixture.registry_dir, &fixture.plans_dir)),
+        host_stores: Some((&fixture.authority_dir, &fixture.sessions_dir)),
+        sibling_anchor_exe: Some(&fixture.context_bin),
+    };
+
+    let export_a1 = export_verified_operator_context(&OperatorContextExportRequest {
+        binding_id: &fixture.binding_id,
+        thread_uuid: THREAD_UUID,
+        verified_project_root: &fixture.project_root,
+        server_config: server_cfg,
+    })
+    .expect("export chat A context");
+    assert!(!export_a1.reused_existing);
+
+    let export_a2 = export_verified_operator_context(&OperatorContextExportRequest {
+        binding_id: &fixture.binding_id,
+        thread_uuid: THREAD_UUID,
+        verified_project_root: &fixture.project_root,
+        server_config: server_cfg,
+    })
+    .expect("idempotent repeat export chat A context");
+    assert!(export_a2.reused_existing);
+    assert_eq!(export_a1.context_path, export_a2.context_path);
+
+    let export_b = export_verified_operator_context(&OperatorContextExportRequest {
+        binding_id: &binding_b.binding_id,
+        thread_uuid: OTHER_THREAD_UUID,
+        verified_project_root: &other_project_root,
+        server_config: server_cfg,
+    })
+    .expect("export chat B context");
+    assert_ne!(export_a1.context_path, export_b.context_path);
+
+    let ctx_a_str = export_a1.context_path.to_str().expect("utf8 ctx_a");
+
+    // 1. Prepare and record a planning grant via the exported context and `flow grant-prepare` / `grant-record`.
+    let base_commit = resolve_exact_commit_sha(
+        &fixture.project_root,
+        "HEAD",
+        DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    )
+    .expect("resolve HEAD commit");
+    let registry = RegistryStore::open(&fixture.registry_dir).expect("open registry");
+    let cur_snap = registry.snapshot().expect("registry snapshot");
+    let planning_profile_id = "profile-planning-grant";
+    let reg_snap = registry
+        .apply(
+            cur_snap.revision,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: planning_profile_id.to_string(),
+                    name: "Planning Grant Profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Orchestrator,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-deepseek-flash".to_string(),
+                                effort: Some("max".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Easy),
+                            choice: ModelChoice {
+                                model_id: "model-deepseek-flash".to_string(),
+                                effort: Some("max".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("upsert planning profile");
+
+    let prepare_grant_req = threadlane_native::coworker_grants::PreparePlanningGrantRequest {
+        request_key: "req_grant_chat_a_1".to_string(),
+        binding_id: fixture.binding_id.clone(),
+        thread_uuid: THREAD_UUID.to_string(),
+        repository_path: fixture.project_root.clone(),
+        base_commit: base_commit.clone(),
+        expected_base_tree_sha: None,
+        profile_id: planning_profile_id.to_string(),
+        expected_registry_revision: Some(reg_snap.revision),
+        roles: vec![threadlane_native::profile_flow::RolePreflightRequest {
+            role: WorkflowRole::Orchestrator,
+            difficulty: None,
+        }],
+        policy: threadlane_native::profile_flow::ExecutionPolicy {
+            schema_version: 1,
+            policy_id: "fresh-chat-policy".to_string(),
+            allow_rules: vec![threadlane_native::profile_flow::PolicyAllowRule {
+                roles: vec![WorkflowRole::Orchestrator],
+                tool_id: "tool-opencode".to_string(),
+                model_id: "model-deepseek-flash".to_string(),
+                efforts: vec!["max".to_string()],
+                allow_no_effort: false,
+            }],
+        },
+        capabilities:
+            threadlane_native::coworker_workflow::contracts::PlanningReadOnlyCapabilities::strict_read_only(),
+        budget: threadlane_native::coworker_workflow::contracts::PlanningCallBudget {
+            max_orchestrator_calls: 2,
+            max_architect_calls: 0,
+            max_total_calls: 2,
+            max_timeout_ms_per_call: 120_000,
+            max_output_bytes_per_call: 65_536,
+        },
+        created_at_ms: 1_760_000_000_000,
+        expires_at_ms: 1_760_003_600_000,
+    };
+
+    let grant_intent_path = fixture.contexts_dir.join("grant-intent.json");
+    fs::write(
+        &grant_intent_path,
+        serde_json::to_vec_pretty(&prepare_grant_req).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&grant_intent_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let grant_prep_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "flow",
+            "grant-prepare",
+            "--request",
+            grant_intent_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        grant_prep_out.status.success(),
+        "flow grant-prepare failed: {}",
+        String::from_utf8_lossy(&grant_prep_out.stderr)
+    );
+    let grant_prep_env: Value =
+        serde_json::from_slice(&grant_prep_out.stdout).expect("parse grant-prepare JSON");
+    let grant_preview: threadlane_native::coworker_grants::PlanningGrantPreview =
+        serde_json::from_value(grant_prep_env["data"].clone())
+            .expect("decode PlanningGrantPreview");
+    let grant_preview_digest = grant_preview.preview_digest.clone();
+
+    let record_grant_req = threadlane_native::coworker_grants::RecordPlanningGrantRequest {
+        // Recording confirms the prepared operation's identity as well as its digest.
+        request_key: grant_preview.request_key.clone(),
+        expected_ledger_revision: None,
+        preview: grant_preview,
+        confirmed_preview_digest: grant_preview_digest.clone(),
+        attestation: threadlane_native::coworker_grants::LocalOperatorGrantAttestation::attested(),
+    };
+    let grant_req_path = fixture.contexts_dir.join("grant-request.json");
+    fs::write(
+        &grant_req_path,
+        serde_json::to_vec_pretty(&record_grant_req).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&grant_req_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Missing `--operator-approved` on `flow grant-record` must fail with `unauthorized_operator` and record nothing.
+    let grant_missing_confirm = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "flow",
+            "grant-record",
+            "--request",
+            grant_req_path.to_str().unwrap(),
+            "--confirm-preview",
+            &grant_preview_digest,
+        ],
+    )
+    .await;
+    assert_error_code(&grant_missing_confirm, "unauthorized_operator");
+
+    // Explicit operator confirmation records the planning grant without paid inference.
+    let grant_rec_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "flow",
+            "grant-record",
+            "--request",
+            grant_req_path.to_str().unwrap(),
+            "--confirm-preview",
+            &grant_preview_digest,
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert!(
+        grant_rec_out.status.success(),
+        "flow grant-record failed: {}",
+        String::from_utf8_lossy(&grant_rec_out.stderr)
+    );
+    let grant_rec_env: Value =
+        serde_json::from_slice(&grant_rec_out.stdout).expect("parse grant-record JSON");
+    assert!(grant_rec_env["data"]["grant_id"]
+        .as_str()
+        .is_some_and(|id| id.starts_with("pgr_")));
+
+    // 2. Prepare and record an execution scope approval via `approve prepare` / `approve record`.
+    let plans = PlanStore::open(&fixture.plans_dir).expect("open plans");
+    let draft2 = plans
+        .change(
+            0, // Revisions are per plan; this plan has not been created yet.
+            PlanChange::SaveDraft {
+                plan_id: "plan-admission-fixture".to_string(),
+                binding_id: fixture.binding_id.clone(),
+                profile_id: planning_profile_id.to_string(),
+                profile_revision: reg_snap.revision,
+                summary: "Admission fixture plan".to_string(),
+                tasks: vec![PlanTask {
+                    id: "task-1".to_string(),
+                    title: "Admission task".to_string(),
+                    instruction: "Run bounded admission verification".to_string(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Easy,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/lib.rs".to_string()],
+                }],
+            },
+        )
+        .expect("save admission plan draft");
+    let plan = plans
+        .change(
+            draft2.revision,
+            PlanChange::Publish {
+                plan_id: "plan-admission-fixture".to_string(),
+                revision: draft2.revision,
+            },
+        )
+        .expect("publish admission plan");
+
+    let approve_intent_path = fixture.contexts_dir.join("approve-intent.json");
+    let approve_intent = json!({
+        "binding_id": fixture.binding_id,
+        "thread_uuid": THREAD_UUID,
+        "plan_id": plan.plan_id,
+        "plan_revision": plan.revision,
+        "expected_registry_revision": reg_snap.revision,
+        "repository_path": fixture.project_root,
+        "base_commit": base_commit,
+        "approved_task_ids": ["task-1"],
+        "approved_write_paths": ["src/lib.rs"],
+        "max_parallel": 1,
+        "budgets": ExecutionBudgets::default()
+    });
+    fs::write(
+        &approve_intent_path,
+        serde_json::to_vec_pretty(&approve_intent).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&approve_intent_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Request-file replacement with chat B's binding_id, chat B's thread_uuid, or another
+    // repository_path must be rejected by `threadlane-approve` when routed through chat A's context.
+    let mut wrong_binding_intent = approve_intent.clone();
+    wrong_binding_intent["binding_id"] = json!(binding_b.binding_id);
+    let wrong_binding_path = fixture.contexts_dir.join("approve-wrong-binding.json");
+    fs::write(
+        &wrong_binding_path,
+        serde_json::to_vec_pretty(&wrong_binding_intent).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&wrong_binding_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let wrong_binding_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "approve",
+            "prepare",
+            "--request",
+            wrong_binding_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_error_code(&wrong_binding_out, "binding_mismatch");
+
+    let mut wrong_thread_intent = approve_intent.clone();
+    wrong_thread_intent["thread_uuid"] = json!(OTHER_THREAD_UUID);
+    let wrong_thread_path = fixture.contexts_dir.join("approve-wrong-thread.json");
+    fs::write(
+        &wrong_thread_path,
+        serde_json::to_vec_pretty(&wrong_thread_intent).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&wrong_thread_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let wrong_thread_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "approve",
+            "prepare",
+            "--request",
+            wrong_thread_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_error_code(&wrong_thread_out, "thread_uuid_mismatch");
+
+    let mut wrong_repo_intent = approve_intent.clone();
+    wrong_repo_intent["repository_path"] = json!(other_project_root);
+    let wrong_repo_path = fixture.contexts_dir.join("approve-wrong-repo.json");
+    fs::write(
+        &wrong_repo_path,
+        serde_json::to_vec_pretty(&wrong_repo_intent).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&wrong_repo_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let wrong_repo_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "approve",
+            "prepare",
+            "--request",
+            wrong_repo_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert_error_code(&wrong_repo_out, "invalid_repository");
+
+    // Valid `approve prepare` through chat A's context succeeds.
+    let approve_prep_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "approve",
+            "prepare",
+            "--request",
+            approve_intent_path.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(
+        approve_prep_out.status.success(),
+        "approve prepare failed: {}",
+        String::from_utf8_lossy(&approve_prep_out.stderr)
+    );
+    let approve_preview: Value =
+        serde_json::from_slice(&approve_prep_out.stdout).expect("parse approve preview JSON");
+    let approve_subject_digest = approve_preview["subject_digest"]
+        .as_str()
+        .expect("approve subject_digest")
+        .to_string();
+    let approve_req_obj = approve_preview["request"].clone();
+
+    let approve_req_path = fixture.contexts_dir.join("approve-request.json");
+    fs::write(
+        &approve_req_path,
+        serde_json::to_vec_pretty(&approve_req_obj).unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&approve_req_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Missing `--operator-approved` on `approve record` fails and creates no new approval.
+    let approve_missing_confirm = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "approve",
+            "record",
+            "--request",
+            approve_req_path.to_str().unwrap(),
+            "--confirm-subject",
+            &approve_subject_digest,
+            "--confirm-thread",
+            THREAD_UUID,
+        ],
+    )
+    .await;
+    assert_error_code(&approve_missing_confirm, "invalid_input");
+
+    // Explicit operator confirmation records the scope approval.
+    let approve_rec_out = run_bin(
+        &export_a1.context_router_executable,
+        &[
+            "--context",
+            ctx_a_str,
+            "approve",
+            "record",
+            "--request",
+            approve_req_path.to_str().unwrap(),
+            "--confirm-subject",
+            &approve_subject_digest,
+            "--confirm-thread",
+            THREAD_UUID,
+            "--operator-approved",
+        ],
+    )
+    .await;
+    assert!(
+        approve_rec_out.status.success(),
+        "approve record failed: {}",
+        String::from_utf8_lossy(&approve_rec_out.stderr)
+    );
+    let approve_summary: Value =
+        serde_json::from_slice(&approve_rec_out.stdout).expect("parse approve summary JSON");
+    let recorded_approval_id = approve_summary["approval_id"]
+        .as_str()
+        .expect("recorded approval_id");
+    assert_ne!(recorded_approval_id, fixture.approval_id);
 
     fixture.shutdown().await;
 }

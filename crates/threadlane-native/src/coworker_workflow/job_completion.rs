@@ -796,9 +796,12 @@ impl CoworkerJobCompletionService {
                 )
                 || loaded_closure_art.execution_report.status != WorkerRunStatus::Succeeded
                 || loaded_closure_art.execution_report.exit_code != Some(0)
-                || !loaded_closure_art
+                || !(loaded_closure_art
                     .execution_report
                     .has_complete_natural_completion_evidence()
+                    || loaded_closure_art
+                        .execution_report
+                        .has_complete_legacy_codex_advisory_evidence())
                 || !loaded_closure_art
                     .execution_report
                     .has_satisfied_model_evidence()
