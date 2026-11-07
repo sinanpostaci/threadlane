@@ -2941,8 +2941,8 @@ pub(crate) fn task_has_derived_attempt_or_post_initial_state(
 }
 
 /// Returns `true` when the task's current `Coder` attempt has already completed and reconciled its
-/// verified terminal execution evidence into [`ControllerJobRuntimeState`], even if workflow stage
-/// promotion to [`CoworkerTaskStage::ReadyForReview`] remains fenced.
+/// verified terminal execution evidence into [`ControllerJobRuntimeState`]. Cached Coder stages
+/// require unpromoted initial evidence; a hold after Coder completion retains its post-Coder stage.
 pub(crate) fn has_reconciled_terminal_coder_attempt(
     task: &CoworkerTaskRecord,
     job: &CoworkerJobRecord,
@@ -2950,6 +2950,61 @@ pub(crate) fn has_reconciled_terminal_coder_attempt(
 ) -> bool {
     let attempt_no = task.current_attempt_no;
     if attempt_no == 0 || task.unresolved_outbox_id.is_some() {
+        return false;
+    }
+    let stage_before_hold = if task.stage == CoworkerTaskStage::Held {
+        task.stage_before_hold
+    } else {
+        Some(task.stage)
+    };
+    let post_coder_stage = matches!(
+        stage_before_hold,
+        Some(
+            CoworkerTaskStage::ReadyForReview
+                | CoworkerTaskStage::ReviewReserved
+                | CoworkerTaskStage::UnderReview
+                | CoworkerTaskStage::CorrectInScopeRequired
+                | CoworkerTaskStage::Accepted
+                | CoworkerTaskStage::IntegrationReserved
+                | CoworkerTaskStage::Integrated
+                | CoworkerTaskStage::Blocked
+        )
+    );
+    // Promoted artifacts cannot rehabilitate a stale Running (or Held-from-Running) stage.
+    // Verification records runtime candidates before Reviewer adds ledger candidates.
+    if !post_coder_stage
+        && (attempt_no != 1
+            || task.active_candidate_id.is_some()
+            || task.accepted_candidate_id.is_some()
+            || task_has_derived_attempt_or_post_initial_state(task, runtime_state)
+            || job.outbox.iter().any(|o| {
+                // Dependency preparation is retained before the first Coder reservation.
+                // Its producer confirms it synchronously and creates no controller effect.
+                let completed_pre_coder_dependency = o.kind
+                    == OutboxDispatchKind::DependencyPreparation
+                    && o.attempt_no == 1
+                    && o.role == WorkflowRole::Coder
+                    && o.status == OutboxDispatchStatus::DispatchedEffectConfirmed
+                    && !task.depends_on.is_empty()
+                    && task.dependency_input_commit.is_some()
+                    && task.dependency_input_tree_sha.is_some()
+                    && job.outbox.iter().any(|coder| {
+                        coder.task_id == task.task_id
+                            && coder.attempt_no == 1
+                            && coder.kind == OutboxDispatchKind::TaskAttemptDispatch
+                            && o.updated_at_job_revision < coder.reserved_at_job_revision
+                    });
+                o.task_id == task.task_id
+                    && (o.attempt_no > attempt_no
+                        || (o.kind != OutboxDispatchKind::TaskAttemptDispatch
+                            && !completed_pre_coder_dependency))
+            })
+            || runtime_state.pending_effects.values().any(|eff| {
+                eff.task_id.as_deref() == Some(task.task_id.as_str())
+                    && (eff.attempt_no != Some(attempt_no)
+                        || eff.kind != PendingControllerEffectKind::CoderDispatch)
+            }))
+    {
         return false;
     }
     let has_blocking_coder_outbox = job.outbox.iter().any(|o| {
@@ -2964,7 +3019,16 @@ pub(crate) fn has_reconciled_terminal_coder_attempt(
     let Some(artifacts) = runtime_state.get_attempt_artifacts(&task.task_id, attempt_no) else {
         return false;
     };
-    if artifacts.committed_head_commit.is_none() || artifacts.committed_tree_sha.is_none() {
+    if (!artifacts.is_derived_attempt
+        && (artifacts.committed_head_commit.is_none() || artifacts.committed_tree_sha.is_none()))
+        || (!post_coder_stage
+            && (artifacts.is_derived_attempt
+                || !artifacts.check_evidence.is_empty()
+                || artifacts.test_evidence_summary.is_some()
+                || artifacts.reviewer_response_digest.is_some()
+                || artifacts.review_receipt.is_some()
+                || artifacts.integration_receipt.is_some()))
+    {
         return false;
     }
     let Some(attempt_record) = task
@@ -2976,11 +3040,36 @@ pub(crate) fn has_reconciled_terminal_coder_attempt(
     };
     if attempt_record.run_id.as_deref() != Some(artifacts.run_id.as_str())
         || attempt_record.worker_id.as_deref() != Some(artifacts.worker_id.as_str())
+        || (artifacts.is_derived_attempt
+            && (attempt_record.head_commit.is_none() || attempt_record.tree_sha.is_none()))
     {
         return false;
     }
+    let derived_receipt = if artifacts.is_derived_attempt {
+        let Some(receipt) = runtime_state.derived_attempts.iter().find(|receipt| {
+            receipt.task_id == task.task_id
+                && receipt.attempt_no == attempt_no
+                && receipt.run_id == artifacts.run_id
+                && receipt.worker_id == artifacts.worker_id
+                && receipt.task_worktree_id == artifacts.task_worktree_id
+        }) else {
+            return false;
+        };
+        Some(receipt)
+    } else {
+        None
+    };
+    let terminal_correlation = if derived_receipt.is_some() {
+        let Some(report_id) = attempt_record.report_artifact_id.as_deref() else {
+            return false;
+        };
+        report_id
+    } else {
+        artifacts.run_id.as_str()
+    };
     let has_confirmed_matching_outbox = job.outbox.iter().any(|o| {
         o.outbox_id == attempt_record.outbox_id
+            && o.request_key == attempt_record.request_key
             && o.task_id == task.task_id
             && o.attempt_no == attempt_no
             && o.kind == OutboxDispatchKind::TaskAttemptDispatch
@@ -2991,6 +3080,8 @@ pub(crate) fn has_reconciled_terminal_coder_attempt(
             )
             && o.run_id.as_deref() == Some(artifacts.run_id.as_str())
             && o.worker_id.as_deref() == Some(artifacts.worker_id.as_str())
+            && o.receipt_id.as_deref() == derived_receipt.map(|r| r.receipt_id.as_str())
+            && derived_receipt.is_none_or(|r| o.subject_digest == r.receipt_digest)
     });
     if !has_confirmed_matching_outbox {
         return false;
@@ -3008,7 +3099,10 @@ pub(crate) fn has_reconciled_terminal_coder_attempt(
         eff.kind == PendingControllerEffectKind::CoderDispatch
             && eff.task_id.as_deref() == Some(task.task_id.as_str())
             && eff.attempt_no == Some(attempt_no)
+            && eff.request_key == attempt_record.request_key
             && eff.status == PendingControllerEffectStatus::EffectConfirmed
+            && eff.external_correlation_id.as_deref() == Some(terminal_correlation)
+            && derived_receipt.is_none_or(|r| eff.subject_digest == r.receipt_digest)
     })
 }
 

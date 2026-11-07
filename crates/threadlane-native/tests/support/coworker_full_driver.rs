@@ -1024,6 +1024,64 @@ async fn cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_co
         );
         assert_eq!(notice_effect_count.load(Ordering::SeqCst), 1);
 
+        // Reconstruct only the dependent task's fenced, pre-verification boundary from its
+        // genuine retained initial Coder and dependency-preparation records. Never persist it.
+        let mut dependent_job = fixture.workflow_store.read_binding_ledger(&binding_id).unwrap()
+            .jobs.into_iter().find(|record| record.job_id == job.job_id).unwrap();
+        let mut dependent_runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
+        dependent_job.phase = CoworkerJobPhase::Held;
+        let task = dependent_job.tasks.iter_mut().find(|task| task.task_id == "task-dep-c").unwrap();
+        assert_eq!(task.current_attempt_no, 1);
+        assert!(!task.accepted_predecessor_receipts.is_empty());
+        task.stage = CoworkerTaskStage::Held;
+        task.stage_before_hold = Some(CoworkerTaskStage::Running);
+        task.active_candidate_id = None;
+        task.accepted_candidate_id = None;
+        task.candidates.clear();
+        task.attempts.retain(|attempt| attempt.role == WorkflowRole::Coder);
+        let coder = task.attempts.last().unwrap();
+        let artifacts = dependent_runtime.attempt_artifacts.get_mut(&ControllerJobRuntimeState::artifact_key("task-dep-c", 1)).unwrap();
+        assert!(!artifacts.is_derived_attempt);
+        artifacts.committed_head_commit = coder.head_commit.clone();
+        artifacts.committed_tree_sha = coder.tree_sha.clone();
+        assert!(artifacts.committed_head_commit.is_some());
+        assert!(artifacts.committed_tree_sha.is_some());
+        artifacts.candidate_id = None;
+        artifacts.check_evidence.clear();
+        artifacts.test_evidence_summary = None;
+        artifacts.review_subject = None;
+        artifacts.reviewer_response_digest = None;
+        artifacts.review_receipt = None;
+        artifacts.integration_receipt = None;
+        dependent_job.outbox.retain(|outbox| outbox.task_id != "task-dep-c" || matches!(outbox.kind,
+            threadlane_native::coworker_workflow::OutboxDispatchKind::DependencyPreparation
+                | threadlane_native::coworker_workflow::OutboxDispatchKind::TaskAttemptDispatch));
+        dependent_runtime.pending_effects.retain(|_, effect| effect.task_id.as_deref() != Some("task-dep-c") || effect.kind == PendingControllerEffectKind::CoderDispatch);
+        let prep_index = dependent_job.outbox.iter().position(|outbox| outbox.task_id == "task-dep-c" && outbox.kind == threadlane_native::coworker_workflow::OutboxDispatchKind::DependencyPreparation).expect("retained genuine dependency preparation");
+        assert_eq!(dependent_job.outbox[prep_index].attempt_no, 1);
+        assert_eq!(dependent_job.outbox[prep_index].status, OutboxDispatchStatus::DispatchedEffectConfirmed);
+        let projection_owner: threadlane_native::coworker_driver::CoworkerDriverStatusReport = serde_json::from_value(status_mid.clone()).unwrap();
+        let projection_approval = fixture.authority.get_for_operator(&approval_id).unwrap();
+        let project_dependent = |snapshot_job: &CoworkerJobRecord| {
+            threadlane_native::coworker_driver::evaluate_live_coder_projection_snapshot_from_job_and_runtime(
+                snapshot_job, &dependent_runtime, &projection_approval, &ownership_key,
+                projection_owner.verified_owner_summary.as_ref().unwrap(), projection_owner.execution_mode,
+                Some(HostPhase::Stopped), false, &[], &[], &fixture.plans_dir, None, &[],
+            )
+        };
+        assert!(!project_dependent(&dependent_job), "completed pre-Coder dependency preparation must not invent Running/Unknown for a fenced terminal dependent Coder");
+        for status in [OutboxDispatchStatus::ReservedBeforeEffect, OutboxDispatchStatus::EffectUnknown, OutboxDispatchStatus::ReconciledNotExecuted] {
+            let mut unproven_preparation = dependent_job.clone();
+            unproven_preparation.outbox[prep_index].status = status;
+            assert!(project_dependent(&unproven_preparation), "unproven dependency preparation must remain blocked: {status:?}");
+        }
+        let mut later_preparation = dependent_job.clone();
+        later_preparation.outbox[prep_index].updated_at_job_revision = later_preparation.job_revision;
+        assert!(project_dependent(&later_preparation), "post-Coder preparation history must not exempt stale cached Coder state");
+        let mut future_preparation = dependent_job.clone();
+        future_preparation.outbox[prep_index].attempt_no = 2;
+        assert!(project_dependent(&future_preparation), "future-attempt preparation must not exempt the current Coder");
+
         supervisor.shutdown().await;
     })
     .await;
@@ -1697,6 +1755,11 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
         let mut unrelated_stale = derived_job.clone();
         unrelated_stale.tasks.iter_mut().find(|task| task.task_id == "task-root-b").unwrap().stage = CoworkerTaskStage::Running;
         assert!(project(&unrelated_stale, &runtime_derived, &stopped_original), "live derived proof must not exempt an unrelated stale original task");
+        let mut unrelated_stale_held = derived_job.clone();
+        let stale_held_b = unrelated_stale_held.tasks.iter_mut().find(|task| task.task_id == "task-root-b").unwrap();
+        stale_held_b.stage = CoworkerTaskStage::Held;
+        stale_held_b.stage_before_hold = Some(CoworkerTaskStage::Running);
+        assert!(project(&unrelated_stale_held, &runtime_derived, &stopped_original), "promoted candidate state must not exempt a stale Held running task on a stopped host");
         let mut stale_derived = derived_job.clone();
         stale_derived.outbox.iter_mut().find(|o| o.task_id == "task-root-a" && o.attempt_no == 2)
             .expect("derived outbox").receipt_id = Some("dar_00000000000000000000000000000099".to_string());
@@ -1815,6 +1878,54 @@ async fn cli_code_driver_full_pipeline_live_held_coders_report_running_not_unkno
         assert_eq!(read_invocation_count(&fixture.root.join("agy_derived_coder_count.txt")), 1);
         assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 3);
         assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+
+        // Isolate the derived post-verification/pre-Reviewer boundary from genuine completed
+        // artifacts. Preserve its terminal Coder receipt/report correlation and prior lineage.
+        // These copies are never persisted, accepted, integrated, or dispatched.
+        let mut held_derived_job = fixture.workflow_store.read_binding_ledger(&binding_id).unwrap()
+            .jobs.into_iter().find(|record| record.job_id == job.job_id).unwrap();
+        let mut held_derived_runtime = fixture.policy_store.get_job_runtime_readonly(&binding_id, &job.job_id).unwrap().unwrap();
+        let task = held_derived_job.tasks.iter_mut().find(|task| task.task_id == "task-root-a").unwrap();
+        task.stage = CoworkerTaskStage::Held;
+        task.stage_before_hold = Some(CoworkerTaskStage::ReadyForReview);
+        task.active_candidate_id = None;
+        task.accepted_candidate_id = None;
+        task.candidates.retain(|candidate| candidate.attempt_no != 2);
+        task.attempts.retain(|attempt| attempt.attempt_no != 2 || attempt.role == WorkflowRole::Coder);
+        held_derived_job.outbox.retain(|outbox| outbox.task_id != "task-root-a" || outbox.attempt_no != 2 || outbox.kind == threadlane_native::coworker_workflow::OutboxDispatchKind::TaskAttemptDispatch);
+        held_derived_runtime.pending_effects.retain(|_, effect| {
+            effect.task_id.as_deref() != Some("task-root-a") || effect.attempt_no != Some(2)
+                || matches!(effect.kind, PendingControllerEffectKind::CoderDispatch | PendingControllerEffectKind::TaskCommit | PendingControllerEffectKind::CheckExecution)
+        });
+        let artifacts = held_derived_runtime.attempt_artifacts.get_mut(&ControllerJobRuntimeState::artifact_key("task-root-a", 2)).unwrap();
+        assert!(artifacts.is_derived_attempt);
+        assert!(artifacts.candidate_id.is_some());
+        assert!(!artifacts.check_evidence.is_empty());
+        assert!(artifacts.review_subject.is_some());
+        artifacts.reviewer_response_digest = None;
+        artifacts.review_receipt = None;
+        artifacts.integration_receipt = None;
+        assert!(!project(&held_derived_job, &held_derived_runtime, &stopped_original), "a verified derived Coder held before Reviewer is physically terminal on a stopped original host");
+        let mut before_derived_commit = held_derived_runtime.clone();
+        let artifacts = before_derived_commit.attempt_artifacts.get_mut(&ControllerJobRuntimeState::artifact_key("task-root-a", 2)).unwrap();
+        artifacts.committed_head_commit = None;
+        artifacts.committed_tree_sha = None;
+        artifacts.candidate_id = None;
+        artifacts.check_evidence.clear();
+        artifacts.test_evidence_summary = None;
+        artifacts.review_subject = None;
+        before_derived_commit.pending_effects.retain(|_, effect| effect.task_id.as_deref() != Some("task-root-a") || effect.attempt_no != Some(2) || effect.kind == PendingControllerEffectKind::CoderDispatch);
+        assert!(!project(&held_derived_job, &before_derived_commit, &stopped_original), "a correlated terminal derived report precedes TaskCommit and must not invent physical Coder liveness");
+        let mut mismatched_terminal = held_derived_runtime.clone();
+        mismatched_terminal.pending_effects.values_mut().find(|effect| effect.task_id.as_deref() == Some("task-root-a") && effect.attempt_no == Some(2) && effect.kind == PendingControllerEffectKind::CoderDispatch).unwrap()
+            .external_correlation_id = Some("unrelated_terminal_report".into());
+        assert!(project(&held_derived_job, &mismatched_terminal, &stopped_original), "an unrelated report must not prove a derived Coder terminal");
+        // TaskCommit and checks follow physical Coder completion; their pending/unknown effects
+        // still fence advancement without inventing a live Coder from the held workflow stage.
+        let mut pending_commit = held_derived_runtime.clone();
+        pending_commit.pending_effects.values_mut().find(|effect| effect.task_id.as_deref() == Some("task-root-a") && effect.attempt_no == Some(2) && effect.kind == PendingControllerEffectKind::TaskCommit).unwrap()
+            .status = PendingControllerEffectStatus::EffectUnknown;
+        assert!(project(&held_derived_job, &pending_commit, &stopped_original), "terminal Coder proof must not clear an unknown TaskCommit effect");
 
         let _ = approval_id;
         supervisor.shutdown().await;
@@ -1971,6 +2082,65 @@ async fn stopped_host_cached_running_is_unknown_without_mutating_historical_stat
         assert_eq!(after, before, "status reads must not mutate authoritative fixture records");
         assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 1, "only completed sibling reaches fake provider body");
         assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 0); assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+
+        // Finish actual TaskCommit/check verification before applying an actual workflow hold.
+        // Reviewer has not run, so the verified candidate exists only in runtime artifacts.
+        let verification_session = driver.controller().open_owned_session(&binding.binding_id, &thread, &job.job_id, now()).unwrap();
+        threadlane_native::coworker_workflow::CoworkerTaskVerificationService::new(driver.controller().clone())
+            .verify_and_prepare_task_attempt(verification_session.guard(), &threadlane_native::coworker_workflow::CoworkerTaskVerificationRequest {
+                binding_id: binding.binding_id.clone(), thread_uuid: thread.clone(), job_id: job.job_id.clone(),
+                task_id: "task-complete-b".into(), attempt_no: 1, now_ms: now(),
+            }).await.expect("verify completed task before Reviewer");
+        let verified = verification_session.verify_admission().unwrap();
+        let verified_task = verified.job.tasks.iter().find(|task| task.task_id == "task-complete-b").unwrap();
+        assert_eq!(verified_task.stage, CoworkerTaskStage::ReadyForReview);
+        assert!(verified_task.candidates.is_empty());
+        let artifacts = verified.runtime_state.get_attempt_artifacts("task-complete-b", 1).unwrap();
+        assert!(artifacts.candidate_id.is_some());
+        assert!(!artifacts.check_evidence.is_empty());
+        assert!(artifacts.review_subject.is_some());
+        assert!(artifacts.review_receipt.is_none());
+        assert!(artifacts.integration_receipt.is_none());
+        assert!(verified.runtime_state.pending_effects.values().any(|effect| {
+            effect.task_id.as_deref() == Some("task-complete-b")
+                && effect.kind == PendingControllerEffectKind::TaskCommit
+                && effect.status == PendingControllerEffectStatus::EffectConfirmed
+        }));
+        let (held_job, _) = fixture.workflow_store.apply_workflow_hold(&threadlane_native::coworker_workflow::ApplyWorkflowHoldRequest {
+            binding_id: binding.binding_id.clone(), thread_uuid: thread.clone(), job_id: job.job_id.clone(),
+            expected_job_revision: verified.job.job_revision, expected_ledger_revision: None,
+            request_key: "hold_after_verified_task_commit".into(),
+            reason: threadlane_native::coworker_workflow::WorkflowHoldReason::ConversationClarificationPending,
+            detail: "Hold verified task before Reviewer dispatch".into(),
+            directly_affected_task_ids: vec!["task-complete-b".into()], affected_write_paths: vec!["src/b.rs".into()],
+            affected_interfaces: Vec::new(), holds_entire_job: false,
+        }).unwrap();
+        let held_task = held_job.tasks.iter().find(|task| task.task_id == "task-complete-b").unwrap();
+        assert_eq!(held_task.stage, CoworkerTaskStage::Held);
+        assert_eq!(held_task.stage_before_hold, Some(CoworkerTaskStage::ReadyForReview));
+        assert!(held_task.candidates.is_empty());
+        assert!(held_task.accepted_candidate_id.is_none());
+        verification_session.release().unwrap();
+        let held_before: Vec<_> = [&fixture.plans_dir, &fixture.registry_dir, &fixture.authority_dir, &fixture.sessions_dir]
+            .into_iter().map(|dir| json_records(dir)).collect();
+        let held_status = driver.status(&binding.binding_id, &thread, &job.job_id).await.unwrap();
+        assert_eq!(held_status.host_phase, Some(HostPhase::Stopped));
+        assert!(!held_status.host_lock_held);
+        let held_observation = held_status.tasks.iter().find(|task| task.task_id == "task-complete-b").unwrap();
+        assert_eq!(held_observation.stage, CoworkerTaskStage::Held);
+        assert_eq!(held_observation.host_status, TaskExecutionStatus::ReadyForReview);
+        assert!(held_observation.fenced);
+        let held_pipeline = held_status.pipeline_report.as_ref().unwrap();
+        assert_eq!(held_pipeline.unknown_effect_task_ids, vec!["task-inactive-a"]);
+        assert_eq!(held_pipeline.tasks.iter().find(|task| task.task_id == "task-complete-b").unwrap().host_status, TaskExecutionStatus::ReadyForReview);
+        assert_ne!(held_status.job_phase, CoworkerJobPhase::Completed);
+        assert_eq!(driver.status(&binding.binding_id, &thread, &job.job_id).await.unwrap(), held_status);
+        let held_after: Vec<_> = [&fixture.plans_dir, &fixture.registry_dir, &fixture.authority_dir, &fixture.sessions_dir]
+            .into_iter().map(|dir| json_records(dir)).collect();
+        assert_eq!(held_before, held_after, "held verification inspection must not dispatch or promote work");
+        assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 1);
+        assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 0);
+        assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
         control.shutdown().await;
     }).await;
 }
