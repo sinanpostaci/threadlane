@@ -12,7 +12,7 @@ checkout; the existing development shells remain the normal development path.
 | Python desktop build wrapper | Ten offline fixture tests pass. |
 | Nix CLI package | Source build passed using the root `Cargo.lock`. Includes `threadlane`, the paired `threadlane-native-mcp` bootstrap, and the trusted `threadlane-context`, `threadlane-workflow`, `threadlane-session`, approval and operator commands. |
 | Nix desktop package | Linux source build passed with the standalone Tauri lockfile, a separately built frontend, and explicit Cargo build subdirectory. The resulting executable's `--help` passed. The latest native window creation was observed; visual human acceptance of the current window is still pending. |
-| GitHub Actions workflows | Automatic Linux checks have run three times without a complete pass. The first two failed (disk exhaustion, then one worker cleanup assertion). The third passed the frontend build/tests, both formatting checks, the early 24-worker gate, and both Clippy steps, then GitHub reported that the job exceeded its 1h30m limit during the root Rust tests; hosted logs are unavailable, so no specific hanging test is proven. The automatic Linux source lane now adds explicit root/Tauri test deadlines, heartbeats, and bounded cleanup through `scripts/run-ci-check.py`; hosted qualification of that supervision remains pending. See [CI workflows](#ci-workflows) for the exact results. Manual packaging and non-Linux runners remain unqualified. |
+| GitHub Actions workflows | All 902 default tests, separate doctest checks, Python helper tests and workflow syntax checks pass locally. Four bounded Nextest shards replace the monolithic root test step. Hosted qualification of this layout and manual packaging remain pending; see [CI workflows](#ci-workflows). |
 | Desktop runtime | The standalone M4 Linux binary builds and passes all-target Clippy. The earlier native Wayland preview rendered successfully. Current Tools/Profiles and History browser checks use explicit DEV fixtures; they do not prove native chat pairing. |
 
 The locked npm dependency hash is recorded in:
@@ -177,93 +177,184 @@ formatting, and worker Clippy with `-D warnings`).
 
 The [third run](https://github.com/sinanpostaci/threadlane/actions/runs/42256529293)
 passed the frontend build/tests, both formatting checks, the early 24-worker
-cleanup gate, and both Clippy steps. GitHub then reported that the job exceeded
-its 1h30m limit during the root Rust tests. The hosted logs are unavailable, so
-the run does not identify a specific hanging test or build phase. This branch
-includes `main` `532c797`. The automatic Linux source lane now wraps the
-unchanged root and standalone Tauri test argv with explicit hard deadlines,
-periodic heartbeats, and bounded cleanup; that source-only supervision and its
-offline fixtures have not yet been qualified by a hosted run. No complete root
-workspace pass, standalone Tauri test pass, manual packaging, macOS/Windows, or
-installed workflow acceptance is claimed from these runs.
+cleanup gate and both Clippy steps before reaching the job timeout during root
+Rust tests.
+
+The [subsequent run](https://github.com/sinanpostaci/threadlane/actions/runs/42296276421)
+lost runner communication on its first attempt. Its second attempt passed the
+same early checks and the offline Python CI-wrapper tests, then GitHub
+automatically cancelled it at the 90-minute job limit during root workspace
+tests. Hosted logs for the timed-out root step are unavailable. No specific
+hanging test or defect in `scripts/run-ci-check.py` has been established.
+
+To make per-test duration, timeouts, and failures visible within standard public
+Linux runner budgets, `.github/workflows/ci.yml` now separates automatic Linux
+validation into the existing reusable quality/frontend/Tauri job (`45m` cap,
+with `skip_root_tests: true`) plus four parallel `ubuntu-24.04` root-test shard
+jobs (`35m` cap each) using pinned `cargo-nextest` `0.9.151` and explicit
+doctest execution on shard 1. The long CLI/driver integration scenario has
+sequential 90s and 300s internal waits. Read-only owned-fixture observations
+confirmed actual stage progression, and the exact test passed under its
+eight-minute exception. This does not establish the root cause of earlier
+hosted timeouts. Hosted sharded runs, manual packaging, macOS/Windows and live
+runtime acceptance remain unqualified.
+
+Local validation covered all **902 default tests** without repeating successful
+cases: 561 passed before a bounded single-group comparison hit its 20-minute
+global ceiling; four complementary partitions covered the remaining cases.
+The one multi-phase driver case reached the initial five-minute limit and then
+passed with the exact eight-minute override (about 306 seconds including command
+setup). The successful test sets are disjoint and cover the complete default
+inventory. The separate doctest command, 12 CI-wrapper tests, 11 packaging-wrapper
+tests and workflow syntax checks also passed. This is local evidence, not a
+successful hosted run of the new layout.
 
 ### Automatic Linux source validation
 
 `.github/workflows/ci.yml` has the display name **Linux CI**. It runs on pull
-requests targeting `main`, pushes to `main`, and manual dispatch. Its single job
-calls the local reusable workflow `./.github/workflows/packaging.yml` at the same
-revision with:
+requests targeting `main`, pushes to `main`, and manual dispatch. It schedules
+two parallel job families on standard public `ubuntu-24.04` runners:
 
-```yaml
-linux_only: true
-skip_artifacts: true
+1. **`linux-source-validation`** (`45`-minute job cap): calls the local
+   reusable workflow `./.github/workflows/packaging.yml` at the same revision
+   with:
+
+   ```yaml
+   linux_only: true
+   skip_artifacts: true
+   skip_root_tests: true
+   ```
+
+   This job validates `ubuntu-24.04` / `linux-x86_64` only. It keeps the
+   frontend `npm ci`, production build, and tests; both Rust workspaces'
+   formatting and Clippy checks; the early `worker_and_git_foundation` cleanup
+   regression gate; the standalone Tauri serial tests; and the offline Python
+   build-wrapper and CI-wrapper tests (`test_build_desktop.py` and
+   `test_run_ci_check.py`). It sets `skip_root_tests: true`
+   only because the four sibling `linux-root-tests` shard jobs cover the root
+   workspace test suite. It does not run the desktop release wrapper or the CLI
+   release build, and it does not stage or upload release binary artifacts
+   (`skip_artifacts: true`).
+
+2. **`linux-root-tests`** (`35`-minute job cap per shard, `fail-fast: false`,
+   `shard: [1, 2, 3, 4]`): runs four independent standard `ubuntu-24.04` jobs
+   for the root Rust workspace. Because the desktop Tauri workspace is
+   standalone, the root shards install only the minimal stable Rust toolchain
+   and Python 3.12 (no Node.js, npm, or GTK/WebKit packages). Each shard sets
+   `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`,
+   `CARGO_INCREMENTAL=0`, and `CARGO_BUILD_JOBS=2`.
+
+Each root shard downloads the official static musl archive for
+`cargo-nextest` `0.9.151`
+(`https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-musl.tar.gz`)
+into `$RUNNER_TEMP`, verifies its pinned SHA-256 digest
+(`6b284d6fde9670dfb6ee10ea9d9abbc85f95643d3f592472d420d82e257b3a6c`) with
+`sha256sum --check --strict -` before extracting only the `cargo-nextest`
+binary member, removes the archive, and appends only that binary directory to
+`GITHUB_PATH`. No floating third-party install action or source compilation of
+Nextest is used.
+
+Each shard executes its disjoint partition of the root workspace tests under
+the outer `scripts/run-ci-check.py` wrapper (covering both compilation and test
+execution with a 30-minute hard ceiling):
+
+```sh
+python3 scripts/run-ci-check.py --timeout-seconds 1800 -- cargo nextest run --workspace --locked --profile ci --partition hash:<shard>/4
 ```
 
-The run validates `ubuntu-24.04` / `linux-x86_64` only. It keeps the frontend
-`npm ci`, production build, and tests; both Rust workspaces' formatting, Clippy,
-and serial tests; and the offline Python build-wrapper and CI-wrapper tests. It
-does not run the desktop release wrapper or the CLI release build, and it does
-not stage or upload artifacts. The caller uses `contents: read` permissions and
-does not inherit repository secrets; the called workflow disables checkout
-credential persistence. Its concurrency group is distinct from the packaging
-workflow's group and cancels an older run for the same pull request or ref. There
-is no path filter, so a required check is always scheduled for a matching pull
-request.
+Because `cargo nextest` does not execute Rust documentation tests, shard 1
+additionally runs all workspace doctests under the same wrapper:
 
-After both formatting checks, the automatic Linux source lane also runs
-`cargo test --locked -p threadlane-workers --test worker_and_git_foundation -- --test-threads=1`.
-This is an additional early signal for the worker cleanup fixture before root
-Clippy and the full workspace tests; it does not replace any existing command.
-The step is limited to the `skip_artifacts` Linux automatic lane, so manual
-full-artifact packaging runs keep their original command sequence.
+```sh
+python3 scripts/run-ci-check.py --timeout-seconds 600 -- cargo test --workspace --doc --locked
+```
 
-Only the automatic Linux source lane adds the new offline CI-wrapper tests:
+`.config/nextest.toml` defines `[profile.ci]`, `[profile.ci.junit]`, and one
+scoped `[[profile.ci.overrides]]` entry for the sharded runs:
+
+- `test-threads = 2`, `retries = 0`, and `fail-fast = false`.
+- `status-level = "pass"`, `final-status-level = "slow"`,
+  `failure-output = "immediate-final"`, and `success-output = "never"`, so
+  console logs show per-test `PASS`, `FAIL`, and `TIMEOUT` outcomes.
+- `slow-timeout = { period = "30s", terminate-after = 10 }` (terminating and
+  failing any test that exceeds 5 minutes by default, with no timeout-pass
+  override), `global-timeout = "20m"`, and
+  `leak-timeout = { period = "500ms", result = "fail" }`.
+- One `[[profile.ci.overrides]]` rule matching
+  `binary_id(=threadlane-native::coworker_pipeline) & test(=coworker_full_driver::cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed)`
+  with `slow-timeout = { period = "30s", terminate-after = 16 }` (a finite
+  8-minute per-test ceiling). Its contract in
+  `tests/support/coworker_full_driver.rs` sequentially performs a 90-second wait
+  and a separate 300-second completion wait plus setup, duplicate ensure/status,
+  and teardown checks, exceeding the general 5-minute budget without weakening
+  assertions or raising global/default limits.
+- `path = "junit.xml"` under `[profile.ci.junit]` writes
+  `target/nextest/ci/junit.xml` with `store-success-output = false` and
+  `store-failure-output = true`. Each shard always uploads only that structured
+  XML report (`nextest-junit-shard-<shard>`, 7-day retention,
+  `if-no-files-found: warn` in case compilation fails before Nextest writes the
+  report). No source tree, runtime store, or raw passing logs are uploaded, and
+  automatic release binary staging remains disabled.
+
+The caller workflow uses `contents: read` permissions and does not inherit
+repository secrets; checkout credential persistence is disabled in all jobs. Its
+concurrency group is distinct from the packaging workflow's group and cancels an
+older run for the same pull request or ref. There is no path filter, so required
+checks are always scheduled for matching pull requests.
+
+After both formatting checks, the `linux-source-validation` job still runs
+`cargo test --locked -p threadlane-workers --test worker_and_git_foundation -- --test-threads=1`
+as an early signal before root Clippy, followed by the offline CI-wrapper checks:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_run_ci_check.py -v
 ```
 
-They use local Python fixtures only; they do not call Cargo, a provider, the
-network, or a system service. The same lane wraps the unchanged root Rust test
-argv with a 60-minute hard maximum:
-
-```sh
-python3 scripts/run-ci-check.py --timeout-seconds 3600 -- cargo test --workspace --locked -- --test-threads=1
-```
-
-It wraps the unchanged standalone Tauri test argv with a 15-minute maximum and
-keeps `CARGO_TARGET_DIR=target/desktop`:
+They use local Python fixtures and the standard library only; they do not
+call Cargo, a provider, the network, or a system service. The quality job wraps
+the unchanged standalone Tauri test argv with a 15-minute maximum and keeps
+`CARGO_TARGET_DIR=target/desktop`:
 
 ```sh
 CARGO_TARGET_DIR=target/desktop python3 scripts/run-ci-check.py --timeout-seconds 900 -- cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
 ```
 
-`scripts/run-ci-check.py` is POSIX-only and executes argv directly without a
-shell. It streams stdout and stderr, emits a fixed heartbeat with elapsed time
-and the last libtest/build-phase hint, and enforces only the explicit hard
-deadline; quiet output does not cancel a command. On timeout it sends SIGTERM
-and then a bounded SIGKILL only while the original child is still live, returns
-124, and never reports success. It drains inherited output pipes for a bounded
-interval after child exit and reports incomplete cleanup nonzero without
-claiming escaped descendants were killed. This is CI supervision only, not
-Threadlane model or runtime timeout policy. Manual and non-Linux fallback steps
-keep the original exact cargo commands without the wrapper and use the
-`(manual packaging)` label suffix.
+If `.github/workflows/packaging.yml` is called in source-only mode without
+`skip_root_tests: true`, its root Rust test step remains wrapped with a
+60-minute hard maximum:
 
-The source-only Linux path sets `CARGO_PROFILE_DEV_DEBUG=0`,
-`CARGO_PROFILE_TEST_DEBUG=0`, and `CARGO_INCREMENTAL=0` for the job before Rust
-compilation. This removes DWARF and incremental files without disabling debug
-assertions or changing optimization levels. It also records `df -h .` before
-validation and in a final `always()` step, so hosted runs capture disk capacity
-on success or failure. Manual full-artifact runs keep Cargo's normal
-build defaults.
+```sh
+python3 scripts/run-ci-check.py --timeout-seconds 3600 -- cargo test --workspace --locked -- --test-threads=1
+```
+
+`scripts/run-ci-check.py` is POSIX-only and executes argv directly without a
+shell. It streams stdout and stderr via nonblocking `os.read`, emits a fixed
+heartbeat with elapsed time and the last libtest/build-phase hint, and enforces
+only the explicit hard deadline; quiet output does not cancel a command. On
+timeout it sends SIGTERM and then a bounded SIGKILL only while the original
+child is still live, returns 124, and never reports success. It drains inherited
+output pipes for a bounded interval after child exit and reports incomplete
+cleanup nonzero without claiming escaped descendants were killed. This is CI
+supervision only, not Threadlane model or runtime timeout policy. Manual and
+non-Linux fallback steps keep the original exact cargo commands without the
+wrapper and use the `(manual packaging)` label suffix.
+
+Both the `linux-source-validation` quality job and the four `linux-root-tests`
+shards set `CARGO_PROFILE_DEV_DEBUG=0`, `CARGO_PROFILE_TEST_DEBUG=0`, and
+`CARGO_INCREMENTAL=0` before Rust compilation. This removes DWARF and
+incremental files without disabling debug assertions or changing optimization
+levels. They also record `df -h .` before validation and in a final `always()`
+step, so hosted runs capture disk capacity on success or failure. Manual
+full-artifact runs keep Cargo's normal build defaults.
 
 ### Manual cross-platform packaging
 
 `.github/workflows/packaging.yml` has the display name **Packaging validation**.
 The same file also supports manual dispatch. Open the repository's **Actions**
-tab, select **Packaging validation**, and run the workflow. Manual dispatch keeps
-the full `fail-fast: false` matrix and uploads artifacts; the reusable inputs are
+tab, select **Packaging validation**, and run the workflow. Manual dispatch
+keeps the 90-minute job timeout, the full `fail-fast: false` matrix, the serial
+root and Tauri tests (`skip_root_tests` defaults to `false`), and release
+artifact uploads (`skip_artifacts` defaults to `false`); the reusable inputs are
 only supplied by `ci.yml`.
 
 | Runner | Artifact label |
@@ -283,18 +374,17 @@ discovery finds no files, and propagates a failing test exit status. On Node.js
 24 only, `npm --prefix apps/desktop test -- --test-isolation=none` runs the
 discovered files in one process for sandbox diagnostics; it is not the default.
 
-The job then runs root workspace formatting, Clippy, and serial tests, followed
-by the standalone `apps/desktop/src-tauri` workspace's formatting, Clippy, and
+The job then runs root workspace formatting, Clippy, and (unless
+`skip_root_tests: true` is passed by `ci.yml`) serial root tests, followed by
+the standalone `apps/desktop/src-tauri` workspace's formatting, Clippy, and
 serial tests with `CARGO_TARGET_DIR=target/desktop`. That target directory is
 separate from the root workspace's `target/` directory. It finishes with the
 offline packaging tests, the desktop release wrapper, the CLI release build,
-artifact staging, and a short-lived workflow artifact upload. Manual full-artifact
-and non-Linux jobs run the original exact root and Tauri test commands directly,
-without the wrapper; those fallback step names append `(manual packaging)`. Their
-default command behavior is unchanged. The automatic Linux caller reuses the
-same steps, adds the early worker cleanup regression and CI-wrapper tests
-described above, wraps only the two serial test commands, and skips only those
-final release and artifact steps.
+artifact staging, and a short-lived workflow artifact upload. Both the
+source-only and manual `(manual packaging)` root-test steps honor
+`!inputs.skip_root_tests`, while manual full-artifact and non-Linux jobs keep
+their original un-sharded `cargo test --workspace --locked -- --test-threads=1`
+and Tauri test commands by default.
 
 On a POSIX shell, the equivalent local validation commands are:
 
@@ -306,24 +396,29 @@ cargo fmt --all -- --check
 cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
 cargo test --locked -p threadlane-workers --test worker_and_git_foundation -- --test-threads=1
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked -- --test-threads=1
+cargo nextest run --workspace --locked --profile ci --partition hash:1/4
+cargo nextest run --workspace --locked --profile ci --partition hash:2/4
+cargo nextest run --workspace --locked --profile ci --partition hash:3/4
+cargo nextest run --workspace --locked --profile ci --partition hash:4/4
+cargo test --workspace --doc --locked
 CARGO_TARGET_DIR=target/desktop cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
 CARGO_TARGET_DIR=target/desktop cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked -- --test-threads=1
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_build_desktop.py -v
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_run_ci_check.py -v
 ```
 
-The direct Cargo commands above remain the manual/local path. The automatic Linux
-lane additionally uses the two wrapper commands shown in the previous section.
+The manual packaging workflow still uses
+`cargo test --workspace --locked -- --test-threads=1`, while automatic Linux CI
+uses the four `cargo nextest` shards plus `cargo test --workspace --doc --locked`
+under `scripts/run-ci-check.py` as shown in the previous section.
 
 The workflows do not publish a release, sign an artifact, use repository
-secrets, or create a system installer. Three hosted Linux runs stopped without a
-complete pass: the first exhausted disk while compiling test binaries, the
-second reached the root tests before the worker cleanup fixture assertion failed,
-and the third exceeded GitHub's 1h30m job limit during the root tests with
-unavailable logs. The source-only supervision and its offline fixtures await
-hosted qualification. Successful end-to-end behavior and the macOS and Windows
-packaging entries remain unverified.
+secrets, or create a system installer. Earlier hosted Linux runs stopped on disk
+exhaustion, one worker cleanup assertion, and GitHub's 90-minute job timeout
+during monolithic serial root tests with unavailable logs. All 902 default tests
+passed locally across disjoint successful runs, including the extended-budget
+multi-stage driver recheck. Hosted sharded runs, macOS/Windows qualification and
+live runtime acceptance remain separate gates.
 
 ## Linux runtime notes
 
@@ -361,14 +456,15 @@ remain untested.
 
 | Platform | Nix package | Source/CI build |
 | --- | --- | --- |
-| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. The third automatic Linux run passed frontend, formatting, the early worker gate, and both Clippy steps, then hit the job timeout during root tests with unavailable logs; hosted qualification of the source-only supervision is pending. Manual packaging has not run on hosted CI. |
+| Linux x86_64 | CLI and desktop Nix builds pass; current-window visual acceptance is pending. | Standalone desktop build and Clippy pass. Local root test-set, separate doctest, helper and workflow syntax checks pass. Hosted sharded qualification and manual packaging remain pending. |
 | Linux aarch64 | Defined for CLI and desktop; not built. | No workflow matrix entry yet. |
 | macOS | CLI expression only; desktop Nix package not provided. | Manual packaging-workflow entry has not run on hosted CI. |
 | Windows | No Nix package. | Manual packaging-workflow entry has not run on hosted CI; Windows runtime ACL support remains a separate product concern. |
 
 No successful CLI submission, generated workflow, or Nix expression is evidence
-that a binary was built, installed, run, signed, or released. Three automatic
-Linux runs have stopped without a complete pass: disk exhaustion, one worker
-cleanup assertion, and a job timeout during root tests with unavailable logs.
-The source-only supervision and its offline fixtures are not yet qualified by a
-hosted run, so successful hosted workflow results remain unverified.
+that a binary was built, installed, run, signed, or released. Earlier automatic
+Linux runs stopped without a complete pass (disk exhaustion, one worker cleanup
+assertion, and auto-cancellation at the 90-minute job limit during serial root
+tests with unavailable logs). Local validation of the sharded Nextest + doctest
+layout does not establish hosted workflow success, macOS/Windows support or live
+runtime acceptance; those gates remain unverified.

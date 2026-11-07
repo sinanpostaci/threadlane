@@ -1,8 +1,10 @@
 name: Linux CI
 
-# Automatic Linux source validation for pull requests and main. The job calls
-# the local reusable packaging workflow from the same revision and disables
-# release builds and artifact upload. Hosted validation results are recorded in
+# Automatic Linux source validation for pull requests and main. The quality job
+# calls the local reusable packaging workflow from the same revision with
+# release builds, artifact staging, and monolithic root tests disabled, while
+# four sibling shard jobs execute the root workspace tests under pinned
+# cargo-nextest (plus doctests on shard 1). Status and limits are recorded in
 # docs/INSTALL.md.
 
 on:
@@ -30,3 +32,87 @@ jobs:
     with:
       linux_only: true
       skip_artifacts: true
+      skip_root_tests: true
+
+  linux-root-tests:
+    name: Linux root tests (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      PYTHONDONTWRITEBYTECODE: "1"
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install pinned cargo-nextest
+        shell: bash
+        env:
+          NEXTEST_VERSION: "0.9.151"
+          NEXTEST_URL: "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.151/cargo-nextest-0.9.151-x86_64-unknown-linux-musl.tar.gz"
+          NEXTEST_SHA256: "6b284d6fde9670dfb6ee10ea9d9abbc85f95643d3f592472d420d82e257b3a6c"
+        run: |
+          set -euo pipefail
+          install_dir="${RUNNER_TEMP}/cargo-nextest-${NEXTEST_VERSION}"
+          archive_path="${install_dir}/cargo-nextest.tar.gz"
+          mkdir -p "${install_dir}/bin"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --output "${archive_path}" "${NEXTEST_URL}"
+          printf '%s  %s\n' "${NEXTEST_SHA256}" "${archive_path}" | sha256sum --check --strict -
+          tar -xzf "${archive_path}" -C "${install_dir}/bin" cargo-nextest
+          rm -f "${archive_path}"
+          chmod 0755 "${install_dir}/bin/cargo-nextest"
+          printf '%s\n' "${install_dir}/bin" >> "${GITHUB_PATH}"
+
+      - name: Report tool versions and disk space
+        shell: bash
+        run: |
+          rustc --version
+          cargo --version
+          cargo nextest --version
+          python --version
+          df -h .
+
+      - name: Run root Rust workspace test shard
+        run: python scripts/run-ci-check.py --timeout-seconds 1800 -- cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.shard }}/4
+
+      - name: Run root Rust workspace doctests
+        if: ${{ matrix.shard == 1 }}
+        run: python scripts/run-ci-check.py --timeout-seconds 600 -- cargo test --workspace --doc --locked
+
+      - name: Upload Nextest JUnit report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-shard-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Report Linux disk space after shard
+        if: ${{ always() }}
+        shell: bash
+        run: df -h .

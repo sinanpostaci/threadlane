@@ -22,6 +22,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_root_tests:
+        description: Skip the root Rust workspace test step when sibling jobs cover it.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,7 +39,7 @@ jobs:
   source-build:
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: ${{ (inputs.skip_artifacts && inputs.skip_root_tests) && 45 || 90 }}
     strategy:
       fail-fast: false
       matrix:
@@ -136,11 +141,11 @@ jobs:
         run: python -m unittest discover -s scripts -p test_run_ci_check.py -v
 
       - name: Run root Rust workspace tests
-        if: ${{ inputs.skip_artifacts && runner.os == 'Linux' }}
+        if: ${{ !inputs.skip_root_tests && inputs.skip_artifacts && runner.os == 'Linux' }}
         run: python scripts/run-ci-check.py --timeout-seconds 3600 -- cargo test --workspace --locked -- --test-threads=1
 
       - name: Run root Rust workspace tests (manual packaging)
-        if: ${{ !inputs.skip_artifacts || runner.os != 'Linux' }}
+        if: ${{ !inputs.skip_root_tests && (!inputs.skip_artifacts || runner.os != 'Linux') }}
         run: cargo test --workspace --locked -- --test-threads=1
 
       - name: Run standalone Tauri workspace tests

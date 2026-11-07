@@ -1,0 +1,30 @@
+# Nextest configuration for the root Rust workspace CI shards.
+# Official syntax references:
+# - https://nexte.st/docs/ci-features/partitioning/
+# - https://nexte.st/docs/features/slow-tests/
+# - https://nexte.st/docs/features/leaky-tests/
+# - https://nexte.st/docs/machine-readable/junit/
+
+[profile.ci]
+test-threads = 2
+retries = 0
+fail-fast = false
+status-level = "pass"
+final-status-level = "slow"
+failure-output = "immediate-final"
+success-output = "never"
+slow-timeout = { period = "30s", terminate-after = 10 }
+global-timeout = "20m"
+leak-timeout = { period = "500ms", result = "fail" }
+
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = false
+store-failure-output = true
+
+# Single multi-phase CLI/driver pipeline test whose source contract sequences a
+# 90s wait and a separate 300s completion wait plus setup, duplicate
+# ensure/status, and teardown checks.
+[[profile.ci.overrides]]
+filter = "binary_id(=threadlane-native::coworker_pipeline) & test(=coworker_full_driver::cli_code_driver_full_automatic_pipeline_runs_parallel_roots_reviewer_correction_dependent_and_single_closure_to_completed)"
+slow-timeout = { period = "30s", terminate-after = 16 }
