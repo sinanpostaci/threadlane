@@ -541,8 +541,18 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
         "worker input must compile to the exact same v1 plan_digest as canonical coder"
     );
 
-    // 4. Unknown role at MCP `save_draft` boundary fails closed with `validation_failed`.
-    let invalid_mcp_err = mcp
+    // 4. Unknown role at MCP `save_draft` boundary fails closed with `validation_failed` on the
+    //    currently enrolled server, while the superseded first server reports `expired_epoch`.
+    let expired_first_err = mcp
+        .invoke_tool_json("catalog", json!({}), None)
+        .await
+        .expect_err("superseded first server epoch must be expired");
+    assert_eq!(
+        expired_first_err.structured_content.expect("expired err")["error"]["code"],
+        "expired_epoch"
+    );
+
+    let invalid_mcp_err = mcp_canonical
         .invoke_tool_json(
             "save_draft",
             json!({
