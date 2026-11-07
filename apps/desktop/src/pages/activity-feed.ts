@@ -3,6 +3,9 @@ import { h } from '../ui/dom.ts';
 import type { ObservationSnapshot } from '../observation/types.ts';
 import {
   countRunningRequests,
+  createActivityFeedFilters,
+  formatActivityFilterCoverage,
+  formatActivityRunningCountLabel,
   formatActivityScopeLabel,
   formatCompactDuration,
   formatCompactUsage,
@@ -16,8 +19,10 @@ import {
   projectVisibleTimeline,
   requestIdentityKey,
   resolveExecutorBrand,
+  type ActivityFeedFilters,
   type ActivityFeedProjection,
   type ActivityFeedScope,
+  type ActivityFilterOption,
   type ActivityRequestView,
   type ActivityVisibleTimelineEvent,
   type LifecycleTone,
@@ -49,6 +54,7 @@ interface RenderedRow {
   durationEl: HTMLElement | null;
   contextAtMs: number | null;
   elapsedStartedAtMs: number | null;
+  lastView: ActivityRequestView | null;
 }
 
 function recordedTimestampMs(value: number | null | undefined): number | null {
@@ -56,6 +62,91 @@ function recordedTimestampMs(value: number | null | undefined): number | null {
     ? value
     : null;
 }
+
+function elapsedDurationTexts(view: ActivityRequestView): string[] {
+  const texts: string[] = [];
+  const collect = (
+    duration: ActivityRequestView['duration'],
+    summary: string,
+    detail: string
+  ): void => {
+    if (duration.kind === 'elapsed') {
+      // The compact value is handled by the duration object itself.
+      texts.push(summary, detail);
+    }
+  };
+  collect(view.duration, view.durationSummary, view.durationDetail);
+  for (const child of view.children) {
+    collect(child.duration, child.durationSummary, child.durationDetail);
+  }
+  return texts;
+}
+
+/**
+ * Running elapsed labels change on every projection without changing any
+ * recorded row content. Their exact generated strings are excluded from the
+ * row-identity signature so the quotes and detail nodes stay stable.
+ */
+function activityRowSignature(
+  view: ActivityRequestView,
+  parentPresent: boolean,
+  stale: boolean
+): string {
+  const elapsedTexts = new Set(elapsedDurationTexts(view));
+
+  return JSON.stringify(
+    [view, parentPresent, stale],
+    (key, value) => {
+      if (
+        key === 'duration' &&
+        typeof value === 'object' &&
+        value !== null &&
+        (value as { kind?: string }).kind === 'elapsed'
+      ) {
+        return { ...(value as ActivityRequestView['duration']), text: '' };
+      }
+      if (
+        typeof value === 'string' &&
+        (key === 'durationSummary' || key === 'durationDetail') &&
+        elapsedTexts.has(value)
+      ) {
+        return '';
+      }
+      if (Array.isArray(value) && key === 'lines') {
+        return value.map((line: unknown) =>
+          typeof line === 'string' && elapsedTexts.has(line) ? '' : line
+        );
+      }
+      return value;
+    }
+  );
+}
+
+function selectedFilterValue(select: HTMLSelectElement): string | null {
+  const value = select.value.trim();
+  return value.length > 0 ? value : null;
+}
+
+function buildFilterField(
+  labelText: string,
+  control: HTMLSelectElement
+): HTMLElement {
+  return h(
+    'label',
+    { className: 'aq-feed-filter-field' },
+    h('span', { className: 'aq-feed-filter-label' }, labelText),
+    control
+  );
+}
+
+function filterOptionTitle(option: ActivityFilterOption): string {
+  const count = `${option.count} loaded ${
+    option.count === 1 ? 'request' : 'requests'
+  } in this view`;
+  return `${option.detail} · ${count}`;
+}
+
+type ActivityFilterDimension = 'projects' | 'chats' | 'states';
 
 /**
  * Read-only durable request feed. The page only observes the supplied snapshot;
@@ -69,6 +160,14 @@ export class ActivityFeedPage {
   private readonly scopeEl: HTMLElement;
   private readonly runningCountEl: HTMLElement;
   private readonly allActivityButton: HTMLButtonElement;
+  private readonly filtersButton: HTMLButtonElement;
+  private readonly filterPanelEl: HTMLElement;
+  private readonly filterSummaryEl: HTMLElement;
+  private readonly filterStatusEl: HTMLElement;
+  private readonly clearFiltersButton: HTMLButtonElement;
+  private readonly projectFilterSelect: HTMLSelectElement;
+  private readonly chatFilterSelect: HTMLSelectElement;
+  private readonly stateFilterSelect: HTMLSelectElement;
   private readonly noticesEl: HTMLElement;
   private readonly listEl: HTMLUListElement;
   private readonly emptyEl: HTMLElement;
@@ -77,6 +176,26 @@ export class ActivityFeedPage {
   private readonly loadMoreButton: HTMLButtonElement;
   private readonly rows = new Map<string, RenderedRow>();
   private readonly expanded = new Set<string>();
+  private readonly filterOptionCache: Record<
+    ActivityFilterDimension,
+    Map<string, ActivityFilterOption>
+  > = {
+    projects: new Map(),
+    chats: new Map(),
+    states: new Map(),
+  };
+  private readonly filterOptionSignatures: Record<
+    ActivityFilterDimension,
+    string
+  > = {
+    projects: '',
+    chats: '',
+    states: '',
+  };
+  private filters: ActivityFeedFilters = createActivityFeedFilters();
+  private filtersOpen = false;
+  private filtersAvailable = false;
+  private activeFilterCount = 0;
   private snapshot: ObservationSnapshot | null = null;
   private scope: ActivityFeedScope | null = null;
   private loading = false;
@@ -106,6 +225,80 @@ export class ActivityFeedPage {
       },
       'All activity'
     );
+    this.filtersButton = h(
+      'button',
+      {
+        type: 'button',
+        className: 'aq-feed-filter-toggle tl-action',
+        'data-action': 'activity-filters',
+        'data-focus-key': 'feed:filter-toggle',
+        'aria-expanded': 'false',
+        'aria-controls': 'activity-feed-filters',
+        'aria-label': 'Filters',
+        title: 'Show activity filters',
+        hidden: true,
+      },
+      'Filters'
+    );
+    this.projectFilterSelect = h('select', {
+      className: 'aq-feed-filter-select',
+      'data-focus-key': 'feed:filter-project',
+      'aria-label': 'Filter loaded activity by project',
+    });
+    this.chatFilterSelect = h('select', {
+      className: 'aq-feed-filter-select',
+      'data-focus-key': 'feed:filter-chat',
+      'aria-label': 'Filter loaded activity by chat',
+    });
+    this.stateFilterSelect = h('select', {
+      className: 'aq-feed-filter-select',
+      'data-focus-key': 'feed:filter-state',
+      'aria-label': 'Filter loaded activity by lifecycle state',
+    });
+    this.filterStatusEl = h('p', {
+      className: 'aq-feed-filter-status',
+      id: 'activity-feed-filter-status',
+      'aria-live': 'polite',
+    });
+    this.clearFiltersButton = h(
+      'button',
+      {
+        type: 'button',
+        className: 'aq-btn aq-feed-filter-clear',
+        'data-focus-key': 'feed:filter-clear',
+        disabled: true,
+      },
+      'Clear filters'
+    );
+    this.filterPanelEl = h(
+      'div',
+      {
+        className: 'aq-feed-filters',
+        id: 'activity-feed-filters',
+        role: 'group',
+        'aria-label': 'Activity filters',
+        'aria-describedby': 'activity-feed-filter-status',
+        hidden: true,
+      },
+      h(
+        'div',
+        { className: 'aq-feed-filter-grid' },
+        buildFilterField('Project', this.projectFilterSelect),
+        buildFilterField('Chat', this.chatFilterSelect),
+        buildFilterField('State', this.stateFilterSelect)
+      ),
+      h(
+        'div',
+        { className: 'aq-feed-filter-actions' },
+        this.filterStatusEl,
+        this.clearFiltersButton
+      )
+    );
+    this.filterSummaryEl = h('p', {
+      className: 'aq-feed-filter-summary',
+      'aria-live': 'polite',
+      hidden: true,
+    });
     this.noticesEl = h('div', { className: 'aq-feed-notices' });
     this.listEl = h('ul', {
       className: 'aq-feed-list',
@@ -128,6 +321,36 @@ export class ActivityFeedPage {
         this.onLoadMore?.();
       }
     });
+    this.filtersButton.addEventListener('click', () => {
+      this.filtersOpen = !this.filtersOpen;
+      this.syncFilterPanel();
+    });
+    this.projectFilterSelect.addEventListener('change', () => {
+      this.applyFilters({
+        ...this.filters,
+        projectKey: selectedFilterValue(this.projectFilterSelect),
+      });
+    });
+    this.chatFilterSelect.addEventListener('change', () => {
+      this.applyFilters({
+        ...this.filters,
+        chatKey: selectedFilterValue(this.chatFilterSelect),
+      });
+    });
+    this.stateFilterSelect.addEventListener('change', () => {
+      this.applyFilters({
+        ...this.filters,
+        state: selectedFilterValue(
+          this.stateFilterSelect
+        ) as ObservationLifecycleState | null,
+      });
+    });
+    this.clearFiltersButton.addEventListener('click', () => {
+      this.applyFilters(createActivityFeedFilters());
+      if (!this.filtersButton.hidden) {
+        this.projectFilterSelect.focus({ preventScroll: true });
+      }
+    });
 
     const header = h(
       'header',
@@ -143,7 +366,8 @@ export class ActivityFeedPage {
       'div',
       { className: 'aq-feed-tools tl-tools' },
       this.scopeEl,
-      this.allActivityButton
+      this.allActivityButton,
+      this.filtersButton
     );
 
     this.footerEl = h(
@@ -166,6 +390,8 @@ export class ActivityFeedPage {
       },
       header,
       tools,
+      this.filterSummaryEl,
+      this.filterPanelEl,
       this.listEl,
       this.emptyEl,
       this.footerEl,
@@ -197,11 +423,19 @@ export class ActivityFeedPage {
     if (options.scope !== undefined || snapshot === null) {
       this.scope = options.scope ?? null;
     }
+    if (snapshot === null) {
+      this.filters = createActivityFeedFilters();
+      this.filtersOpen = false;
+      this.clearFilterOptionCache();
+    }
 
     if (this.snapshot) {
-      this.renderProjection(
-        projectActivityFeed(this.snapshot, { scope: this.scope })
-      );
+      const projection = projectActivityFeed(this.snapshot, {
+        scope: this.scope,
+        filters: this.filters,
+      });
+      this.filters = projection.filters;
+      this.renderProjection(projection);
     } else {
       this.renderWithoutSnapshot();
     }
@@ -247,9 +481,150 @@ export class ActivityFeedPage {
     this.element.replaceChildren();
   }
 
+  private applyFilters(filters: ActivityFeedFilters): void {
+    if (!this.snapshot) {
+      return;
+    }
+    const scroller = this.element.closest('.aq-main') as HTMLElement | null;
+    const scrollTop = scroller?.scrollTop ?? null;
+    const projection = projectActivityFeed(this.snapshot, {
+      scope: this.scope,
+      filters,
+    });
+    this.filters = projection.filters;
+    this.renderProjection(projection);
+    if (scroller && scrollTop !== null) {
+      scroller.scrollTop = scrollTop;
+    }
+  }
+
+  private syncFilterPanel(): void {
+    const open = this.filtersOpen && this.filtersAvailable;
+    this.filterPanelEl.hidden = !open;
+    this.filtersButton.setAttribute('aria-expanded', open ? 'true' : 'false');
+    this.filtersButton.title = open
+      ? 'Hide activity filters'
+      : 'Show activity filters';
+    this.filterSummaryEl.hidden =
+      !this.filtersAvailable || this.activeFilterCount === 0 || open;
+  }
+
+  private renderFilters(projection: ActivityFeedProjection): void {
+    this.filtersAvailable =
+      projection.scopeRowCount > 0 || projection.activeFilterCount > 0;
+    this.activeFilterCount = projection.activeFilterCount;
+    this.filtersButton.hidden = !this.filtersAvailable;
+    this.filtersButton.textContent =
+      projection.activeFilterCount > 0
+        ? `Filters (${projection.activeFilterCount})`
+        : 'Filters';
+    this.filtersButton.setAttribute(
+      'aria-label',
+      projection.activeFilterCount > 0
+        ? `Filters, ${projection.activeFilterCount} active`
+        : 'Filters'
+    );
+    this.filtersButton.dataset.active =
+      projection.activeFilterCount > 0 ? 'true' : 'false';
+    this.syncFilterPanel();
+
+    const coverage = formatActivityFilterCoverage(
+      projection.scopeRowCount,
+      projection.visibleRowCount,
+      projection.activeFilterCount
+    );
+    this.filterStatusEl.textContent = coverage;
+    this.filterSummaryEl.textContent = coverage;
+    this.clearFiltersButton.disabled = projection.activeFilterCount === 0;
+
+    this.renderFilterSelect(
+      'projects',
+      this.projectFilterSelect,
+      'All projects',
+      projection.filterOptions.projects,
+      this.filters.projectKey,
+      projection.scopeRowCount
+    );
+    this.renderFilterSelect(
+      'chats',
+      this.chatFilterSelect,
+      'All chats',
+      projection.filterOptions.chats,
+      this.filters.chatKey,
+      projection.scopeRowCount
+    );
+    this.renderFilterSelect(
+      'states',
+      this.stateFilterSelect,
+      'All states',
+      projection.filterOptions.states,
+      this.filters.state,
+      projection.scopeRowCount
+    );
+  }
+
+  private renderFilterSelect(
+    dimension: ActivityFilterDimension,
+    select: HTMLSelectElement,
+    allLabel: string,
+    options: readonly ActivityFilterOption[],
+    selectedKey: string | null,
+    scopeRowCount: number
+  ): void {
+    const cache = this.filterOptionCache[dimension];
+    for (const option of options) {
+      cache.set(option.key, option);
+    }
+    const merged = [...options];
+    if (selectedKey && !merged.some((option) => option.key === selectedKey)) {
+      const cached = cache.get(selectedKey);
+      merged.unshift({
+        key: selectedKey,
+        label: cached?.label ?? 'Selected filter',
+        detail:
+          cached?.detail ??
+          'The selected filter is not present in the loaded activity.',
+        count: 0,
+      });
+    }
+    const signature = JSON.stringify([merged, selectedKey, scopeRowCount]);
+    if (this.filterOptionSignatures[dimension] === signature) {
+      if (select.value !== (selectedKey ?? '')) {
+        select.value = selectedKey ?? '';
+      }
+      return;
+    }
+
+    const optionElements = merged.map((option) =>
+      h(
+        'option',
+        { value: option.key, title: filterOptionTitle(option) },
+        `${option.label} (${option.count})`
+      )
+    );
+    select.replaceChildren(
+      h('option', { value: '' }, `${allLabel} (${scopeRowCount})`),
+      ...optionElements
+    );
+    select.value = selectedKey ?? '';
+    this.filterOptionSignatures[dimension] = signature;
+  }
+
+  private clearFilterOptionCache(): void {
+    for (const dimension of [
+      'projects',
+      'chats',
+      'states',
+    ] as ActivityFilterDimension[]) {
+      this.filterOptionCache[dimension].clear();
+      this.filterOptionSignatures[dimension] = '';
+    }
+  }
+
   private renderProjection(projection: ActivityFeedProjection): void {
     this.element.setAttribute('aria-busy', this.loading ? 'true' : 'false');
     this.renderHeader(projection);
+    this.renderFilters(projection);
     this.renderNotices(projection);
     this.reconcileRows(projection);
     this.renderEmpty(projection);
@@ -278,6 +653,14 @@ export class ActivityFeedPage {
     }
     this.runningCountEl.hidden = true;
     this.runningCountEl.textContent = '';
+    this.filtersAvailable = false;
+    this.activeFilterCount = 0;
+    this.filtersButton.hidden = true;
+    this.filtersButton.setAttribute('aria-expanded', 'false');
+    this.filterPanelEl.hidden = true;
+    this.filterSummaryEl.hidden = true;
+    this.filterSummaryEl.textContent = '';
+    this.filterStatusEl.textContent = '';
 
     for (const entry of this.rows.values()) {
       entry.li.remove();
@@ -326,8 +709,14 @@ export class ActivityFeedPage {
     );
     this.allActivityButton.hidden = !projection.scope.scoped;
     const running = countRunningRequests(projection.rows);
-    this.runningCountEl.hidden = running === 0;
-    const runningText = formatRunningCountLabel(running);
+    this.runningCountEl.hidden = projection.scopeRunningCount === 0;
+    const runningText =
+      running === projection.scopeRunningCount
+        ? formatRunningCountLabel(running)
+        : formatActivityRunningCountLabel(
+            running,
+            projection.scopeRunningCount
+          );
     if (this.runningCountEl.textContent !== runningText) {
       this.runningCountEl.textContent = runningText;
     }
@@ -345,7 +734,9 @@ export class ActivityFeedPage {
             role: 'alert',
           },
           this.error,
-          projection.rows.length > 0 ? ' Showing available rows.' : ''
+          projection.rows.length > 0
+            ? ' Last available snapshot; status may be stale until a refresh succeeds.'
+            : ''
         )
       );
     }
@@ -514,6 +905,7 @@ export class ActivityFeedPage {
       durationEl: null,
       contextAtMs: null,
       elapsedStartedAtMs: null,
+      lastView: null,
     };
   }
 
@@ -522,13 +914,36 @@ export class ActivityFeedPage {
       ? requestIdentityKey(view.request.source_id, view.parentRequestId)
       : null;
     const parentPresent = parentKey !== null && this.rows.has(parentKey);
-    const signature = JSON.stringify([view, parentPresent]);
+    const signature = activityRowSignature(
+      view,
+      parentPresent,
+      this.error !== null
+    );
 
     if (entry.signature === signature) {
       const open = this.expanded.has(view.key);
       if (entry.details.open !== open) {
         entry.details.open = open;
       }
+      this.updateElapsedDurationText(entry, entry.lastView, view);
+      entry.lastView = view;
+      const duration = formatCompactDuration(
+        view.duration,
+        view.durationDetail
+      );
+      if (entry.durationEl) {
+        if (entry.durationEl.textContent !== duration.value) {
+          entry.durationEl.textContent = duration.value;
+        }
+        if (entry.durationEl.title !== duration.detail) {
+          entry.durationEl.title = duration.detail;
+          entry.durationEl.setAttribute('aria-label', duration.detail);
+        }
+      }
+      entry.elapsedStartedAtMs =
+        view.duration.kind === 'elapsed'
+          ? recordedTimestampMs(view.request.started_at_ms)
+          : null;
       return;
     }
 
@@ -555,6 +970,47 @@ export class ActivityFeedPage {
       view.duration.kind === 'elapsed'
         ? recordedTimestampMs(view.request.started_at_ms)
         : null;
+    entry.lastView = view;
+  }
+
+  private updateElapsedDurationText(
+    entry: RenderedRow,
+    previous: ActivityRequestView | null,
+    next: ActivityRequestView
+  ): void {
+    if (!previous) {
+      return;
+    }
+    const before = elapsedDurationTexts(previous);
+    const after = elapsedDurationTexts(next);
+    if (before.length !== after.length) {
+      return;
+    }
+    const replacements = new Map<string, string | null>();
+    for (let index = 0; index < before.length; index += 1) {
+      const oldText = before[index]!;
+      const newText = after[index]!;
+      if (oldText === newText) {
+        continue;
+      }
+      const existing = replacements.get(oldText);
+      if (existing === undefined) {
+        replacements.set(oldText, newText);
+      } else if (existing !== newText) {
+        // Ambiguous repeated elapsed values are safer to leave until a full
+        // meaningful row refresh than to rewrite the wrong evidence line.
+        replacements.set(oldText, null);
+      }
+    }
+    if (replacements.size === 0) {
+      return;
+    }
+    for (const text of entry.details.querySelectorAll<HTMLElement>('p')) {
+      const replacement = replacements.get(text.textContent ?? '');
+      if (typeof replacement === 'string' && text.textContent !== replacement) {
+        text.textContent = replacement;
+      }
+    }
   }
 
   private buildSummary(view: ActivityRequestView): HTMLElement {
@@ -562,7 +1018,7 @@ export class ActivityFeedPage {
       view.stateLabel,
       view.stateTone,
       view.state,
-      view.showSpinner
+      view.showSpinner && this.error === null
     );
     const duration = formatCompactDuration(view.duration, view.durationDetail);
     const usage = formatCompactUsage(view.usage);
@@ -588,8 +1044,21 @@ export class ActivityFeedPage {
         { className: 'aq-feed-context tl-context' },
         h(
           'span',
-          { className: 'aq-feed-project', title: view.projectLabel },
-          view.projectLabel
+          { className: 'aq-feed-context-lead' },
+          h(
+            'span',
+            { className: 'aq-feed-project', title: view.projectDetail },
+            view.projectLabel
+          ),
+          h(
+            'span',
+            {
+              className: 'aq-feed-chat',
+              title: view.chatDetail,
+              'aria-label': view.chatDetail,
+            },
+            view.chatLabel
+          )
         ),
         h(
           'span',
@@ -835,6 +1304,15 @@ export class ActivityFeedPage {
     this.emptyEl.hidden = false;
     if (this.loading) {
       this.emptyEl.textContent = 'Loading recorded activity…';
+    } else if (
+      projection.activeFilterCount > 0 &&
+      projection.scopeRowCount > 0
+    ) {
+      this.emptyEl.textContent = `No loaded activity matches the selected filters. ${formatActivityFilterCoverage(
+        projection.scopeRowCount,
+        projection.visibleRowCount,
+        projection.activeFilterCount
+      )} Use Clear filters to show all loaded activity.`;
     } else if (projection.scope.scoped) {
       this.emptyEl.textContent = 'No recorded requests match this job scope.';
     } else if (projection.unavailableSources.length > 0) {

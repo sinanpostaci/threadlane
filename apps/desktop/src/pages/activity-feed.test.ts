@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import Module from 'node:module';
 
 import type {
   ObservationActor,
@@ -15,8 +16,13 @@ import type {
 } from '../observation/types.ts';
 import {
   buildActivityRequestView,
+  countActiveActivityFilters,
   countRunningRequests,
+  createActivityFeedFilters,
   describeDeliveryStage,
+  filterActivityRequestRows,
+  formatActivityFilterCoverage,
+  formatActivityRunningCountLabel,
   formatActivityScopeLabel,
   formatChildCoverage,
   formatCompactDuration,
@@ -39,7 +45,10 @@ import {
   formatRequesterSelectedModel,
   formatRequesterSummary,
   isLocalMcpExecutor,
+  normalizeActivityFeedFilters,
   projectActivityFeed,
+  projectActivityFilterOptions,
+  projectChatIdentity,
   projectDuration,
   projectExecutorDisplay,
   projectRecordedModel,
@@ -51,9 +60,50 @@ import {
   requestMeaningfulTimestampMs,
   resolveLifecycleTone,
   shouldShowSpinner,
+  type ActivityFeedFilters,
   type DeliveryStage,
   type ObservationLifecycleState,
 } from './activity-feed-model.ts';
+
+if (typeof (Module as { registerHooks?: unknown }).registerHooks === 'function') {
+  (
+    Module as unknown as {
+      registerHooks: (hooks: {
+        load?: (
+          url: string,
+          context: unknown,
+          nextLoad: (url: string, context: unknown) => unknown
+        ) => unknown;
+      }) => void;
+    }
+  ).registerHooks({
+    load(url, context, nextLoad) {
+      if (url.endsWith('.css')) {
+        return { format: 'module', shortCircuit: true, source: 'export default {};' };
+      }
+      if (url.endsWith('.svg')) {
+        return { format: 'module', shortCircuit: true, source: 'export default "";' };
+      }
+      return nextLoad(url, context);
+    },
+  });
+} else if (typeof Module.register === 'function') {
+  const loaderSource = `
+    export async function load(url, context, nextLoad) {
+      if (url.endsWith('.css')) {
+        return { format: 'module', shortCircuit: true, source: 'export default {};' };
+      }
+      if (url.endsWith('.svg')) {
+        return { format: 'module', shortCircuit: true, source: 'export default "";' };
+      }
+      return nextLoad(url, context);
+    }
+  `;
+  Module.register(
+    `data:text/javascript,${encodeURIComponent(loaderSource)}`,
+    import.meta.url
+  );
+}
 
 const NOW_MS = 1_730_000_000_000;
 
@@ -1309,6 +1359,38 @@ describe('activity feed request projection', () => {
     assert.match(different.recordedModelDetail, /requested gpt-5/);
     assert.match(different.recordedModelDetail, /observed gpt-5-2026/);
 
+    const worker = buildActivityRequestView(
+      makeSnapshot(),
+      makeRequest({
+        executor: makeExecutor({ role: 'coder' }),
+        actor: makeActor({ role: 'coder', label: 'Codex requester' }),
+      })
+    );
+    assert.equal(worker.executorRoleLabel, 'Worker');
+    assert.equal(worker.actorRole, 'coder');
+    assert.equal(formatExecutorRoleLabel(worker.actorRole), 'Worker');
+    assert.equal(formatExecutorRoleLabel('coder'), 'Worker');
+    assert.equal(formatExecutorRoleLabel('Coder'), 'Worker');
+    assert.equal(formatExecutorRoleLabel('root_worker'), 'root worker');
+    assert.equal(formatRecordedOperation('coder'), 'coder');
+    const workerRequesterEvent = worker.timeline.find(
+      (event) => event.kind === 'requester'
+    );
+    assert.ok(workerRequesterEvent);
+    assert.match(workerRequesterEvent.lines.join(' '), /role coder/);
+    const workerRequesterDisplay = projectTimelineDisplay(
+      worker,
+      workerRequesterEvent
+    );
+    assert.match(workerRequesterDisplay.detail, /Codex requester · Worker/);
+    assert.doesNotMatch(workerRequesterDisplay.detail, /Coder/);
+    const workerRequestEvent = worker.timeline.find(
+      (event) => event.kind === 'request'
+    );
+    assert.ok(workerRequestEvent);
+    assert.match(workerRequestEvent.lines.join(' '), /Root executor: Worker/);
+    assert.match(workerRequestEvent.lines.join(' '), /recorded role coder/);
+
     assert.equal(
       projectRecordedModel('gpt-5', null).value,
       'requested gpt-5'
@@ -1586,7 +1668,7 @@ describe('activity feed request projection', () => {
       }) })],
     }));
     const display = projectRequestExecutorDisplay(view);
-    assert.equal(display.role, 'Called Coder');
+    assert.equal(display.role, 'Called Worker');
     assert.equal(display.model, 'DeepSeek · Max');
     assert.equal(view.executorRoleLabel, 'Role not reported');
     assert.equal(view.observedModel, 'Not reported');
@@ -1706,7 +1788,7 @@ describe('activity feed request projection', () => {
     const root = buildActivityRequestView(makeSnapshot(), makeRequest({
       executor: makeExecutor(), children: [child], children_count: 1,
     }));
-    assert.equal(projectRequestExecutorDisplay(root).role, 'Coder');
+    assert.equal(projectRequestExecutorDisplay(root).role, 'Worker');
     assert.equal(projectRequestExecutorDisplay(root).model, 'GPT-5 · High');
     const noModel = buildActivityRequestView(makeSnapshot(), makeRequest({ executor: metadataRoot }));
     assert.equal(projectRequestExecutorDisplay(noModel).role, 'Threadlane');
@@ -1842,7 +1924,7 @@ describe('activity feed request projection', () => {
     );
     assert.ok(withWorker.calledExecutor);
     const withWorkerDisplay = projectRequestExecutorDisplay(withWorker);
-    assert.equal(withWorkerDisplay.role, 'Called Coder');
+    assert.equal(withWorkerDisplay.role, 'Called Worker');
     assert.equal(withWorkerDisplay.model, 'DeepSeek · Max');
     assert.equal(withWorker.usage.summary, 'Usage not reported');
     assert.equal(formatCompactUsage(withWorker.usage).value, 'Usage not reported');
@@ -1998,6 +2080,1109 @@ describe('activity feed request projection', () => {
     );
     assert.ok(
       timelineDisplay.lines.includes('Configured model: Sol · xhigh (selected)')
+    );
+  });
+});
+
+interface FakeEvent {
+  type: string;
+  target: FakeNode;
+}
+
+type FakeListener = (event: FakeEvent) => void;
+
+class FakeNode {
+  parentNode: FakeElement | null = null;
+  parentElement: FakeElement | null = null;
+  private textValue = '';
+
+  get textContent(): string {
+    return this.textValue;
+  }
+
+  set textContent(value: string) {
+    this.textValue = value;
+  }
+}
+
+class FakeTextNode extends FakeNode {
+  constructor(text: string) {
+    super();
+    this.textContent = text;
+  }
+}
+
+class FakeElement extends FakeNode {
+  readonly tagName: string;
+  className = '';
+  id = '';
+  title = '';
+  value = '';
+  src = '';
+  alt = '';
+  decoding = '';
+  hidden = false;
+  open = false;
+  disabled = false;
+  scrollTop = 0;
+  readonly isConnected = true;
+  readonly dataset: Record<string, string> = {};
+  readonly attributes = new Map<string, string>();
+  readonly children: FakeNode[] = [];
+  private readonly listeners = new Map<string, FakeListener[]>();
+  readonly style = {
+    setProperty: (_name: string, _value: string): void => {},
+  };
+
+  constructor(tagName: string) {
+    super();
+    this.tagName = tagName.toLowerCase();
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, value);
+    if (name === 'class') {
+      this.className = value;
+    } else if (name === 'id') {
+      this.id = value;
+    } else if (name === 'title') {
+      this.title = value;
+    } else if (name === 'value') {
+      this.value = value;
+    } else if (name === 'src') {
+      this.src = value;
+    } else if (name === 'hidden') {
+      this.hidden = true;
+    } else if (name === 'open') {
+      this.open = true;
+    } else if (name === 'disabled') {
+      this.disabled = true;
+    } else if (name.startsWith('data-')) {
+      this.dataset[dataAttributeKey(name)] = value;
+    }
+  }
+
+  getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+
+  hasAttribute(name: string): boolean {
+    return this.attributes.has(name);
+  }
+
+  appendChild<T extends FakeNode>(child: T): T {
+    child.parentNode = this;
+    child.parentElement = this;
+    this.children.push(child);
+    return child;
+  }
+
+  append(...nodes: Array<FakeNode | string | null | undefined>): void {
+    for (const node of nodes) {
+      if (node === null || node === undefined) {
+        continue;
+      }
+      this.appendChild(
+        typeof node === 'string' ? new FakeTextNode(node) : node
+      );
+    }
+  }
+
+  replaceChildren(...nodes: FakeNode[]): void {
+    this.children.length = 0;
+    for (const node of nodes) {
+      this.appendChild(node);
+    }
+  }
+
+  insertBefore<T extends FakeNode>(child: T, reference: FakeNode | null): T {
+    if (reference === null) {
+      return this.appendChild(child);
+    }
+    const index = this.children.indexOf(reference);
+    if (index < 0) {
+      return this.appendChild(child);
+    }
+    child.parentNode = this;
+    child.parentElement = this;
+    this.children.splice(index, 0, child);
+    return child;
+  }
+
+  removeChild<T extends FakeNode>(child: T): T {
+    const index = this.children.indexOf(child);
+    if (index >= 0) {
+      this.children.splice(index, 1);
+      child.parentNode = null;
+      child.parentElement = null;
+    }
+    return child;
+  }
+
+  remove(): void {
+    this.parentNode?.removeChild(this);
+  }
+
+  contains(target: FakeNode | null): boolean {
+    if (!target) {
+      return false;
+    }
+    if (target === this) {
+      return true;
+    }
+    return this.children.some(
+      (child) => child instanceof FakeElement && child.contains(target)
+    );
+  }
+
+  closest(selector: string): FakeElement | null {
+    let candidate: FakeElement | null = this;
+    while (candidate) {
+      if (matchesFakeSelector(candidate, selector)) {
+        return candidate;
+      }
+      candidate = candidate.parentElement;
+    }
+    return null;
+  }
+
+  querySelectorAll<T extends FakeElement = FakeElement>(selector: string): T[] {
+    const matches: T[] = [];
+    const visit = (element: FakeElement): void => {
+      for (const child of element.children) {
+        if (child instanceof FakeElement) {
+          if (matchesFakeSelector(child, selector)) {
+            matches.push(child as T);
+          }
+          visit(child);
+        }
+      }
+    };
+    visit(this);
+    return matches;
+  }
+
+  querySelector<T extends FakeElement = FakeElement>(selector: string): T | null {
+    return this.querySelectorAll<T>(selector)[0] ?? null;
+  }
+
+  addEventListener(type: string, handler: FakeListener): void {
+    const handlers = this.listeners.get(type) ?? [];
+    handlers.push(handler);
+    this.listeners.set(type, handlers);
+  }
+
+  dispatchEvent(event: string | FakeEvent): boolean {
+    const actual =
+      typeof event === 'string' ? { type: event, target: this } : event;
+    for (const handler of this.listeners.get(actual.type) ?? []) {
+      handler(actual);
+    }
+    return true;
+  }
+
+  click(): void {
+    if (!this.disabled) {
+      this.dispatchEvent('click');
+    }
+  }
+
+  focus(_options?: unknown): void {
+    (
+      document as unknown as { activeElement: FakeElement | null }
+    ).activeElement = this;
+  }
+
+  scrollIntoView(_options?: unknown): void {}
+
+  get textContent(): string {
+    return this.children.map((child) => child.textContent ?? '').join('');
+  }
+
+  set textContent(value: string) {
+    this.children.length = 0;
+    this.appendChild(new FakeTextNode(value));
+  }
+}
+
+class FakeButtonElement extends FakeElement {}
+class FakeInputElement extends FakeElement {}
+class FakeSelectElement extends FakeElement {}
+class FakeTextAreaElement extends FakeElement {}
+class FakeOptionElement extends FakeElement {}
+class FakeFieldSetElement extends FakeElement {}
+class FakeDetailsElement extends FakeElement {}
+
+function dataAttributeKey(name: string): string {
+  return name
+    .slice(5)
+    .replace(/-([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+function matchesFakeSelector(element: FakeElement, selector: string): boolean {
+  const trimmed = selector.trim();
+  if (trimmed.startsWith('.')) {
+    return element.className.split(/\s+/).includes(trimmed.slice(1));
+  }
+  const attribute = trimmed.match(/^\[([a-z0-9-]+)(?:="([^"]*)")?\]$/i);
+  if (attribute) {
+    const name = attribute[1]!;
+    if (attribute[2] === undefined) {
+      return element.attributes.has(name);
+    }
+    return element.getAttribute(name) === attribute[2];
+  }
+  return element.tagName === trimmed.toLowerCase();
+}
+
+function installActivityFeedDom(): void {
+  const global = globalThis as Record<string, unknown>;
+  global.Node = FakeNode;
+  global.HTMLElement = FakeElement;
+  global.HTMLButtonElement = FakeButtonElement;
+  global.HTMLInputElement = FakeInputElement;
+  global.HTMLSelectElement = FakeSelectElement;
+  global.HTMLTextAreaElement = FakeTextAreaElement;
+  global.HTMLOptionElement = FakeOptionElement;
+  global.HTMLFieldSetElement = FakeFieldSetElement;
+  global.HTMLDetailsElement = FakeDetailsElement;
+  global.document = {
+    activeElement: null,
+    createElement(tag: string): FakeElement {
+      switch (tag.toLowerCase()) {
+        case 'button':
+          return new FakeButtonElement(tag);
+        case 'input':
+          return new FakeInputElement(tag);
+        case 'select':
+          return new FakeSelectElement(tag);
+        case 'textarea':
+          return new FakeTextAreaElement(tag);
+        case 'option':
+          return new FakeOptionElement(tag);
+        case 'fieldset':
+          return new FakeFieldSetElement(tag);
+        case 'details':
+          return new FakeDetailsElement(tag);
+        default:
+          return new FakeElement(tag);
+      }
+    },
+    createElementNS(_namespace: string, tag: string): FakeElement {
+      return new FakeElement(tag);
+    },
+    createTextNode(text: string): FakeTextNode {
+      return new FakeTextNode(text);
+    },
+  };
+}
+
+function fakeRows(pageElement: FakeElement): FakeElement[] {
+  return pageElement.querySelectorAll<FakeElement>('.aq-feed-item');
+}
+
+function fakeFirstRowDetails(
+  pageElement: FakeElement
+): FakeDetailsElement | null {
+  return (
+    fakeRows(pageElement)[0]?.querySelector<FakeDetailsElement>('details') ??
+    null
+  );
+}
+
+function setFakeFilter(
+  pageElement: FakeElement,
+  focusKey: string,
+  value: string
+): void {
+  const select = pageElement.querySelector<FakeElement>(
+    `[data-focus-key="${focusKey}"]`
+  );
+  assert.ok(select, `filter control ${focusKey}`);
+  select.value = value;
+  select.dispatchEvent('change');
+}
+
+describe('activity chat labels and local filters', () => {
+  it('labels real chats, falls back honestly, and keys duplicate titles by stable identity', () => {
+    const duplicateTitle = 'Design discussion';
+    const first = makeRequest({
+      id: 'chat-first',
+      thread_label: duplicateTitle,
+      thread_uuid: 'thread-first',
+      binding_id: 'binding-first',
+    });
+    const second = makeRequest({
+      id: 'chat-second',
+      thread_label: duplicateTitle,
+      thread_uuid: 'thread-second',
+      binding_id: 'binding-second',
+    });
+    const firstChat = projectChatIdentity(first);
+    const secondChat = projectChatIdentity(second);
+
+    assert.equal(firstChat.label, duplicateTitle);
+    assert.equal(secondChat.label, duplicateTitle);
+    assert.notEqual(firstChat.key, secondChat.key);
+    assert.match(firstChat.detail, /Thread ID: thread-first/);
+    assert.match(firstChat.detail, /Binding: binding-first/);
+    assert.match(secondChat.detail, /Thread ID: thread-second/);
+    assert.equal(firstChat.stableId, 'thread-first');
+    assert.equal(firstChat.labelSource, 'thread_label');
+
+    const fallbackThread = projectChatIdentity(
+      makeRequest({
+        thread_label: null,
+        thread_uuid: '00000000-0000-4000-8000-000000000099',
+        binding_id: 'binding-fallback',
+      })
+    );
+    assert.equal(fallbackThread.label, 'Chat 00000000');
+    assert.equal(fallbackThread.labelSource, 'thread_uuid');
+    assert.match(fallbackThread.detail, /Thread ID: 00000000-0000-4000-8000-000000000099/);
+
+    const fallbackBinding = projectChatIdentity(
+      makeRequest({
+        thread_label: '   ',
+        thread_uuid: null,
+        binding_id: 'binding-only',
+      })
+    );
+    assert.equal(fallbackBinding.label, 'Chat binding-only');
+    assert.equal(fallbackBinding.labelSource, 'binding_id');
+
+    const unknown = projectChatIdentity(
+      makeRequest({ thread_label: null, thread_uuid: null, binding_id: null })
+    );
+    assert.equal(unknown.label, 'Unknown chat');
+    assert.equal(unknown.key, 'source-a\u0000chat\u0000unknown');
+    assert.equal(unknown.labelSource, 'unknown');
+    assert.doesNotMatch(unknown.detail, /Thread: /);
+  });
+
+  it('treats the literal Codex chat fallback as unavailable and keeps same-named chats distinct', () => {
+    const firstUuid = '11111111-1111-4111-8111-111111111111';
+    const secondUuid = '22222222-2222-4222-8222-222222222222';
+    const requests = [
+      makeRequest({
+        id: 'fallback-one',
+        project_label: 'Project A',
+        thread_label: 'Codex chat',
+        thread_uuid: firstUuid,
+        binding_id: 'binding-one',
+      }),
+      makeRequest({
+        id: 'fallback-two',
+        project_label: 'Project A',
+        thread_label: ' Codex  Chat ',
+        thread_uuid: secondUuid,
+        binding_id: 'binding-two',
+      }),
+      makeRequest({
+        id: 'missing-title',
+        project_label: 'Project A',
+        thread_label: null,
+        thread_uuid: null,
+        binding_id: null,
+      }),
+    ];
+    const snapshot = makeSnapshot({ jobs: [], requests });
+    const first = buildActivityRequestView(snapshot, requests[0]!);
+    const second = buildActivityRequestView(snapshot, requests[1]!);
+    const unknown = buildActivityRequestView(snapshot, requests[2]!);
+
+    assert.equal(first.chatLabel, 'Chat 11111111');
+    assert.equal(second.chatLabel, 'Chat 22222222');
+    assert.equal(first.chatLabelSource, 'thread_uuid');
+    assert.equal(second.chatLabelSource, 'thread_uuid');
+    assert.doesNotMatch(first.chatLabel, /Codex chat/i);
+    assert.doesNotMatch(second.chatLabel, /Codex chat/i);
+    assert.notEqual(first.chatKey, second.chatKey);
+    assert.ok(first.chatDetail.includes(firstUuid));
+    assert.ok(second.chatDetail.includes(secondUuid));
+    assert.doesNotMatch(first.conversationDetails, /Codex chat/i);
+    assert.ok(first.conversationDetails.includes(firstUuid));
+    assert.equal(unknown.chatLabel, 'Unknown chat');
+    assert.equal(unknown.chatLabelSource, 'unknown');
+    assert.equal(unknown.chatKey, 'source-a\u0000chat\u0000unknown');
+
+    const bindingOnly = projectChatIdentity(
+      makeRequest({
+        thread_label: 'Codex chat',
+        thread_uuid: null,
+        binding_id: 'binding-x',
+      })
+    );
+    assert.equal(bindingOnly.label, 'Chat binding-x');
+    assert.equal(bindingOnly.labelSource, 'binding_id');
+    assert.match(bindingOnly.detail, /Binding: binding-x/);
+
+    const projection = projectActivityFeed(snapshot);
+    const firstOption = projection.filterOptions.chats.find(
+      (option) => option.key === first.chatKey
+    );
+    const secondOption = projection.filterOptions.chats.find(
+      (option) => option.key === second.chatKey
+    );
+    assert.ok(firstOption);
+    assert.ok(secondOption);
+    assert.ok(firstOption.detail.includes(firstUuid));
+    assert.ok(secondOption.detail.includes(secondUuid));
+    assert.doesNotMatch(firstOption.label, /Codex chat/i);
+    assert.doesNotMatch(secondOption.label, /Codex chat/i);
+    assert.equal(
+      projectActivityFeed(snapshot, {
+        filters: { chatKey: first.chatKey },
+      }).rows[0]?.request.id,
+      'fallback-one'
+    );
+  });
+
+  it('derives stable project/chat/state options from loaded rows and disambiguates duplicate titles', () => {
+    const requests = [
+      makeRequest({
+        id: 'first-chat',
+        project_label: 'Shared project',
+        thread_label: 'Same name',
+        thread_uuid: 'thread-one',
+        state: 'running',
+      }),
+      makeRequest({
+        id: 'second-chat',
+        project_label: 'Shared project',
+        thread_label: 'Same name',
+        thread_uuid: 'thread-two',
+        state: 'completed',
+      }),
+      makeRequest({
+        id: 'unknown-chat',
+        project_label: 'Shared project',
+        thread_label: null,
+        thread_uuid: null,
+        binding_id: null,
+        state: 'unknown',
+      }),
+    ];
+    const projection = projectActivityFeed(
+      makeSnapshot({ jobs: [], requests })
+    );
+    const options = projectActivityFilterOptions(projection.rows);
+    const sameNameOptions = options.chats.filter((option) =>
+      option.label.startsWith('Same name')
+    );
+
+    assert.equal(options.projects.length, 1);
+    assert.equal(options.projects[0]?.count, 3);
+    assert.equal(sameNameOptions.length, 2);
+    assert.notEqual(sameNameOptions[0]?.key, sameNameOptions[1]?.key);
+    assert.notEqual(sameNameOptions[0]?.label, sameNameOptions[1]?.label);
+    assert.match(sameNameOptions.map((option) => option.label).join(' '), /thread-/);
+    const unknownChat = options.chats.find(
+      (option) => option.label === 'Unknown chat'
+    );
+    assert.ok(unknownChat);
+    assert.deepEqual(
+      projectActivityFeed(
+        makeSnapshot({ jobs: [], requests }),
+        { filters: { chatKey: unknownChat.key } }
+      ).rows.map((row) => row.request.id),
+      ['unknown-chat']
+    );
+    assert.deepEqual(
+      options.states.map((option) => option.key).sort(),
+      ['completed', 'running', 'unknown']
+    );
+    assert.equal(options.states.find((option) => option.key === 'running')?.count, 1);
+  });
+
+  it('keeps overlapping project names distinct by source identity and path', () => {
+    const snapshot = makeSnapshot({
+      sources: [
+        makeSource({ id: 'source-a', label: 'Source A', project_path: '/tmp/shared' }),
+        makeSource({ id: 'source-b', label: 'Source B', project_path: '/tmp/shared' }),
+      ],
+      jobs: [],
+      requests: [
+        makeRequest({
+          source_id: 'source-a',
+          id: 'project-a-request',
+          job_id: '',
+          project_label: 'Shared project',
+          thread_label: 'Chat A',
+          thread_uuid: 'thread-project-a',
+        }),
+        makeRequest({
+          source_id: 'source-b',
+          id: 'project-b-request',
+          job_id: '',
+          project_label: 'Shared project',
+          thread_label: 'Chat B',
+          thread_uuid: 'thread-project-b',
+        }),
+      ],
+    });
+    const projection = projectActivityFeed(snapshot);
+    assert.equal(projection.filterOptions.projects.length, 2);
+    assert.notEqual(
+      projection.filterOptions.projects[0]?.key,
+      projection.filterOptions.projects[1]?.key
+    );
+    assert.notEqual(
+      projection.filterOptions.projects[0]?.label,
+      projection.filterOptions.projects[1]?.label
+    );
+    const firstProject = projection.filterOptions.projects[0]!;
+    const filtered = projectActivityFeed(snapshot, {
+      filters: { projectKey: firstProject.key },
+    });
+    assert.equal(filtered.rows.length, 1);
+    assert.equal(filtered.rows[0]?.projectKey, firstProject.key);
+    assert.equal(filtered.scopeRowCount, 2);
+    assert.equal(filtered.visibleRowCount, 1);
+  });
+
+  it('combines project, chat, and state filters over loaded rows without changing external scope', () => {
+    const snapshot = makeSnapshot({
+      jobs: [
+        makeJob({ id: 'job-one', project_label: 'Project One', project_path: '/tmp/one' }),
+        makeJob({ id: 'job-two', project_label: 'Project Two', project_path: '/tmp/two' }),
+      ],
+      requests: [
+        makeRequest({
+          id: 'one-a',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Chat A',
+          thread_uuid: 'thread-a',
+          binding_id: 'binding-a',
+          state: 'running',
+        }),
+        makeRequest({
+          id: 'one-b',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Chat B',
+          thread_uuid: 'thread-b',
+          binding_id: 'binding-b',
+          state: 'completed',
+        }),
+        makeRequest({
+          id: 'two-a',
+          job_id: 'job-two',
+          project_label: 'Project Two',
+          thread_label: 'Chat A',
+          thread_uuid: 'thread-c',
+          binding_id: 'binding-c',
+          state: 'completed',
+        }),
+      ],
+    });
+    const loaded = projectActivityFeed(snapshot);
+    const project = loaded.filterOptions.projects.find(
+      (option) => option.label === 'Project One'
+    );
+    const chatA = loaded.filterOptions.chats.find(
+      (option) => option.key === projectChatIdentity(snapshot.requests[0]!).key
+    );
+    assert.ok(project);
+    assert.ok(chatA);
+
+    const filters: ActivityFeedFilters = createActivityFeedFilters({
+      projectKey: project.key,
+      chatKey: chatA.key,
+      state: 'running',
+    });
+    const filtered = projectActivityFeed(snapshot, {
+      scope: { source_id: 'source-a', job_id: 'job-one' },
+      filters,
+    });
+
+    assert.deepEqual(filtered.rows.map((row) => row.request.id), ['one-a']);
+    assert.equal(filtered.scope.scoped, true);
+    assert.equal(filtered.scope.scope?.job_id, 'job-one');
+    assert.equal(filtered.filters.projectKey, project.key);
+    assert.equal(filtered.activeFilterCount, 3);
+    assert.equal(filtered.scopeRowCount, 2);
+    assert.equal(filtered.visibleRowCount, 1);
+    assert.equal(filtered.localFilteredCount, 1);
+    assert.equal(filtered.filteredOutCount, 1);
+    assert.equal(countActiveActivityFilters(filters), 3);
+    assert.equal(
+      normalizeActivityFeedFilters({ ...filters, projectKey: '  ' }).projectKey,
+      null
+    );
+
+    const cleared = projectActivityFeed(snapshot, {
+      scope: { source_id: 'source-a', job_id: 'job-one' },
+      filters: createActivityFeedFilters(),
+    });
+    assert.deepEqual(
+      cleared.rows.map((row) => row.request.id).sort(),
+      ['one-a', 'one-b']
+    );
+    assert.equal(cleared.scope.scope?.job_id, 'job-one');
+    assert.equal(cleared.activeFilterCount, 0);
+    assert.equal(
+      filterActivityRequestRows(filtered.rows, filters).length,
+      filtered.rows.length
+    );
+  });
+
+  it('keeps running and coverage counts honest when filters hide loaded rows', () => {
+    const snapshot = makeSnapshot({
+      requests: [
+        makeRequest({ id: 'running-visible', state: 'running' }),
+        makeRequest({ id: 'running-hidden', state: 'running' }),
+        makeRequest({ id: 'completed-visible', state: 'completed' }),
+        makeRequest({ id: 'failed-hidden', state: 'failed' }),
+        makeRequest({ id: 'cancelled-hidden', state: 'cancelled' }),
+      ],
+    });
+    const projection = projectActivityFeed(snapshot, {
+      filters: { state: 'completed' },
+    });
+
+    assert.equal(projection.scopeRowCount, 5);
+    assert.equal(projection.visibleRowCount, 1);
+    assert.equal(projection.scopeRunningCount, 2);
+    assert.equal(projection.visibleRunningCount, 0);
+    assert.equal(projection.localFilteredCount, 4);
+    assert.equal(projection.activeFilterCount, 1);
+    assert.equal(
+      formatActivityRunningCountLabel(0, 2),
+      '0 visible · 2 calls running in view'
+    );
+    assert.equal(
+      formatActivityRunningCountLabel(2, 2),
+      formatRunningCountLabel(2)
+    );
+    assert.equal(
+      formatActivityFilterCoverage(5, 1, 1),
+      'Showing 1 of 5 loaded requests. Filters apply to loaded activity only.'
+    );
+    assert.equal(
+      formatActivityFilterCoverage(5, 5, 0),
+      '5 loaded requests available to filter. Filters apply to loaded activity only.'
+    );
+  });
+
+  it('wires compact chat labels and local filters beside the existing scope action', () => {
+    const source = readFileSync(
+      new URL('./activity-feed.ts', import.meta.url),
+      'utf8'
+    );
+    assert.match(source, /aq-feed-chat/);
+    assert.match(source, /view\.chatDetail/);
+    assert.match(source, /feed:filter-project/);
+    assert.match(source, /feed:filter-chat/);
+    assert.match(source, /feed:filter-state/);
+    assert.match(source, /feed:filter-clear/);
+    assert.match(source, /formatActivityFilterCoverage/);
+    assert.match(source, /formatActivityRunningCountLabel/);
+    assert.match(source, /formatExecutorRoleLabel\(requesterRole\)/);
+    assert.match(
+      source,
+      /this\.scopeEl,\s*this\.allActivityButton,\s*this\.filtersButton/
+    );
+    assert.match(source, /createActivityFeedFilters\(\)/);
+    assert.doesNotMatch(source, /full-history search/i);
+  });
+
+  it('renders chat chips and filter interactions while preserving scope, expansions, and refresh state', async () => {
+    installActivityFeedDom();
+    const { ActivityFeedPage } = await import('./activity-feed.ts');
+    let loadMoreCalls = 0;
+    const page = new ActivityFeedPage({
+      onLoadMore: () => {
+        loadMoreCalls += 1;
+      },
+    });
+    const main = new FakeElement('main');
+    main.className = 'aq-main';
+    main.appendChild(page.element as unknown as FakeElement);
+    const pageElement = page.element as unknown as FakeElement;
+
+    const firstSnapshot = makeSnapshot({
+      jobs: [
+        makeJob({
+          id: 'job-one',
+          project_label: 'Project One',
+          project_path: '/tmp/project-one',
+          title: 'Job One',
+        }),
+        makeJob({
+          id: 'job-two',
+          project_label: 'Project Two',
+          project_path: '/tmp/project-two',
+          title: 'Job Two',
+        }),
+      ],
+      requests: [
+        makeRequest({
+          id: 'chat-a-running',
+          title: 'Chat A running request',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Shared chat',
+          thread_uuid: 'thread-a',
+          binding_id: 'binding-a',
+          state: 'running',
+          updated_at_ms: NOW_MS,
+        }),
+        makeRequest({
+          id: 'chat-b-completed',
+          title: 'Chat B completed request',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Shared chat',
+          thread_uuid: 'thread-b',
+          binding_id: 'binding-b',
+          state: 'completed',
+          updated_at_ms: NOW_MS - 1_000,
+        }),
+        makeRequest({
+          id: 'chat-c-running',
+          title: 'Chat C running request',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Review chat',
+          thread_uuid: 'thread-c',
+          binding_id: 'binding-c',
+          state: 'running',
+          updated_at_ms: NOW_MS - 2_000,
+        }),
+        makeRequest({
+          id: 'other-job',
+          title: 'Other job request',
+          job_id: 'job-two',
+          project_label: 'Project Two',
+          thread_label: 'Other chat',
+          thread_uuid: 'thread-d',
+          binding_id: 'binding-d',
+          state: 'completed',
+          updated_at_ms: NOW_MS - 3_000,
+        }),
+      ],
+      has_more: true,
+    });
+    page.update(firstSnapshot, {
+      scope: { source_id: 'source-a', job_id: 'job-one' },
+    });
+
+    assert.equal(fakeRows(pageElement).length, 3);
+    assert.equal(
+      pageElement.querySelectorAll('.aq-feed-chat').length,
+      3
+    );
+    const firstContext = fakeRows(pageElement)[0]?.querySelector(
+      '.aq-feed-context-lead'
+    );
+    assert.match(firstContext?.textContent ?? '', /Project One/);
+    assert.match(firstContext?.textContent ?? '', /Shared chat/);
+    assert.match(
+      fakeRows(pageElement)[0]?.querySelector('.aq-feed-chat')?.title ?? '',
+      /Thread ID: thread-a/
+    );
+    const scopeBefore = pageElement.querySelector('.aq-feed-scope')?.textContent;
+    assert.match(scopeBefore ?? '', /Project One/);
+    assert.match(scopeBefore ?? '', /Job One/);
+    assert.equal(
+      pageElement.querySelector('[data-action="activity-all"]')?.hidden,
+      false
+    );
+    assert.equal(
+      pageElement.querySelector('.aq-feed-load-more')?.hidden,
+      false
+    );
+
+    const toggle = pageElement.querySelector<FakeElement>(
+      '[data-action="activity-filters"]'
+    );
+    assert.ok(toggle);
+    toggle.click();
+    assert.equal(
+      pageElement.querySelector('[id="activity-feed-filters"]')?.hidden,
+      false
+    );
+
+    const projection = projectActivityFeed(firstSnapshot, {
+      scope: { source_id: 'source-a', job_id: 'job-one' },
+    });
+    const projectOne = projection.filterOptions.projects.find((option) =>
+      option.label.startsWith('Project One')
+    );
+    const chatA = projection.filterOptions.chats.find(
+      (option) => option.key === projectChatIdentity(firstSnapshot.requests[0]!).key
+    );
+    const chatB = projection.filterOptions.chats.find(
+      (option) => option.key === projectChatIdentity(firstSnapshot.requests[1]!).key
+    );
+    assert.ok(projectOne);
+    assert.ok(chatA);
+    assert.ok(chatB);
+
+    setFakeFilter(pageElement, 'feed:filter-project', projectOne.key);
+    setFakeFilter(pageElement, 'feed:filter-chat', chatA.key);
+    setFakeFilter(pageElement, 'feed:filter-state', 'running');
+    assert.equal(toggle.textContent, 'Filters (3)');
+    assert.equal(fakeRows(pageElement).length, 1);
+    assert.match(
+      fakeRows(pageElement)[0]?.textContent ?? '',
+      /Chat A running request/
+    );
+
+    const expandedRow = fakeRows(pageElement)[0]!;
+    const expandedDetails = expandedRow.querySelector<FakeDetailsElement>('details');
+    assert.ok(expandedDetails);
+    expandedDetails.open = true;
+    expandedDetails.dispatchEvent('toggle');
+    assert.equal(
+      pageElement.querySelector('.aq-feed-running-count')?.textContent,
+      '1 call running visible · 2 calls running in view'
+    );
+
+    setFakeFilter(pageElement, 'feed:filter-chat', chatB.key);
+    setFakeFilter(pageElement, 'feed:filter-state', '');
+    assert.equal(fakeRows(pageElement).length, 1);
+    assert.match(
+      fakeRows(pageElement)[0]?.textContent ?? '',
+      /Chat B completed request/
+    );
+
+    const refreshedSnapshot = makeSnapshot({
+      ...firstSnapshot,
+      requests: [
+        ...firstSnapshot.requests,
+        makeRequest({
+          id: 'chat-a-new',
+          title: 'Chat A new request',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Shared chat',
+          thread_uuid: 'thread-a',
+          binding_id: 'binding-a',
+          state: 'running',
+          updated_at_ms: NOW_MS + 1_000,
+        }),
+      ],
+    });
+    setFakeFilter(pageElement, 'feed:filter-chat', chatA.key);
+    const focusedChatFilter = pageElement.querySelector<FakeElement>(
+      '[data-focus-key="feed:filter-chat"]'
+    );
+    assert.ok(focusedChatFilter);
+    focusedChatFilter.focus();
+    main.scrollTop = 37;
+    page.update(refreshedSnapshot, {
+      scope: { source_id: 'source-a', job_id: 'job-one' },
+    });
+
+    assert.equal(main.scrollTop, 37);
+    assert.equal(
+      (
+        document as unknown as { activeElement: FakeElement | null }
+      ).activeElement,
+      focusedChatFilter
+    );
+    assert.equal(
+      pageElement.querySelector<FakeElement>(
+        '[data-focus-key="feed:filter-chat"]'
+      )?.value,
+      chatA.key
+    );
+    assert.equal(fakeRows(pageElement).length, 2);
+    assert.match(
+      fakeRows(pageElement).map((row) => row.textContent).join(' '),
+      /Chat A new request/
+    );
+    const preservedRow = pageElement.querySelector<FakeElement>(
+      `[data-feed-key="${
+        projection.rows.find((row) => row.request.id === 'chat-a-running')!
+          .domKey
+      }"]`
+    );
+    const preservedDetails = preservedRow?.querySelector<FakeDetailsElement>(
+      'details'
+    );
+    assert.equal(preservedDetails?.open, true);
+    assert.match(
+      pageElement.querySelector('.aq-feed-running-count')?.textContent ?? '',
+      /2 calls running visible · 3 calls running in view/
+    );
+
+    const loadedOlderSnapshot = makeSnapshot({
+      ...refreshedSnapshot,
+      generated_at_ms: NOW_MS + 2_000,
+      requests: [
+        ...refreshedSnapshot.requests,
+        makeRequest({
+          id: 'chat-a-older',
+          title: 'Chat A older request',
+          job_id: 'job-one',
+          project_label: 'Project One',
+          thread_label: 'Shared chat',
+          thread_uuid: 'thread-a',
+          binding_id: 'binding-a',
+          state: 'completed',
+          updated_at_ms: NOW_MS - 5_000,
+          delivery: [],
+        }),
+      ],
+    });
+    page.update(loadedOlderSnapshot, {
+      scope: { source_id: 'source-a', job_id: 'job-one' },
+    });
+    assert.equal(
+      pageElement.querySelector<FakeElement>(
+        '[data-focus-key="feed:filter-chat"]'
+      )?.value,
+      chatA.key
+    );
+    assert.equal(fakeRows(pageElement).length, 3);
+    assert.match(
+      fakeRows(pageElement).map((row) => row.textContent).join(' '),
+      /Chat A older request/
+    );
+    assert.match(
+      pageElement.querySelector('.aq-feed-filter-status')?.textContent ?? '',
+      /Showing 3 of 5 loaded requests/
+    );
+    assert.equal(preservedDetails?.open, true);
+    assert.equal(
+      pageElement.querySelector<FakeElement>(
+        `[data-feed-key="${
+          projection.rows.find((row) => row.request.id === 'chat-a-running')!
+            .domKey
+        }"]`
+      )?.querySelector<FakeDetailsElement>('details'),
+      preservedDetails
+    );
+
+    setFakeFilter(pageElement, 'feed:filter-chat', chatB.key);
+    setFakeFilter(pageElement, 'feed:filter-state', 'running');
+    assert.equal(fakeRows(pageElement).length, 0);
+    assert.match(
+      pageElement.querySelector('.aq-feed-empty')?.textContent ?? '',
+      /No loaded activity matches the selected filters/
+    );
+    assert.match(
+      pageElement.querySelector('.aq-feed-empty')?.textContent ?? '',
+      /Use Clear filters/
+    );
+    assert.equal(
+      pageElement.querySelector('.aq-feed-load-more')?.hidden,
+      false
+    );
+
+    const clear = pageElement.querySelector<FakeElement>(
+      '[data-focus-key="feed:filter-clear"]'
+    );
+    assert.ok(clear);
+    clear.click();
+    assert.equal(fakeRows(pageElement).length, 5);
+    assert.equal(toggle.textContent, 'Filters');
+    assert.equal(
+      pageElement.querySelector('.aq-feed-scope')?.textContent,
+      scopeBefore
+    );
+    assert.equal(
+      pageElement.querySelector('[data-action="activity-all"]')?.hidden,
+      false
+    );
+    const restoredRow = pageElement.querySelector<FakeElement>(
+      `[data-feed-key="${
+        projection.rows.find((row) => row.request.id === 'chat-a-running')!
+          .domKey
+      }"]`
+    );
+    assert.equal(
+      restoredRow?.querySelector<FakeDetailsElement>('details')?.open,
+      true
+    );
+
+    const loadMore = pageElement.querySelector<FakeElement>('.aq-feed-load-more');
+    assert.ok(loadMore);
+    loadMore.click();
+    assert.equal(loadMoreCalls, 1);
+  });
+
+  it('suppresses stale spinners and updates elapsed duration without rebuilding an expanded row', async () => {
+    installActivityFeedDom();
+    const { ActivityFeedPage } = await import('./activity-feed.ts');
+    const page = new ActivityFeedPage();
+    const main = new FakeElement('main');
+    main.className = 'aq-main';
+    main.appendChild(page.element as unknown as FakeElement);
+    const pageElement = page.element as unknown as FakeElement;
+    const runningRequest = makeRequest({
+      id: 'elapsed-running',
+      title: 'Elapsed running request',
+      state: 'running',
+      duration_ms: null,
+      started_at_ms: NOW_MS - 2_000,
+      finished_at_ms: null,
+      updated_at_ms: NOW_MS,
+      thread_label: 'Codex chat',
+      thread_uuid: '00000000-0000-4000-8000-000000000123',
+      binding_id: 'binding-elapsed',
+    });
+    const initialSnapshot = makeSnapshot({
+      generated_at_ms: NOW_MS,
+      requests: [runningRequest],
+    });
+    page.update(initialSnapshot, { scope: null });
+
+    assert.equal(
+      pageElement.querySelector('.aq-feed-chat')?.textContent,
+      'Chat 00000000'
+    );
+    assert.equal(pageElement.querySelectorAll('.aq-feed-spinner').length, 1);
+    const details = fakeFirstRowDetails(pageElement);
+    assert.ok(details);
+    details.open = true;
+    details.dispatchEvent('toggle');
+    const duration = pageElement.querySelector<FakeElement>(
+      '[data-feed-duration]'
+    );
+    assert.equal(duration?.textContent, '2s');
+
+    const laterSnapshot = makeSnapshot({
+      generated_at_ms: NOW_MS + 5_000,
+      requests: [runningRequest],
+    });
+    page.update(laterSnapshot, { scope: null });
+    assert.equal(fakeFirstRowDetails(pageElement), details);
+    assert.equal(details.open, true);
+    assert.equal(duration?.textContent, '7s');
+    assert.match(duration?.title ?? '', /Elapsed 7s/);
+    assert.match(details.textContent, /Elapsed 7s/);
+    assert.doesNotMatch(details.textContent, /Elapsed 2s/);
+    assert.equal(pageElement.querySelectorAll('.aq-feed-spinner').length, 1);
+
+    page.update(laterSnapshot, {
+      scope: null,
+      error: 'Snapshot refresh failed',
+    });
+    assert.equal(pageElement.querySelectorAll('.aq-feed-spinner').length, 0);
+    const staleNotice = pageElement.querySelector('.aq-feed-notice--danger');
+    assert.match(staleNotice?.textContent ?? '', /Last available snapshot/);
+    assert.match(staleNotice?.textContent ?? '', /status may be stale/i);
+    assert.equal(
+      pageElement.querySelector('.aq-feed-status-text')?.textContent,
+      'Running'
+    );
+    assert.equal(fakeFirstRowDetails(pageElement)?.open, true);
+
+    page.update(laterSnapshot, { scope: null, error: null });
+    assert.equal(pageElement.querySelectorAll('.aq-feed-spinner').length, 1);
+    assert.equal(
+      pageElement.querySelector('.aq-feed-status-text')?.textContent,
+      'Running'
+    );
+    assert.equal(fakeFirstRowDetails(pageElement)?.open, true);
+    assert.equal(
+      pageElement.querySelector('.aq-feed-notice--danger'),
+      null
     );
   });
 });

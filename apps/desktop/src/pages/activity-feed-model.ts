@@ -41,6 +41,39 @@ export type LifecycleTone =
   | 'cancelled'
   | 'unknown';
 
+export type ActivityChatLabelSource =
+  | 'thread_label'
+  | 'thread_uuid'
+  | 'binding_id'
+  | 'unknown';
+
+export interface ActivityChatIdentityView {
+  key: string;
+  label: string;
+  detail: string;
+  stableId: string | null;
+  labelSource: ActivityChatLabelSource;
+}
+
+export interface ActivityFeedFilters {
+  projectKey: string | null;
+  chatKey: string | null;
+  state: ObservationLifecycleState | null;
+}
+
+export interface ActivityFilterOption {
+  key: string;
+  label: string;
+  detail: string;
+  count: number;
+}
+
+export interface ActivityFeedFilterOptions {
+  projects: ActivityFilterOption[];
+  chats: ActivityFilterOption[];
+  states: ActivityFilterOption[];
+}
+
 export type ActivityDurationKind = 'recorded' | 'derived' | 'elapsed' | 'unknown';
 
 export interface ActivityDurationView {
@@ -165,7 +198,15 @@ export interface ActivityRequestView {
   job: ObservationJob | null;
   sourceLabel: string;
   sourceDetails: string;
+  projectKey: string;
   projectLabel: string;
+  projectPath: string | null;
+  projectDetail: string;
+  chatKey: string;
+  chatLabel: string;
+  chatDetail: string;
+  chatStableId: string | null;
+  chatLabelSource: ActivityChatLabelSource;
   jobLabel: string;
   jobLinked: boolean;
   jobUnavailable: boolean;
@@ -253,6 +294,14 @@ export interface UnavailableSourceView {
 export interface ActivityFeedProjection {
   scope: ActivityScopeView;
   rows: ActivityRequestView[];
+  filters: ActivityFeedFilters;
+  filterOptions: ActivityFeedFilterOptions;
+  activeFilterCount: number;
+  scopeRowCount: number;
+  visibleRowCount: number;
+  localFilteredCount: number;
+  scopeRunningCount: number;
+  visibleRunningCount: number;
   totalRecorded: number;
   filteredOutCount: number;
   hasMore: boolean;
@@ -266,6 +315,7 @@ export interface ActivityFeedProjection {
 
 export interface ActivityFeedProjectionOptions {
   scope?: ActivityFeedScope | null;
+  filters?: Partial<ActivityFeedFilters> | null;
   now_ms?: number | null;
 }
 
@@ -324,6 +374,17 @@ function trimOrNull(value: string | null | undefined): string | null {
   return trimmed.length > 0 ? trimmed : null;
 }
 
+function usableChatLabel(value: string | null | undefined): string | null {
+  const label = trimOrNull(value);
+  if (label === null) {
+    return null;
+  }
+  // "Codex chat" is a backend display fallback, not a recorded title.
+  return label.replace(/\s+/g, ' ').toLowerCase() === 'codex chat'
+    ? null
+    : label;
+}
+
 function finiteTimestamp(value: number | null | undefined): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
@@ -360,6 +421,89 @@ export function requestIdentityKey(sourceId: string, requestId: string): string 
 
 export function requestDomKey(sourceId: string, requestId: string): string {
   return `${encodeURIComponent(sourceId)}::${encodeURIComponent(requestId)}`;
+}
+
+function compactStableIdentifier(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length <= 12 ? trimmed : trimmed.slice(0, 8);
+}
+
+export function projectIdentityKey(
+  sourceId: string,
+  projectPath: string | null | undefined,
+  projectLabel: string | null | undefined
+): string {
+  const path = trimOrNull(projectPath);
+  const label = trimOrNull(projectLabel) ?? 'Project not reported';
+  return `${sourceId}\u0000project\u0000${path ?? `label:${label}`}`;
+}
+
+export function projectProjectIdentity(
+  sourceId: string,
+  sourceDetails: string,
+  projectPath: string | null | undefined,
+  projectLabel: string | null | undefined
+): {
+  key: string;
+  label: string;
+  path: string | null;
+  detail: string;
+} {
+  const path = trimOrNull(projectPath);
+  const label = trimOrNull(projectLabel) ?? 'Project not reported';
+  return {
+    key: projectIdentityKey(sourceId, path, label),
+    label,
+    path,
+    detail: `Project: ${label} · Project path: ${
+      path ?? 'Not reported'
+    } · ${sourceDetails}`,
+  };
+}
+
+/**
+ * A thread UUID is the most stable chat identity. A durable binding is the
+ * fallback when no thread UUID was recorded. Display labels never key a chat.
+ */
+export function chatIdentityKey(
+  sourceId: string,
+  threadUuid: string | null | undefined,
+  bindingId: string | null | undefined
+): string {
+  const thread = trimOrNull(threadUuid);
+  const binding = trimOrNull(bindingId);
+  return `${sourceId}\u0000chat\u0000${thread ?? binding ?? 'unknown'}`;
+}
+
+export function projectChatIdentity(
+  request: Pick<
+    ObservationRequest,
+    'source_id' | 'thread_label' | 'thread_uuid' | 'binding_id'
+  >
+): ActivityChatIdentityView {
+  const label = usableChatLabel(request.thread_label);
+  const thread = trimOrNull(request.thread_uuid);
+  const binding = trimOrNull(request.binding_id);
+  const stableId = thread ?? binding;
+  const labelSource: ActivityChatLabelSource = label
+    ? 'thread_label'
+    : thread
+      ? 'thread_uuid'
+      : binding
+        ? 'binding_id'
+        : 'unknown';
+  const display =
+    label ??
+    (stableId ? `Chat ${compactStableIdentifier(stableId)}` : 'Unknown chat');
+  return {
+    key: chatIdentityKey(request.source_id, thread, binding),
+    label: display,
+    detail: `Chat: ${display} · Thread ID: ${
+      thread ?? 'Not reported'
+    } · Binding: ${binding ?? 'Not reported'}`,
+    stableId,
+    labelSource,
+  };
 }
 
 export function compactFeedText(
@@ -453,6 +597,220 @@ export function shouldShowSpinner(
   return state === 'running';
 }
 
+export function normalizeActivityFeedFilters(
+  filters: Partial<ActivityFeedFilters> | null | undefined
+): ActivityFeedFilters {
+  const state = trimOrNull(filters?.state);
+  return {
+    projectKey: trimOrNull(filters?.projectKey),
+    chatKey: trimOrNull(filters?.chatKey),
+    state:
+      state !== null && Object.hasOwn(LIFECYCLE_LABELS, state)
+        ? (state as ObservationLifecycleState)
+        : null,
+  };
+}
+
+export function createActivityFeedFilters(
+  overrides: Partial<ActivityFeedFilters> = {}
+): ActivityFeedFilters {
+  return normalizeActivityFeedFilters(overrides);
+}
+
+export function countActiveActivityFilters(
+  filters: Partial<ActivityFeedFilters> | null | undefined
+): number {
+  const normalized = normalizeActivityFeedFilters(filters);
+  return [normalized.projectKey, normalized.chatKey, normalized.state].filter(
+    (value) => value !== null
+  ).length;
+}
+
+export function filterActivityRequestRows(
+  rows: readonly ActivityRequestView[],
+  filters: Partial<ActivityFeedFilters> | null | undefined
+): ActivityRequestView[] {
+  const normalized = normalizeActivityFeedFilters(filters);
+  return rows.filter(
+    (row) =>
+      (normalized.projectKey === null ||
+        row.projectKey === normalized.projectKey) &&
+      (normalized.chatKey === null || row.chatKey === normalized.chatKey) &&
+      (normalized.state === null || row.state === normalized.state)
+  );
+}
+
+interface FilterOptionSeed {
+  key: string;
+  label: string;
+  detail: string;
+  disambiguator: string;
+  count: number;
+}
+
+function compactFilterDisambiguator(value: string): string {
+  const trimmed = value.trim();
+  return trimmed.length <= 24
+    ? trimmed
+    : `${trimmed.slice(0, 12)}…${trimmed.slice(-8)}`;
+}
+
+function addFilterOptionSeed(
+  seeds: Map<string, FilterOptionSeed>,
+  key: string,
+  label: string,
+  detail: string,
+  disambiguator: string
+): void {
+  const existing = seeds.get(key);
+  if (existing) {
+    existing.count += 1;
+    return;
+  }
+  seeds.set(key, {
+    key,
+    label,
+    detail,
+    disambiguator,
+    count: 1,
+  });
+}
+
+function materializeFilterOptions(
+  seeds: Map<string, FilterOptionSeed>
+): ActivityFilterOption[] {
+  const labelCounts = new Map<string, number>();
+  for (const seed of seeds.values()) {
+    labelCounts.set(seed.label, (labelCounts.get(seed.label) ?? 0) + 1);
+  }
+  return Array.from(seeds.values())
+    .map((seed) => {
+      const duplicateLabel = (labelCounts.get(seed.label) ?? 0) > 1;
+      const suffix =
+        duplicateLabel && seed.disambiguator
+          ? ` · ${compactFilterDisambiguator(seed.disambiguator)}`
+          : '';
+      return {
+        key: seed.key,
+        label: `${seed.label}${suffix}`,
+        detail: seed.detail,
+        count: seed.count,
+      };
+    })
+    .sort(
+      (left, right) =>
+        compareText(left.label.toLowerCase(), right.label.toLowerCase()) ||
+        compareText(left.key, right.key)
+    );
+}
+
+/** Options describe only requests already loaded in the active view. */
+export function projectActivityFilterOptions(
+  rows: readonly ActivityRequestView[]
+): ActivityFeedFilterOptions {
+  const projects = new Map<string, FilterOptionSeed>();
+  const chats = new Map<string, FilterOptionSeed>();
+  const states = new Map<string, FilterOptionSeed>();
+
+  for (const row of rows) {
+    const projectTail = row.projectPath
+      ? row.projectPath.split(/[\\/]/).filter(Boolean).slice(-2).join('/')
+      : null;
+    addFilterOptionSeed(
+      projects,
+      row.projectKey,
+      row.projectLabel,
+      row.projectDetail,
+      [row.request.source_id, projectTail].filter(Boolean).join(' · ')
+    );
+    addFilterOptionSeed(
+      chats,
+      row.chatKey,
+      row.chatLabel,
+      row.chatDetail,
+      [row.request.source_id, row.chatStableId].filter(Boolean).join(' · ')
+    );
+    addFilterOptionSeed(
+      states,
+      row.state,
+      row.stateLabel,
+      `Recorded lifecycle state: ${row.stateLabel} (${row.state})`,
+      ''
+    );
+  }
+
+  return {
+    projects: materializeFilterOptions(projects),
+    chats: materializeFilterOptions(chats),
+    states: materializeFilterOptions(states),
+  };
+}
+
+export function formatActivityFilterCoverage(
+  scopeRowCount: number,
+  visibleRowCount: number,
+  activeFilterCount: number
+): string {
+  const scope = Math.max(
+    0,
+    Number.isFinite(scopeRowCount) ? Math.trunc(scopeRowCount) : 0
+  );
+  const visible = Math.min(
+    scope,
+    Math.max(
+      0,
+      Number.isFinite(visibleRowCount) ? Math.trunc(visibleRowCount) : 0
+    )
+  );
+  const active = Math.max(
+    0,
+    Number.isFinite(activeFilterCount) ? Math.trunc(activeFilterCount) : 0
+  );
+  const suffix = 'Filters apply to loaded activity only.';
+  if (scope === 0) {
+    return `No loaded requests are available to filter. ${suffix}`;
+  }
+  if (active === 0) {
+    return `${pluralizedCount(
+      scope,
+      'loaded request',
+      'loaded requests'
+    )} available to filter. ${suffix}`;
+  }
+  return `Showing ${visible} of ${pluralizedCount(
+    scope,
+    'loaded request',
+    'loaded requests'
+  )}. ${suffix}`;
+}
+
+/** Keep filtered running counts visibly separate from the wider loaded scope. */
+export function formatActivityRunningCountLabel(
+  visibleCount: number,
+  scopeCount: number
+): string {
+  const scope = Math.max(
+    0,
+    Number.isFinite(scopeCount) ? Math.trunc(scopeCount) : 0
+  );
+  const visible = Math.min(
+    scope,
+    Math.max(0, Number.isFinite(visibleCount) ? Math.trunc(visibleCount) : 0)
+  );
+  if (scope === 0) {
+    return '';
+  }
+  if (visible === scope) {
+    return formatRunningCountLabel(scope);
+  }
+  if (visible === 0) {
+    return `0 visible · ${formatRunningCountLabel(scope)} in view`;
+  }
+  return `${formatRunningCountLabel(visible)} visible · ${formatRunningCountLabel(
+    scope
+  )} in view`;
+}
+
 export function formatRequesterEvidence(
   evidence: ObservationActor['evidence'] | null | undefined
 ): RequesterEvidenceLabel {
@@ -537,8 +895,13 @@ export function formatExecutorRoleLabel(
   role: string | null | undefined
 ): string {
   const value = trimOrNull(role);
-  return value === null || value === 'Not reported'
-    ? 'Role not reported'
+  if (value === null || value === 'Not reported') {
+    return 'Role not reported';
+  }
+  // The canonical execution role stays `coder` in records and digests. Only
+  // the human-facing role presentation is Worker.
+  return value.toLowerCase() === 'coder'
+    ? 'Worker'
     : humanizeRecordedLabel(value);
 }
 
@@ -672,11 +1035,13 @@ export function projectTimelineDisplay(
     const selectedModel = formatRequesterSelectedModel(actor);
     const detail = [
       view.requesterLabel,
-      trimOrNull(actor.role) ? capitalizeLabel(humanizeRecordedLabel(actor.role!)) : null,
+      trimOrNull(actor.role)
+        ? capitalizeLabel(formatExecutorRoleLabel(actor.role))
+        : null,
       selectedModel,
       trimOrNull(actor.source),
     ].filter(Boolean).join(' · ');
-    const conversation = trimOrNull(view.request.thread_label);
+    const conversation = usableChatLabel(view.request.thread_label);
     return {
       label: 'Requester',
       detail,
@@ -1563,7 +1928,7 @@ export function formatConversationDetails(
   request: Pick<ObservationRequest, 'binding_id' | 'thread_uuid' | 'thread_label'>
 ): string {
   const parts: string[] = [];
-  const label = trimOrNull(request.thread_label);
+  const label = usableChatLabel(request.thread_label);
   if (label) {
     parts.push(`Thread: ${label}`);
   }
@@ -1688,7 +2053,12 @@ function buildTimelineEvents(view: ActivityRequestView): ActivityTimelineEventVi
     `Project: ${view.projectLabel}`,
     `Job: ${jobDetail}`,
     `Conversation: ${view.conversationDetails}`,
-    `Root executor: ${view.executorRoleLabel} · tool ${view.executorTool} · provider ${view.executorProvider}`,
+    `Root executor: ${view.executorRoleLabel}${
+      view.executorRole !== 'Not reported' &&
+      view.executorRole !== view.executorRoleLabel
+        ? ` · recorded role ${view.executorRole}`
+        : ''
+    } · tool ${view.executorTool} · provider ${view.executorProvider}`,
     `Root model: requested ${view.requestedModel} · observed ${view.observedModel}`,
     `Root effort: requested ${view.requestedEffort} · observed ${view.observedEffort}`,
     view.calledExecutor
@@ -1855,6 +2225,21 @@ export function buildActivityRequestView(
     executor?.requested_model,
     executor?.observed_model
   );
+  const sourceDetails = formatSourceDetails(source, request.source_id);
+  const projectLabel =
+    trimOrNull(request.project_label) ??
+    trimOrNull(jobResolution.job?.project_label) ??
+    'Project not reported';
+  const projectPath =
+    trimOrNull(jobResolution.job?.project_path) ??
+    trimOrNull(source?.project_path);
+  const projectIdentity = projectProjectIdentity(
+    request.source_id,
+    sourceDetails,
+    projectPath,
+    projectLabel
+  );
+  const chatIdentity = projectChatIdentity(request);
 
   const view: ActivityRequestView = {
     key: requestIdentityKey(request.source_id, request.id),
@@ -1863,11 +2248,16 @@ export function buildActivityRequestView(
     source,
     job: jobResolution.job,
     sourceLabel: source ? trimOrNull(source.label) ?? source.id : 'Source details unavailable',
-    sourceDetails: formatSourceDetails(source, request.source_id),
-    projectLabel:
-      trimOrNull(request.project_label) ??
-      trimOrNull(jobResolution.job?.project_label) ??
-      'Project not reported',
+    sourceDetails,
+    projectKey: projectIdentity.key,
+    projectLabel: projectIdentity.label,
+    projectPath: projectIdentity.path,
+    projectDetail: projectIdentity.detail,
+    chatKey: chatIdentity.key,
+    chatLabel: chatIdentity.label,
+    chatDetail: chatIdentity.detail,
+    chatStableId: chatIdentity.stableId,
+    chatLabelSource: chatIdentity.labelSource,
     jobLabel: jobResolution.label,
     jobLinked: jobResolution.linked,
     jobUnavailable: jobResolution.unavailable,
@@ -1980,7 +2370,7 @@ export function projectActivityFeed(
       )
     : uniqueRequests;
 
-  const rows = scopedRequests
+  const loadedRows = scopedRequests
     .map((request) => buildActivityRequestView(snapshot, request, nowMs))
     .sort((left, right) => {
       const leftMs = left.meaningfulAtMs;
@@ -2000,6 +2390,10 @@ export function projectActivityFeed(
       }
       return compareText(left.request.id, right.request.id);
     });
+  const filters = normalizeActivityFeedFilters(options.filters);
+  const filterOptions = projectActivityFilterOptions(loadedRows);
+  const rows = filterActivityRequestRows(loadedRows, filters);
+  const activeFilterCount = countActiveActivityFilters(filters);
 
   const unavailableSources = (snapshot.sources ?? [])
     .filter((source) => source.availability === 'unavailable')
@@ -2018,8 +2412,16 @@ export function projectActivityFeed(
   return {
     scope: describeActivityScope(snapshot, scope),
     rows,
+    filters,
+    filterOptions,
+    activeFilterCount,
+    scopeRowCount: loadedRows.length,
+    visibleRowCount: rows.length,
+    localFilteredCount: loadedRows.length - rows.length,
+    scopeRunningCount: countRunningRequests(loadedRows),
+    visibleRunningCount: countRunningRequests(rows),
     totalRecorded: uniqueRequests.length,
-    filteredOutCount: uniqueRequests.length - rows.length,
+    filteredOutCount: uniqueRequests.length - loadedRows.length,
     hasMore: snapshot.has_more === true,
     jobsHasMore: snapshot.jobs_has_more === true,
     warnings,
