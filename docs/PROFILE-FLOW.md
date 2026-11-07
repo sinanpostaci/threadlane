@@ -105,22 +105,28 @@ For the trusted-local operator CLI wrapper (`threadlane-flow`), see
      `WorkflowRole::Closure`) when an explicit reasoning effort is configured and validated by
      `threadlane_workers::resolve_model_target(WorkerProvider::CodexCli, ...)`.
    - The approved Coworker controller path separately uses `normalize_coder_choice` after exact
-     role/policy preflight. New Codex Coder approvals freeze provider, canonical executable,
-     model/effort, `standalone=false`, TaskFiles permissions and finite write scopes into their
-     subject digest. The host accepts only these complete frozen contracts; persisted
-     `provider=None` native records retain their original digest and manual semantics.
-     `WorkflowRole::Follower` remains native. Saved profiles or catalog entries never grant authority without an explicit
-     `ExecutionPolicy` and the required `PlanningAdviceGrant` or
-     `FrozenControllerCapabilityEnvelope` gate.
+     role/policy preflight for the user-facing **Worker** execution role (canonical
+     `WorkflowRole::Coder`, wire/storage identifier `"coder"`). User-facing surfaces call this
+     role `Worker` because Threadlane can coordinate more than software coding tasks, while
+     canonical `WorkflowRole::Coder` (`"coder"`), persisted profile/approval keys, function names
+     (`normalize_coder_choice`), and v1 digests are retained for compatibility. Renaming the
+     display label does not add arbitrary non-repository jobs: tasks remain bounded to a canonical
+     Git repository, base commit, and finite repository-relative write scopes. New Codex Worker
+     (`coder`) approvals freeze provider, canonical executable, model/effort, `standalone=false`,
+     TaskFiles permissions and finite write scopes into their subject digest. The host accepts only
+     these complete frozen contracts; persisted `provider=None` native records retain their
+     original digest and manual semantics. `WorkflowRole::Follower` remains native. Saved profiles
+     or catalog entries never grant authority without an explicit `ExecutionPolicy` and the
+     required `PlanningAdviceGrant` or `FrozenControllerCapabilityEnvelope` gate.
    - Because Linux `codex exec --json` does not emit runtime model or effort telemetry on stdout,
-     `CodexCli` Coder, review and closure evidence records the verified pinned launch
+     `CodexCli` Worker (`coder`), review and closure evidence records the verified pinned launch
      configuration explicitly and separately from runtime-observed stream telemetry: absent
      observed model/effort remains `None` with no `requested -> observed` fallback, while legacy
      `Antigravity` and `OpencodeV2` runtime telemetry requirements remain strict. See
      [`docs/CODEX-ADVISORY.md`](CODEX-ADVISORY.md) and [`docs/CODEX-CODER.md`](CODEX-CODER.md).
-     Coder execution retains an immutable private source report and a compact sanitized launch
-     proof with its digest. The original/dependent task and derived correction paths verify the
-     exact launch against frozen authority and owned worktree scope. Passing checks, Reviewer
+     Worker (`coder`) execution retains an immutable private source report and a compact sanitized
+     launch proof with its digest. The original/dependent task and derived correction paths verify
+     the exact launch against frozen authority and owned worktree scope. Passing checks, Reviewer
      receipts, integration and one Closure remain mandatory; a launch pin never accepts work.
 5. **Explicit approvals and separately started hosts**:
    - Creating a cycle requires an existing frozen [`ApprovalRecord`] from
@@ -219,12 +225,12 @@ A sealed receipt without its corresponding worker snapshot is insufficient for
 reconciliation. The handoff remains unresolved until matching worker evidence
 becomes available; missing telemetry is never converted into completion.
 
-## Codex Coder acceptance boundary
+## Codex Worker (`coder`) acceptance boundary
 
 The frozen controller path supports explicitly selected Codex CLI models and reasoning efforts
-(for example `gpt-6-luna` / `max`) for original tasks, dependency-bound tasks and authorized
-in-scope corrections. This does not change the native Coworker model, installed profiles or
-manual role-flow handoff semantics. Future-call profile adoption is a separate follow-up.
+(for example `gpt-6-luna` / `max`) for original Worker (`coder`) tasks, dependency-bound tasks and
+authorized in-scope corrections. This does not change the native Coworker model, installed profiles
+or manual role-flow handoff semantics. Future-call profile adoption is a separate follow-up.
 
 Linux offline fixtures exercise the full pipeline with deterministic subprocesses, including
 parallel roots, a rejected original candidate, one correction, dependent input receipts, checks,

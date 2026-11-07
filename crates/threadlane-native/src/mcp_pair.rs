@@ -127,8 +127,30 @@ enum McpWorkflowRole {
     Orchestrator,
     Architect,
     Coder,
+    Worker,
     Reviewer,
     Closure,
+}
+
+impl From<McpWorkflowRole> for WorkflowRole {
+    fn from(role: McpWorkflowRole) -> Self {
+        match role {
+            McpWorkflowRole::Follower => Self::Follower,
+            McpWorkflowRole::Orchestrator => Self::Orchestrator,
+            McpWorkflowRole::Architect => Self::Architect,
+            McpWorkflowRole::Coder | McpWorkflowRole::Worker => Self::Coder,
+            McpWorkflowRole::Reviewer => Self::Reviewer,
+            McpWorkflowRole::Closure => Self::Closure,
+        }
+    }
+}
+
+fn deserialize_mcp_workflow_role<'de, D>(deserializer: D) -> Result<WorkflowRole, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let role = McpWorkflowRole::deserialize(deserializer)?;
+    Ok(WorkflowRole::from(role))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -143,8 +165,9 @@ enum McpDifficulty {
 /// Schema-validated task node within a [`SaveDraftParams`] request.
 ///
 /// Mirrors [`PlanTask`] with strict `#[serde(deny_unknown_fields)]` and `schemars::JsonSchema`
-/// support while deserializing [`WorkflowRole`] and [`Difficulty`] through their canonical
-/// enum serde implementations.
+/// support while accepting both `"worker"` and canonical `"coder"` at the MCP single-role input
+/// boundary (normalizing to canonical [`WorkflowRole::Coder`] so serialized and persisted task
+/// records remain `"coder"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanTaskParams {
@@ -152,8 +175,9 @@ pub struct PlanTaskParams {
     pub id: String,
     /// Short human-readable task title.
     pub title: String,
-    /// Workflow role used to resolve the target model from the workflow profile (`follower`, `orchestrator`, `architect`, `coder`, `reviewer`, `closure`).
+    /// Workflow role used to resolve the target model from the workflow profile (`follower`, `orchestrator`, `architect`, `worker` or canonical `coder`, `reviewer`, `closure`; normalizes `worker` to canonical `coder`).
     #[schemars(with = "McpWorkflowRole")]
+    #[serde(deserialize_with = "deserialize_mcp_workflow_role")]
     pub role: WorkflowRole,
     /// Task difficulty tier used to resolve the target model from the workflow profile (`easy`, `medium`, `hard`, `extreme`).
     #[schemars(with = "McpDifficulty")]
@@ -1823,7 +1847,7 @@ impl PairedMcpServer {
     /// Delegated `operating_guide` tool (requires verified operator enrollment).
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-07.v1) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes bounded historical fatal_error and advisory original-host Coder progress-attention limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-07.v2) for the enrolled chat binding. Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes bounded historical fatal_error and advisory original-host Worker (coder) progress-attention limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -2143,7 +2167,7 @@ impl PairedMcpServer {
     /// Lists a bounded page of configured workflow profiles from the operator registry (requires verified operator enrollment).
     #[tool(
         name = "catalog",
-        description = "List a bounded cursor-paginated page of configured workflow profiles and active five-role execution assignments from the operator registry for the enrolled chat binding. Omits legacy follower assignments, CLI executable paths, and credentials; assignments referencing disabled tools report tool_enabled: false and available: false without model substitution.",
+        description = "List a bounded cursor-paginated page of configured workflow profiles and active five-role execution assignments (including derived human-readable role_label such as Worker for canonical coder) from the operator registry for the enrolled chat binding. Omits legacy follower assignments, CLI executable paths, and credentials; assignments referencing disabled tools report tool_enabled: false and available: false without model substitution.",
         annotations(
             title = "List Workflow Profile Catalog",
             read_only_hint = true,
@@ -2214,7 +2238,7 @@ impl PairedMcpServer {
     /// Creates or updates a draft workflow plan revision owned by the enrolled chat binding (requires verified operator enrollment).
     #[tool(
         name = "save_draft",
-        description = "Create or update an unapproved draft workflow plan revision scoped to the enrolled chat binding. Validates task DAG acyclicity, repository-relative non-protected allowed_write_paths, and role/difficulty resolution against the pinned profile_revision before persisting.",
+        description = "Create or update an unapproved draft workflow plan revision scoped to the enrolled chat binding. Accepts task role worker or canonical coder (persisting canonical coder) and validates task DAG acyclicity, repository-relative non-protected allowed_write_paths, and role/difficulty resolution against the pinned profile_revision before persisting.",
         annotations(
             title = "Save Workflow Plan Draft",
             read_only_hint = false,
@@ -2805,7 +2829,7 @@ impl PairedMcpServer {
     /// Enqueues an Orchestrator technical planning command for a prepared Coworker job and triggers detached execution via `threadlane-flow` (requires verified operator enrollment).
     #[tool(
         name = "request_technical_plan",
-        description = "Enqueue an Orchestrator technical planning command for (grant_id, job_id) under an active standing planning grant and trigger detached background execution via the canonical sibling threadlane-flow process. Open technical questions and proposed additions are allowed into technical planning, while execution approval remains blocked until open questions and unconfirmed proposals are resolved. Never accepts caller-built task DAGs, never self-approves execution, and never starts coder/reviewer workers.",
+        description = "Enqueue an Orchestrator technical planning command for (grant_id, job_id) under an active standing planning grant and trigger detached background execution via the canonical sibling threadlane-flow process. Open technical questions and proposed additions are allowed into technical planning, while execution approval remains blocked until open questions and unconfirmed proposals are resolved. Never accepts caller-built task DAGs, never self-approves execution, and never starts Worker (coder) or Reviewer workers.",
         annotations(
             title = "Request Orchestrator Technical Plan",
             read_only_hint = false,
@@ -2996,7 +3020,7 @@ impl PairedMcpServer {
     /// Reads the current verified `CoworkerCodeDriver` status for an approved Coworker job (requires verified operator enrollment).
     #[tool(
         name = "execution_status",
-        description = "Read the current verified CoworkerCodeDriver execution status for job_id in the enrolled (binding_id, thread_uuid), including live physical owner verification, task stages, unknown-effect blocking flags, legacy/diagnostic overall_status, execution_mode, pipeline_status, pipeline_report, stopping_draining_in_flight, and native_notice/latest plus native_notice_error metadata. AllTasksIntegrated is not completion; completion requires the required combined checks and exactly one accepted Closure. Older scopes may report the diagnostic Phase 1 fallback; completed Coder runs are never inferred as accepted or integrated. A status read after an event is not a new dispatch.",
+        description = "Read the current verified CoworkerCodeDriver execution status for job_id in the enrolled (binding_id, thread_uuid), including live physical owner verification, task stages, unknown-effect blocking flags, legacy/diagnostic overall_status, execution_mode, pipeline_status, pipeline_report, stopping_draining_in_flight, and native_notice/latest plus native_notice_error metadata. AllTasksIntegrated is not completion; completion requires the required combined checks and exactly one accepted Closure. Older scopes may report the diagnostic Phase 1 fallback; completed Worker (coder) runs are never inferred as accepted or integrated. A status read after an event is not a new dispatch.",
         annotations(
             title = "Get Coworker Execution Status",
             read_only_hint = true,
@@ -3048,7 +3072,7 @@ impl PairedMcpServer {
     /// Records durable operator stop first and performs narrow `CoworkerCodeDriver` task cancellation for an approved Coworker job (requires verified operator enrollment).
     #[tool(
         name = "stop_execution",
-        description = "Record durable stop_requested state first and perform narrow CoworkerCodeDriver cancellation for job_id in the enrolled (binding_id, thread_uuid) with an optional bounded reason. Signals original and derived Coder tasks, drains finite Reviewer/check/Closure calls, and fences late outputs without broad process kills; remote inference termination is not proven.",
+        description = "Record durable stop_requested state first and perform narrow CoworkerCodeDriver cancellation for job_id in the enrolled (binding_id, thread_uuid) with an optional bounded reason. Signals original and derived Worker (coder) tasks, drains finite Reviewer/check/Closure calls, and fences late outputs without broad process kills; remote inference termination is not proven.",
         annotations(
             title = "Stop Coworker Execution",
             read_only_hint = false,

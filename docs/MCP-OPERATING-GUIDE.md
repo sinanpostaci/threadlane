@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-07.v1`
+Version: `2026-11-07.v2`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -11,10 +11,17 @@ Version: `2026-11-07.v1`
   behavior: its model and reasoning effort are selected or changed directly by the
   human in Codex, never by a workflow execution profile slot.
 - Workflow profiles in `catalog` expose the five active execution roles
-  (`Orchestrator`, `Architect`, `Coder` / `coder`, `Reviewer` / `reviewer`, and
-  `Closure` / `closure`) plus optional read-only `decision_advisor` metadata.
-  Historical persisted `follower` entries remain readable for compatibility only and
-  are omitted from active catalog availability.
+  (`Orchestrator`, `Architect`, `Worker` — canonical wire/storage role `coder` with
+  derived `role_label: "Worker"`, `Reviewer` / `reviewer`, and `Closure` /
+  `closure`) plus optional read-only `decision_advisor` metadata. User-facing task
+  execution is called `Worker` because Threadlane can coordinate more than software
+  coding tasks, while canonical `coder` is retained in persisted records, profile
+  keys, and v1 digests for compatibility (`save_draft` accepts `"worker"` or
+  `"coder"` and stores canonical `"coder"`). Renaming the display label does not
+  add arbitrary non-repository jobs: existing canonical Git repository, base-commit,
+  and repository-relative `allowed_write_paths` limits still apply. Historical
+  persisted `follower` entries remain readable for compatibility only and are
+  omitted from active catalog availability.
 - After connecting and reading `operating_guide`, read the configured profile via
   `catalog` (when workflow stores are configured) and refresh live scoped state and
   revisions (`status`, `coworker_status`, `list_plans`, `list_approvals`), then
@@ -85,14 +92,23 @@ Version: `2026-11-07.v1`
      recorded grant to produce the actual `Orchestrator` plan. Before requesting
      human execution approval, prepare the concrete authority scope preview via
      `<context_router_executable> --context <context_path> approve prepare --request <private_json>`
-     and present the plan together with that preview's resolved model/effort, write
-     scopes/files, base commit, `subject_digest`, and planned execution-policy
-     budgets to the human (do not create an extra opaque approval loop, infer broad
-     permission, or treat profile selection as authority).
-  4. Only after exact human execution approval of that presented scope in this
-     chat, record that preview via `<context_router_executable> --context <context_path> approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`,
+     (and, when needed, inspect the matching execution scope preview) and present the
+     plan together with ALL roles (`Worker` / `coder`, `Reviewer`, `Closure`, and any
+     advisory/correction roles), resolved models, efforts, call/attempt caps and
+     budgets, verification check-command scopes, repository-relative write
+     scopes/files, canonical repository and base commit, and `subject_digest` that
+     the later frozen execution envelope will use. Do not infer broad permission or
+     treat profile selection as authority.
+  4. Only after exact human execution approval of that complete presented scope in
+     this chat, record the approval via `<context_router_executable> --context <context_path> approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`,
      preview and record the matching frozen execution envelope via `flow coworker-execution preview`
      and `record`, and call `start_execution` for only that approved execution.
+     Recording `approve record` and the frozen envelope may only bind the exact scope
+     already shown to and approved by the human—recording may never add roles,
+     models, efforts, caps, check commands, or write/base scope. Avoid a redundant
+     extra human approval prompt when the frozen envelope matches that identical
+     already-approved scope; any changed or expanded scope requires a new preview and
+     fresh human approval before recording or starting execution.
   5. If `operator_context.available` is `false`, report its `code` and
      `message` and the concrete store/package configuration needed. Never treat the
      human's generic task request, profile selection, worker prose, another chat's
@@ -100,11 +116,12 @@ Version: `2026-11-07.v1`
      heuristic or claim an MCP self-approval tool. A local `--operator-approved`
      flag remains an explicit operator attestation (`native_per_call_identity_verified: false`),
      not cryptographic proof of human intent or per-call identity.
-- Coding (`coder`), review (`reviewer`), and `closure` are distinct execution
-  roles. Do not silently perform worker role execution or substitute models.
-  Active human scope, model, effort, and quota restrictions always override saved
-  profiles. Reading a profile, `catalog`, or guide grants no execution authority,
-  approval, host startup, or model permission.
+- Task execution (`Worker`, canonical `coder`), review (`Reviewer` / `reviewer`),
+  and `Closure` (`closure`) are distinct execution roles. Do not silently perform
+  worker role execution or substitute models. Active human scope, model, effort,
+  and quota restrictions always override saved profiles. Reading a profile,
+  `catalog`, or guide grants no execution authority, approval, host startup, or
+  model permission.
 
 ## Execute, monitor, and stop
 
@@ -119,9 +136,9 @@ Version: `2026-11-07.v1`
   `stopping_draining_in_flight` for authoritative pipeline state. The Phase 1
   fallback's `ReadyForReview` / `AwaitingChecksOrReview` is never acceptance,
   integration, or completion.
-- `stop_execution` records durable stop first, signals original and derived Coder
-  tasks, drains finite `Reviewer`/check/`Closure` calls, and fences late outputs.
-  A superseded job, or a change to its profile or registry revision, still
+- `stop_execution` records durable stop first, signals original and derived Worker
+  (`coder`) tasks, drains finite `Reviewer`/check/`Closure` calls, and fences late
+  outputs. A superseded job, or a change to its profile or registry revision, still
   permits immutable-scoped status and narrow stop, but never new dispatch. The
   current amendment fences and halts the superseded job as a whole; do not
   promise that unaffected tasks keep advancing. It does not prove remote
@@ -141,9 +158,10 @@ Version: `2026-11-07.v1`
   `execution_status` expose `native_notice` / `latest` and `native_notice_error`
   metadata. Missing notices or endpoint are not new execution authority or model
   permission. Never poll; when an event arrives, read status, not a new dispatch.
-- Automatic Coder corrections currently follow a Reviewer `CorrectInScope` verdict.
-  Failed verification checks settle in `BlockedByFailedChecks`. Allowing or recording
-  a check-failure correction basis does not prove provider execution is implemented.
+- Automatic Worker (`coder`) corrections currently follow a Reviewer
+  `CorrectInScope` verdict. Failed verification checks settle in
+  `BlockedByFailedChecks`. Allowing or recording a check-failure correction basis
+  does not prove provider execution is implemented.
 - After terminal status or once an approved host has stopped (`phase: "stopped"`),
   read `execution_status` and use `approved_activity` (with optional `task_id`,
   `cursor`, `after_seq`, `limit`, or `kind`) to inspect bounded read-only history
@@ -169,7 +187,7 @@ Version: `2026-11-07.v1`
   provider termination. The hint does not permit early cancellation, model
   substitution, blind retry or redispatch, or approval expansion. Respect the
   authorized timeout policy, explicit stop authority, and reconciliation of Unknown effects.
-- Live watchdog attention notices currently cover only original host Coder calls.
+- Live watchdog attention notices currently cover only original host Worker (`coder`) calls.
   Advisory roles and direct derived corrections may carry watchdog diagnostics
   in final reports, but have no during-call notice. OpenCode allocation and
   metadata updates provide no live progress hints. Do not imply universal role,

@@ -102,9 +102,15 @@ impl fmt::Display for TaskExecutionRoute {
 /// Assignments referencing disabled tools are marked with `tool_enabled: false` and
 /// `available: false` without ever substituting an unapproved model or tool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawCatalogRoleAssignment")]
 pub struct CatalogRoleAssignment {
     /// Target workflow role.
     pub role: WorkflowRole,
+    /// Derived human-readable display label for `role` ([`WorkflowRole::display_label`], e.g. `"Worker"` for [`WorkflowRole::Coder`]).
+    ///
+    /// Non-authoritative display metadata built from the canonical `role`; never changes
+    /// executable model assignment, count, availability, authority, or registry snapshots.
+    pub role_label: String,
     /// Optional target difficulty tier (`None` for the explicit role-level default).
     pub difficulty: Option<Difficulty>,
     /// Identifier of the configured model in the registry.
@@ -127,6 +133,45 @@ pub struct CatalogRoleAssignment {
     pub tool_enabled: bool,
     /// Whether this assignment is currently available (`tool_enabled` is `true`).
     pub available: bool,
+}
+
+#[derive(Deserialize)]
+struct RawCatalogRoleAssignment {
+    role: WorkflowRole,
+    #[serde(default)]
+    #[allow(dead_code)]
+    role_label: Option<String>,
+    difficulty: Option<Difficulty>,
+    model_id: String,
+    model_label: String,
+    model_arg: String,
+    effort: Option<String>,
+    tool_id: String,
+    tool_label: String,
+    adapter: ToolAdapter,
+    route: TaskExecutionRoute,
+    tool_enabled: bool,
+    available: bool,
+}
+
+impl From<RawCatalogRoleAssignment> for CatalogRoleAssignment {
+    fn from(raw: RawCatalogRoleAssignment) -> Self {
+        Self {
+            role: raw.role,
+            role_label: raw.role.display_label().to_string(),
+            difficulty: raw.difficulty,
+            model_id: raw.model_id,
+            model_label: raw.model_label,
+            model_arg: raw.model_arg,
+            effort: raw.effort,
+            tool_id: raw.tool_id,
+            tool_label: raw.tool_label,
+            adapter: raw.adapter,
+            route: raw.route,
+            tool_enabled: raw.tool_enabled,
+            available: raw.available,
+        }
+    }
 }
 
 /// Type alias for [`CatalogRoleAssignment`].
@@ -547,5 +592,59 @@ impl ScopedProfileDependencyProof {
         Ok(self
             .spec
             .to_scoped_registry_snapshot(self.provenance_revision))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_role_assignment_derives_role_label_and_defaults_legacy_catalog_reads() {
+        let legacy_json = serde_json::json!({
+            "role": "coder",
+            "difficulty": "hard",
+            "model_id": "argon-high",
+            "model_label": "Model argon-high",
+            "model_arg": "gemini-4-argon-high",
+            "effort": "high",
+            "tool_id": "agy",
+            "tool_label": "Tool agy",
+            "adapter": "antigravity",
+            "route": "headless_worker",
+            "tool_enabled": true,
+            "available": true
+        });
+        let decoded: CatalogRoleAssignment =
+            serde_json::from_value(legacy_json).expect("decode legacy CatalogRoleAssignment");
+        assert_eq!(decoded.role, WorkflowRole::Coder);
+        assert_eq!(decoded.role_label, "Worker");
+
+        let serialized = serde_json::to_value(&decoded).expect("serialize CatalogRoleAssignment");
+        assert_eq!(serialized["role"], "coder");
+        assert_eq!(serialized["role_label"], "Worker");
+
+        let round_trip: CatalogRoleAssignment =
+            serde_json::from_value(serialized).expect("round-trip CatalogRoleAssignment");
+        assert_eq!(round_trip, decoded);
+
+        let worker_role_json = serde_json::json!({
+            "role": "worker",
+            "difficulty": "easy",
+            "model_id": "deepseek-flash",
+            "model_label": "Model deepseek-flash",
+            "model_arg": "opencode-go/deepseek-v4.1-flash",
+            "effort": "max",
+            "tool_id": "opencode",
+            "tool_label": "Tool opencode",
+            "adapter": "opencode_v2",
+            "route": "headless_worker",
+            "tool_enabled": true,
+            "available": true
+        });
+        assert!(
+            serde_json::from_value::<CatalogRoleAssignment>(worker_role_json).is_err(),
+            "CatalogRoleAssignment.role uses canonical WorkflowRole serde and must not accept non-canonical wire role strings"
+        );
     }
 }

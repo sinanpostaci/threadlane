@@ -1169,6 +1169,7 @@ fn build_catalog_profile(
         let available = tool_enabled && route.is_supported();
         assignments.push(CatalogRoleAssignment {
             role: assignment.role,
+            role_label: assignment.role.display_label().to_string(),
             difficulty: assignment.difficulty,
             model_id: model.id.clone(),
             model_label: model.label.clone(),

@@ -13,10 +13,15 @@ it does not create new authority by itself.
   a technical plan and task breakdown. It does not execute code.
 - **Architect** — a read-only adviser for focused design or interface questions.
   Architect advice informs a plan; it is not approval to run work.
-- **Coder** — the implementation role. It works only inside the approved task scope
-  and its isolated worktree.
-- **Reviewer** — reviews a Coder candidate against the approved task and returns a
-  structured verdict, not just praise or prose.
+- **Worker (`coder`)** — the task execution role. User-facing surfaces call this role
+  Worker because Threadlane can coordinate more than software coding, while persisted
+  records, profile keys, and v1 digests retain the canonical identifier `coder` for
+  compatibility (`catalog` exposes `role: "coder"` with derived `role_label: "Worker"`,
+  and `save_draft` accepts `"worker"` or `"coder"` while persisting `"coder"`). A
+  Worker still runs only inside an approved repository task worktree and its explicit
+  repository-relative write scope; the label does not add arbitrary non-repository jobs.
+- **Reviewer** — reviews a Worker (`coder`) candidate against the approved task and
+  returns a structured verdict, not just praise or prose.
 - **Closure** — the single final review of the combined candidate produced by the
   whole job. Closure acceptance is not merge, push or install permission, and it does
   not replace required checks.
@@ -30,8 +35,8 @@ it does not create new authority by itself.
   approval of its exact scope. Planning may read; approved execution has not begun.
 - **Running** — a worker attempt is actively executing. This is activity, not proof
   of success.
-- **Ready for review** — the Coder finished and passed the post-run diff gate. A
-  candidate exists and needs structured review; it is **not** accepted yet.
+- **Ready for review** — the Worker (`coder`) finished and passed the post-run diff
+  gate. A candidate exists and needs structured review; it is **not** accepted yet.
 - **Correct in scope** — this can follow a Reviewer verdict of Correct in scope, or a
   genuine failed frozen check when automatic check-failure corrections were explicitly
   enabled in the exact frozen approval. The corrective attempt stays inside the
@@ -61,8 +66,8 @@ it does not create new authority by itself.
   duration or copy another model’s numbers.
 - **Delivered, acknowledged, read** — delivery is transport. An ACK confirms the
   recorded batch, not that a person read it or that a model explained it.
-- **Coder completed** — output exists and may be ready for review. It is not approval,
-  acceptance, integration or workflow completion.
+- **Worker (`coder`) completed** — output exists and may be ready for review. It is not
+  approval, acceptance, integration or workflow completion.
 - **Full workflow completed** — requires the actual checks, review receipts and final
   closure. A clean exit, a summary, or a merge/push/install is not a substitute.
 - **Duplicate or missing events** — reconcile durable receipts and state. Do not

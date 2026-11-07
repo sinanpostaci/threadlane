@@ -17,7 +17,10 @@ runtime snapshot; it does not execute a worker or test paid model access.
   inspection checks installed files, not upstream updates.
 - Import the intended provider's models and efforts. OpenCode Go and API routes
   are distinct. Catalog visibility does not prove subscription entitlement.
-- Save the desired role assignments in **Profiles**. A complete workflow has
+- Save the desired role assignments in **Profiles**. The five active execution
+  roles are `Orchestrator`, `Architect`, `Worker` (stored under the canonical
+  role key `coder` for backward compatibility, with derived `role_label:
+  "Worker"` in `catalog`), `Reviewer`, and `Closure`. A complete workflow has
   valid role defaults; difficulty overrides supplement those defaults. A saved
   model assignment does not authorize using that model.
 - Attach the intended real runtime in **Settings → Connections**, then select
@@ -44,11 +47,16 @@ binding or use a chat title as identity.
 threadlane-context --context /private/project-context.json workflow catalog
 ```
 
-Ask Codex to prepare one bounded task, including the model, effort, write paths,
-base commit, timeout and checks. Inspect the frozen execution preview in the
-conversation and approve that exact scope. Existing operator commands then
-record the approval, explicitly start the host and dispatch only approved tasks.
-See [native operator commands](NATIVE-OPERATOR.md) and
+Ask Codex to prepare one bounded Worker (`coder`) task, including the model,
+effort, repository-relative write paths, base commit, timeout and checks. User-facing
+surfaces call the task execution role `Worker` because Threadlane can support
+more than software coding, while raw stored records retain canonical `coder`
+(`save_draft` accepts `"worker"` or `"coder"`) and existing repository/worktree
+and write-scope limits still apply (renaming does not enable arbitrary
+non-repository jobs). Inspect the frozen execution preview in the conversation
+and approve that exact scope. Existing operator commands then record the
+approval, explicitly start the host and dispatch only approved tasks. See
+[native operator commands](NATIVE-OPERATOR.md) and
 [approval](NATIVE-APPROVAL.md).
 
 For the first run, keep the change small enough to inspect independently, such
@@ -60,7 +68,7 @@ reviewed, accepted, merged or pushed.
 
 Use the explicitly selected notification route for the approved session. A
 notification carries software-owned identifiers and pull/ACK instructions,
-never new execution authority. The follower pulls events, summarizes relevant
+never new execution authority. The Coworker pulls events, summarizes relevant
 progress or questions and acknowledges the actual returned batch ID.
 
 Continue asking questions or steering in Codex. Record scope and model changes

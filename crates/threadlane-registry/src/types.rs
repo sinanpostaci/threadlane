@@ -227,7 +227,7 @@ pub enum WorkflowRole {
     /// System and task architect role.
     #[serde(rename = "architect")]
     Architect,
-    /// Implementation coder role.
+    /// Task execution worker role (user-facing label `Worker`; canonical wire and storage identifier `"coder"`).
     #[serde(rename = "coder")]
     Coder,
     /// Task verification and code reviewer role.
@@ -249,7 +249,7 @@ impl WorkflowRole {
         Self::Closure,
     ];
 
-    /// The five configurable execution roles in Threadlane profiles (`Orchestrator`, `Architect`, `Coder`, `Reviewer`, `Closure`).
+    /// The five configurable execution roles in Threadlane profiles (`Orchestrator`, `Architect`, `Coder` / user-facing `Worker`, `Reviewer`, `Closure`).
     ///
     /// Native Coworker chat model selection is controlled by the human in Codex and is outside
     /// profile execution role assignments.
@@ -271,7 +271,7 @@ impl WorkflowRole {
         matches!(self, Self::Follower)
     }
 
-    /// Returns the canonical `snake_case` identifier for this role.
+    /// Returns the canonical `snake_case` identifier for this role (`"coder"` for [`Self::Coder`]).
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Follower => "follower",
@@ -280,6 +280,18 @@ impl WorkflowRole {
             Self::Coder => "coder",
             Self::Reviewer => "reviewer",
             Self::Closure => "closure",
+        }
+    }
+
+    /// Returns the human-readable user-facing display label for this role (`"Worker"` for [`Self::Coder`]).
+    pub const fn display_label(self) -> &'static str {
+        match self {
+            Self::Follower => "Follower",
+            Self::Orchestrator => "Orchestrator",
+            Self::Architect => "Architect",
+            Self::Coder => "Worker",
+            Self::Reviewer => "Reviewer",
+            Self::Closure => "Closure",
         }
     }
 }
@@ -298,7 +310,7 @@ impl FromStr for WorkflowRole {
             "follower" => Ok(Self::Follower),
             "orchestrator" => Ok(Self::Orchestrator),
             "architect" => Ok(Self::Architect),
-            "coder" => Ok(Self::Coder),
+            "coder" | "worker" => Ok(Self::Coder),
             "reviewer" => Ok(Self::Reviewer),
             "closure" => Ok(Self::Closure),
             _ => Err(RegistryError::InvalidInput(
@@ -623,4 +635,78 @@ pub struct ScopedProfileDependencySpec {
     pub models: Vec<ScopedModelDependency>,
     /// Referenced tool definitions sorted by `id`.
     pub tools: Vec<ScopedToolDependency>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    #[test]
+    fn workflow_role_display_label_from_str_alias_and_strict_serde_contract() {
+        assert_eq!(WorkflowRole::Follower.as_str(), "follower");
+        assert_eq!(WorkflowRole::Orchestrator.as_str(), "orchestrator");
+        assert_eq!(WorkflowRole::Architect.as_str(), "architect");
+        assert_eq!(WorkflowRole::Coder.as_str(), "coder");
+        assert_eq!(WorkflowRole::Reviewer.as_str(), "reviewer");
+        assert_eq!(WorkflowRole::Closure.as_str(), "closure");
+
+        assert_eq!(WorkflowRole::Coder.to_string(), "coder");
+
+        assert_eq!(WorkflowRole::Follower.display_label(), "Follower");
+        assert_eq!(WorkflowRole::Orchestrator.display_label(), "Orchestrator");
+        assert_eq!(WorkflowRole::Architect.display_label(), "Architect");
+        assert_eq!(WorkflowRole::Coder.display_label(), "Worker");
+        assert_eq!(WorkflowRole::Reviewer.display_label(), "Reviewer");
+        assert_eq!(WorkflowRole::Closure.display_label(), "Closure");
+
+        assert_eq!("coder".parse::<WorkflowRole>(), Ok(WorkflowRole::Coder));
+        assert_eq!("worker".parse::<WorkflowRole>(), Ok(WorkflowRole::Coder));
+        for role in WorkflowRole::ALL {
+            assert_eq!(role.as_str().parse::<WorkflowRole>(), Ok(role));
+        }
+        for unknown in ["Worker", "CODER", "builder", "executor", "", "coder "] {
+            assert_eq!(
+                unknown.parse::<WorkflowRole>(),
+                Err(RegistryError::InvalidInput(
+                    "Unknown workflow role variant."
+                )),
+                "unknown role `{unknown}` must be rejected by FromStr"
+            );
+        }
+
+        // Canonical serde stays "coder" and rejects "worker" so map keys can never collide.
+        assert_eq!(
+            serde_json::to_string(&WorkflowRole::Coder).expect("serialize Coder"),
+            "\"coder\""
+        );
+        assert_eq!(
+            serde_json::from_str::<WorkflowRole>("\"coder\"").expect("deserialize coder"),
+            WorkflowRole::Coder
+        );
+        for rejected in ["\"worker\"", "\"Worker\"", "\"builder\"", "\"unknown\""] {
+            assert!(
+                serde_json::from_str::<WorkflowRole>(rejected).is_err(),
+                "core WorkflowRole serde must reject {rejected}"
+            );
+        }
+
+        let valid_map: BTreeMap<WorkflowRole, &str> =
+            serde_json::from_str(r#"{"coder":"argon-high","reviewer":"astra-high"}"#)
+                .expect("deserialize canonical role map");
+        assert_eq!(valid_map.get(&WorkflowRole::Coder), Some(&"argon-high"));
+        assert!(
+            serde_json::from_str::<BTreeMap<WorkflowRole, String>>(r#"{"worker":"argon-high"}"#)
+                .is_err(),
+            "BTreeMap<WorkflowRole, _> must reject worker key"
+        );
+        assert!(
+            serde_json::from_str::<BTreeMap<WorkflowRole, String>>(
+                r#"{"coder":"argon-high","worker":"override-attempt"}"#
+            )
+            .is_err(),
+            "simultaneous coder and worker keys in a role map must fail closed"
+        );
+    }
 }

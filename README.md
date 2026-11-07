@@ -92,9 +92,15 @@ installed planning, execution, review and completion chain.
   See [Jev shadow advice](docs/JEV-SHADOW.md).
 
 - **Optional decision advisor**: Profiles may reference a global decision API
-  model separately from the five execution roles. Advisors default to off, have no
-  effort setting, and provide shadow advice only. Saving a choice sends no
-  provider request. See [profile decision advisors](docs/PROFILE-ADVISOR.md).
+  model separately from the five execution roles (`Orchestrator`, `Architect`,
+  `Worker` / canonical `coder`, `Reviewer`, and `Closure`). User-facing surfaces
+  display `Worker` for task execution (`WorkflowRole::display_label`, `catalog`
+  `role_label: "Worker"`, and CLI/`save_draft` `"worker"` input normalization) while
+  retaining canonical `coder` (`WorkflowRole::Coder`) in stored profiles, plan/approval
+  records, and v1 digests; tasks remain bounded to repository worktrees and
+  repository-relative write scopes. Advisors default to off, have no effort setting,
+  and provide shadow advice only. Saving a choice sends no provider request. See
+  [profile decision advisors](docs/PROFILE-ADVISOR.md).
 
 - **Profile-selected role cycles**: `threadlane-flow` validates only requested
   roles against an explicit model/effort policy, freezes an approved cycle, and

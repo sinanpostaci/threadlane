@@ -1,7 +1,14 @@
 # Codex CLI Mutable Task Worker (`threadlane-task-files`)
 
 This document describes the worker-layer execution contract for mutable headless `CodexCli`
-(`WorkerProvider::CodexCli`) task-worktree runs in `threadlane-workers`.
+(`WorkerProvider::CodexCli`) task-worktree runs in `threadlane-workers` for the user-facing
+**Worker** execution role (canonical `WorkflowRole::Coder`, wire/storage role `"coder"`).
+User-facing surfaces call this role `Worker` because Threadlane can coordinate more than
+software coding tasks, while this filename (`docs/CODEX-CODER.md`), canonical `WorkflowRole::Coder`
+(`"coder"`), `normalize_coder_choice`, test target `crates/threadlane-workers/tests/codex_coder.rs`,
+and persisted v1 digests are retained for compatibility. Renaming the display label does not add
+arbitrary non-repository jobs: mutable task runs remain bounded to an isolated Git repository
+worktree and finite repository-relative `allowed_write_paths`.
 
 ## Scope and Distinction from Read-Only Advisory Runs
 
@@ -140,12 +147,13 @@ mutable `TaskFiles` reports cannot use historical advisory compatibility.
 
 ## Frozen approved workflow
 
-The approved Coworker controller path supports Codex CLI Coder tasks, including dependency-bound
-tasks and authorized in-scope corrections. Exact provider/model/effort policy admission precedes
-Coder normalization. Approval previews freeze provider, canonical executable, model and effort,
-`standalone=false`, TaskFiles permissions and finite write scopes into the approval digest.
-A new explicitly selected `gpt-6-luna` / `max` Coder can use this route; other explicitly admitted
-Codex CLI targets use the same contract. No runtime registry or native Coworker model is changed.
+The approved Coworker controller path supports Codex CLI Worker (`coder`) tasks, including
+dependency-bound tasks and authorized in-scope corrections. Exact provider/model/effort policy
+admission precedes `normalize_coder_choice`. Approval previews freeze provider, canonical
+executable, model and effort, `standalone=false`, TaskFiles permissions and finite write scopes
+into the approval digest. A new explicitly selected `gpt-6-luna` / `max` Worker (`coder`) can use
+this route; other explicitly admitted Codex CLI targets use the same contract. No runtime registry
+or native Coworker model is changed.
 
 Persisted native Codex approvals with `provider=None` retain their existing digest and manual
 routing. They are never reinterpreted as writable worker contracts. Generic role-flow preflight
