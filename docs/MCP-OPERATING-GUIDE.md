@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-08.v1`
+Version: `2026-11-08.v2`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -116,6 +116,31 @@ Version: `2026-11-08.v1`
      heuristic or claim an MCP self-approval tool. A local `--operator-approved`
      flag remains an explicit operator attestation (`native_per_call_identity_verified: false`),
      not cryptographic proof of human intent or per-call identity.
+  6. The local operator CLI (`context_router_executable`) reaches the live
+     supervisor over local loopback separately from the MCP channel. If a local
+     operator command fails with `transport_unavailable` after
+     `connect_current_chat` succeeded with `operator_context.available: true`,
+     do not assume the supervisor is offline: run one read-only diagnostic
+     `<context_router_executable> --context <context_path> flow grant-list` with
+     the same returned `context_router_executable` and `context_path`. If the
+     command execution sandbox restricts local loopback, obtain narrowly scoped
+     local execution permission for the operator CLI through the actual executor
+     tool's supported mechanism (never disable sandboxing globally, modify
+     firewall/OS settings, install fixed bindings, edit global configuration, or
+     restart the backend). Distinguish command-executor permission from
+     Threadlane human approval: never invoke `grant-record`, `approve record`,
+     `coworker-execution record`, writes, or model calls automatically on
+     transport failure. Once the route is confirmed, `flow grant-prepare` and
+     `approve prepare` are read-only preview steps; explicit human consent to
+     the presented preview digest still precedes `flow grant-record` or
+     `approve record`. Retry only a read-only diagnostic or preview once after
+     permission is granted (no loops), and never replay an effectful or
+     `outcome_unknown` command without reconciling durable receipts first. If
+     local execution permission is unavailable or declined, report that local
+     operator access remains unverified (mentioning a sandbox restriction only
+     when independently confirmed) rather than claiming the supervisor is
+     offline or fabricating a manual substitute for an actual `Orchestrator`
+     technical plan.
 - Task execution (`Worker`, canonical `coder`), review (`Reviewer` / `reviewer`),
   and `Closure` (`closure`) are distinct execution roles. Do not silently perform
   worker role execution or substitute models. Active human scope, model, effort,

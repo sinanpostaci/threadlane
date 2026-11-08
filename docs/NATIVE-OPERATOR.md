@@ -16,7 +16,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-07.v1`).
+fetch the same shared guide and version (`2026-11-08.v2`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -45,6 +45,35 @@ On a fresh chat without an active planning grant or execution approval:
 2. Only after explicit human approval of that preview in chat, record the grant via `<context_router_executable> --context <context_path> flow grant-record --request <private_json> --confirm-preview <PREVIEW_SHA256> --operator-approved`.
 3. Request the actual `Orchestrator` technical plan (`prepare_work`, `request_technical_plan`, `planning_command`), prepare the concrete authority scope preview via `<context_router_executable> --context <context_path> approve prepare --request <private_json>` before requesting human execution approval, and present the plan together with that preview's resolved model/effort, write scopes/files, base commit, `subject_digest`, and planned execution-policy budgets to the human.
 4. Only after exact human execution approval of that presented scope in chat, record that preview (`approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`), then preview/record the matching frozen execution envelope (`flow coworker-execution preview` / `record`) and start only that approved execution (`start_execution`).
+
+### Local loopback access and sandboxed execution
+
+The trusted-local operator CLI (`context_router_executable`) verifies the active
+binding against the local supervisor over loopback independently of the MCP
+transport. If an operator command returns `transport_unavailable` after
+`connect_current_chat` succeeded with `operator_context.available: true`, do not
+report the supervisor as offline without checking local loopback access:
+
+- Run one read-only `<context_router_executable> --context <context_path> flow grant-list`
+  diagnostic using the same returned `context_router_executable` and
+  `context_path`.
+- When a command sandbox blocks local loopback, request narrowly scoped local
+  execution permission for that command via the executor tool's supported
+  mechanism. Never disable sandboxing globally, alter firewall/system settings,
+  install fixed bindings, edit global configuration, or restart the backend.
+- Keep executor permission distinct from Threadlane human preview approval.
+  Never run `grant-record`, `approve record`, `coworker-execution record`,
+  writes, or model calls automatically on transport failure. After the route is
+  confirmed, `flow grant-prepare` and `approve prepare` remain read-only preview
+  commands; explicit human consent to the shown digest still precedes
+  `flow grant-record` or `approve record`.
+- Retry only a read-only diagnostic or preview once after permission is granted
+  (no loops). Never replay an effectful or `outcome_unknown` command; reconcile
+  durable receipts and live status first.
+- If local execution permission is unavailable or declined, state that local
+  operator access remains unverified (mentioning a sandbox restriction only
+  when independently confirmed) rather than claiming the supervisor is offline
+  or fabricating a manual substitute for an actual `Orchestrator` plan.
 
 It may start the baseline control
 supervisor with no workers or notifications; approved hosts are not resumed.

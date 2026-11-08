@@ -331,7 +331,7 @@ fn map_supervisor_error(err: &threadlane::Error) -> OperatorCliError {
                 ),
                 _ => OperatorCliError::new(
                     "transport_unavailable",
-                    "live supervisor runtime is offline or unreachable",
+                    "live supervisor runtime is unreachable or local loopback network access is restricted",
                 ),
             }
         }
@@ -816,6 +816,57 @@ mod tests {
             .await
             .expect_err("offline supervisor must fail");
         assert_eq!(offline_err.code, "transport_unavailable");
+        assert_eq!(
+            offline_err.message,
+            "live supervisor runtime is unreachable or local loopback network access is restricted"
+        );
+    }
+
+    #[test]
+    fn map_supervisor_error_redacts_transport_details_and_preserves_distinct_codes() {
+        let transport_err = map_supervisor_error(&threadlane::Error::Transport(
+            "connect failed for /private/runtime/supervisor.json bearer secret_token_123".into(),
+        ));
+        assert_eq!(transport_err.code, "transport_unavailable");
+        assert_eq!(
+            transport_err.message,
+            "live supervisor runtime is unreachable or local loopback network access is restricted"
+        );
+        assert!(!transport_err.message.contains("/private/runtime"));
+        assert!(!transport_err.message.contains("secret_token_123"));
+
+        let unauthorized_err =
+            map_supervisor_error(&threadlane::Error::Remote(threadlane::ApiError::new(
+                RuntimeErrorCode::Unauthorized,
+                "invalid bearer token secret_token_123 at /private/runtime",
+            )));
+        assert_eq!(unauthorized_err.code, "unauthorized_operator");
+        assert_eq!(
+            unauthorized_err.message,
+            "supervisor rejected local operator authentication"
+        );
+        assert!(!unauthorized_err.message.contains("secret_token_123"));
+
+        let security_err = map_supervisor_error(&threadlane::Error::SecurityViolation(
+            "/private/runtime/supervisor.json mode 0644".into(),
+        ));
+        assert_eq!(security_err.code, "security_violation");
+        assert_eq!(
+            security_err.message,
+            "runtime state directory or descriptor failed security checks"
+        );
+        assert!(!security_err.message.contains("/private/runtime"));
+
+        let remote_security_err =
+            map_supervisor_error(&threadlane::Error::Remote(threadlane::ApiError::new(
+                RuntimeErrorCode::SecurityViolation,
+                "/private/runtime descriptor violation",
+            )));
+        assert_eq!(remote_security_err.code, "security_violation");
+        assert_eq!(
+            remote_security_err.message,
+            "runtime state directory or descriptor failed security checks"
+        );
     }
 
     #[test]

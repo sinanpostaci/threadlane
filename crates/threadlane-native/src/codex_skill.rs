@@ -23,7 +23,7 @@ use crate::error::{NativeError, NativeErrorCode};
 use crate::fs_safety::validate_absolute_no_symlink_components;
 
 /// Bundled Threadlane Codex skill version identifier.
-pub const THREADLANE_SKILL_VERSION: &str = "2026-11-08.v1";
+pub const THREADLANE_SKILL_VERSION: &str = "2026-11-08.v2";
 
 /// Directory and skill name for the bundled Threadlane Codex skill.
 pub const THREADLANE_SKILL_NAME: &str = "threadlane";
