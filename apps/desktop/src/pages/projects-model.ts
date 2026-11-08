@@ -37,6 +37,10 @@ import {
   type LifecycleTone,
 } from './activity-feed-model.ts';
 import { formatJobLifecycle, jobPlanKey } from './job-plans-model.ts';
+import {
+  filterArchivedObservationSnapshot,
+  sanitizeProjectsArchiveCutoffMs,
+} from './projects-archive.ts';
 import { summarizeProjectTaskStatuses } from './projects-task-status.ts';
 
 export type ProjectsWindowHours = 6 | 24;
@@ -142,6 +146,7 @@ export interface ProjectProjectsOptions {
   nowMs?: number;
   windowHours?: ProjectsWindowHours;
   scope?: ActivityFeedScope | null;
+  archiveBeforeMs?: number | null;
 }
 
 const MAX_RECENT_EVENTS_PER_SESSION = 6;
@@ -1310,14 +1315,33 @@ export function projectProjects(
     safeTimestampMs(snapshot.generated_at_ms) ??
     Date.now();
   const cutoffMs = nowMs - windowHours * 60 * 60 * 1000;
+  const hasExplicitJobScope =
+    scope !== null &&
+    trimOrNull(scope.source_id) !== null &&
+    trimOrNull(scope.job_id) !== null;
+  const archiveBeforeMs = hasExplicitJobScope
+    ? null
+    : sanitizeProjectsArchiveCutoffMs(options.archiveBeforeMs, nowMs);
+  const effectiveSnapshot =
+    archiveBeforeMs !== null
+      ? filterArchivedObservationSnapshot(
+          {
+            ...snapshot,
+            jobs: deduplicateJobs(snapshot.jobs ?? []),
+            requests: deduplicateRequests(snapshot.requests ?? []),
+          },
+          archiveBeforeMs,
+          nowMs
+        )
+      : snapshot;
 
-  const sources = snapshot.sources ?? [];
+  const sources = effectiveSnapshot.sources ?? [];
   const sourcesById = new Map<string, ObservationSource>(
     sources.map((source) => [source.id, source] as const)
   );
 
-  const uniqueJobs = deduplicateJobs(snapshot.jobs ?? []);
-  const uniqueRequests = deduplicateRequests(snapshot.requests ?? []);
+  const uniqueJobs = deduplicateJobs(effectiveSnapshot.jobs ?? []);
+  const uniqueRequests = deduplicateRequests(effectiveSnapshot.requests ?? []);
   const allJobsByKey = new Map<string, ObservationJob>(
     uniqueJobs.map(
       (job) => [projectJobLookupKey(job.source_id, job.id), job] as const

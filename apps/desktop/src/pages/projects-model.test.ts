@@ -597,6 +597,256 @@ test('exact 6h boundary retains session at cutoff and filters session 1ms older 
   assert.equal(twentyFourHourView.projects[0]?.sessions.length, 2);
 });
 
+test('archive cutoff hides old inactive sessions and calls while keeping new activity in the same chat visible', () => {
+  const archiveCutoffMs = NOW_MS - 30 * 60 * 1000;
+  const beforeCutoffMs = archiveCutoffMs - 10_000;
+  const afterCutoffMs = archiveCutoffMs + 10_000;
+
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-old-hold',
+        thread_uuid: 'thread-old-hold',
+        thread_label: 'Old Hold Session',
+        binding_id: 'bind-old-hold',
+        state: 'needs_user',
+        active_call_count: 0,
+        updated_at_ms: beforeCutoffMs,
+      }),
+      makeJob({
+        id: 'job-same-chat-old',
+        thread_uuid: 'thread-active-chat',
+        thread_label: 'Same Chat',
+        binding_id: 'bind-active-chat',
+        state: 'completed',
+        active_call_count: 0,
+        updated_at_ms: beforeCutoffMs,
+      }),
+      makeJob({
+        id: 'job-same-chat-linked',
+        thread_uuid: 'thread-active-chat',
+        thread_label: 'Same Chat',
+        binding_id: 'bind-active-chat',
+        state: 'completed',
+        active_call_count: 0,
+        updated_at_ms: beforeCutoffMs,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-old-chat',
+        job_id: 'job-same-chat-old',
+        thread_uuid: 'thread-active-chat',
+        thread_label: 'Same Chat',
+        binding_id: 'bind-active-chat',
+        state: 'completed',
+        started_at_ms: beforeCutoffMs - 5_000,
+        finished_at_ms: beforeCutoffMs,
+        updated_at_ms: beforeCutoffMs,
+      }),
+      makeRequest({
+        id: 'req-new-chat',
+        job_id: 'job-same-chat-linked',
+        thread_uuid: 'thread-active-chat',
+        thread_label: 'Same Chat',
+        binding_id: 'bind-active-chat',
+        state: 'completed',
+        started_at_ms: afterCutoffMs - 5_000,
+        finished_at_ms: afterCutoffMs,
+        updated_at_ms: afterCutoffMs,
+        children: [
+          makeCall({
+            id: 'call-old-done',
+            title: 'Archived call',
+            state: 'completed',
+            started_at_ms: beforeCutoffMs - 4_000,
+            finished_at_ms: beforeCutoffMs,
+          }),
+          makeCall({
+            id: 'call-fresh-done',
+            title: 'Fresh call',
+            state: 'completed',
+            started_at_ms: afterCutoffMs - 2_000,
+            finished_at_ms: afterCutoffMs,
+          }),
+        ],
+        children_count: 2,
+      }),
+    ],
+  });
+
+  const beforeArchive = projectProjects(snapshot, {
+    nowMs: NOW_MS,
+    windowHours: 6,
+  });
+  assert.deepEqual(
+    beforeArchive.projects[0]?.sessions.map((s) => s.label),
+    ['Old Hold Session', 'Same Chat']
+  );
+  const sameChatBefore = beforeArchive.projects[0]?.sessions.find(
+    (s) => s.label === 'Same Chat'
+  );
+  assert.equal(sameChatBefore?.jobs.length, 2);
+  assert.deepEqual(
+    sameChatBefore?.calls.map((call) => call.title).sort(),
+    ['Archived call', 'Fresh call', 'Worker handoff']
+  );
+
+  const afterArchive = projectProjects(snapshot, {
+    nowMs: NOW_MS,
+    windowHours: 6,
+    archiveBeforeMs: archiveCutoffMs,
+  });
+  assert.deepEqual(
+    afterArchive.projects[0]?.sessions.map((s) => s.label),
+    ['Same Chat']
+  );
+  const sameChatAfter = afterArchive.projects[0]?.sessions[0];
+  assert.ok(sameChatAfter);
+  assert.deepEqual(
+    sameChatAfter.jobs.map((j) => j.job.id),
+    ['job-same-chat-linked']
+  );
+  assert.deepEqual(
+    sameChatAfter.calls.map((c) => c.title),
+    ['Fresh call']
+  );
+});
+
+test('archive decisions use the canonical job and request rather than stale active duplicates in either order', () => {
+  const archiveBeforeMs = NOW_MS - 30 * 60 * 1000;
+  const olderMs = archiveBeforeMs - 20_000;
+  const newerMs = archiveBeforeMs - 10_000;
+  const staleJob = makeJob({
+    id: 'job-duplicate', state: 'running', execution_status: 'running',
+    active_call_count: 1, updated_at_ms: olderMs,
+  });
+  const canonicalJob = makeJob({
+    id: 'job-duplicate', state: 'reviewing', execution_status: 'ready_for_review',
+    active_call_count: 0, updated_at_ms: newerMs,
+  });
+  const staleRequest = makeRequest({
+    id: 'request-duplicate', state: 'running',
+    started_at_ms: olderMs, finished_at_ms: null, updated_at_ms: olderMs,
+  });
+  const canonicalRequest = makeRequest({
+    id: 'request-duplicate', state: 'completed',
+    started_at_ms: olderMs, finished_at_ms: newerMs, updated_at_ms: newerMs,
+  });
+  for (const reverse of [false, true]) {
+    for (const kind of ['job', 'request'] as const) {
+      const jobs = kind === 'job' ? [staleJob, canonicalJob] : [];
+      const requests = kind === 'request' ? [staleRequest, canonicalRequest] : [];
+      const snapshot = makeSnapshot({
+        jobs: reverse ? jobs.reverse() : jobs,
+        requests: reverse ? requests.reverse() : requests,
+      });
+      const before = JSON.stringify(snapshot);
+      assert.deepEqual(
+        projectProjects(snapshot, { nowMs: NOW_MS, archiveBeforeMs }).projects,
+        [],
+        `The canonical inactive ${kind} archives regardless of duplicate order`
+      );
+      assert.equal(JSON.stringify(snapshot), before);
+    }
+  }
+});
+
+test('archive cutoff retains running checks and active calls while explicit job scope bypasses archive filter', () => {
+  const archiveCutoffMs = NOW_MS - 10 * 60 * 1000;
+  const oldMs = archiveCutoffMs - 30_000;
+
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-reviewing',
+        thread_uuid: 'thread-review',
+        thread_label: 'Reviewing Checks',
+        binding_id: 'bind-review',
+        state: 'running',
+        execution_status: 'running',
+        active_call_count: 0,
+        updated_at_ms: oldMs,
+      }),
+      makeJob({
+        id: 'job-archived-done',
+        thread_uuid: 'thread-done',
+        thread_label: 'Archived Completed',
+        binding_id: 'bind-done',
+        state: 'completed',
+        active_call_count: 0,
+        updated_at_ms: oldMs,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-reviewing',
+        job_id: 'job-reviewing',
+        thread_uuid: 'thread-review',
+        thread_label: 'Reviewing Checks',
+        binding_id: 'bind-review',
+        state: 'completed',
+        started_at_ms: oldMs - 5_000,
+        finished_at_ms: oldMs,
+        updated_at_ms: oldMs,
+      }),
+      makeRequest({
+        id: 'req-running-call',
+        thread_uuid: 'thread-running',
+        thread_label: 'Running Worker',
+        binding_id: 'bind-running',
+        state: 'completed',
+        started_at_ms: oldMs - 5_000,
+        finished_at_ms: oldMs,
+        updated_at_ms: oldMs,
+        children: [
+          makeCall({
+            id: 'call-still-running',
+            title: 'Active execution',
+            state: 'running',
+            started_at_ms: oldMs,
+            finished_at_ms: null,
+          }),
+        ],
+        children_count: 1,
+      }),
+      makeRequest({
+        id: 'req-archived-done',
+        job_id: 'job-archived-done',
+        thread_uuid: 'thread-done',
+        thread_label: 'Archived Completed',
+        binding_id: 'bind-done',
+        state: 'completed',
+        started_at_ms: oldMs - 5_000,
+        finished_at_ms: oldMs,
+        updated_at_ms: oldMs,
+      }),
+    ],
+  });
+
+  const archivedView = projectProjects(snapshot, {
+    nowMs: NOW_MS,
+    windowHours: 6,
+    archiveBeforeMs: archiveCutoffMs,
+  });
+  assert.equal(archivedView.runningCount, 1);
+  assert.deepEqual(
+    archivedView.projects[0]?.sessions.map((s) => s.label),
+    ['Reviewing Checks', 'Running Worker']
+  );
+
+  const scopedView = projectProjects(snapshot, {
+    nowMs: NOW_MS,
+    windowHours: 6,
+    archiveBeforeMs: archiveCutoffMs,
+    scope: { source_id: 'src-1', job_id: 'job-archived-done' },
+  });
+  assert.deepEqual(
+    scopedView.projects[0]?.sessions.map((s) => s.label),
+    ['Archived Completed']
+  );
+});
+
 test('project and session order stays alphabetical and stable after new activity and with future or nonfinite timestamps', () => {
   const initial = makeSnapshot({
     sources: [

@@ -17,11 +17,27 @@ import {
   type ProjectsProjection,
   type ProjectsWindowHours,
 } from './projects-model.ts';
+import {
+  readProjectsArchiveCutoff,
+  writeProjectsArchiveCutoff,
+  type ProjectsArchiveStorage,
+} from './projects-archive.ts';
 
 import { projectTaskStatus } from './projects-task-status.ts';
 import './projects.css';
 
 const MAX_RECENT_EVENTS = 6;
+
+function resolveBrowserArchiveStorage(): ProjectsArchiveStorage | null {
+  try {
+    if (typeof globalThis !== 'undefined' && 'localStorage' in globalThis) {
+      return globalThis.localStorage ?? null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
 
 function formatRecordedAge(atMs: number | null, nowMs: number): string {
   if (atMs === null) {
@@ -72,6 +88,7 @@ export interface ProjectsPageOptions {
   onViewJob?: (scope: { source_id: string; job_id: string }) => void;
   onLoadMore?: () => void;
   onClearScope?: () => void;
+  storage?: ProjectsArchiveStorage | null;
 }
 
 export interface ProjectsUpdateOptions {
@@ -342,12 +359,14 @@ export class ProjectsPage {
   public readonly element: HTMLElement;
 
   private readonly options: ProjectsPageOptions;
+  private readonly storage: ProjectsArchiveStorage | null;
   private readonly liveBadgeEl: HTMLSpanElement;
   private readonly liveDotEl: HTMLSpanElement;
   private readonly liveTextEl: HTMLSpanElement;
   private readonly toolbarLabelEl: HTMLSpanElement;
   private readonly clearScopeBtn: HTMLButtonElement;
   private readonly windowSelectEl: HTMLSelectElement;
+  private readonly archiveBtn: HTMLButtonElement;
   private readonly noticeBannerEl: HTMLDivElement;
   private readonly projectsContainer: HTMLElement;
   private readonly globalEmptyEl: HTMLParagraphElement;
@@ -370,6 +389,8 @@ export class ProjectsPage {
   private userDiagnosticsOpen = false;
 
   private windowHours: ProjectsWindowHours = 6;
+  private archiveBeforeMs: number | null = null;
+  private archiveError: string | null = null;
   private lastSnapshot: ObservationSnapshot | null = null;
   private currentScope: ActivityFeedScope | null = null;
   private pendingFocusScope: ActivityFeedScope | null = null;
@@ -381,6 +402,11 @@ export class ProjectsPage {
 
   public constructor(options: ProjectsPageOptions = {}) {
     this.options = options;
+    this.storage =
+      'storage' in options
+        ? (options.storage ?? null)
+        : resolveBrowserArchiveStorage();
+    this.archiveBeforeMs = readProjectsArchiveCutoff(this.storage);
 
     this.liveDotEl = h('span', { className: 'tp-live-dot', 'aria-hidden': 'true' });
     this.liveTextEl = h('span', { className: 'tp-live-text' }, 'Waiting for data');
@@ -447,15 +473,58 @@ export class ProjectsPage {
       }
     });
 
+    this.archiveBtn = h(
+      'button',
+      {
+        type: 'button',
+        className: 'tp-back-btn cursor-interaction',
+        'data-archive-history': '',
+        disabled: true,
+      },
+      'Archive history'
+    );
+    this.archiveBtn.addEventListener('click', () => {
+      if (
+        this.disposed ||
+        this.archiveBtn.disabled ||
+        this.lastSnapshot === null ||
+        hasActiveScope(this.currentScope)
+      ) {
+        return;
+      }
+      const nowMs = Date.now();
+      const writeResult = writeProjectsArchiveCutoff(
+        this.storage,
+        nowMs,
+        nowMs
+      );
+      if (!writeResult.ok) {
+        this.archiveError = writeResult.error;
+        this.announcementEl.textContent = writeResult.error;
+        this.syncNoticeBanner();
+        return;
+      }
+      this.archiveError = null;
+      this.archiveBeforeMs = writeResult.archiveBeforeMs;
+      this.announcementEl.textContent =
+        'Archived inactive project history before now. Active work remains visible.';
+      this.renderCurrentState(nowMs);
+    });
+
     const toolbarEl = h(
       'div',
       { className: 'tp-toolbar' },
       h('div', { className: 'tp-toolbar-start' }, this.toolbarLabelEl, this.clearScopeBtn),
       h(
-        'label',
-        { className: 'tp-window-label' },
-        h('span', { className: 'tp-sr-only' }, 'Session time window'),
-        this.windowSelectEl
+        'div',
+        { className: 'tp-toolbar-start' },
+        h(
+          'label',
+          { className: 'tp-window-label' },
+          h('span', { className: 'tp-sr-only' }, 'Session time window'),
+          this.windowSelectEl
+        ),
+        this.archiveBtn
       )
     );
 
@@ -477,8 +546,16 @@ export class ProjectsPage {
       this.globalEmptyEl
     );
 
-    this.footerNoteLeftEl = h('span', { className: 'tp-footer-summary' }, 'Available records');
-    this.footerNoteRightEl = h('span', { className: 'tp-footer-window' }, 'Last 6h');
+    this.footerNoteLeftEl = h(
+      'span',
+      { className: 'tp-footer-summary' },
+      this.archiveBeforeMs !== null ? 'History archived' : 'Available records'
+    );
+    this.footerNoteRightEl = h(
+      'span',
+      { className: 'tp-footer-window' },
+      this.archiveBeforeMs !== null ? 'Last 6h · Archived' : 'Last 6h'
+    );
     this.loadMoreBtn = h(
       'button',
       {
@@ -562,6 +639,9 @@ export class ProjectsPage {
     const initialLiveTooltip = '0 running calls among recorded loaded calls in view';
     this.liveBadgeEl.setAttribute('aria-label', initialLiveTooltip);
     this.liveTextEl.textContent = '0 working in view';
+    if (this.archiveBeforeMs !== null) {
+      this.announcementEl.textContent = 'Archived history filter active.';
+    }
   }
 
   public update(snapshot: ObservationSnapshot | null, options?: ProjectsUpdateOptions): void {
@@ -594,6 +674,7 @@ export class ProjectsPage {
       nowMs,
       windowHours: this.windowHours,
       scope: this.currentScope,
+      archiveBeforeMs: this.archiveBeforeMs,
     });
 
     const signature = (projects: ProjectGroupView[]): string =>
@@ -707,6 +788,8 @@ export class ProjectsPage {
   private syncScopeControls(): void {
     const scoped = hasActiveScope(this.currentScope);
     this.clearScopeBtn.hidden = !scoped;
+    this.archiveBtn.hidden = scoped;
+    this.archiveBtn.disabled = scoped || this.lastSnapshot === null;
     this.toolbarLabelEl.textContent = scoped ? 'Scoped job view' : 'Recent sessions';
   }
 
@@ -743,8 +826,13 @@ export class ProjectsPage {
       this.globalEmptyEl.hidden = false;
       this.footerNoteLeftEl.textContent = this.error
         ? 'Observation state unavailable'
-        : 'Available records';
-      this.footerNoteRightEl.textContent = `Last ${this.windowHours}h`;
+        : this.archiveBeforeMs !== null
+          ? 'History archived'
+          : 'Available records';
+      this.footerNoteRightEl.textContent =
+        this.archiveBeforeMs !== null
+          ? `Last ${this.windowHours}h · Archived`
+          : `Last ${this.windowHours}h`;
       this.loadMoreBtn.hidden = true;
       while (this.warningsListEl.firstChild) {
         this.warningsListEl.removeChild(this.warningsListEl.firstChild);
@@ -761,6 +849,7 @@ export class ProjectsPage {
       nowMs,
       windowHours: this.windowHours,
       scope: this.currentScope,
+      archiveBeforeMs: this.archiveBeforeMs,
     });
 
     this.syncHeaderRunningCount(projection);
@@ -797,10 +886,20 @@ export class ProjectsPage {
     if (this.error) {
       this.noticeBannerEl.className = 'tp-notice tp-notice-error';
       this.noticeBannerEl.setAttribute('role', 'alert');
-      this.noticeBannerEl.textContent =
+      const backendNotice =
         this.lastSnapshot !== null
           ? `${this.error} Showing last recorded snapshot.`
           : this.error;
+      this.noticeBannerEl.textContent = this.archiveError
+        ? `${backendNotice} ${this.archiveError}`
+        : backendNotice;
+      this.noticeBannerEl.hidden = false;
+      return;
+    }
+    if (this.archiveError) {
+      this.noticeBannerEl.className = 'tp-notice tp-notice-error';
+      this.noticeBannerEl.setAttribute('role', 'alert');
+      this.noticeBannerEl.textContent = this.archiveError;
       this.noticeBannerEl.hidden = false;
       return;
     }
@@ -837,6 +936,12 @@ export class ProjectsPage {
 
   private syncFooterAndWarnings(projection: ProjectsProjection): void {
     const summaryParts: string[] = [];
+    if (
+      this.archiveBeforeMs !== null &&
+      !hasActiveScope(this.currentScope)
+    ) {
+      summaryParts.push('History archived');
+    }
     if (projection.hiddenSessionCount > 0) {
       summaryParts.push(
         `${projection.hiddenSessionCount} older ${
@@ -870,7 +975,9 @@ export class ProjectsPage {
     this.loadMoreBtn.disabled = !showLoadMore || this.loading || !this.options.onLoadMore;
     this.footerNoteRightEl.textContent = hasActiveScope(this.currentScope)
       ? 'Scoped view'
-      : `Last ${this.windowHours}h`;
+      : this.archiveBeforeMs !== null
+        ? `Last ${this.windowHours}h · Archived`
+        : `Last ${this.windowHours}h`;
 
     while (this.warningsListEl.firstChild) {
       this.warningsListEl.removeChild(this.warningsListEl.firstChild);
