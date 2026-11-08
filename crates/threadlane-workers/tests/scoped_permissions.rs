@@ -321,7 +321,27 @@ fn static_validation_and_build_argv_for_workdir_distinguish_inherit_and_task_fil
     assert_eq!(&resolved_argv[..10], &inherit_argv[..10]);
     assert_eq!(resolved_argv[10], "--settings");
     assert_eq!(resolved_argv[12], "--print");
-    assert_eq!(resolved_argv[13], "Task files prompt");
+    assert!(
+        resolved_argv[13].starts_with("[THREADLANE_AGY_TASK_FILES_CONTRACT] "),
+        "TaskFiles argv[13] must start with the session-local AGY TaskFiles contract header"
+    );
+    let (contract_header, retained_prompt) = resolved_argv[13]
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("TaskFiles argv[13] must contain unambiguous task instruction boundary");
+    assert_eq!(retained_prompt, "Task files prompt");
+    assert!(resolved_argv[13].ends_with("Task files prompt"));
+    assert!(contract_header.contains("`read_file`"));
+    assert!(contract_header.contains("`view_file`"));
+    assert!(contract_header.contains("`list_dir`"));
+    assert!(contract_header.contains("`grep_search`"));
+    assert!(contract_header.contains("`edit_file`"));
+    assert!(
+        contract_header.contains("Never use or request `command`, `run_command`, `bash`, `shell`")
+    );
+    assert!(contract_header.contains("parent controller runs all checks and Git operations"));
+    assert!(contract_header.contains(
+        "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `docs/WORKERS.md` (exact file only; no descendant `/**`)]"
+    ));
     assert!(!resolved_argv
         .iter()
         .any(|a| a.contains("dangerously") || a == "--auto" || a == "--variant"));
@@ -361,6 +381,15 @@ fn static_validation_and_build_argv_for_workdir_distinguish_inherit_and_task_fil
         expected_allow.push(format!("{tool}({w}/docs/WORKERS.md)"));
     }
     assert_eq!(allow_list, expected_allow);
+    assert!(
+        !allow_list.iter().any(|rule| {
+            rule.starts_with("command(")
+                || rule.starts_with("run_command(")
+                || rule.starts_with("bash(")
+                || rule.starts_with("shell(")
+        }),
+        "TaskFiles allowlist must never grant command or shell execution permissions"
+    );
     for tool in AGY_WRITE_PERMISSION_TOOLS {
         assert!(
             !allow_list.contains(&format!("{tool}({w}/docs/WORKERS.md/**)")),
@@ -420,6 +449,12 @@ printf '{"event":"result","result":{"conversation_id":"s-scoped-1","status":"SUC
             .map(str::to_string)
             .collect();
     assert_eq!(received_argv, expected_argv);
+    assert!(
+        received_argv[13].ends_with(
+            "[THREADLANE_TASK_INSTRUCTION] Edit crates/threadlane-workers/src/lib.rs safely"
+        ),
+        "child AGY process must receive guarded prompt ending with verbatim task instruction"
+    );
 
     // Verify the settings argument uses the canonical task checkout path, not source_repo.
     let settings_arg = &received_argv[11];
@@ -468,6 +503,57 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
     assert_eq!(
         rogue_report.overall_acceptance_state,
         WorkAcceptanceState::RejectedByDiffGate
+    );
+
+    // Verify that a zero-exit AGY run reporting `denied_actions` for `command` / `run_command`
+    // (matching installed AGY 1.5.3 headless auto-denial) remains Blocked and rejected with no
+    // changed task path.
+    let blocked_cmd_bin = env.write_fake_executable(
+        "blocked-cmd-task-files-agy",
+        r#"
+printf '{"event":"init","conversation_id":"s-blocked-cmd","init":{"model":"gemini-4-argon-high","cwd":"%s","permission_mode":"accept-edits"}}\n' "$PWD"
+printf '{"event":"result","result":{"conversation_id":"s-blocked-cmd","status":"SUCCESS","response":"Command auto-denied in headless mode","denied_actions":[{"action":"command","display_name":"run_command"}],"num_turns":1}}\n'
+exit 0
+"#,
+    );
+    let blocked_cmd_spec = env.antigravity_spec(
+        blocked_cmd_bin,
+        "Do not use command tool",
+        WorkerFilePermissions::TaskFiles,
+    );
+    let blocked_cmd_report = execute_worker_task(
+        &blocked_cmd_spec,
+        "run-m2c",
+        "task-blocked-cmd",
+        None,
+        &mut cancel_rx,
+    )
+    .await
+    .expect("execute blocked command worker task");
+    assert_eq!(
+        blocked_cmd_report.worker_report.status,
+        WorkerRunStatus::Blocked
+    );
+    assert!(
+        !blocked_cmd_report
+            .worker_report
+            .evidence
+            .blocked_events
+            .is_empty(),
+        "denied_actions on exit 0 must record a blocked event"
+    );
+    assert_ne!(
+        blocked_cmd_report.overall_acceptance_state,
+        WorkAcceptanceState::DiffGatePassedPendingReview
+    );
+    assert!(
+        git_stdout(
+            &blocked_cmd_report.manifest.checkout_path,
+            &["status", "--porcelain"]
+        )
+        .trim()
+        .is_empty(),
+        "blocked command worker must leave no modified or untracked files in task checkout"
     );
 }
 
@@ -985,6 +1071,13 @@ async fn exact_file_and_absent_file_scopes_never_grant_descendant_wildcards_whil
         build_antigravity_task_files_settings_json(&workdir, &existing_file_paths)
             .expect("direct builder for existing exact file");
     assert_eq!(existing_file_argv[11], direct_existing_json);
+    assert!(existing_file_argv[13].contains(
+        "[`crates/threadlane-workers/src/lib.rs` (exact file only; no descendant `/**`)]"
+    ));
+    assert!(!existing_file_argv[13].contains("directory subtree"));
+    assert!(
+        existing_file_argv[13].ends_with("[THREADLANE_TASK_INSTRUCTION] Existing exact file scope")
+    );
 
     let existing_allow = parse_allow_rules(&existing_file_argv[11]);
     let mut expected_existing_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
@@ -1018,6 +1111,9 @@ async fn exact_file_and_absent_file_scopes_never_grant_descendant_wildcards_whil
         build_antigravity_task_files_settings_json(&workdir, &absent_file_paths)
             .expect("direct builder for absent exact file");
     assert_eq!(absent_file_argv[11], direct_absent_json);
+    assert!(absent_file_argv[13].contains("[`new.txt` (exact file only; no descendant `/**`)]"));
+    assert!(!absent_file_argv[13].contains("directory subtree"));
+    assert!(absent_file_argv[13].ends_with("[THREADLANE_TASK_INSTRUCTION] Absent exact file scope"));
 
     let absent_allow = parse_allow_rules(&absent_file_argv[11]);
     let mut expected_absent_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
@@ -1054,6 +1150,12 @@ async fn exact_file_and_absent_file_scopes_never_grant_descendant_wildcards_whil
         build_antigravity_task_files_settings_json(&workdir, &explicit_dir_paths)
             .expect("direct builder for explicit directories");
     assert_eq!(explicit_dir_argv[11], direct_explicit_dir_json);
+    assert!(explicit_dir_argv[13].contains(
+        "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`), `new_dir/` (directory subtree `new_dir` and `new_dir/**`)]"
+    ));
+    assert!(
+        explicit_dir_argv[13].ends_with("[THREADLANE_TASK_INSTRUCTION] Explicit directory scopes")
+    );
 
     let explicit_dir_allow = parse_allow_rules(&explicit_dir_argv[11]);
     let mut expected_explicit_dir_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
@@ -1095,6 +1197,27 @@ async fn exact_file_and_absent_file_scopes_never_grant_descendant_wildcards_whil
     let legacy_spec_argv = legacy_bare_dir_spec
         .build_argv_for_workdir(&workdir)
         .expect("WorkerSpec::build_argv_for_workdir resolves legacy bare base directory via pinned base_commit");
+    assert!(legacy_spec_argv[13].contains(
+        "[`crates/threadlane-workers/` (directory subtree `crates/threadlane-workers` and `crates/threadlane-workers/**`)]"
+    ));
+    assert!(legacy_spec_argv[13]
+        .ends_with("[THREADLANE_TASK_INSTRUCTION] Legacy bare base directory in WorkerSpec"));
+
+    let multiline_prompt = "Line 1: update module\nLine 2: preserve exact bytes & symbols!\n";
+    let mut multiline_spec = env.antigravity_spec(
+        noop_bin.clone(),
+        multiline_prompt,
+        WorkerFilePermissions::TaskFiles,
+    );
+    multiline_spec.allowed_write_paths = existing_file_paths.clone();
+    let multiline_argv = multiline_spec
+        .build_argv_for_workdir(&workdir)
+        .expect("build_argv_for_workdir with multiline task prompt");
+    let (_, extracted_multiline) = multiline_argv[13]
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("split boundary on multiline prompt");
+    assert_eq!(extracted_multiline, multiline_prompt);
+
     let legacy_spec_allow = parse_allow_rules(&legacy_spec_argv[11]);
     let mut expected_legacy_spec_allow = vec![format!("{AGY_READ_PERMISSION_TOOL}({w}/**)")];
     for tool in AGY_WRITE_PERMISSION_TOOLS {

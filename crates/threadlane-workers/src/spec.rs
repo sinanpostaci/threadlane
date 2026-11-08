@@ -30,6 +30,7 @@ pub use crate::permissions::{
     OPENCODE_READ_ONLY_DENIED_PERMISSION_ACTIONS, OPENCODE_READ_ONLY_DENIED_TOOL_POLICIES,
 };
 use crate::permissions::{
+    build_antigravity_task_files_prompt_for_scopes,
     build_antigravity_task_files_settings_json_for_scopes, validate_permission_pattern_path,
 };
 
@@ -562,11 +563,13 @@ impl WorkerSpec {
     /// [`WorkerFilePermissions::TaskFiles`], validates that the canonical `working_directory` and
     /// `allowed_write_paths` contain no unsafe glob/rule metacharacters or symlinks and, for
     /// [`WorkerProvider::Antigravity`], resolves `allowed_write_paths` against the immutable
-    /// pinned `base_commit` tree via [`crate::git::resolve_allowed_write_scopes_at_base`] and
+    /// pinned `base_commit` tree via [`crate::git::resolve_allowed_write_scopes_at_base`],
     /// injects `--settings <inline-json>` scoped to `working_directory` (granting descendant `/**`
     /// rules only for [`WriteScopeKind::DirectorySubtree`] scopes and exact-only rules for
-    /// [`WriteScopeKind::ExactFile`] scopes). [`WorkerFilePermissions::ReadOnly`] is rejected on
-    /// [`WorkerSpec`] and must use [`AdvisoryWorkerSpec::build_argv_for_workdir`].
+    /// [`WriteScopeKind::ExactFile`] scopes), and prepends a session-local `task_files` execution
+    /// contract ahead of the verbatim task instruction in the `--print` argument.
+    /// [`WorkerFilePermissions::ReadOnly`] is rejected on [`WorkerSpec`] and must use
+    /// [`AdvisoryWorkerSpec::build_argv_for_workdir`].
     pub fn build_argv_for_workdir(
         &self,
         working_directory: &Path,
@@ -574,8 +577,8 @@ impl WorkerSpec {
         let report = self.validate()?;
         let canonical_workdir =
             validate_existing_canonical_dir(working_directory, "working_directory")?;
-        let settings_json = match (self.provider, self.file_permissions) {
-            (WorkerProvider::Antigravity, WorkerFilePermissions::Inherit) => None,
+        let (settings_json, effective_prompt) = match (self.provider, self.file_permissions) {
+            (WorkerProvider::Antigravity, WorkerFilePermissions::Inherit) => (None, None),
             (WorkerProvider::Antigravity, WorkerFilePermissions::TaskFiles) => {
                 let resolved_write_scopes = crate::git::resolve_allowed_write_scopes_at_base(
                     &report.canonical_repository_path,
@@ -583,10 +586,15 @@ impl WorkerSpec {
                     &self.allowed_write_paths,
                     crate::git::DEFAULT_GIT_COMMAND_TIMEOUT_MS,
                 )?;
-                Some(build_antigravity_task_files_settings_json_for_scopes(
+                let settings_json = build_antigravity_task_files_settings_json_for_scopes(
                     &canonical_workdir,
                     &resolved_write_scopes,
-                )?)
+                )?;
+                let guarded_prompt = build_antigravity_task_files_prompt_for_scopes(
+                    &resolved_write_scopes,
+                    &self.prompt,
+                );
+                (Some(settings_json), Some(guarded_prompt))
             }
             (WorkerProvider::Antigravity, WorkerFilePermissions::ReadOnly) => {
                 return Err(WorkerError::InvalidSpec(
@@ -596,7 +604,7 @@ impl WorkerSpec {
             }
             (WorkerProvider::OpenCodeV2, _) => {
                 let _ = self.build_opencode_config_for_workdir(&canonical_workdir)?;
-                None
+                (None, None)
             }
             (WorkerProvider::CodexCli, WorkerFilePermissions::TaskFiles) => {
                 let resolved_write_scopes = crate::git::resolve_allowed_write_scopes_at_base(
@@ -616,10 +624,13 @@ impl WorkerSpec {
                         )));
                     }
                 }
-                Some(build_codex_task_files_permission_profile_config_for_scopes(
-                    &canonical_workdir,
-                    &resolved_write_scopes,
-                )?)
+                (
+                    Some(build_codex_task_files_permission_profile_config_for_scopes(
+                        &canonical_workdir,
+                        &resolved_write_scopes,
+                    )?),
+                    None,
+                )
             }
             (WorkerProvider::CodexCli, WorkerFilePermissions::Inherit) => {
                 return Err(WorkerError::UnsupportedCapability {
@@ -638,7 +649,15 @@ impl WorkerSpec {
                 ));
             }
         };
-        Ok(self.build_argv_from_resolved(&report.resolved_model, settings_json))
+        Ok(build_provider_argv_from_resolved(
+            self.provider,
+            &report.resolved_model,
+            "accept-edits",
+            self.standalone,
+            self.session_id.as_deref(),
+            settings_json,
+            effective_prompt.as_deref().unwrap_or(&self.prompt),
+        ))
     }
 
     /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for this spec and

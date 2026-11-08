@@ -783,6 +783,11 @@ fn legacy_inherit_and_task_files_argv_and_settings_remain_unchanged() {
     assert!(!agy_inherit_argv
         .iter()
         .any(|arg| arg.contains("dangerously-skip-permissions") || arg == "--auto"));
+    let agy_inherit_workdir_argv = agy_inherit_spec
+        .build_argv_for_workdir(&repo_dir)
+        .expect("build agy inherit workdir argv");
+    assert_eq!(agy_inherit_workdir_argv, agy_inherit_argv);
+    assert_eq!(agy_inherit_workdir_argv[11], "implement task");
 
     // 2. Legacy Antigravity `TaskFiles` settings JSON omits `deny` so byte representation is unchanged
     let task_files_json = build_antigravity_task_files_settings_json(
@@ -791,6 +796,8 @@ fn legacy_inherit_and_task_files_argv_and_settings_remain_unchanged() {
     )
     .expect("build task_files settings json");
     assert!(!task_files_json.contains("\"deny\""));
+    assert!(!task_files_json.contains("command("));
+    assert!(!task_files_json.contains("run_command("));
     let parsed_val: serde_json::Value = serde_json::from_str(&task_files_json).expect("valid json");
     assert!(parsed_val["permissions"]["allow"].is_array());
     assert!(parsed_val["permissions"].get("deny").is_none());

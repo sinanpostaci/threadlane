@@ -1608,6 +1608,57 @@ pub fn build_antigravity_task_files_settings_json_for_scopes(
     Ok(json)
 }
 
+/// Unambiguous delimiter separating the session-local Antigravity `task_files` execution contract
+/// from the caller's verbatim task prompt.
+pub(crate) const AGY_TASK_FILES_PROMPT_BOUNDARY: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+
+/// Builds the session-local Antigravity `--print` prompt for [`WorkerFilePermissions::TaskFiles`]
+/// from resolved repository-relative [`WriteScopeKind`] entries and the caller's `task_prompt`.
+///
+/// Prepends a concise single-line execution contract instructing the headless Antigravity worker
+/// to use only built-in file read/search/edit tools, never invoke or request `command`/shell/
+/// terminal tools (which headless `--mode accept-edits` cannot prompt for and auto-denies), never
+/// run builds/tests/Git/subagents/web/MCP from the worker, never write provider/control configs,
+/// and persist edits only within the exact resolved write scopes (distinguishing directory
+/// subtrees from exact files). Preserves `task_prompt` byte-for-byte after
+/// [`AGY_TASK_FILES_PROMPT_BOUNDARY`].
+#[must_use]
+pub(crate) fn build_antigravity_task_files_prompt_for_scopes(
+    resolved_write_scopes: &BTreeMap<String, WriteScopeKind>,
+    task_prompt: &str,
+) -> String {
+    let mut scope_descriptions = Vec::with_capacity(resolved_write_scopes.len());
+    for (raw_entry, &scope_kind) in resolved_write_scopes {
+        let clean_entry = raw_entry.strip_suffix('/').unwrap_or(raw_entry.as_str());
+        match scope_kind {
+            WriteScopeKind::DirectorySubtree => {
+                scope_descriptions.push(format!(
+                    "`{clean_entry}/` (directory subtree `{clean_entry}` and `{clean_entry}/**`)"
+                ));
+            }
+            WriteScopeKind::ExactFile => {
+                scope_descriptions.push(format!(
+                    "`{clean_entry}` (exact file only; no descendant `/**`)"
+                ));
+            }
+        }
+    }
+    let scopes_summary = scope_descriptions.join(", ");
+
+    format!(
+        "[THREADLANE_AGY_TASK_FILES_CONTRACT] Session-local Antigravity task_files execution contract: \
+use only built-in file read/search/edit tools (`read_file`, `view_file`, `list_dir`, `grep_search`, \
+`edit_file`, `write_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`). \
+Never use or request `command`, `run_command`, `bash`, `shell`, `execute`, `run_in_terminal`, or any \
+terminal/shell tool; headless mode cannot prompt for `command` permissions and auto-denies them. \
+Do not run tests, builds, linters, formatters, `git`, subagents, web/browser, or MCP tools from this \
+worker; the parent controller runs all checks and Git operations. Do not write provider or control \
+configs (`.gemini`, `.codex`, `.opencode`, `.claude`, `.agents`, `.git`, `AGENTS.md`, `.env*`). \
+Persist changes only within declared task write scopes: [{scopes_summary}]. \
+{AGY_TASK_FILES_PROMPT_BOUNDARY}{task_prompt}"
+    )
+}
+
 /// Builds the structured OpenCode 2.2.0 V2 [`OpenCodeConfigContent`] for a validated model target,
 /// [`WorkerFilePermissions`] mode, existing canonical task `working_directory`, and
 /// `allowed_write_paths`.
