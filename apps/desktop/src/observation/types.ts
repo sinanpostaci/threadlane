@@ -138,6 +138,20 @@ export interface ObservationJob {
   summary: string | null;
 }
 
+export type ObservationWarningOrigin =
+  | 'registry'
+  | 'jobs'
+  | 'journal'
+  | 'requests'
+  | 'snapshot'
+  | (string & {});
+
+export interface ObservationWarningContext {
+  warning: string;
+  source_id: string | null;
+  origin: ObservationWarningOrigin;
+}
+
 export interface ObservationSnapshot {
   schema_version: 1;
   generated_at_ms: number;
@@ -148,6 +162,7 @@ export interface ObservationSnapshot {
   has_more: boolean;
   jobs_has_more: boolean;
   warnings: string[];
+  warning_contexts?: ObservationWarningContext[];
 }
 
 export interface ObservationSnapshotRequest {

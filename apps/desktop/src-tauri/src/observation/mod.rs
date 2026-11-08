@@ -1,4 +1,5 @@
 pub(crate) mod coworker_jobs;
+pub(crate) mod diagnostics;
 pub(crate) mod jobs;
 pub(crate) mod requests;
 pub(crate) mod sources;
@@ -18,6 +19,10 @@ use threadlane_core::observation::{
 
 use crate::AppError;
 
+pub(crate) use diagnostics::{
+    ObservationWarningCollector, WARNING_ORIGIN_JOBS, WARNING_ORIGIN_JOURNAL,
+    WARNING_ORIGIN_REQUESTS,
+};
 pub(crate) use sources::{
     ObservationSourceConfig, ObservationSourceError, ObservationSourceRegistry, SourceSpec,
 };
@@ -84,7 +89,8 @@ impl ObservationService {
         let registry = self.registry.clone();
         let inventory = registry.inventory();
 
-        let mut raw_warnings = inventory.warnings;
+        let mut warning_collector = ObservationWarningCollector::new();
+        warning_collector.extend_inventory(inventory.warnings);
         let mut all_jobs = Vec::new();
         let mut all_requests = Vec::new();
         let mut upstream_jobs_has_more = false;
@@ -118,19 +124,31 @@ impl ObservationService {
             }
 
             let mut job_projection = jobs::project_jobs(spec);
-            raw_warnings.extend(job_projection.warnings);
+            warning_collector.extend_source(
+                &spec.source.id,
+                WARNING_ORIGIN_JOBS,
+                job_projection.warnings,
+            );
             if job_projection.jobs_has_more {
                 upstream_jobs_has_more = true;
             }
 
             let (journal_records, journal_warnings) = read_source_journal_records(spec);
-            raw_warnings.extend(journal_warnings);
+            warning_collector.extend_source(
+                &spec.source.id,
+                WARNING_ORIGIN_JOURNAL,
+                journal_warnings,
+            );
 
             let prepared_journal = coworker_jobs::prepare_journal_records_for_projection(
                 &journal_records,
                 &job_projection.coworker_scopes,
             );
-            raw_warnings.extend(prepared_journal.warnings.clone());
+            warning_collector.extend_source(
+                &spec.source.id,
+                WARNING_ORIGIN_JOURNAL,
+                prepared_journal.warnings.clone(),
+            );
 
             let mut request_projection = requests::project_requests(
                 &spec.source.id,
@@ -145,7 +163,11 @@ impl ObservationService {
                 &job_projection.coworker_scopes,
                 &prepared_journal,
             );
-            raw_warnings.extend(request_projection.warnings);
+            warning_collector.extend_source(
+                &spec.source.id,
+                WARNING_ORIGIN_REQUESTS,
+                request_projection.warnings,
+            );
 
             all_jobs.extend(job_projection.jobs);
             all_requests.extend(request_projection.requests);
@@ -153,11 +175,11 @@ impl ObservationService {
 
         let jobs_page = filter_and_cap_jobs(all_jobs, &query, upstream_jobs_has_more);
         if let Some(cap_warning) = jobs_page.cap_warning {
-            raw_warnings.push(cap_warning);
+            warning_collector.push_snapshot(cap_warning);
         }
 
         let requests_page = filter_sort_and_page_requests(all_requests, &query);
-        let warnings = sanitize_and_bound_warnings(raw_warnings);
+        let (warnings, warning_contexts) = warning_collector.finish();
 
         Ok(ObservationSnapshot {
             schema_version: OBSERVATION_SCHEMA_VERSION,
@@ -169,6 +191,7 @@ impl ObservationService {
             has_more: requests_page.has_more,
             jobs_has_more: jobs_page.jobs_has_more,
             warnings,
+            warning_contexts,
         })
     }
 }

@@ -41,7 +41,14 @@ import {
   filterArchivedObservationSnapshot,
   sanitizeProjectsArchiveCutoffMs,
 } from './projects-archive.ts';
+import {
+  projectDiagnostics,
+  type ProjectDiagnosticRowView,
+  type ProjectDiagnosticSeverity,
+} from './projects-diagnostics.ts';
 import { summarizeProjectTaskStatuses } from './projects-task-status.ts';
+
+export type { ProjectDiagnosticRowView, ProjectDiagnosticSeverity };
 
 export type ProjectsWindowHours = 6 | 24;
 
@@ -137,6 +144,7 @@ export interface ProjectsProjection {
   hiddenSessionCount: number;
   unavailableSourceCount: number;
   warnings: string[];
+  diagnostics: ProjectDiagnosticRowView[];
   hasMore: boolean;
   jobsHasMore: boolean;
   emptyMessage: string | null;
@@ -2068,6 +2076,8 @@ export function projectProjects(
     );
   }
 
+  const diagnostics = projectDiagnostics(snapshot, { scope });
+
   let emptyMessage: string | null = null;
   if (projects.length === 0) {
     if (scope !== null) {
@@ -2094,6 +2104,7 @@ export function projectProjects(
     hiddenSessionCount,
     unavailableSourceCount,
     warnings,
+    diagnostics,
     hasMore,
     jobsHasMore,
     emptyMessage,

@@ -5,11 +5,16 @@
  * helper follows only the bridge's real `next_cursor` and `has_more` values; it
  * never synthesizes cursors and stops immediately if the bridge repeats one.
  */
-import type { ObservationRequest, ObservationSnapshot } from './types.ts';
+import type {
+  ObservationRequest,
+  ObservationSnapshot,
+  ObservationWarningContext,
+} from './types.ts';
 
 export const OBSERVATION_DEFAULT_PAGE_LIMIT = 25;
 export const OBSERVATION_MAX_PAGE_LIMIT = 200;
 export const OBSERVATION_MAX_WINDOW_REQUESTS = 1000;
+export const OBSERVATION_MAX_WARNING_CONTEXTS = 32;
 
 export interface ObservationPageQuery {
   cursor: string | null;
@@ -73,6 +78,61 @@ function appendWarning(warnings: string[], warning: string | null | undefined): 
   }
 }
 
+function normalizeWarningOrigin(origin: string | null | undefined): string {
+  const trimmed = (origin ?? '').trim();
+  if (
+    trimmed === 'registry' ||
+    trimmed === 'jobs' ||
+    trimmed === 'journal' ||
+    trimmed === 'requests' ||
+    trimmed === 'snapshot'
+  ) {
+    return trimmed;
+  }
+  return 'snapshot';
+}
+
+function normalizeWarningSourceId(sourceId: string | null | undefined): string | null {
+  if (typeof sourceId !== 'string') {
+    return null;
+  }
+  const trimmed = sourceId.trim();
+  if (
+    trimmed.length === 0 ||
+    trimmed.length > 128 ||
+    trimmed !== sourceId ||
+    !/^[A-Za-z0-9_.-]+$/.test(trimmed)
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+
+function appendWarningContext(
+  contexts: ObservationWarningContext[],
+  seenKeys: Set<string>,
+  raw: ObservationWarningContext | null | undefined
+): void {
+  if (!raw || typeof raw !== 'object') {
+    return;
+  }
+  const warning = typeof raw.warning === 'string' ? raw.warning.trim() : '';
+  if (warning.length === 0) {
+    return;
+  }
+  const sourceId = normalizeWarningSourceId(raw.source_id);
+  const origin = normalizeWarningOrigin(raw.origin);
+  const key = `${warning}\u0000${sourceId ?? ''}\u0000${origin}`;
+  if (!seenKeys.has(key)) {
+    seenKeys.add(key);
+    contexts.push({
+      warning,
+      source_id: sourceId,
+      origin,
+    });
+  }
+}
+
 /**
  * Collects a fresh head window of unique requests.
  *
@@ -104,7 +164,10 @@ export async function collectObservationWindow(
   const maxPages = Math.max(1, Math.min(maxRequests, Math.ceil(maxRequests / pageLimit) + 2));
   const requests = new Map<string, ObservationRequest>();
   const warnings: string[] = [];
+  const rawWarningContexts: ObservationWarningContext[] = [];
+  const seenWarningContextKeys = new Set<string>();
   const seenCursors = new Set<string>();
+  let sawWarningContexts = false;
   let cursor: string | null = null;
   let firstPage: ObservationSnapshot | null = null;
   let lastPage: ObservationSnapshot | null = null;
@@ -159,6 +222,12 @@ export async function collectObservationWindow(
     lastPage = page;
     for (const warning of page.warnings ?? []) {
       appendWarning(warnings, warning);
+    }
+    if (Array.isArray(page.warning_contexts)) {
+      sawWarningContexts = true;
+      for (const context of page.warning_contexts) {
+        appendWarningContext(rawWarningContexts, seenWarningContextKeys, context);
+      }
     }
     for (const request of page.requests ?? []) {
       const key = observationRequestKey(request);
@@ -253,15 +322,25 @@ export async function collectObservationWindow(
     );
   }
 
+  const survivingWarnings = new Set(warnings);
+  const warningContexts = rawWarningContexts
+    .filter((context) => survivingWarnings.has(context.warning))
+    .slice(0, OBSERVATION_MAX_WARNING_CONTEXTS);
+
+  const mergedSnapshot: ObservationSnapshot = {
+    ...firstPage,
+    requests: [...requests.values()],
+    warnings: [...warnings],
+    next_cursor: nextCursor,
+    has_more: repeatedCursor === null && finalPage.has_more === true,
+    jobs_has_more: firstPage.jobs_has_more === true,
+  };
+  if (sawWarningContexts || warningContexts.length > 0) {
+    mergedSnapshot.warning_contexts = warningContexts;
+  }
+
   return {
-    snapshot: {
-      ...firstPage,
-      requests: [...requests.values()],
-      warnings: [...warnings],
-      next_cursor: nextCursor,
-      has_more: repeatedCursor === null && finalPage.has_more === true,
-      jobs_has_more: firstPage.jobs_has_more === true,
-    },
+    snapshot: mergedSnapshot,
     aborted: false,
     pagesFetched,
     requestsCollected: requests.size,

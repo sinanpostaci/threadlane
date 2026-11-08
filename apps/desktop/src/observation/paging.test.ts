@@ -14,6 +14,7 @@ import type {
 import {
   collectObservationWindow,
   OBSERVATION_MAX_PAGE_LIMIT,
+  OBSERVATION_MAX_WARNING_CONTEXTS,
   OBSERVATION_MAX_WINDOW_REQUESTS,
   type ObservationPageFetcher,
   type ObservationPageQuery,
@@ -485,5 +486,95 @@ describe('observation paging window', () => {
     ]);
     assert.equal(result.snapshot?.next_cursor, null);
     assert.equal(result.snapshot?.has_more, false);
+  });
+
+  it('accumulates and deduplicates bounded warning_contexts across all fetched pages with source isolation', async () => {
+    const sharedWarning =
+      'Skipped unreadable or invalid coworker workflow ledger in observation source.';
+    const laterOnlyWarning =
+      'Rejected unverified or mismatched parent request hint; kept request standalone.';
+
+    const fetcher: ObservationPageFetcher = async ({ cursor }) => {
+      if (cursor === null) {
+        return makeSnapshot({
+          sources: [
+            makeSource({ id: 'src_alpha', label: 'Alpha' }),
+            makeSource({ id: 'src_beta', label: 'Beta' }),
+          ],
+          requests: makeRequests(25, 'page1'),
+          warnings: [sharedWarning],
+          warning_contexts: [
+            {
+              warning: sharedWarning,
+              source_id: 'src_alpha',
+              origin: 'jobs',
+            },
+            {
+              warning: sharedWarning,
+              source_id: 'src_alpha',
+              origin: 'jobs',
+            },
+          ],
+          next_cursor: 'offset-25',
+          has_more: true,
+        });
+      }
+      return makeSnapshot({
+        sources: [
+          makeSource({ id: 'src_alpha', label: 'Alpha' }),
+          makeSource({ id: 'src_beta', label: 'Beta' }),
+        ],
+        requests: makeRequests(5, 'page2'),
+        warnings: [sharedWarning, laterOnlyWarning],
+        warning_contexts: [
+          {
+            warning: sharedWarning,
+            source_id: 'src_beta',
+            origin: 'jobs',
+          },
+          {
+            warning: laterOnlyWarning,
+            source_id: 'src_beta',
+            origin: 'requests',
+          },
+          {
+            warning: 'Orphan context not in warnings',
+            source_id: 'src_beta',
+            origin: 'requests',
+          },
+        ],
+        next_cursor: null,
+        has_more: false,
+      });
+    };
+
+    const result = await collectObservationWindow({
+      target: 30,
+      pageLimit: 25,
+      fetcher,
+    });
+
+    assert.equal(result.pagesFetched, 2);
+    assert.deepEqual(result.snapshot?.warnings, [sharedWarning, laterOnlyWarning]);
+    assert.deepEqual(result.snapshot?.warning_contexts, [
+      {
+        warning: sharedWarning,
+        source_id: 'src_alpha',
+        origin: 'jobs',
+      },
+      {
+        warning: sharedWarning,
+        source_id: 'src_beta',
+        origin: 'jobs',
+      },
+      {
+        warning: laterOnlyWarning,
+        source_id: 'src_beta',
+        origin: 'requests',
+      },
+    ]);
+    assert.ok(
+      (result.snapshot?.warning_contexts?.length ?? 0) <= OBSERVATION_MAX_WARNING_CONTEXTS
+    );
   });
 });

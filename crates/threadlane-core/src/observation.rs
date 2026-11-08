@@ -633,6 +633,17 @@ pub struct ObservationJob {
     pub summary: Option<String>,
 }
 
+/// Structured provenance context for a single read-only observation warning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationWarningContext {
+    /// Sanitized warning message matching an entry in [`ObservationSnapshot::warnings`].
+    pub warning: String,
+    /// Validated registry observation source identifier (`src_...`) when the warning originated from a specific source, or `None` for global/registry/snapshot warnings.
+    pub source_id: Option<String>,
+    /// Subsystem origin token (`registry`, `jobs`, `journal`, `requests`, or `snapshot`).
+    pub origin: String,
+}
+
 /// Read-only point-in-time observation snapshot returned to the desktop UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservationSnapshot {
@@ -654,6 +665,9 @@ pub struct ObservationSnapshot {
     pub jobs_has_more: bool,
     /// Per-source or journal warnings encountered during read-only projection.
     pub warnings: Vec<String>,
+    /// Optional structured provenance contexts for entries in [`Self::warnings`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warning_contexts: Vec<ObservationWarningContext>,
 }
 
 /// Optional filter and pagination arguments for `ipcObservationSnapshot`.
@@ -4442,5 +4456,49 @@ mod tests {
             "state.db",
         )
         .expect("schema rejection leaves metadata unchanged");
+    }
+
+    #[test]
+    fn observation_snapshot_deserializes_legacy_payload_without_warning_contexts() {
+        let legacy_json = r#"{
+            "schema_version": 1,
+            "generated_at_ms": 1700000000000,
+            "sources": [],
+            "jobs": [],
+            "requests": [],
+            "next_cursor": null,
+            "has_more": false,
+            "jobs_has_more": false,
+            "warnings": ["Skipped unreadable or invalid coworker workflow ledger in observation source."]
+        }"#;
+
+        let snapshot: ObservationSnapshot =
+            serde_json::from_str(legacy_json).expect("legacy snapshot should deserialize");
+        assert_eq!(snapshot.schema_version, OBSERVATION_SCHEMA_VERSION);
+        assert_eq!(
+            snapshot.warnings,
+            vec!["Skipped unreadable or invalid coworker workflow ledger in observation source."]
+        );
+        assert!(snapshot.warning_contexts.is_empty());
+
+        let serialized_empty =
+            serde_json::to_value(&snapshot).expect("serialize snapshot with empty contexts");
+        assert!(serialized_empty.get("warning_contexts").is_none());
+
+        let mut with_context = snapshot;
+        with_context
+            .warning_contexts
+            .push(ObservationWarningContext {
+                warning:
+                    "Skipped unreadable or invalid coworker workflow ledger in observation source."
+                        .to_string(),
+                source_id: Some("src_alpha".to_string()),
+                origin: "jobs".to_string(),
+            });
+        let round_trip_json =
+            serde_json::to_string(&with_context).expect("serialize snapshot with contexts");
+        let round_trip: ObservationSnapshot =
+            serde_json::from_str(&round_trip_json).expect("deserialize snapshot with contexts");
+        assert_eq!(round_trip.warning_contexts, with_context.warning_contexts);
     }
 }

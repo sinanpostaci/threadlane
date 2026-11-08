@@ -10,6 +10,7 @@ import {
   projectProjects,
   type ProjectAttentionItemView,
   type ProjectCallView,
+  type ProjectDiagnosticRowView,
   type ProjectEventView,
   type ProjectGroupView,
   type ProjectJobView,
@@ -190,6 +191,21 @@ interface ProjectDomEntry {
   sessionsContainer: HTMLDivElement;
   emptyEl: HTMLParagraphElement;
   sessionEntries: Map<string, SessionDomEntry>;
+}
+
+interface DiagnosticDomEntry {
+  key: string;
+  diag: ProjectDiagnosticRowView;
+  element: HTMLLIElement;
+  dotEl: HTMLSpanElement;
+  titleEl: HTMLSpanElement;
+  metaEl: HTMLParagraphElement;
+  impactEl: HTMLParagraphElement;
+  nextStepEl: HTMLParagraphElement;
+  scopeNoteEl: HTMLParagraphElement;
+  technicalDetailsEl: HTMLDetailsElement;
+  technicalSummaryEl: HTMLElement;
+  technicalTextEl: HTMLParagraphElement;
 }
 
 function hasActiveScope(scope: ActivityFeedScope | null | undefined): boolean {
@@ -379,6 +395,7 @@ export class ProjectsPage {
   private readonly announcementEl: HTMLSpanElement;
 
   private readonly projectEntries = new Map<string, ProjectDomEntry>();
+  private readonly diagnosticEntries = new Map<string, DiagnosticDomEntry>();
   private readonly initializedProjects = new Set<string>();
   private readonly initializedSessions = new Set<string>();
   private readonly initializedRecent = new Set<string>();
@@ -386,6 +403,7 @@ export class ProjectsPage {
   private readonly userSessionOpenState = new Map<string, boolean>();
   private readonly userRecentOpenState = new Map<string, boolean>();
   private readonly userOlderJobsOpenState = new Map<string, boolean>();
+  private readonly userDiagnosticTechnicalOpenState = new Map<string, boolean>();
   private userDiagnosticsOpen = false;
 
   private windowHours: ProjectsWindowHours = 6;
@@ -809,6 +827,7 @@ export class ProjectsPage {
       this.userSessionOpenState.clear();
       this.userRecentOpenState.clear();
       this.userOlderJobsOpenState.clear();
+      this.userDiagnosticTechnicalOpenState.clear();
       this.hasAutoExpandedFirstProject = false;
       const resetTooltip = '0 running calls among recorded loaded calls in view';
       this.liveBadgeEl.setAttribute('aria-label', resetTooltip);
@@ -834,6 +853,7 @@ export class ProjectsPage {
           ? `Last ${this.windowHours}h · Archived`
           : `Last ${this.windowHours}h`;
       this.loadMoreBtn.hidden = true;
+      this.diagnosticEntries.clear();
       while (this.warningsListEl.firstChild) {
         this.warningsListEl.removeChild(this.warningsListEl.firstChild);
       }
@@ -979,21 +999,201 @@ export class ProjectsPage {
         ? `Last ${this.windowHours}h · Archived`
         : `Last ${this.windowHours}h`;
 
-    while (this.warningsListEl.firstChild) {
-      this.warningsListEl.removeChild(this.warningsListEl.firstChild);
-    }
-    if (projection.warnings.length > 0) {
-      this.diagnosticsSummaryTextEl.textContent = `Diagnostics (${projection.warnings.length})`;
-      for (const warning of projection.warnings) {
-        this.warningsListEl.appendChild(h('li', { className: 'tp-warning-item' }, warning));
+    this.reconcileDiagnostics(projection.diagnostics);
+  }
+
+  private reconcileDiagnostics(diagnostics: ProjectDiagnosticRowView[]): void {
+    const activeEl =
+      typeof document !== 'undefined' ? document.activeElement : null;
+    let focusedDiagnosticKey: string | null = null;
+    let focusedDiagnosticControl: 'summary' | 'details' | 'item' | null = null;
+    if (activeEl) {
+      for (const [key, entry] of this.diagnosticEntries.entries()) {
+        if (
+          activeEl === entry.technicalSummaryEl ||
+          entry.technicalSummaryEl.contains(activeEl)
+        ) {
+          focusedDiagnosticKey = key;
+          focusedDiagnosticControl = 'summary';
+          break;
+        }
+        if (activeEl === entry.technicalDetailsEl) {
+          focusedDiagnosticKey = key;
+          focusedDiagnosticControl = 'details';
+          break;
+        }
+        if (activeEl === entry.element || entry.element.contains(activeEl)) {
+          focusedDiagnosticKey = key;
+          focusedDiagnosticControl = 'item';
+          break;
+        }
       }
-      this.warningsListEl.hidden = false;
-      this.diagnosticsDetailsEl.hidden = false;
-      this.diagnosticsDetailsEl.open = this.userDiagnosticsOpen;
-    } else {
+    }
+
+    const nextKeys = new Set(diagnostics.map((diag) => diag.key));
+    for (const [key, entry] of this.diagnosticEntries.entries()) {
+      if (!nextKeys.has(key)) {
+        this.userDiagnosticTechnicalOpenState.set(
+          key,
+          entry.technicalDetailsEl.open
+        );
+        entry.element.remove();
+        this.diagnosticEntries.delete(key);
+      }
+    }
+
+    if (diagnostics.length === 0) {
       this.diagnosticsSummaryTextEl.textContent = 'Diagnostics (0)';
       this.warningsListEl.hidden = true;
       this.diagnosticsDetailsEl.hidden = true;
+      return;
+    }
+
+    this.diagnosticsSummaryTextEl.textContent = `Diagnostics (${diagnostics.length})`;
+    this.warningsListEl.hidden = false;
+    this.diagnosticsDetailsEl.hidden = false;
+    this.diagnosticsDetailsEl.open = this.userDiagnosticsOpen;
+
+    for (let index = 0; index < diagnostics.length; index += 1) {
+      const diag = diagnostics[index]!;
+      let entry = this.diagnosticEntries.get(diag.key);
+      if (!entry) {
+        entry = this.createDiagnosticEntry(diag);
+        this.diagnosticEntries.set(diag.key, entry);
+      } else {
+        this.userDiagnosticTechnicalOpenState.set(
+          diag.key,
+          entry.technicalDetailsEl.open
+        );
+        this.updateDiagnosticEntry(entry, diag);
+      }
+
+      const targetNode = this.warningsListEl.children[index] ?? null;
+      if (targetNode !== entry.element) {
+        this.warningsListEl.insertBefore(entry.element, targetNode);
+      }
+    }
+
+    if (focusedDiagnosticKey !== null && focusedDiagnosticControl !== null) {
+      const retainedEntry = this.diagnosticEntries.get(focusedDiagnosticKey);
+      if (retainedEntry) {
+        const targetFocusEl =
+          focusedDiagnosticControl === 'summary'
+            ? retainedEntry.technicalSummaryEl
+            : focusedDiagnosticControl === 'details'
+              ? retainedEntry.technicalDetailsEl
+              : retainedEntry.element;
+        if (
+          typeof document !== 'undefined' &&
+          document.activeElement !== targetFocusEl &&
+          typeof targetFocusEl.focus === 'function'
+        ) {
+          targetFocusEl.focus({ preventScroll: true });
+        }
+      }
+    }
+  }
+
+  private createDiagnosticEntry(diag: ProjectDiagnosticRowView): DiagnosticDomEntry {
+    const dotEl = h('span', {
+      className:
+        diag.severity === 'warning'
+          ? 'tp-dot waiting tp-diagnostic-dot'
+          : 'tp-dot tp-diagnostic-dot',
+      'aria-hidden': 'true',
+    });
+    const titleEl = h('span', { className: 'tp-diagnostic-item-title' }, diag.title);
+    const headerEl = h('div', { className: 'tp-diagnostic-header' }, dotEl, titleEl);
+
+    const metaEl = h(
+      'p',
+      { className: 'tp-diagnostic-meta' },
+      `${diag.sourceLabel} · ${diag.area}`
+    );
+    const impactEl = h('p', { className: 'tp-diagnostic-impact' }, diag.impact);
+    const nextStepEl = h('p', { className: 'tp-diagnostic-next' }, diag.nextStep);
+    const scopeNoteEl = h(
+      'p',
+      { className: 'tp-diagnostic-scope' },
+      diag.conversationNote
+    );
+
+    const technicalChevron = createUiIcon('chevron-right');
+    technicalChevron.classList.add('tp-chevron');
+    const technicalSummaryEl = h(
+      'summary',
+      { className: 'tp-diagnostic-technical-summary cursor-interaction' },
+      h('span', undefined, 'Technical details'),
+      technicalChevron
+    );
+    const technicalTextEl = h(
+      'p',
+      { className: 'tp-diagnostic-technical-text' },
+      diag.technicalDetails
+    );
+    const technicalDetailsEl = h(
+      'details',
+      { className: 'tp-diagnostic-technical' },
+      technicalSummaryEl,
+      technicalTextEl
+    );
+    technicalDetailsEl.open =
+      this.userDiagnosticTechnicalOpenState.get(diag.key) ?? false;
+    technicalDetailsEl.addEventListener('toggle', () => {
+      if (!this.disposed) {
+        this.userDiagnosticTechnicalOpenState.set(diag.key, technicalDetailsEl.open);
+      }
+    });
+
+    const element = h(
+      'li',
+      {
+        className: 'tp-warning-item tp-diagnostic-item',
+        'data-severity': diag.severity,
+      },
+      headerEl,
+      metaEl,
+      impactEl,
+      nextStepEl,
+      scopeNoteEl,
+      technicalDetailsEl
+    );
+
+    return {
+      key: diag.key,
+      diag,
+      element,
+      dotEl,
+      titleEl,
+      metaEl,
+      impactEl,
+      nextStepEl,
+      scopeNoteEl,
+      technicalDetailsEl,
+      technicalSummaryEl,
+      technicalTextEl,
+    };
+  }
+
+  private updateDiagnosticEntry(
+    entry: DiagnosticDomEntry,
+    diag: ProjectDiagnosticRowView
+  ): void {
+    entry.diag = diag;
+    entry.element.setAttribute('data-severity', diag.severity);
+    entry.dotEl.className =
+      diag.severity === 'warning'
+        ? 'tp-dot waiting tp-diagnostic-dot'
+        : 'tp-dot tp-diagnostic-dot';
+    entry.titleEl.textContent = diag.title;
+    entry.metaEl.textContent = `${diag.sourceLabel} · ${diag.area}`;
+    entry.impactEl.textContent = diag.impact;
+    entry.nextStepEl.textContent = diag.nextStep;
+    entry.scopeNoteEl.textContent = diag.conversationNote;
+    entry.technicalTextEl.textContent = diag.technicalDetails;
+    const savedOpen = this.userDiagnosticTechnicalOpenState.get(diag.key);
+    if (savedOpen !== undefined && entry.technicalDetailsEl.open !== savedOpen) {
+      entry.technicalDetailsEl.open = savedOpen;
     }
   }
 

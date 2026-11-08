@@ -738,11 +738,104 @@
 
 .threadlane-projects .tp-warnings {
   margin: 0;
-  padding: 0 12px 6px 22px;
-  color: var(--tp-warm);
+  padding: 0 5px 6px;
+  list-style: none;
+  color: var(--tp-muted);
   font-size: 11px;
   display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.threadlane-projects .tp-diagnostic-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--tp-line);
+  background: var(--tp-nested);
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-diagnostic-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.threadlane-projects .tp-diagnostic-dot {
+  flex: 0 0 6px;
+}
+
+.threadlane-projects .tp-diagnostic-item[data-severity='warning'] .tp-diagnostic-dot {
+  background: var(--tp-status-warm, var(--tp-warm));
+}
+
+.threadlane-projects .tp-diagnostic-item[data-severity='info'] .tp-diagnostic-dot {
+  background: var(--tp-faint);
+}
+
+.threadlane-projects .tp-diagnostic-item-title {
+  font-weight: 500;
+  color: var(--tp-ink);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-diagnostic-item[data-severity='warning'] .tp-diagnostic-item-title {
+  color: var(--tp-status-warm, var(--tp-warm));
+}
+
+.threadlane-projects .tp-diagnostic-meta,
+.threadlane-projects .tp-diagnostic-impact,
+.threadlane-projects .tp-diagnostic-next,
+.threadlane-projects .tp-diagnostic-scope,
+.threadlane-projects .tp-diagnostic-technical-text {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-diagnostic-meta {
+  color: var(--tp-ink);
+  font-weight: 500;
+}
+
+.threadlane-projects .tp-diagnostic-impact,
+.threadlane-projects .tp-diagnostic-next {
+  color: var(--tp-muted);
+}
+
+.threadlane-projects .tp-diagnostic-scope {
+  color: var(--tp-faint);
+}
+
+.threadlane-projects .tp-diagnostic-technical {
+  margin-top: 2px;
+  min-width: 0;
+}
+
+.threadlane-projects .tp-diagnostic-technical-summary {
+  display: inline-flex;
+  align-items: center;
   gap: 4px;
+  color: var(--tp-faint);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-diagnostic-technical[open] > summary > .tp-chevron {
+  transform: rotate(90deg);
+}
+
+.threadlane-projects .tp-diagnostic-technical-text {
+  margin-top: 3px;
+  padding-left: 8px;
+  border-left: 1px solid var(--tp-line);
+  color: var(--tp-faint);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
 }
 
 .threadlane-projects .tp-sr-only {
