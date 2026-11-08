@@ -729,19 +729,24 @@ function buildDraftStatus(
     ? analysis.errors.filter((message) => message !== 'Profile name is required.')
     : analysis.errors;
 
+  const summaryParts = [
+    `${analysis.defaultCount}/${ROLES.length} role defaults set`,
+  ];
+  if (analysis.overrideCount > 0) {
+    summaryParts.push(
+      `${analysis.overrideCount} difficulty ${analysis.overrideCount === 1 ? 'override' : 'overrides'}`
+    );
+  }
+  if (analysis.missingDefaults.length > 0) {
+    summaryParts.push(
+      `Missing defaults: ${analysis.missingDefaults.map((role) => workflowRoleLabel(role)).join(', ')}`
+    );
+  }
+
   const status = h(
     'div',
     { class: 'aq-profiles-status' },
-    h(
-      'div',
-      { class: 'aq-profiles-stats' },
-      pill(`${analysis.defaultCount}/${ROLES.length} role defaults`, 'muted'),
-      pill(`${analysis.overrideCount} difficulty overrides`, 'muted'),
-      pill(`${analysis.assignmentCount} assignments`, 'muted'),
-      analysis.missingDefaults.length > 0
-        ? pill('Partial profile', 'warn')
-        : pill('Role defaults complete', 'accent')
-    )
+    h('p', { class: 'aq-profiles-summary' }, summaryParts.join(' · '))
   );
 
   if (suppressInitialBlankNameError) {
@@ -749,37 +754,17 @@ function buildDraftStatus(
       h(
         'p',
         { class: 'aq-profiles-note', 'data-tone': 'muted' },
-        'Enter a profile name to enable saving. Role assignments are optional and can be completed later.'
+        'Enter a profile name to save. Role assignments are optional.'
       )
     );
   }
 
-  if (analysis.missingDefaults.length > 0) {
-    status.append(
-      h(
-        'p',
-        { class: 'aq-profiles-note' },
-        h('strong', {}, 'Missing role defaults: '),
-        analysis.missingDefaults.map((role) => workflowRoleLabel(role)).join(', ')
-      )
-    );
-  }
-  if (analysis.unassignedRoles.length > 0) {
-    status.append(
-      h(
-        'p',
-        { class: 'aq-profiles-note', 'data-tone': 'muted' },
-        h('strong', {}, 'No assignments yet: '),
-        analysis.unassignedRoles.map((role) => workflowRoleLabel(role)).join(', ')
-      )
-    );
-  }
   if (visibleErrors.length > 0) {
     status.append(
       h(
         'div',
         { class: 'aq-profiles-errors', role: 'alert' },
-        h('p', {}, 'Fix these before saving:'),
+        h('p', {}, 'Fix before saving:'),
         h('ul', {}, ...visibleErrors.map((message) => h('li', {}, message)))
       )
     );
@@ -915,17 +900,15 @@ export class ProfilesPage {
       h(
         'div',
         { class: 'aq-profiles-heading' },
-        h('p', { class: 'aq-profiles-kicker' }, 'Registry'),
         h('h2', { class: 'aq-profiles-title', id: headingId }, 'Profiles'),
         h(
           'p',
           { class: 'aq-profiles-subtitle' },
-          'Map workflow roles and difficulties to enabled tools and models. Changes affect future task resolution only.'
+          'Assign enabled models and effort levels to workflow roles for future tasks.'
         ),
         h(
           'p',
           { class: 'aq-profiles-meta' },
-          h('span', {}, `Revision ${snapshot.revision}`),
           h(
             'span',
             {},
@@ -1168,22 +1151,19 @@ export class ProfilesPage {
     if (isDefault) {
       badges.push(pill('Default', 'accent'));
     }
-    if (summary.assignmentCount === 0) {
-      badges.push(pill('Empty profile', 'muted'));
+    if (summary.issues.length > 0 || advisorIssue) {
+      badges.push(pill('Needs attention', 'error'));
     } else if (summary.missingDefaults.length > 0) {
-      badges.push(pill('Partial profile', 'warn'));
+      badges.push(pill('Partial', 'warn'));
     }
-    if (summary.issues.length > 0) {
-      badges.push(
-        pill(
-          `${summary.issues.length} ${summary.issues.length === 1 ? 'issue' : 'issues'}`,
-          'error'
-        )
+
+    const summaryParts = [`${summary.defaultCount}/${ROLES.length} role defaults`];
+    if (summary.overrideCount > 0) {
+      summaryParts.push(
+        `${summary.overrideCount} difficulty ${summary.overrideCount === 1 ? 'override' : 'overrides'}`
       );
     }
-    if (advisorIssue) {
-      badges.push(pill('Advisor issue', 'error'));
-    }
+    summaryParts.push(`Advisor: ${advisorSummaryText(summary.advisor)}`);
 
     return h(
       'article',
@@ -1194,23 +1174,11 @@ export class ProfilesPage {
         h(
           'div',
           { class: 'aq-profiles-card-title' },
-          h('h4', {}, profile.name || 'Unnamed profile'),
-          h('p', { class: 'aq-profiles-id' }, profile.id)
+          h('h4', {}, profile.name || 'Unnamed profile')
         ),
-        h('div', { class: 'aq-profiles-badges' }, ...badges)
+        badges.length > 0 ? h('div', { class: 'aq-profiles-badges' }, ...badges) : null
       ),
-      h(
-        'p',
-        { class: 'aq-profiles-summary' },
-        `${summary.defaultCount}/${ROLES.length} role defaults · ` +
-          `${summary.overrideCount} difficulty overrides · ${summary.assignmentCount} assignments`
-      ),
-      h(
-        'p',
-        { class: 'aq-profiles-advisor-summary' },
-        h('strong', {}, 'Decision advisor: '),
-        advisorSummaryText(summary.advisor)
-      ),
+      h('p', { class: 'aq-profiles-summary' }, summaryParts.join(' · ')),
       advisorIssue
         ? h(
             'p',
@@ -1277,6 +1245,16 @@ export class ProfilesPage {
           ariaLabel: `Delete ${profile.name}`,
         })
       ),
+      h(
+        'details',
+        { class: 'aq-profiles-details' },
+        h('summary', {}, 'Profile details'),
+        h(
+          'p',
+          { class: 'aq-profiles-id' },
+          `ID: ${profile.id} · Revision ${snapshot.revision}`
+        )
+      ),
       isConfirming
         ? h(
             'div',
@@ -1289,7 +1267,7 @@ export class ProfilesPage {
             h(
               'p',
               {},
-              'This cannot be undone. Running tasks keep their resolved choices; future tasks will not use this profile.'
+              'Cannot be undone. Active tasks keep their current models.'
             ),
             isDefault
               ? h(
@@ -1383,15 +1361,8 @@ export class ProfilesPage {
           'div',
           {},
           h('h3', { id: editorId }, title),
-          h(
-            'p',
-            { class: 'aq-profiles-meta' },
-            context,
-            ' · ',
-            `Draft revision ${draft.sourceRevision}`
-          )
-        ),
-        pill('Draft', 'accent')
+          h('p', { class: 'aq-profiles-meta' }, context)
+        )
       ),
       ...this.buildExternalChangeBanner(draft),
       h(
@@ -1402,15 +1373,9 @@ export class ProfilesPage {
           { class: 'aq-profiles-field', for: nameId },
           h('span', {}, 'Profile name'),
           nameInput
-        ),
-        h(
-          'p',
-          { class: 'aq-profiles-id' },
-          `${draft.id} · Saves against registry revision ${snapshot.revision}.`
         )
       ),
       h('div', { 'data-draft-status': 'true' }, buildDraftStatus(analysis, draft)),
-      this.buildDecisionAdvisorSection(draft, analysis, busy),
       this.buildModelSetupCard(snapshot, true),
       showRoleEditors
         ? h(
@@ -1419,6 +1384,7 @@ export class ProfilesPage {
             ...ROLES.map((role) => this.buildRoleEditor(role, draft, analysis, busy))
           )
         : null,
+      this.buildDecisionAdvisorSection(draft, analysis, busy),
       h(
         'div',
         { class: 'aq-profiles-editor-actions' },
@@ -1446,9 +1412,14 @@ export class ProfilesPage {
         })
       ),
       h(
-        'p',
-        { class: 'aq-profiles-footnote' },
-        'Profiles are preferences. Running tasks keep their resolved model choices until they finish.'
+        'details',
+        { class: 'aq-profiles-details' },
+        h('summary', {}, 'Profile details'),
+        h(
+          'p',
+          { class: 'aq-profiles-id' },
+          `ID: ${draft.id} · Base revision ${draft.sourceRevision} · Registry revision ${snapshot.revision}`
+        )
       )
     );
   }
@@ -1576,15 +1547,14 @@ export class ProfilesPage {
         h(
           'div',
           { class: 'aq-profiles-advisor-title' },
-          h('p', { class: 'aq-profiles-kicker' }, 'Optional'),
           h('h4', {}, 'Decision advisor')
         ),
-        pill('Shadow', 'accent')
+        h('span', { class: 'aq-profiles-role-status' }, 'Optional')
       ),
       h(
         'p',
-        { class: 'aq-profiles-note' },
-        'Suggests task difficulty without changing your plan or starting work.'
+        { class: 'aq-profiles-note', id: helpId },
+        'Suggests task difficulty without changing plans or active tasks.'
       ),
       h(
         'div',
@@ -1611,11 +1581,6 @@ export class ProfilesPage {
       openAiNote
         ? h('p', { class: 'aq-profiles-note', 'data-tone': 'warn' }, openAiNote)
         : null,
-      h(
-        'p',
-        { class: 'aq-profiles-note', id: helpId },
-        'Saving this choice sends no request. Running tasks keep their current settings.'
-      ),
       choices.length === 0
         ? h(
             'div',
@@ -1623,8 +1588,7 @@ export class ProfilesPage {
             h(
               'p',
               {},
-              'No enabled Jev or OpenAI decisions API model is available. Add an enabled ' +
-                'API tool and a model that allows no effort in Tools.'
+              'No eligible decision API model is enabled. Enable a no-effort API model in Tools.'
             ),
             advisorIssue
               ? null
@@ -1752,8 +1716,8 @@ export class ProfilesPage {
         { class: 'aq-profiles-overrides-toolbar' },
         h(
           'p',
-          { class: 'aq-profiles-overrides-note' },
-          'Difficulty overrides take precedence over the role default.'
+          { class: 'aq-profiles-note', 'data-tone': 'muted' },
+          'Overrides replace the role default for that difficulty.'
         ),
         button(
           'Clear difficulty overrides',
@@ -2306,7 +2270,7 @@ export class ProfilesPage {
     await this.runChange(
       { op: 'upsert_profile', profile },
       { kind: 'save', targetId: profile.id },
-      `Profile "${profile.name}" saved.`,
+      `"${profile.name}" saved.`,
       `edit-${profile.id}`,
       () => {
         this.draft = null;
@@ -2332,7 +2296,7 @@ export class ProfilesPage {
     await this.runChange(
       { op: 'delete_profile', profile_id: profile.id },
       { kind: 'delete', targetId: profile.id },
-      `Profile "${profile.name}" deleted.`,
+      `"${profile.name}" deleted.`,
       focusKey,
       () => {
         if (this.draft?.sourceId === profile.id) {
@@ -2347,7 +2311,7 @@ export class ProfilesPage {
     await this.runChange(
       { op: 'set_default_profile', profile_id: profile.id },
       { kind: 'default', targetId: profile.id },
-      `Default profile set to "${profile.name}".`,
+      `Default set to "${profile.name}".`,
       `edit-${profile.id}`
     );
   }
@@ -2361,7 +2325,7 @@ export class ProfilesPage {
     await this.runChange(
       { op: 'set_default_profile', profile_id: null },
       { kind: 'default' },
-      'Default profile cleared.',
+      'Default cleared.',
       focusKey
     );
   }

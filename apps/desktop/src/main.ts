@@ -21,11 +21,9 @@ import {
 } from './types.ts';
 import {
   classifyTaskBucket,
-  formatAttachmentBadge,
   formatBindingLabel,
   formatEvidenceFieldCheck,
   formatEvidenceSummary,
-  formatFooterStatus,
   formatModelAndEffort,
   formatProviderName,
   formatRelativeTimestamp,
@@ -96,7 +94,6 @@ import {
   desktop_tool_versions,
   formatAppError,
 } from './registry/ipc.ts';
-import { visibleModelCount } from './registry/model-families.ts';
 import {
   ipcLinkObservationContext,
   ipcObservationSnapshot,
@@ -1917,20 +1914,6 @@ class ThreadlaneDesktopApp {
       h('span', { className: 'aq-title-text', 'data-tauri-drag-region': 'true' }, pageTitle)
     );
 
-    const badgeEl = observationPage
-      ? null
-      : h(
-          'span',
-          {
-            className: 'aq-preview-label',
-            'data-state': this.state.snapshot.attachment.connection,
-          },
-          formatAttachmentBadge(
-            this.state.snapshot.attachment,
-            this.state.isDevPreviewFixture
-          )
-        );
-
     const windowControls = h(
       'div',
       { className: 'aq-window-controls' },
@@ -1960,7 +1943,7 @@ class ThreadlaneDesktopApp {
       )
     );
 
-    const rightEl = h('div', { className: 'aq-top-right' }, badgeEl, windowControls);
+    const rightEl = h('div', { className: 'aq-top-right' }, windowControls);
     this.headerEl.replaceChildren(titleEl, rightEl);
   }
 
@@ -2844,7 +2827,16 @@ class ThreadlaneDesktopApp {
     const frag = document.createDocumentFragment();
     const bindingSnapshotCurrent = isCurrentBindingSnapshot(this.state);
 
-    frag.appendChild(h('p', { className: 'aq-kicker' }, 'Connections'));
+    const liveAdvancedDetails = this.mainEl?.querySelector<HTMLDetailsElement>(
+      'details[data-advanced-controls="true"]'
+    );
+    if (liveAdvancedDetails) {
+      this.advancedControlsOpen = liveAdvancedDetails.open;
+    }
+    const prevSetupDetailsOpen =
+      this.mainEl?.querySelector<HTMLDetailsElement>(
+        'details[data-codex-setup-details="true"]'
+      )?.open ?? false;
 
     if (bindingSnapshotCurrent) {
       frag.appendChild(this.preserveOverviewExpansion(renderReadinessChecklist({
@@ -2920,159 +2912,34 @@ class ThreadlaneDesktopApp {
           )
         );
       }
-
-      frag.appendChild(
-        h(
-          'p',
-          { className: 'aq-note' },
-          'Only verified runtime bindings appear above. Native thread metadata discovery below is read-only and never fabricates pairing.'
-        )
-      );
     }
 
-    frag.appendChild(
-      buildCodexSetupPanel({
-        report: this.codexSetupReport,
-        busy: this.codexSetupBusy,
-        isBrowserPreview: !hasTauriRuntime(),
-        onRecheck: () => {
-          void this.handleRecheckCodexSetup();
-        },
-        onRetry: () => {
-          void this.handleRetryCodexSetup();
-        },
-      })
-    );
+    const codexSetupPanel = buildCodexSetupPanel({
+      report: this.codexSetupReport,
+      busy: this.codexSetupBusy,
+      isBrowserPreview: !hasTauriRuntime(),
+      onRecheck: () => {
+        void this.handleRecheckCodexSetup();
+      },
+      onRetry: () => {
+        void this.handleRetryCodexSetup();
+      },
+    });
+    if (prevSetupDetailsOpen) {
+      const setupDetails = codexSetupPanel.querySelector<HTMLDetailsElement>(
+        'details[data-codex-setup-details="true"]'
+      );
+      if (setupDetails) {
+        setupDetails.open = true;
+      }
+    }
+    frag.appendChild(codexSetupPanel);
 
     frag.appendChild(
       this.nativeLinkingPanel.render(this.state.registrySnapshot, bindings)
     );
 
-    const { snapshot, pendingMutation } = this.state;
-    const busy = pendingMutation !== null;
-
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-kicker', style: 'margin-top: 18px;' },
-        'Runtime attachment & local demo'
-      )
-    );
-
-    frag.appendChild(
-      h(
-        'dl',
-        { className: 'aq-facts', style: 'margin: 8px 0 12px;' },
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Active mode'),
-          h('dd', undefined, snapshot.attachment.mode)
-        ),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'Connection'),
-          h('dd', undefined, snapshot.attachment.connection)
-        ),
-        h(
-          'div',
-          undefined,
-          h('dt', undefined, 'State dir'),
-          h('dd', undefined, snapshot.attachment.state_dir ?? 'None attached')
-        )
-      )
-    );
-
-    frag.appendChild(
-      h(
-        'div',
-        { className: 'aq-setting' },
-        h(
-          'label',
-          { className: 'aq-label', for: 'settings-state-dir-input' },
-          h('span', undefined, 'Attach runtime folder (read-only observer)')
-        ),
-        h(
-          'div',
-          { className: 'aq-input-row' },
-          h('input', {
-            id: 'settings-state-dir-input',
-            type: 'text',
-            className: 'aq-text-input',
-            value: this.state.stateDirDraft,
-            placeholder: '/path/to/threadlane/state-dir',
-            'data-input': 'state-dir',
-            'data-focus': 'state-dir-input',
-            disabled: busy,
-          }),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'aq-btn aq-btn-primary',
-              'data-action': 'attach-runtime',
-              'data-focus': 'settings-attach-btn',
-              disabled: busy,
-            },
-            pendingLabel(pendingMutation === 'attach', 'Attach', 'Attaching…')
-          )
-        ),
-        h(
-          'label',
-          { className: 'aq-toggle' },
-          h('span', undefined, 'Remember folder path on this device'),
-          h('input', {
-            type: 'checkbox',
-            checked: this.state.appearance.rememberStateDir,
-            'data-toggle-remember-dir': 'true',
-            'data-focus': 'remember-state-dir',
-          })
-        )
-      )
-    );
-
-    if (snapshot.demo_controls.available) {
-      const demoActive = snapshot.demo_controls.can_cancel;
-      frag.appendChild(
-        h(
-          'div',
-          { className: 'aq-setting' },
-          h('div', { className: 'aq-label' }, h('span', undefined, 'Local demo')),
-          h(
-            'button',
-            {
-              type: 'button',
-              className: 'aq-btn',
-              'data-action': 'start-demo',
-              'data-focus': 'settings-start-demo',
-              disabled: busy || demoActive,
-            },
-            createUiIcon('play'),
-            h(
-              'span',
-              undefined,
-              pendingMutation === 'start_demo'
-                ? 'Starting…'
-                : demoActive
-                   ? 'Local demo active'
-                   : 'Run local demo'
-            )
-          )
-        )
-      );
-    }
-
-    frag.appendChild(this.buildObservationSourcesSection());
     frag.appendChild(this.buildAdvancedControlsSection());
-
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Only appearance, bounded execution preferences, and an optional remembered folder path are saved locally. Prompts, run history, and credentials are never stored in browser storage.'
-      )
-    );
 
     return frag;
   }
@@ -3248,52 +3115,158 @@ class ThreadlaneDesktopApp {
   }
 
   private buildAdvancedControlsSection(): HTMLElement {
+    const { snapshot, pendingMutation } = this.state;
+    const busy = pendingMutation !== null;
+
     const details = h('details', {
       className: 'aq-technical aq-advanced-controls',
       'data-advanced-controls': 'true',
       open: this.advancedControlsOpen,
     });
+    details.addEventListener('toggle', () => {
+      this.advancedControlsOpen = details.open;
+    });
     details.appendChild(
       h(
         'summary',
         { 'data-focus': 'advanced-controls' },
-        h('span', undefined, 'Advanced controls'),
+        h('span', undefined, 'Advanced diagnostics'),
         createUiIcon('chevron-down')
       )
     );
-    details.appendChild(
+
+    const body = h(
+      'div',
+      { className: 'aq-advanced-controls-body' },
+      h(
+        'dl',
+        { className: 'aq-facts', style: 'margin: 6px 0 10px;' },
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'Active mode'),
+          h('dd', undefined, snapshot.attachment.mode)
+        ),
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'Connection'),
+          h('dd', undefined, snapshot.attachment.connection)
+        ),
+        h(
+          'div',
+          undefined,
+          h('dt', undefined, 'State dir'),
+          h('dd', undefined, snapshot.attachment.state_dir ?? 'None attached')
+        )
+      ),
       h(
         'div',
-        { className: 'aq-advanced-controls-body' },
+        { className: 'aq-setting' },
         h(
-          'p',
-          { className: 'aq-note' },
-          'Secondary read-only surfaces. Opening this section performs no work; choose a route explicitly. Neither route dispatches or starts a worker.'
+          'label',
+          { className: 'aq-label', for: 'settings-state-dir-input' },
+          h('span', undefined, 'Attach runtime folder (read-only observer)')
         ),
         h(
-          'button',
-          {
-            type: 'button',
-            className: 'aq-link',
-            'data-action': 'open-advanced-activity',
-            'data-focus': 'open-advanced-activity',
-          },
-          h('span', undefined, 'Legacy activity diagnostics'),
-          createUiIcon('chevron-right')
+          'div',
+          { className: 'aq-input-row' },
+          h('input', {
+            id: 'settings-state-dir-input',
+            type: 'text',
+            className: 'aq-text-input',
+            value: this.state.stateDirDraft,
+            placeholder: '/path/to/threadlane/state-dir',
+            'data-input': 'state-dir',
+            'data-focus': 'state-dir-input',
+            disabled: busy,
+          }),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'aq-btn aq-btn-primary',
+              'data-action': 'attach-runtime',
+              'data-focus': 'settings-attach-btn',
+              disabled: busy,
+            },
+            pendingLabel(pendingMutation === 'attach', 'Attach', 'Attaching…')
+          )
         ),
         h(
-          'button',
-          {
-            type: 'button',
-            className: 'aq-link',
-            'data-action': 'open-advanced-plans',
-            'data-focus': 'open-advanced-plans',
-          },
-          h('span', undefined, 'Advanced plan editor'),
-          createUiIcon('chevron-right')
+          'label',
+          { className: 'aq-toggle' },
+          h('span', undefined, 'Remember folder path on this device'),
+          h('input', {
+            type: 'checkbox',
+            checked: this.state.appearance.rememberStateDir,
+            'data-toggle-remember-dir': 'true',
+            'data-focus': 'remember-state-dir',
+          })
         )
       )
     );
+
+    if (snapshot.demo_controls.available) {
+      const demoActive = snapshot.demo_controls.can_cancel;
+      body.appendChild(
+        h(
+          'div',
+          { className: 'aq-setting' },
+          h('div', { className: 'aq-label' }, h('span', undefined, 'Local demo')),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'aq-btn',
+              'data-action': 'start-demo',
+              'data-focus': 'settings-start-demo',
+              disabled: busy || demoActive,
+            },
+            createUiIcon('play'),
+            h(
+              'span',
+              undefined,
+              pendingMutation === 'start_demo'
+                ? 'Starting…'
+                : demoActive
+                   ? 'Local demo active'
+                   : 'Run local demo'
+            )
+          )
+        )
+      );
+    }
+
+    body.appendChild(this.buildObservationSourcesSection());
+    body.appendChild(
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'aq-link',
+          'data-action': 'open-advanced-activity',
+          'data-focus': 'open-advanced-activity',
+        },
+        h('span', undefined, 'Legacy activity diagnostics'),
+        createUiIcon('chevron-right')
+      )
+    );
+    body.appendChild(
+      h(
+        'button',
+        {
+          type: 'button',
+          className: 'aq-link',
+          'data-action': 'open-advanced-plans',
+          'data-focus': 'open-advanced-plans',
+        },
+        h('span', undefined, 'Advanced plan editor'),
+        createUiIcon('chevron-right')
+      )
+    );
+
+    details.appendChild(body);
     return details;
   }
 
@@ -3346,34 +3319,7 @@ class ThreadlaneDesktopApp {
     return frag;
   }
 
-  private buildRegistryHeaderBar(): HTMLElement {
-    const modelCount = visibleModelCount(
-      this.state.registrySnapshot.models,
-      this.state.registrySnapshot.tools
-    );
-    return h(
-      'div',
-      { className: 'aq-scope-bar' },
-      h(
-        'span',
-        undefined,
-        `Registry revision r${this.state.registrySnapshot.revision} · ${this.state.registrySnapshot.tools.length} tools · ${modelCount} models · ${this.state.registrySnapshot.profiles.length} profiles`
-      ),
-      h(
-        'button',
-        {
-          type: 'button',
-          className: 'aq-icon-button',
-          'data-action': 'refresh-registry',
-          'data-focus': 'refresh-registry',
-          'aria-label': 'Refresh registry',
-          title: 'Refresh registry',
-          disabled: this.state.registryInFlight,
-        },
-        createUiIcon('refresh-cw')
-      )
-    );
-  }
+
 
   private handleOpenProfilesFromTools(): void {
     this.returnFocusKey = null;
@@ -3391,7 +3337,6 @@ class ThreadlaneDesktopApp {
 
   private buildToolsView(): DocumentFragment {
     const frag = document.createDocumentFragment();
-    frag.appendChild(this.buildRegistryHeaderBar());
 
     if (this.state.registryError) {
       frag.appendChild(
@@ -3428,7 +3373,6 @@ class ThreadlaneDesktopApp {
 
   private buildProfilesView(): DocumentFragment {
     const frag = document.createDocumentFragment();
-    frag.appendChild(this.buildRegistryHeaderBar());
 
     if (this.state.registryError) {
       frag.appendChild(
@@ -3449,8 +3393,7 @@ class ThreadlaneDesktopApp {
     frag.appendChild(
       h(
         'div',
-        { className: 'aq-setting' },
-        h('div', { className: 'aq-label' }, h('span', undefined, 'Settings section')),
+        { className: 'aq-setting', style: 'padding-top: 2px;' },
         h(
           'div',
           { className: 'aq-segment', role: 'group', 'aria-label': 'Settings section' },
@@ -3559,16 +3502,9 @@ class ThreadlaneDesktopApp {
 
     frag.appendChild(this.buildExecutionPreferencesSection(executionPrefs));
 
-    frag.appendChild(
-      h(
-        'p',
-        { className: 'aq-note' },
-        'Only appearance, bounded execution preferences, and an optional remembered folder path are saved locally. Prompts, run history, and credentials are never stored in browser storage.'
-      )
-    );
-
     return frag;
   }
+
 
   private buildExecutionPreferencesSection(prefs: ExecutionPreferences): HTMLElement {
     const updatePref = (patch: Partial<ExecutionPreferences>, focusKey?: string): void => {
@@ -3651,7 +3587,7 @@ class ThreadlaneDesktopApp {
       h(
         'div',
         { className: 'aq-row-head' },
-        h('p', { className: 'aq-kicker', style: 'margin: 0;' }, 'Execution & privacy bounds'),
+        h('p', { className: 'aq-kicker', style: 'margin: 0;' }, 'Execution & privacy'),
         resetBtn
       ),
       h(
@@ -3660,38 +3596,33 @@ class ThreadlaneDesktopApp {
         h(
           'label',
           { className: 'aq-field' },
-          h('span', { className: 'aq-field-label' }, 'Max concurrent workers (1–8)'),
+          h('span', { className: 'aq-field-label' }, 'Concurrent workers (1–8)'),
           workersInput
         ),
         h(
           'label',
           { className: 'aq-field' },
-          h('span', { className: 'aq-field-label' }, 'Max tasks per plan (1–32)'),
+          h('span', { className: 'aq-field-label' }, 'Tasks per plan (1–32)'),
           tasksInput
         ),
         h(
           'label',
           { className: 'aq-field' },
-          h('span', { className: 'aq-field-label' }, 'Worker timeout secs (30–3600)'),
+          h('span', { className: 'aq-field-label' }, 'Worker timeout (30–3600s)'),
           timeoutInput
         )
       ),
       h(
         'label',
         { className: 'aq-toggle' },
-        h('span', undefined, 'Redact home and workspace paths in exported diagnostics'),
+        h('span', undefined, 'Redact paths in exported diagnostics'),
         redactToggle
       ),
       h(
         'label',
         { className: 'aq-toggle' },
-        h('span', undefined, 'Require explicit operator publish before plan admission'),
+        h('span', undefined, 'Require explicit publish before plan admission'),
         explicitPublishToggle
-      ),
-      h(
-        'p',
-        { className: 'aq-note', style: 'margin-bottom: 0;' },
-        'Typed bounds only: arbitrary shell flags, custom CLI arguments, and raw environment variable overrides are prohibited. Editing preferences here never alters running tasks.'
       )
     );
   }
@@ -3727,19 +3658,9 @@ class ThreadlaneDesktopApp {
   }
 
   private renderFooter(): void {
-    if (this.isObservationPageLayoutActive()) {
-      // The observation footer stays hidden; leave its existing children
-      // untouched instead of replacing them on every render.
-      return;
+    if (this.footerEl.childNodes.length > 0) {
+      this.footerEl.replaceChildren();
     }
-    const status = formatFooterStatus(
-      this.state.snapshot.attachment,
-      this.state.isDevPreviewFixture
-    );
-    this.footerEl.replaceChildren(
-      h('span', undefined, status.left),
-      h('span', undefined, status.right)
-    );
   }
 
   private renderNav(): void {

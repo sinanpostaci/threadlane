@@ -50,34 +50,19 @@ export class NativeLinkingPanel {
     // replacing the filter input, so typing and focus survive polls.
     this.container = h('section', {
       className: 'aq-card',
-      'aria-label': 'Native Codex metadata and pairing verification',
+      'aria-label': 'Codex conversations',
     });
 
     const sectionHeader = h(
       'div',
       { className: 'aq-section', style: 'margin-top: 14px;' },
-      h('span', undefined, 'Native Codex metadata & pairing gate'),
-      h(
-        'span',
-        { className: 'aq-badge', 'data-status': 'warn' },
-        'needs_verification'
-      )
+      h('span', undefined, 'Codex conversations')
     );
 
     const verificationBanner = h(
-      'div',
-      { className: 'aq-banner' },
-      h(
-        'div',
-        { className: 'aq-banner-head' },
-        h('span', undefined, 'Paired MCP & busy-turn gate pending verification'),
-        h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unverified')
-      ),
-      h(
-        'p',
-        { className: 'aq-banner-sub' },
-        'Two-chat isolation and busy-turn steer delivery remain marked needs_verification until an explicit authorized operator experiment is run. Enrollment requires an operator-retrieved connection_identity nonce on the thread-scoped MCP connection; model parameters never authorize binding.'
-      )
+      'p',
+      { className: 'aq-note' },
+      'Browse local Codex conversations in read-only mode; loading this list does not pair or authenticate chats.'
     );
 
     const errorText = h('span');
@@ -95,7 +80,7 @@ export class NativeLinkingPanel {
         'div',
         { className: 'aq-banner-head' },
         h('span', undefined, 'Codex CLI adapter not configured'),
-        h('span', { className: 'aq-badge' }, 'not_configured')
+        h('span', { className: 'aq-badge' }, 'Setup required')
       ),
       h(
         'p',
@@ -154,7 +139,7 @@ export class NativeLinkingPanel {
     });
     blockedNote.hidden = true;
 
-    const fetchButton = createButton('Load native thread metadata', () => {
+    const fetchButton = createButton('Load conversations', () => {
       void this.load('fresh');
     });
     fetchButton.classList.add('aq-btn-primary');
@@ -276,7 +261,7 @@ export class NativeLinkingPanel {
     this.fetchButton.disabled = state.loading || blockReason !== null;
     this.fetchButton.textContent = state.loading
       ? 'Querying metadata…'
-      : 'Load native thread metadata';
+      : 'Load conversations';
 
     const context = state.appliedContext;
     if (context !== null) {
@@ -284,7 +269,7 @@ export class NativeLinkingPanel {
         context.projectFilter === null
           ? 'all projects'
           : `project "${context.projectFilter}"`;
-      this.contextNote.textContent = `List represents ${context.toolLabel} (${context.toolId}) · ${projectLabel} · registry r${context.registryRevision}.`;
+      this.contextNote.textContent = `Showing ${context.toolLabel} · ${projectLabel}.`;
       this.contextNote.hidden = false;
     } else {
       this.contextNote.hidden = true;
@@ -342,7 +327,7 @@ export class NativeLinkingPanel {
               selected: tool.id === state.selectedToolId,
               disabled: !tool.enabled,
             },
-            `${tool.label} (${tool.id})${tool.enabled ? '' : ' [disabled]'}`
+            `${tool.label}${tool.enabled ? '' : ' [disabled]'}`
           )
         )
       );
@@ -364,7 +349,7 @@ export class NativeLinkingPanel {
         : 'Showing the last successful metadata page; the latest request failed.';
     }
     if (state.appliedContext === null) {
-      return 'Passive view: no CLI or proxy commands are executed on page load or polling. Click "Load native thread metadata" to inspect read-only thread metadata.';
+      return 'Choose Load conversations to browse local chats. This does not pair them.';
     }
     if (state.threads.length === 0) {
       return 'No native threads returned for the current filter.';
@@ -380,8 +365,8 @@ export class NativeLinkingPanel {
     return state.threads.map((thread) => {
       const matchedBinding = boundByThreadUuid.get(thread.id) ?? null;
       const pairingStatusLabel = matchedBinding
-        ? `Observed binding ${matchedBinding.binding_id} · enrollment unverified`
-        : 'No observed binding · enrollment unverified';
+        ? 'Binding recorded · not verified'
+        : 'No binding recorded';
 
       return h(
         'div',
@@ -407,24 +392,35 @@ export class NativeLinkingPanel {
           h(
             'span',
             undefined,
-            `Native thread.id: ${thread.id} · Status: ${thread.status}`
-          )
-        ),
-        h(
-          'div',
-          { className: 'aq-role-line' },
-          h(
-            'span',
-            undefined,
-            `Model: ${thread.model ?? 'Unspecified'} · Effort: ${
+            `Status: ${thread.status} · Model: ${thread.model ?? 'Unspecified'} · Effort: ${
               thread.effort ?? 'Unspecified'
-            } · Project: ${thread.project_id ?? 'None'}`
+            }`
           )
         ),
         h(
-          'div',
-          { className: 'aq-role-line' },
-          h('span', undefined, `Working directory: ${thread.cwd}`)
+          'details',
+          { className: 'aq-details' },
+          h('summary', undefined, 'Conversation details'),
+          h(
+            'div',
+            { className: 'aq-role-line' },
+            h(
+              'span',
+              undefined,
+              `Native thread.id: ${thread.id} · Observed binding: ${
+                matchedBinding?.binding_id ?? 'None'
+              }`
+            )
+          ),
+          h(
+            'div',
+            { className: 'aq-role-line' },
+            h(
+              'span',
+              undefined,
+              `Project: ${thread.project_id ?? 'None'} · Working directory: ${thread.cwd}`
+            )
+          )
         )
       );
     });

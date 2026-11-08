@@ -455,11 +455,22 @@
 }
 
 .aq-tools-version-path {
+  display: inline-block;
+  max-width: 100%;
   padding: 0;
   background: transparent;
   color: var(--aq-text);
   font-size: 0.76rem;
+  word-break: break-all;
   overflow-wrap: anywhere;
+}
+
+.aq-tools-version-details {
+  padding-top: 5px;
+}
+
+.aq-tools-version-details > :not(summary) {
+  margin-top: 6px;
 }
 
 .aq-tools-version-action {
@@ -1042,7 +1053,8 @@ input.aq-tools-catalog-search:focus-visible {
 
   .aq-tools-form-grid,
   .aq-tools-status-grid,
-  .aq-tools-facts {
+  .aq-tools-facts,
+  .aq-tools-version-facts {
     grid-template-columns: minmax(0, 1fr);
   }
 

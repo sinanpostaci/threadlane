@@ -30,13 +30,13 @@ body,
 }
 
 .aq-app {
-  --aq-text: #262626;
-  --aq-muted: #666666;
-  --aq-line: #dadada;
+  --aq-text: #292929;
+  --aq-muted: #696969;
+  --aq-line: #e2e2e2;
   --aq-base: #f7f7f7;
-  --aq-field: #efefef;
-  --aq-hover: #eaeaea;
-  --aq-selected: #eaeaea;
+  --aq-field: #ffffff;
+  --aq-hover: #eeeeee;
+  --aq-selected: #eeeeee;
   --aq-border: rgba(96, 96, 96, 0.24);
   --aq-danger: #9e3b33;
   --aq-danger-bg: rgba(158, 59, 51, 0.1);
@@ -56,7 +56,9 @@ body,
   flex-direction: column;
   overflow: hidden;
   color: var(--aq-text);
-  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  border-radius: 13px;
+  font: 400 13px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  letter-spacing: -0.012em;
   border: 1px solid var(--aq-border);
   background-color: var(--aq-base);
   background: color-mix(in srgb, var(--aq-base) var(--aq-opacity), transparent);
@@ -127,13 +129,13 @@ body,
 }
 
 .aq-app[data-theme="light"] {
-  --aq-text: #262626;
-  --aq-muted: #666666;
-  --aq-line: #dadada;
+  --aq-text: #292929;
+  --aq-muted: #696969;
+  --aq-line: #e2e2e2;
   --aq-base: #f7f7f7;
-  --aq-field: #efefef;
-  --aq-hover: #eaeaea;
-  --aq-selected: #eaeaea;
+  --aq-field: #ffffff;
+  --aq-hover: #eeeeee;
+  --aq-selected: #eeeeee;
   --aq-border: rgba(96, 96, 96, 0.24);
   --aq-danger: #9e3b33;
   --aq-danger-bg: rgba(158, 59, 51, 0.1);
@@ -142,101 +144,16 @@ body,
   --aq-accent: var(--aq-accent-light);
 }
 
-/*
- * Approved Projects shell presentation applies only to the primary Projects
- * view. Tools, Profiles, Settings, and legacy diagnostics keep their layout.
- */
-.aq-app[data-projects-layout="true"] {
-  --aq-text: #292929;
-  --aq-muted: #696969;
-  --aq-line: #e2e2e2;
-  --aq-base: #f7f7f7;
-  --aq-field: #ffffff;
-  --aq-hover: #eeeeee;
-  --aq-selected: #eeeeee;
-  --aq-pad: 16px;
-  width: 100%;
-  border-radius: 13px;
-  font: 400 13px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
-  letter-spacing: -0.012em;
-}
-
-.aq-app[data-projects-layout="true"][data-theme="dark"] {
-  --aq-text: #e8e8e8;
-  --aq-muted: #ababab;
-  --aq-line: #3c3c3c;
-  --aq-base: #252525;
-  --aq-field: #202020;
-  --aq-hover: #303030;
-  --aq-selected: #303030;
-}
-
-@media (prefers-color-scheme: dark) {
-  .aq-app[data-projects-layout="true"][data-theme="system"] {
-    --aq-text: #e8e8e8;
-    --aq-muted: #ababab;
-    --aq-line: #3c3c3c;
-    --aq-base: #252525;
-    --aq-field: #202020;
-    --aq-hover: #303030;
-    --aq-selected: #303030;
-  }
-}
-
 .aq-app[data-projects-layout="true"] .aq-main {
   padding: 0;
-}
-
-.aq-app[data-projects-layout="true"] .aq-top {
-  min-height: 0;
-  padding: 14px 16px;
-  gap: 14px;
-}
-
-.aq-app[data-projects-layout="true"] .aq-title {
-  font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 0.005em;
-  gap: 8px;
 }
 
 .aq-app[data-projects-layout="true"] .aq-main > .aq-banner {
   margin: 10px 16px;
 }
 
-.aq-app[data-projects-layout="true"] .aq-foot {
-  display: none;
-}
-
-.aq-app[data-projects-layout="true"] .aq-nav {
-  gap: 3px;
-  padding: 6px 8px 8px;
-}
-
-.aq-app[data-projects-layout="true"] .aq-nav button {
-  min-width: 0;
-  border-radius: 7px;
-  gap: 4px;
-  padding: 8px 2px 5px;
-  font-size: 11px;
-}
-
-.aq-app[data-projects-layout="true"] .aq-nav button svg {
-  width: 15px;
-  height: 15px;
-}
-
-.aq-app[data-projects-layout="true"] .aq-nav button[aria-current="page"] {
-  color: var(--aq-text);
-  background: var(--aq-hover);
-}
-
-.aq-app[data-projects-layout="true"] .aq-nav button[aria-current="page"] svg {
-  color: var(--aq-accent);
-}
-
 @media (max-width: 390px) {
-  .aq-app[data-projects-layout="true"] .aq-top {
+  .aq-top {
     padding-left: 12px;
     padding-right: 12px;
   }
@@ -281,19 +198,20 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
-  min-height: 52px;
-  padding: 10px var(--aq-pad) 8px;
+  gap: 10px;
+  min-height: 0;
+  padding: 12px var(--aq-pad);
   border-bottom: 1px solid var(--aq-line);
 }
 
 .aq-title {
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 500;
+  letter-spacing: 0.005em;
   margin: 0;
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 8px;
   min-width: 0;
   flex: 1;
 }
@@ -1077,48 +995,44 @@ summary::-webkit-details-marker {
 
 /* Footer & bottom navigation */
 .aq-foot {
-  flex: none;
-  padding: 8px var(--aq-pad);
-  color: var(--aq-muted);
-  font-size: 11px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  border-top: 1px solid var(--aq-line);
-  gap: 8px;
-}
-
-.aq-foot > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: none;
 }
 
 .aq-nav {
   flex: none;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 2px;
-  padding: 3px 7px 7px;
+  gap: 3px;
+  padding: 6px 8px 8px;
   border-top: 1px solid var(--aq-line);
 }
 
 .aq-nav button {
-  padding: 7px 0 5px;
+  min-width: 0;
+  padding: 8px 2px 5px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 4px;
   color: var(--aq-muted);
   font-size: 11px;
-  border-radius: 6px;
+  border-radius: 7px;
   min-height: 44px;
 }
 
+.aq-nav button svg {
+  width: 15px;
+  height: 15px;
+}
+
 .aq-nav button[aria-current="page"] {
-  color: var(--aq-accent);
+  color: var(--aq-text);
   background: var(--aq-hover);
   font-weight: 500;
+}
+
+.aq-nav button[aria-current="page"] svg {
+  color: var(--aq-accent);
 }
 
 @media (max-width: 360px) {

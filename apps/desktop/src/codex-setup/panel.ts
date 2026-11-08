@@ -1,3 +1,4 @@
+import { createUiIcon } from '../icons.ts';
 import { createButton, h } from '../ui/dom.ts';
 import {
   projectCodexSetupViewModel,
@@ -76,12 +77,12 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
     {
       className: 'aq-section',
       style:
-        'margin-top: 14px; margin-bottom: 6px; flex-wrap: wrap; min-width: 0; max-width: 100%;',
+        'margin-top: 10px; margin-bottom: 6px; flex-wrap: wrap; min-width: 0; max-width: 100%;',
     },
     h(
       'span',
       { style: 'min-width: 0; max-width: 100%; overflow-wrap: anywhere;' },
-      'Codex MCP startup registration'
+      'Codex setup'
     )
   );
 
@@ -116,7 +117,7 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
     {
       'data-codex-skill-section': 'true',
       'data-codex-skill-state': skillVm.state,
-      style: 'margin: 10px 0 8px; min-width: 0; max-width: 100%;',
+      style: 'margin: 8px 0 6px; min-width: 0; max-width: 100%;',
     },
     h(
       'div',
@@ -131,34 +132,10 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
           style: 'min-width: 0; max-width: 100%; overflow-wrap: anywhere;',
         },
         'Threadlane skill'
-      )
-    ),
-    h(
-      'div',
-      {
-        style:
-          'display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 8px;',
-      },
+      ),
       skillBadge
     ),
-    h('p', { className: 'aq-note' }, skillVm.message),
-    h(
-      'dl',
-      {
-        className: 'aq-facts',
-        style: 'margin: 6px 0 8px; min-width: 0; max-width: 100%;',
-      },
-      h(
-        'div',
-        { style: 'flex-wrap: wrap; min-width: 0; max-width: 100%;' },
-        h('dt', undefined, 'Skill path'),
-        h(
-          'dd',
-          { style: 'min-width: 0; max-width: 100%;' },
-          h('code', { style: codeWrapStyle }, skillVm.pathLabel)
-        )
-      )
-    )
+    h('p', { className: 'aq-note' }, skillVm.message)
   );
 
   if (skillVm.invocationHint) {
@@ -174,22 +151,24 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
     );
   }
 
-  const card = h(
-    'section',
+  const setupDetails = h(
+    'details',
     {
-      className: 'aq-card codex-setup-panel',
-      style: 'min-width: 0; max-width: 100%; box-sizing: border-box;',
-      'aria-label': 'Codex MCP startup registration',
-      'data-codex-setup-state': vm.state,
+      className: 'aq-technical',
+      'data-codex-setup-details': 'true',
+      style: 'margin-top: 8px;',
     },
-    sectionHeader,
-    statusBadgeRow,
-    h('p', { className: 'aq-note' }, vm.summaryMessage),
+    h(
+      'summary',
+      { 'data-focus': 'codex-setup-details' },
+      h('span', undefined, 'Setup details'),
+      createUiIcon('chevron-down')
+    ),
     h(
       'dl',
       {
         className: 'aq-facts',
-        style: 'margin: 6px 0 8px; min-width: 0; max-width: 100%;',
+        style: 'margin: 4px 0 6px; min-width: 0; max-width: 100%;',
       },
       h(
         'div',
@@ -210,8 +189,31 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
           { style: 'min-width: 0; max-width: 100%;' },
           h('code', { style: codeWrapStyle }, vm.configPathLabel)
         )
+      ),
+      h(
+        'div',
+        { style: 'flex-wrap: wrap; min-width: 0; max-width: 100%;' },
+        h('dt', undefined, 'Skill path'),
+        h(
+          'dd',
+          { style: 'min-width: 0; max-width: 100%;' },
+          h('code', { style: codeWrapStyle }, skillVm.pathLabel)
+        )
       )
     )
+  );
+
+  const card = h(
+    'section',
+    {
+      className: 'aq-card codex-setup-panel',
+      style: 'min-width: 0; max-width: 100%; box-sizing: border-box;',
+      'aria-label': 'Codex MCP startup registration',
+      'data-codex-setup-state': vm.state,
+    },
+    sectionHeader,
+    statusBadgeRow,
+    h('p', { className: 'aq-note' }, vm.summaryMessage)
   );
 
   card.appendChild(skillSection);
@@ -275,6 +277,7 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
       retryBtn
     )
   );
+  card.appendChild(setupDetails);
 
   return card;
 }

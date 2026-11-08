@@ -608,8 +608,8 @@ describe('profiles coworker native model simplification', () => {
     const renderedRoot = page.render(snapshot) as unknown as FakeElement;
     const draftStatus = renderedRoot.querySelector('[data-draft-status]');
     assert.ok(draftStatus, 'expected draft status in rendered editor');
-    assert.equal(draftStatus.textContent.includes('5/5 role defaults'), true);
-    assert.equal(draftStatus.textContent.includes('Role defaults complete'), true);
+    assert.equal(draftStatus.textContent.includes('5/5 role defaults set'), true);
+    assert.equal(draftStatus.textContent.includes('difficulty override'), false);
     assert.equal(draftStatus.textContent.includes('Follower'), false);
 
     const roleFieldsets = renderedRoot.querySelectorAll('[data-profile-role]');
@@ -649,9 +649,50 @@ describe('profiles coworker native model simplification', () => {
     coderHardEffort.value = 'high';
     coderHardEffort.dispatchEvent('change');
 
-    assert.equal(draftStatus.textContent.includes('5/5 role defaults'), true);
-    assert.equal(draftStatus.textContent.includes('1 difficulty overrides'), true);
-    assert.equal(draftStatus.textContent.includes('6 assignments'), true);
+    assert.equal(draftStatus.textContent.includes('5/5 role defaults set'), true);
+    assert.equal(draftStatus.textContent.includes('1 difficulty override'), true);
+    assert.equal(
+      draftStatus.textContent.includes('5/5 role defaults set · 1 difficulty override'),
+      true
+    );
+
+    const idDetails = renderedRoot
+      .querySelectorAll('details')
+      .find(
+        (details) =>
+          details.textContent.includes(legacyProfile.id) ||
+          details
+            .querySelectorAll('input')
+            .some((input) => input.value === legacyProfile.id)
+      );
+    assert.ok(idDetails, 'expected internal profile ID under a details disclosure');
+    assert.equal(idDetails.open, false);
+
+    const architectDefaultModel = renderedRoot.querySelector(
+      '[data-model-key="architect:default"]'
+    );
+    assert.ok(architectDefaultModel, 'expected architect default model selector');
+    architectDefaultModel.value = '';
+    architectDefaultModel.dispatchEvent('change');
+    assert.equal(draftStatus.textContent.includes('4/5 role defaults set'), true);
+    assert.equal(draftStatus.textContent.includes('Missing defaults: Architect'), true);
+    assert.equal(renderedRoot.querySelector('[role="alert"]'), null);
+
+    const nameInput =
+      renderedRoot.querySelector('[data-focus-key="profile-name"]') ??
+      renderedRoot
+        .querySelectorAll('input')
+        .find((input) => input.value === legacyProfile.name) ??
+      null;
+    assert.ok(nameInput, 'expected profile name input');
+    nameInput.value = '';
+    nameInput.dispatchEvent('input');
+    assert.equal(
+      renderedRoot
+        .querySelector('[role="alert"]')
+        ?.textContent.includes('Profile name is required.'),
+      true
+    );
 
     page.dispose();
   });
@@ -763,10 +804,13 @@ describe('profile difficulty override reset', () => {
 
     const draftStatus = root.querySelector('[data-draft-status]');
     assert.ok(draftStatus, 'expected draft status in editor');
-    assert.equal(draftStatus.textContent.includes('6 assignments'), true);
-    assert.equal(draftStatus.textContent.includes('1 difficulty overrides'), true);
     assert.equal(
-      root.textContent.includes('5 difficulty overrides · 10 assignments'),
+      draftStatus.textContent.includes('5/5 role defaults set · 1 difficulty override'),
+      true
+    );
+    assert.equal(draftStatus.textContent.includes('1 difficulty override'), true);
+    assert.equal(
+      root.textContent.includes('5 difficulty overrides'),
       true
     );
 
@@ -843,7 +887,10 @@ describe('profile difficulty override reset', () => {
     const draftStatus = root.querySelector('[data-draft-status]');
     assert.ok(draftStatus, 'expected draft status in editor');
     assert.equal(draftStatus.textContent.includes('3 difficulty overrides'), true);
-    assert.equal(draftStatus.textContent.includes('7 assignments'), true);
+    assert.equal(
+      draftStatus.textContent.includes('5/5 role defaults set · 3 difficulty overrides'),
+      true
+    );
 
     const clearButton = root.querySelector('[data-focus-key="clear-overrides-coder"]');
     assert.ok(clearButton, 'expected coder difficulty override reset action');

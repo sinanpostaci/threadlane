@@ -706,6 +706,7 @@ export class ToolsPage {
     const root = this.root;
     const snapshot = this.snapshot;
     if (!root || !snapshot) return;
+    this.captureVersionDetailsOpenState(root);
     const active =
       typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
         ? document.activeElement
@@ -1109,6 +1110,7 @@ export class ToolsPage {
     const root = this.root;
     const snapshot = this.snapshot;
     if (!root || !snapshot) return;
+    this.captureVersionDetailsOpenState(root);
     const focus = captureFocus(root);
     root.replaceChildren(...this.build(snapshot));
     root.dataset.revision = String(snapshot.revision);
@@ -1155,30 +1157,16 @@ export class ToolsPage {
       h(
         'div',
         undefined,
-        h('p', { className: 'aq-kicker' }, 'Guided setup & registry'),
         h('h2', { className: 'aq-page-title', id: `${this.pageId}-title` }, 'Tools and models'),
         h(
           'p',
           { className: 'aq-note' },
-          'Add detected CLIs, choose models from their catalog, and assign them in Profiles. Version-only checks run at startup; model catalogs and logins are never probed in the background.'
+          'Add local CLIs or API tools and choose models to assign in Profiles.'
         )
       ),
       h(
         'div',
         { className: 'aq-tools-hero-actions aq-tools-progress' },
-        h('span', { className: 'aq-badge' }, `Revision ${snapshot.revision}`),
-        h(
-          'span',
-          { className: 'aq-badge', 'data-status': snapshot.tools.length > 0 ? 'active' : undefined },
-          `${snapshot.tools.length} tool${snapshot.tools.length === 1 ? '' : 's'}`
-        ),
-        h(
-          'span',
-          { className: 'aq-badge', 'data-status': readyModelCount > 0 ? 'active' : 'warn' },
-          readyModelCount > 0
-            ? `${readyModelCount} model${readyModelCount === 1 ? '' : 's'} ready`
-            : 'No models added'
-        ),
         readyModelCount > 0 && this.onOpenProfiles
           ? this.button(
               'Open Profiles',
@@ -1187,7 +1175,7 @@ export class ToolsPage {
               'primary'
             )
           : null,
-        this.button('Reload registry', () => this.notifyOuter(), 'reload-registry')
+        this.button('Refresh', () => this.notifyOuter(), 'reload-registry')
       )
     );
   }
@@ -1295,7 +1283,6 @@ export class ToolsPage {
   }
 
   private buildTools(snapshot: RegistrySnapshot): HTMLElement {
-    const enabled = snapshot.tools.filter((tool) => tool.enabled).length;
     const unregisteredFoundClis: Array<{
       item: ToolsDiscoveryItem;
       setup: DiscoveryCliSetup;
@@ -1330,7 +1317,7 @@ export class ToolsPage {
         : null;
 
     const refreshBtn = this.button(
-      this.discoveryLoading ? 'Refreshing…' : 'Refresh discovery',
+      this.discoveryLoading ? 'Refreshing…' : 'Refresh tools',
       () => {
         if (this.onRefreshDiscovery) {
           this.onRefreshDiscovery();
@@ -1365,17 +1352,11 @@ export class ToolsPage {
         h(
           'div',
           undefined,
-          h('h3', { className: 'aq-tools-heading', id: `${this.pageId}-tools-title` }, 'Tools'),
-          h(
-            'p',
-            { className: 'aq-note' },
-            'Step 1: Add a detected CLI with automatic system resolution or a custom tool. Step 2: Click Choose models and add the models you want to assign in Profiles.'
-          )
+          h('h3', { className: 'aq-tools-heading', id: `${this.pageId}-tools-title` }, 'Tools')
         ),
         h(
           'div',
           { className: 'aq-tools-actions aq-tools-progress' },
-          h('span', { className: 'aq-badge' }, `${enabled} enabled`),
           this.discoveryLoading
             ? h(
                 'span',
@@ -1475,14 +1456,14 @@ export class ToolsPage {
     const buttonLabel = loading ? 'Checking versions…' : hasRun ? 'Recheck versions' : 'Check versions';
     const note =
       status === 'loading'
-        ? 'Checking enabled local CLI tools in the background with version-only commands. Editing stays available.'
+        ? 'Checking enabled local CLI versions…'
         : status === 'ready'
-          ? 'Versions are CLI-reported; login, catalog, and entitlement are not checked.'
+          ? 'CLI-reported local versions.'
           : status === 'stale'
             ? 'The registry changed since these versions were checked. Recheck versions to match the current tools.'
             : status === 'error'
               ? safeText(state?.error ?? '', 'Version checks could not complete.')
-              : 'The startup version check is waiting for the initial registry snapshot.';
+              : 'Waiting for initial version check.';
     const recheck = this.button(
       buttonLabel,
       () => this.onRecheckVersions?.(),
@@ -1511,12 +1492,7 @@ export class ToolsPage {
       h(
         'div',
         { className: 'aq-tools-version-overview-actions' },
-        recheck,
-        h(
-          'span',
-          { className: 'aq-tools-hint' },
-          'Version-only checks do not install or update packages.'
-        )
+        recheck
       )
     );
   }
@@ -1547,10 +1523,48 @@ export class ToolsPage {
 
     const availability = inspection.availability;
     const custom = inspection.selection_mode === 'custom';
+    const reportedVersion = inspection.version
+      ? safeText(inspection.version, 'Not reported')
+      : null;
+
+    if (availability === 'api_only') {
+      return this.buildVersionDetails(
+        tool.id,
+        {
+          'data-availability': availability,
+          'aria-label': `Version details for ${tool.label}`,
+        },
+        h(
+          'div',
+          { className: 'aq-tools-badges' },
+          h(
+            'span',
+            {
+              className: 'aq-badge',
+              'data-status': versionAvailabilityStatus(availability),
+            },
+            versionAvailabilityLabel(availability)
+          )
+        ),
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          safeText(
+            inspection.message,
+            'This API adapter has no local executable version. No local process is started.'
+          )
+        )
+      );
+    }
+
     const head = h(
       'div',
       { className: 'aq-tools-version-head' },
-      h('span', { className: 'aq-tools-version-title' }, 'Installed version'),
+      h(
+        'span',
+        { className: 'aq-tools-version-title' },
+        reportedVersion ? `Installed version · ${reportedVersion}` : 'Installed version'
+      ),
       h(
         'div',
         { className: 'aq-tools-badges' },
@@ -1562,31 +1576,9 @@ export class ToolsPage {
           },
           versionAvailabilityLabel(availability)
         ),
-        availability !== 'api_only'
-          ? h('span', { className: 'aq-badge' }, custom ? 'Custom mode' : 'System mode')
-          : null
+        h('span', { className: 'aq-badge' }, custom ? 'Custom mode' : 'System mode')
       )
     );
-
-    if (availability === 'api_only') {
-      return h(
-        'section',
-        {
-          className: 'aq-tools-version',
-          'data-availability': availability,
-          'aria-label': `Version details for ${tool.label}`,
-        },
-        head,
-        h(
-          'p',
-          { className: 'aq-tools-hint' },
-          safeText(
-            inspection.message,
-            'This API adapter has no local executable version. No local process is started.'
-          )
-        )
-      );
-    }
 
     if (availability === 'disabled') {
       return h(
@@ -1642,11 +1634,11 @@ export class ToolsPage {
 
     const comparisonNote =
       custom && inspection.system_path_differs
-        ? 'This tool uses its custom path. The system command resolves to a different path; its version is shown separately and is not treated as newer or as a replacement.'
+        ? 'Custom path active; system path differs (see Installation details to compare or Use system).'
         : custom && inspection.system_path === null
-          ? 'This tool uses its custom path. No system command was resolved for comparison; the saved custom path is unchanged until you choose Use system.'
+          ? 'Custom path active; no system executable found for comparison (see Installation details for Use system).'
           : custom
-            ? 'This tool keeps a custom selection even when its current path matches the system resolution. Choose Use system to switch to automatic resolution.'
+            ? 'Custom selection matches the system path (see Installation details for Use system).'
             : null;
 
     const busy =
@@ -1665,6 +1657,17 @@ export class ToolsPage {
     useSystemButton.setAttribute('aria-label', `Use system installation for ${tool.label}`);
     useSystemButton.setAttribute('aria-describedby', useSystemHintId);
 
+    const fallbackStatusMessage =
+      availability === 'not_found'
+        ? 'Executable was not found; version check failed. See Installation details for error and path details.'
+        : 'Version check failed. See Installation details for the error code and path details.';
+    const statusMessage =
+      availability === 'not_found'
+        ? safeText(inspection.message, fallbackStatusMessage)
+        : inspection.error_code
+          ? safeText(inspection.message, fallbackStatusMessage)
+          : null;
+
     return h(
       'section',
       {
@@ -1674,31 +1677,80 @@ export class ToolsPage {
         'aria-label': `Version details for ${tool.label}`,
       },
       head,
-      facts,
       comparisonNote ? h('p', { className: 'aq-tools-hint' }, comparisonNote) : null,
-      inspection.message
-        ? h(
-            'p',
-            { className: 'aq-tools-message' },
-            safeText(inspection.message, 'Version check completed without a message.')
-          )
-        : null,
-      inspection.error_code
-        ? h(
-            'p',
-            { className: 'aq-tools-inline-error' },
-            h('code', { className: 'aq-tools-code' }, safeText(inspection.error_code, 'version_error'))
-          )
-        : null,
-      custom
-        ? h(
-            'div',
-            { className: 'aq-tools-version-action' },
-            useSystemButton,
-            h('p', { className: 'aq-tools-hint', id: useSystemHintId }, useSystemHint)
-          )
-        : null
+      statusMessage ? h('p', { className: 'aq-tools-message' }, statusMessage) : null,
+      this.buildVersionDetails(
+        tool.id,
+        undefined,
+        facts,
+        inspection.error_code
+          ? h(
+              'p',
+              { className: 'aq-tools-inline-error' },
+              h('code', { className: 'aq-tools-code' }, safeText(inspection.error_code, 'version_error'))
+            )
+          : null,
+        custom
+          ? h(
+              'div',
+              { className: 'aq-tools-version-action' },
+              useSystemButton,
+              h('p', { className: 'aq-tools-hint', id: useSystemHintId }, useSystemHint)
+            )
+          : null
+      )
     );
+  }
+
+  private toolVersionDetailsKey(toolId: string): string {
+    return `tool-version-details:${toolId}`;
+  }
+
+  private captureVersionDetailsOpenState(root: HTMLElement): void {
+    for (const details of root.querySelectorAll<HTMLDetailsElement>(
+      'details[data-tool-version-details]'
+    )) {
+      const toolId = details.dataset.toolVersionDetails;
+      if (!toolId) continue;
+      const key = this.toolVersionDetailsKey(toolId);
+      if (details.open) {
+        this.expanded.add(key);
+      } else {
+        this.expanded.delete(key);
+      }
+    }
+  }
+
+  private buildVersionDetails(
+    toolId: string,
+    extraAttrs: Record<string, string> | undefined,
+    ...children: Array<HTMLElement | string | null | undefined | false>
+  ): HTMLDetailsElement {
+    const key = this.toolVersionDetailsKey(toolId);
+    const details = h(
+      'details',
+      {
+        className: 'aq-tools-advanced aq-tools-version-details',
+        'data-tool-version-details': toolId,
+        ...extraAttrs,
+      },
+      h(
+        'summary',
+        { 'data-focus-key': `tool-${toolId}-version-details` },
+        'Installation details'
+      ),
+      ...children
+    ) as HTMLDetailsElement;
+    details.open = this.expanded.has(key);
+    details.addEventListener('toggle', () => {
+      if (this.disposed || !this.root || !this.root.contains(details)) return;
+      if (details.open) {
+        this.expanded.add(key);
+      } else {
+        this.expanded.delete(key);
+      }
+    });
+    return details;
   }
 
   private buildDiscoveredChoiceCard(
@@ -1956,7 +2008,7 @@ export class ToolsPage {
   private buildTool(
     snapshot: RegistrySnapshot,
     tool: ToolDefinition,
-    discoveredMatch: ToolsDiscoveryItem | null = null
+    _discoveredMatch: ToolsDiscoveryItem | null = null
   ): HTMLElement {
     const draft = this.toolEdit(tool);
     const changed = !sameTool(tool, draft);
@@ -1965,10 +2017,7 @@ export class ToolsPage {
     const api = provider ? this.apiState(tool.id) : null;
     const using = snapshot.models.filter((model) => model.tool_id === tool.id);
     const usingModelCount = visibleModelCount(using, snapshot.tools);
-    const usingCountText =
-      using.length === usingModelCount
-        ? `${usingModelCount} model${usingModelCount === 1 ? '' : 's'}`
-        : `${usingModelCount} model${usingModelCount === 1 ? '' : 's'} (${using.length} CLI variants)`;
+    const usingCountText = `${usingModelCount} model${usingModelCount === 1 ? '' : 's'}`;
     const deleting = this.pending.has(`tool-delete:${tool.id}`);
     const confirming = this.deleteConfirm?.kind === 'tool' && this.deleteConfirm?.id === tool.id;
     const cardKey = `tool:${tool.id}`;
@@ -2065,14 +2114,7 @@ export class ToolsPage {
         h(
           'div',
           { className: 'aq-tools-tool-title' },
-          h('h4', undefined, tool.label),
-          h(
-            'span',
-            { className: 'aq-tools-hint' },
-            using.length === 0
-              ? 'Registered · No models added yet'
-              : `${usingCountText} added for Profiles`
-          )
+          h('h4', undefined, tool.label)
         ),
         h(
           'div',
@@ -2085,15 +2127,11 @@ export class ToolsPage {
               { className: 'aq-badge', 'data-status': tool.enabled ? 'active' : 'warn' },
               tool.enabled ? 'Enabled' : 'Disabled'
             ),
-            discoveredMatch
-              ? h('span', { className: 'aq-badge', 'data-status': 'found' }, 'Added')
-              : null,
             h(
               'span',
               { className: 'aq-badge', 'data-status': using.length > 0 ? 'active' : 'warn' },
               using.length > 0 ? usingCountText : 'No models added'
             ),
-            h('span', { className: 'aq-badge' }, ADAPTER_LABELS[tool.adapter]),
             changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null
           ),
           h(
@@ -2109,13 +2147,6 @@ export class ToolsPage {
         { 'data-tool-version-slot': tool.id },
         this.buildToolVersionPanel(tool)
       ),
-      using.length === 0 && !pickerOpen && !open
-        ? h(
-            'p',
-            { className: 'aq-tools-hint' },
-            'Registration alone does not add models. Click Choose models to read the catalog and select model families for Profiles.'
-          )
-        : null,
       pickerOpen
         ? provider === null
           ? this.buildProbe(tool, probe)
@@ -2232,15 +2263,13 @@ export class ToolsPage {
                 `tool-${tool.id}-discard`
               )
             ),
-            h(
-              'p',
-              { className: 'aq-tools-hint' },
-              changed
-                ? 'Save changes before loading models from an updated path or adapter.'
-                : provider === null
-                  ? 'Choose models reads the catalog from the saved tool definition.'
-                  : 'API adapters never spawn a CLI. Credential and synthetic controls use the saved tool definition.'
-            ),
+            changed
+              ? h(
+                  'p',
+                  { className: 'aq-tools-hint' },
+                  'Save changes before loading models from an updated path or adapter.'
+                )
+              : null,
             provider ? this.buildApi(tool, provider) : null
           )
         : null
@@ -2883,26 +2912,21 @@ export class ToolsPage {
           h(
             'p',
             { className: 'aq-note' },
-            'Models added from tool catalogs or manual setup appear here. Antigravity effort variants are grouped into one family card while every concrete CLI record stays editable under CLI variants. Detected options are metadata, not runtime verification.'
+            'Models ready to assign in Profiles.'
           )
         ),
-        h(
-          'div',
-          { className: 'aq-tools-actions aq-tools-progress' },
-          h(
-            'span',
-            { className: 'aq-badge', 'data-status': visibleCount > 0 ? 'active' : 'warn' },
-            `${visibleCount} model${visibleCount === 1 ? '' : 's'}`
-          ),
-          visibleCount > 0 && this.onOpenProfiles
-            ? this.button(
+        visibleCount > 0 && this.onOpenProfiles
+          ? h(
+              'div',
+              { className: 'aq-tools-actions aq-tools-progress' },
+              this.button(
                 'Open Profiles',
                 () => this.onOpenProfiles?.(),
                 'open-profiles-models',
                 'primary'
               )
-            : null
-        )
+            )
+          : null
       ),
       families.length === 0
         ? h(
@@ -2949,7 +2973,7 @@ export class ToolsPage {
       h(
         'p',
         { className: 'aq-tools-hint' },
-        'Each CLI variant keeps its exact model ID and provider model argument. Expand a variant to review, edit, or delete that concrete saved record.'
+        'Expand a variant to review, edit, or delete that saved record.'
       ),
       h(
         'div',
@@ -2977,26 +3001,12 @@ export class ToolsPage {
             { className: 'aq-tools-hint' },
             `${tool?.label ?? 'Missing tool'} · Efforts: ${effortList || 'Not detected'}`
           )
-        ),
-        h(
-          'div',
-          { className: 'aq-tools-card-controls' },
-          h(
-            'div',
-            { className: 'aq-tools-badges' },
-            h('span', { className: 'aq-badge', 'data-status': 'active' }, 'Model family'),
-            h(
-              'span',
-              { className: 'aq-badge' },
-              `${family.members.length} CLI variant${family.members.length === 1 ? '' : 's'}`
-            )
-          )
         )
       ),
       h(
         'p',
         { className: 'aq-tools-hint' },
-        'Select this model and its effort in Profiles. Advanced CLI settings are available below.'
+        'Select this model and its effort in Profiles.'
       ),
       variants
     );
@@ -3211,7 +3221,6 @@ export class ToolsPage {
           'div',
           { className: 'aq-tools-tool-title' },
           h('h4', undefined, model.label),
-          h('code', { className: 'aq-tools-code' }, model.id),
           h(
             'span',
             { className: 'aq-tools-hint' },
@@ -3224,22 +3233,27 @@ export class ToolsPage {
           h(
             'div',
             { className: 'aq-tools-badges' },
-            modelTool ? h('span', { className: 'aq-badge' }, ADAPTER_LABELS[modelTool.adapter]) : null,
             changed ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Unsaved draft') : null,
             references ? h('span', { className: 'aq-badge', 'data-status': 'warn' }, 'Referenced') : null
           ),
           toggle
         )
       ),
+      h(
+        'details',
+        { className: 'aq-tools-advanced' },
+        h('summary', undefined, 'Model details'),
+        h(
+          'p',
+          { className: 'aq-tools-hint' },
+          'Model ID: ',
+          h('code', { className: 'aq-tools-code' }, model.id)
+        )
+      ),
       open
         ? h(
             'div',
             { className: 'aq-tools-card-body', id: bodyId },
-            h(
-              'p',
-              { className: 'aq-tools-hint' },
-              `Model arg: ${safeText(model.model_arg, 'missing')} · ${effortText(model)}`
-            ),
             h(
               'div',
               { className: 'aq-tools-form-grid aq-tools-edit-grid' },
@@ -3894,8 +3908,8 @@ export class ToolsPage {
         title: `${tool.label} added`,
         text:
           chooseModelsAfter && openModelsAfter
-            ? `Added "${tool.label}"${resolutionNote} at revision ${next.revision} and reading its model catalog.`
-            : `Added tool "${tool.label}"${resolutionNote} at revision ${next.revision}. Click Choose models on its card when you are ready to add models.`,
+            ? `Added "${tool.label}"${resolutionNote}. Loading its model catalog.`
+            : `Added "${tool.label}"${resolutionNote}. Click Choose models on its card to add models.`,
       };
     });
     if (saved && provider === null && this.snapshot) {
@@ -3948,7 +3962,7 @@ export class ToolsPage {
     const saved = await this.apply(
       `tool-save:${tool.id}`,
       { op: 'upsert_tool', tool: value },
-      (next) => {
+      () => {
         if (isSameToolDraft()) {
           this.toolDrafts.delete(tool.id);
           this.expanded.delete(`tool:${tool.id}`);
@@ -3966,7 +3980,7 @@ export class ToolsPage {
           this.apiStates.delete(tool.id);
           this.selections.delete(`api:${tool.id}`);
         }
-        this.notice = { tone: 'success', text: `Saved tool "${value.label}" at revision ${next.revision}.` };
+        this.notice = { tone: 'success', text: `Saved tool "${value.label}".` };
       },
       (error) => {
         if (isConflict(error) && isSameToolDraft()) {
@@ -3995,11 +4009,11 @@ export class ToolsPage {
     const saved = await this.apply(
       `tool-use-system:${tool.id}`,
       { op: 'upsert_tool', tool: { ...tool, executable_path: null } },
-      (next) => {
+      () => {
         this.notice = {
           tone: 'success',
           title: 'System installation selected',
-          text: `Saved "${tool.label}" to use automatic system resolution at revision ${next.revision}. Models, efforts, profile assignments, and running approvals were not changed.`,
+          text: `Saved "${tool.label}" to use automatic system resolution.`,
         };
       }
     );
@@ -4015,7 +4029,7 @@ export class ToolsPage {
     const deleted = await this.apply(
       `tool-delete:${tool.id}`,
       { op: 'delete_tool', tool_id: tool.id },
-      (next) => {
+      () => {
         this.deleteConfirm = null;
         this.toolDrafts.delete(tool.id);
         this.expanded.delete(`tool:${tool.id}`);
@@ -4027,7 +4041,7 @@ export class ToolsPage {
         this.selections.delete(`api:${tool.id}`);
         this.catalogSearch.delete(`probe:${tool.id}`);
         this.catalogSearch.delete(`api:${tool.id}`);
-        this.notice = { tone: 'success', text: `Deleted tool "${tool.label}" at revision ${next.revision}.` };
+        this.notice = { tone: 'success', text: `Deleted tool "${tool.label}".` };
       }
     );
     if (!deleted) this.deleteConfirm = null;
@@ -4104,14 +4118,14 @@ export class ToolsPage {
       allow_no_effort: Boolean(model.allow_no_effort) || model.efforts.length === 0,
     }));
     const addedFamilyCount = groupModelFamilies(models, [tool]).length;
-    await this.apply(`import:${key}`, { op: 'upsert_models', models }, (next) => {
+    await this.apply(`import:${key}`, { op: 'upsert_models', models }, () => {
       this.selections.delete(key);
       this.catalogSearch.delete(key);
       this.openPickers.delete(tool.id);
       this.notice = {
         tone: 'success',
         title: 'Models added',
-        text: `Added ${addedFamilyCount} model famil${addedFamilyCount === 1 ? 'y' : 'ies'} (${models.length} concrete model${models.length === 1 ? '' : 's'}) for ${tool.label} at revision ${next.revision}. Catalog metadata, including any detected effort options, was kept. The added records are available in Profiles.`,
+        text: `Added ${addedFamilyCount} model${addedFamilyCount === 1 ? '' : 's'} for ${tool.label}. Assign them in Profiles.`,
         showOpenProfiles: true,
       };
     });
@@ -4187,7 +4201,7 @@ export class ToolsPage {
       this.notice = {
         tone: 'success',
         title: 'Model added',
-        text: `Added model "${model.label}" at revision ${next.revision}.`,
+        text: `Added model "${model.label}". Assign it in Profiles.`,
         showOpenProfiles: true,
       };
     });
@@ -4227,12 +4241,12 @@ export class ToolsPage {
     await this.apply(
       `model-save:${model.id}`,
       { op: 'upsert_model', model: value },
-      (next) => {
+      () => {
         if (isSameModelDraft()) {
           this.modelDrafts.delete(model.id);
           this.expanded.delete(`model:${model.id}`);
         }
-        this.notice = { tone: 'success', text: `Saved model "${value.label}" at revision ${next.revision}.` };
+        this.notice = { tone: 'success', text: `Saved model "${value.label}".` };
       },
       (error) => {
         if (isConflict(error) && isSameModelDraft()) {
@@ -4253,11 +4267,11 @@ export class ToolsPage {
     const deleted = await this.apply(
       `model-delete:${model.id}`,
       { op: 'delete_model', model_id: model.id },
-      (next) => {
+      () => {
         this.deleteConfirm = null;
         this.modelDrafts.delete(model.id);
         this.expanded.delete(`model:${model.id}`);
-        this.notice = { tone: 'success', text: `Deleted model "${model.label}" at revision ${next.revision}.` };
+        this.notice = { tone: 'success', text: `Deleted model "${model.label}".` };
       }
     );
     if (!deleted) this.deleteConfirm = null;
