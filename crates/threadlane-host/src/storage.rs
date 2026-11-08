@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use threadlane::{ValidatedWorkerProfile, WorkersConfig};
 use threadlane_authority::{
-    build_approved_worker_profile_config, ApprovalRecord, ApprovedTaskRecord,
+    build_approved_worker_profile_config, compute_recorded_history_worker_profile_digest,
+    ApprovalRecord, ApprovedTaskRecord,
 };
 use threadlane_core::WorkerExecutionBinding;
 use uuid::Uuid;
@@ -1394,6 +1395,13 @@ pub fn read_task_receipt(
 /// Persisted pending dispatch intents and sealed task run receipts.
 pub type ReadonlyTaskLedger = (Vec<TaskDispatchIntent>, Vec<TaskRunReceipt>);
 
+/// Internal profile-validation policy for reading a session task ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskLedgerReadPolicy {
+    StrictLive,
+    RecordedHistoryReadonly,
+}
+
 /// Reads the persisted [`TaskDispatchIntent`] and [`TaskRunReceipt`] lists from `<session_dir>/task-receipts.json`
 /// in strictly read-only mode without opening or creating any lock file.
 pub fn read_session_task_ledger_readonly(
@@ -1403,6 +1411,25 @@ pub fn read_session_task_ledger_readonly(
 ) -> Result<Option<ReadonlyTaskLedger>, HostError> {
     read_task_receipts_locked(session_dir, record, session_binding_id)
         .map(|opt| opt.map(|ledger| (ledger.pending_intents, ledger.receipts)))
+}
+
+/// Reads the persisted [`TaskDispatchIntent`] and [`TaskRunReceipt`] lists from `<session_dir>/task-receipts.json`
+/// in read-only recorded-history mode without opening or creating any lock file or requiring
+/// the historical provider executable to remain on disk.
+///
+/// Never use this historical reader for runtime admission or live execution authority.
+pub fn read_session_task_ledger_recorded_history_readonly(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+) -> Result<Option<ReadonlyTaskLedger>, HostError> {
+    read_task_receipts_locked_with_policy(
+        session_dir,
+        record,
+        session_binding_id,
+        TaskLedgerReadPolicy::RecordedHistoryReadonly,
+    )
+    .map(|opt| opt.map(|ledger| (ledger.pending_intents, ledger.receipts)))
 }
 
 /// Verifies `<session_dir>/task-receipts.json` (if present) against `record` and `session_binding_id`
@@ -1816,6 +1843,20 @@ fn read_task_receipts_locked(
     record: &ApprovalRecord,
     session_binding_id: &str,
 ) -> Result<Option<TaskReceiptsFile>, HostError> {
+    read_task_receipts_locked_with_policy(
+        session_dir,
+        record,
+        session_binding_id,
+        TaskLedgerReadPolicy::StrictLive,
+    )
+}
+
+fn read_task_receipts_locked_with_policy(
+    session_dir: &Path,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    policy: TaskLedgerReadPolicy,
+) -> Result<Option<TaskReceiptsFile>, HostError> {
     let receipts_path = session_dir.join(TASK_RECEIPTS_FILENAME);
     let checked = ensure_no_symlink_components(&receipts_path)?;
     let meta = match fs::symlink_metadata(&checked) {
@@ -1867,7 +1908,17 @@ fn read_task_receipts_locked(
             reason: format!("invalid task-receipts.json JSON: {err}"),
         })?;
 
-    verify_task_receipts_ledger(&ledger, record, session_binding_id, &checked)?;
+    if policy == TaskLedgerReadPolicy::StrictLive {
+        verify_task_receipts_ledger(&ledger, record, session_binding_id, &checked)?;
+    } else {
+        verify_task_receipts_ledger_with_policy(
+            &ledger,
+            record,
+            session_binding_id,
+            &checked,
+            policy,
+        )?;
+    }
     Ok(Some(ledger))
 }
 
@@ -1876,6 +1927,22 @@ fn verify_task_receipts_ledger(
     record: &ApprovalRecord,
     session_binding_id: &str,
     receipts_path: &Path,
+) -> Result<(), HostError> {
+    verify_task_receipts_ledger_with_policy(
+        ledger,
+        record,
+        session_binding_id,
+        receipts_path,
+        TaskLedgerReadPolicy::StrictLive,
+    )
+}
+
+fn verify_task_receipts_ledger_with_policy(
+    ledger: &TaskReceiptsFile,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    receipts_path: &Path,
+    policy: TaskLedgerReadPolicy,
 ) -> Result<(), HostError> {
     let corrupt = |reason: String| HostError::CorruptReceipts {
         path: receipts_path.display().to_string(),
@@ -1917,7 +1984,17 @@ fn verify_task_receipts_ledger(
                 intent.task_id
             )));
         }
-        validate_single_intent(intent, record, session_binding_id, receipts_path)?;
+        if policy == TaskLedgerReadPolicy::StrictLive {
+            validate_single_intent(intent, record, session_binding_id, receipts_path)?;
+        } else {
+            validate_single_intent_with_policy(
+                intent,
+                record,
+                session_binding_id,
+                receipts_path,
+                policy,
+            )?;
+        }
     }
 
     let mut seen_tasks = BTreeSet::new();
@@ -1942,7 +2019,17 @@ fn verify_task_receipts_ledger(
                 receipt.worker_id
             )));
         }
-        validate_single_receipt(receipt, record, session_binding_id, receipts_path)?;
+        if policy == TaskLedgerReadPolicy::StrictLive {
+            validate_single_receipt(receipt, record, session_binding_id, receipts_path)?;
+        } else {
+            validate_single_receipt_with_policy(
+                receipt,
+                record,
+                session_binding_id,
+                receipts_path,
+                policy,
+            )?;
+        }
         if let Some(intent) = ledger
             .pending_intents
             .iter()
@@ -2055,12 +2142,46 @@ pub(crate) fn build_validated_task_profile(
         .ok_or_else(|| format!("validated profile `{profile_id}` not found"))
 }
 
+fn build_recorded_history_task_profile_digest(
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    work_area_root: &Path,
+    task: &ApprovedTaskRecord,
+) -> Result<String, String> {
+    compute_recorded_history_worker_profile_digest(
+        record,
+        task,
+        session_binding_id,
+        work_area_root,
+        work_area_root,
+    )
+    .map_err(|err| err.to_string())
+}
+
 fn validate_task_execution_binding(
     task: &ApprovedTaskRecord,
     execution_binding: &Option<WorkerExecutionBinding>,
     record: &ApprovalRecord,
     session_binding_id: &str,
     receipts_path: &Path,
+) -> Result<(), HostError> {
+    validate_task_execution_binding_with_policy(
+        task,
+        execution_binding,
+        record,
+        session_binding_id,
+        receipts_path,
+        TaskLedgerReadPolicy::StrictLive,
+    )
+}
+
+fn validate_task_execution_binding_with_policy(
+    task: &ApprovedTaskRecord,
+    execution_binding: &Option<WorkerExecutionBinding>,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    receipts_path: &Path,
+    policy: TaskLedgerReadPolicy,
 ) -> Result<(), HostError> {
     let corrupt = |reason: String| HostError::CorruptReceipts {
         path: receipts_path.display().to_string(),
@@ -2095,18 +2216,29 @@ fn validate_task_execution_binding(
         .parent()
         .ok_or_else(|| corrupt("task-receipts.json path has no session_dir parent".to_string()))?;
     let work_area_root = session_dir.join(WORK_AREA_SUBDIR);
-    let validated_profile =
-        build_validated_task_profile(record, session_binding_id, &work_area_root, task).map_err(
-            |reason| {
-                corrupt(format!(
-                    "failed to validate frozen profile for dependent task `{}`: {reason}",
-                    task.task_id
-                ))
-            },
-        )?;
+    let expected_profile_digest = match policy {
+        TaskLedgerReadPolicy::StrictLive => {
+            build_validated_task_profile(record, session_binding_id, &work_area_root, task)
+                .map(|profile| profile.profile_digest)
+        }
+        TaskLedgerReadPolicy::RecordedHistoryReadonly => {
+            build_recorded_history_task_profile_digest(
+                record,
+                session_binding_id,
+                &work_area_root,
+                task,
+            )
+        }
+    }
+    .map_err(|reason| {
+        corrupt(format!(
+            "failed to validate frozen profile for dependent task `{}`: {reason}",
+            task.task_id
+        ))
+    })?;
 
     let expected_binding = WorkerExecutionBinding::new(
-        &validated_profile.profile_digest,
+        &expected_profile_digest,
         &task.instruction,
         &binding.input_digest,
         &binding.seal_file_digest,
@@ -2128,7 +2260,7 @@ fn validate_task_execution_binding(
 
     binding
         .verify_against(
-            &validated_profile.profile_digest,
+            &expected_profile_digest,
             &task.instruction,
             &binding.execution_base_commit,
         )
@@ -2147,6 +2279,22 @@ fn validate_single_intent(
     record: &ApprovalRecord,
     session_binding_id: &str,
     receipts_path: &Path,
+) -> Result<(), HostError> {
+    validate_single_intent_with_policy(
+        intent,
+        record,
+        session_binding_id,
+        receipts_path,
+        TaskLedgerReadPolicy::StrictLive,
+    )
+}
+
+fn validate_single_intent_with_policy(
+    intent: &TaskDispatchIntent,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    receipts_path: &Path,
+    policy: TaskLedgerReadPolicy,
 ) -> Result<(), HostError> {
     let corrupt = |reason: String| HostError::CorruptReceipts {
         path: receipts_path.display().to_string(),
@@ -2194,13 +2342,24 @@ fn validate_single_intent(
             intent.command_key, intent.task_id
         )));
     }
-    validate_task_execution_binding(
-        task,
-        &intent.execution_binding,
-        record,
-        session_binding_id,
-        receipts_path,
-    )?;
+    if policy == TaskLedgerReadPolicy::StrictLive {
+        validate_task_execution_binding(
+            task,
+            &intent.execution_binding,
+            record,
+            session_binding_id,
+            receipts_path,
+        )?;
+    } else {
+        validate_task_execution_binding_with_policy(
+            task,
+            &intent.execution_binding,
+            record,
+            session_binding_id,
+            receipts_path,
+            policy,
+        )?;
+    }
 
     Ok(())
 }
@@ -2210,6 +2369,22 @@ fn validate_single_receipt(
     record: &ApprovalRecord,
     session_binding_id: &str,
     receipts_path: &Path,
+) -> Result<(), HostError> {
+    validate_single_receipt_with_policy(
+        receipt,
+        record,
+        session_binding_id,
+        receipts_path,
+        TaskLedgerReadPolicy::StrictLive,
+    )
+}
+
+fn validate_single_receipt_with_policy(
+    receipt: &TaskRunReceipt,
+    record: &ApprovalRecord,
+    session_binding_id: &str,
+    receipts_path: &Path,
+    policy: TaskLedgerReadPolicy,
 ) -> Result<(), HostError> {
     let corrupt = |reason: String| HostError::CorruptReceipts {
         path: receipts_path.display().to_string(),
@@ -2273,13 +2448,24 @@ fn validate_single_receipt(
             receipt.task_id, receipt.worker_id
         )));
     }
-    validate_task_execution_binding(
-        task,
-        &receipt.execution_binding,
-        record,
-        session_binding_id,
-        receipts_path,
-    )?;
+    if policy == TaskLedgerReadPolicy::StrictLive {
+        validate_task_execution_binding(
+            task,
+            &receipt.execution_binding,
+            record,
+            session_binding_id,
+            receipts_path,
+        )?;
+    } else {
+        validate_task_execution_binding_with_policy(
+            task,
+            &receipt.execution_binding,
+            record,
+            session_binding_id,
+            receipts_path,
+            policy,
+        )?;
+    }
 
     Ok(())
 }

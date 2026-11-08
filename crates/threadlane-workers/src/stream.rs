@@ -628,10 +628,13 @@ impl NdjsonStreamParser {
             };
         }
 
-        // 2. Check for non-fatal recoverable step/tool errors (`step_update`, `tool_result`)
+        // 2. Check for non-fatal recoverable step/tool errors (`step_update`, `tool_result`,
+        // or provider-scoped Codex `item.completed` `command_execution` nonzero exits)
         // before terminal provider error detection so a recoverable step tool failure
         // does not poison a subsequent valid `result` event.
-        if is_recoverable_step_error(obj, event_type, subtype) {
+        if is_recoverable_step_error(obj, event_type, subtype)
+            || is_recoverable_codex_command_execution_error(self.provider, obj, event_type, subtype)
+        {
             self.recoverable_step_errors_count += 1;
         } else if let Some((err_code, err_msg)) = detect_error_event(obj, event_type, subtype) {
             self.record_observed_event_effort(event_effort.as_deref(), event_effort_source);
@@ -1887,6 +1890,54 @@ fn is_recoverable_step_error(
         || step_obj.and_then(|s| s.get("is_error")) == Some(&Value::Bool(true))
         || has_object_error_field(obj)
         || step_obj.is_some_and(has_object_error_field)
+}
+
+fn is_recoverable_codex_command_execution_error(
+    provider: Option<WorkerProvider>,
+    obj: &Map<String, Value>,
+    event_type: &str,
+    subtype: Option<&str>,
+) -> bool {
+    if provider != Some(WorkerProvider::CodexCli) || event_type != "item.completed" {
+        return false;
+    }
+    if !subtype.is_none_or(|st| st == "command_execution") {
+        return false;
+    }
+    if obj.contains_key("status")
+        || obj.contains_key("is_error")
+        || obj.contains_key("failure")
+        || obj.contains_key("result")
+        || obj.contains_key("part")
+        || has_object_error_field(obj)
+    {
+        return false;
+    }
+    let Some(item) = obj.get("item").and_then(Value::as_object) else {
+        return false;
+    };
+    if item.get("type").and_then(Value::as_str) != Some("command_execution") {
+        return false;
+    }
+    if item.contains_key("state")
+        || item.contains_key("is_error")
+        || item.contains_key("failure")
+        || has_object_error_field(item)
+    {
+        return false;
+    }
+    let Some(item_status) = item.get("status").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(
+        item_status.to_ascii_lowercase().as_str(),
+        "failed" | "completed"
+    ) {
+        return false;
+    }
+    item.get("exit_code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0)
 }
 
 fn detect_error_event(

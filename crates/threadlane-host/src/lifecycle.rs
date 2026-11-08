@@ -151,6 +151,13 @@ pub(crate) fn verify_worker_model_evidence(
     }
 }
 
+/// Internal mode selector for task lifecycle projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LifecycleProjectionMode {
+    StrictLive,
+    RecordedHistoryReadonly,
+}
+
 /// Projects the truthful, read-only review and integration lifecycle for a task snapshot.
 ///
 /// - Preserves the legacy execution invariant (`TaskStateSnapshot::accepted == false` and
@@ -165,6 +172,57 @@ pub fn project_task_lifecycle(
     status: TaskExecutionStatus,
     run_receipt: Option<&TaskRunReceipt>,
     worker: Option<&WorkerSnapshot>,
+) -> TaskLifecycleProjection {
+    project_task_lifecycle_with_mode(
+        record,
+        session_dir,
+        task,
+        status,
+        run_receipt,
+        worker,
+        LifecycleProjectionMode::StrictLive,
+    )
+}
+
+/// Projects read-only recorded review and integration history for desktop observation of
+/// stopped or inactive hosts.
+///
+/// - Tolerates primary repository `HEAD` advancement past `record.base_commit` only when the
+///   frozen approval base remains an ancestor of `HEAD` and sealed review + integration receipts
+///   plus repository commit, tree, ancestry, and allowed-write-path history all verify.
+/// - Fails closed under an advanced `HEAD` when either review or integration receipt is absent
+///   or invalid.
+/// - Projects verified full-receipt historical successes as `HistoricalAccepted`,
+///   `HistoricalIntegrated`, and `RecordedHistoricalOnly` independently of stale or dirty leftover
+///   task/run checkouts, while current partial outcomes at the frozen `record.base_commit` retain
+///   their original strict read-only projection.
+pub fn project_task_lifecycle_recorded_history_readonly(
+    record: &ApprovalRecord,
+    session_dir: &Path,
+    task: &ApprovedTaskRecord,
+    status: TaskExecutionStatus,
+    run_receipt: Option<&TaskRunReceipt>,
+    worker: Option<&WorkerSnapshot>,
+) -> TaskLifecycleProjection {
+    project_task_lifecycle_with_mode(
+        record,
+        session_dir,
+        task,
+        status,
+        run_receipt,
+        worker,
+        LifecycleProjectionMode::RecordedHistoryReadonly,
+    )
+}
+
+fn project_task_lifecycle_with_mode(
+    record: &ApprovalRecord,
+    session_dir: &Path,
+    task: &ApprovedTaskRecord,
+    status: TaskExecutionStatus,
+    run_receipt: Option<&TaskRunReceipt>,
+    worker: Option<&WorkerSnapshot>,
+    mode: LifecycleProjectionMode,
 ) -> TaskLifecycleProjection {
     if status != TaskExecutionStatus::ReadyForReview {
         return TaskLifecycleProjection {
@@ -354,10 +412,22 @@ pub fn project_task_lifecycle(
             }
         };
 
-    // Verify primary repository HEAD remains at the frozen approval base commit.
-    match resolve_exact_commit_sha(&canonical_repo, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS) {
-        Ok(current_repo_head) if current_repo_head == record.base_commit => {}
-        Ok(_) => {
+    // Verify primary repository HEAD against the frozen approval base commit.
+    let current_repo_head =
+        match resolve_exact_commit_sha(&canonical_repo, "HEAD", DEFAULT_GIT_COMMAND_TIMEOUT_MS) {
+            Ok(head) => head,
+            Err(_) => {
+                return invalidated_projection(
+                    task_checkout_present,
+                    integration_checkout_present,
+                    None,
+                    "Failed to resolve primary repository HEAD commit.",
+                );
+            }
+        };
+    let head_advanced = current_repo_head != record.base_commit;
+    if head_advanced {
+        if mode == LifecycleProjectionMode::StrictLive {
             return invalidated_projection(
                 task_checkout_present,
                 integration_checkout_present,
@@ -365,13 +435,21 @@ pub fn project_task_lifecycle(
                 "Primary repository HEAD moved away from the frozen approval base commit.",
             );
         }
-        Err(_) => {
-            return invalidated_projection(
-                task_checkout_present,
-                integration_checkout_present,
-                None,
-                "Failed to resolve primary repository HEAD commit.",
-            );
+        match is_commit_ancestor(
+            &canonical_repo,
+            &record.base_commit,
+            &current_repo_head,
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        ) {
+            Ok(true) => {}
+            _ => {
+                return invalidated_projection(
+                    task_checkout_present,
+                    integration_checkout_present,
+                    None,
+                    "Primary repository HEAD moved away from the frozen approval base commit without preserving base ancestry.",
+                );
+            }
         }
     }
 
@@ -380,26 +458,39 @@ pub fn project_task_lifecycle(
     let expected_allowed_write_paths: BTreeSet<String> =
         task.allowed_write_paths.iter().cloned().collect();
 
-    let session_receipts =
-        match verify_existing_task_receipts(session_dir, record, &worker.binding_id) {
-            Ok(Some(ledger)) => ledger.receipts,
-            Ok(None) => {
-                return invalidated_projection(
-                    task_checkout_present,
-                    integration_checkout_present,
-                    None,
-                    "Session task receipts ledger is missing for a ReadyForReview task.",
-                );
-            }
-            Err(_) => {
-                return invalidated_projection(
-                    task_checkout_present,
-                    integration_checkout_present,
-                    None,
-                    "Session task receipts ledger failed integrity verification.",
-                );
-            }
-        };
+    let session_receipts_res = match mode {
+        LifecycleProjectionMode::StrictLive => {
+            verify_existing_task_receipts(session_dir, record, &worker.binding_id)
+                .map(|opt| opt.map(|ledger| ledger.receipts))
+        }
+        LifecycleProjectionMode::RecordedHistoryReadonly => {
+            crate::storage::read_session_task_ledger_recorded_history_readonly(
+                session_dir,
+                record,
+                &worker.binding_id,
+            )
+            .map(|opt| opt.map(|(_, receipts)| receipts))
+        }
+    };
+    let session_receipts = match session_receipts_res {
+        Ok(Some(receipts)) => receipts,
+        Ok(None) => {
+            return invalidated_projection(
+                task_checkout_present,
+                integration_checkout_present,
+                None,
+                "Session task receipts ledger is missing for a ReadyForReview task.",
+            );
+        }
+        Err(_) => {
+            return invalidated_projection(
+                task_checkout_present,
+                integration_checkout_present,
+                None,
+                "Session task receipts ledger failed integrity verification.",
+            );
+        }
+    };
 
     let mut known_session_pairs = BTreeSet::new();
     known_session_pairs.insert((expected_run_tag.clone(), expected_task_tag.clone()));
@@ -428,6 +519,18 @@ pub fn project_task_lifecycle(
             );
         }
     };
+
+    if mode == LifecycleProjectionMode::RecordedHistoryReadonly
+        && head_advanced
+        && (scanned.review_receipts.is_empty() || scanned.integration_receipts.is_empty())
+    {
+        return invalidated_projection(
+            task_checkout_present,
+            integration_checkout_present,
+            None,
+            "Primary repository HEAD moved away from the frozen approval base commit before review and integration receipts were sealed.",
+        );
+    }
 
     // Case 1: No review receipt exists for this task yet.
     if scanned.review_receipts.is_empty() {
@@ -475,20 +578,45 @@ pub fn project_task_lifecycle(
 
     // Validate static task/scope/policy bindings on every review receipt targeting this task,
     // and select the latest non-conflicting review receipt.
+    let review_scope_mode = if mode == LifecycleProjectionMode::RecordedHistoryReadonly
+        && !scanned.integration_receipts.is_empty()
+    {
+        LifecycleProjectionMode::RecordedHistoryReadonly
+    } else {
+        LifecycleProjectionMode::StrictLive
+    };
     for receipt in &scanned.review_receipts {
-        if let Err(reason) = verify_review_receipt_task_scope(
-            receipt,
-            &canonical_repo,
-            &canonical_work_area,
-            task_worktree_id,
-            &expected_run_tag,
-            &expected_task_tag,
-            &expected_base_commit,
-            &expected_allowed_write_paths,
-            provider.as_str(),
-            &task.base_model,
-            task.effort.as_deref(),
-        ) {
+        let scope_res = if review_scope_mode == LifecycleProjectionMode::StrictLive {
+            verify_review_receipt_task_scope(
+                receipt,
+                &canonical_repo,
+                &canonical_work_area,
+                task_worktree_id,
+                &expected_run_tag,
+                &expected_task_tag,
+                &expected_base_commit,
+                &expected_allowed_write_paths,
+                provider.as_str(),
+                &task.base_model,
+                task.effort.as_deref(),
+            )
+        } else {
+            verify_review_receipt_task_scope_with_mode(
+                receipt,
+                &canonical_repo,
+                &canonical_work_area,
+                task_worktree_id,
+                &expected_run_tag,
+                &expected_task_tag,
+                &expected_base_commit,
+                &expected_allowed_write_paths,
+                provider.as_str(),
+                &task.base_model,
+                task.effort.as_deref(),
+                review_scope_mode,
+            )
+        };
+        if let Err(reason) = scope_res {
             return invalidated_projection(
                 task_checkout_present,
                 integration_checkout_present,
@@ -509,6 +637,63 @@ pub fn project_task_lifecycle(
             );
         }
     };
+
+    if mode == LifecycleProjectionMode::RecordedHistoryReadonly
+        && !scanned.integration_receipts.is_empty()
+    {
+        if let Err(reason) = verify_historical_review_in_repo(
+            review_receipt,
+            &canonical_repo,
+            &expected_base_commit,
+            &expected_allowed_write_paths,
+        ) {
+            return invalidated_projection(
+                task_checkout_present,
+                integration_checkout_present,
+                None,
+                reason,
+            );
+        }
+        let integration_receipt = match verify_and_select_integration_receipt(
+            &scanned.integration_receipts,
+            None,
+            review_receipt,
+            &canonical_repo,
+            &canonical_work_area,
+            task_worktree_id,
+            run_worktree_id,
+            &expected_run_tag,
+            &expected_task_tag,
+            &expected_base_commit,
+            &record.base_commit,
+            false,
+            worker,
+        ) {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                return invalidated_projection(
+                    task_checkout_present,
+                    integration_checkout_present,
+                    None,
+                    reason,
+                );
+            }
+        };
+        let review_summary = build_review_receipt_summary(review_receipt);
+        let integration_summary = build_integration_receipt_summary(integration_receipt);
+        return TaskLifecycleProjection {
+            review_status: TaskReviewLifecycleStatus::HistoricalAccepted,
+            integration_status: TaskIntegrationLifecycleStatus::HistoricalIntegrated,
+            evidence_status: TaskEvidenceVerificationStatus::RecordedHistoricalOnly,
+            task_checkout_present,
+            integration_checkout_present,
+            review_receipt: Some(review_summary),
+            integration_receipt: Some(integration_summary),
+            verification_detail: Some(sanitize_lifecycle_detail(
+                "Verified from sealed review and integration receipts and repository commit/tree history in read-only historical mode.",
+            )),
+        };
+    }
 
     // Case 2: Live task checkout is present on disk -> reconstruct live ReviewSubject and verify.
     if task_checkout_present {
@@ -1047,10 +1232,71 @@ fn verify_review_receipt_task_scope(
         expected_effort,
     )?;
 
-    if !receipt.test_evidence.all_checks_passed() {
+    verify_review_test_evidence_for_mode(
+        LifecycleProjectionMode::StrictLive,
+        receipt.policy.require_passing_tests,
+        receipt.test_evidence.all_checks_passed(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_review_receipt_task_scope_with_mode(
+    receipt: &ReviewReceipt,
+    canonical_repo: &Path,
+    canonical_work_area: &Path,
+    task_worktree_id: &str,
+    expected_run_tag: &str,
+    expected_task_tag: &str,
+    expected_base_commit: &str,
+    expected_allowed_write_paths: &BTreeSet<String>,
+    expected_provider: &str,
+    expected_model: &str,
+    expected_effort: Option<&str>,
+    mode: LifecycleProjectionMode,
+) -> Result<(), &'static str> {
+    if receipt.task_worktree_id != task_worktree_id
+        || receipt.run_id != expected_run_tag
+        || receipt.task_id != expected_task_tag
+        || receipt.repository_path != canonical_repo
+        || receipt.work_area_root != canonical_work_area
+    {
+        return Err("Review receipt worktree, run, task, or repository identity mismatch.");
+    }
+    if receipt.base_commit != expected_base_commit {
+        return Err("Review receipt base_commit does not match expected task base commit.");
+    }
+    if &receipt.allowed_write_paths != expected_allowed_write_paths {
+        return Err("Review receipt allowed_write_paths do not match frozen task write scope.");
+    }
+    if receipt.task_head_commit == receipt.base_commit {
+        return Err("Review receipt task_head_commit must advance beyond base_commit.");
+    }
+    verify_policy_matches_frozen_task_with_mode(
+        &receipt.policy,
+        expected_provider,
+        expected_model,
+        expected_effort,
+        mode,
+    )?;
+    verify_review_test_evidence_for_mode(
+        mode,
+        receipt.policy.require_passing_tests,
+        receipt.test_evidence.all_checks_passed(),
+    )
+}
+
+fn verify_review_test_evidence_for_mode(
+    mode: LifecycleProjectionMode,
+    require_passing_tests: bool,
+    all_checks_passed: bool,
+) -> Result<(), &'static str> {
+    if mode == LifecycleProjectionMode::StrictLive && !require_passing_tests {
+        return Err("Review receipt policy must require passing test evidence.");
+    }
+    if (mode == LifecycleProjectionMode::StrictLive || require_passing_tests) && !all_checks_passed
+    {
         return Err("Review receipt test evidence does not have all required checks passing.");
     }
-
     Ok(())
 }
 
@@ -1059,6 +1305,22 @@ fn verify_policy_matches_frozen_task(
     expected_provider: &str,
     expected_model: &str,
     expected_effort: Option<&str>,
+) -> Result<(), &'static str> {
+    verify_policy_matches_frozen_task_with_mode(
+        policy,
+        expected_provider,
+        expected_model,
+        expected_effort,
+        LifecycleProjectionMode::StrictLive,
+    )
+}
+
+fn verify_policy_matches_frozen_task_with_mode(
+    policy: &ReviewPolicyBinding,
+    expected_provider: &str,
+    expected_model: &str,
+    expected_effort: Option<&str>,
+    mode: LifecycleProjectionMode,
 ) -> Result<(), &'static str> {
     if policy.validate(true).is_err() {
         return Err("Review receipt policy binding failed validation.");
@@ -1081,7 +1343,7 @@ fn verify_policy_matches_frozen_task(
             return Err("Review receipt effort evidence does not match frozen task effort.");
         }
     }
-    if !policy.require_passing_tests {
+    if mode == LifecycleProjectionMode::StrictLive && !policy.require_passing_tests {
         return Err("Review receipt policy must require passing test evidence.");
     }
     Ok(())
@@ -1597,4 +1859,33 @@ fn sanitize_lifecycle_detail(raw: &str) -> String {
         end -= 1;
     }
     format!("{}...", &collapsed[..end])
+}
+
+#[cfg(test)]
+mod recorded_history_review_policy_tests {
+    use super::*;
+
+    #[test]
+    fn sealed_no_test_review_policy_accepted_only_in_recorded_history_mode() {
+        assert_eq!(
+            verify_review_test_evidence_for_mode(LifecycleProjectionMode::StrictLive, false, false,),
+            Err("Review receipt policy must require passing test evidence.")
+        );
+        assert_eq!(
+            verify_review_test_evidence_for_mode(
+                LifecycleProjectionMode::RecordedHistoryReadonly,
+                false,
+                false,
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            verify_review_test_evidence_for_mode(
+                LifecycleProjectionMode::RecordedHistoryReadonly,
+                true,
+                false,
+            ),
+            Err("Review receipt test evidence does not have all required checks passing.")
+        );
+    }
 }

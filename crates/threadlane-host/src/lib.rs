@@ -55,13 +55,17 @@ pub use cli::{
 pub use client::ApprovedHostClient;
 pub use error::HostError;
 pub use host::{ApprovedHost, ApprovedHostConfig, ApprovedHostHandle, DEFAULT_HOST_TICK_INTERVAL};
-pub use lifecycle::{load_verified_codex_task_report, project_task_lifecycle};
+pub use lifecycle::{
+    load_verified_codex_task_report, project_task_lifecycle,
+    project_task_lifecycle_recorded_history_readonly,
+};
 pub use storage::{
     derive_ack_command_key, derive_cancel_command_key, ensure_fresh_session_dir_locked,
     ensure_no_symlink_components, ensure_private_dir,
     has_prepared_dependency_input_or_ledger_entry, is_host_lock_held, paths_overlap,
     prepare_session_dir, read_and_verify_host_manifest, read_host_launch_intent_optional,
-    read_host_manifest_optional, read_session_task_ledger_readonly, read_task_dispatch_intent,
+    read_host_manifest_optional, read_session_task_ledger_readonly,
+    read_session_task_ledger_recorded_history_readonly, read_task_dispatch_intent,
     read_task_receipt, record_task_dispatch_intent, record_task_receipt, validate_approval_id,
     validate_canonical_thread_uuid, validate_hex_digest, validate_host_instance_id,
     validate_identifier, validate_sessions_root, verify_existing_private_dir,
@@ -7239,6 +7243,73 @@ exit 0
             assert_eq!(int_sum.strategy, IntegrationStrategy::MergeNoFf);
         }
 
+        let captured_record = fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("approval record for task-root-agy");
+        let captured_session_dir = host.session_dir().to_path_buf();
+        let captured_task = captured_record
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "task-root-agy")
+            .cloned()
+            .unwrap();
+        let captured_worker = completed.worker.as_ref().unwrap().clone();
+        let captured_run_receipt = read_session_task_ledger_readonly(
+            &captured_session_dir,
+            &captured_record,
+            &captured_worker.binding_id,
+        )
+        .expect("read session task ledger")
+        .unwrap()
+        .1
+        .iter()
+        .find(|receipt| receipt.task_id == "task-root-agy")
+        .cloned()
+        .unwrap();
+
+        // A dirty live task checkout must fail strict live verification and must never lend live
+        // ReadyToIntegrate/VerifiedLive authority through the read-only historical projection.
+        let dirty_marker = checkout.join("dirty-after-integration.tmp");
+        fs::write(&dirty_marker, b"dirty").expect("write temporary dirty file in live checkout");
+        let strict_dirty = project_task_lifecycle(
+            &captured_record,
+            &captured_session_dir,
+            &captured_task,
+            TaskExecutionStatus::ReadyForReview,
+            Some(&captured_run_receipt),
+            Some(&captured_worker),
+        );
+        assert_eq!(
+            strict_dirty.review_status,
+            TaskReviewLifecycleStatus::Invalidated
+        );
+        assert_eq!(
+            strict_dirty.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+        let readonly_dirty = project_task_lifecycle_recorded_history_readonly(
+            &captured_record,
+            &captured_session_dir,
+            &captured_task,
+            TaskExecutionStatus::ReadyForReview,
+            Some(&captured_run_receipt),
+            Some(&captured_worker),
+        );
+        assert_eq!(
+            readonly_dirty.review_status,
+            TaskReviewLifecycleStatus::HistoricalAccepted
+        );
+        assert_eq!(
+            readonly_dirty.integration_status,
+            TaskIntegrationLifecycleStatus::HistoricalIntegrated
+        );
+        assert_eq!(
+            readonly_dirty.evidence_status,
+            TaskEvidenceVerificationStatus::RecordedHistoricalOnly
+        );
+        fs::remove_file(&dirty_marker).expect("remove temporary dirty file before cleanup");
+
         // 5. Clean up the integrated task worktree and verify historical projection with verification limits.
         let cleanup_report = cleanup_integrated_task_worktree(&VerifiedIntegratedCleanupRequest {
             work_area_root: host.work_area_dir().to_path_buf(),
@@ -7295,6 +7366,158 @@ exit 0
             assert!(detail.contains("cleaned up"));
             assert!(!detail.contains(&fixture.root.display().to_string()));
         }
+
+        // 6. Advance primary repository HEAD to the integrated commit: strict projection rejects,
+        // while read-only recorded-history projection verifies sealed receipts + repo history.
+        run_sanitized_git(
+            &fixture.repo_dir,
+            &[
+                "merge",
+                "--ff-only",
+                &integration_receipt.integrated_target_commit,
+            ],
+            DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+        )
+        .expect("advance primary repository HEAD to integrated target commit");
+
+        let strict_after_advance = client
+            .get_task(&approval_id, "task-root-agy")
+            .await
+            .expect("get_task after primary HEAD advanced");
+        let strict_adv_lc = strict_after_advance
+            .lifecycle
+            .as_ref()
+            .expect("strict lifecycle after advance");
+        assert_eq!(
+            strict_adv_lc.review_status,
+            TaskReviewLifecycleStatus::Invalidated
+        );
+        assert_eq!(
+            strict_adv_lc.integration_status,
+            TaskIntegrationLifecycleStatus::NotIntegrated
+        );
+        assert_eq!(
+            strict_adv_lc.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+
+        let readonly_after_advance = project_task_lifecycle_recorded_history_readonly(
+            &captured_record,
+            &captured_session_dir,
+            &captured_task,
+            TaskExecutionStatus::ReadyForReview,
+            Some(&captured_run_receipt),
+            Some(&captured_worker),
+        );
+        assert_eq!(
+            readonly_after_advance.review_status,
+            TaskReviewLifecycleStatus::HistoricalAccepted
+        );
+        assert_eq!(
+            readonly_after_advance.integration_status,
+            TaskIntegrationLifecycleStatus::HistoricalIntegrated
+        );
+        assert_eq!(
+            readonly_after_advance.evidence_status,
+            TaskEvidenceVerificationStatus::RecordedHistoricalOnly
+        );
+        assert_eq!(
+            readonly_after_advance
+                .review_receipt
+                .as_ref()
+                .map(|r| r.receipt_id.as_str()),
+            Some(review_receipt.receipt_id.as_str())
+        );
+        assert_eq!(
+            readonly_after_advance
+                .integration_receipt
+                .as_ref()
+                .map(|r| r.receipt_id.as_str()),
+            Some(integration_receipt.receipt_id.as_str())
+        );
+
+        // Missing or tampered integration receipt and unknown base commits fail closed.
+        let int_receipt_path = host
+            .work_area_dir()
+            .join(MANIFESTS_SUBDIR)
+            .join(threadlane_operations::RECEIPTS_SUBDIR)
+            .join(format!(
+                "integration-{}.json",
+                integration_receipt.receipt_id
+            ));
+        let orig_int_bytes = fs::read(&int_receipt_path).expect("read integration receipt bytes");
+        let mut tampered_int_json: serde_json::Value =
+            serde_json::from_slice(&orig_int_bytes).expect("parse integration receipt json");
+        tampered_int_json["operator_id"] = serde_json::Value::String("tampered-op".to_string());
+        fs::write(
+            &int_receipt_path,
+            serde_json::to_vec(&tampered_int_json).expect("serialize tampered receipt"),
+        )
+        .expect("write tampered integration receipt");
+        fs::set_permissions(&int_receipt_path, fs::Permissions::from_mode(0o600))
+            .expect("set 0600 on tampered receipt");
+        let tampered_proj = project_task_lifecycle_recorded_history_readonly(
+            &captured_record,
+            &captured_session_dir,
+            &captured_task,
+            TaskExecutionStatus::ReadyForReview,
+            Some(&captured_run_receipt),
+            Some(&captured_worker),
+        );
+        assert_eq!(
+            tampered_proj.review_status,
+            TaskReviewLifecycleStatus::Invalidated
+        );
+        assert_eq!(
+            tampered_proj.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+
+        fs::remove_file(&int_receipt_path).expect("remove integration receipt for missing check");
+        let missing_int_proj = project_task_lifecycle_recorded_history_readonly(
+            &captured_record,
+            &captured_session_dir,
+            &captured_task,
+            TaskExecutionStatus::ReadyForReview,
+            Some(&captured_run_receipt),
+            Some(&captured_worker),
+        );
+        assert_eq!(
+            missing_int_proj.review_status,
+            TaskReviewLifecycleStatus::Invalidated
+        );
+        assert_eq!(
+            missing_int_proj.integration_status,
+            TaskIntegrationLifecycleStatus::NotIntegrated
+        );
+        assert_eq!(
+            missing_int_proj.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
+        assert!(missing_int_proj.review_receipt.is_none());
+
+        fs::write(&int_receipt_path, &orig_int_bytes).expect("restore integration receipt");
+        fs::set_permissions(&int_receipt_path, fs::Permissions::from_mode(0o600))
+            .expect("restore 0600 on integration receipt");
+
+        let mut missing_commit_record = captured_record.clone();
+        missing_commit_record.base_commit = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef".to_string();
+        let missing_commit_proj = project_task_lifecycle_recorded_history_readonly(
+            &missing_commit_record,
+            &captured_session_dir,
+            &captured_task,
+            TaskExecutionStatus::ReadyForReview,
+            Some(&captured_run_receipt),
+            Some(&captured_worker),
+        );
+        assert_eq!(
+            missing_commit_proj.review_status,
+            TaskReviewLifecycleStatus::Invalidated
+        );
+        assert_eq!(
+            missing_commit_proj.evidence_status,
+            TaskEvidenceVerificationStatus::Invalidated
+        );
 
         // Polling never re-invoked the worker provider.
         assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);

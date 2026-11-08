@@ -38,7 +38,10 @@ pub mod types;
 pub mod validation;
 
 pub use error::AuthorityError;
-pub use store::{build_approved_worker_profile_config, AuthorityStore};
+pub use store::{
+    build_approved_worker_profile_config, compute_recorded_history_worker_profile_digest,
+    AuthorityStore,
+};
 pub use types::{
     ApprovalRecord, ApprovalSummary, ApprovedTaskDispatch, ApprovedTaskRecord, MaterializedPlan,
     NativeRoute, OperatorApprovalIntent, OperatorApprovalPreview, OperatorApprovalRequest,
@@ -2303,6 +2306,63 @@ mod tests {
             assert_eq!(
                 single_prof.profile_digest, mat_prof.profile_digest,
                 "static profile_digest must match AuthorityStore::materialize bit-for-bit"
+            );
+
+            let history_digest = compute_recorded_history_worker_profile_digest(
+                &record,
+                task,
+                &session_binding.binding_id,
+                &work_area,
+                fixture.authority.approvals_path(),
+            )
+            .expect("compute_recorded_history_worker_profile_digest with executable present");
+            assert_eq!(
+                history_digest, mat_prof.profile_digest,
+                "recorded-history profile digest must match materialized validated profile_digest"
+            );
+        }
+
+        for task in &record.tasks {
+            let exe_path = task
+                .canonical_executable
+                .as_ref()
+                .expect("frozen canonical_executable");
+            assert!(
+                exe_path.starts_with(&fixture.root),
+                "refusing to delete executable outside test fixture root"
+            );
+            if exe_path.exists() {
+                fs::remove_file(exe_path).expect("remove owned fake executable");
+            }
+        }
+
+        for task in &record.tasks {
+            let profile_id = task.profile_id.as_ref().expect("frozen profile_id");
+            let mat_prof = mat_validated
+                .profiles
+                .get(profile_id)
+                .expect("materialized validated profile");
+            let err = build_approved_worker_profile_config(
+                &record,
+                task,
+                &session_binding.binding_id,
+                &work_area,
+                fixture.authority.approvals_path(),
+            )
+            .expect_err("strict builder must fail when frozen executable is removed");
+            assert!(matches!(err, AuthorityError::WorkersConfigInvalid { .. }));
+
+            let history_digest_after_gc = compute_recorded_history_worker_profile_digest(
+                &record,
+                task,
+                &session_binding.binding_id,
+                &work_area,
+                fixture.authority.approvals_path(),
+            )
+            .expect("history digest must succeed after executable removal");
+            assert_eq!(
+                history_digest_after_gc, mat_prof.profile_digest,
+                "recorded-history profile digest must stay equal after executable removal"
             );
         }
     }

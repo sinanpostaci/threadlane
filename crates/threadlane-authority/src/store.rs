@@ -1298,14 +1298,8 @@ impl AuthorityStore {
     }
 }
 
-/// Synthesizes and validates the exact frozen [`WorkerProfileConfig`] for an approved headless
-/// worker task (`antigravity` or `opencode_v2`) against `session_binding_id` and `work_area_root`.
-///
-/// Reused by both [`AuthorityStore::materialize`] and host execution-binding/profile validation
-/// so static profile digests (`ValidatedWorkerProfile::profile_digest`) can never drift across
-/// non-default budgets, efforts, or providers (`standalone == false` for Antigravity,
-/// `standalone == true` for OpenCode Go).
-pub fn build_approved_worker_profile_config(
+/// Reconstructs frozen profile metadata for the strict and recorded-identity wrappers.
+fn build_frozen_worker_profile_metadata(
     record: &ApprovalRecord,
     task: &ApprovedTaskRecord,
     session_binding_id: &str,
@@ -1370,14 +1364,6 @@ pub fn build_approved_worker_profile_config(
         budgets: record.budgets.clone(),
     };
 
-    // Validate full WorkerSpec (including TaskFiles permission rules for both AGY and OC).
-    let full_spec = spec_template.to_worker_spec(task.instruction.clone());
-    full_spec
-        .validate()
-        .map_err(|err| AuthorityError::WorkersConfigInvalid {
-            reason: format!("profile `{profile_id}` spec validation failed: {err}"),
-        })?;
-
     let dependency_input = if task.depends_on.is_empty() {
         None
     } else {
@@ -1400,6 +1386,71 @@ pub fn build_approved_worker_profile_config(
         allowed_binding_ids: BTreeSet::from([session_binding_id.to_string()]),
         spec: spec_template,
         dependency_input,
+    })
+}
+
+/// Synthesizes and validates the exact frozen [`WorkerProfileConfig`] for an approved headless
+/// worker task (`antigravity` or `opencode_v2`) against `session_binding_id` and `work_area_root`.
+///
+/// Reused by both [`AuthorityStore::materialize`] and host execution-binding/profile validation
+/// so static profile digests (`ValidatedWorkerProfile::profile_digest`) can never drift across
+/// non-default budgets, efforts, or providers (`standalone == false` for Antigravity,
+/// `standalone == true` for OpenCode Go).
+pub fn build_approved_worker_profile_config(
+    record: &ApprovalRecord,
+    task: &ApprovedTaskRecord,
+    session_binding_id: &str,
+    work_area_root: &Path,
+    store_path_label: &Path,
+) -> Result<WorkerProfileConfig, AuthorityError> {
+    let profile_config = build_frozen_worker_profile_metadata(
+        record,
+        task,
+        session_binding_id,
+        work_area_root,
+        store_path_label,
+    )?;
+
+    // Validate full WorkerSpec (including TaskFiles permission rules for both AGY and OC).
+    let full_spec = profile_config.spec.to_worker_spec(task.instruction.clone());
+    full_spec
+        .validate()
+        .map_err(|err| AuthorityError::WorkersConfigInvalid {
+            reason: format!(
+                "profile `{}` spec validation failed: {err}",
+                profile_config.profile_id
+            ),
+        })?;
+
+    Ok(profile_config)
+}
+
+/// Computes the deterministic frozen profile 64-hex SHA-256 identity digest for an approved
+/// headless worker task from recorded metadata alone.
+///
+/// This helper is strictly for read-only recorded-history identity verification and never grants
+/// runtime execution, materialization, or dispatch authority.
+pub fn compute_recorded_history_worker_profile_digest(
+    record: &ApprovalRecord,
+    task: &ApprovedTaskRecord,
+    session_binding_id: &str,
+    work_area_root: &Path,
+    store_path_label: &Path,
+) -> Result<String, AuthorityError> {
+    let profile_config = build_frozen_worker_profile_metadata(
+        record,
+        task,
+        session_binding_id,
+        work_area_root,
+        store_path_label,
+    )?;
+    threadlane::compute_frozen_profile_identity_digest(&profile_config).map_err(|err| {
+        AuthorityError::WorkersConfigInvalid {
+            reason: format!(
+                "profile `{}` frozen identity digest failed: {err}",
+                profile_config.profile_id
+            ),
+        }
     })
 }
 

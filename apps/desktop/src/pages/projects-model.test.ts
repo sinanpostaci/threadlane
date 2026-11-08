@@ -383,7 +383,7 @@ test('duplicate requests and jobs deduplicate stably by source+id and newest mea
   assert.equal(forwardSession.calls[0]?.title, 'Newest completed copy');
   assert.equal(forwardSession.calls[0]?.running, false);
   assert.equal(forwardSession.jobs.length, 1);
-  assert.equal(forwardSession.jobs[0]?.stateLabel, 'Reviewing');
+  assert.equal(forwardSession.jobs[0]?.stateLabel, 'Awaiting review');
   assert.deepEqual(forwardSession, reverseSession);
 });
 
@@ -550,8 +550,8 @@ test('old active, waiting, unresolved approval, and unknown sessions are retaine
 
   const reviewingSession = sessions.find((s) => s.label === 'Active Reviewing');
   assert.ok(reviewingSession);
-  assert.equal(reviewingSession.jobs[0]?.stateLabel, 'Reviewing');
-  assert.equal(reviewingSession.stateLabel, 'Reviewing');
+  assert.equal(reviewingSession.jobs[0]?.stateLabel, 'Awaiting review');
+  assert.match(reviewingSession.stateLabel, /^(?:Older work a|A)waiting review$/);
 });
 
 test('exact 6h boundary retains session at cutoff and filters session 1ms older under 6h window', () => {
@@ -695,10 +695,10 @@ test('job-only snapshot projects sessions and inline job summaries with zero req
   assert.equal(session.calls.length, 0);
   assert.equal(session.recent.length, 0);
   assert.equal(session.jobs.length, 1);
-  assert.equal(session.jobs[0]?.stateLabel, 'Planning');
+  assert.equal(session.jobs[0]?.stateLabel, 'Planning recorded');
   assert.equal(session.jobs[0]?.planLabel, 'Plan · revision 2');
   assert.equal(session.jobs[0]?.job.plan_id, 'plan-42');
-  assert.match(session.jobs[0]?.taskSummary ?? '', /2 tasks recorded · 1 marked completed/);
+  assert.equal(session.jobs[0]?.taskSummary, '1 running · 1 done');
 });
 
 test('missing usage stays Usage unknown, requested model is not faked as observed, and parent+child tokens are never summed', () => {
@@ -1039,4 +1039,786 @@ test('child calls and local child events prefer own timestamps over newer parent
   const localEvent = session.recent.find((event) => event.label === 'Old local child');
   assert.ok(localEvent);
   assert.equal(localEvent.atMs, oldFinishedMs);
+});
+
+test('multiple old pending approvals with recent local MCP stay older and reason-specific', () => {
+  const nov4Ms = NOW_MS - 96 * ONE_HOUR_MS;
+  const nov6Ms = NOW_MS - 48 * ONE_HOUR_MS;
+  const aliases = [
+    'awaiting_approval',
+    'pending_approval',
+    'approval_needed',
+    'needs_approval',
+    'waiting_for_approval',
+  ];
+  const snapshot = makeSnapshot({
+    jobs: aliases.map((alias, idx) =>
+      makeJob({
+        id: `job-old-plan-${idx + 1}`,
+        title: `Legacy plan ${idx + 1} (${alias})`,
+        plan_id: `plan-${idx + 1}`,
+        plan_revision: 1,
+        state: idx % 2 === 0 ? 'needs_user' : 'ready',
+        approval_status: alias,
+        execution_status: 'pending',
+        active_call_count: 0,
+        updated_at_ms: idx < 3 ? nov4Ms + idx * 1_000 : nov6Ms + idx * 1_000,
+      })
+    ),
+    requests: [
+      makeRequest({
+        id: 'req-mcp-status',
+        title: 'Status refresh',
+        operation: 'mcp.status',
+        executor: makeLocalMcpExecutor(),
+        state: 'completed',
+        started_at_ms: NOW_MS - 2_000,
+        finished_at_ms: NOW_MS - 1_000,
+        updated_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS, windowHours: 24 });
+  const session = projection.projects[0]?.sessions[0];
+  assert.ok(session);
+  assert.equal(session.updatedAtMs, NOW_MS - 1_000);
+  assert.equal(session.stateLabel, '5 older plans awaiting approval');
+  assert.equal(session.olderJobCount, 5);
+  assert.equal(session.attentionItems.length, 5);
+  for (const item of session.attentionItems) {
+    assert.equal(item.kind, 'plan_approval');
+    assert.equal(item.olderThanWindow, true);
+    assert.equal(item.reason, 'Plan awaiting approval');
+    assert.ok(item.updatedAtMs !== null && item.updatedAtMs <= nov6Ms + 10_000);
+  }
+  for (const jobView of session.jobs) {
+    assert.equal(jobView.stateLabel, 'Awaiting approval');
+    assert.equal(jobView.attentionKind, 'plan_approval');
+    assert.equal(jobView.olderThanWindow, true);
+  }
+});
+
+test('held work outranks pending approval and mixed reasons summarize cleanly without invented causes', () => {
+  const oldMs = NOW_MS - 30 * ONE_HOUR_MS;
+  const heldVsApprovalSnapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-held-plan',
+        title: 'Held migration plan',
+        plan_id: 'plan-held',
+        state: 'needs_user',
+        approval_status: 'awaiting_approval',
+        execution_status: 'on_hold',
+        active_call_count: 0,
+        updated_at_ms: NOW_MS - 30_000,
+      }),
+    ],
+  });
+  const heldProjection = projectProjects(heldVsApprovalSnapshot, { nowMs: NOW_MS });
+  const heldSession = heldProjection.projects[0]?.sessions[0];
+  assert.ok(heldSession);
+  assert.equal(heldSession.stateLabel, 'Work on hold');
+  assert.equal(heldSession.jobs[0]?.attentionKind, 'on_hold');
+  assert.equal(heldSession.jobs[0]?.stateLabel, 'On hold');
+  assert.equal(heldSession.jobs[0]?.reason, 'Work on hold');
+
+  const mixedSnapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-mix-approval',
+        title: 'Plan needing approval',
+        plan_id: 'plan-10',
+        state: 'ready',
+        approval_status: 'pending_approval',
+        execution_status: 'pending',
+        active_call_count: 0,
+        updated_at_ms: oldMs,
+      }),
+      makeJob({
+        id: 'job-mix-generic-wait',
+        title: 'Unqualified wait job',
+        plan_id: null,
+        state: 'needs_user',
+        approval_status: 'none',
+        execution_status: 'waiting_for_user',
+        active_call_count: 0,
+        updated_at_ms: oldMs - 5_000,
+      }),
+      makeJob({
+        id: 'job-mix-unknown',
+        title: 'Conflicting old test',
+        plan_id: null,
+        state: 'unknown',
+        approval_status: 'unknown',
+        execution_status: 'unknown',
+        active_call_count: 0,
+        updated_at_ms: oldMs - 10_000,
+      }),
+    ],
+  });
+  const mixedProjection = projectProjects(mixedSnapshot, { nowMs: NOW_MS });
+  const mixedSession = mixedProjection.projects[0]?.sessions[0];
+  assert.ok(mixedSession);
+  assert.equal(mixedSession.stateLabel, '3 older items to check');
+  assert.equal(mixedSession.tone, 'unknown');
+  assert.deepEqual(
+    mixedSession.attentionItems.map((item) => item.kind),
+    ['status_check', 'plan_approval', 'recorded_wait']
+  );
+  const genericWait = mixedSession.attentionItems.find(
+    (item) => item.jobId === 'job-mix-generic-wait'
+  );
+  assert.equal(genericWait?.reason, 'Recorded wait; reason not provided');
+  const statusCheck = mixedSession.attentionItems.find(
+    (item) => item.jobId === 'job-mix-unknown'
+  );
+  assert.equal(statusCheck?.reason, 'Status needs checking');
+});
+
+test('settled completed and failed jobs with leftover pending fields do not regain approval and stay source-isolated', () => {
+  const snapshot = makeSnapshot({
+    sources: [
+      makeSource({ id: 'src-1', label: 'Alpha', project_path: '/work/alpha' }),
+      makeSource({ id: 'src-2', label: 'Beta', project_path: '/work/beta' }),
+    ],
+    jobs: [
+      makeJob({
+        source_id: 'src-1',
+        id: 'job-shared',
+        project_label: 'Alpha',
+        project_path: '/work/alpha',
+        title: 'Completed with leftover approval',
+        plan_id: 'plan-leftover',
+        state: 'completed',
+        approval_status: 'awaiting_approval',
+        execution_status: 'on_hold',
+        review_state: 'ready_for_review',
+        active_call_count: 0,
+        updated_at_ms: NOW_MS - 10_000,
+      }),
+      makeJob({
+        source_id: 'src-1',
+        id: 'job-failed-recent',
+        project_label: 'Alpha',
+        project_path: '/work/alpha',
+        thread_uuid: 'thread-failed',
+        binding_id: 'bind-failed',
+        title: 'Failed with leftover approval',
+        plan_id: 'plan-failed',
+        state: 'failed',
+        approval_status: 'pending_approval',
+        execution_status: 'failed',
+        review_state: 'needs_review',
+        active_call_count: 0,
+        updated_at_ms: NOW_MS - 20_000,
+      }),
+      makeJob({
+        source_id: 'src-1',
+        id: 'job-failed-old',
+        project_label: 'Alpha',
+        project_path: '/work/alpha',
+        thread_uuid: 'thread-failed-old',
+        binding_id: 'bind-failed-old',
+        title: 'Historical failed job',
+        plan_id: 'plan-failed-old',
+        state: 'failed',
+        approval_status: 'awaiting_approval',
+        execution_status: 'failed',
+        active_call_count: 0,
+        updated_at_ms: NOW_MS - 48 * ONE_HOUR_MS,
+      }),
+      makeJob({
+        source_id: 'src-2',
+        id: 'job-shared',
+        project_label: 'Beta',
+        project_path: '/work/beta',
+        title: 'Pending in second source',
+        plan_id: 'plan-beta',
+        state: 'ready',
+        approval_status: 'approval_needed',
+        execution_status: 'pending',
+        active_call_count: 0,
+        updated_at_ms: NOW_MS - 15_000,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        source_id: 'src-1',
+        id: 'req-settled-leftover',
+        job_id: 'job-shared',
+        project_label: 'Alpha',
+        state: 'waiting_for_user',
+        updated_at_ms: NOW_MS - 9_000,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  assert.equal(projection.hiddenSessionCount, 1);
+  const alphaProject = projection.projects.find((p) => p.label === 'Alpha');
+  const betaProject = projection.projects.find((p) => p.label === 'Beta');
+  assert.ok(alphaProject);
+  assert.ok(betaProject);
+
+  const completedSession = alphaProject.sessions.find(
+    (s) => s.threadUuid === 'thread-1'
+  );
+  assert.ok(completedSession);
+  assert.equal(completedSession.stateLabel, 'Completed');
+  assert.equal(completedSession.attention, false);
+  assert.equal(completedSession.attentionItems.length, 0);
+  assert.equal(completedSession.jobs[0]?.attention, false);
+
+  const failedSession = alphaProject.sessions.find(
+    (s) => s.threadUuid === 'thread-failed'
+  );
+  assert.ok(failedSession);
+  assert.equal(failedSession.stateLabel, 'Failed');
+  assert.equal(failedSession.attentionItems.length, 0);
+  assert.equal(failedSession.jobs[0]?.attention, false);
+
+  const betaSession = betaProject.sessions[0];
+  assert.ok(betaSession);
+  assert.equal(betaSession.stateLabel, '1 plan awaiting approval');
+  assert.equal(betaSession.attentionItems[0]?.sourceId, 'src-2');
+  assert.equal(betaSession.attentionItems[0]?.jobId, 'job-shared');
+});
+
+test('waiting request without job uses actual request identity and deduplicates parent-child and job waits', () => {
+  const oldWaitMs = NOW_MS - 12 * ONE_HOUR_MS;
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-with-wait',
+        title: 'Job already waiting',
+        thread_uuid: 'thread-job-wait',
+        binding_id: 'bind-job-wait',
+        plan_id: null,
+        state: 'needs_user',
+        approval_status: 'none',
+        execution_status: 'waiting_for_user',
+        active_call_count: 0,
+        updated_at_ms: oldWaitMs,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-parent-wait',
+        job_id: null,
+        thread_uuid: 'thread-req-only',
+        binding_id: 'bind-req-only',
+        title: 'Parent handoff wait',
+        state: 'waiting_for_user',
+        started_at_ms: oldWaitMs - 5_000,
+        finished_at_ms: null,
+        updated_at_ms: oldWaitMs,
+      }),
+      makeRequest({
+        id: 'req-child-wait',
+        parent_request_id: 'req-parent-wait',
+        job_id: null,
+        thread_uuid: 'thread-req-only',
+        binding_id: 'bind-req-only',
+        title: 'Confirm target environment',
+        state: 'waiting_for_user',
+        started_at_ms: oldWaitMs - 2_000,
+        finished_at_ms: null,
+        updated_at_ms: oldWaitMs,
+        children: [
+          makeCall({
+            id: 'call-child-wait',
+            title: 'Confirm target environment',
+            state: 'waiting_for_user',
+            started_at_ms: oldWaitMs - 2_000,
+            finished_at_ms: null,
+          }),
+        ],
+        children_count: 1,
+      }),
+      makeRequest({
+        id: 'req-duplicate-of-job',
+        job_id: 'job-with-wait',
+        thread_uuid: 'thread-job-wait',
+        binding_id: 'bind-job-wait',
+        title: 'Duplicate request wait for job',
+        state: 'waiting_for_user',
+        updated_at_ms: oldWaitMs,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const sessions = projection.projects[0]?.sessions ?? [];
+  const reqOnlySession = sessions.find((s) => s.threadUuid === 'thread-req-only');
+  assert.ok(reqOnlySession);
+  assert.equal(reqOnlySession.jobs.length, 0);
+  assert.equal(reqOnlySession.attentionItems.length, 1);
+  assert.equal(reqOnlySession.attentionItems[0]?.jobId, null);
+  assert.equal(reqOnlySession.attentionItems[0]?.requestId, 'req-child-wait');
+  assert.equal(reqOnlySession.attentionItems[0]?.title, 'Confirm target environment');
+  assert.equal(reqOnlySession.attentionItems[0]?.updatedAtMs, oldWaitMs);
+  assert.equal(reqOnlySession.attentionItems[0]?.olderThanWindow, true);
+  assert.equal(reqOnlySession.stateLabel, 'Waiting for user (older)');
+
+  const jobWaitSession = sessions.find((s) => s.threadUuid === 'thread-job-wait');
+  assert.ok(jobWaitSession);
+  assert.equal(jobWaitSession.attentionItems.length, 1);
+  assert.equal(jobWaitSession.attentionItems[0]?.jobId, 'job-with-wait');
+});
+
+test('persisted reviewing or ready_for_review without active reviewer reports awaiting review while running reviewer stays running', () => {
+  const oldReviewMs = NOW_MS - 18 * ONE_HOUR_MS;
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-stale-review',
+        thread_uuid: 'thread-stale-review',
+        binding_id: 'bind-stale-review',
+        title: 'Worker finished awaiting review',
+        state: 'reviewing',
+        review_state: 'ready_for_review',
+        active_call_count: 0,
+        updated_at_ms: oldReviewMs,
+      }),
+      makeJob({
+        id: 'job-active-review',
+        thread_uuid: 'thread-active-review',
+        binding_id: 'bind-active-review',
+        title: 'Active package review',
+        state: 'reviewing',
+        review_state: 'reviewing',
+        active_call_count: 1,
+        updated_at_ms: NOW_MS - 3_000,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-stale-worker',
+        job_id: 'job-stale-review',
+        thread_uuid: 'thread-stale-review',
+        binding_id: 'bind-stale-review',
+        title: 'Worker handoff',
+        state: 'ready_for_review',
+        started_at_ms: oldReviewMs - 10_000,
+        finished_at_ms: oldReviewMs,
+        updated_at_ms: oldReviewMs,
+      }),
+      makeRequest({
+        id: 'req-active-reviewer',
+        job_id: 'job-active-review',
+        thread_uuid: 'thread-active-review',
+        binding_id: 'bind-active-review',
+        title: 'Closing review',
+        state: 'running',
+        executor: makeExecutor({ role: 'reviewer', requested_model: 'gpt-6-astra', observed_model: 'gpt-6-astra' }),
+        started_at_ms: NOW_MS - 3_000,
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const sessions = projection.projects[0]?.sessions ?? [];
+  const staleSession = sessions.find((s) => s.threadUuid === 'thread-stale-review');
+  assert.ok(staleSession);
+  assert.equal(staleSession.runningCount, 0);
+  assert.equal(staleSession.stateLabel, 'Older work awaiting review');
+  assert.equal(staleSession.tone, 'review');
+  assert.equal(staleSession.jobs[0]?.stateLabel, 'Awaiting review');
+  assert.equal(staleSession.attentionItems.length, 1);
+  assert.match(staleSession.attentionItems[0]?.reason ?? '', /no active reviewer/i);
+
+  const activeSession = sessions.find((s) => s.threadUuid === 'thread-active-review');
+  assert.ok(activeSession);
+  assert.equal(activeSession.runningCount, 1);
+  assert.equal(activeSession.stateLabel, 'Running');
+  assert.equal(activeSession.tone, 'active');
+  assert.equal(activeSession.jobs[0]?.stateLabel, 'Reviewing');
+  assert.equal(activeSession.jobs[0]?.attention, false);
+  assert.equal(activeSession.attentionItems.length, 0);
+});
+
+test('reviewer running identity is scoped to exact source+job, stale planning shows Planning recorded, and task status summary is grouped', () => {
+  const oldMs = NOW_MS - 48 * ONE_HOUR_MS;
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-a',
+        thread_uuid: 'thread-mixed-review',
+        thread_label: 'Mixed Review Session',
+        state: 'reviewing',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+      makeJob({
+        id: 'job-b',
+        thread_uuid: 'thread-mixed-review',
+        thread_label: 'Mixed Review Session',
+        state: 'reviewing',
+        updated_at_ms: oldMs,
+      }),
+      makeJob({
+        id: 'job-c',
+        thread_uuid: 'thread-worker-on-review',
+        thread_label: 'Worker On Reviewing Job',
+        state: 'reviewing',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+      makeJob({
+        id: 'job-unlinked',
+        thread_uuid: 'thread-unlinked-reviewer',
+        thread_label: 'Unlinked Reviewer Session',
+        state: 'reviewing',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+      makeJob({
+        id: 'job-stale-plan',
+        thread_uuid: 'thread-stale-plan',
+        thread_label: 'Stale Planning Session',
+        state: 'planning',
+        updated_at_ms: oldMs,
+        tasks: [
+          { id: 't1', title: 'Task done', status: 'completed', depends_on: [] },
+          { id: 't2', title: 'Task review', status: 'ready_for_review', depends_on: [] },
+          { id: 't3', title: 'Task failed', status: 'failed', depends_on: [] },
+          { id: 't4', title: 'Task waiting', status: 'not_started', depends_on: [] },
+        ],
+      }),
+      makeJob({
+        id: 'job-held',
+        thread_uuid: 'thread-held',
+        thread_label: 'Held Session',
+        state: 'needs_user',
+        execution_status: 'held',
+        updated_at_ms: NOW_MS - 5_000,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-reviewer-a',
+        job_id: 'job-a',
+        thread_uuid: 'thread-mixed-review',
+        thread_label: 'Mixed Review Session',
+        state: 'running',
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+        executor: makeExecutor({ role: 'reviewer' }),
+      }),
+      makeRequest({
+        id: 'req-worker-c',
+        job_id: 'job-c',
+        thread_uuid: 'thread-worker-on-review',
+        thread_label: 'Worker On Reviewing Job',
+        state: 'running',
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+        executor: makeExecutor({ role: 'coder' }),
+      }),
+      makeRequest({
+        id: 'req-reviewer-unlinked',
+        job_id: null,
+        thread_uuid: 'thread-unlinked-reviewer',
+        thread_label: 'Unlinked Reviewer Session',
+        state: 'running',
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+        executor: makeExecutor({ role: 'Reviewer' }),
+      }),
+      makeRequest({
+        id: 'req-mcp-heartbeat',
+        job_id: 'job-stale-plan',
+        thread_uuid: 'thread-stale-plan',
+        thread_label: 'Stale Planning Session',
+        state: 'running',
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+        executor: makeLocalMcpExecutor(),
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const sessions = projection.projects[0]?.sessions ?? [];
+
+  const mixed = sessions.find((s) => s.threadUuid === 'thread-mixed-review');
+  assert.ok(mixed);
+  const jobA = mixed.jobs.find((j) => j.job.id === 'job-a');
+  const jobB = mixed.jobs.find((j) => j.job.id === 'job-b');
+  assert.equal(jobA?.stateLabel, 'Reviewing');
+  assert.equal(jobA?.attention, false);
+  assert.equal(jobB?.stateLabel, 'Awaiting review');
+  assert.equal(jobB?.attention, true);
+  assert.equal(jobB?.olderThanWindow, true);
+
+  const workerOnReview = sessions.find((s) => s.threadUuid === 'thread-worker-on-review');
+  assert.ok(workerOnReview);
+  assert.equal(workerOnReview.jobs[0]?.stateLabel, 'Awaiting review');
+  assert.equal(workerOnReview.jobs[0]?.attention, true);
+
+  const unlinked = sessions.find((s) => s.threadUuid === 'thread-unlinked-reviewer');
+  assert.ok(unlinked);
+  assert.equal(unlinked.runningCount, 1);
+  assert.equal(unlinked.jobs[0]?.stateLabel, 'Awaiting review');
+  assert.equal(unlinked.jobs[0]?.attention, true);
+
+  const stalePlan = sessions.find((s) => s.threadUuid === 'thread-stale-plan');
+  assert.ok(stalePlan);
+  assert.equal(stalePlan.jobs[0]?.stateLabel, 'Planning recorded');
+  assert.equal(stalePlan.jobs[0]?.attention, true);
+  assert.equal(
+    stalePlan.jobs[0]?.reason,
+    'Planning was recorded; no active planning call is verified'
+  );
+  assert.equal(stalePlan.jobs[0]?.updatedAtMs, oldMs);
+  assert.equal(stalePlan.jobs[0]?.olderThanWindow, true);
+  assert.equal(
+    stalePlan.jobs[0]?.taskSummary,
+    '1 failed · 1 awaiting review · 1 not started · 1 done'
+  );
+
+  const held = sessions.find((s) => s.threadUuid === 'thread-held');
+  assert.ok(held);
+  assert.equal(
+    held.jobs[0]?.nextStep,
+    'Review the hold in Codex; updated scope or approval may be needed.'
+  );
+});
+
+test('nested running Reviewer under a local MCP parent only suppresses its exact source and job', () => {
+  const snapshot = makeSnapshot({
+    sources: [
+      makeSource(),
+      makeSource({
+        id: 'src-2',
+        label: 'Other',
+        project_path: '/work/other',
+      }),
+    ],
+    jobs: [
+      makeJob({
+        id: 'job-nested-review',
+        thread_uuid: 'thread-nested-review',
+        thread_label: 'Nested Review Session',
+        state: 'running',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+      makeJob({
+        id: 'job-other',
+        thread_uuid: 'thread-nested-review',
+        thread_label: 'Nested Review Session',
+        state: 'running',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+      makeJob({
+        source_id: 'src-2',
+        id: 'job-nested-review',
+        project_label: 'Other',
+        project_path: '/work/other',
+        thread_uuid: 'thread-other-source',
+        thread_label: 'Other Source Session',
+        state: 'running',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+      makeJob({
+        id: 'job-unbound-nested',
+        thread_uuid: 'thread-unbound-nested',
+        thread_label: 'Unbound Nested Session',
+        state: 'running',
+        updated_at_ms: NOW_MS - 2_000,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-nested-parent',
+        job_id: 'job-nested-review',
+        thread_uuid: 'thread-nested-review',
+        thread_label: 'Nested Review Session',
+        state: 'running',
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+        executor: makeLocalMcpExecutor(),
+        children: [
+          makeCall({
+            id: 'call-nested-reviewer',
+            state: 'running',
+            executor: makeExecutor({ role: 'reviewer' }),
+            finished_at_ms: null,
+          }),
+        ],
+        children_count: 1,
+      }),
+      makeRequest({
+        id: 'req-nested-ready',
+        job_id: 'job-nested-review',
+        thread_uuid: 'thread-nested-review',
+        thread_label: 'Nested Review Session',
+        title: 'Nested review ready',
+        state: 'ready_for_review',
+        finished_at_ms: NOW_MS - 4_000,
+        updated_at_ms: NOW_MS - 4_000,
+      }),
+      makeRequest({
+        id: 'req-other-job-ready',
+        job_id: 'job-other',
+        thread_uuid: 'thread-nested-review',
+        thread_label: 'Nested Review Session',
+        title: 'Other job review ready',
+        state: 'ready_for_review',
+        finished_at_ms: NOW_MS - 4_000,
+        updated_at_ms: NOW_MS - 4_000,
+      }),
+      makeRequest({
+        id: 'req-other-source-ready',
+        source_id: 'src-2',
+        job_id: 'job-nested-review',
+        thread_uuid: 'thread-other-source',
+        thread_label: 'Other Source Session',
+        title: 'Other source review ready',
+        state: 'ready_for_review',
+        finished_at_ms: NOW_MS - 4_000,
+        updated_at_ms: NOW_MS - 4_000,
+      }),
+      makeRequest({
+        id: 'req-unbound-parent',
+        job_id: null,
+        thread_uuid: 'thread-unbound-nested',
+        thread_label: 'Unbound Nested Session',
+        state: 'running',
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+        executor: makeLocalMcpExecutor(),
+        children: [
+          makeCall({
+            id: 'call-unbound-reviewer',
+            state: 'running',
+            executor: makeExecutor({ role: 'reviewer' }),
+            finished_at_ms: null,
+          }),
+        ],
+        children_count: 1,
+      }),
+      makeRequest({
+        id: 'req-unbound-ready',
+        job_id: null,
+        thread_uuid: 'thread-unbound-nested',
+        thread_label: 'Unbound Nested Session',
+        title: 'Unbound review ready',
+        state: 'ready_for_review',
+        finished_at_ms: NOW_MS - 4_000,
+        updated_at_ms: NOW_MS - 4_000,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const sessions = projection.projects.flatMap((project) => project.sessions);
+
+  const nested = sessions.find(
+    (session) => session.threadUuid === 'thread-nested-review'
+  );
+  assert.ok(nested);
+  assert.equal(
+    nested.attentionItems.some((item) => item.requestId === 'req-nested-ready'),
+    false
+  );
+  assert.equal(
+    nested.attentionItems.some((item) => item.requestId === 'req-other-job-ready'),
+    true
+  );
+
+  const otherSource = sessions.find(
+    (session) => session.threadUuid === 'thread-other-source'
+  );
+  assert.ok(otherSource);
+  assert.equal(
+    otherSource.attentionItems.some(
+      (item) => item.requestId === 'req-other-source-ready'
+    ),
+    true
+  );
+
+  const unbound = sessions.find(
+    (session) => session.threadUuid === 'thread-unbound-nested'
+  );
+  assert.ok(unbound);
+  assert.equal(
+    unbound.attentionItems.some((item) => item.requestId === 'req-unbound-ready'),
+    true
+  );
+});
+
+test('unbound Reviewer does not suppress an unrelated pending review', () => {
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-unbound-context',
+        thread_uuid: 'thread-unbound-review',
+        thread_label: 'Unbound Reviewer Session',
+        state: 'completed',
+        execution_status: 'completed',
+        active_call_count: 0,
+        updated_at_ms: NOW_MS - 6_000,
+      }),
+    ],
+    requests: [
+      makeRequest({
+        id: 'req-pending-review',
+        job_id: null,
+        thread_uuid: 'thread-unbound-review',
+        thread_label: 'Unbound Reviewer Session',
+        title: 'Pending review',
+        state: 'ready_for_review',
+        started_at_ms: NOW_MS - 8_000,
+        finished_at_ms: NOW_MS - 4_000,
+        updated_at_ms: NOW_MS - 4_000,
+      }),
+      makeRequest({
+        id: 'req-unbound-reviewer',
+        job_id: null,
+        thread_uuid: 'thread-unbound-review',
+        thread_label: 'Unbound Reviewer Session',
+        title: 'Unbound review',
+        state: 'running',
+        executor: makeExecutor({ role: 'Reviewer' }),
+        started_at_ms: NOW_MS - 3_000,
+        finished_at_ms: null,
+        updated_at_ms: NOW_MS - 1_000,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const session = projection.projects[0]?.sessions.find(
+    (candidate) => candidate.threadUuid === 'thread-unbound-review'
+  );
+  assert.ok(session);
+  assert.equal(session.attentionItems.length, 1);
+  assert.equal(session.attentionItems[0]?.requestId, 'req-pending-review');
+  assert.equal(session.attentionItems[0]?.kind, 'awaiting_review');
+});
+
+test('needs_user with held execution status retains hold guidance', () => {
+  const snapshot = makeSnapshot({
+    jobs: [
+      makeJob({
+        id: 'job-held-alias',
+        thread_uuid: 'thread-held-alias',
+        thread_label: 'Held Alias Session',
+        state: 'needs_user',
+        execution_status: 'held',
+        updated_at_ms: NOW_MS - 5_000,
+      }),
+    ],
+  });
+
+  const projection = projectProjects(snapshot, { nowMs: NOW_MS });
+  const session = projection.projects[0]?.sessions.find(
+    (candidate) => candidate.threadUuid === 'thread-held-alias'
+  );
+  assert.ok(session);
+  assert.equal(
+    session.jobs[0]?.nextStep,
+    'Review the hold in Codex; updated scope or approval may be needed.'
+  );
 });

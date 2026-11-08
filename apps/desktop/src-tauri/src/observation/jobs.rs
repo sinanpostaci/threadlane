@@ -15,11 +15,12 @@ use threadlane_core::observation::{
 };
 use threadlane_core::{WorkerAcceptanceState, WorkerSnapshot, WorkerStatus};
 use threadlane_host::{
-    is_host_lock_held, project_task_lifecycle, read_host_manifest_optional,
-    read_session_task_ledger_readonly, HostPhase, HostSessionManifest, TaskDispatchIntent,
-    TaskExecutionStatus, TaskIntegrationLifecycleStatus, TaskLifecycleProjection,
-    TaskReviewLifecycleStatus, TaskRunReceipt, RUNTIME_STATE_SUBDIR, TASK_RECEIPTS_FILENAME,
-    WORK_AREA_SUBDIR,
+    is_host_lock_held, project_task_lifecycle, project_task_lifecycle_recorded_history_readonly,
+    read_host_manifest_optional, read_session_task_ledger_readonly,
+    read_session_task_ledger_recorded_history_readonly, HostPhase, HostSessionManifest,
+    TaskDispatchIntent, TaskExecutionStatus, TaskIntegrationLifecycleStatus,
+    TaskLifecycleProjection, TaskReviewLifecycleStatus, TaskRunReceipt, RUNTIME_STATE_SUBDIR,
+    TASK_RECEIPTS_FILENAME, WORK_AREA_SUBDIR,
 };
 use threadlane_plans::{
     validate_plan_revision, PlanRevision, PlanStatus, PlanTask, MAX_PLAN_STORE_BYTES,
@@ -776,17 +777,28 @@ fn inspect_approval_session(
         return (SessionInspection::CorruptOrUnresolved, session_dir);
     };
 
-    let (pending_intents, receipts) =
-        match read_session_task_ledger_readonly(&session_dir, record, session_binding_id) {
-            Ok(Some(ledger)) => ledger,
-            Ok(None) => {
-                return (SessionInspection::CorruptOrUnresolved, session_dir);
-            }
-            Err(_) => {
-                push_unique_warning(warnings, WARN_SESSION_STATE_INVALID);
-                return (SessionInspection::CorruptOrUnresolved, session_dir);
-            }
-        };
+    let host_lock_held = match is_host_lock_held(&session_dir) {
+        Ok(held) => held,
+        Err(_) => {
+            push_unique_warning(warnings, WARN_SESSION_STATE_INVALID);
+            return (SessionInspection::CorruptOrUnresolved, session_dir);
+        }
+    };
+    let ledger_res = if manifest.phase == HostPhase::Stopped || !host_lock_held {
+        read_session_task_ledger_recorded_history_readonly(&session_dir, record, session_binding_id)
+    } else {
+        read_session_task_ledger_readonly(&session_dir, record, session_binding_id)
+    };
+    let (pending_intents, receipts) = match ledger_res {
+        Ok(Some(ledger)) => ledger,
+        Ok(None) => {
+            return (SessionInspection::CorruptOrUnresolved, session_dir);
+        }
+        Err(_) => {
+            push_unique_warning(warnings, WARN_SESSION_STATE_INVALID);
+            return (SessionInspection::CorruptOrUnresolved, session_dir);
+        }
+    };
 
     let session_runtime_dir = session_dir.join(RUNTIME_STATE_SUBDIR);
     let extra_core_snapshot = match fs::symlink_metadata(&session_runtime_dir) {
@@ -1269,14 +1281,25 @@ fn evaluate_approved_worker_task(
     });
 
     let exec_status = TaskExecutionStatus::from_worker_snapshot(&worker);
-    let lifecycle = project_task_lifecycle(
-        record,
-        session_dir,
-        approved_task,
-        exec_status,
-        Some(receipt),
-        Some(&worker),
-    );
+    let lifecycle = if host_lock_held && manifest_allows_live {
+        project_task_lifecycle(
+            record,
+            session_dir,
+            approved_task,
+            exec_status,
+            Some(receipt),
+            Some(&worker),
+        )
+    } else {
+        project_task_lifecycle_recorded_history_readonly(
+            record,
+            session_dir,
+            approved_task,
+            exec_status,
+            Some(receipt),
+            Some(&worker),
+        )
+    };
 
     let (status_str, review_outcome) = apply_task_lifecycle_projection(
         &worker,

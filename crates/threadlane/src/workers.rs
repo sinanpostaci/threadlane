@@ -778,6 +778,242 @@ fn validate_profile_side_effect_free(
     })
 }
 
+fn validate_frozen_canonical_path(
+    path: &Path,
+    field: &str,
+    profile_id: &str,
+) -> Result<PathBuf, Error> {
+    let Some(raw) = path.to_str() else {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{profile_id}`: `{field}` must be valid UTF-8"
+        )));
+    };
+    if raw.is_empty()
+        || raw.len() > MAX_WORKER_PATH_BYTES
+        || raw.contains('\0')
+        || !path.is_absolute()
+        || raw.ends_with('/')
+        || raw.contains("//")
+    {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{profile_id}`: `{field}` must be a normalized non-root absolute path"
+        )));
+    }
+    let mut saw_root = false;
+    let mut normal_count = 0usize;
+    for comp in path.components() {
+        match comp {
+            Component::RootDir if !saw_root && normal_count == 0 => saw_root = true,
+            Component::Normal(p) if saw_root && !p.is_empty() => normal_count += 1,
+            _ => {
+                return Err(Error::InvalidConfig(format!(
+                    "profile `{profile_id}`: `{field}` has non-normal path component"
+                )));
+            }
+        }
+    }
+    if !saw_root || normal_count == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{profile_id}`: `{field}` must be a non-root absolute path"
+        )));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// Computes the canonical 64-hex SHA-256 identity digest for a frozen [`WorkerProfileConfig`]
+/// without checking executable existence on disk.
+///
+/// This is a pure read-only historical identity helper and is **not** executable validation
+/// or runtime execution admission authority.
+pub fn compute_frozen_profile_identity_digest(
+    profile: &WorkerProfileConfig,
+) -> Result<String, Error> {
+    validate_identifier_chars(&profile.profile_id, "profile_id", MAX_WORKER_PROFILE_ID_LEN)?;
+    validate_simple_identifier(&profile.profile_id, "profile_id")
+        .map_err(|err| Error::InvalidConfig(err.to_string()))?;
+    if profile.allowed_binding_ids.is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{}` must specify at least one allowed binding_id",
+            profile.profile_id
+        )));
+    }
+    for binding_id in &profile.allowed_binding_ids {
+        validate_identifier_chars(binding_id, "allowed_binding_ids entry", MAX_ID_LEN)?;
+    }
+    let normalized_base_commit = validate_exact_commit_sha(&profile.spec.base_commit)?;
+    let checked_executable = validate_frozen_canonical_path(
+        &profile.spec.executable,
+        "executable",
+        &profile.profile_id,
+    )?;
+    let checked_repository_path = validate_frozen_canonical_path(
+        &profile.spec.repository_path,
+        "repository_path",
+        &profile.profile_id,
+    )?;
+    let checked_work_area = validate_frozen_canonical_path(
+        &profile.spec.work_area_root,
+        "work_area_root",
+        &profile.profile_id,
+    )?;
+    if checked_repository_path == checked_work_area
+        || checked_executable == checked_repository_path
+        || checked_executable == checked_work_area
+    {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{}`: executable, repository_path, and work_area_root must be distinct",
+            profile.profile_id
+        )));
+    }
+    if profile.spec.allowed_write_paths.is_empty() {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{}`: `allowed_write_paths` must not be empty",
+            profile.profile_id
+        )));
+    }
+    for entry in &profile.spec.allowed_write_paths {
+        let trimmed = entry.trim();
+        let rel = entry.strip_suffix('/').unwrap_or(entry);
+        if trimmed.is_empty()
+            || trimmed != entry
+            || rel.is_empty()
+            || entry.len() > MAX_WORKER_PATH_BYTES
+            || entry.starts_with('/')
+            || entry.contains("//")
+            || entry.chars().any(|c| {
+                c.is_control()
+                    || matches!(
+                        c,
+                        '\\' | '*'
+                            | '?'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '$'
+                            | '`'
+                            | ';'
+                            | '|'
+                            | '&'
+                            | '<'
+                            | '>'
+                    )
+            })
+            || rel
+                .split('/')
+                .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{}`: invalid `allowed_write_paths` entry `{entry}`",
+                profile.profile_id
+            )));
+        }
+        let mut count = 0usize;
+        for comp in Path::new(rel).components() {
+            match comp {
+                Component::Normal(p) if !p.is_empty() => count += 1,
+                _ => {
+                    return Err(Error::InvalidConfig(format!(
+                        "profile `{}`: `allowed_write_paths` entry `{entry}` must be normalized relative",
+                        profile.profile_id
+                    )));
+                }
+            }
+        }
+        if count == 0 {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{}`: empty `allowed_write_paths` entry",
+                profile.profile_id
+            )));
+        }
+    }
+    match profile.spec.provider {
+        WorkerProvider::OpenCodeV2 if !profile.spec.standalone => {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{}`: OpenCode v2 requires `standalone: true`",
+                profile.profile_id
+            )));
+        }
+        WorkerProvider::Antigravity if profile.spec.standalone => {
+            return Err(Error::InvalidConfig(format!(
+                "profile `{}`: Antigravity requires `standalone: false`",
+                profile.profile_id
+            )));
+        }
+        _ => {}
+    }
+    if let Some(ref sid) = profile.spec.session_id {
+        validate_identifier_chars(sid, "session_id", MAX_ID_LEN)?;
+    }
+    let b = &profile.spec.budgets;
+    if b.timeout_ms == 0
+        || b.max_line_bytes == 0
+        || b.max_stdout_bytes == 0
+        || b.max_stderr_bytes == 0
+        || b.max_events == 0
+    {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{}`: budgets must be non-zero",
+            profile.profile_id
+        )));
+    }
+    let canonical_dependency_input = match &profile.dependency_input {
+        Some(policy) => {
+            validate_dependency_input_policy(policy, &checked_work_area).map_err(|err| {
+                Error::InvalidConfig(format!("profile `{}`: {err}", profile.profile_id))
+            })?;
+            let mut normalized = policy.clone();
+            normalized.seal_path = checked_work_area
+                .join(MANIFESTS_SUBDIR)
+                .join(DEPENDENCIES_MANIFEST_SUBDIR)
+                .join(format!("{}.json", policy.task_id));
+            Some(normalized)
+        }
+        None => None,
+    };
+    let resolved_model = profile
+        .spec
+        .to_worker_spec("validation-placeholder".to_string())
+        .resolve_model_target()
+        .map_err(|err| Error::InvalidConfig(format!("profile `{}`: {err}", profile.profile_id)))?;
+    if !profile
+        .spec
+        .allowed_models
+        .contains(&resolved_model.base_model)
+    {
+        return Err(Error::InvalidConfig(format!(
+            "profile `{}`: model `{}` is not in `allowed_models`",
+            profile.profile_id, resolved_model.base_model
+        )));
+    }
+    if profile.spec.file_permissions == WorkerFilePermissions::TaskFiles {
+        validate_task_files_profile_paths(
+            &profile.profile_id,
+            profile.spec.provider,
+            &checked_work_area,
+            &profile.spec.allowed_write_paths,
+        )?;
+    }
+    let requested_effort = resolved_model
+        .effort
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    validate_identifier_chars(&requested_effort, "effort", MAX_ID_LEN)?;
+    let mut canonical_template = profile.spec.clone();
+    canonical_template.executable = checked_executable;
+    canonical_template.repository_path = checked_repository_path;
+    canonical_template.work_area_root = checked_work_area;
+    canonical_template.base_commit = normalized_base_commit;
+    compute_profile_digest(
+        &profile.profile_id,
+        &profile.allowed_binding_ids,
+        &canonical_template,
+        &resolved_model,
+        &requested_effort,
+        canonical_dependency_input.as_ref(),
+    )
+}
+
 fn compute_profile_digest(
     profile_id: &str,
     allowed_binding_ids: &BTreeSet<String>,
@@ -2323,5 +2559,124 @@ mod tests {
         assert!(map_live_event_to_progress(&malformed)
             .watchdog_attention
             .is_none());
+    }
+
+    #[test]
+    fn frozen_profile_identity_digest_matches_validated_and_survives_executable_gc() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonical root");
+        let repo_path = root.join("repo");
+        fs::create_dir_all(repo_path.join(".git")).expect("repo .git");
+        fs::create_dir_all(repo_path.join("docs")).expect("repo docs");
+        let work_area_root = root.join("work-area");
+        crate::descriptor::prepare_state_dir(&work_area_root).expect("work_area");
+        let exe_path = root.join("mock-opencode");
+        fs::write(&exe_path, b"#!/bin/sh\nexit 0\n").expect("write exe");
+        fs::set_permissions(&exe_path, fs::Permissions::from_mode(0o700)).expect("chmod");
+        let base_commit = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let profile = WorkerProfileConfig {
+            profile_id: "prof_hist_01".to_string(),
+            allowed_binding_ids: BTreeSet::from(["bind_01".to_string()]),
+            spec: WorkerSpecTemplate {
+                provider: WorkerProvider::OpenCodeV2,
+                executable: exe_path.clone(),
+                model: "opencode-go/deepseek-v4.1-flash".to_string(),
+                effort: Some("max".to_string()),
+                allowed_models: BTreeSet::from(["opencode-go/deepseek-v4.1-flash".to_string()]),
+                standalone: true,
+                session_id: None,
+                repository_path: repo_path,
+                base_commit: base_commit.clone(),
+                work_area_root,
+                allowed_write_paths: BTreeSet::from(["src/lib.rs".to_string()]),
+                file_permissions: WorkerFilePermissions::Inherit,
+                budgets: ExecutionBudgets::default(),
+            },
+            dependency_input: None,
+        };
+        let validated = WorkersConfig {
+            max_parallel: 1,
+            profiles: vec![profile.clone()],
+        }
+        .validate()
+        .expect("strict validate");
+        let validated_digest = validated.profiles["prof_hist_01"].profile_digest.clone();
+        let frozen_digest = compute_frozen_profile_identity_digest(&profile).expect("frozen");
+        assert_eq!(frozen_digest, validated_digest);
+        let mut dir_profile = profile.clone();
+        dir_profile.spec.allowed_write_paths = BTreeSet::from(["docs/".to_string()]);
+        let dir_validated = WorkersConfig {
+            max_parallel: 1,
+            profiles: vec![dir_profile.clone()],
+        }
+        .validate()
+        .expect("strict validate dir scope");
+        let dir_validated_digest = dir_validated.profiles["prof_hist_01"]
+            .profile_digest
+            .clone();
+        let dir_frozen_digest =
+            compute_frozen_profile_identity_digest(&dir_profile).expect("frozen dir scope");
+        assert_eq!(dir_frozen_digest, dir_validated_digest);
+        assert_ne!(dir_frozen_digest, validated_digest);
+        let binding = WorkerExecutionBinding::new(
+            &validated_digest,
+            "implement task",
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &base_commit,
+        )
+        .expect("binding");
+        fs::remove_file(&exe_path).expect("remove executable");
+        assert!(WorkersConfig {
+            max_parallel: 1,
+            profiles: vec![profile.clone()],
+        }
+        .validate()
+        .is_err());
+        let post_gc_digest = compute_frozen_profile_identity_digest(&profile).expect("post gc");
+        assert_eq!(post_gc_digest, validated_digest);
+        let post_gc_dir_digest =
+            compute_frozen_profile_identity_digest(&dir_profile).expect("post gc dir scope");
+        assert_eq!(post_gc_dir_digest, dir_validated_digest);
+        assert!(binding
+            .verify_against(&post_gc_digest, "implement task", &base_commit)
+            .is_ok());
+
+        let mut bad_binding = profile.clone();
+        bad_binding.allowed_binding_ids = BTreeSet::from(["bind_other".to_string()]);
+        let d_bind = compute_frozen_profile_identity_digest(&bad_binding).expect("binding digest");
+        assert_ne!(d_bind, validated_digest);
+        assert!(binding
+            .verify_against(&d_bind, "implement task", &base_commit)
+            .is_err());
+
+        let mut bad_model = profile.clone();
+        bad_model.spec.model = "opencode-go/unlisted".to_string();
+        assert!(compute_frozen_profile_identity_digest(&bad_model).is_err());
+        bad_model
+            .spec
+            .allowed_models
+            .insert("opencode-go/unlisted".to_string());
+        let d_model = compute_frozen_profile_identity_digest(&bad_model).expect("model digest");
+        assert_ne!(d_model, validated_digest);
+
+        let mut bad_effort = profile.clone();
+        bad_effort.spec.effort = Some("high".to_string());
+        let d_effort = compute_frozen_profile_identity_digest(&bad_effort).expect("effort digest");
+        assert_ne!(d_effort, validated_digest);
+
+        let mut bad_scope = profile.clone();
+        bad_scope.spec.allowed_write_paths = BTreeSet::from(["docs/README.md".to_string()]);
+        let d_scope = compute_frozen_profile_identity_digest(&bad_scope).expect("scope digest");
+        assert_ne!(d_scope, validated_digest);
+        assert!(binding
+            .verify_against(&d_scope, "implement task", &base_commit)
+            .is_err());
+        for invalid_scope in ["", "/", "docs//", "docs/..", "../docs/", "docs/*"] {
+            let mut invalid_profile = profile.clone();
+            invalid_profile.spec.allowed_write_paths = BTreeSet::from([invalid_scope.to_string()]);
+            assert!(compute_frozen_profile_identity_digest(&invalid_profile).is_err());
+        }
     }
 }

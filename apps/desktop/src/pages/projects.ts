@@ -8,6 +8,7 @@ import {
 } from './activity-feed-model.ts';
 import {
   projectProjects,
+  type ProjectAttentionItemView,
   type ProjectCallView,
   type ProjectEventView,
   type ProjectGroupView,
@@ -17,40 +18,54 @@ import {
   type ProjectsWindowHours,
 } from './projects-model.ts';
 
+import { projectTaskStatus } from './projects-task-status.ts';
 import './projects.css';
 
 const MAX_RECENT_EVENTS = 6;
 
-const PENDING_APPROVAL_STATUSES = new Set([
-  'pending',
-  'pending_approval',
-  'awaiting_approval',
-  'needs_approval',
-  'approval_needed',
-  'unapproved',
-  'required',
-  'requested',
-  'waiting_for_approval',
-]);
+function formatRecordedAge(atMs: number | null, nowMs: number): string {
+  if (atMs === null) {
+    return 'Time not reported';
+  }
+  return `Recorded ${formatRelativeTime(atMs, nowMs)}`;
+}
 
-function hasPlanApprovalEvidence(job: ProjectJobView['job']): boolean {
-  const hasPlanId = typeof job.plan_id === 'string' && job.plan_id.trim().length > 0;
-  if (!hasPlanId) {
-    return false;
+function summarizeAttentionBreakdown(
+  items: readonly ProjectAttentionItemView[]
+): string {
+  const counts = {
+    on_hold: 0,
+    plan_approval: 0,
+    awaiting_review: 0,
+    recorded_wait: 0,
+    status_check: 0,
+  };
+  for (const item of items) {
+    counts[item.kind] += 1;
   }
-  const approvalStatus = (job.approval_status ?? '').trim().toLowerCase();
-  if (PENDING_APPROVAL_STATUSES.has(approvalStatus)) {
-    return true;
+  const parts: string[] = [];
+  if (counts.on_hold > 0) {
+    parts.push(`${counts.on_hold} on hold`);
   }
-  if (
-    approvalStatus === 'approved' ||
-    approvalStatus === 'accepted' ||
-    approvalStatus === 'not_required' ||
-    approvalStatus === 'none'
-  ) {
-    return false;
+  if (counts.plan_approval > 0) {
+    parts.push(
+      `${counts.plan_approval} ${counts.plan_approval === 1 ? 'plan' : 'plans'} awaiting approval`
+    );
   }
-  return job.state === 'ready';
+  if (counts.awaiting_review > 0) {
+    parts.push(`${counts.awaiting_review} awaiting review`);
+  }
+  if (counts.recorded_wait > 0) {
+    parts.push(
+      `${counts.recorded_wait} recorded ${counts.recorded_wait === 1 ? 'wait' : 'waits'}`
+    );
+  }
+  if (counts.status_check > 0) {
+    parts.push(
+      `${counts.status_check} ${counts.status_check === 1 ? 'status' : 'statuses'} to check`
+    );
+  }
+  return parts.join(' · ');
 }
 
 export interface ProjectsPageOptions {
@@ -75,6 +90,8 @@ interface JobDomEntry {
   planLabelEl: HTMLSpanElement;
   phaseRightEl: HTMLSpanElement;
   titleEl: HTMLElement;
+  fullTitleEl: HTMLParagraphElement;
+  recordedAgeEl: HTMLSpanElement;
   summaryEl: HTMLParagraphElement;
   tasksListEl: HTMLUListElement;
   approvalNoteEl: HTMLParagraphElement;
@@ -129,7 +146,14 @@ interface SessionDomEntry {
   ageEl: HTMLSpanElement;
   detailMetaEl: HTMLSpanElement;
   bodyEl: HTMLDivElement;
+  pendingSectionEl: HTMLDivElement;
+  pendingHeadingEl: HTMLDivElement;
+  pendingSummaryEl: HTMLParagraphElement;
+  pendingListEl: HTMLUListElement;
   jobsContainer: HTMLDivElement;
+  olderJobsDetails: HTMLDetailsElement;
+  olderJobsSummaryTextEl: HTMLSpanElement;
+  olderJobsListEl: HTMLDivElement;
   jobEntries: Map<string, JobDomEntry>;
   callsContainer: HTMLDivElement;
   callEntries: Map<string, CallDomEntry>;
@@ -153,6 +177,110 @@ interface ProjectDomEntry {
 
 function hasActiveScope(scope: ActivityFeedScope | null | undefined): boolean {
   return Boolean(scope && (scope.source_id || scope.job_id));
+}
+
+const pendingListSignatures = new WeakMap<object, string>();
+
+type SessionStatusTone =
+  | 'working'
+  | 'ok'
+  | 'waiting'
+  | 'danger'
+  | 'completed'
+  | 'review'
+  | 'queued'
+  | 'unknown'
+  | 'neutral';
+
+function jobPhaseTone(jobView: ProjectJobView): SessionStatusTone {
+  const state = jobView.job.state.trim().toLowerCase();
+  const execution = (jobView.job.execution_status ?? '').trim().toLowerCase();
+  if (
+    state === 'failed' ||
+    state === 'timed_out' ||
+    execution === 'failed' ||
+    execution === 'timed_out'
+  ) {
+    return 'danger';
+  }
+  if (
+    state === 'completed' ||
+    state === 'accepted' ||
+    state === 'integrated'
+  ) {
+    return 'ok';
+  }
+  if (
+    jobView.attentionKind === 'on_hold' ||
+    jobView.attentionKind === 'plan_approval' ||
+    jobView.attentionKind === 'recorded_wait'
+  ) {
+    return 'waiting';
+  }
+  if (jobView.attentionKind === 'awaiting_review') {
+    return 'review';
+  }
+  if (jobView.attentionKind === 'status_check') {
+    return /planning/i.test(jobView.stateLabel) ? 'review' : 'unknown';
+  }
+  if (
+    state === 'needs_user' ||
+    state === 'on_hold' ||
+    execution === 'held'
+  ) {
+    return 'waiting';
+  }
+  if (
+    state === 'queued' ||
+    state === 'not_started' ||
+    state === 'pending_dependencies'
+  ) {
+    return 'queued';
+  }
+  if (state === 'planning') {
+    return 'review';
+  }
+  if (state === 'running' || state === 'reviewing' || state === 'claimed') {
+    return 'working';
+  }
+  return 'neutral';
+}
+
+function sessionStatusTone(session: ProjectSessionView): SessionStatusTone {
+  if (session.runningCount > 0 || session.tone === 'active') {
+    return 'working';
+  }
+  if (session.tone === 'danger') {
+    return 'danger';
+  }
+  const attentionKinds = new Set(
+    session.attentionItems.map((item) => item.kind)
+  );
+  if (
+    attentionKinds.has('recorded_wait') ||
+    attentionKinds.has('plan_approval') ||
+    attentionKinds.has('on_hold')
+  ) {
+    return 'waiting';
+  }
+  if (attentionKinds.has('status_check') || session.tone === 'unknown') {
+    return 'unknown';
+  }
+  if (attentionKinds.has('awaiting_review') || session.tone === 'review') {
+    return 'review';
+  }
+  if (
+    session.jobs.some((jobView) => {
+      const tone = jobPhaseTone(jobView);
+      return tone === 'queued' || tone === 'review';
+    })
+  ) {
+    return 'review';
+  }
+  if (session.tone === 'ok') {
+    return 'completed';
+  }
+  return 'neutral';
 }
 
 function sessionIndicatorKind(session: ProjectSessionView): SessionIndicatorKind {
@@ -226,6 +354,8 @@ export class ProjectsPage {
   private readonly footerNoteLeftEl: HTMLSpanElement;
   private readonly footerNoteRightEl: HTMLSpanElement;
   private readonly loadMoreBtn: HTMLButtonElement;
+  private readonly diagnosticsDetailsEl: HTMLDetailsElement;
+  private readonly diagnosticsSummaryTextEl: HTMLSpanElement;
   private readonly warningsListEl: HTMLUListElement;
   private readonly announcementEl: HTMLSpanElement;
 
@@ -236,6 +366,8 @@ export class ProjectsPage {
   private readonly userProjectOpenState = new Map<string, boolean>();
   private readonly userSessionOpenState = new Map<string, boolean>();
   private readonly userRecentOpenState = new Map<string, boolean>();
+  private readonly userOlderJobsOpenState = new Map<string, boolean>();
+  private userDiagnosticsOpen = false;
 
   private windowHours: ProjectsWindowHours = 6;
   private lastSnapshot: ObservationSnapshot | null = null;
@@ -370,10 +502,41 @@ export class ProjectsPage {
       h('div', { className: 'tp-bottom-actions' }, this.loadMoreBtn, this.footerNoteRightEl)
     );
 
+    this.diagnosticsSummaryTextEl = h(
+      'span',
+      { className: 'tp-diagnostics-title' },
+      'Diagnostics (0)'
+    );
+    const diagnosticsChevron = createUiIcon('chevron-right');
+    diagnosticsChevron.classList.add('tp-chevron');
+    const diagnosticsSummaryEl = h(
+      'summary',
+      { className: 'tp-diagnostics-summary cursor-interaction' },
+      this.diagnosticsSummaryTextEl,
+      diagnosticsChevron
+    );
+    const diagnosticsNoteEl = h(
+      'p',
+      { className: 'tp-diagnostics-note' },
+      'Technical notes from bounded observation queries or unavailable sources.'
+    );
     this.warningsListEl = h('ul', {
       className: 'tp-warnings',
       'aria-label': 'Observation warnings',
       hidden: true,
+    });
+    this.diagnosticsDetailsEl = h(
+      'details',
+      { className: 'tp-diagnostics', 'data-diagnostics': '', hidden: true },
+      diagnosticsSummaryEl,
+      diagnosticsNoteEl,
+      this.warningsListEl
+    );
+    this.diagnosticsDetailsEl.open = false;
+    this.diagnosticsDetailsEl.addEventListener('toggle', () => {
+      if (!this.disposed) {
+        this.userDiagnosticsOpen = this.diagnosticsDetailsEl.open;
+      }
     });
 
     this.announcementEl = h('span', {
@@ -393,12 +556,11 @@ export class ProjectsPage {
       this.noticeBannerEl,
       this.projectsContainer,
       bottomNoteEl,
-      this.warningsListEl,
+      this.diagnosticsDetailsEl,
       this.announcementEl
     );
     const initialLiveTooltip = '0 running calls among recorded loaded calls in view';
-    this.liveBadgeEl.title = initialLiveTooltip;
-    this.liveBadgeEl.setAttribute('data-tooltip', initialLiveTooltip);
+    this.liveBadgeEl.setAttribute('aria-label', initialLiveTooltip);
     this.liveTextEl.textContent = '0 working in view';
   }
 
@@ -445,7 +607,17 @@ export class ProjectsPage {
             tone: session.tone,
             attention: session.attention,
             runningCount: session.runningCount,
-            jobs: session.jobs.map((job) => job.key),
+            olderJobCount: session.olderJobCount,
+            attentionItems: session.attentionItems.map((item) => ({
+              key: item.key,
+              kind: item.kind,
+              older: item.olderThanWindow,
+            })),
+            jobs: session.jobs.map((job) => ({
+              key: job.key,
+              state: job.stateLabel,
+              older: job.olderThanWindow,
+            })),
             calls: session.calls.map((call) => ({
               key: call.key,
               state: call.stateLabel,
@@ -475,6 +647,21 @@ export class ProjectsPage {
           sessionEntry.session.updatedAtMs,
           nowMs
         );
+        const pendingAges =
+          sessionEntry.pendingListEl.querySelectorAll<HTMLElement>('[data-recorded-ms]');
+        for (const ageNode of pendingAges) {
+          const raw = Number(ageNode.getAttribute('data-recorded-ms'));
+          ageNode.textContent = formatRecordedAge(
+            Number.isFinite(raw) && raw >= 0 ? raw : null,
+            nowMs
+          );
+        }
+        for (const jobEntry of sessionEntry.jobEntries.values()) {
+          const ageText = formatRecordedAge(jobEntry.jobView.updatedAtMs, nowMs);
+          jobEntry.recordedAgeEl.textContent = jobEntry.jobView.olderThanWindow
+            ? `${ageText} · Outside ${this.windowHours}h window`
+            : ageText;
+        }
         for (const call of session.calls) {
           const callEntry = sessionEntry.callEntries.get(call.key);
           if (callEntry && call.running) {
@@ -538,10 +725,10 @@ export class ProjectsPage {
       this.userProjectOpenState.clear();
       this.userSessionOpenState.clear();
       this.userRecentOpenState.clear();
+      this.userOlderJobsOpenState.clear();
       this.hasAutoExpandedFirstProject = false;
       const resetTooltip = '0 running calls among recorded loaded calls in view';
-      this.liveBadgeEl.title = resetTooltip;
-      this.liveBadgeEl.setAttribute('data-tooltip', resetTooltip);
+      this.liveBadgeEl.setAttribute('aria-label', resetTooltip);
       this.liveBadgeEl.setAttribute('data-active', 'false');
       if (this.error) {
         this.liveTextEl.textContent = 'Unavailable';
@@ -563,6 +750,7 @@ export class ProjectsPage {
         this.warningsListEl.removeChild(this.warningsListEl.firstChild);
       }
       this.warningsListEl.hidden = true;
+      this.diagnosticsDetailsEl.hidden = true;
       if (mainScrollEl && savedScrollTop !== null && mainScrollEl.scrollTop !== savedScrollTop) {
         mainScrollEl.scrollTop = savedScrollTop;
       }
@@ -634,8 +822,7 @@ export class ProjectsPage {
       projection.runningCount === 1
         ? '1 running call among recorded loaded calls in view'
         : `${projection.runningCount} running calls among recorded loaded calls in view`;
-    this.liveBadgeEl.title = liveTooltip;
-    this.liveBadgeEl.setAttribute('data-tooltip', liveTooltip);
+    this.liveBadgeEl.setAttribute('aria-label', liveTooltip);
     if (projection.runningCount > 0) {
       this.liveBadgeEl.setAttribute('data-active', 'true');
       this.liveTextEl.textContent =
@@ -689,12 +876,17 @@ export class ProjectsPage {
       this.warningsListEl.removeChild(this.warningsListEl.firstChild);
     }
     if (projection.warnings.length > 0) {
+      this.diagnosticsSummaryTextEl.textContent = `Diagnostics (${projection.warnings.length})`;
       for (const warning of projection.warnings) {
         this.warningsListEl.appendChild(h('li', { className: 'tp-warning-item' }, warning));
       }
       this.warningsListEl.hidden = false;
+      this.diagnosticsDetailsEl.hidden = false;
+      this.diagnosticsDetailsEl.open = this.userDiagnosticsOpen;
     } else {
+      this.diagnosticsSummaryTextEl.textContent = 'Diagnostics (0)';
       this.warningsListEl.hidden = true;
+      this.diagnosticsDetailsEl.hidden = true;
     }
   }
 
@@ -707,6 +899,7 @@ export class ProjectsPage {
         for (const [sKey, sEntry] of entry.sessionEntries.entries()) {
           this.userSessionOpenState.set(sKey, sEntry.details.open);
           this.userRecentOpenState.set(sKey, sEntry.recentDetails.open);
+          this.userOlderJobsOpenState.set(sKey, sEntry.olderJobsDetails.open);
         }
         entry.details.remove();
         this.projectEntries.delete(key);
@@ -804,9 +997,6 @@ export class ProjectsPage {
   ): void {
     entry.project = project;
     entry.nameEl.textContent = project.label;
-    const tooltip = project.path ? `${project.label} — ${project.path}` : project.label;
-    entry.summary.title = tooltip;
-    entry.summary.setAttribute('data-tooltip', tooltip);
 
     if (project.runningCount > 0) {
       entry.statusEl.className = 'tp-project-status tp-working';
@@ -834,6 +1024,7 @@ export class ProjectsPage {
       if (!nextKeys.has(key)) {
         this.userSessionOpenState.set(key, sessionEntry.details.open);
         this.userRecentOpenState.set(key, sessionEntry.recentDetails.open);
+        this.userOlderJobsOpenState.set(key, sessionEntry.olderJobsDetails.open);
         sessionEntry.details.remove();
         projectEntry.sessionEntries.delete(key);
       }
@@ -848,6 +1039,7 @@ export class ProjectsPage {
       } else {
         this.userSessionOpenState.set(session.key, sessionEntry.details.open);
         this.userRecentOpenState.set(session.key, sessionEntry.recentDetails.open);
+        this.userOlderJobsOpenState.set(session.key, sessionEntry.olderJobsDetails.open);
       }
 
       this.updateSessionEntry(sessionEntry, session, nowMs);
@@ -881,7 +1073,61 @@ export class ProjectsPage {
       detailMetaEl
     );
 
-    const jobsContainer = h('div', { className: 'tp-jobs' });
+    const pendingHeadingEl = h(
+      'div',
+      { className: 'tp-pending-heading' },
+      'Pending items'
+    );
+    const pendingSummaryEl = h('p', {
+      className: 'tp-pending-summary',
+      hidden: true,
+    });
+    const pendingListEl = h('ul', { className: 'tp-pending-list' });
+    const pendingSectionEl = h(
+      'div',
+      {
+        className: 'tp-pending-section',
+        'data-pending-section': session.key,
+        hidden: true,
+      },
+      pendingHeadingEl,
+      pendingSummaryEl,
+      pendingListEl
+    );
+
+    const olderJobsSummaryTextEl = h(
+      'span',
+      { className: 'tp-older-jobs-title' },
+      'Older unresolved work (0)'
+    );
+    const olderJobsChevron = createUiIcon('chevron-right');
+    olderJobsChevron.classList.add('tp-chevron');
+    const olderJobsSummaryEl = h(
+      'summary',
+      { className: 'tp-older-jobs-summary cursor-interaction' },
+      olderJobsSummaryTextEl,
+      olderJobsChevron
+    );
+    const olderJobsListEl = h('div', { className: 'tp-older-jobs-list' });
+    const olderJobsDetails = h(
+      'details',
+      {
+        className: 'tp-older-jobs',
+        'data-older-jobs': session.key,
+        hidden: true,
+      },
+      olderJobsSummaryEl,
+      olderJobsListEl
+    );
+    const savedOlderOpen = this.userOlderJobsOpenState.get(session.key);
+    olderJobsDetails.open = savedOlderOpen ?? false;
+    olderJobsDetails.addEventListener('toggle', () => {
+      if (!this.disposed) {
+        this.userOlderJobsOpenState.set(session.key, olderJobsDetails.open);
+      }
+    });
+
+    const jobsContainer = h('div', { className: 'tp-jobs' }, olderJobsDetails);
     const callsContainer = h('div', {
       className: 'tp-calls',
       'aria-label': 'Agent calls',
@@ -922,6 +1168,7 @@ export class ProjectsPage {
     const bodyEl = h(
       'div',
       { className: 'tp-session-body' },
+      pendingSectionEl,
       callsContainer,
       jobsContainer,
       quietNoteEl,
@@ -962,7 +1209,14 @@ export class ProjectsPage {
       ageEl,
       detailMetaEl,
       bodyEl,
+      pendingSectionEl,
+      pendingHeadingEl,
+      pendingSummaryEl,
+      pendingListEl,
       jobsContainer,
+      olderJobsDetails,
+      olderJobsSummaryTextEl,
+      olderJobsListEl,
       jobEntries: new Map<string, JobDomEntry>(),
       callsContainer,
       callEntries: new Map<string, CallDomEntry>(),
@@ -992,11 +1246,9 @@ export class ProjectsPage {
       entry.details.removeAttribute('data-binding-id');
     }
 
-    const tooltip = session.detail ? `${session.label} — ${session.detail}` : session.label;
-    entry.summary.title = tooltip;
-    entry.summary.setAttribute('data-tooltip', tooltip);
     entry.nameEl.textContent = session.label;
     entry.detailMetaEl.textContent = session.detail;
+    entry.stateEl.setAttribute('data-tone', sessionStatusTone(session));
 
     const nextIndicator = sessionIndicatorKind(session);
     if (entry.indicatorKind !== nextIndicator) {
@@ -1004,32 +1256,25 @@ export class ProjectsPage {
       while (entry.stateEl.firstChild && entry.stateEl.firstChild !== entry.stateTextNode) {
         entry.stateEl.removeChild(entry.stateEl.firstChild);
       }
-      let markerNode: Node;
-      if (nextIndicator === 'completed') {
-        const checkIcon = createUiIcon('check');
-        checkIcon.classList.add('tp-complete-icon');
-        markerNode = checkIcon;
-      } else {
-        const dotClass =
-          nextIndicator === 'working'
-            ? 'tp-dot working'
-            : nextIndicator === 'waiting'
-              ? 'tp-dot waiting'
-              : nextIndicator === 'danger'
-                ? 'tp-dot danger'
-                : 'tp-dot';
-        markerNode = h('span', { className: dotClass });
-      }
-      entry.stateEl.insertBefore(markerNode, entry.stateTextNode);
+      entry.stateEl.insertBefore(
+        h('span', { className: 'tp-dot', 'aria-hidden': 'true' }),
+        entry.stateTextNode
+      );
     }
     entry.stateTextNode.nodeValue = session.stateLabel;
     entry.ageEl.textContent = formatRelativeTime(session.updatedAtMs, nowMs);
 
-    this.reconcileJobs(entry, session);
+    this.reconcilePendingItems(entry, session, nowMs);
+    this.reconcileJobs(entry, session, nowMs);
     this.reconcileCalls(entry, session.calls, nowMs);
     this.reconcileEvents(entry, session.recent, nowMs);
 
-    if (session.jobs.length === 0 && session.calls.length === 0 && session.recent.length === 0) {
+    if (
+      session.jobs.length === 0 &&
+      session.calls.length === 0 &&
+      session.recent.length === 0 &&
+      session.attentionItems.length === 0
+    ) {
       entry.quietNoteEl.textContent = session.detail || 'No active agents in this conversation.';
       entry.quietNoteEl.hidden = false;
     } else {
@@ -1037,7 +1282,137 @@ export class ProjectsPage {
     }
   }
 
-  private reconcileJobs(sessionEntry: SessionDomEntry, session: ProjectSessionView): void {
+  private reconcilePendingItems(
+    sessionEntry: SessionDomEntry,
+    session: ProjectSessionView,
+    nowMs: number
+  ): void {
+    // Job-derived items duplicate their own job disclosure; request-derived
+    // items (including linked requests) still need their reason and age.
+    const items = session.attentionItems.filter(
+      (item) => item.requestId !== null || item.jobId === null
+    );
+    if (items.length === 0) {
+      if (pendingListSignatures.get(sessionEntry) !== '[]') {
+        while (sessionEntry.pendingListEl.firstChild) {
+          sessionEntry.pendingListEl.removeChild(sessionEntry.pendingListEl.firstChild);
+        }
+        pendingListSignatures.set(sessionEntry, '[]');
+      }
+      sessionEntry.pendingSectionEl.hidden = true;
+      sessionEntry.pendingSummaryEl.hidden = true;
+      sessionEntry.pendingSummaryEl.textContent = '';
+      return;
+    }
+
+    const signature = JSON.stringify(
+      items.map((item) => [
+        item.key,
+        item.kind,
+        item.sourceId,
+        item.jobId,
+        item.title,
+        item.reason,
+        item.nextStep,
+        item.olderThanWindow ? 'older' : 'current',
+      ])
+    );
+    if (pendingListSignatures.get(sessionEntry) === signature) {
+      const ageNodes =
+        sessionEntry.pendingListEl.querySelectorAll<HTMLElement>(
+          '[data-recorded-ms]'
+        );
+      for (let index = 0; index < items.length; index += 1) {
+        const ageNode = ageNodes[index];
+        const item = items[index];
+        if (!ageNode || !item) {
+          continue;
+        }
+        ageNode.setAttribute(
+          'data-recorded-ms',
+          item.updatedAtMs !== null ? String(item.updatedAtMs) : ''
+        );
+        ageNode.textContent = formatRecordedAge(item.updatedAtMs, nowMs);
+      }
+      return;
+    }
+    pendingListSignatures.set(sessionEntry, signature);
+    while (sessionEntry.pendingListEl.firstChild) {
+      sessionEntry.pendingListEl.removeChild(sessionEntry.pendingListEl.firstChild);
+    }
+
+    const allOlder = items.every((item) => item.olderThanWindow);
+    sessionEntry.pendingHeadingEl.textContent = allOlder
+      ? 'Older unresolved work'
+      : 'Pending items';
+    const breakdown = summarizeAttentionBreakdown(items);
+    if (items.length > 1 && breakdown) {
+      sessionEntry.pendingSummaryEl.textContent = breakdown;
+      sessionEntry.pendingSummaryEl.hidden = false;
+    } else {
+      sessionEntry.pendingSummaryEl.hidden = true;
+      sessionEntry.pendingSummaryEl.textContent = '';
+    }
+
+    for (const item of items) {
+      const titleEl = h('span', { className: 'tp-pending-title' }, item.title);
+      const ageEl = h(
+        'time',
+        {
+          className: 'tp-pending-age',
+          'data-recorded-ms': item.updatedAtMs !== null ? String(item.updatedAtMs) : '',
+        },
+        formatRecordedAge(item.updatedAtMs, nowMs)
+      );
+      const metaEl = h('span', { className: 'tp-pending-meta' }, ageEl);
+      if (item.jobId !== null) {
+        const targetSource = item.sourceId;
+        const targetJob = item.jobId;
+        const jumpBtn = h(
+          'button',
+          {
+            type: 'button',
+            className: 'tp-pending-jump cursor-interaction',
+            'data-focus-source-id': targetSource,
+            'data-focus-job-id': targetJob,
+          },
+          'Inspect job'
+        );
+        jumpBtn.addEventListener('click', () => {
+          if (!this.disposed) {
+            this.focusJob({ source_id: targetSource, job_id: targetJob });
+          }
+        });
+        metaEl.appendChild(jumpBtn);
+      }
+      const topRowEl = h('div', { className: 'tp-pending-row' }, titleEl, metaEl);
+      const detailEl = h(
+        'div',
+        { className: 'tp-pending-detail' },
+        `${item.reason}. ${item.nextStep}`
+      );
+      sessionEntry.pendingListEl.appendChild(
+        h(
+          'li',
+          {
+            className: 'tp-pending-item',
+            'data-attention-key': item.key,
+            'data-attention-kind': item.kind,
+            'data-older': item.olderThanWindow ? 'true' : 'false',
+          },
+          topRowEl,
+          detailEl
+        )
+      );
+    }
+    sessionEntry.pendingSectionEl.hidden = false;
+  }
+
+  private reconcileJobs(
+    sessionEntry: SessionDomEntry,
+    session: ProjectSessionView,
+    nowMs: number
+  ): void {
     const jobs = session.jobs;
     const nextKeys = new Set(jobs.map((job) => job.key));
 
@@ -1049,20 +1424,51 @@ export class ProjectsPage {
     }
 
     sessionEntry.jobsContainer.hidden = jobs.length === 0;
+    const currentJobs = jobs.filter((job) => !job.olderThanWindow);
+    const olderJobs = jobs.filter((job) => job.olderThanWindow);
 
-    for (let index = 0; index < jobs.length; index += 1) {
-      const jobView = jobs[index];
+    for (let index = 0; index < currentJobs.length; index += 1) {
+      const jobView = currentJobs[index];
       let jobEntry = sessionEntry.jobEntries.get(jobView.key);
       if (!jobEntry) {
         jobEntry = this.createJobEntry(jobView);
         sessionEntry.jobEntries.set(jobView.key, jobEntry);
       }
-      this.updateJobEntry(jobEntry, jobView, session.label);
+      this.updateJobEntry(jobEntry, jobView, session.label, nowMs);
 
-      const targetNode = sessionEntry.jobsContainer.children[index] ?? null;
+      const targetNode =
+        sessionEntry.jobsContainer.children[index] ?? sessionEntry.olderJobsDetails;
       if (targetNode !== jobEntry.element) {
         sessionEntry.jobsContainer.insertBefore(jobEntry.element, targetNode);
       }
+    }
+
+    if (olderJobs.length > 0) {
+      sessionEntry.olderJobsSummaryTextEl.textContent = `Older work (${olderJobs.length})`;
+      sessionEntry.olderJobsDetails.hidden = false;
+      const savedOlderOpen = this.userOlderJobsOpenState.get(session.key);
+      if (savedOlderOpen !== undefined) {
+        sessionEntry.olderJobsDetails.open = savedOlderOpen;
+      }
+      for (let index = 0; index < olderJobs.length; index += 1) {
+        const jobView = olderJobs[index];
+        let jobEntry = sessionEntry.jobEntries.get(jobView.key);
+        if (!jobEntry) {
+          jobEntry = this.createJobEntry(jobView);
+          sessionEntry.jobEntries.set(jobView.key, jobEntry);
+        }
+        this.updateJobEntry(jobEntry, jobView, session.label, nowMs);
+
+        const targetNode = sessionEntry.olderJobsListEl.children[index] ?? null;
+        if (targetNode !== jobEntry.element) {
+          sessionEntry.olderJobsListEl.insertBefore(jobEntry.element, targetNode);
+        }
+      }
+      if (sessionEntry.jobsContainer.lastElementChild !== sessionEntry.olderJobsDetails) {
+        sessionEntry.jobsContainer.appendChild(sessionEntry.olderJobsDetails);
+      }
+    } else {
+      sessionEntry.olderJobsDetails.hidden = true;
     }
   }
 
@@ -1086,6 +1492,8 @@ export class ProjectsPage {
       chevronEl
     );
 
+    const fullTitleEl = h('p', { className: 'tp-job-full-title', hidden: true });
+    const recordedAgeEl = h('span', { className: 'tp-job-age' });
     const planLabelEl = h('span', { className: 'tp-plan-label', hidden: true });
     const phaseRightEl = h('span', { className: 'tp-phase-right' });
     const phaseEl = h('div', { className: 'tp-phase' }, planLabelEl, phaseRightEl);
@@ -1094,11 +1502,13 @@ export class ProjectsPage {
     const approvalNoteEl = h(
       'p',
       { className: 'tp-context-note tp-approval-note', hidden: true },
-      'Review and approve the scope in your Codex conversation.'
+      'Review and approve the plan in your Codex conversation.'
     );
     const bodyEl = h(
       'div',
       { className: 'tp-job-body' },
+      fullTitleEl,
+      recordedAgeEl,
       phaseEl,
       summaryEl,
       tasksListEl,
@@ -1135,6 +1545,8 @@ export class ProjectsPage {
       planLabelEl,
       phaseRightEl,
       titleEl,
+      fullTitleEl,
+      recordedAgeEl,
       summaryEl,
       tasksListEl,
       approvalNoteEl,
@@ -1145,15 +1557,20 @@ export class ProjectsPage {
   private updateJobEntry(
     entry: JobDomEntry,
     jobView: ProjectJobView,
-    sessionLabel: string
+    sessionLabel: string,
+    nowMs = Date.now()
   ): void {
     entry.jobView = jobView;
     const job = jobView.job;
     const inspectDetail = buildJobInspectDetail(jobView);
-    entry.element.title = inspectDetail;
-    entry.element.setAttribute('data-tooltip', inspectDetail);
     entry.element.setAttribute('data-source-id', job.source_id);
     entry.element.setAttribute('data-job-id', job.id);
+    entry.element.setAttribute('data-older', jobView.olderThanWindow ? 'true' : 'false');
+    if (jobView.attentionKind) {
+      entry.element.setAttribute('data-attention-kind', jobView.attentionKind);
+    } else {
+      entry.element.removeAttribute('data-attention-kind');
+    }
     entry.detailMetaEl.textContent = inspectDetail;
 
     const isFocused = this.focusedJobKey === jobView.key;
@@ -1166,9 +1583,8 @@ export class ProjectsPage {
 
     entry.element.setAttribute('data-attention', jobView.attention ? 'true' : 'false');
     entry.phaseStateEl.textContent = jobView.stateLabel;
-    entry.phaseStateEl.className = jobView.attention
-      ? 'tp-phase-state tp-job-state tp-waiting'
-      : 'tp-phase-state tp-job-state';
+    entry.phaseStateEl.className = 'tp-phase-state tp-job-state';
+    entry.phaseStateEl.setAttribute('data-tone', jobPhaseTone(jobView));
     if (jobView.planLabel) {
       entry.planLabelEl.textContent = jobView.planLabel;
       entry.planLabelEl.hidden = false;
@@ -1177,35 +1593,21 @@ export class ProjectsPage {
       entry.planLabelEl.textContent = '';
     }
 
-    const approvalNeeded = jobView.attention && hasPlanApprovalEvidence(job);
-    const defaultApprovalNote =
-      entry.approvalNoteEl.getAttribute('data-default-note') ??
-      (entry.approvalNoteEl.textContent || 'Plan approval happens in your Codex conversation.');
-    if (!entry.approvalNoteEl.hasAttribute('data-default-note')) {
-      entry.approvalNoteEl.setAttribute('data-default-note', defaultApprovalNote);
-    }
+    const ageText = formatRecordedAge(jobView.updatedAtMs, nowMs);
+    entry.recordedAgeEl.textContent = jobView.olderThanWindow
+      ? `${ageText} · Outside ${this.windowHours}h window`
+      : ageText;
 
     if (jobView.attention) {
       entry.phaseRightEl.className = 'tp-phase-right tp-waiting';
       const summary = jobView.taskSummary.trim();
-      if (approvalNeeded) {
-        entry.phaseRightEl.textContent =
-          summary && !summary.toLowerCase().includes('approval')
-            ? `Approval needed · ${summary}`
-            : 'Approval needed';
-        entry.approvalNoteEl.textContent = defaultApprovalNote;
-      } else {
-        const cleanSummary =
-          summary &&
-          !summary.toLowerCase().includes('approval') &&
-          !summary.toLowerCase().includes('attention')
-            ? summary
-            : '';
-        entry.phaseRightEl.textContent = cleanSummary
-          ? `Needs attention · ${cleanSummary}`
-          : 'Needs attention';
-        entry.approvalNoteEl.textContent = 'Continue in your Codex conversation.';
-      }
+      const reason = jobView.reason ?? jobView.stateLabel;
+      entry.phaseRightEl.textContent =
+        summary && !summary.toLowerCase().includes(reason.toLowerCase())
+          ? `${reason} · ${summary}`
+          : reason;
+      entry.approvalNoteEl.textContent =
+        jobView.nextStep ?? 'Check or continue in your Codex conversation.';
       entry.approvalNoteEl.hidden = false;
     } else {
       entry.phaseRightEl.className = 'tp-phase-right';
@@ -1221,8 +1623,9 @@ export class ProjectsPage {
     const displayTitle =
       trimmedTitle || sessionLabel.trim() || jobView.planLabel || `Job ${job.id}`;
     entry.titleEl.textContent = displayTitle;
-    entry.titleEl.title = displayTitle;
     entry.titleEl.hidden = false;
+    entry.fullTitleEl.textContent = displayTitle;
+    entry.fullTitleEl.hidden = false;
 
     const trimmedSummary = job.summary?.trim() ?? '';
     if (trimmedSummary && trimmedSummary !== displayTitle) {
@@ -1238,15 +1641,23 @@ export class ProjectsPage {
     }
     if (job.tasks.length > 0) {
       for (const task of job.tasks) {
+        const statusInfo = projectTaskStatus(task.status);
         entry.tasksListEl.appendChild(
           h(
             'li',
             {
               className: 'tp-plan-task',
               'data-task-status': task.status,
-              title: `${task.title} (${task.status})`,
             },
-            task.title
+            h('span', { className: 'tp-task-title' }, task.title),
+            h(
+              'span',
+              {
+                className: 'tp-task-status',
+                'data-tone': statusInfo.tone,
+              },
+              statusInfo.label
+            )
           )
         );
       }
@@ -1354,8 +1765,6 @@ export class ProjectsPage {
 
     entry.element.className = call.running ? 'tp-call' : 'tp-call tp-call-finished';
     entry.element.setAttribute('data-running', call.running ? 'true' : 'false');
-    entry.element.title = call.detail;
-    entry.element.setAttribute('data-tooltip', call.detail);
     entry.detailMetaEl.textContent = call.detail;
 
     const role = call.role.trim();
@@ -1442,8 +1851,6 @@ export class ProjectsPage {
     entry.event = event;
     entry.labelEl.textContent = event.label;
     entry.timeEl.textContent = formatRelativeTime(event.atMs, nowMs);
-    entry.element.title = event.detail;
-    entry.element.setAttribute('data-tooltip', event.detail);
     entry.detailMetaEl.textContent = event.detail;
   }
 
@@ -1467,6 +1874,14 @@ export class ProjectsPage {
 
             sessionEntry.details.open = true;
             this.userSessionOpenState.set(sessionEntry.key, true);
+
+            if (
+              jobEntry.jobView.olderThanWindow ||
+              jobEntry.element.parentElement === sessionEntry.olderJobsListEl
+            ) {
+              sessionEntry.olderJobsDetails.open = true;
+              this.userOlderJobsOpenState.set(sessionEntry.key, true);
+            }
 
             jobEntry.element.open = true;
             getUserJobOpenState(this).set(jobEntry.key, true);

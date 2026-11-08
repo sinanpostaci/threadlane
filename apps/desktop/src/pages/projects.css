@@ -6,10 +6,10 @@
   --tp-surface: var(--aq-base, var(--aq-surface, light-dark(#f7f7f7, #252525)));
   --tp-ink: var(--aq-ink, var(--aq-text, light-dark(#292929, #e8e8e8)));
   --tp-muted: var(--aq-muted, light-dark(#696969, #ababab));
-  --tp-faint: var(--aq-faint, light-dark(#686868, #a0a0a0));
+  --tp-faint: var(--aq-faint, color-mix(in srgb, var(--tp-muted) 80%, var(--tp-surface)));
   --tp-line: var(--aq-line, var(--aq-border, light-dark(#e2e2e2, #3c3c3c)));
   --tp-hover: var(--aq-hover, light-dark(#eeeeee, #303030));
-  --tp-nested: var(--aq-nested, light-dark(#f1f1f1, #222222));
+  --tp-nested: var(--aq-nested, var(--aq-field, var(--tp-surface)));
   --tp-field: var(--aq-field, var(--aq-elevated, light-dark(#ffffff, #202020)));
   --tp-accent-base: var(--aq-accent-base, #98beaa);
   --tp-accent: var(
@@ -216,7 +216,9 @@
 }
 
 .threadlane-projects .tp-project[open] > summary > .tp-chevron,
-.threadlane-projects .tp-job[open] > summary > .tp-chevron {
+.threadlane-projects .tp-job[open] > summary > .tp-chevron,
+.threadlane-projects .tp-older-jobs[open] > summary > .tp-chevron,
+.threadlane-projects .tp-diagnostics[open] > summary > .tp-chevron {
   transform: rotate(90deg);
 }
 
@@ -587,9 +589,156 @@
   gap: 8px;
 }
 
+.threadlane-projects .tp-pending-section {
+  margin: 2px 0 8px;
+  padding: 7px 9px;
+  border-radius: 5px;
+  border: 1px solid var(--tp-line);
+  background: var(--tp-nested);
+  display: grid;
+  gap: 5px;
+}
+
+.threadlane-projects .tp-pending-heading {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--tp-warm);
+}
+
+.threadlane-projects .tp-pending-summary {
+  margin: 0;
+  font-size: 11px;
+  color: var(--tp-muted);
+}
+
+.threadlane-projects .tp-pending-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 6px;
+}
+
+.threadlane-projects .tp-pending-item {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  padding-top: 5px;
+  border-top: 1px solid var(--tp-line);
+}
+
+.threadlane-projects .tp-pending-item:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.threadlane-projects .tp-pending-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.threadlane-projects .tp-pending-title {
+  font-weight: 500;
+  color: var(--tp-ink);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-pending-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.threadlane-projects .tp-pending-age {
+  font-variant-numeric: tabular-nums;
+  color: var(--tp-faint);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-pending-jump {
+  background: var(--tp-field);
+  color: var(--tp-ink);
+  border: 1px solid var(--tp-line);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.threadlane-projects .tp-pending-jump:hover {
+  background: var(--tp-hover);
+}
+
+.threadlane-projects .tp-pending-detail {
+  color: var(--tp-muted);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-job-full-title {
+  margin: 2px 0 3px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tp-ink);
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-job-age {
+  display: block;
+  font-size: 11px;
+  color: var(--tp-faint);
+  font-variant-numeric: tabular-nums;
+  margin: 0 0 5px;
+}
+
+.threadlane-projects .tp-older-jobs {
+  margin-top: 6px;
+  border-top: 1px solid var(--tp-line);
+  padding-top: 4px;
+}
+
+.threadlane-projects .tp-older-jobs-summary,
+.threadlane-projects .tp-diagnostics-summary {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 5px;
+  border-radius: 5px;
+  font-size: 11px;
+  color: var(--tp-muted);
+}
+
+.threadlane-projects .tp-older-jobs-summary:hover,
+.threadlane-projects .tp-diagnostics-summary:hover {
+  background: var(--tp-hover);
+}
+
+.threadlane-projects .tp-older-jobs-list {
+  padding-top: 2px;
+}
+
+.threadlane-projects .tp-diagnostics {
+  margin: 0 12px 14px;
+  border-top: 1px solid var(--tp-line);
+  padding-top: 6px;
+}
+
+.threadlane-projects .tp-diagnostics-note {
+  margin: 4px 5px 6px;
+  font-size: 11px;
+  color: var(--tp-faint);
+}
+
 .threadlane-projects .tp-warnings {
   margin: 0;
-  padding: 0 16px 14px 30px;
+  padding: 0 12px 6px 22px;
   color: var(--tp-warm);
   font-size: 11px;
   display: grid;
@@ -634,6 +783,48 @@
   .threadlane-projects .tp-call {
     gap: 5px;
   }
+  .threadlane-projects .tp-plan-task {
+    gap: 2px 6px;
+  }
+}
+
+.threadlane-projects .tp-plan-task {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.threadlane-projects .tp-task-title {
+  min-width: 0;
+  flex: 1 1 160px;
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-task-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-muted, #8b949e);
+  white-space: nowrap;
+}
+
+.threadlane-projects .tp-task-status[data-tone='ok'] {
+  color: var(--status-ok, #3fb950);
+}
+
+.threadlane-projects .tp-task-status[data-tone='waiting'],
+.threadlane-projects .tp-task-status[data-tone='unknown'] {
+  color: var(--status-warn, #d29922);
+}
+
+.threadlane-projects .tp-task-status[data-tone='danger'] {
+  color: var(--status-danger, #f85149);
+}
+
+.threadlane-projects .tp-task-status[data-tone='active'] {
+  color: var(--accent, #58a6ff);
 }
 
 @media (pointer: coarse) {
@@ -658,4 +849,109 @@
   .threadlane-projects .tp-spinner {
     animation: none;
   }
+}
+
+.threadlane-projects {
+  --tp-status-ok: var(--status-ok, light-dark(#3f8f4f, #71c982));
+  --tp-status-danger: var(--status-danger, light-dark(#b44437, #e07a6f));
+  --tp-status-warm: var(--status-warn, light-dark(#91672f, #d0a95e));
+  --tp-status-review: var(--status-review, light-dark(#6b52c9, #b4a7e8));
+  --tp-status-unknown: var(--tp-faint);
+}
+
+.threadlane-projects .tp-job-state,
+.threadlane-projects .tp-task-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.threadlane-projects .tp-dot,
+.threadlane-projects .tp-job-state::before,
+.threadlane-projects .tp-task-status::before {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 50%;
+  background: var(--tp-status-unknown);
+}
+
+.threadlane-projects .tp-job-state::before,
+.threadlane-projects .tp-task-status::before {
+  content: '';
+}
+
+.threadlane-projects .tp-session-state[data-tone='completed'] .tp-dot,
+.threadlane-projects .tp-job-state[data-tone='ok']::before,
+.threadlane-projects .tp-task-status[data-tone='ok']::before {
+  background: var(--tp-status-ok);
+}
+
+.threadlane-projects .tp-job-state[data-tone='ok'],
+.threadlane-projects .tp-task-status[data-tone='ok'] {
+  color: var(--tp-status-ok);
+}
+
+.threadlane-projects .tp-session-state[data-tone='danger'] .tp-dot,
+.threadlane-projects .tp-job-state[data-tone='danger']::before,
+.threadlane-projects .tp-task-status[data-tone='danger']::before {
+  background: var(--tp-status-danger);
+}
+
+.threadlane-projects .tp-job-state[data-tone='danger'],
+.threadlane-projects .tp-task-status[data-tone='danger'] {
+  color: var(--tp-status-danger);
+}
+
+.threadlane-projects .tp-session-state[data-tone='waiting'] .tp-dot,
+.threadlane-projects .tp-job-state[data-tone='waiting']::before,
+.threadlane-projects .tp-task-status[data-tone='waiting']::before {
+  background: var(--tp-status-warm);
+}
+
+.threadlane-projects .tp-job-state[data-tone='waiting'],
+.threadlane-projects .tp-task-status[data-tone='waiting'] {
+  color: var(--tp-status-warm);
+}
+
+.threadlane-projects .tp-session-state[data-tone='review'] .tp-dot,
+.threadlane-projects .tp-job-state[data-tone='review']::before,
+.threadlane-projects .tp-job-state[data-tone='queued']::before,
+.threadlane-projects .tp-task-status[data-tone='neutral']::before {
+  background: var(--tp-status-review);
+}
+
+.threadlane-projects .tp-job-state[data-tone='review'],
+.threadlane-projects .tp-job-state[data-tone='queued'],
+.threadlane-projects .tp-task-status[data-tone='neutral'] {
+  color: var(--tp-status-review);
+}
+
+.threadlane-projects .tp-session-state[data-tone='unknown'] .tp-dot,
+.threadlane-projects .tp-session-state[data-tone='neutral'] .tp-dot,
+.threadlane-projects .tp-job-state[data-tone='unknown']::before,
+.threadlane-projects .tp-task-status[data-tone='unknown']::before,
+.threadlane-projects .tp-task-status[data-tone='cancelled']::before {
+  background: var(--tp-status-unknown);
+}
+
+.threadlane-projects .tp-job-state[data-tone='unknown'],
+.threadlane-projects .tp-task-status[data-tone='unknown'],
+.threadlane-projects .tp-task-status[data-tone='cancelled'] {
+  color: var(--tp-status-unknown);
+}
+
+.threadlane-projects .tp-session-state[data-tone='working'] .tp-dot,
+.threadlane-projects .tp-job-state[data-tone='working']::before,
+.threadlane-projects .tp-task-status[data-tone='active']::before {
+  background: var(--tp-accent);
+}
+
+.threadlane-projects .tp-job-state[data-tone='working'],
+.threadlane-projects .tp-task-status[data-tone='active'] {
+  color: var(--tp-accent);
 }

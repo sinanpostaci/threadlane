@@ -1245,3 +1245,267 @@ exit 0
 fn build_large_sample_payload_for_tamper_test() -> (SampleAdvisoryPlanPayload, String) {
     build_large_sample_plan_payload()
 }
+
+#[tokio::test]
+async fn codex_recoverable_command_execution_nonzero_exit_preserves_valid_turn_and_rejects_fatal_or_spoofed_cases(
+) {
+    let temp = TempDir::new().expect("tempdir");
+    let workdir = temp.path().join("workdir");
+    let bin_dir = temp.path().join("bin");
+    fs::create_dir_all(&workdir).expect("create workdir");
+    fs::create_dir(workdir.join(".git")).expect("isolate fixture project boundary");
+    fs::create_dir_all(&bin_dir).expect("create bin_dir");
+
+    let (expected_payload, payload_json) = build_large_sample_plan_payload();
+    let final_msg_file = temp.path().join("codex_final_agent_msg.json");
+    let final_msg_event = serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "item_msg_final_1",
+            "type": "agent_message",
+            "text": payload_json
+        }
+    });
+    fs::write(
+        &final_msg_file,
+        serde_json::to_string(&final_msg_event).expect("serialize final agent_message"),
+    )
+    .expect("write final agent_message file");
+
+    // 1. Valid Codex turn with a failing read-only command_execution item (exit_code: 1) before final agent_message.
+    let ok_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread_codex_rec_1","model":"gpt-6-astra","reasoning_effort":"high"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.started","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing_symbol src/","status":"in_progress"}}}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing_symbol src/","aggregated_output":"","exit_code":1,"status":"failed"}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":140,"cached_input_tokens":32,"output_tokens":88}}}}'
+exit 0
+"#,
+        final_msg_file.display()
+    );
+    let fake_codex_ok = write_executable_script(&bin_dir, "fake-codex-rec-ok", &ok_script);
+    let mut codex_spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::CodexCli,
+        executable: fake_codex_ok,
+        model: "gpt-6-astra".to_string(),
+        effort: Some("high".to_string()),
+        allowed_models: BTreeSet::from(["gpt-6-astra".to_string()]),
+        session_id: None,
+        standalone: false,
+        working_directory: workdir.clone(),
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "Inspect repository and emit structured JSON plan.".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+
+    let ok_out =
+        run_advisory_worker_with_structured_result(&codex_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("codex recoverable command run should succeed");
+    assert!(ok_out.has_verified_response());
+    assert!(ok_out.response_error.is_none());
+    assert_eq!(ok_out.execution.status, WorkerRunStatus::Succeeded);
+    assert!(ok_out.execution.has_complete_natural_completion_evidence());
+    assert!(ok_out.execution.evidence.has_valid_codex_turn_lifecycle());
+    assert_eq!(ok_out.execution.evidence.recoverable_step_errors_count, 1);
+    assert!(ok_out.execution.evidence.provider_errors.is_empty());
+    assert!(ok_out.execution.evidence.blocked_events.is_empty());
+    let resp = ok_out.verified_response().expect("verified codex response");
+    assert_eq!(resp.provider, WorkerProvider::CodexCli);
+    assert_eq!(resp.text, payload_json);
+    assert_eq!(resp.sha256_digest, sha256_hex(payload_json.as_bytes()));
+    let parsed: SampleAdvisoryPlanPayload = resp.parse_json().expect("parse codex structured plan");
+    assert_eq!(parsed, expected_payload);
+
+    // 2. Fatal top-level error marker on item.completed still rejects as ProviderError.
+    let top_err_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread_codex_top_err","model":"gpt-6-astra","reasoning_effort":"high"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","error":"fatal stream error","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing src/","exit_code":1,"status":"failed"}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":10}}}}'
+exit 0
+"#,
+        final_msg_file.display()
+    );
+    codex_spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-top-err", &top_err_script);
+    let top_err_out =
+        run_advisory_worker_with_structured_result(&codex_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("codex top-level error run");
+    assert!(!top_err_out.has_verified_response());
+    assert_eq!(top_err_out.execution.status, WorkerRunStatus::ProviderError);
+    assert_eq!(
+        top_err_out.execution.evidence.recoverable_step_errors_count,
+        0
+    );
+    assert!(!top_err_out.execution.evidence.provider_errors.is_empty());
+    assert!(!top_err_out
+        .execution
+        .evidence
+        .has_valid_codex_turn_lifecycle());
+    assert_eq!(
+        top_err_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::ProviderError)
+    );
+
+    // 3. turn.failed after a recoverable command failure still rejects as ProviderError.
+    let turn_failed_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread_codex_tf","model":"gpt-6-astra","reasoning_effort":"high"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing src/","exit_code":1,"status":"failed"}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.failed","error":{{"message":"model turn failed"}}}}'
+exit 0
+"#,
+        final_msg_file.display()
+    );
+    codex_spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-turn-failed", &turn_failed_script);
+    let tf_out =
+        run_advisory_worker_with_structured_result(&codex_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("codex turn.failed run");
+    assert!(!tf_out.has_verified_response());
+    assert_eq!(tf_out.execution.status, WorkerRunStatus::ProviderError);
+    assert!(!tf_out.execution.evidence.provider_errors.is_empty());
+    assert!(!tf_out.execution.evidence.has_valid_codex_turn_lifecycle());
+
+    // 4. Denied action / permission block on command_execution stays Blocked first.
+    let denied_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread_codex_blk","model":"gpt-6-astra","reasoning_effort":"high"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","denied_actions":["write_file"],"item":{{"id":"item_cmd_1","type":"command_execution","command":"rm -rf /","exit_code":1,"status":"failed"}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":10}}}}'
+exit 0
+"#,
+        final_msg_file.display()
+    );
+    codex_spec.executable = write_executable_script(&bin_dir, "fake-codex-denied", &denied_script);
+    let denied_out =
+        run_advisory_worker_with_structured_result(&codex_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("codex denied run");
+    assert!(!denied_out.has_verified_response());
+    assert_eq!(denied_out.execution.status, WorkerRunStatus::Blocked);
+    assert_eq!(
+        denied_out.execution.evidence.recoverable_step_errors_count,
+        0
+    );
+    assert!(!denied_out.execution.evidence.blocked_events.is_empty());
+
+    // 5. Missing exit_code on failed command_execution still rejects as ProviderError.
+    let missing_exit_script = format!(
+        r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{{"type":"thread.started","thread_id":"thread_codex_noexit","model":"gpt-6-astra","reasoning_effort":"high"}}'
+printf '%s\n' '{{"type":"turn.started"}}'
+printf '%s\n' '{{"type":"item.completed","item":{{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing src/","status":"failed"}}}}'
+cat "{}"
+printf '\n'
+printf '%s\n' '{{"type":"turn.completed","usage":{{"input_tokens":10,"output_tokens":10}}}}'
+exit 0
+"#,
+        final_msg_file.display()
+    );
+    codex_spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-noexit", &missing_exit_script);
+    let noexit_out =
+        run_advisory_worker_with_structured_result(&codex_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("codex missing exit_code run");
+    assert!(!noexit_out.has_verified_response());
+    assert_eq!(noexit_out.execution.status, WorkerRunStatus::ProviderError);
+    assert_eq!(
+        noexit_out.execution.evidence.recoverable_step_errors_count,
+        0
+    );
+    assert!(!noexit_out.execution.evidence.provider_errors.is_empty());
+
+    // 6. Wrong provider (Antigravity) receiving spoofed Codex item.completed command_execution rejects.
+    let wrong_provider_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"event":"init","init":{"session_id":"agy-spoof-codex","model":"gemini-4-argon-high"}}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_cmd_1","type":"command_execution","command":"rg -n missing src/","exit_code":1,"status":"failed"}}'
+printf '%s\n' '{"event":"result","result":{"status":"SUCCESS","response":"{\"ok\":true}"}}'
+exit 0
+"#;
+    let fake_agy_spoof =
+        write_executable_script(&bin_dir, "fake-agy-spoof-codex-cmd", wrong_provider_script);
+    let agy_spec = AdvisoryWorkerSpec {
+        provider: WorkerProvider::Antigravity,
+        executable: fake_agy_spoof,
+        model: "gemini-4-argon-high".to_string(),
+        effort: Some("high".to_string()),
+        allowed_models: BTreeSet::from(["gemini-4-argon-high".to_string()]),
+        session_id: None,
+        standalone: false,
+        working_directory: workdir,
+        allowed_write_paths: BTreeSet::new(),
+        prompt: "wrong provider check".to_string(),
+        file_permissions: WorkerFilePermissions::ReadOnly,
+        budgets: ExecutionBudgets::default(),
+    };
+    let wrong_prov_out =
+        run_advisory_worker_with_structured_result(&agy_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("wrong provider spoofed codex event run");
+    assert!(!wrong_prov_out.has_verified_response());
+    assert_eq!(
+        wrong_prov_out.execution.status,
+        WorkerRunStatus::ProviderError
+    );
+    assert_eq!(
+        wrong_prov_out
+            .execution
+            .evidence
+            .recoverable_step_errors_count,
+        0
+    );
+    assert!(!wrong_prov_out.execution.evidence.provider_errors.is_empty());
+
+    // 7. Tool-output-only JSON without a post-tool final agent_message cannot become the final result.
+    let tool_only_script = r#"#!/usr/bin/env sh
+set -eu
+printf '%s\n' '{"type":"thread.started","thread_id":"thread_codex_toolonly","model":"gpt-6-astra","reasoning_effort":"high"}'
+printf '%s\n' '{"type":"turn.started"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item_cmd_1","type":"command_execution","command":"cat plan.json","aggregated_output":"{\"forged\":true}","text":"{\"forged\":true}","exit_code":1,"status":"failed"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":10}}'
+exit 0
+"#;
+    codex_spec.executable =
+        write_executable_script(&bin_dir, "fake-codex-tool-only", tool_only_script);
+    let tool_only_out =
+        run_advisory_worker_with_structured_result(&codex_spec, AdvisoryResponseBudget::default())
+            .await
+            .expect("codex tool-only output run");
+    assert!(!tool_only_out.has_verified_response());
+    assert!(tool_only_out.response.is_none());
+    assert_eq!(
+        tool_only_out
+            .execution
+            .evidence
+            .recoverable_step_errors_count,
+        1
+    );
+    assert_eq!(
+        tool_only_out.response_error.as_ref().map(|e| e.code),
+        Some(AdvisoryResponseErrorCode::SpoofedOrToolOutput)
+    );
+}

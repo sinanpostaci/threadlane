@@ -36,11 +36,8 @@ import {
   type ActivityFeedScope,
   type LifecycleTone,
 } from './activity-feed-model.ts';
-import {
-  formatJobLifecycle,
-  jobPlanKey,
-  summarizeJobProgress,
-} from './job-plans-model.ts';
+import { formatJobLifecycle, jobPlanKey } from './job-plans-model.ts';
+import { summarizeProjectTaskStatuses } from './projects-task-status.ts';
 
 export type ProjectsWindowHours = 6 | 24;
 
@@ -68,12 +65,39 @@ export interface ProjectEventView {
   detail: string;
 }
 
+export type ProjectAttentionKind =
+  | 'on_hold'
+  | 'plan_approval'
+  | 'awaiting_review'
+  | 'recorded_wait'
+  | 'status_check';
+
+export interface ProjectAttentionItemView {
+  key: string;
+  kind: ProjectAttentionKind;
+  sourceId: string;
+  jobId: string | null;
+  requestId: string | null;
+  title: string;
+  stateLabel: string;
+  reason: string;
+  nextStep: string;
+  updatedAtMs: number | null;
+  olderThanWindow: boolean;
+  planLabel: string | null;
+}
+
 export interface ProjectJobView {
   key: string;
   job: ObservationJob;
   stateLabel: string;
   taskSummary: string;
   attention: boolean;
+  attentionKind: ProjectAttentionKind | null;
+  reason: string | null;
+  nextStep: string | null;
+  updatedAtMs: number | null;
+  olderThanWindow: boolean;
   planLabel: string | null;
 }
 
@@ -88,6 +112,8 @@ export interface ProjectSessionView {
   tone: LifecycleTone;
   runningCount: number;
   attention: boolean;
+  attentionItems: ProjectAttentionItemView[];
+  olderJobCount: number;
   jobs: ProjectJobView[];
   calls: ProjectCallView[];
   recent: ProjectEventView[];
@@ -329,6 +355,7 @@ function formatCallUsage(
 interface CallCandidate {
   callKeyId: string;
   sourceId: string;
+  jobId: string | null;
   state: ObservationRequest['state'];
   view: ProjectCallView;
   sortAtMs: number | null;
@@ -365,6 +392,7 @@ function buildCallCandidateFromChild(
   return {
     callKeyId: call.id,
     sourceId,
+    jobId: trimOrNull(parentRequest.job_id),
     state: call.state,
     sortAtMs:
       maxTimestampMs([finishedAtMs, startedAtMs]) ??
@@ -420,6 +448,7 @@ function buildCallCandidateFromRequest(
   return {
     callKeyId: request.id,
     sourceId: request.source_id,
+    jobId: trimOrNull(request.job_id),
     state: request.state,
     sortAtMs: requestSafeMeaningfulTimestampMs(request),
     fromChild: false,
@@ -531,65 +560,195 @@ function buildEventFromLocalChild(
   };
 }
 
-function isUnresolvedApprovalStatus(status: string | null | undefined): boolean {
-  const normalized = trimOrNull(status)?.toLowerCase();
-  if (!normalized) {
+function normalizeStatusToken(value: string | null | undefined): string {
+  if (typeof value !== 'string') {
+    return '';
+  }
+  return value.trim().toLowerCase().replace(/[\s-]+/g, '_');
+}
+
+const KNOWN_APPROVAL_ALIASES = new Set([
+  'pending',
+  'pending_approval',
+  'awaiting_approval',
+  'approval_needed',
+  'needs_approval',
+  'approval_required',
+  'waiting_for_approval',
+  'requested',
+  'required',
+  'unapproved',
+]);
+
+const HOLD_STATUS_ALIASES = new Set(['on_hold', 'held', 'hold', 'paused']);
+
+const UNRESOLVED_REVIEW_STATES = new Set([
+  'ready_for_review',
+  'needs_review',
+  'reviewing',
+  'pending',
+  'pending_review',
+  'awaiting_review',
+  'changes_requested',
+]);
+
+function isHoldStatus(value: string | null | undefined): boolean {
+  const token = normalizeStatusToken(value);
+  if (!token) {
     return false;
   }
   return (
-    normalized === 'pending' ||
-    normalized === 'needs_user' ||
-    normalized === 'awaiting_approval' ||
-    normalized === 'approval_required' ||
-    normalized === 'requested' ||
-    normalized === 'required' ||
-    normalized === 'unapproved' ||
-    normalized === 'ready'
+    HOLD_STATUS_ALIASES.has(token) ||
+    token.startsWith('on_hold_') ||
+    token.endsWith('_on_hold')
   );
+}
+
+function isUnresolvedApprovalStatus(status: string | null | undefined): boolean {
+  return KNOWN_APPROVAL_ALIASES.has(normalizeStatusToken(status));
 }
 
 function isUnresolvedReviewState(state: string | null | undefined): boolean {
-  const normalized = trimOrNull(state)?.toLowerCase();
-  if (!normalized) {
-    return false;
+  return UNRESOLVED_REVIEW_STATES.has(normalizeStatusToken(state));
+}
+
+interface ResolvedJobAttention {
+  kind: ProjectAttentionKind;
+  stateLabel: string;
+  reason: string;
+  nextStep: string;
+}
+
+function resolveJobAttention(
+  job: ObservationJob,
+  hasRunningCall = false,
+  hasRunningReviewerCall = false
+): ResolvedJobAttention | null {
+  if (job.state === 'completed' || job.state === 'failed') {
+    return null;
   }
-  return (
-    normalized === 'ready_for_review' ||
-    normalized === 'needs_review' ||
-    normalized === 'reviewing' ||
-    normalized === 'pending' ||
-    normalized === 'changes_requested'
-  );
+  const approvalToken = normalizeStatusToken(job.approval_status);
+  const executionToken = normalizeStatusToken(job.execution_status);
+  const reviewToken = normalizeStatusToken(job.review_state);
+  const stateToken = normalizeStatusToken(job.state);
+
+  if (
+    isHoldStatus(executionToken) ||
+    isHoldStatus(approvalToken) ||
+    isHoldStatus(reviewToken) ||
+    isHoldStatus(stateToken)
+  ) {
+    return {
+      kind: 'on_hold',
+      stateLabel: 'On hold',
+      reason: 'Work on hold',
+      nextStep:
+        'Review the hold in Codex; updated scope or approval may be needed.',
+    };
+  }
+
+  const hasPlanId = trimOrNull(job.plan_id) !== null;
+  const hasConflict =
+    job.state === 'unknown' ||
+    approvalToken === 'unknown' ||
+    executionToken === 'unknown' ||
+    reviewToken === 'unknown' ||
+    approvalToken === 'conflict' ||
+    executionToken === 'conflict' ||
+    reviewToken === 'conflict' ||
+    approvalToken === 'rejected' ||
+    approvalToken === 'denied' ||
+    approvalToken === 'invalid' ||
+    executionToken === 'completed' ||
+    executionToken === 'failed' ||
+    executionToken === 'cancelled' ||
+    executionToken === 'rejected' ||
+    executionToken === 'error' ||
+    (job.state === 'running' && isUnresolvedApprovalStatus(approvalToken)) ||
+    (job.state === 'reviewing' &&
+      (reviewToken === 'approved' || reviewToken === 'accepted')) ||
+    (!hasPlanId &&
+      isUnresolvedApprovalStatus(approvalToken) &&
+      job.state !== 'needs_user');
+
+  if (hasConflict) {
+    return {
+      kind: 'status_check',
+      stateLabel: 'Status needs checking',
+      reason: 'Status needs checking',
+      nextStep:
+        'Recorded status is unknown or inconsistent. Check the conversation or logs; no specific cause was recorded.',
+    };
+  }
+
+  if (hasPlanId && isUnresolvedApprovalStatus(approvalToken)) {
+    return {
+      kind: 'plan_approval',
+      stateLabel: 'Awaiting approval',
+      reason: 'Plan awaiting approval',
+      nextStep: 'Review and approve the plan in your Codex conversation.',
+    };
+  }
+
+  if (job.state === 'reviewing' || isUnresolvedReviewState(reviewToken)) {
+    if (hasRunningReviewerCall && job.state === 'reviewing') {
+      return null;
+    }
+    if (reviewToken === 'changes_requested') {
+      return {
+        kind: 'awaiting_review',
+        stateLabel: 'Changes requested',
+        reason: 'Changes requested in review',
+        nextStep: 'Address the requested changes in your Codex conversation.',
+      };
+    }
+    return {
+      kind: 'awaiting_review',
+      stateLabel: 'Awaiting review',
+      reason:
+        reviewToken === 'ready_for_review'
+          ? 'Ready for review; no active reviewer is running'
+          : 'Awaiting review; no active reviewer is running',
+      nextStep:
+        'No active reviewer is running. Review or continue in your Codex conversation.',
+    };
+  }
+
+  if (
+    job.state === 'needs_user' ||
+    approvalToken === 'needs_user' ||
+    executionToken === 'needs_user' ||
+    executionToken === 'waiting_for_user'
+  ) {
+    return {
+      kind: 'recorded_wait',
+      stateLabel: 'Recorded wait',
+      reason: 'Recorded wait; reason not provided',
+      nextStep: 'Check or continue in your Codex conversation.',
+    };
+  }
+
+  if (job.state === 'planning') {
+    if (hasRunningCall) {
+      return null;
+    }
+    return {
+      kind: 'recorded_wait',
+      stateLabel: 'Planning recorded',
+      reason: 'Planning was recorded; no active planning call is verified',
+      nextStep: 'Check or continue in your Codex conversation.',
+    };
+  }
+
+  return null;
 }
 
 function isJobActive(job: ObservationJob): boolean {
-  return (
-    job.state === 'planning' ||
-    job.state === 'running' ||
-    job.state === 'reviewing' ||
-    (Number.isSafeInteger(job.active_call_count) && job.active_call_count > 0)
-  );
+  return job.state === 'running';
 }
 
 function isJobAttention(job: ObservationJob): boolean {
-  if (
-    job.state === 'needs_user' ||
-    job.state === 'ready' ||
-    job.state === 'reviewing' ||
-    job.state === 'unknown'
-  ) {
-    return true;
-  }
-  const isTerminal = job.state === 'completed' || job.state === 'failed';
-  if (!isTerminal) {
-    if (
-      isUnresolvedApprovalStatus(job.approval_status) ||
-      isUnresolvedReviewState(job.review_state)
-    ) {
-      return true;
-    }
-  }
-  return false;
+  return resolveJobAttention(job, false) !== null;
 }
 
 function formatJobPlanLabel(job: ObservationJob): string | null {
@@ -607,14 +766,36 @@ function formatJobPlanLabel(job: ObservationJob): string | null {
   return null;
 }
 
-function buildProjectJobView(job: ObservationJob): ProjectJobView {
-  const taskSummary = summarizeJobProgress(job) || 'No tasks recorded';
+function buildProjectJobView(
+  job: ObservationJob,
+  hasRunningCall = false,
+  cutoffMs = 0,
+  hasRunningReviewerCall = false
+): ProjectJobView {
+  const taskSummary =
+    summarizeProjectTaskStatuses(job.tasks) || 'No tasks recorded';
+  const updatedAtMs = safeTimestampMs(job.updated_at_ms);
+  const resolved = resolveJobAttention(
+    job,
+    hasRunningCall,
+    hasRunningReviewerCall
+  );
+  const activelyExecuting =
+    (hasRunningCall || job.state === 'running') && resolved === null;
+  const olderThanWindow =
+    !activelyExecuting && updatedAtMs !== null && updatedAtMs < cutoffMs;
+
   return {
     key: jobPlanKey(job),
     job,
-    stateLabel: formatJobLifecycle(job.state),
+    stateLabel: resolved ? resolved.stateLabel : formatJobLifecycle(job.state),
     taskSummary,
-    attention: isJobAttention(job),
+    attention: resolved !== null,
+    attentionKind: resolved ? resolved.kind : null,
+    reason: resolved ? resolved.reason : null,
+    nextStep: resolved ? resolved.nextStep : null,
+    updatedAtMs,
+    olderThanWindow,
     planLabel: formatJobPlanLabel(job),
   };
 }
@@ -638,43 +819,381 @@ interface SessionAccumulator {
   requests: ObservationRequest[];
 }
 
+const ATTENTION_KIND_PRIORITY: Record<ProjectAttentionKind, number> = {
+  on_hold: 0,
+  status_check: 1,
+  plan_approval: 2,
+  awaiting_review: 3,
+  recorded_wait: 4,
+};
+
+function buildSessionAttentionItems(
+  jobViews: readonly ProjectJobView[],
+  allJobsInSession: readonly ObservationJob[],
+  requests: readonly ObservationRequest[],
+  cutoffMs: number
+): ProjectAttentionItemView[] {
+  const items: ProjectAttentionItemView[] = [];
+  const coveredJobKeys = new Set<string>();
+  const settledJobKeys = new Set<string>();
+  const acceptedReviewJobKeys = new Set<string>();
+  const knownJobKeys = new Set<string>();
+
+  for (const job of allJobsInSession) {
+    const jobKey = projectJobLookupKey(job.source_id, job.id);
+    knownJobKeys.add(jobKey);
+    if (job.state === 'completed' || job.state === 'failed') {
+      settledJobKeys.add(jobKey);
+    }
+    const reviewToken = normalizeStatusToken(job.review_state);
+    if (reviewToken === 'approved' || reviewToken === 'accepted') {
+      acceptedReviewJobKeys.add(jobKey);
+    }
+  }
+
+  for (const jobView of jobViews) {
+    if (!jobView.attention || jobView.attentionKind === null) {
+      continue;
+    }
+    const jobKey = projectJobLookupKey(jobView.job.source_id, jobView.job.id);
+    coveredJobKeys.add(jobKey);
+    items.push({
+      key: jobView.key,
+      kind: jobView.attentionKind,
+      sourceId: jobView.job.source_id,
+      jobId: jobView.job.id,
+      requestId: null,
+      title: trimOrNull(jobView.job.title) ?? `Job ${jobView.job.id}`,
+      stateLabel: jobView.stateLabel,
+      reason: jobView.reason ?? jobView.stateLabel,
+      nextStep:
+        jobView.nextStep ?? 'Check or continue in your Codex conversation.',
+      updatedAtMs: jobView.updatedAtMs,
+      olderThanWindow: jobView.olderThanWindow,
+      planLabel: jobView.planLabel,
+    });
+  }
+
+  const runningReviewerJobKeys = new Set<string>();
+  for (const request of requests) {
+    const reviewerJobId = trimOrNull(request.job_id);
+    if (reviewerJobId === null) {
+      continue;
+    }
+    const reviewerCalls = [request, ...(request.children ?? [])];
+    const hasRunningReviewer = reviewerCalls.some(
+      (call) =>
+        !isLocalMcpExecutor(call.executor) &&
+        normalizeStatusToken(call.state) === 'running' &&
+        normalizeStatusToken(call.executor?.role ?? '') === 'reviewer'
+    );
+    if (hasRunningReviewer) {
+      runningReviewerJobKeys.add(
+        projectJobLookupKey(request.source_id, reviewerJobId)
+      );
+    }
+  }
+
+  const parentRequestKeysWithAttentionChild = new Set<string>();
+  for (const req of requests) {
+    const parentId = trimOrNull(req.parent_request_id);
+    if (!parentId || isLocalMcpExecutor(req.executor)) {
+      continue;
+    }
+    const childHasAttention =
+      req.state === 'waiting_for_user' ||
+      req.state === 'ready_for_review' ||
+      req.state === 'unknown' ||
+      (req.children ?? []).some(
+        (child) =>
+          !isLocalMcpExecutor(child.executor) &&
+          (child.state === 'waiting_for_user' ||
+            child.state === 'ready_for_review' ||
+            child.state === 'unknown')
+      );
+    if (childHasAttention) {
+      parentRequestKeysWithAttentionChild.add(
+        projectRequestLookupKey(req.source_id, parentId)
+      );
+    }
+  }
+
+  for (const request of requests) {
+    const rawJobId = trimOrNull(request.job_id);
+    const linkedJobKey =
+      rawJobId !== null
+        ? projectJobLookupKey(request.source_id, rawJobId)
+        : null;
+    if (
+      linkedJobKey !== null &&
+      (settledJobKeys.has(linkedJobKey) || coveredJobKeys.has(linkedJobKey))
+    ) {
+      continue;
+    }
+    const reqLookupKey = projectRequestLookupKey(request.source_id, request.id);
+    if (parentRequestKeysWithAttentionChild.has(reqLookupKey)) {
+      continue;
+    }
+
+    let targetState: ObservationRequest['state'] | null = null;
+    let targetTitle =
+      trimOrNull(request.title) ??
+      capitalizeLabel(formatRecordedOperation(request.operation));
+    let targetAtMs = requestSafeMeaningfulTimestampMs(request);
+    let targetKey = JSON.stringify([
+      'attention-request',
+      request.source_id,
+      request.id,
+    ]);
+
+    if (
+      request.state === 'waiting_for_user' ||
+      request.state === 'ready_for_review' ||
+      request.state === 'unknown'
+    ) {
+      targetState = request.state;
+    } else {
+      const attentionChild = (request.children ?? []).find(
+        (child) =>
+          !isLocalMcpExecutor(child.executor) &&
+          (child.state === 'waiting_for_user' ||
+            child.state === 'ready_for_review' ||
+            child.state === 'unknown')
+      );
+      if (attentionChild) {
+        targetState = attentionChild.state;
+        targetTitle = trimOrNull(attentionChild.title) ?? targetTitle;
+        targetAtMs =
+          maxTimestampMs([
+            attentionChild.finished_at_ms,
+            attentionChild.started_at_ms,
+          ]) ?? safeTimestampMs(request.updated_at_ms);
+        targetKey = JSON.stringify([
+          'attention-call',
+          request.source_id,
+          request.id,
+          attentionChild.id,
+        ]);
+      }
+    }
+
+    if (targetState === null) {
+      continue;
+    }
+    if (targetState === 'ready_for_review') {
+      const hasLinkedRunningReviewer =
+        linkedJobKey !== null && runningReviewerJobKeys.has(linkedJobKey);
+      const hasUnlinkedRunningReviewer =
+        linkedJobKey === null &&
+        ((normalizeStatusToken(request.state) === 'running' &&
+          normalizeStatusToken(request.executor?.role ?? '') === 'reviewer') ||
+          (request.children ?? []).some(
+            (child) =>
+              !isLocalMcpExecutor(child.executor) &&
+              normalizeStatusToken(child.state) === 'running' &&
+              normalizeStatusToken(child.executor?.role ?? '') === 'reviewer'
+          ));
+      if (
+        hasLinkedRunningReviewer ||
+        hasUnlinkedRunningReviewer ||
+        (linkedJobKey !== null && acceptedReviewJobKeys.has(linkedJobKey))
+      ) {
+        continue;
+      }
+    }
+
+    let kind: ProjectAttentionKind;
+    let stateLabel: string;
+    let reason: string;
+    let nextStep: string;
+    if (targetState === 'waiting_for_user') {
+      kind = 'recorded_wait';
+      stateLabel = 'Waiting for user';
+      reason = 'Waiting for user';
+      nextStep = 'Respond or continue in your Codex conversation.';
+    } else if (targetState === 'ready_for_review') {
+      kind = 'awaiting_review';
+      stateLabel = 'Ready for review';
+      reason = 'Ready for review; no active reviewer is running';
+      nextStep =
+        'No active reviewer is running. Review or continue in your Codex conversation.';
+    } else {
+      kind = 'status_check';
+      stateLabel = 'Status needs checking';
+      reason = 'Status needs checking';
+      nextStep =
+        'Recorded status is unknown or inconsistent. Check the conversation or logs; no specific cause was recorded.';
+    }
+
+    const resolvedJobId =
+      linkedJobKey !== null && knownJobKeys.has(linkedJobKey) ? rawJobId : null;
+    if (linkedJobKey !== null) {
+      coveredJobKeys.add(linkedJobKey);
+    }
+    items.push({
+      key: targetKey,
+      kind,
+      sourceId: request.source_id,
+      jobId: resolvedJobId,
+      requestId: request.id,
+      title: targetTitle,
+      stateLabel,
+      reason,
+      nextStep,
+      updatedAtMs: targetAtMs,
+      olderThanWindow: targetAtMs !== null && targetAtMs < cutoffMs,
+      planLabel: null,
+    });
+  }
+
+  return items.sort((left, right) => {
+    const kindDiff =
+      ATTENTION_KIND_PRIORITY[left.kind] - ATTENTION_KIND_PRIORITY[right.kind];
+    if (kindDiff !== 0) {
+      return kindDiff;
+    }
+    if (left.olderThanWindow !== right.olderThanWindow) {
+      return left.olderThanWindow ? 1 : -1;
+    }
+    const leftMs = left.updatedAtMs ?? -1;
+    const rightMs = right.updatedAtMs ?? -1;
+    if (leftMs !== rightMs) {
+      return rightMs - leftMs;
+    }
+    return (
+      compareCaseInsensitiveThenExact(left.title, right.title) ||
+      compareText(left.key, right.key)
+    );
+  });
+}
+
+function formatAttentionSessionState(
+  attentionItems: readonly ProjectAttentionItemView[]
+): { stateLabel: string; tone: LifecycleTone } {
+  const count = attentionItems.length;
+  const allOlder = attentionItems.every((item) => item.olderThanWindow);
+  const kinds = new Set(attentionItems.map((item) => item.kind));
+
+  if (kinds.size > 1) {
+    return {
+      stateLabel: allOlder
+        ? `${count} older items to check`
+        : `${count} items to check`,
+      tone: kinds.has('status_check') ? 'unknown' : 'waiting',
+    };
+  }
+
+  const first = attentionItems[0]!;
+  switch (first.kind) {
+    case 'on_hold':
+      return {
+        stateLabel:
+          count === 1
+            ? allOlder
+              ? 'Work on hold (older)'
+              : 'Work on hold'
+            : allOlder
+              ? `Work on hold (${count} older)`
+              : `Work on hold (${count})`,
+        tone: 'waiting',
+      };
+    case 'plan_approval':
+      return {
+        stateLabel:
+          count === 1
+            ? allOlder
+              ? '1 older plan awaiting approval'
+              : '1 plan awaiting approval'
+            : allOlder
+              ? `${count} older plans awaiting approval`
+              : `${count} plans awaiting approval`,
+        tone: 'waiting',
+      };
+    case 'awaiting_review':
+      if (count === 1) {
+        if (first.stateLabel === 'Changes requested') {
+          return {
+            stateLabel: allOlder
+              ? 'Changes requested (older)'
+              : 'Changes requested',
+            tone: 'review',
+          };
+        }
+        if (first.stateLabel === 'Ready for review' && !allOlder) {
+          return { stateLabel: 'Ready for review', tone: 'review' };
+        }
+        return {
+          stateLabel: allOlder ? 'Older work awaiting review' : 'Awaiting review',
+          tone: 'review',
+        };
+      }
+      return {
+        stateLabel: allOlder
+          ? `${count} older items awaiting review`
+          : `${count} items awaiting review`,
+        tone: 'review',
+      };
+    case 'status_check':
+      return {
+        stateLabel:
+          count === 1
+            ? allOlder
+              ? 'Status needs checking (older)'
+              : 'Status needs checking'
+            : allOlder
+              ? `${count} older statuses need checking`
+              : `${count} statuses need checking`,
+        tone: 'unknown',
+      };
+    case 'recorded_wait':
+      if (count === 1) {
+        if (first.jobId === null && first.stateLabel === 'Waiting for user') {
+          return {
+            stateLabel: allOlder
+              ? 'Waiting for user (older)'
+              : 'Waiting for user',
+            tone: 'waiting',
+          };
+        }
+        return {
+          stateLabel: allOlder
+            ? 'Recorded wait; reason not provided (older)'
+            : 'Recorded wait; reason not provided',
+          tone: 'waiting',
+        };
+      }
+      return {
+        stateLabel: allOlder
+          ? `${count} older recorded waits`
+          : `${count} recorded waits`,
+        tone: 'waiting',
+      };
+  }
+}
+
 function resolveSessionSummaryState(
   jobs: readonly ProjectJobView[],
   calls: readonly ProjectCallView[],
   requests: readonly ObservationRequest[],
+  attentionItems: readonly ProjectAttentionItemView[],
   runningCount: number
 ): { stateLabel: string; tone: LifecycleTone; attention: boolean } {
-  const hasNeedsUserJob = jobs.some((item) => item.job.state === 'needs_user');
-  const hasWaitingCallOrRequest =
-    calls.some((call) => call.stateLabel === 'Waiting for user') ||
-    requests.some((req) => req.state === 'waiting_for_user');
-  const hasReviewingJob = jobs.some(
-    (item) =>
-      item.job.state === 'reviewing' ||
-      (item.job.state !== 'completed' &&
-        item.job.state !== 'failed' &&
-        isUnresolvedReviewState(item.job.review_state))
+  const hasRunningJob = jobs.some(
+    (item) => item.job.state === 'running' && !item.attention
   );
-  const hasReadyForReviewCallOrRequest =
-    calls.some((call) => call.stateLabel === 'Ready for review') ||
-    requests.some((req) => req.state === 'ready_for_review');
-  const hasReadyJob = jobs.some(
-    (item) =>
-      item.job.state === 'ready' ||
-      (item.job.state !== 'completed' &&
-        item.job.state !== 'failed' &&
-        trimOrNull(item.job.plan_id) !== null &&
-        isUnresolvedApprovalStatus(item.job.approval_status))
+  const hasPlanningJob = jobs.some(
+    (item) => item.job.state === 'planning' && !item.attention
   );
-  const hasPlanningJob = jobs.some((item) => item.job.state === 'planning');
-  const hasRunningJob = jobs.some((item) => item.job.state === 'running');
+  const hasApprovedReadyJob = jobs.some(
+    (item) => item.job.state === 'ready' && !item.attention
+  );
   const hasQueuedCall =
     calls.some((call) => call.stateLabel === 'Queued') ||
     requests.some(
       (req) => !isLocalMcpExecutor(req.executor) && req.state === 'queued'
     );
   const hasUnknown =
-    jobs.some((item) => item.job.state === 'unknown') ||
+    attentionItems.some((item) => item.kind === 'status_check') ||
     calls.some((call) => call.stateLabel === 'Unknown') ||
     requests.some((req) => req.state === 'unknown');
   const hasFailed =
@@ -686,12 +1205,8 @@ function resolveSessionSummaryState(
     requests.some((req) => req.state === 'cancelled');
 
   const attention =
+    attentionItems.length > 0 ||
     jobs.some((item) => item.attention) ||
-    hasNeedsUserJob ||
-    hasWaitingCallOrRequest ||
-    hasReviewingJob ||
-    hasReadyForReviewCallOrRequest ||
-    hasReadyJob ||
     hasUnknown ||
     hasFailed;
 
@@ -702,32 +1217,39 @@ function resolveSessionSummaryState(
       attention,
     };
   }
-  if (hasNeedsUserJob) {
-    return { stateLabel: 'Needs you', tone: 'waiting', attention: true };
+  if (attentionItems.length > 0) {
+    const formatted = formatAttentionSessionState(attentionItems);
+    if (hasFailed) {
+      return {
+        stateLabel: `Failed · ${formatted.stateLabel}`,
+        tone: 'danger',
+        attention: true,
+      };
+    }
+    return {
+      stateLabel: formatted.stateLabel,
+      tone: formatted.tone,
+      attention: true,
+    };
   }
-  if (hasWaitingCallOrRequest) {
-    return { stateLabel: 'Waiting for user', tone: 'waiting', attention: true };
+  if (hasUnknown) {
+    return {
+      stateLabel: 'Status needs checking',
+      tone: 'unknown',
+      attention: true,
+    };
   }
-  if (hasReviewingJob) {
-    return { stateLabel: 'Reviewing', tone: 'review', attention: true };
+  if (hasFailed) {
+    return { stateLabel: 'Failed', tone: 'danger', attention };
   }
-  if (hasReadyForReviewCallOrRequest) {
-    return { stateLabel: 'Ready for review', tone: 'review', attention: true };
-  }
-  if (hasReadyJob) {
-    return { stateLabel: 'Ready', tone: 'waiting', attention: true };
+  if (hasApprovedReadyJob) {
+    return { stateLabel: 'Ready', tone: 'waiting', attention };
   }
   if (hasPlanningJob) {
     return { stateLabel: 'Planning', tone: 'active', attention };
   }
   if (hasQueuedCall) {
     return { stateLabel: 'Queued', tone: 'neutral', attention };
-  }
-  if (hasUnknown) {
-    return { stateLabel: 'Unknown', tone: 'unknown', attention: true };
-  }
-  if (hasFailed) {
-    return { stateLabel: 'Failed', tone: 'danger', attention };
   }
   if (jobs.length > 0) {
     return { stateLabel: 'Completed', tone: 'ok', attention };
@@ -1122,7 +1644,44 @@ export function projectProjects(
           compareText(left.id, right.id) ||
           compareText(left.source_id, right.source_id)
       );
-    const jobViews = orderedJobs.map((job) => buildProjectJobView(job));
+
+    const jobKeysWithRunningCalls = new Set<string>();
+    const jobKeysWithRunningReviewerCalls = new Set<string>();
+    for (const request of accumulator.requests) {
+      const reqRunning =
+        isProviderExecutor(request.executor) && shouldShowSpinner(request.state);
+      const runningAgentChildren = (request.children ?? []).filter(
+        (child) =>
+          !isLocalMcpExecutor(child.executor) && shouldShowSpinner(child.state)
+      );
+      const jobId = trimOrNull(request.job_id);
+      const jobKey = jobId
+        ? projectJobLookupKey(request.source_id, jobId)
+        : null;
+      if ((reqRunning || runningAgentChildren.length > 0) && jobKey) {
+        jobKeysWithRunningCalls.add(jobKey);
+      }
+      if (
+        jobKey &&
+        ((reqRunning &&
+          normalizeStatusToken(request.executor?.role) === 'reviewer') ||
+          runningAgentChildren.some(
+            (child) => normalizeStatusToken(child.executor?.role) === 'reviewer'
+          ))
+      ) {
+        jobKeysWithRunningReviewerCalls.add(jobKey);
+      }
+    }
+
+    const jobViews = orderedJobs.map((job) => {
+      const jobKey = projectJobLookupKey(job.source_id, job.id);
+      return buildProjectJobView(
+        job,
+        jobKeysWithRunningCalls.has(jobKey),
+        cutoffMs,
+        jobKeysWithRunningReviewerCalls.has(jobKey)
+      );
+    });
 
     const parentRequestIdsWithAgentChildRequest = new Set<string>();
     for (const request of accumulator.requests) {
@@ -1242,14 +1801,41 @@ export function projectProjects(
       return compareText(left.view.key, right.view.key);
     });
 
+    const settledJobKeys = new Set(
+      accumulator.jobs
+        .filter((job) => job.state === 'completed')
+        .map((job) => projectJobLookupKey(job.source_id, job.id))
+    );
+    const unresolvedJobKeys = new Set(
+      jobViews
+        .filter((item) => item.attention)
+        .map((item) => projectJobLookupKey(item.job.source_id, item.job.id))
+    );
+
     const selectedCalls: ProjectCallView[] = [];
+    const olderUnresolvedCalls: ProjectCallView[] = [];
     let terminalCallsIncluded = 0;
     for (const candidate of sortedCandidates) {
       if (isTerminalLifecycleState(candidate.state)) {
+        const candidateJobKey =
+          candidate.jobId !== null
+            ? projectJobLookupKey(candidate.sourceId, candidate.jobId)
+            : null;
+        const isSettledJobCall =
+          candidateJobKey !== null && settledJobKeys.has(candidateJobKey);
+        const belongsToUnresolvedJob =
+          candidateJobKey !== null && unresolvedJobKeys.has(candidateJobKey);
         if (
           scope === null &&
           (candidate.sortAtMs === null || candidate.sortAtMs < cutoffMs)
         ) {
+          if (
+            !isSettledJobCall &&
+            olderUnresolvedCalls.length < MAX_TERMINAL_CALLS_PER_SESSION &&
+            (belongsToUnresolvedJob || retainRegardlessOfAge)
+          ) {
+            olderUnresolvedCalls.push(candidate.view);
+          }
           continue;
         }
         if (terminalCallsIncluded >= MAX_TERMINAL_CALLS_PER_SESSION) {
@@ -1258,6 +1844,28 @@ export function projectProjects(
         terminalCallsIncluded += 1;
       }
       selectedCalls.push(candidate.view);
+    }
+    if (selectedCalls.length === 0 && olderUnresolvedCalls.length > 0) {
+      selectedCalls.push(...olderUnresolvedCalls);
+    } else if (olderUnresolvedCalls.length > 0) {
+      for (const olderCall of olderUnresolvedCalls) {
+        if (
+          selectedCalls.length < MAX_TERMINAL_CALLS_PER_SESSION &&
+          !selectedCalls.some((call) => call.key === olderCall.key)
+        ) {
+          const matching = sortedCandidates.find(
+            (c) => c.view.key === olderCall.key
+          );
+          if (
+            matching?.jobId &&
+            unresolvedJobKeys.has(
+              projectJobLookupKey(matching.sourceId, matching.jobId)
+            )
+          ) {
+            selectedCalls.push(olderCall);
+          }
+        }
+      }
     }
 
     const sortedRecent = [...recentEvents]
@@ -1278,11 +1886,6 @@ export function projectProjects(
     const runningCount = allCallCandidates.filter(
       (candidate) => candidate.view.running
     ).length;
-    const settledJobKeys = new Set(
-      accumulator.jobs
-        .filter((job) => job.state === 'completed')
-        .map((job) => projectJobLookupKey(job.source_id, job.id))
-    );
     const settledRequests = accumulator.requests.filter(
       (request) =>
         request.job_id !== null &&
@@ -1306,12 +1909,20 @@ export function projectProjects(
       const requestAtMs = requestSafeMeaningfulTimestampMs(request);
       return requestAtMs !== null && requestAtMs >= cutoffMs;
     });
+    const attentionItems = buildSessionAttentionItems(
+      jobViews,
+      accumulator.jobs,
+      accumulator.requests,
+      cutoffMs
+    );
     const summaryState = resolveSessionSummaryState(
       jobViews,
       selectedCalls.filter((call) => !settledCallKeys.has(call.key)),
       summaryRequests,
+      attentionItems,
       runningCount
     );
+    const olderJobCount = jobViews.filter((job) => job.olderThanWindow).length;
 
     const primaryLabel =
       accumulator.threadLabels[0] ??
@@ -1344,6 +1955,8 @@ export function projectProjects(
       tone: summaryState.tone,
       runningCount,
       attention: summaryState.attention,
+      attentionItems,
+      olderJobCount,
       jobs: jobViews,
       calls: selectedCalls,
       recent: sortedRecent,
