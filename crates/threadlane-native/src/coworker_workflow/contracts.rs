@@ -2426,6 +2426,9 @@ pub enum WorkflowHoldReason {
     SharedWriteScopeOrInterfaceHold,
     /// An outbox dispatch outcome is [`OutboxDispatchStatus::EffectUnknown`] and requires reconciliation.
     UnknownEffectReconciliationRequired,
+    /// Live workflow registry configuration changed after frozen execution approval; future effects
+    /// require refreshed authority.
+    RegistryConfigurationChanged,
 }
 
 /// Durable hold record pausing advancement of affected tasks until explicitly resolved.

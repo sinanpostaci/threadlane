@@ -1281,6 +1281,9 @@ async fn valid_complete_subject_bound_closure_json_accepted_and_cached_on_repeat
     );
     assert_eq!(read_launch_count(&fixture.launch_count_file), 1);
 
+    fs::remove_file(&fixture.fake_agy_exe)
+        .expect("remove fake_agy_exe before cached closure reuse");
+
     finish_test_2_cache_and_artifact_assertions(&fixture, &job.job_id, &assembled, &first_outcome)
         .await;
 }
@@ -2856,6 +2859,9 @@ async fn verify_post_sidecar_crash_recovery_without_reinvocation_or_double_charg
             recorded_at_ms: 1_700_000_633_000,
         })
         .expect("persist sidecar before simulated crash");
+
+    fs::remove_file(&fixture.fake_agy_exe)
+        .expect("remove fake_agy_exe before persisted sidecar recovery");
 
     let recovered_outcome = fixture
         .candidate_service

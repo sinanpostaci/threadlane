@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-07.v2`
+Version: `2026-11-08.v1`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -142,7 +142,22 @@ Version: `2026-11-07.v2`
   permits immutable-scoped status and narrow stop, but never new dispatch. The
   current amendment fences and halts the superseded job as a whole; do not
   promise that unaffected tasks keep advancing. It does not prove remote
-  inference termination and performs no broad process kills.
+  inference termination and performs no broad process kills. New strict authority
+  creation still requires the exact `registry_revision`. Active frozen jobs never
+  retarget to edited saved models: when `registry_revision` changes, provably
+  identical selected `Worker` (`coder`), `Reviewer`, and `Closure` role/tool/model/effort
+  and frozen canonical executable dependencies allow unrelated, default-profile, or
+  name edits to continue on the frozen targets, whereas any changed or unprovable
+  dependency (including legacy/unrepresented `Reviewer`/`Closure` executables or
+  enabled `shadow_jev_policy`) records one durable `registry_configuration_changed`
+  hold (`HeldByWorkflowHolds`). Under that hold, existing in-flight outcomes are
+  retained on their frozen targets while future dispatch, `Reviewer`,
+  `RunIntegration`, derived correction, and `Closure` effects are held without
+  setting `stop_requested` (preserving explicit human stop as distinct), without
+  automatic resume when settings are restored, and without adopting new models;
+  refresh authority explicitly as required and reconcile `Unknown` effects rather
+  than replaying them. The same configuration-hold `Attention` notice is
+  deduplicated across later terminal receipt revisions.
 - Native notices are operator-only via `--coworker-native-notices`, off by default
   on the raw CLI. Trusted managed setup enables them as transport configuration
   only on verified Linux desktop sessions. They require an actually verified

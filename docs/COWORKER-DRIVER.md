@@ -120,6 +120,32 @@ or `--request <ABS_PATH_TO_0600_JSON>`:
      `CoworkerDerivedCancellationBoundary::OriginalAndDerivedSignalledDirectCheckReviewerClosureDrainedFenced`),
      prevents any new stage dispatch, fences late outputs from promoting to receipts or downstream
      stages, and releases the guard and owned host only after in-flight futures reach `0`.
+5. **Registry revision drift and configuration hold boundary**:
+   - Creating new authority or freezing a new execution envelope (`verify_live_approval_and_registry`)
+     still strictly requires the live `RegistryStore` revision to match the frozen `registry_revision`.
+   - Active admitted jobs (`verify_job_admission`) never retarget to edited saved profile or model
+     definitions. When the live `RegistryStore` revision changes after frozen execution approval,
+     `prove_live_registry_equivalence_to_frozen_authority` checks whether the exact frozen
+     `profile_id`, frozen `ExecutionPolicy`, all approved `Worker` (`coder`) task difficulties, and
+     frozen `Reviewer` and `Closure` choices still resolve to identical tool/adapter/model/raw
+     `model_arg`/effort/route selections and identical canonical executables proven from frozen
+     `ApprovedTaskRecord.canonical_executable` entries.
+   - Provably identical selected role/tool/model/effort/executable dependencies allow unrelated
+     profile, default-profile, or name edits to continue on the frozen targets; any changed or
+     unprovable dependency (including legacy or unrepresented `Reviewer` / `Closure` tool
+     executables or an enabled `shadow_jev_policy`) records one durable job-wide
+     `WorkflowHoldReason::RegistryConfigurationChanged` hold (`HeldByWorkflowHolds`) and sets a
+     bounded `stop_or_block_reason` without setting `stop_requested` (preserving explicit human stop
+     as distinct; no claim of universal unrelated-edit continuation).
+   - Under a configuration hold, Pass 1 host-snapshot reconciliation retains genuine outcomes from
+     already in-flight frozen tasks and existing in-flight pipeline futures finish on their frozen
+     targets, while future dispatch, dependency preparation, `Reviewer`, `RunIntegration`, derived
+     `Coder` correction, and `Closure` effects are held. Restoring saved settings never
+     auto-resumes the hold or adopts new models; refresh authority explicitly as required and
+     reconcile `Unknown` effects rather than replaying them.
+   - Admission-snapshot `Attention` notices for an active `RegistryConfigurationChanged` hold
+     anchor reservation to the hold's `created_at_job_revision`, deduplicating configuration-hold
+     attention across later Pass 1 terminal receipt revisions.
 
 ## Fatal owner diagnostics
 

@@ -14,7 +14,7 @@ use crate::coworker_driver::{CoworkerDriverFatalError, CoworkerDriverPipelineRep
 use crate::coworker_workflow::{
     sha256_hex, CombinedCandidateStatus, CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey,
     CoworkerJobPhase, CoworkerPipelineStatus, CoworkerTaskStage, OwnedCoworkerControllerSession,
-    PendingControllerEffectStatus, VerifiedControllerAdmission,
+    PendingControllerEffectStatus, VerifiedControllerAdmission, WorkflowHoldReason,
 };
 use crate::fs_safety::{
     acquire_cross_process_lock, constant_time_str_eq, prepare_private_dir,
@@ -1026,12 +1026,23 @@ impl CoworkerNoticeStore {
         } else {
             Vec::new()
         };
+        let notice_job_revision = if settled_report.is_none() && kind == NoticeKind::Attention {
+            admission
+                .job
+                .holds
+                .iter()
+                .find(|h| h.active && h.reason == WorkflowHoldReason::RegistryConfigurationChanged)
+                .map(|h| h.created_at_job_revision)
+                .unwrap_or(admission.job.job_revision)
+        } else {
+            admission.job.job_revision
+        };
         let reserved = self.reserve_attempt_with_worker_failures(
             &key,
             &admission.runtime_state.envelope.envelope_digest,
             Path::new(&admission.approval.repository_path),
             kind,
-            admission.job.job_revision,
+            notice_job_revision,
             snapshot,
             Some(session.guard()),
             &worker_failure_fps,

@@ -21,15 +21,15 @@ use super::contracts::{
     deterministic_prefixed_id, validate_non_native_worker_choice, CoworkerJobPhase,
     CoworkerJobRecord, CoworkerTaskRecord, CoworkerTaskStage, OutboxDispatchKind,
     OutboxDispatchRecord, OutboxDispatchStatus, ReviewVerdictOutcome, StructuredReviewVerdict,
-    TaskCandidateRef, MAX_COWORKER_ID_LEN, MAX_COWORKER_LEDGER_BYTES,
+    TaskCandidateRef, WorkflowHoldReason, MAX_COWORKER_ID_LEN, MAX_COWORKER_LEDGER_BYTES,
 };
 use super::controller::{
     verify_task_fenced_for_advancement, CoworkerControllerService, VerifiedControllerAdmission,
 };
 use super::controller_policy::{
-    deterministic_controller_instance_id, ControllerJobRuntimeState, PendingControllerEffect,
-    PendingControllerEffectKind, PendingControllerEffectStatus, TaskAttemptExecutionArtifacts,
-    DEFAULT_CONTROLLER_LEASE_TTL_MS,
+    deterministic_controller_instance_id, prove_registry_snapshot_equivalence_to_frozen_authority,
+    ControllerJobRuntimeState, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, TaskAttemptExecutionArtifacts, DEFAULT_CONTROLLER_LEASE_TTL_MS,
 };
 use super::ownership::CoworkerJobOwnershipGuard;
 use super::review::{ExpectedTaskReviewIdentity, MAX_TASK_REVIEW_RESPONSE_BYTES};
@@ -1024,7 +1024,14 @@ fn resolve_frozen_reviewer_route(
     }
 
     let snapshot = read_registry_snapshot_readonly(controller.authority().registry().config_dir())?;
-    if snapshot.revision != adm.linkage.registry_revision {
+    if snapshot.revision != adm.linkage.registry_revision
+        && !prove_registry_snapshot_equivalence_to_frozen_authority(
+            &adm.approval,
+            &adm.job,
+            &adm.runtime_state.envelope,
+            &snapshot,
+        )?
+    {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             format!(
@@ -2128,6 +2135,27 @@ fn finalize_and_promote_review_report(
         },
     )?;
 
+    if let Some(fenced_err) = reconcile_verified_review_outbox_under_registry_hold(
+        controller,
+        guard,
+        request,
+        plans_dir,
+        controller_instance_id,
+        lease_epoch,
+        candidate_id,
+        review_subject,
+        expected_identity,
+        reviewer_choice,
+        request_key,
+        effect_id,
+        report_artifact_id,
+        outbox_record,
+        &report,
+        &response_digest,
+    )? {
+        return Err(fenced_err);
+    }
+
     let (post_adm, _, _, post_task, _, post_artifacts, _, _, _, _, _, _, _) =
         verify_live_task_review_gate(
             controller,
@@ -2306,6 +2334,561 @@ fn finalize_and_promote_review_report(
         blocking_error,
         reused_existing: false,
     })
+}
+
+const MAX_REVIEW_OUTBOX_HOLD_RECONCILE_ATTEMPTS: usize = 4;
+
+fn retry_on_stale_job_revision_cas<T, F>(mut op: F) -> Result<T, NativeError>
+where
+    F: FnMut() -> Result<T, NativeError>,
+{
+    let mut attempt = 0usize;
+    loop {
+        attempt += 1;
+        match op() {
+            Err(err)
+                if attempt < MAX_REVIEW_OUTBOX_HOLD_RECONCILE_ATTEMPTS
+                    && err.code == NativeErrorCode::ValidationFailed
+                    && err.message
+                        == "expected_job_revision does not match current job_revision" =>
+            {
+                continue;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn reconcile_verified_review_outbox_under_registry_hold(
+    controller: &CoworkerControllerService,
+    guard: &CoworkerJobOwnershipGuard,
+    request: &CoworkerTaskReviewStageRequest,
+    plans_dir: &Path,
+    controller_instance_id: &str,
+    lease_epoch: u64,
+    candidate_id: &str,
+    review_subject: &ReviewSubject,
+    expected_identity: &ExpectedTaskReviewIdentity,
+    reviewer_choice: &SelectedRoleChoice,
+    request_key: &str,
+    effect_id: &str,
+    report_artifact_id: &str,
+    outbox_record: &OutboxDispatchRecord,
+    report: &TaskReviewExecutionReport,
+    response_digest: &str,
+) -> Result<Option<NativeError>, NativeError> {
+    if report.status != TaskReviewExecutionStatus::VerifiedVerdict {
+        return Ok(None);
+    }
+    retry_on_stale_job_revision_cas(|| {
+        reconcile_verified_review_outbox_under_registry_hold_once(
+            controller,
+            guard,
+            request,
+            plans_dir,
+            controller_instance_id,
+            lease_epoch,
+            candidate_id,
+            review_subject,
+            expected_identity,
+            reviewer_choice,
+            request_key,
+            effect_id,
+            report_artifact_id,
+            outbox_record,
+            report,
+            response_digest,
+        )
+    })
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn reconcile_verified_review_outbox_under_registry_hold_once(
+    controller: &CoworkerControllerService,
+    guard: &CoworkerJobOwnershipGuard,
+    request: &CoworkerTaskReviewStageRequest,
+    plans_dir: &Path,
+    controller_instance_id: &str,
+    lease_epoch: u64,
+    candidate_id: &str,
+    review_subject: &ReviewSubject,
+    expected_identity: &ExpectedTaskReviewIdentity,
+    reviewer_choice: &SelectedRoleChoice,
+    request_key: &str,
+    effect_id: &str,
+    report_artifact_id: &str,
+    outbox_record: &OutboxDispatchRecord,
+    report: &TaskReviewExecutionReport,
+    response_digest: &str,
+) -> Result<Option<NativeError>, NativeError> {
+    if report.status != TaskReviewExecutionStatus::VerifiedVerdict {
+        return Ok(None);
+    }
+
+    controller.verify_physical_ownership(
+        guard,
+        &request.binding_id,
+        &request.thread_uuid,
+        &request.job_id,
+    )?;
+
+    let mut adm = Box::new(controller.verify_job_admission(
+        guard,
+        &request.binding_id,
+        &request.thread_uuid,
+        &request.job_id,
+    )?);
+
+    let own_instance_id = deterministic_controller_instance_id(
+        &request.binding_id,
+        &request.job_id,
+        guard.instance_id(),
+    );
+    let lease = adm.runtime_state.lease.as_ref().ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ControllerJobRuntimeState has no active driver lease",
+        )
+    })?;
+    if !lease.active
+        || lease.instance_id != own_instance_id
+        || lease.lease_epoch == 0
+        || lease.expires_at_ms <= lease.acquired_at_ms
+        || lease.instance_id != controller_instance_id
+        || lease.lease_epoch != lease_epoch
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "controller driver lease changed during task review stage",
+        ));
+    }
+
+    if adm.runtime_state.stop_requested {
+        return Ok(None);
+    }
+
+    let change_summary = ConversationChangeStore::open_readonly(plans_dir)
+        .and_then(|store| {
+            store.unresolved_blocking_changes(
+                &request.binding_id,
+                Some(&adm.approval.approval_id),
+                None,
+            )
+        })
+        .map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!("failed to read ConversationChangeStore during task review stage: {err}"),
+            )
+        })?;
+    if change_summary.current_change_revision > adm.runtime_state.synced_change_revision {
+        controller.policy_store().mutate_job_runtime(
+            &request.binding_id,
+            &request.job_id,
+            controller_instance_id,
+            lease_epoch,
+            |state| {
+                if change_summary.current_change_revision > state.synced_change_revision {
+                    state.synced_change_revision = change_summary.current_change_revision;
+                }
+                Ok(())
+            },
+        )?;
+        adm.runtime_state.synced_change_revision = change_summary.current_change_revision;
+    }
+    if change_summary.approval_superseded || !change_summary.blocking_changes.is_empty() {
+        return Ok(None);
+    }
+
+    let has_active_registry_hold = adm.job.holds.iter().any(|h| {
+        h.active
+            && h.reason == WorkflowHoldReason::RegistryConfigurationChanged
+            && (h.holds_entire_job
+                || h.directly_affected_task_ids
+                    .iter()
+                    .any(|id| id == &request.task_id))
+    });
+    let has_other_active_hold = adm
+        .job
+        .holds
+        .iter()
+        .any(|h| h.active && h.reason != WorkflowHoldReason::RegistryConfigurationChanged);
+    if !has_active_registry_hold || has_other_active_hold || adm.job.phase != CoworkerJobPhase::Held
+    {
+        return Ok(None);
+    }
+
+    let candidate_task = adm
+        .job
+        .tasks
+        .iter()
+        .find(|t| t.task_id == request.task_id)
+        .cloned()
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "task `{}` was not found in job `{}`",
+                    request.task_id, request.job_id
+                ),
+            )
+        })?;
+    let approved_task = adm
+        .approval
+        .tasks
+        .iter()
+        .find(|t| t.task_id == request.task_id)
+        .cloned()
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "task `{}` was not found in ApprovalRecord `{}`",
+                    request.task_id, adm.approval.approval_id
+                ),
+            )
+        })?;
+    if candidate_task.current_attempt_no != request.attempt_no {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "task `{}` current_attempt_no `{}` does not match requested attempt_no `{}`",
+                request.task_id, candidate_task.current_attempt_no, request.attempt_no
+            ),
+        ));
+    }
+    if candidate_task.stage != CoworkerTaskStage::Held
+        || candidate_task.active_hold_ids.is_empty()
+        || candidate_task.stage_before_hold.is_none()
+    {
+        return Ok(None);
+    }
+
+    if &adm.runtime_state.envelope.reviewer_choice != reviewer_choice {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "reviewer_choice does not match frozen execution envelope",
+        ));
+    }
+    validate_non_native_worker_choice(WorkflowRole::Reviewer, reviewer_choice)?;
+    if !adm.linkage.authorizes_reviewer_dispatch(reviewer_choice) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "frozen approval linkage does not authorize the envelope reviewer_choice",
+        ));
+    }
+    if !adm.runtime_state.envelope.policy.allows(
+        WorkflowRole::Reviewer,
+        &reviewer_choice.tool_id,
+        &reviewer_choice.model_id,
+        reviewer_choice.effort.as_deref(),
+    )? {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "frozen execution policy denies the envelope reviewer_choice",
+        ));
+    }
+
+    let art_key = ControllerJobRuntimeState::artifact_key(&request.task_id, request.attempt_no);
+    let artifacts = adm
+        .runtime_state
+        .attempt_artifacts
+        .get(&art_key)
+        .cloned()
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing TaskAttemptExecutionArtifacts for task `{}` attempt `{}`",
+                    request.task_id, request.attempt_no
+                ),
+            )
+        })?;
+    let (verified_candidate_id, verified_review_subject) =
+        verify_preserved_candidate_and_live_subject(
+            plans_dir,
+            request,
+            &adm,
+            &candidate_task,
+            &approved_task,
+            &artifacts,
+        )?;
+    if verified_candidate_id != candidate_id || &verified_review_subject != review_subject {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "preserved candidate_id or ReviewSubject drifted from review invocation context",
+        ));
+    }
+
+    let recomputed_identity = ExpectedTaskReviewIdentity::from_subject(
+        review_subject,
+        &request.task_id,
+        request.attempt_no,
+        candidate_id,
+        &adm.linkage.policy_digest,
+    );
+    let recomputed_request_key = compute_task_review_request_key(
+        &request.job_id,
+        &request.task_id,
+        request.attempt_no,
+        candidate_id,
+        &review_subject.subject_digest,
+        &adm.linkage.policy_digest,
+        &adm.runtime_state.envelope.envelope_digest,
+        reviewer_choice,
+    );
+    let recomputed_effect_id = compute_task_review_effect_id(
+        &request.job_id,
+        &request.task_id,
+        request.attempt_no,
+        &recomputed_request_key,
+    );
+    let recomputed_report_artifact_id = compute_task_review_report_artifact_id(
+        &request.job_id,
+        &request.task_id,
+        request.attempt_no,
+        &recomputed_request_key,
+    );
+    if &recomputed_identity != expected_identity
+        || recomputed_request_key != request_key
+        || recomputed_effect_id != effect_id
+        || recomputed_report_artifact_id != report_artifact_id
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "review identity, request_key, effect_id, or report_artifact_id does not match frozen authority",
+        ));
+    }
+
+    verify_no_conflicting_review_key(
+        &adm.job,
+        &adm.runtime_state,
+        &candidate_task,
+        request.attempt_no,
+        candidate_id,
+        request_key,
+        effect_id,
+        &review_subject.subject_digest,
+    )?;
+
+    report.validate_integrity()?;
+    if report.binding_id != request.binding_id
+        || report.thread_uuid != request.thread_uuid
+        || report.job_id != request.job_id
+        || &report.subject != review_subject
+        || &report.expected_identity != expected_identity
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "TaskReviewExecutionReport identity or subject does not match current review request",
+        ));
+    }
+    let persisted_report = read_persisted_task_review_report(plans_dir, effect_id)?.ok_or_else(
+        || {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                format!(
+                    "missing persisted private 0600 TaskReviewExecutionReport for effect `{effect_id}`"
+                ),
+            )
+        },
+    )?;
+    if &persisted_report != report {
+        return Err(NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "persisted TaskReviewExecutionReport does not match VerifiedVerdict report",
+        ));
+    }
+    let persisted_digest = persisted_report
+        .advisory_response()
+        .map(|r| r.sha256_digest.as_str())
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "persisted VerifiedVerdict report is missing bounded advisory_response digest",
+            )
+        })?;
+    if !constant_time_str_eq(persisted_digest, response_digest)
+        || artifacts.reviewer_response_digest.as_deref() != Some(response_digest)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "persisted reviewer_response_digest does not match VerifiedVerdict report digest",
+        ));
+    }
+
+    let _validated_verdict = report.promote_verified_verdict(review_subject, expected_identity)?;
+
+    let confirmed_effect = adm
+        .runtime_state
+        .pending_effects
+        .get(effect_id)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "missing ReviewerInvocation PendingControllerEffect `{effect_id}` in runtime state"
+                ),
+            )
+        })?;
+    if confirmed_effect.kind != PendingControllerEffectKind::ReviewerInvocation
+        || confirmed_effect.job_id != request.job_id
+        || confirmed_effect.task_id.as_deref() != Some(request.task_id.as_str())
+        || confirmed_effect.attempt_no != Some(request.attempt_no)
+        || confirmed_effect.request_key != request_key
+        || !constant_time_str_eq(
+            &confirmed_effect.subject_digest,
+            &review_subject.subject_digest,
+        )
+        || confirmed_effect.status != PendingControllerEffectStatus::EffectConfirmed
+        || confirmed_effect.external_correlation_id.as_deref() != Some(report_artifact_id)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "ReviewerInvocation PendingControllerEffect `{effect_id}` does not match confirmed VerifiedVerdict identity"
+            ),
+        ));
+    }
+
+    let live_outbox =
+        find_task_review_outbox(&adm.job, &request.task_id, request_key).ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "missing matching TaskReviewDispatch outbox record for held review invocation",
+            )
+        })?;
+    if live_outbox.outbox_id != outbox_record.outbox_id
+        || live_outbox.task_id != request.task_id
+        || live_outbox.attempt_no != request.attempt_no
+        || live_outbox.kind != OutboxDispatchKind::TaskReviewDispatch
+        || live_outbox.role != WorkflowRole::Reviewer
+        || live_outbox.request_key != request_key
+        || !constant_time_str_eq(&live_outbox.subject_digest, &review_subject.subject_digest)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "TaskReviewDispatch outbox identity does not match VerifiedVerdict review invocation",
+        ));
+    }
+
+    if outbox_record.status == OutboxDispatchStatus::EffectUnknown
+        || live_outbox.status == OutboxDispatchStatus::EffectUnknown
+    {
+        return Ok(None);
+    }
+
+    let final_job = match live_outbox.status {
+        OutboxDispatchStatus::ReservedBeforeEffect => {
+            if outbox_record.status != OutboxDispatchStatus::ReservedBeforeEffect {
+                return Ok(None);
+            }
+            if candidate_task.unresolved_outbox_id.as_deref()
+                != Some(live_outbox.outbox_id.as_str())
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "held task `{}` unresolved_outbox_id `{:?}` does not match ReservedBeforeEffect outbox `{}`",
+                        candidate_task.task_id,
+                        candidate_task.unresolved_outbox_id,
+                        live_outbox.outbox_id
+                    ),
+                ));
+            }
+            controller.verify_physical_ownership(
+                guard,
+                &request.binding_id,
+                &request.thread_uuid,
+                &request.job_id,
+            )?;
+            let (updated_job, finalized_outbox) = controller
+                .workflow_store()
+                .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+                    binding_id: request.binding_id.clone(),
+                    thread_uuid: request.thread_uuid.clone(),
+                    job_id: request.job_id.clone(),
+                    expected_job_revision: adm.job.job_revision,
+                    expected_ledger_revision: None,
+                    outbox_id: live_outbox.outbox_id.clone(),
+                    status: OutboxDispatchStatus::DispatchedEffectConfirmed,
+                    next_task_stage: CoworkerTaskStage::Held,
+                    run_id: None,
+                    worker_id: None,
+                    task_worktree_id: Some(review_subject.task_worktree_id.clone()),
+                    head_commit: Some(review_subject.task_head_commit.clone()),
+                    tree_sha: Some(review_subject.task_tree_sha.clone()),
+                    diff_digest: Some(review_subject.diff_digest.clone()),
+                    report_artifact_id: Some(report_artifact_id.to_string()),
+                    observed_model: report.observed_model.clone(),
+                    observed_effort: report.observed_effort.clone(),
+                    receipt_id: None,
+                    diagnostic: None,
+                })?;
+            if finalized_outbox.status != OutboxDispatchStatus::DispatchedEffectConfirmed {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "finalized TaskReviewDispatch outbox did not transition to DispatchedEffectConfirmed",
+                ));
+            }
+            updated_job
+        }
+        OutboxDispatchStatus::DispatchedEffectConfirmed => {
+            if candidate_task.unresolved_outbox_id.is_some()
+                || live_outbox.run_id.is_some()
+                || live_outbox.worker_id.is_some()
+                || live_outbox.receipt_id.is_some()
+            {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "already-confirmed TaskReviewDispatch outbox has inconsistent held task or outbox fields",
+                ));
+            }
+            adm.job.clone()
+        }
+        _ => return Ok(None),
+    };
+
+    let final_task = final_job
+        .tasks
+        .iter()
+        .find(|t| t.task_id == request.task_id)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "held task missing after TaskReviewDispatch outbox reconciliation",
+            )
+        })?;
+    if final_task.stage != CoworkerTaskStage::Held
+        || final_task.stage_before_hold != candidate_task.stage_before_hold
+        || final_task.unresolved_outbox_id.is_some()
+        || final_job.holds != adm.job.holds
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "held task stage, stage_before_hold, or workflow holds drifted during outbox finalization",
+        ));
+    }
+
+    match verify_task_fenced_for_advancement(
+        final_task,
+        &final_job,
+        &adm.runtime_state,
+        &adm.approval.approval_id,
+        plans_dir,
+    ) {
+        Err(fenced_err) => Ok(Some(fenced_err)),
+        Ok(()) => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "task `{}` is held under RegistryConfigurationChanged; review promotion is fenced",
+                request.task_id
+            ),
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2496,6 +3079,88 @@ fn mark_review_effect_and_outbox_unknown(
                     diagnostic: Some(clean_diag),
                 },
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_job_revision_cas_retry_unit_tests {
+    use super::{
+        retry_on_stale_job_revision_cas, NativeError, NativeErrorCode,
+        MAX_REVIEW_OUTBOX_HOLD_RECONCILE_ATTEMPTS,
+    };
+
+    #[test]
+    fn retries_exact_stale_job_revision_cas_and_returns_success_or_none_without_extra_calls() {
+        let mut attempts = 0usize;
+        let outcome: Result<Option<&'static str>, NativeError> =
+            retry_on_stale_job_revision_cas(|| {
+                attempts += 1;
+                if attempts < 4 {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "expected_job_revision does not match current job_revision",
+                    ));
+                }
+                Ok(Some("fenced_after_reconcile"))
+            });
+        assert_eq!(attempts, 4);
+        assert_eq!(
+            outcome.expect("succeeds on 4th attempt"),
+            Some("fenced_after_reconcile")
+        );
+
+        let mut none_attempts = 0usize;
+        let none_outcome: Result<Option<&'static str>, NativeError> =
+            retry_on_stale_job_revision_cas(|| {
+                none_attempts += 1;
+                Ok(None)
+            });
+        assert_eq!(none_attempts, 1);
+        assert_eq!(none_outcome.expect("Ok(None) returns immediately"), None);
+    }
+
+    #[test]
+    fn exhausts_after_four_stale_job_revision_cas_conflicts() {
+        let mut attempts = 0usize;
+        let err = retry_on_stale_job_revision_cas::<(), _>(|| {
+            attempts += 1;
+            Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "expected_job_revision does not match current job_revision",
+            ))
+        })
+        .expect_err("4 consecutive CAS conflicts must fail closed");
+        assert_eq!(attempts, MAX_REVIEW_OUTBOX_HOLD_RECONCILE_ATTEMPTS);
+        assert_eq!(err.code, NativeErrorCode::ValidationFailed);
+        assert_eq!(
+            err.message,
+            "expected_job_revision does not match current job_revision"
+        );
+    }
+
+    #[test]
+    fn non_cas_errors_propagate_immediately_on_first_attempt() {
+        for (code, msg) in [
+            (
+                NativeErrorCode::ValidationFailed,
+                "persisted reviewer_response_digest does not match VerifiedVerdict report digest",
+            ),
+            (NativeErrorCode::IoError, "failed to read report file"),
+            (
+                NativeErrorCode::PersistenceUncertain,
+                "ledger write durability uncertain",
+            ),
+        ] {
+            let mut attempts = 0usize;
+            let err = retry_on_stale_job_revision_cas::<(), _>(|| {
+                attempts += 1;
+                Err(NativeError::new(code, msg))
+            })
+            .expect_err("non-CAS error must fail immediately");
+            assert_eq!(attempts, 1);
+            assert_eq!(err.code, code);
+            assert_eq!(err.message, msg);
         }
     }
 }

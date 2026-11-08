@@ -82,10 +82,10 @@ use super::controller::{
     verify_task_fenced_for_advancement, CoworkerControllerService, VerifiedControllerAdmission,
 };
 use super::controller_policy::{
-    deterministic_controller_instance_id, sanitize_controller_diagnostic,
-    CheckFailureCorrectionBasis, ControllerJobRuntimeState, DerivedTaskAttemptReceipt,
-    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
-    TaskAttemptExecutionArtifacts, DEFAULT_CONTROLLER_LEASE_TTL_MS,
+    deterministic_controller_instance_id, prove_registry_snapshot_equivalence_to_frozen_authority,
+    sanitize_controller_diagnostic, CheckFailureCorrectionBasis, ControllerJobRuntimeState,
+    DerivedTaskAttemptReceipt, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, TaskAttemptExecutionArtifacts, DEFAULT_CONTROLLER_LEASE_TTL_MS,
     MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
 };
 use super::ownership::CoworkerJobOwnershipGuard;
@@ -2712,7 +2712,14 @@ fn build_and_validate_derived_coder_worker_spec(
     }
 
     let snapshot = read_registry_snapshot_readonly(controller.authority().registry().config_dir())?;
-    if snapshot.revision != adm.linkage.registry_revision {
+    if snapshot.revision != adm.linkage.registry_revision
+        && !prove_registry_snapshot_equivalence_to_frozen_authority(
+            &adm.approval,
+            &adm.job,
+            &adm.runtime_state.envelope,
+            &snapshot,
+        )?
+    {
         return Err(NativeError::new(
             NativeErrorCode::ValidationFailed,
             format!(

@@ -64,10 +64,10 @@ use super::contracts::{
     MAX_COWORKER_ID_LEN,
 };
 use super::controller_policy::{
-    deterministic_controller_instance_id, verify_live_approval_and_registry,
-    ControllerJobRuntimeState, ControllerPolicyStore, PendingControllerEffect,
-    PendingControllerEffectKind, PendingControllerEffectStatus, TaskAttemptExecutionArtifacts,
-    DEFAULT_CONTROLLER_LEASE_TTL_MS,
+    deterministic_controller_instance_id, verify_approval_and_plan_evidence,
+    verify_frozen_runtime_registry_or_apply_config_hold, ControllerJobRuntimeState,
+    ControllerPolicyStore, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, TaskAttemptExecutionArtifacts, DEFAULT_CONTROLLER_LEASE_TTL_MS,
 };
 use super::ownership::{
     CoworkerJobOwnershipGuard, CoworkerJobOwnershipKey, CoworkerJobOwnershipStore,
@@ -487,6 +487,7 @@ impl CoworkerControllerService {
     ///    within the frozen `WorkflowRole::Coder` role budget caps (never silently clamped).
     /// 6. Every task is a non-native headless `WorkflowRole::Coder` task matching its frozen
     ///    [`SelectedRoleChoice`] and [`ApprovedTaskRecord`].
+    #[inline(never)]
     pub fn verify_job_admission(
         &self,
         guard: &CoworkerJobOwnershipGuard,
@@ -496,89 +497,8 @@ impl CoworkerControllerService {
     ) -> Result<VerifiedControllerAdmission, NativeError> {
         self.verify_physical_ownership(guard, binding_id, thread_uuid, job_id)?;
 
-        let ledger = self.workflow_store.read_binding_ledger(binding_id)?;
-        ledger.validate(binding_id)?;
-        if ledger.thread_uuid.as_deref() != Some(thread_uuid) {
-            return Err(NativeError::new(
-                NativeErrorCode::SecurityViolation,
-                format!(
-                    "binding `{binding_id}` ledger thread_uuid `{:?}` does not match requested thread_uuid `{thread_uuid}`",
-                    ledger.thread_uuid
-                ),
-            ));
-        }
-
-        let job = ledger
-            .jobs
-            .iter()
-            .find(|j| j.job_id == job_id)
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    format!("job `{job_id}` was not found in binding `{binding_id}`"),
-                )
-            })?
-            .clone();
-
-        if job.binding_id != binding_id || job.thread_uuid != thread_uuid {
-            return Err(NativeError::new(
-                NativeErrorCode::SecurityViolation,
-                "job binding_id or thread_uuid does not match requested controller scope",
-            ));
-        }
-
-        if ledger
-            .jobs
-            .iter()
-            .any(|other| other.supersedes_job_id.as_deref() == Some(job.job_id.as_str()))
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                format!(
-                    "job `{}` has been superseded by a newer amendment job and cannot run automatically",
-                    job.job_id
-                ),
-            ));
-        }
-
-        let planning_result = job
-            .planning_result
-            .as_ref()
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    format!(
-                        "job `{}` has no Orchestrator PlanningResultRef; manual unlinked jobs are refused by automatic controller admission",
-                        job.job_id
-                    ),
-                )
-            })?
-            .clone();
-        planning_result.validate()?;
-
-        if !constant_time_str_eq(&planning_result.work_brief_digest, &job.work_brief_digest) {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "job.planning_result.work_brief_digest does not match current job.work_brief_digest",
-            ));
-        }
-        if planning_result.project_base != job.work_brief.project_base {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "job.planning_result.project_base does not match current job.work_brief.project_base",
-            ));
-        }
-        if !job
-            .work_brief
-            .is_ready_for_execution_approval_with_planning(Some(&planning_result))
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "job.work_brief has unresolved open_questions or unconfirmed proposed_additions not covered by planning_result",
-            ));
-        }
-
-        self.verify_planning_provenance_in_ledger(&ledger, &job, &planning_result)?;
+        let (mut job, planning_result) =
+            self.load_and_verify_admitted_job_from_ledger(binding_id, thread_uuid, job_id)?;
 
         let linkage = job
             .approval_linkage
@@ -636,7 +556,7 @@ impl CoworkerControllerService {
             }
         }
 
-        let runtime_state = self
+        let mut runtime_state = self
             .policy_store
             .get_job_runtime_readonly(binding_id, job_id)?
             .ok_or_else(|| {
@@ -663,7 +583,7 @@ impl CoworkerControllerService {
                 )
             })?;
 
-        verify_live_approval_and_registry(
+        verify_approval_and_plan_evidence(
             &approval,
             &job,
             &runtime_state.envelope.policy,
@@ -749,6 +669,15 @@ impl CoworkerControllerService {
             verify_approved_task_matches_coder_choice(approved_task, job_task)?;
         }
 
+        verify_frozen_runtime_registry_or_apply_config_hold(
+            &approval,
+            &mut job,
+            &mut runtime_state,
+            &self.authority,
+            &self.workflow_store,
+            &self.policy_store,
+        )?;
+
         Ok(VerifiedControllerAdmission {
             job,
             planning_result,
@@ -758,6 +687,100 @@ impl CoworkerControllerService {
         })
     }
 
+    #[inline(never)]
+    fn load_and_verify_admitted_job_from_ledger(
+        &self,
+        binding_id: &str,
+        thread_uuid: &str,
+        job_id: &str,
+    ) -> Result<(CoworkerJobRecord, PlanningResultRef), NativeError> {
+        let ledger = self.workflow_store.read_binding_ledger(binding_id)?;
+        ledger.validate(binding_id)?;
+        if ledger.thread_uuid.as_deref() != Some(thread_uuid) {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!(
+                    "binding `{binding_id}` ledger thread_uuid `{:?}` does not match requested thread_uuid `{thread_uuid}`",
+                    ledger.thread_uuid
+                ),
+            ));
+        }
+
+        let job = ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == job_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!("job `{job_id}` was not found in binding `{binding_id}`"),
+                )
+            })?
+            .clone();
+
+        if job.binding_id != binding_id || job.thread_uuid != thread_uuid {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                "job binding_id or thread_uuid does not match requested controller scope",
+            ));
+        }
+
+        if ledger
+            .jobs
+            .iter()
+            .any(|other| other.supersedes_job_id.as_deref() == Some(job.job_id.as_str()))
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "job `{}` has been superseded by a newer amendment job and cannot run automatically",
+                    job.job_id
+                ),
+            ));
+        }
+
+        let planning_result = job
+            .planning_result
+            .as_ref()
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!(
+                        "job `{}` has no Orchestrator PlanningResultRef; manual unlinked jobs are refused by automatic controller admission",
+                        job.job_id
+                    ),
+                )
+            })?
+            .clone();
+        planning_result.validate()?;
+
+        if !constant_time_str_eq(&planning_result.work_brief_digest, &job.work_brief_digest) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "job.planning_result.work_brief_digest does not match current job.work_brief_digest",
+            ));
+        }
+        if planning_result.project_base != job.work_brief.project_base {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "job.planning_result.project_base does not match current job.work_brief.project_base",
+            ));
+        }
+        if !job
+            .work_brief
+            .is_ready_for_execution_approval_with_planning(Some(&planning_result))
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "job.work_brief has unresolved open_questions or unconfirmed proposed_additions not covered by planning_result",
+            ));
+        }
+
+        self.verify_planning_provenance_in_ledger(&ledger, &job, &planning_result)?;
+        Ok((job, planning_result))
+    }
+
+    #[inline(never)]
     fn verify_planning_provenance_in_ledger(
         &self,
         ledger: &CoworkerBindingLedger,
@@ -941,86 +964,8 @@ impl CoworkerControllerService {
         request: &CoworkerControllerStepRequest,
     ) -> Result<CoworkerControllerStepReport, NativeError> {
         let _step_serial_guard = self.step_mutex.lock().await;
-        validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
-        validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
-        if request.now_ms == 0 {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "CoworkerControllerStepRequest.now_ms must be > 0",
-            ));
-        }
-
-        let admission = self.verify_job_admission(
-            guard,
-            &request.binding_id,
-            &request.thread_uuid,
-            &request.job_id,
-        )?;
-
-        let lease_ttl_ms = request
-            .lease_ttl_ms
-            .unwrap_or(DEFAULT_CONTROLLER_LEASE_TTL_MS);
-        let controller_instance_id = deterministic_controller_instance_id(
-            &request.binding_id,
-            &request.job_id,
-            guard.instance_id(),
-        );
-
-        self.reconcile_stale_logical_lease_under_physical_guard(
-            guard,
-            &request.binding_id,
-            &request.thread_uuid,
-            &request.job_id,
-        )?;
-
-        let lease_record = self.policy_store.acquire_or_renew_lease(
-            &request.binding_id,
-            &request.job_id,
-            &controller_instance_id,
-            request.now_ms,
-            lease_ttl_ms,
-        )?;
-        let runtime_after_lease = self
-            .policy_store
-            .get_job_runtime_readonly(&request.binding_id, &request.job_id)?
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::UnauthorizedOperator,
-                    format!(
-                        "no ControllerJobRuntimeState configured in ControllerPolicyStore for job `{}`",
-                        request.job_id
-                    ),
-                )
-            })?;
-        let lease_epoch =
-            require_active_lease_epoch(&runtime_after_lease, &controller_instance_id)?;
-        if lease_record.lease_epoch != lease_epoch {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "controller lease_epoch drifted immediately after acquire_or_renew_lease",
-            ));
-        }
-
-        if let Ok(change_store) =
-            ConversationChangeStore::open_readonly(self.workflow_store.plans_dir())
-        {
-            if let Ok(change_rev) = change_store.current_revision(&request.binding_id) {
-                if change_rev > runtime_after_lease.synced_change_revision {
-                    self.policy_store.mutate_job_runtime(
-                        &request.binding_id,
-                        &request.job_id,
-                        &controller_instance_id,
-                        lease_epoch,
-                        |state| {
-                            if change_rev > state.synced_change_revision {
-                                state.synced_change_revision = change_rev;
-                            }
-                            Ok(())
-                        },
-                    )?;
-                }
-            }
-        }
+        let (controller_instance_id, lease_epoch, approval, approved_by_id, task_ids) =
+            self.prepare_step_job(guard, request)?;
 
         let host_client = ApprovedHostClient::new(
             Arc::clone(&self.authority),
@@ -1030,27 +975,12 @@ impl CoworkerControllerService {
         )
         .map_err(map_host_error)?;
 
-        let approval = admission.approval;
-        let approved_by_id: BTreeMap<String, ApprovedTaskRecord> = approval
-            .tasks
-            .iter()
-            .cloned()
-            .map(|t| (t.task_id.clone(), t))
-            .collect();
-
         let mut promoted_dependency_ready_task_ids = Vec::new();
         let mut reconciled_ready_for_review_task_ids = Vec::new();
         let mut dispatched_task_ids = Vec::new();
         let mut fenced_task_ids = Vec::new();
 
         // Pass 1: Query live host task snapshots and reconcile existing attempts / dependency seals.
-        let task_ids: Vec<String> = admission
-            .job
-            .tasks
-            .iter()
-            .map(|t| t.task_id.clone())
-            .collect();
-
         for task_id in &task_ids {
             self.verify_physical_ownership(
                 guard,
@@ -1094,77 +1024,14 @@ impl CoworkerControllerService {
         }
 
         // Pass 2: Bounded parallel dispatch of ready initial Coder tasks (`attempt_no == 1`).
-        loop {
-            self.verify_physical_ownership(
-                guard,
-                &request.binding_id,
-                &request.thread_uuid,
-                &request.job_id,
-            )?;
-
-            let current_adm = self.verify_job_admission(
-                guard,
-                &request.binding_id,
-                &request.thread_uuid,
-                &request.job_id,
-            )?;
-
-            if require_active_lease_epoch(&current_adm.runtime_state, &controller_instance_id)?
-                != lease_epoch
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "controller lease_epoch changed concurrently during step_job",
-                ));
-            }
-
-            if current_adm.runtime_state.stop_requested
-                || current_adm.job.phase != CoworkerJobPhase::Executing
-            {
-                for t in &current_adm.job.tasks {
-                    if t.stage == CoworkerTaskStage::ReadyToDispatch
-                        && !fenced_task_ids.contains(&t.task_id)
-                    {
-                        fenced_task_ids.push(t.task_id.clone());
-                    }
-                }
-                break;
-            }
-
-            // Count currently active/in-flight Coder tasks (including derived attempts) against `approval.max_parallel`.
-            let active_in_flight =
-                count_active_coder_executions(&current_adm.job, &current_adm.runtime_state);
-
-            if active_in_flight >= approval.max_parallel {
-                break;
-            }
-
-            // Select the next `ReadyToDispatch` task in plan order that is not fenced.
-            let mut next_candidate: Option<CoworkerTaskRecord> = None;
-            for task in &current_adm.job.tasks {
-                if task.stage != CoworkerTaskStage::ReadyToDispatch {
-                    continue;
-                }
-                if is_task_fenced_by_hold_or_sibling(
-                    task,
-                    &current_adm.job,
-                    &current_adm.runtime_state,
-                    &approval.approval_id,
-                    self.workflow_store.plans_dir(),
-                )? {
-                    if !fenced_task_ids.contains(&task.task_id) {
-                        fenced_task_ids.push(task.task_id.clone());
-                    }
-                    continue;
-                }
-                next_candidate = Some(task.clone());
-                break;
-            }
-
-            let Some(candidate_task) = next_candidate else {
-                break;
-            };
-
+        while let Some(candidate_task) = self.select_next_dispatch_candidate(
+            guard,
+            request,
+            &approval,
+            &controller_instance_id,
+            lease_epoch,
+            &mut fenced_task_ids,
+        )? {
             let approved_task = approved_by_id.get(&candidate_task.task_id).ok_or_else(|| {
                 NativeError::new(
                     NativeErrorCode::ValidationFailed,
@@ -1246,6 +1113,201 @@ impl CoworkerControllerService {
         .await
     }
 
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn prepare_step_job(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        request: &CoworkerControllerStepRequest,
+    ) -> Result<
+        (
+            String,
+            u64,
+            ApprovalRecord,
+            BTreeMap<String, ApprovedTaskRecord>,
+            Vec<String>,
+        ),
+        NativeError,
+    > {
+        validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+        validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+        if request.now_ms == 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CoworkerControllerStepRequest.now_ms must be > 0",
+            ));
+        }
+
+        let admission = self.verify_job_admission(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+
+        let lease_ttl_ms = request
+            .lease_ttl_ms
+            .unwrap_or(DEFAULT_CONTROLLER_LEASE_TTL_MS);
+        let controller_instance_id = deterministic_controller_instance_id(
+            &request.binding_id,
+            &request.job_id,
+            guard.instance_id(),
+        );
+
+        self.reconcile_stale_logical_lease_under_physical_guard(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+
+        let lease_record = self.policy_store.acquire_or_renew_lease(
+            &request.binding_id,
+            &request.job_id,
+            &controller_instance_id,
+            request.now_ms,
+            lease_ttl_ms,
+        )?;
+        let runtime_after_lease = self
+            .policy_store
+            .get_job_runtime_readonly(&request.binding_id, &request.job_id)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::UnauthorizedOperator,
+                    format!(
+                        "no ControllerJobRuntimeState configured in ControllerPolicyStore for job `{}`",
+                        request.job_id
+                    ),
+                )
+            })?;
+        let lease_epoch =
+            require_active_lease_epoch(&runtime_after_lease, &controller_instance_id)?;
+        if lease_record.lease_epoch != lease_epoch {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "controller lease_epoch drifted immediately after acquire_or_renew_lease",
+            ));
+        }
+
+        if let Ok(change_store) =
+            ConversationChangeStore::open_readonly(self.workflow_store.plans_dir())
+        {
+            if let Ok(change_rev) = change_store.current_revision(&request.binding_id) {
+                if change_rev > runtime_after_lease.synced_change_revision {
+                    self.policy_store.mutate_job_runtime(
+                        &request.binding_id,
+                        &request.job_id,
+                        &controller_instance_id,
+                        lease_epoch,
+                        |state| {
+                            if change_rev > state.synced_change_revision {
+                                state.synced_change_revision = change_rev;
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
+            }
+        }
+
+        let approval = admission.approval;
+        let approved_by_id: BTreeMap<String, ApprovedTaskRecord> = approval
+            .tasks
+            .iter()
+            .cloned()
+            .map(|t| (t.task_id.clone(), t))
+            .collect();
+        let task_ids: Vec<String> = admission
+            .job
+            .tasks
+            .iter()
+            .map(|t| t.task_id.clone())
+            .collect();
+
+        Ok((
+            controller_instance_id,
+            lease_epoch,
+            approval,
+            approved_by_id,
+            task_ids,
+        ))
+    }
+
+    #[inline(never)]
+    fn select_next_dispatch_candidate(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        request: &CoworkerControllerStepRequest,
+        approval: &ApprovalRecord,
+        controller_instance_id: &str,
+        lease_epoch: u64,
+        fenced_task_ids: &mut Vec<String>,
+    ) -> Result<Option<CoworkerTaskRecord>, NativeError> {
+        self.verify_physical_ownership(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+
+        let current_adm = self.verify_job_admission(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+
+        if require_active_lease_epoch(&current_adm.runtime_state, controller_instance_id)?
+            != lease_epoch
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "controller lease_epoch changed concurrently during step_job",
+            ));
+        }
+
+        if current_adm.runtime_state.stop_requested
+            || current_adm.job.phase != CoworkerJobPhase::Executing
+        {
+            for t in &current_adm.job.tasks {
+                if t.stage == CoworkerTaskStage::ReadyToDispatch
+                    && !fenced_task_ids.contains(&t.task_id)
+                {
+                    fenced_task_ids.push(t.task_id.clone());
+                }
+            }
+            return Ok(None);
+        }
+
+        let active_in_flight =
+            count_active_coder_executions(&current_adm.job, &current_adm.runtime_state);
+        if active_in_flight >= approval.max_parallel {
+            return Ok(None);
+        }
+
+        for task in &current_adm.job.tasks {
+            if task.stage != CoworkerTaskStage::ReadyToDispatch {
+                continue;
+            }
+            if is_task_fenced_by_hold_or_sibling(
+                task,
+                &current_adm.job,
+                &current_adm.runtime_state,
+                &approval.approval_id,
+                self.workflow_store.plans_dir(),
+            )? {
+                if !fenced_task_ids.contains(&task.task_id) {
+                    fenced_task_ids.push(task.task_id.clone());
+                }
+                continue;
+            }
+            return Ok(Some(task.clone()));
+        }
+
+        Ok(None)
+    }
+
+    #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn reconcile_single_task_snapshot(
         &self,
@@ -2152,50 +2214,18 @@ impl CoworkerControllerService {
         reconciled_ready_for_review_task_ids: &mut Vec<String>,
         fenced_task_ids: &mut Vec<String>,
     ) -> Result<(), NativeError> {
-        self.verify_physical_ownership(
-            guard,
-            &request.binding_id,
-            &request.thread_uuid,
-            &request.job_id,
-        )?;
-
-        let current_adm = self.verify_job_admission(
-            guard,
-            &request.binding_id,
-            &request.thread_uuid,
-            &request.job_id,
-        )?;
-        if require_active_lease_epoch(&current_adm.runtime_state, controller_instance_id)?
-            != lease_epoch
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "controller lease_epoch changed before task dispatch",
-            ));
-        }
-
-        let command_key = approved_task_command_key(approved_task)?;
-
-        // Intent-before-host-dispatch: reserve role call, job attempt cap, and task outbox.
-        let (job_after_reserve, outbox) = self.ensure_initial_coder_outbox_and_effect(
-            request,
-            &current_adm,
-            approved_task,
-            candidate_task,
-            &command_key,
-            controller_instance_id,
-            lease_epoch,
-        )?;
-        if outbox.status != OutboxDispatchStatus::ReservedBeforeEffect {
+        let Some((reserved_job_revision, command_key, outbox_id)) = self
+            .reserve_initial_coder_dispatch_before_effect(
+                guard,
+                request,
+                approved_task,
+                candidate_task,
+                controller_instance_id,
+                lease_epoch,
+            )?
+        else {
             return Ok(());
-        }
-
-        self.verify_physical_ownership(
-            guard,
-            &request.binding_id,
-            &request.thread_uuid,
-            &request.job_id,
-        )?;
+        };
 
         let dispatch_res = host_client
             .dispatch_task(&approval.approval_id, &candidate_task.task_id)
@@ -2237,9 +2267,9 @@ impl CoworkerControllerService {
                             binding_id: request.binding_id.clone(),
                             thread_uuid: request.thread_uuid.clone(),
                             job_id: request.job_id.clone(),
-                            expected_job_revision: job_after_reserve.job_revision,
+                            expected_job_revision: reserved_job_revision,
                             expected_ledger_revision: None,
-                            outbox_id: outbox.outbox_id,
+                            outbox_id,
                             status: OutboxDispatchStatus::ReconciledNotExecuted,
                             next_task_stage: CoworkerTaskStage::ReadyToDispatch,
                             run_id: None,
@@ -2281,9 +2311,9 @@ impl CoworkerControllerService {
                             binding_id: request.binding_id.clone(),
                             thread_uuid: request.thread_uuid.clone(),
                             job_id: request.job_id.clone(),
-                            expected_job_revision: job_after_reserve.job_revision,
+                            expected_job_revision: reserved_job_revision,
                             expected_ledger_revision: None,
-                            outbox_id: outbox.outbox_id,
+                            outbox_id,
                             status: OutboxDispatchStatus::EffectUnknown,
                             next_task_stage: CoworkerTaskStage::EffectUnknown,
                             run_id: None,
@@ -2329,6 +2359,132 @@ impl CoworkerControllerService {
         }
     }
 
+    #[inline(never)]
+    fn reserve_initial_coder_dispatch_before_effect(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        request: &CoworkerControllerStepRequest,
+        approved_task: &ApprovedTaskRecord,
+        candidate_task: &CoworkerTaskRecord,
+        controller_instance_id: &str,
+        lease_epoch: u64,
+    ) -> Result<Option<(u64, String, String)>, NativeError> {
+        self.verify_physical_ownership(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+
+        let current_adm = self.verify_job_admission(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+        if require_active_lease_epoch(&current_adm.runtime_state, controller_instance_id)?
+            != lease_epoch
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "controller lease_epoch changed before task dispatch",
+            ));
+        }
+
+        if candidate_task.task_id != approved_task.task_id {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "candidate_task.task_id does not match approved_task.task_id",
+            ));
+        }
+        verify_approved_task_matches_coder_choice(approved_task, candidate_task)?;
+        let command_key = approved_task_command_key(approved_task)?;
+        verify_no_conflicting_initial_coder_key(
+            &current_adm.job,
+            &current_adm.runtime_state,
+            &candidate_task.task_id,
+            &command_key,
+        )?;
+
+        let current_task = current_adm
+            .job
+            .tasks
+            .iter()
+            .find(|t| t.task_id == candidate_task.task_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    format!("task `{}` not found in job", candidate_task.task_id),
+                )
+            })?;
+        if !constant_time_str_eq(&current_task.task_digest, &candidate_task.task_digest)
+            || current_task.role != candidate_task.role
+            || current_task.difficulty != candidate_task.difficulty
+            || current_task.selected_choice != candidate_task.selected_choice
+            || current_task.depends_on != candidate_task.depends_on
+            || current_task.write_paths != candidate_task.write_paths
+            || current_task.owned_interfaces != candidate_task.owned_interfaces
+            || current_task.consumed_interfaces != candidate_task.consumed_interfaces
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "task `{}` immutable specification drifted before dispatch",
+                    candidate_task.task_id
+                ),
+            ));
+        }
+
+        if current_adm.runtime_state.stop_requested
+            || current_adm.job.phase != CoworkerJobPhase::Executing
+            || current_task.stage != CoworkerTaskStage::ReadyToDispatch
+            || current_task != candidate_task
+            || current_task.unresolved_outbox_id.is_some()
+            || task_has_derived_attempt_or_post_initial_state(
+                current_task,
+                &current_adm.runtime_state,
+            )
+            || count_active_coder_executions(&current_adm.job, &current_adm.runtime_state)
+                >= current_adm.approval.max_parallel
+            || is_task_fenced_by_hold_or_sibling(
+                current_task,
+                &current_adm.job,
+                &current_adm.runtime_state,
+                &current_adm.approval.approval_id,
+                self.workflow_store.plans_dir(),
+            )?
+        {
+            return Ok(None);
+        }
+
+        // Intent-before-host-dispatch: reserve role call, job attempt cap, and task outbox.
+        let (job_after_reserve, outbox) = self.ensure_initial_coder_outbox_and_effect(
+            request,
+            &current_adm,
+            approved_task,
+            current_task,
+            &command_key,
+            controller_instance_id,
+            lease_epoch,
+        )?;
+        if outbox.status != OutboxDispatchStatus::ReservedBeforeEffect {
+            return Ok(None);
+        }
+
+        self.verify_physical_ownership(
+            guard,
+            &request.binding_id,
+            &request.thread_uuid,
+            &request.job_id,
+        )?;
+
+        Ok(Some((
+            job_after_reserve.job_revision,
+            command_key,
+            outbox.outbox_id,
+        )))
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn build_step_report(
         &self,
@@ -2348,12 +2504,12 @@ impl CoworkerControllerService {
         let mut unknown_effect_task_ids = Vec::new();
         let mut active_running_count = 0usize;
 
-        let final_adm = self.verify_job_admission(
+        let final_adm = Box::new(self.verify_job_admission(
             guard,
             &request.binding_id,
             &request.thread_uuid,
             &request.job_id,
-        )?;
+        )?);
         if require_active_lease_epoch(&final_adm.runtime_state, &controller_instance_id)?
             != lease_epoch
         {
@@ -2432,85 +2588,145 @@ impl CoworkerControllerService {
                 )?;
             }
 
-            let refreshed_ledger = self
-                .workflow_store
-                .read_binding_ledger(&request.binding_id)?;
-            let refreshed_job = refreshed_ledger
-                .jobs
-                .iter()
-                .find(|j| j.job_id == request.job_id)
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "job disappeared during step report",
-                    )
-                })?;
-            let refreshed_task = refreshed_job
-                .tasks
-                .iter()
-                .find(|t| t.task_id == task.task_id)
-                .ok_or_else(|| {
-                    NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "task disappeared during step report",
-                    )
-                })?;
-            let refreshed_runtime = self
-                .policy_store
-                .get_job_runtime_readonly(&request.binding_id, &request.job_id)?
-                .unwrap_or_else(|| final_adm.runtime_state.clone());
-
-            let fenced = fenced_task_ids.contains(&task.task_id)
-                || refreshed_task.stage == CoworkerTaskStage::Held
-                || !refreshed_task.active_hold_ids.is_empty();
-            if fenced && !fenced_task_ids.contains(&task.task_id) {
-                fenced_task_ids.push(task.task_id.clone());
-            }
-
-            if (refreshed_task.stage == CoworkerTaskStage::EffectUnknown
-                || snap.status == TaskExecutionStatus::Unknown)
-                && !unknown_effect_task_ids.contains(&task.task_id)
-            {
-                unknown_effect_task_ids.push(task.task_id.clone());
-            }
-
-            let has_derived_state =
-                task_has_derived_attempt_or_post_initial_state(refreshed_task, &refreshed_runtime);
-            if is_task_coder_execution_active(refreshed_task, refreshed_job, &refreshed_runtime)
-                || (!has_derived_state
-                    && matches!(
-                        snap.status,
-                        TaskExecutionStatus::Queued
-                            | TaskExecutionStatus::Claimed
-                            | TaskExecutionStatus::Running
-                            | TaskExecutionStatus::CancelRequested
-                    ))
-            {
-                active_running_count += 1;
-            }
-
-            let command_key = approved_task_command_key(approved_task)?;
-            observations.push(CoworkerControllerTaskObservation {
-                task_id: task.task_id.clone(),
-                stage: refreshed_task.stage,
-                host_status: snap.status,
-                command_key,
-                run_id: snap.run_id.clone(),
-                worker_id: snap.worker_id.clone(),
-                task_worktree_id: snap
-                    .worker
-                    .as_ref()
-                    .and_then(|w| w.worktree.task_worktree_id.clone()),
-                observed_model: snap.worker.as_ref().and_then(|w| w.observed_model.clone()),
-                observed_effort: snap.worker.as_ref().and_then(|w| w.observed_effort.clone()),
-                watchdog_attention: snap
-                    .worker
-                    .as_ref()
-                    .and_then(|w| w.progress.watchdog_attention.clone()),
-                fenced,
-            });
+            self.record_task_step_observation(
+                request,
+                &final_adm.runtime_state,
+                &task.task_id,
+                approved_task,
+                &snap,
+                &mut fenced_task_ids,
+                &mut unknown_effect_task_ids,
+                &mut active_running_count,
+                &mut observations,
+            )?;
         }
 
+        drop(final_adm);
+        self.finalize_step_report(
+            guard,
+            request,
+            approval,
+            controller_instance_id,
+            dispatched_task_ids,
+            reconciled_ready_for_review_task_ids,
+            promoted_dependency_ready_task_ids,
+            fenced_task_ids,
+            unknown_effect_task_ids,
+            active_running_count,
+            observations,
+        )
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn record_task_step_observation(
+        &self,
+        request: &CoworkerControllerStepRequest,
+        fallback_runtime: &ControllerJobRuntimeState,
+        task_id: &str,
+        approved_task: &ApprovedTaskRecord,
+        snap: &TaskStateSnapshot,
+        fenced_task_ids: &mut Vec<String>,
+        unknown_effect_task_ids: &mut Vec<String>,
+        active_running_count: &mut usize,
+        observations: &mut Vec<CoworkerControllerTaskObservation>,
+    ) -> Result<(), NativeError> {
+        let refreshed_ledger = self
+            .workflow_store
+            .read_binding_ledger(&request.binding_id)?;
+        let refreshed_job = refreshed_ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == request.job_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "job disappeared during step report",
+                )
+            })?;
+        let refreshed_task = refreshed_job
+            .tasks
+            .iter()
+            .find(|t| t.task_id == task_id)
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "task disappeared during step report",
+                )
+            })?;
+        let refreshed_runtime_opt = self
+            .policy_store
+            .get_job_runtime_readonly(&request.binding_id, &request.job_id)?;
+        let refreshed_runtime = refreshed_runtime_opt.as_ref().unwrap_or(fallback_runtime);
+
+        let fenced = fenced_task_ids.iter().any(|id| id == task_id)
+            || refreshed_task.stage == CoworkerTaskStage::Held
+            || !refreshed_task.active_hold_ids.is_empty();
+        if fenced && !fenced_task_ids.iter().any(|id| id == task_id) {
+            fenced_task_ids.push(task_id.to_string());
+        }
+
+        if (refreshed_task.stage == CoworkerTaskStage::EffectUnknown
+            || snap.status == TaskExecutionStatus::Unknown)
+            && !unknown_effect_task_ids.iter().any(|id| id == task_id)
+        {
+            unknown_effect_task_ids.push(task_id.to_string());
+        }
+
+        let has_derived_state =
+            task_has_derived_attempt_or_post_initial_state(refreshed_task, refreshed_runtime);
+        if is_task_coder_execution_active(refreshed_task, refreshed_job, refreshed_runtime)
+            || (!has_derived_state
+                && matches!(
+                    snap.status,
+                    TaskExecutionStatus::Queued
+                        | TaskExecutionStatus::Claimed
+                        | TaskExecutionStatus::Running
+                        | TaskExecutionStatus::CancelRequested
+                ))
+        {
+            *active_running_count += 1;
+        }
+
+        let command_key = approved_task_command_key(approved_task)?;
+        observations.push(CoworkerControllerTaskObservation {
+            task_id: task_id.to_string(),
+            stage: refreshed_task.stage,
+            host_status: snap.status,
+            command_key,
+            run_id: snap.run_id.clone(),
+            worker_id: snap.worker_id.clone(),
+            task_worktree_id: snap
+                .worker
+                .as_ref()
+                .and_then(|w| w.worktree.task_worktree_id.clone()),
+            observed_model: snap.worker.as_ref().and_then(|w| w.observed_model.clone()),
+            observed_effort: snap.worker.as_ref().and_then(|w| w.observed_effort.clone()),
+            watchdog_attention: snap
+                .worker
+                .as_ref()
+                .and_then(|w| w.progress.watchdog_attention.clone()),
+            fenced,
+        });
+        Ok(())
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_step_report(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        request: &CoworkerControllerStepRequest,
+        approval: &ApprovalRecord,
+        controller_instance_id: String,
+        dispatched_task_ids: Vec<String>,
+        reconciled_ready_for_review_task_ids: Vec<String>,
+        promoted_dependency_ready_task_ids: Vec<String>,
+        fenced_task_ids: Vec<String>,
+        unknown_effect_task_ids: Vec<String>,
+        active_running_count: usize,
+        observations: Vec<CoworkerControllerTaskObservation>,
+    ) -> Result<CoworkerControllerStepReport, NativeError> {
         let refreshed_adm = self.verify_job_admission(
             guard,
             &request.binding_id,

@@ -42,11 +42,11 @@ use crate::coworker_workflow::contracts::{
     TaskCandidateRef, MAX_COWORKER_ID_LEN,
 };
 use crate::coworker_workflow::controller_policy::{
-    sanitize_controller_diagnostic, verify_live_approval_and_registry,
-    ClosureExecutionArtifactRecord, ControllerJobRuntimeState, ControllerPolicyStore,
-    FrozenControllerExecutionEnvelope, LoadedClosureExecutionArtifact, PendingControllerEffect,
-    PendingControllerEffectKind, PendingControllerEffectStatus,
-    PersistClosureExecutionArtifactRequest,
+    prove_registry_snapshot_equivalence_to_frozen_authority, sanitize_controller_diagnostic,
+    verify_frozen_runtime_registry_or_apply_config_hold, ClosureExecutionArtifactRecord,
+    ControllerJobRuntimeState, ControllerPolicyStore, FrozenControllerExecutionEnvelope,
+    LoadedClosureExecutionArtifact, PendingControllerEffect, PendingControllerEffectKind,
+    PendingControllerEffectStatus, PersistClosureExecutionArtifactRequest,
 };
 use crate::coworker_workflow::store::{
     CoworkerLedgerMutationOutcome, CoworkerWorkflowStore, RecordCombinedCandidateRequest,
@@ -288,6 +288,39 @@ pub struct ExecuteFinalCandidateClosureOutcome {
     pub verdict: Option<ClosureVerdict>,
     /// `true` when an existing verified `Accepted` closure verdict for the identical subject was reused without invoking a worker.
     pub reused_cached_verdict: bool,
+}
+
+struct RecoveredClosureExecution {
+    provider: WorkerProvider,
+    closure_budget: super::controller_policy::ControllerRoleExecutionBudget,
+    closure_store: FinalCandidateClosureStore,
+    submitted_ledger_rev: u64,
+    reserved_attempt: ClosureAttemptRecord,
+    effect_id: String,
+    structured_exec: AdvisoryStructuredExecution,
+    actual_observed_model: Option<String>,
+    actual_observed_effort: Option<String>,
+    recorded_at_ms: i64,
+    cumulative_runtime_ms: u64,
+    obs_ctx: Option<(CoworkerCallObservationHandle, String)>,
+}
+
+struct PreparedClosureWorkerDispatch {
+    provider: WorkerProvider,
+    closure_budget: super::controller_policy::ControllerRoleExecutionBudget,
+    closure_store: FinalCandidateClosureStore,
+    submitted_ledger_rev: u64,
+    reserved_attempt: ClosureAttemptRecord,
+    effect_id: String,
+    advisory_spec: AdvisoryWorkerSpec,
+    response_budget: AdvisoryResponseBudget,
+    obs_handle: CoworkerCallObservationHandle,
+}
+
+enum PreparedFinalCandidateClosure {
+    Cached(Box<ExecuteFinalCandidateClosureOutcome>),
+    Recovered(Box<RecoveredClosureExecution>),
+    NeedsWorkerDispatch(Box<PreparedClosureWorkerDispatch>),
 }
 
 /// Service assembling verified combined candidates from integrated task receipts and binding
@@ -729,6 +762,7 @@ impl CoworkerCandidateService {
         )
     }
 
+    #[inline(never)]
     fn assemble_and_inspect_operations_candidate_internal(
         &self,
         authority: &AuthorityStore,
@@ -753,11 +787,11 @@ impl CoworkerCandidateService {
 
         self.verify_check_evidence_for_candidate(&request.check_evidence)?;
 
-        let ledger = self.store.read_binding_ledger(&request.binding_id)?;
+        let mut ledger = self.store.read_binding_ledger(&request.binding_id)?;
         ensure_ledger_thread_scope(&ledger.thread_uuid, &request.thread_uuid)?;
         let job = ledger
             .jobs
-            .iter()
+            .iter_mut()
             .find(|j| j.job_id == request.job_id)
             .ok_or_else(|| {
                 NativeError::new(
@@ -777,14 +811,16 @@ impl CoworkerCandidateService {
             ));
         }
 
-        let runtime = policy_store
-            .read_job_runtime(&request.binding_id, &request.job_id)?
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::NotConfigured,
-                    "ControllerJobRuntimeState with frozen execution envelope is required before assembling operations candidate",
-                )
-            })?;
+        let mut runtime = Box::new(
+            policy_store
+                .read_job_runtime(&request.binding_id, &request.job_id)?
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::NotConfigured,
+                        "ControllerJobRuntimeState with frozen execution envelope is required before assembling operations candidate",
+                    )
+                })?,
+        );
         if runtime.stop_requested {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -792,22 +828,47 @@ impl CoworkerCandidateService {
             ));
         }
         runtime.envelope.verify_matches_job(job)?;
+        let approval_id = job
+            .approval_linkage
+            .as_ref()
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "job has no FrozenApprovalLinkage",
+                )
+            })?
+            .approval_id
+            .clone();
+        {
+            let approval = authority.get_for_operator(&approval_id).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "frozen approval_id was not found in AuthorityStore",
+                )
+            })?;
+            verify_approval_tasks_match_job(&approval, job)?;
+            verify_frozen_runtime_registry_or_apply_config_hold(
+                &approval,
+                job,
+                &mut runtime,
+                authority,
+                &self.store,
+                policy_store,
+            )?;
+        }
+        let job = &*job;
+        if job.holds.iter().any(|h| h.active) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "cannot assemble a combined candidate while the job has an active workflow hold",
+            ));
+        }
         let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "job has no FrozenApprovalLinkage",
             )
         })?;
-        let approval = authority
-            .get_for_operator(&linkage.approval_id)
-            .map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "frozen approval_id was not found in AuthorityStore",
-                )
-            })?;
-        verify_live_approval_and_registry(&approval, job, &runtime.envelope.policy, authority)?;
-        verify_approval_tasks_match_job(&approval, job)?;
 
         if !runtime.envelope.allow_run_integration_execution {
             return Err(NativeError::new(
@@ -1102,6 +1163,38 @@ impl CoworkerCandidateService {
         policy_store: &ControllerPolicyStore,
         request: &ExecuteFinalCandidateClosureRequest,
     ) -> Result<ExecuteFinalCandidateClosureOutcome, NativeError> {
+        let execution =
+            match self.prepare_final_candidate_closure(authority, policy_store, request)? {
+                PreparedFinalCandidateClosure::Cached(outcome) => return Ok(*outcome),
+                PreparedFinalCandidateClosure::Recovered(recovered) => recovered,
+                PreparedFinalCandidateClosure::NeedsWorkerDispatch(dispatch) => {
+                    let worker_res = run_advisory_worker_with_structured_result(
+                        &dispatch.advisory_spec,
+                        dispatch.response_budget,
+                    )
+                    .await;
+                    match self.record_dispatched_closure_worker_result(
+                        policy_store,
+                        request,
+                        dispatch,
+                        worker_res,
+                    )? {
+                        Ok(exec) => exec,
+                        Err(unknown_outcome) => return Ok(*unknown_outcome),
+                    }
+                }
+            };
+
+        self.finalize_final_candidate_closure(authority, policy_store, request, execution)
+    }
+
+    #[inline(never)]
+    fn prepare_final_candidate_closure(
+        &self,
+        authority: &AuthorityStore,
+        policy_store: &ControllerPolicyStore,
+        request: &ExecuteFinalCandidateClosureRequest,
+    ) -> Result<PreparedFinalCandidateClosure, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.command_key, "command_key", MAX_COWORKER_ID_LEN)?;
@@ -1115,11 +1208,11 @@ impl CoworkerCandidateService {
             .map_err(map_operations_error)?;
         verify_subject_job_aggregation_intent_if_present(&request.final_subject)?;
 
-        let ledger = self.store.read_binding_ledger(&request.binding_id)?;
+        let mut ledger = self.store.read_binding_ledger(&request.binding_id)?;
         ensure_ledger_thread_scope(&ledger.thread_uuid, &request.thread_uuid)?;
         let job = ledger
             .jobs
-            .iter()
+            .iter_mut()
             .find(|j| j.job_id == request.job_id)
             .ok_or_else(|| {
                 NativeError::new(
@@ -1141,14 +1234,16 @@ impl CoworkerCandidateService {
             ));
         }
 
-        let runtime = policy_store
-            .read_job_runtime(&request.binding_id, &request.job_id)?
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::NotConfigured,
-                    "ControllerJobRuntimeState is not configured for this job",
-                )
-            })?;
+        let mut runtime = Box::new(
+            policy_store
+                .read_job_runtime(&request.binding_id, &request.job_id)?
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::NotConfigured,
+                        "ControllerJobRuntimeState is not configured for this job",
+                    )
+                })?,
+        );
         if runtime.stop_requested {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -1156,21 +1251,47 @@ impl CoworkerCandidateService {
             ));
         }
         runtime.envelope.verify_matches_job(job)?;
+        let approval_id = job
+            .approval_linkage
+            .as_ref()
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "job has no FrozenApprovalLinkage",
+                )
+            })?
+            .approval_id
+            .clone();
+        {
+            let approval = authority.get_for_operator(&approval_id).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "frozen approval_id was not found in AuthorityStore",
+                )
+            })?;
+            verify_approval_tasks_match_job(&approval, job)?;
+            verify_frozen_runtime_registry_or_apply_config_hold(
+                &approval,
+                job,
+                &mut runtime,
+                authority,
+                &self.store,
+                policy_store,
+            )?;
+        }
+        let job = &*job;
+        if job.holds.iter().any(|h| h.active) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "cannot execute Closure while the job has an active workflow hold",
+            ));
+        }
         let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
                 "job has no FrozenApprovalLinkage",
             )
         })?;
-        let approval = authority
-            .get_for_operator(&linkage.approval_id)
-            .map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "frozen approval_id was not found in AuthorityStore",
-                )
-            })?;
-        verify_live_approval_and_registry(&approval, job, &runtime.envelope.policy, authority)?;
 
         let combined_cand = job
             .combined_candidates
@@ -1276,17 +1397,7 @@ impl CoworkerCandidateService {
             })
             .cloned();
 
-        let (
-            submitted_ledger_rev,
-            reserved_attempt,
-            effect_id,
-            structured_exec,
-            actual_observed_model,
-            actual_observed_effort,
-            recorded_at_ms,
-            cumulative_runtime_ms,
-            obs_ctx,
-        ) = if let Some(submitted_attempt) = submitted_for_subject {
+        if let Some(submitted_attempt) = submitted_for_subject {
             let effect_id = deterministic_prefixed_id(
                 "threadlane-native:controller-closure-effect:v1",
                 "eff",
@@ -1409,355 +1520,428 @@ impl CoworkerCandidateService {
                 },
             )?;
 
-            (
-                initial_closure_ledger.ledger_revision,
-                submitted_attempt,
-                effect_id,
-                recovered_exec,
-                recovered_model,
-                recovered_effort,
-                recovered_recorded_at_ms,
-                cumulative_ms,
-                None,
-            )
-        } else {
-            let has_cached_accepted = initial_closure_ledger.attempts.iter().any(|a| {
-                a.subject_digest == request.final_subject.subject_digest
-                    && a.state == threadlane_operations::ClosureAttemptState::Terminal
-                    && a.verdict
-                        .as_ref()
-                        .is_some_and(|v| v.kind == ClosureVerdictKind::Accepted)
-            });
+            return Ok(PreparedFinalCandidateClosure::Recovered(Box::new(
+                RecoveredClosureExecution {
+                    provider,
+                    closure_budget,
+                    closure_store,
+                    submitted_ledger_rev: initial_closure_ledger.ledger_revision,
+                    reserved_attempt: submitted_attempt,
+                    effect_id,
+                    structured_exec: recovered_exec,
+                    actual_observed_model: recovered_model,
+                    actual_observed_effort: recovered_effort,
+                    recorded_at_ms: recovered_recorded_at_ms,
+                    cumulative_runtime_ms: cumulative_ms,
+                    obs_ctx: None,
+                },
+            )));
+        }
 
-            if !has_cached_accepted
-                && runtime.pending_effects.values().any(|eff| {
-                    eff.kind == PendingControllerEffectKind::ClosureInvocation
-                        && eff.status.blocks_replay()
-                })
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                    "Unresolved ClosureInvocation PendingControllerEffect blocks blind replay until reconciled.",
-                ));
-            }
+        let has_cached_accepted = initial_closure_ledger.attempts.iter().any(|a| {
+            a.subject_digest == request.final_subject.subject_digest
+                && a.state == threadlane_operations::ClosureAttemptState::Terminal
+                && a.verdict
+                    .as_ref()
+                    .is_some_and(|v| v.kind == ClosureVerdictKind::Accepted)
+        });
 
-            let has_idempotent_reserved = initial_closure_ledger.attempts.iter().any(|a| {
-                a.subject_digest == request.final_subject.subject_digest
-                    && a.state == threadlane_operations::ClosureAttemptState::Reserved
-                    && a.command_key == request.command_key
-            });
-            if !has_cached_accepted && !has_idempotent_reserved {
-                runtime.ensure_role_budget_available(WorkflowRole::Closure)?;
-            }
+        if !has_cached_accepted
+            && runtime.pending_effects.values().any(|eff| {
+                eff.kind == PendingControllerEffectKind::ClosureInvocation
+                    && eff.status.blocks_replay()
+            })
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                "Unresolved ClosureInvocation PendingControllerEffect blocks blind replay until reconciled.",
+            ));
+        }
 
-            let reservation_outcome = closure_store
-                .reserve_closure_attempt(&ReserveClosureAttemptRequest {
-                    expected_ledger_revision: initial_closure_ledger.ledger_revision,
-                    command_key: request.command_key.clone(),
-                    attempt_id: None,
-                    subject: request.final_subject.clone(),
-                    legacy_base_tree_digest: Some(
-                        request.final_subject.approved_base_tree_sha.clone(),
-                    ),
-                    reserved_at_ms: request.current_time_ms,
-                })
-                .map_err(map_operations_error)?;
+        let has_idempotent_reserved = initial_closure_ledger.attempts.iter().any(|a| {
+            a.subject_digest == request.final_subject.subject_digest
+                && a.state == threadlane_operations::ClosureAttemptState::Reserved
+                && a.command_key == request.command_key
+        });
+        if !has_cached_accepted && !has_idempotent_reserved {
+            runtime.ensure_role_budget_available(WorkflowRole::Closure)?;
+        }
 
-            if let ClosureReservationOutcome::CacheHit {
-                ledger_revision,
-                attempt,
-                verdict,
-            } = reservation_outcome
-            {
-                if runtime.closure_artifacts.contains_key(&attempt.attempt_id)
-                    || runtime.closure_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
-                    || policy_store
-                        .closure_artifact_path_for_attempt(
-                            &request.binding_id,
-                            &request.job_id,
-                            &attempt.attempt_id,
-                        )?
-                        .exists()
-                {
-                    let loaded = policy_store.load_closure_execution_artifact(
+        let reservation_outcome = closure_store
+            .reserve_closure_attempt(&ReserveClosureAttemptRequest {
+                expected_ledger_revision: initial_closure_ledger.ledger_revision,
+                command_key: request.command_key.clone(),
+                attempt_id: None,
+                subject: request.final_subject.clone(),
+                legacy_base_tree_digest: Some(request.final_subject.approved_base_tree_sha.clone()),
+                reserved_at_ms: request.current_time_ms,
+            })
+            .map_err(map_operations_error)?;
+
+        if let ClosureReservationOutcome::CacheHit {
+            ledger_revision,
+            attempt,
+            verdict,
+        } = reservation_outcome
+        {
+            if runtime.closure_artifacts.contains_key(&attempt.attempt_id)
+                || runtime.closure_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+                || policy_store
+                    .closure_artifact_path_for_attempt(
                         &request.binding_id,
-                        &request.thread_uuid,
                         &request.job_id,
                         &attempt.attempt_id,
-                    )?;
-                    if loaded.subject_digest != request.final_subject.subject_digest
-                        || loaded.candidate_tree_sha != request.final_subject.candidate_tree_sha
-                        || loaded.fenced_from_promotion
-                    {
-                        return Err(NativeError::new(
-                            NativeErrorCode::ValidationFailed,
-                            "Cached closure execution artifact failed subject binding or promotion fence check.",
-                        ));
-                    }
-                }
-                let updated_job = self.record_closure_outcome_on_job(
+                    )?
+                    .exists()
+            {
+                let loaded = policy_store.load_closure_execution_artifact(
                     &request.binding_id,
                     &request.thread_uuid,
                     &request.job_id,
-                    request.expected_job_revision,
-                    request.expected_ledger_revision,
-                    &request.combined_candidate_id,
                     &attempt.attempt_id,
-                    Some(&verdict),
-                    None,
                 )?;
-                return Ok(ExecuteFinalCandidateClosureOutcome {
+                if loaded.subject_digest != request.final_subject.subject_digest
+                    || loaded.candidate_tree_sha != request.final_subject.candidate_tree_sha
+                    || loaded.fenced_from_promotion
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Cached closure execution artifact failed subject binding or promotion fence check.",
+                    ));
+                }
+            }
+            let updated_job = self.record_closure_outcome_on_job(
+                &request.binding_id,
+                &request.thread_uuid,
+                &request.job_id,
+                request.expected_job_revision,
+                request.expected_ledger_revision,
+                &request.combined_candidate_id,
+                &attempt.attempt_id,
+                Some(&verdict),
+                None,
+            )?;
+            return Ok(PreparedFinalCandidateClosure::Cached(Box::new(
+                ExecuteFinalCandidateClosureOutcome {
                     job: updated_job,
                     closure_ledger_revision: ledger_revision,
                     attempt,
                     verdict: Some(*verdict),
                     reused_cached_verdict: true,
-                });
-            }
-
-            let reserved_ledger_rev = reservation_outcome.ledger_revision();
-            let reserved_attempt = reservation_outcome.attempt().clone();
-
-            let effect_id = deterministic_prefixed_id(
-                "threadlane-native:controller-closure-effect:v1",
-                "eff",
-                &[
-                    &request.job_id,
-                    &reserved_attempt.attempt_id,
-                    &request.command_key,
-                ],
-            );
-            let external_request_id = deterministic_prefixed_id(
-                "threadlane-native:closure-req:v1",
-                "crq",
-                &[
-                    &request.job_id,
-                    &reserved_attempt.attempt_id,
-                    &request.final_subject.subject_digest,
-                ],
-            );
-
-            let executable = resolve_tool_executable(authority, &closure_choice.tool_id)?;
-            let response_budget =
-                AdvisoryResponseBudget::new(closure_budget.max_structured_response_bytes);
-            response_budget
-                .validate()
-                .map_err(|err| NativeError::new(NativeErrorCode::InvalidConfig, err.to_string()))?;
-
-            // Record intent-before-effect in ControllerPolicyStore and reserve 1 closure call budget.
-            let () = policy_store.mutate_job_runtime_for_operator(
-                &request.binding_id,
-                &request.job_id,
-                |state| {
-                    if state.pending_effects.contains_key(&effect_id) {
-                        return Err(NativeError::new(
-                            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                            "ClosureInvocation PendingControllerEffect already exists; refusing blind replay.",
-                        ));
-                    }
-                    let _ = state.reserve_role_call(WorkflowRole::Closure)?;
-                    state.closure_attempt_id = Some(reserved_attempt.attempt_id.clone());
-                    state.pending_effects.insert(
-                        effect_id.clone(),
-                        PendingControllerEffect {
-                            effect_id: effect_id.clone(),
-                            request_key: request.command_key.clone(),
-                            job_id: request.job_id.clone(),
-                            task_id: None,
-                            attempt_no: None,
-                            kind: PendingControllerEffectKind::ClosureInvocation,
-                            status: PendingControllerEffectStatus::ReservedBeforeEffect,
-                            subject_digest: request.final_subject.subject_digest.clone(),
-                            external_correlation_id: Some(reserved_attempt.attempt_id.clone()),
-                            created_at_ms: request.current_time_ms.max(0) as u64,
-                            updated_at_ms: request.current_time_ms.max(0) as u64,
-                            diagnostic: None,
-                        },
-                    );
-                    Ok(())
                 },
-            )?;
+            )));
+        }
 
-            let (submitted_ledger_rev, _submitted_attempt) = closure_store
-                .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
-                    expected_ledger_revision: reserved_ledger_rev,
-                    attempt_id: reserved_attempt.attempt_id.clone(),
-                    command_key: request.command_key.clone(),
-                    expected_subject_digest: request.final_subject.subject_digest.clone(),
-                    external_request_id: external_request_id.clone(),
-                    submitted_at_ms: request.current_time_ms,
-                })
-                .map_err(map_operations_error)?;
+        let reserved_ledger_rev = reservation_outcome.ledger_revision();
+        let reserved_attempt = reservation_outcome.attempt().clone();
 
-            let prompt = build_closure_worker_prompt(&request.final_subject);
-            let mut allowed_models = BTreeSet::new();
-            allowed_models.insert(closure_choice.model_arg.clone());
-            let advisory_spec = AdvisoryWorkerSpec {
+        let effect_id = deterministic_prefixed_id(
+            "threadlane-native:controller-closure-effect:v1",
+            "eff",
+            &[
+                &request.job_id,
+                &reserved_attempt.attempt_id,
+                &request.command_key,
+            ],
+        );
+        let external_request_id = deterministic_prefixed_id(
+            "threadlane-native:closure-req:v1",
+            "crq",
+            &[
+                &request.job_id,
+                &reserved_attempt.attempt_id,
+                &request.final_subject.subject_digest,
+            ],
+        );
+
+        let executable = resolve_verified_closure_tool_executable(
+            authority,
+            job,
+            &runtime.envelope,
+            &closure_choice,
+        )?;
+        let response_budget =
+            AdvisoryResponseBudget::new(closure_budget.max_structured_response_bytes);
+        response_budget
+            .validate()
+            .map_err(|err| NativeError::new(NativeErrorCode::InvalidConfig, err.to_string()))?;
+
+        // Record intent-before-effect in ControllerPolicyStore and reserve 1 closure call budget.
+        let () = policy_store.mutate_job_runtime_for_operator(
+            &request.binding_id,
+            &request.job_id,
+            |state| {
+                if state.pending_effects.contains_key(&effect_id) {
+                    return Err(NativeError::new(
+                        NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                        "ClosureInvocation PendingControllerEffect already exists; refusing blind replay.",
+                    ));
+                }
+                let _ = state.reserve_role_call(WorkflowRole::Closure)?;
+                state.closure_attempt_id = Some(reserved_attempt.attempt_id.clone());
+                state.pending_effects.insert(
+                    effect_id.clone(),
+                    PendingControllerEffect {
+                        effect_id: effect_id.clone(),
+                        request_key: request.command_key.clone(),
+                        job_id: request.job_id.clone(),
+                        task_id: None,
+                        attempt_no: None,
+                        kind: PendingControllerEffectKind::ClosureInvocation,
+                        status: PendingControllerEffectStatus::ReservedBeforeEffect,
+                        subject_digest: request.final_subject.subject_digest.clone(),
+                        external_correlation_id: Some(reserved_attempt.attempt_id.clone()),
+                        created_at_ms: request.current_time_ms.max(0) as u64,
+                        updated_at_ms: request.current_time_ms.max(0) as u64,
+                        diagnostic: None,
+                    },
+                );
+                Ok(())
+            },
+        )?;
+
+        let (submitted_ledger_rev, _submitted_attempt) = closure_store
+            .mark_closure_attempt_submitted(&MarkClosureSubmittedRequest {
+                expected_ledger_revision: reserved_ledger_rev,
+                attempt_id: reserved_attempt.attempt_id.clone(),
+                command_key: request.command_key.clone(),
+                expected_subject_digest: request.final_subject.subject_digest.clone(),
+                external_request_id: external_request_id.clone(),
+                submitted_at_ms: request.current_time_ms,
+            })
+            .map_err(map_operations_error)?;
+
+        let prompt = build_closure_worker_prompt(&request.final_subject);
+        let mut allowed_models = BTreeSet::new();
+        allowed_models.insert(closure_choice.model_arg.clone());
+        let advisory_spec = AdvisoryWorkerSpec {
+            provider,
+            executable,
+            model: closure_choice.model_arg.clone(),
+            effort: closure_choice.effort.clone(),
+            allowed_models,
+            session_id: None,
+            standalone: provider == WorkerProvider::OpenCodeV2,
+            working_directory: request.final_subject.integration_checkout_path.clone(),
+            allowed_write_paths: BTreeSet::new(),
+            prompt,
+            file_permissions: WorkerFilePermissions::ReadOnly,
+            budgets: ExecutionBudgets {
+                progress_watchdog: None,
+                timeout_ms: closure_budget.max_timeout_ms_per_call,
+                max_stdout_bytes: closure_budget.max_stdout_bytes_per_call,
+                max_stderr_bytes: closure_budget.max_stderr_bytes_per_call,
+                max_line_bytes: DEFAULT_MAX_LINE_BYTES
+                    .max(
+                        closure_budget
+                            .max_structured_response_bytes
+                            .saturating_mul(2),
+                    )
+                    .min(MAX_LINE_BYTES)
+                    .min(closure_budget.max_stdout_bytes_per_call),
+                max_events: MAX_EVENTS,
+            },
+        };
+
+        let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
+            journal_dir: self.store.plans_dir().to_path_buf(),
+            operation: COWORKER_OBS_OP_CLOSURE_CANDIDATE.to_string(),
+            title: format!(
+                "Final candidate closure `{}`",
+                request.combined_candidate_id
+            ),
+            call_key: effect_id.clone(),
+            binding_id: request.binding_id.clone(),
+            thread_uuid: request.thread_uuid.clone(),
+            repository_path: request.final_subject.repository_path.clone(),
+            job_id: Some(request.job_id.clone()),
+            plan_id: None,
+            task_id: None,
+            approval_id: Some(request.final_subject.policy.approval_id.clone()),
+            attempt_no: None,
+            run_id: Some(request.final_subject.run_id.clone()),
+            worker_id: None,
+            candidate_id: Some(request.combined_candidate_id.clone()),
+            executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
+                WorkflowRole::Closure,
+                &closure_choice,
+            ),
+            verified_context: None,
+            entry_summary: None,
+        });
+
+        Ok(PreparedFinalCandidateClosure::NeedsWorkerDispatch(
+            Box::new(PreparedClosureWorkerDispatch {
                 provider,
-                executable,
-                model: closure_choice.model_arg.clone(),
-                effort: closure_choice.effort.clone(),
-                allowed_models,
-                session_id: None,
-                standalone: provider == WorkerProvider::OpenCodeV2,
-                working_directory: request.final_subject.integration_checkout_path.clone(),
-                allowed_write_paths: BTreeSet::new(),
-                prompt,
-                file_permissions: WorkerFilePermissions::ReadOnly,
-                budgets: ExecutionBudgets {
-                    progress_watchdog: None,
-                    timeout_ms: closure_budget.max_timeout_ms_per_call,
-                    max_stdout_bytes: closure_budget.max_stdout_bytes_per_call,
-                    max_stderr_bytes: closure_budget.max_stderr_bytes_per_call,
-                    max_line_bytes: DEFAULT_MAX_LINE_BYTES
-                        .max(
-                            closure_budget
-                                .max_structured_response_bytes
-                                .saturating_mul(2),
-                        )
-                        .min(MAX_LINE_BYTES)
-                        .min(closure_budget.max_stdout_bytes_per_call),
-                    max_events: MAX_EVENTS,
-                },
-            };
-
-            let obs_handle = begin_coworker_call_observation(CoworkerCallObservationSpec {
-                journal_dir: self.store.plans_dir().to_path_buf(),
-                operation: COWORKER_OBS_OP_CLOSURE_CANDIDATE.to_string(),
-                title: format!(
-                    "Final candidate closure `{}`",
-                    request.combined_candidate_id
-                ),
-                call_key: effect_id.clone(),
-                binding_id: request.binding_id.clone(),
-                thread_uuid: request.thread_uuid.clone(),
-                repository_path: request.final_subject.repository_path.clone(),
-                job_id: Some(request.job_id.clone()),
-                plan_id: None,
-                task_id: None,
-                approval_id: Some(request.final_subject.policy.approval_id.clone()),
-                attempt_no: None,
-                run_id: Some(request.final_subject.run_id.clone()),
-                worker_id: None,
-                candidate_id: Some(request.combined_candidate_id.clone()),
-                executor: CoworkerObservationExecutorSpec::from_selected_role_choice(
-                    WorkflowRole::Closure,
-                    &closure_choice,
-                ),
-                verified_context: None,
-                entry_summary: None,
-            });
-
-            let structured_exec =
-                match run_advisory_worker_with_structured_result(&advisory_spec, response_budget)
-                    .await
-                {
-                    Ok(exec) => exec,
-                    Err(worker_err) => {
-                        let reason = format!(
-                            "closure worker invocation failed with uncertain outcome: {worker_err}"
-                        );
-                        let _ = obs_handle.finish(CoworkerCallFinishSpec {
-                            state: Some(ObservationCallState::Unknown),
-                            diagnostic: Some(reason.clone()),
-                            ..CoworkerCallFinishSpec::default()
-                        });
-                        return self.record_unknown_closure_outcome(
-                            policy_store,
-                            &closure_store,
-                            request,
-                            submitted_ledger_rev,
-                            &reserved_attempt.attempt_id,
-                            &effect_id,
-                            &reason,
-                        );
-                    }
-                };
-
-            let duration_ms = structured_exec.execution.duration_ms;
-            let actual_observed_model = structured_exec
-                .execution
-                .effective_observed_model()
-                .map(str::to_string);
-            let actual_observed_effort = structured_exec
-                .execution
-                .effective_observed_effort()
-                .map(str::to_string);
-            let recorded_at_ms = now_epoch_ms().max(request.current_time_ms);
-
-            // Persist the full bounded execution report, structured response, and response error
-            // to a private (0600) sidecar file BEFORE updating terminal role counters or the ledger.
-            let artifact_ref = policy_store.persist_closure_execution_artifact(
-                &PersistClosureExecutionArtifactRequest {
-                    binding_id: request.binding_id.clone(),
-                    thread_uuid: request.thread_uuid.clone(),
-                    job_id: request.job_id.clone(),
-                    effect_id: effect_id.clone(),
-                    attempt_id: reserved_attempt.attempt_id.clone(),
-                    command_key: reserved_attempt.command_key.clone(),
-                    subject_digest: request.final_subject.subject_digest.clone(),
-                    candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
-                    execution_report: structured_exec.execution.clone(),
-                    advisory_response: structured_exec.response.clone(),
-                    response_error: structured_exec.response_error.clone(),
-                    observed_model: actual_observed_model.clone(),
-                    observed_effort: actual_observed_effort.clone(),
-                    recorded_at_ms: recorded_at_ms.max(0) as u64,
-                },
-            )?;
-            let obs_artifact_id = artifact_ref.artifact_id.clone();
-
-            // Record compact cryptographically bound artifact reference and update completion counters.
-            let cumulative_runtime_ms = policy_store.mutate_job_runtime_for_operator(
-                &request.binding_id,
-                &request.job_id,
-                |state| {
-                    if !state
-                        .closure_artifacts
-                        .contains_key(&reserved_attempt.attempt_id)
-                    {
-                        state.record_role_completion(WorkflowRole::Closure, duration_ms);
-                    }
-                    state.closure_artifacts.insert(
-                        reserved_attempt.attempt_id.clone(),
-                        ClosureExecutionArtifactRecord {
-                            attempt_id: reserved_attempt.attempt_id.clone(),
-                            command_key: reserved_attempt.command_key.clone(),
-                            subject_digest: request.final_subject.subject_digest.clone(),
-                            candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
-                            artifact_ref: Some(artifact_ref),
-                            execution_report: None,
-                            advisory_response: None,
-                            response_error: None,
-                            observed_model: actual_observed_model.clone(),
-                            observed_effort: actual_observed_effort.clone(),
-                            fenced_from_promotion: false,
-                            diagnostic: structured_exec
-                                .response_error
-                                .as_ref()
-                                .map(|e| sanitize_controller_diagnostic(&e.message)),
-                            recorded_at_ms: recorded_at_ms.max(0) as u64,
-                        },
-                    );
-                    Ok(state
-                        .role_usage
-                        .get(&WorkflowRole::Closure)
-                        .map_or(duration_ms, |u| u.total_runtime_ms))
-                },
-            )?;
-
-            (
+                closure_budget,
+                closure_store,
                 submitted_ledger_rev,
                 reserved_attempt,
                 effect_id,
-                structured_exec,
-                actual_observed_model,
-                actual_observed_effort,
-                recorded_at_ms,
-                cumulative_runtime_ms,
-                Some((obs_handle, obs_artifact_id)),
-            )
+                advisory_spec,
+                response_budget,
+                obs_handle,
+            }),
+        ))
+    }
+
+    #[inline(never)]
+    fn record_dispatched_closure_worker_result(
+        &self,
+        policy_store: &ControllerPolicyStore,
+        request: &ExecuteFinalCandidateClosureRequest,
+        dispatch: Box<PreparedClosureWorkerDispatch>,
+        worker_res: Result<AdvisoryStructuredExecution, threadlane_workers::WorkerError>,
+    ) -> Result<
+        Result<Box<RecoveredClosureExecution>, Box<ExecuteFinalCandidateClosureOutcome>>,
+        NativeError,
+    > {
+        let PreparedClosureWorkerDispatch {
+            provider,
+            closure_budget,
+            closure_store,
+            submitted_ledger_rev,
+            reserved_attempt,
+            effect_id,
+            advisory_spec: _,
+            response_budget: _,
+            obs_handle,
+        } = *dispatch;
+
+        let structured_exec = match worker_res {
+            Ok(exec) => exec,
+            Err(worker_err) => {
+                let reason = format!(
+                    "closure worker invocation failed with uncertain outcome: {worker_err}"
+                );
+                let _ = obs_handle.finish(CoworkerCallFinishSpec {
+                    state: Some(ObservationCallState::Unknown),
+                    diagnostic: Some(reason.clone()),
+                    ..CoworkerCallFinishSpec::default()
+                });
+                let outcome = self.record_unknown_closure_outcome(
+                    policy_store,
+                    &closure_store,
+                    request,
+                    submitted_ledger_rev,
+                    &reserved_attempt.attempt_id,
+                    &effect_id,
+                    &reason,
+                )?;
+                return Ok(Err(Box::new(outcome)));
+            }
         };
+
+        let duration_ms = structured_exec.execution.duration_ms;
+        let actual_observed_model = structured_exec
+            .execution
+            .effective_observed_model()
+            .map(str::to_string);
+        let actual_observed_effort = structured_exec
+            .execution
+            .effective_observed_effort()
+            .map(str::to_string);
+        let recorded_at_ms = now_epoch_ms().max(request.current_time_ms);
+
+        // Persist the full bounded execution report, structured response, and response error
+        // to a private (0600) sidecar file BEFORE updating terminal role counters or the ledger.
+        let artifact_ref = policy_store.persist_closure_execution_artifact(
+            &PersistClosureExecutionArtifactRequest {
+                binding_id: request.binding_id.clone(),
+                thread_uuid: request.thread_uuid.clone(),
+                job_id: request.job_id.clone(),
+                effect_id: effect_id.clone(),
+                attempt_id: reserved_attempt.attempt_id.clone(),
+                command_key: reserved_attempt.command_key.clone(),
+                subject_digest: request.final_subject.subject_digest.clone(),
+                candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
+                execution_report: structured_exec.execution.clone(),
+                advisory_response: structured_exec.response.clone(),
+                response_error: structured_exec.response_error.clone(),
+                observed_model: actual_observed_model.clone(),
+                observed_effort: actual_observed_effort.clone(),
+                recorded_at_ms: recorded_at_ms.max(0) as u64,
+            },
+        )?;
+        let obs_artifact_id = artifact_ref.artifact_id.clone();
+
+        // Record compact cryptographically bound artifact reference and update completion counters.
+        let cumulative_runtime_ms = policy_store.mutate_job_runtime_for_operator(
+            &request.binding_id,
+            &request.job_id,
+            |state| {
+                if !state
+                    .closure_artifacts
+                    .contains_key(&reserved_attempt.attempt_id)
+                {
+                    state.record_role_completion(WorkflowRole::Closure, duration_ms);
+                }
+                state.closure_artifacts.insert(
+                    reserved_attempt.attempt_id.clone(),
+                    ClosureExecutionArtifactRecord {
+                        attempt_id: reserved_attempt.attempt_id.clone(),
+                        command_key: reserved_attempt.command_key.clone(),
+                        subject_digest: request.final_subject.subject_digest.clone(),
+                        candidate_tree_sha: request.final_subject.candidate_tree_sha.clone(),
+                        artifact_ref: Some(artifact_ref),
+                        execution_report: None,
+                        advisory_response: None,
+                        response_error: None,
+                        observed_model: actual_observed_model.clone(),
+                        observed_effort: actual_observed_effort.clone(),
+                        fenced_from_promotion: false,
+                        diagnostic: structured_exec
+                            .response_error
+                            .as_ref()
+                            .map(|e| sanitize_controller_diagnostic(&e.message)),
+                        recorded_at_ms: recorded_at_ms.max(0) as u64,
+                    },
+                );
+                Ok(state
+                    .role_usage
+                    .get(&WorkflowRole::Closure)
+                    .map_or(duration_ms, |u| u.total_runtime_ms))
+            },
+        )?;
+
+        Ok(Ok(Box::new(RecoveredClosureExecution {
+            provider,
+            closure_budget,
+            closure_store,
+            submitted_ledger_rev,
+            reserved_attempt,
+            effect_id,
+            structured_exec,
+            actual_observed_model,
+            actual_observed_effort,
+            recorded_at_ms,
+            cumulative_runtime_ms,
+            obs_ctx: Some((obs_handle, obs_artifact_id)),
+        })))
+    }
+
+    #[inline(never)]
+    fn finalize_final_candidate_closure(
+        &self,
+        authority: &AuthorityStore,
+        policy_store: &ControllerPolicyStore,
+        request: &ExecuteFinalCandidateClosureRequest,
+        execution: Box<RecoveredClosureExecution>,
+    ) -> Result<ExecuteFinalCandidateClosureOutcome, NativeError> {
+        let RecoveredClosureExecution {
+            provider,
+            closure_budget,
+            closure_store,
+            submitted_ledger_rev,
+            reserved_attempt,
+            effect_id,
+            structured_exec,
+            actual_observed_model,
+            actual_observed_effort,
+            recorded_at_ms,
+            cumulative_runtime_ms,
+            obs_ctx,
+        } = *execution;
 
         let duration_ms = structured_exec.execution.duration_ms;
         let worker_id = deterministic_prefixed_id(
@@ -2299,6 +2483,7 @@ impl CoworkerCandidateService {
         Ok(updated_job)
     }
 
+    #[inline(never)]
     fn check_post_completion_fencing(
         &self,
         authority: &AuthorityStore,
@@ -2316,11 +2501,11 @@ impl CoworkerCandidateService {
                 err.message
             ));
         }
-        let ledger = self
+        let mut ledger = self
             .store
             .read_binding_ledger(&request.binding_id)
             .map_err(|e| e.message)?;
-        let Some(job) = ledger.jobs.iter().find(|j| j.job_id == request.job_id) else {
+        let Some(job) = ledger.jobs.iter_mut().find(|j| j.job_id == request.job_id) else {
             return Err("job_id no longer present in binding ledger".to_string());
         };
         if job.holds.iter().any(|h| h.active) {
@@ -2345,12 +2530,14 @@ impl CoworkerCandidateService {
         {
             return Err("combined candidate tree or commit drifted on job".to_string());
         }
-        let runtime = policy_store
-            .read_job_runtime(&request.binding_id, &request.job_id)
-            .map_err(|e| e.message)?
-            .ok_or_else(|| {
-                "ControllerJobRuntimeState missing after worker completion".to_string()
-            })?;
+        let mut runtime = Box::new(
+            policy_store
+                .read_job_runtime(&request.binding_id, &request.job_id)
+                .map_err(|e| e.message)?
+                .ok_or_else(|| {
+                    "ControllerJobRuntimeState missing after worker completion".to_string()
+                })?,
+        );
         if runtime.stop_requested {
             return Err(
                 "controller stop_requested became active during closure execution".to_string(),
@@ -2360,12 +2547,27 @@ impl CoworkerCandidateService {
             .envelope
             .verify_matches_job(job)
             .map_err(|e| e.message)?;
-        if let Some(ref linkage) = job.approval_linkage {
-            let approval = authority
-                .get_for_operator(&linkage.approval_id)
-                .map_err(|e| e.to_string())?;
-            verify_live_approval_and_registry(&approval, job, &runtime.envelope.policy, authority)
-                .map_err(|e| e.message)?;
+        let approval_id = job
+            .approval_linkage
+            .as_ref()
+            .ok_or_else(|| "job has no FrozenApprovalLinkage".to_string())?
+            .approval_id
+            .clone();
+        let approval = authority
+            .get_for_operator(&approval_id)
+            .map_err(|e| e.to_string())?;
+        verify_approval_tasks_match_job(&approval, job).map_err(|e| e.message)?;
+        verify_frozen_runtime_registry_or_apply_config_hold(
+            &approval,
+            job,
+            &mut runtime,
+            authority,
+            &self.store,
+            policy_store,
+        )
+        .map_err(|e| e.message)?;
+        if job.holds.iter().any(|h| h.active) {
+            return Err("workflow hold became active while closure worker was running".to_string());
         }
         Ok(())
     }
@@ -2563,6 +2765,85 @@ pub fn resolve_closure_choice_for_envelope(
         ));
     }
     Ok(envelope.closure_choice.clone())
+}
+
+/// Verifies that the current [`AuthorityStore`] registry snapshot is either at the job's frozen
+/// `registry_revision` or proven strictly equivalent to the frozen authority, then resolves and
+/// validates the canonical non-symlink executable path for `closure_choice` from that same
+/// snapshot without invoking any worker provider.
+pub fn resolve_verified_closure_tool_executable(
+    authority: &AuthorityStore,
+    job: &CoworkerJobRecord,
+    envelope: &FrozenControllerExecutionEnvelope,
+    closure_choice: &SelectedRoleChoice,
+) -> Result<PathBuf, NativeError> {
+    let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
+        NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "job has no FrozenApprovalLinkage",
+        )
+    })?;
+    let approval = authority
+        .get_for_operator(&linkage.approval_id)
+        .map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "frozen approval_id was not found in AuthorityStore",
+            )
+        })?;
+    verify_approval_tasks_match_job(&approval, job)?;
+    envelope.verify_matches_job(job)?;
+    if &envelope.closure_choice != closure_choice {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "closure_choice does not match frozen execution envelope",
+        ));
+    }
+    if approval.registry_revision != linkage.registry_revision {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord registry_revision does not match FrozenApprovalLinkage",
+        ));
+    }
+    let snap = authority.registry().snapshot().map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "failed to read workflow registry snapshot",
+        )
+    })?;
+    if snap.revision != linkage.registry_revision
+        && !prove_registry_snapshot_equivalence_to_frozen_authority(
+            &approval, job, envelope, &snap,
+        )?
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "workflow registry snapshot changed and is not equivalent to frozen authority for Closure dispatch",
+        ));
+    }
+    let tool = snap
+        .tools
+        .iter()
+        .find(|t| t.id == closure_choice.tool_id && t.enabled)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                format!(
+                    "enabled tool `{}` was not found in RegistryStore",
+                    closure_choice.tool_id
+                ),
+            )
+        })?;
+    if tool.adapter != closure_choice.adapter {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            format!(
+                "enabled tool `{}` adapter does not match frozen Closure choice adapter",
+                closure_choice.tool_id
+            ),
+        ));
+    }
+    resolve_advisory_tool_executable(tool)
 }
 
 /// Resolves and validates the canonical non-symlink executable path for `tool_id` in `authority.registry()`.

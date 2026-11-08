@@ -937,7 +937,10 @@ impl<'g> CoworkerPipelineDriver<'g> {
         acc: &mut TickAccumulator,
     ) -> Result<(), NativeError> {
         let adm = Box::pin(self.acquire_or_verify_short_admission(now_ms)).await?;
-        if adm.job.phase != CoworkerJobPhase::Executing {
+        if !matches!(
+            adm.job.phase,
+            CoworkerJobPhase::Executing | CoworkerJobPhase::Held
+        ) {
             return Ok(());
         }
 
@@ -949,7 +952,10 @@ impl<'g> CoworkerPipelineDriver<'g> {
             lease_ttl_ms: None,
         };
 
-        if has_global_unknown_effect(&adm.runtime_state) || adm.runtime_state.stop_requested {
+        if adm.job.phase == CoworkerJobPhase::Held
+            || has_global_unknown_effect(&adm.runtime_state)
+            || adm.runtime_state.stop_requested
+        {
             drop(adm);
             // Still run step_job so live host snapshots and fenced/unknown statuses are reconciled
             // without dispatching new tasks or preparing new dependency seals.

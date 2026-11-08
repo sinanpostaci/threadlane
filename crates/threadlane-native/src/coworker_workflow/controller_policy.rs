@@ -22,7 +22,7 @@ use threadlane_workers::{
     DEFAULT_TIMEOUT_MS, MAX_ADVISORY_RESPONSE_BYTES, MAX_STDERR_BYTES, MAX_STDOUT_BYTES,
     MAX_TIMEOUT_MS,
 };
-use threadlane_workflow::{DecisionAdvisorMode, WorkflowRole};
+use threadlane_workflow::{DecisionAdvisorMode, ToolAdapter, WorkflowRole};
 
 use crate::conversation_change::UnresolvedBlockingChange;
 use crate::error::{NativeError, NativeErrorCode};
@@ -33,7 +33,8 @@ use crate::fs_safety::{
     MAX_PRIVATE_STATE_FILE_BYTES,
 };
 use crate::profile_flow::{
-    normalize_read_only_advisory_choice, preflight, ExecutionPolicy, PreflightRequest,
+    normalize_coder_choice, normalize_read_only_advisory_choice, preflight,
+    resolve_advisory_tool_executable, ExecutionPolicy, PreflightRequest, RoleExecutionRoute,
     RolePreflightRequest, SelectedRoleChoice,
 };
 
@@ -43,11 +44,12 @@ use super::checks::{
 };
 use super::contracts::{
     deterministic_prefixed_id, sha256_hex, validate_non_native_worker_choice,
-    CandidateCheckEvidence, CanonicalProjectBaseRef, CoworkerJobRecord, CoworkerTaskRecord,
-    CoworkerTaskStage, FrozenControllerCapabilityEnvelope, ReviewVerdictOutcome,
-    TaskIndependenceProof, WorkflowHoldRecord, MAX_CHECK_EVIDENCE_ITEMS, MAX_COWORKER_ID_LEN,
-    MAX_COWORKER_TEXT_BYTES,
+    CandidateCheckEvidence, CanonicalProjectBaseRef, CoworkerJobPhase, CoworkerJobRecord,
+    CoworkerTaskRecord, CoworkerTaskStage, FrozenControllerCapabilityEnvelope,
+    ReviewVerdictOutcome, TaskIndependenceProof, WorkflowHoldReason, WorkflowHoldRecord,
+    MAX_CHECK_EVIDENCE_ITEMS, MAX_COWORKER_ID_LEN, MAX_COWORKER_TEXT_BYTES,
 };
+use super::store::{ApplyWorkflowHoldRequest, CoworkerWorkflowStore};
 
 /// Maximum in-scope correction attempts permitted per task (`2`, allowing attempts `2` and `3`).
 pub const MAX_IN_SCOPE_CORRECTION_ATTEMPTS: u32 = 2;
@@ -4374,10 +4376,10 @@ impl ControllerPolicyStore {
         validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
         let path = self.ledger_path_for_binding(binding_id)?;
-        let Some(ledger) = self.read_ledger_unlocked(binding_id, &path)? else {
+        let Some(mut ledger) = self.read_ledger_unlocked(binding_id, &path)? else {
             return Ok(None);
         };
-        Ok(ledger.jobs.get(job_id).cloned())
+        Ok(ledger.jobs.remove(job_id))
     }
 
     /// Alias for [`Self::get_job_runtime_readonly`] returning `Option<ControllerJobRuntimeState>`.
@@ -4892,9 +4894,15 @@ impl ControllerPolicyStore {
     }
 }
 
-/// Verifies that the live [`ApprovalRecord`], active published plan revision in [`threadlane_workflow::PlanStore`],
-/// [`ExecutionPolicy`], and [`threadlane_workflow::RegistryStore`] snapshot still match `job.approval_linkage` without drift.
-pub fn verify_live_approval_and_registry(
+/// Verifies that the live [`ApprovalRecord`], [`ExecutionPolicy`], live repository base commit,
+/// and active published plan revision in [`threadlane_workflow::PlanStore`] still match
+/// `job.approval_linkage` without drift.
+///
+/// This helper intentionally does not read the mutable [`threadlane_workflow::RegistryStore`]
+/// snapshot or perform live [`preflight`] model/effort admission; callers that require live
+/// registry revision equality and worker preflight must call [`verify_live_approval_and_registry`].
+#[inline(never)]
+pub(crate) fn verify_approval_and_plan_evidence(
     approval: &ApprovalRecord,
     job: &CoworkerJobRecord,
     policy: &ExecutionPolicy,
@@ -4971,6 +4979,47 @@ pub fn verify_live_approval_and_registry(
             "Approved plan revision is no longer the active published revision.",
         ));
     }
+    Ok(())
+}
+
+/// Typed outcome of assessing the live [`threadlane_workflow::RegistryStore`] snapshot and
+/// [`preflight`] worker policy admission against a job's frozen approval linkage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryGateOutcome {
+    /// The live `RegistryStore` revision matches `linkage.registry_revision` and all approved
+    /// headless `Coder` tasks pass [`preflight`] under `policy`.
+    Ready,
+    /// The live `RegistryStore` snapshot is readable and valid, but its revision differs from
+    /// the job's frozen `registry_revision`.
+    RevisionChanged {
+        /// Revision recorded in `job.approval_linkage.registry_revision`.
+        frozen_revision: u64,
+        /// Current revision observed in [`threadlane_workflow::RegistryStore`].
+        live_revision: u64,
+    },
+}
+
+/// Assesses the live [`threadlane_workflow::RegistryStore`] snapshot revision and [`preflight`]
+/// worker policy admission against `job.approval_linkage` using a single registry snapshot.
+///
+/// This helper alone is not complete execution authority: callers must first verify approval and
+/// active plan evidence ([`verify_approval_and_plan_evidence`]), the frozen execution envelope,
+/// ownership, and scope. Registry read failures and task/route/policy preflight rejections remain
+/// [`Err(NativeError)`]; only a valid unequal registry revision returns
+/// [`RegistryGateOutcome::RevisionChanged`].
+#[inline(never)]
+pub(crate) fn assess_live_registry_and_preflight(
+    approval: &ApprovalRecord,
+    job: &CoworkerJobRecord,
+    policy: &ExecutionPolicy,
+    authority: &AuthorityStore,
+) -> Result<RegistryGateOutcome, NativeError> {
+    let Some(ref linkage) = job.approval_linkage else {
+        return Err(NativeError::new(
+            NativeErrorCode::UnauthorizedOperator,
+            "Job has no FrozenApprovalLinkage.",
+        ));
+    };
 
     let reg_snap = authority.registry().snapshot().map_err(|_| {
         NativeError::new(
@@ -4979,10 +5028,10 @@ pub fn verify_live_approval_and_registry(
         )
     })?;
     if reg_snap.revision != linkage.registry_revision {
-        return Err(NativeError::new(
-            NativeErrorCode::ValidationFailed,
-            "RegistryStore revision drifted from the job's frozen registry_revision.",
-        ));
+        return Ok(RegistryGateOutcome::RevisionChanged {
+            frozen_revision: linkage.registry_revision,
+            live_revision: reg_snap.revision,
+        });
     }
 
     let mut role_reqs = Vec::new();
@@ -5016,7 +5065,568 @@ pub fn verify_live_approval_and_registry(
             "A1 preflight rejected one or more approved tasks under the frozen execution policy.",
         ));
     }
+    Ok(RegistryGateOutcome::Ready)
+}
+
+/// Conservatively proves whether a live [`threadlane_workflow::RegistryStore`] snapshot whose
+/// `revision` differs from `job.approval_linkage.registry_revision` remains strictly equivalent
+/// across every dependency used by the job's frozen [`ApprovalRecord`] and
+/// [`FrozenControllerExecutionEnvelope`].
+///
+/// Reads a fresh [`threadlane_workflow::RegistrySnapshot`] (propagating registry read/protocol or
+/// malformed-structure errors as `Err`) and evaluates only existing frozen evidence without
+/// sidecars, migrations, or fallback adoption:
+/// - Evaluates [`preflight`] against the exact frozen `profile_id` (never falling back to the
+///   current default profile) and frozen `envelope.policy` for every approved task difficulty plus
+///   the frozen [`WorkflowRole::Reviewer`] and [`WorkflowRole::Closure`] choices.
+/// - Normalizes the live [`WorkflowRole::Coder`], [`WorkflowRole::Reviewer`], and
+///   [`WorkflowRole::Closure`] selections with [`normalize_coder_choice`] and
+///   [`normalize_read_only_advisory_choice`] and requires exact equality with the frozen choices
+///   (`tool_id`, `adapter`, `route`, `model_id`, effective `model_arg`, `effort`, and
+///   `matched_difficulty`).
+/// - Requires every selected role tool (`Coder`, `Reviewer`, and `Closure`) to resolve via
+///   [`resolve_advisory_tool_executable`] to the exact same canonical executable path recorded in
+///   an actual frozen [`ApprovedTaskRecord::canonical_executable`] for that same `tool_id` and
+///   `adapter`, with all matching frozen task paths in agreement. If `Reviewer` or `Closure` uses
+///   a tool not represented in `approval.tasks`, returns `Ok(false)`.
+/// - If `envelope.shadow_jev_policy` is enabled, returns `Ok(false)` conservatively because its
+///   live dependencies cannot be proven from existing frozen task evidence.
+#[inline(never)]
+pub(crate) fn prove_live_registry_equivalence_to_frozen_authority(
+    approval: &ApprovalRecord,
+    job: &CoworkerJobRecord,
+    envelope: &FrozenControllerExecutionEnvelope,
+    authority: &AuthorityStore,
+) -> Result<bool, NativeError> {
+    let reg_snap = authority.registry().snapshot().map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "Failed to read workflow registry snapshot.",
+        )
+    })?;
+    prove_registry_snapshot_equivalence_to_frozen_authority(approval, job, envelope, &reg_snap)
+}
+
+/// Conservatively proves whether a specific [`threadlane_workflow::RegistrySnapshot`] whose
+/// `revision` differs from `job.approval_linkage.registry_revision` remains strictly equivalent
+/// across every dependency used by the job's frozen [`ApprovalRecord`] and
+/// [`FrozenControllerExecutionEnvelope`].
+#[inline(never)]
+pub(crate) fn prove_registry_snapshot_equivalence_to_frozen_authority(
+    approval: &ApprovalRecord,
+    job: &CoworkerJobRecord,
+    envelope: &FrozenControllerExecutionEnvelope,
+    reg_snap: &threadlane_workflow::RegistrySnapshot,
+) -> Result<bool, NativeError> {
+    let Some(ref linkage) = job.approval_linkage else {
+        return Ok(false);
+    };
+    if envelope
+        .shadow_jev_policy
+        .as_ref()
+        .is_some_and(|jev| jev.enabled)
+    {
+        return Ok(false);
+    }
+    if approval.profile_id != linkage.profile_id
+        || envelope.profile_id != linkage.profile_id
+        || approval.tasks.is_empty()
+        || approval.tasks.len() != job.tasks.len()
+        || envelope.task_coder_choices.len() != job.tasks.len()
+    {
+        return Ok(false);
+    }
+
+    let mut role_reqs = Vec::new();
+    let mut seen_roles = BTreeSet::new();
+    for task in &approval.tasks {
+        if !task.is_frozen_headless_worker() || task.role != WorkflowRole::Coder {
+            return Ok(false);
+        }
+        if seen_roles.insert((task.role, Some(task.difficulty))) {
+            role_reqs.push(RolePreflightRequest {
+                role: task.role,
+                difficulty: Some(task.difficulty),
+            });
+        }
+    }
+    if seen_roles.insert((
+        WorkflowRole::Reviewer,
+        envelope.reviewer_choice.matched_difficulty,
+    )) {
+        role_reqs.push(RolePreflightRequest {
+            role: WorkflowRole::Reviewer,
+            difficulty: envelope.reviewer_choice.matched_difficulty,
+        });
+    }
+    if seen_roles.insert((
+        WorkflowRole::Closure,
+        envelope.closure_choice.matched_difficulty,
+    )) {
+        role_reqs.push(RolePreflightRequest {
+            role: WorkflowRole::Closure,
+            difficulty: envelope.closure_choice.matched_difficulty,
+        });
+    }
+
+    let report = preflight(
+        reg_snap,
+        &PreflightRequest {
+            profile_id: Some(linkage.profile_id.clone()),
+            roles: role_reqs,
+        },
+        &envelope.policy,
+    )?;
+    if !report.ready
+        || report.used_default_profile
+        || report.profile_id.as_deref() != Some(linkage.profile_id.as_str())
+    {
+        return Ok(false);
+    }
+
+    for approved_task in &approval.tasks {
+        let Some(job_task) = job
+            .tasks
+            .iter()
+            .find(|t| t.task_id == approved_task.task_id)
+        else {
+            return Ok(false);
+        };
+        let Some(env_choice) = envelope.task_coder_choices.get(&approved_task.task_id) else {
+            return Ok(false);
+        };
+        if env_choice != &job_task.selected_choice {
+            return Ok(false);
+        }
+        let Some(outcome) = report.roles.iter().find(|r| {
+            r.role == WorkflowRole::Coder
+                && r.requested_difficulty == Some(approved_task.difficulty)
+        }) else {
+            return Ok(false);
+        };
+        if !outcome.ready {
+            return Ok(false);
+        }
+        let Some(ref raw_selected) = outcome.selected else {
+            return Ok(false);
+        };
+        let Ok(live_coder) = normalize_coder_choice(raw_selected) else {
+            return Ok(false);
+        };
+        if &live_coder != env_choice
+            || live_coder.route != RoleExecutionRoute::HeadlessWorker
+            || live_coder.tool_id != approved_task.tool_id
+            || live_coder.adapter != approved_task.adapter
+            || live_coder.model_id != approved_task.model_id
+            || live_coder.model_arg != approved_task.model_arg
+            || live_coder.effort != approved_task.effort
+        {
+            return Ok(false);
+        }
+    }
+
+    let Some(reviewer_outcome) = report.roles.iter().find(|r| {
+        r.role == WorkflowRole::Reviewer
+            && r.requested_difficulty == envelope.reviewer_choice.matched_difficulty
+    }) else {
+        return Ok(false);
+    };
+    if !reviewer_outcome.ready {
+        return Ok(false);
+    }
+    let Some(ref raw_reviewer) = reviewer_outcome.selected else {
+        return Ok(false);
+    };
+    let Ok(live_reviewer) =
+        normalize_read_only_advisory_choice(WorkflowRole::Reviewer, raw_reviewer)
+    else {
+        return Ok(false);
+    };
+    if live_reviewer != envelope.reviewer_choice {
+        return Ok(false);
+    }
+
+    let Some(closure_outcome) = report.roles.iter().find(|r| {
+        r.role == WorkflowRole::Closure
+            && r.requested_difficulty == envelope.closure_choice.matched_difficulty
+    }) else {
+        return Ok(false);
+    };
+    if !closure_outcome.ready {
+        return Ok(false);
+    }
+    let Some(ref raw_closure) = closure_outcome.selected else {
+        return Ok(false);
+    };
+    let Ok(live_closure) = normalize_read_only_advisory_choice(WorkflowRole::Closure, raw_closure)
+    else {
+        return Ok(false);
+    };
+    if live_closure != envelope.closure_choice {
+        return Ok(false);
+    }
+
+    let mut frozen_exec_by_tool: BTreeMap<&str, (ToolAdapter, &PathBuf)> = BTreeMap::new();
+    for approved_task in &approval.tasks {
+        let Some(ref frozen_exec) = approved_task.canonical_executable else {
+            return Ok(false);
+        };
+        if frozen_exec.as_os_str().is_empty() {
+            return Ok(false);
+        }
+        match frozen_exec_by_tool.get(approved_task.tool_id.as_str()) {
+            Some((existing_adapter, existing_exec)) => {
+                if *existing_adapter != approved_task.adapter || *existing_exec != frozen_exec {
+                    return Ok(false);
+                }
+            }
+            None => {
+                frozen_exec_by_tool.insert(
+                    approved_task.tool_id.as_str(),
+                    (approved_task.adapter, frozen_exec),
+                );
+            }
+        }
+    }
+
+    let mut selected_role_tools: BTreeMap<&str, ToolAdapter> = BTreeMap::new();
+    for choice in envelope
+        .task_coder_choices
+        .values()
+        .chain(std::iter::once(&envelope.reviewer_choice))
+        .chain(std::iter::once(&envelope.closure_choice))
+    {
+        match selected_role_tools.get(choice.tool_id.as_str()) {
+            Some(existing_adapter) if *existing_adapter != choice.adapter => {
+                return Ok(false);
+            }
+            Some(_) => {}
+            None => {
+                selected_role_tools.insert(choice.tool_id.as_str(), choice.adapter);
+            }
+        }
+    }
+
+    for (tool_id, expected_adapter) in selected_role_tools {
+        let Some((frozen_adapter, frozen_exec)) = frozen_exec_by_tool.get(tool_id) else {
+            return Ok(false);
+        };
+        if *frozen_adapter != expected_adapter {
+            return Ok(false);
+        }
+        let Some(tool_def) = reg_snap.tools.iter().find(|t| t.id == tool_id) else {
+            return Ok(false);
+        };
+        if !tool_def.enabled || tool_def.adapter != expected_adapter {
+            return Ok(false);
+        }
+        let Ok(live_exec) = resolve_advisory_tool_executable(tool_def) else {
+            return Ok(false);
+        };
+        if &live_exec != *frozen_exec {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+const MAX_CONFIG_HOLD_CAS_ATTEMPTS: usize = 4;
+
+/// Verifies an already-frozen [`ControllerJobRuntimeState`] against its [`CoworkerJobRecord`],
+/// live [`ApprovalRecord`] / published plan evidence, and live [`threadlane_workflow::RegistryStore`].
+///
+/// This helper is strictly for already-frozen job execution/admission/candidate/closure paths
+/// after caller-specific metadata, ownership, task, and budget checks; it never creates new
+/// authority or substitutes a live model/tool target.
+///
+/// - When the live registry revision matches `job.approval_linkage.registry_revision`, runs the
+///   full Worker preflight via [`assess_live_registry_and_preflight`].
+/// - When a valid live registry snapshot has a changed revision, allows execution to continue
+///   without a hold only when [`prove_live_registry_equivalence_to_frozen_authority`] returns
+///   `Ok(true)` and no active job-wide [`WorkflowHoldReason::RegistryConfigurationChanged`] hold
+///   already exists.
+/// - Otherwise, for a non-terminal job without `runtime_state.stop_requested`, ensures an active
+///   job-wide [`WorkflowHoldReason::RegistryConfigurationChanged`] hold is persisted in
+///   `workflow_store` and sets `runtime_state.stop_or_block_reason` (reloading persisted runtime
+///   state via [`ControllerPolicyStore::get_job_runtime_readonly`]) in place on `(job, runtime_state)`.
+#[inline(never)]
+pub fn verify_frozen_runtime_registry_or_apply_config_hold(
+    approval: &ApprovalRecord,
+    job: &mut CoworkerJobRecord,
+    runtime_state: &mut ControllerJobRuntimeState,
+    authority: &AuthorityStore,
+    workflow_store: &CoworkerWorkflowStore,
+    policy_store: &ControllerPolicyStore,
+) -> Result<(), NativeError> {
+    runtime_state.envelope.verify_matches_job(job)?;
+    verify_approval_and_plan_evidence(approval, job, &runtime_state.envelope.policy, authority)?;
+
+    if job.approval_linkage.is_none() {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "CoworkerJobRecord has no FrozenApprovalLinkage.",
+        ));
+    }
+
+    match assess_live_registry_and_preflight(
+        approval,
+        job,
+        &runtime_state.envelope.policy,
+        authority,
+    )? {
+        RegistryGateOutcome::Ready => Ok(()),
+        RegistryGateOutcome::RevisionChanged {
+            frozen_revision,
+            live_revision: _,
+        } => apply_registry_config_hold_if_needed(
+            approval,
+            job,
+            runtime_state,
+            frozen_revision,
+            authority,
+            workflow_store,
+            policy_store,
+        ),
+    }
+}
+
+#[inline(never)]
+fn apply_registry_config_hold_if_needed(
+    approval: &ApprovalRecord,
+    job: &mut CoworkerJobRecord,
+    runtime_state: &mut ControllerJobRuntimeState,
+    frozen_revision: u64,
+    authority: &AuthorityStore,
+    workflow_store: &CoworkerWorkflowStore,
+    policy_store: &ControllerPolicyStore,
+) -> Result<(), NativeError> {
+    if runtime_state.stop_requested
+        || matches!(
+            job.phase,
+            CoworkerJobPhase::Completed | CoworkerJobPhase::Cancelled
+        )
+    {
+        return Ok(());
+    }
+
+    let has_active_config_hold = job.holds.iter().any(|h| {
+        h.active
+            && h.holds_entire_job
+            && h.reason == WorkflowHoldReason::RegistryConfigurationChanged
+    });
+    let requires_config_hold = if has_active_config_hold {
+        true
+    } else {
+        !prove_live_registry_equivalence_to_frozen_authority(
+            approval,
+            job,
+            &runtime_state.envelope,
+            authority,
+        )?
+    };
+    if !requires_config_hold {
+        return Ok(());
+    }
+
+    let approval_id = job
+        .approval_linkage
+        .as_ref()
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "CoworkerJobRecord has no FrozenApprovalLinkage.",
+            )
+        })?
+        .approval_id
+        .clone();
+    let binding_id = job.binding_id.clone();
+    let thread_uuid = job.thread_uuid.clone();
+    let job_id = job.job_id.clone();
+    let detail = format!(
+        "saved workflow registry configuration changed after frozen execution approval `{}` (frozen registry_revision {}); future effects require refreshed authority",
+        approval_id, frozen_revision
+    );
+
+    if !has_active_config_hold {
+        for _ in 0..MAX_CONFIG_HOLD_CAS_ATTEMPTS {
+            if matches!(
+                job.phase,
+                CoworkerJobPhase::Completed | CoworkerJobPhase::Cancelled
+            ) || job.holds.iter().any(|h| {
+                h.active
+                    && h.holds_entire_job
+                    && h.reason == WorkflowHoldReason::RegistryConfigurationChanged
+            }) {
+                break;
+            }
+            let resolved_config_hold_count = job
+                .holds
+                .iter()
+                .filter(|h| {
+                    !h.active && h.reason == WorkflowHoldReason::RegistryConfigurationChanged
+                })
+                .count();
+            let request_key = deterministic_prefixed_id(
+                "threadlane-native:coworker-registry-config-hold:v1",
+                "hldreq",
+                &[
+                    &binding_id,
+                    &job_id,
+                    &approval_id,
+                    &frozen_revision.to_string(),
+                    &resolved_config_hold_count.to_string(),
+                ],
+            );
+            let directly_affected_task_ids = job.tasks.iter().map(|t| t.task_id.clone()).collect();
+            match workflow_store.apply_workflow_hold(&ApplyWorkflowHoldRequest {
+                binding_id: binding_id.clone(),
+                thread_uuid: thread_uuid.clone(),
+                job_id: job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key,
+                reason: WorkflowHoldReason::RegistryConfigurationChanged,
+                detail: detail.clone(),
+                directly_affected_task_ids,
+                affected_write_paths: Vec::new(),
+                affected_interfaces: Vec::new(),
+                holds_entire_job: true,
+            }) {
+                Ok((updated_job, hold_rec)) => {
+                    *job = updated_job;
+                    if hold_rec.active
+                        && job.holds.iter().any(|h| {
+                            h.active
+                                && h.holds_entire_job
+                                && h.reason == WorkflowHoldReason::RegistryConfigurationChanged
+                        })
+                    {
+                        break;
+                    }
+                }
+                Err(err)
+                    if err.code == NativeErrorCode::ValidationFailed
+                        && err.message
+                            == "expected_job_revision does not match current job_revision" =>
+                {
+                    let ledger = workflow_store.read_binding_ledger(&binding_id)?;
+                    if ledger.thread_uuid.as_deref() != Some(thread_uuid.as_str()) {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "binding ledger thread_uuid does not match job thread_uuid",
+                        ));
+                    }
+                    let reloaded_job = ledger
+                        .jobs
+                        .into_iter()
+                        .find(|j| j.job_id == job_id)
+                        .ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::ValidationFailed,
+                                format!(
+                                    "job `{job_id}` was not found in binding ledger `{binding_id}`"
+                                ),
+                            )
+                        })?;
+                    if reloaded_job.binding_id != binding_id
+                        || reloaded_job.thread_uuid != thread_uuid
+                        || reloaded_job.job_id != job_id
+                    {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "reloaded job binding_id, thread_uuid, or job_id scope mismatch",
+                        ));
+                    }
+                    let reloaded_runtime = policy_store
+                        .get_job_runtime_readonly(&binding_id, &job_id)?
+                        .ok_or_else(|| {
+                            NativeError::new(
+                                NativeErrorCode::UnauthorizedOperator,
+                                format!(
+                                    "no ControllerJobRuntimeState configured in ControllerPolicyStore for job `{job_id}`"
+                                ),
+                            )
+                        })?;
+                    reloaded_runtime
+                        .envelope
+                        .verify_matches_job(&reloaded_job)?;
+                    verify_approval_and_plan_evidence(
+                        approval,
+                        &reloaded_job,
+                        &reloaded_runtime.envelope.policy,
+                        authority,
+                    )?;
+                    *job = reloaded_job;
+                    *runtime_state = reloaded_runtime;
+                    if runtime_state.stop_requested
+                        || matches!(
+                            job.phase,
+                            CoworkerJobPhase::Completed | CoworkerJobPhase::Cancelled
+                        )
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if !matches!(
+            job.phase,
+            CoworkerJobPhase::Completed | CoworkerJobPhase::Cancelled
+        ) && !job.holds.iter().any(|h| {
+            h.active
+                && h.holds_entire_job
+                && h.reason == WorkflowHoldReason::RegistryConfigurationChanged
+        }) {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "failed to establish active RegistryConfigurationChanged workflow hold after bounded attempts",
+            ));
+        }
+    }
+    if runtime_state.stop_or_block_reason.is_none() {
+        policy_store.mutate_job_runtime_for_operator(&binding_id, &job_id, |state| {
+            if !state.stop_requested && state.stop_or_block_reason.is_none() {
+                state.stop_or_block_reason = Some(detail.clone());
+            }
+            Ok(())
+        })?;
+        *runtime_state = policy_store
+            .get_job_runtime_readonly(&binding_id, &job_id)?
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::UnauthorizedOperator,
+                    format!(
+                        "no ControllerJobRuntimeState configured in ControllerPolicyStore for job `{job_id}`"
+                    ),
+                )
+            })?;
+    }
+
     Ok(())
+}
+
+/// Verifies that the live [`ApprovalRecord`], [`ExecutionPolicy`], live repository base commit,
+/// and active published plan revision in [`threadlane_workflow::PlanStore`] match
+/// `job.approval_linkage` via [`verify_approval_and_plan_evidence`], and further verifies via
+/// [`assess_live_registry_and_preflight`] that the live [`threadlane_workflow::RegistryStore`]
+/// snapshot revision and [`preflight`] worker policy admission still match `job.approval_linkage`
+/// without drift.
+pub fn verify_live_approval_and_registry(
+    approval: &ApprovalRecord,
+    job: &CoworkerJobRecord,
+    policy: &ExecutionPolicy,
+    authority: &AuthorityStore,
+) -> Result<(), NativeError> {
+    verify_approval_and_plan_evidence(approval, job, policy, authority)?;
+    match assess_live_registry_and_preflight(approval, job, policy, authority)? {
+        RegistryGateOutcome::Ready => Ok(()),
+        RegistryGateOutcome::RevisionChanged { .. } => Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "RegistryStore revision drifted from the job's frozen registry_revision.",
+        )),
+    }
 }
 
 /// Generates a deterministic logical controller driver instance identifier (`ctl_<32hex>`) for

@@ -2283,3 +2283,6 @@ async fn stopped_host_cached_running_is_unknown_without_mutating_historical_stat
         control.shutdown().await;
     }).await;
 }
+
+#[path = "coworker_registry_drift.rs"]
+mod coworker_registry_drift;
