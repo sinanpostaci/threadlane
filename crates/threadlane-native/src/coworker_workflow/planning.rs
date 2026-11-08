@@ -54,7 +54,8 @@ use threadlane_workers::{
     AdvisoryStructuredExecution, AdvisoryWorkerSpec, BaseCommitPathKind, BoundedAdvisoryResponse,
     ExecutionBudgets, WorkerError, WorkerExecutionReport, WorkerFilePermissions, WorkerProvider,
     WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
-    DEFAULT_MAX_LINE_BYTES, MAX_ADVISORY_RESPONSE_BYTES, MAX_PROMPT_BYTES, MAX_STDOUT_BYTES,
+    DEFAULT_MAX_LINE_BYTES, MAX_ADVISORY_RESPONSE_BYTES, MAX_LINE_BYTES, MAX_PROMPT_BYTES,
+    MAX_STDOUT_BYTES,
 };
 use threadlane_workflow::{
     Difficulty, PlanStatus, PlanSummary, PlanTask, PublishedPlanView, RegistrySnapshot,
@@ -2291,7 +2292,7 @@ impl CoworkerPlanningService {
             }
         };
 
-        let (exec_budgets, response_budget) = match build_worker_budgets(&grant.budget) {
+        let (exec_budgets, response_budget) = match build_worker_budgets(provider, &grant.budget) {
             Ok(b) => b,
             Err(err) => {
                 let _ = self
@@ -3523,7 +3524,7 @@ impl CoworkerPlanningService {
             }
         };
 
-        let (exec_budgets, response_budget) = match build_worker_budgets(&grant.budget) {
+        let (exec_budgets, response_budget) = match build_worker_budgets(provider, &grant.budget) {
             Ok(b) => b,
             Err(err) => {
                 let _ = self
@@ -4798,6 +4799,7 @@ fn resolve_headless_planning_worker(
 }
 
 fn build_worker_budgets(
+    provider: WorkerProvider,
     grant_budget: &PlanningCallBudget,
 ) -> Result<(ExecutionBudgets, AdvisoryResponseBudget), NativeError> {
     grant_budget.validate()?;
@@ -4819,7 +4821,12 @@ fn build_worker_budgets(
             "max_output_bytes_per_call must be within supported worker stdout bounds",
         ));
     }
-    let max_line_bytes = DEFAULT_MAX_LINE_BYTES.min(max_stdout_bytes);
+    let max_line_bytes = match provider {
+        WorkerProvider::CodexCli => max_stdout_bytes.min(MAX_LINE_BYTES),
+        WorkerProvider::Antigravity | WorkerProvider::OpenCodeV2 => {
+            DEFAULT_MAX_LINE_BYTES.min(max_stdout_bytes)
+        }
+    };
     let budgets = ExecutionBudgets {
         timeout_ms: grant_budget.max_timeout_ms_per_call,
         max_stdout_bytes,
@@ -5230,5 +5237,82 @@ mod tests {
         )
         .expect("modify tracked src/lib.rs");
         assert!(verify_live_repository_clean_at_base(&base).is_err());
+    }
+
+    #[test]
+    fn build_worker_budgets_uses_approved_codex_line_cap_with_hard_ceiling_and_keeps_legacy_provider_line_limit(
+    ) {
+        let observed_grant_budget = PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 2,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: 600_000,
+            max_output_bytes_per_call: 4_194_304,
+        };
+        let (codex_budgets, codex_resp_budget) =
+            build_worker_budgets(WorkerProvider::CodexCli, &observed_grant_budget)
+                .expect("build codex worker budgets for 4 MiB grant");
+        assert_eq!(codex_budgets.timeout_ms, 600_000);
+        assert_eq!(codex_budgets.max_stdout_bytes, 4_194_304);
+        assert_eq!(codex_budgets.max_line_bytes, MAX_LINE_BYTES);
+        assert_eq!(codex_resp_budget.max_response_bytes, 4_194_304);
+
+        for provider in [WorkerProvider::Antigravity, WorkerProvider::OpenCodeV2] {
+            let (legacy_budgets, legacy_resp_budget) =
+                build_worker_budgets(provider, &observed_grant_budget)
+                    .expect("build non-codex worker budgets for 4 MiB grant");
+            assert_eq!(legacy_budgets.timeout_ms, 600_000);
+            assert_eq!(legacy_budgets.max_stdout_bytes, 4_194_304);
+            assert_eq!(legacy_budgets.max_line_bytes, DEFAULT_MAX_LINE_BYTES);
+            assert_eq!(legacy_resp_budget.max_response_bytes, 4_194_304);
+        }
+
+        let large_stdout_budget = PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 2,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: 600_000,
+            max_output_bytes_per_call: 8 * 1024 * 1024,
+        };
+        let (codex_large, codex_large_resp) =
+            build_worker_budgets(WorkerProvider::CodexCli, &large_stdout_budget)
+                .expect("build codex worker budgets when stdout cap exceeds MAX_LINE_BYTES");
+        assert_eq!(codex_large.max_stdout_bytes, 8 * 1024 * 1024);
+        assert_eq!(codex_large.max_line_bytes, MAX_LINE_BYTES);
+        assert_eq!(
+            codex_large_resp.max_response_bytes,
+            MAX_ADVISORY_RESPONSE_BYTES
+        );
+
+        for provider in [WorkerProvider::Antigravity, WorkerProvider::OpenCodeV2] {
+            let (legacy_large, legacy_large_resp) =
+                build_worker_budgets(provider, &large_stdout_budget)
+                    .expect("build non-codex worker budgets for 8 MiB grant");
+            assert_eq!(legacy_large.max_stdout_bytes, 8 * 1024 * 1024);
+            assert_eq!(legacy_large.max_line_bytes, DEFAULT_MAX_LINE_BYTES);
+            assert_eq!(
+                legacy_large_resp.max_response_bytes,
+                MAX_ADVISORY_RESPONSE_BYTES
+            );
+        }
+
+        let small_budget = PlanningCallBudget {
+            max_total_calls: 2,
+            max_orchestrator_calls: 1,
+            max_architect_calls: 1,
+            max_timeout_ms_per_call: 30_000,
+            max_output_bytes_per_call: 65_536,
+        };
+        for provider in [
+            WorkerProvider::CodexCli,
+            WorkerProvider::Antigravity,
+            WorkerProvider::OpenCodeV2,
+        ] {
+            let (small_exec, small_resp) =
+                build_worker_budgets(provider, &small_budget).expect("build small worker budgets");
+            assert_eq!(small_exec.max_stdout_bytes, 65_536);
+            assert_eq!(small_exec.max_line_bytes, 65_536);
+            assert_eq!(small_resp.max_response_bytes, 65_536);
+        }
     }
 }

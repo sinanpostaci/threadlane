@@ -176,6 +176,10 @@ if [ "$MODE" = "custom_file" ]; then
     elif [ -f "$PROMPTS_DIR/hook.sh" ]; then
         /bin/sh "$PROMPTS_DIR/hook.sh"
     fi
+    if [ -f "$PROMPTS_DIR/raw_after_init_$c.jsonl" ]; then
+        cat "$PROMPTS_DIR/raw_after_init_$c.jsonl"
+        exit 0
+    fi
     if [ -f "$PROMPTS_DIR/custom_fenced_$c.json" ]; then
         emit_fenced_response < "$PROMPTS_DIR/custom_fenced_$c.json"
     fi
@@ -1972,6 +1976,11 @@ c=$((c + 1))
 printf "%s" "$c" > "$COUNT_FILE"
 printf "%s\n" "$@" > "$PROMPTS_DIR/args_$c.txt"
 
+if [ -f "$PROMPTS_DIR/raw_stream_$c.jsonl" ]; then
+    cat "$PROMPTS_DIR/raw_stream_$c.jsonl"
+    exit 0
+fi
+
 resp_file="$PROMPTS_DIR/resp_$c.json"
 cat <<'EOF' > "$resp_file"
 {{"outcome":"plan","schema_version":1,"summary":"Compile two independent Coder tasks and one dependent exporter Coder task for sample-telemetry-service using read-only Codex Orchestrator advisory execution.","tasks":[{{"task_id":"task_parse","title":"Implement binary frame header parser","description":"Parse binary telemetry frames in src/parser.rs and expose the stable ParsedFrame struct for downstream batch export.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]}},{{"task_id":"task_metrics","title":"Add frame counter helper","description":"Update src/metrics.rs to track total parsed telemetry frames without overlapping parser or exporter files.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["src/metrics.rs"],"owned_interfaces":[],"consumed_interfaces":[]}},{{"task_id":"task_export","title":"Wire batch exporter to ParsedFrame","description":"Consume iface_parsed_frame in src/exporter.rs and emit framed telemetry batches to the configured sink.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":["iface_export_sink"],"consumed_interfaces":["iface_parsed_frame"]}}],"check_suggestions":[{{"check_id":"chk_telemetry_unit","command_summary":"cargo test --workspace","required":true}}],"unconfirmed_proposal_notes":["Keep optional pushgateway exporter out of scope until human approval."],"resolved_open_questions":[],"deferred_proposals":[]}}
@@ -3066,4 +3075,835 @@ async fn proof_bound_grant_rejects_selected_dependency_drift_before_call_and_mid
         NativeErrorCode::ValidationFailed
     );
     assert_eq!(fx.invocation_count(), 1);
+}
+
+fn setup_codex_planning_fixture() -> (OrchestratorTestFixture, PathBuf, PathBuf, ExecutionPolicy) {
+    let fx = OrchestratorTestFixture::new();
+    let fake_codex_exe = fx.root_dir.join("bin/fake-codex");
+    let codex_count_file = fx.root_dir.join("codex-invocations.txt");
+    let codex_prompts_dir = fx.root_dir.join("codex-prompts");
+    write_fake_codex_planning_script(&fake_codex_exe, &codex_count_file, &codex_prompts_dir);
+
+    let rev0 = fx.registry.snapshot().expect("snapshot").revision;
+    fx.registry
+        .apply(
+            rev0,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-codex".to_string(),
+                    label: "Codex CLI".to_string(),
+                    adapter: ToolAdapter::CodexCli,
+                    executable_path: Some(fake_codex_exe),
+                    enabled: true,
+                },
+            },
+        )
+        .expect("upsert tool-codex");
+    fx.registry
+        .apply(
+            rev0 + 1,
+            RegistryChange::UpsertModels {
+                models: vec![
+                    ModelDefinition {
+                        id: "model-argon".to_string(),
+                        tool_id: "tool-agy".to_string(),
+                        label: "Gemini 4 Argon High".to_string(),
+                        model_arg: "gemini-4-argon-high".to_string(),
+                        efforts: vec!["high".to_string()],
+                        allow_no_effort: false,
+                    },
+                    ModelDefinition {
+                        id: "model-codex-sol".to_string(),
+                        tool_id: "tool-codex".to_string(),
+                        label: "GPT-6.1 Sol".to_string(),
+                        model_arg: "gpt-6.1-sol".to_string(),
+                        efforts: vec!["xhigh".to_string()],
+                        allow_no_effort: false,
+                    },
+                ],
+            },
+        )
+        .expect("upsert models with codex sol");
+    fx.registry
+        .apply(
+            rev0 + 2,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-main".to_string(),
+                    name: "Main Planning Profile".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Architect,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-codex-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Orchestrator,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-codex-sol".to_string(),
+                                effort: Some("xhigh".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: None,
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("upsert profile with codex sol orchestrator/architect");
+
+    let codex_policy = ExecutionPolicy {
+        schema_version: EXECUTION_POLICY_SCHEMA_VERSION,
+        policy_id: "pol-codex-sol-planning".to_string(),
+        allow_rules: vec![PolicyAllowRule {
+            tool_id: "tool-codex".to_string(),
+            model_id: "model-codex-sol".to_string(),
+            efforts: vec!["xhigh".to_string()],
+            allow_no_effort: false,
+            roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+        }],
+    };
+
+    (fx, codex_count_file, codex_prompts_dir, codex_policy)
+}
+
+fn create_codex_grant_with_budget(
+    fx: &OrchestratorTestFixture,
+    codex_policy: &ExecutionPolicy,
+    request_key: &str,
+    budget: PlanningCallBudget,
+) -> threadlane_native::coworker_grants::PlanningGrantSummary {
+    use threadlane_native::coworker_grants::{
+        prepare_planning_grant_preview_with_store, record_planning_grant,
+        LocalOperatorGrantAttestation, PreparePlanningGrantRequest, RecordPlanningGrantRequest,
+    };
+    use threadlane_native::profile_flow::RolePreflightRequest;
+
+    let mut roles = Vec::new();
+    if budget.max_orchestrator_calls > 0 {
+        roles.push(RolePreflightRequest {
+            role: WorkflowRole::Orchestrator,
+            difficulty: None,
+        });
+    }
+    if budget.max_architect_calls > 0 {
+        roles.push(RolePreflightRequest {
+            role: WorkflowRole::Architect,
+            difficulty: None,
+        });
+    }
+
+    let mut matching_policy = codex_policy.clone();
+    for rule in &mut matching_policy.allow_rules {
+        rule.roles.retain(|role| match role {
+            WorkflowRole::Orchestrator => budget.max_orchestrator_calls > 0,
+            WorkflowRole::Architect => budget.max_architect_calls > 0,
+            _ => false,
+        });
+    }
+    matching_policy
+        .allow_rules
+        .retain(|rule| !rule.roles.is_empty());
+
+    let snapshot = fx.registry.snapshot().expect("snapshot with codex sol");
+    let preview = prepare_planning_grant_preview_with_store(
+        &fx.store,
+        &snapshot,
+        &PreparePlanningGrantRequest {
+            request_key: request_key.to_string(),
+            binding_id: BINDING_ID.to_string(),
+            thread_uuid: THREAD_UUID.to_string(),
+            repository_path: fx.repo_dir.clone(),
+            base_commit: fx.project_base.base_commit.clone(),
+            expected_base_tree_sha: Some(fx.project_base.base_tree_sha.clone()),
+            profile_id: "profile-main".to_string(),
+            expected_registry_revision: Some(snapshot.revision),
+            roles,
+            policy: matching_policy,
+            capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+            budget,
+            created_at_ms: 1_700_000_000_000,
+            expires_at_ms: 1_800_000_000_000,
+        },
+    )
+    .expect("prepare codex planning grant preview");
+
+    let ledger = fx.store.read_binding_ledger(BINDING_ID).ok();
+    let expected_ledger_revision = ledger.map(|l| l.ledger_revision);
+    record_planning_grant(
+        &fx.store,
+        &snapshot,
+        &RecordPlanningGrantRequest {
+            request_key: request_key.to_string(),
+            expected_ledger_revision,
+            preview: preview.clone(),
+            confirmed_preview_digest: preview.preview_digest,
+            attestation: LocalOperatorGrantAttestation::attested(),
+        },
+    )
+    .expect("record codex planning grant")
+}
+
+fn format_codex_command_execution_line(
+    item_id: &str,
+    command: &str,
+    aggregated_output: &str,
+) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": item_id,
+            "type": "command_execution",
+            "command": command,
+            "aggregated_output": aggregated_output,
+            "exit_code": 0,
+            "status": "completed"
+        }
+    }))
+    .expect("serialize codex command_execution line")
+}
+
+fn format_codex_agent_message_line(item_id: &str, structured_json: &str) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": item_id,
+            "type": "agent_message",
+            "text": structured_json
+        }
+    }))
+    .expect("serialize codex agent_message line")
+}
+
+#[tokio::test]
+async fn codex_planning_accepts_completed_command_jsonl_event_above_256_kib_within_approved_budget()
+{
+    use threadlane_native::{
+        EnqueuePlanningCommandRequest, PlanningCommandDriver, PlanningCommandResultRef,
+        PlanningCommandStatus,
+    };
+    use threadlane_workers::{NormalizedEventKind, WorkerRunStatus, DEFAULT_MAX_LINE_BYTES};
+
+    let (fx, codex_count_file, codex_prompts_dir, codex_policy) = setup_codex_planning_fixture();
+    let recorded_grant = create_codex_grant_with_budget(
+        &fx,
+        &codex_policy,
+        "req_grant_codex_large_line_1",
+        PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 2,
+            max_architect_calls: 2,
+            max_timeout_ms_per_call: 600_000,
+            max_output_bytes_per_call: 4_194_304,
+        },
+    );
+
+    let large_tool_output = "telemetry_symbol_inspection_line_0123456789abcdef\n".repeat(6_400);
+    assert!(
+        large_tool_output.len() > DEFAULT_MAX_LINE_BYTES,
+        "command_execution payload must exceed legacy 256 KiB line limit"
+    );
+
+    // Call 1 (Orchestrator round 0): emits a >256 KiB completed command_execution line and requests Architect advice.
+    let orch_round_0_json = r#"{"outcome":"requires_architect_advice","schema_version":1,"summary":"Consult Architect on ParsedFrame ownership boundary after inspecting large repository output.","questions":[{"question_id":"q_parsed_frame","question_summary":"Should ParsedFrame in src/parser.rs be a copyable header struct?","dependency_files":["src/parser.rs","src/exporter.rs"],"interfaces":["iface_parsed_frame"]}]}"#;
+    let call_1_cmd_line = format_codex_command_execution_line(
+        "cmd_orch_r0_large",
+        "git grep -n ParsedFrame",
+        &large_tool_output,
+    );
+    assert!(call_1_cmd_line.len() > DEFAULT_MAX_LINE_BYTES);
+    let call_1_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000101"}"#,
+        r#"{"type":"turn.started"}"#,
+        call_1_cmd_line,
+        format_codex_agent_message_line("msg_orch_r0", orch_round_0_json),
+        r#"{"type":"turn.completed","usage":{"input_tokens":1500,"cached_input_tokens":300,"output_tokens":320}}"#,
+    );
+    fs::write(codex_prompts_dir.join("raw_stream_1.jsonl"), &call_1_stream)
+        .expect("write raw_stream_1.jsonl");
+
+    // Call 2 (Architect round 1): emits a >256 KiB completed command_execution line and returns StructuredArchitectAdviceOutput.
+    let arch_round_1_json = r#"{"schema_version":1,"decision_summary":"Keep ParsedFrame as a fixed-size header struct in src/parser.rs.","rationale":"Decouples frame header validation from exporter buffer lifetimes.","recommended_write_paths":["src/parser.rs","src/exporter.rs"],"interface_contracts":{"iface_parsed_frame":"pub struct ParsedFrame { pub version: u8, pub payload_len: u16 }"},"open_questions":[]}"#;
+    let call_2_cmd_line = format_codex_command_execution_line(
+        "cmd_arch_r1_large",
+        "cargo metadata --format-version 1",
+        &large_tool_output,
+    );
+    assert!(call_2_cmd_line.len() > DEFAULT_MAX_LINE_BYTES);
+    let call_2_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000102"}"#,
+        r#"{"type":"turn.started"}"#,
+        call_2_cmd_line,
+        format_codex_agent_message_line("msg_arch_r1", arch_round_1_json),
+        r#"{"type":"turn.completed","usage":{"input_tokens":1620,"cached_input_tokens":400,"output_tokens":380}}"#,
+    );
+    fs::write(codex_prompts_dir.join("raw_stream_2.jsonl"), &call_2_stream)
+        .expect("write raw_stream_2.jsonl");
+
+    // Call 3 (Orchestrator round 1): emits seven completed command_execution events including a >256 KiB line,
+    // followed by the final valid structured plan and turn.completed.
+    let orch_round_1_plan_json = r#"{"outcome":"plan","schema_version":1,"summary":"Compile parser, metrics, and exporter DAG after >256 KiB read-only Codex command inspection and Architect consultation.","tasks":[{"task_id":"task_parse","title":"Implement ParsedFrame header parser","description":"Define copyable ParsedFrame in src/parser.rs per Architect contract.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"],"owned_interfaces":["iface_parsed_frame"],"consumed_interfaces":[]},{"task_id":"task_metrics","title":"Add frame counter helper","description":"Update src/metrics.rs to track total parsed telemetry frames.","role":"coder","difficulty":"easy","depends_on":[],"allowed_write_paths":["src/metrics.rs"],"owned_interfaces":[],"consumed_interfaces":[]},{"task_id":"task_export","title":"Consume ParsedFrame in batch exporter","description":"Wire src/exporter.rs to iface_parsed_frame.","role":"coder","difficulty":"hard","depends_on":["task_parse"],"allowed_write_paths":["src/exporter.rs"],"owned_interfaces":["iface_export_sink"],"consumed_interfaces":["iface_parsed_frame"]}],"check_suggestions":[{"check_id":"chk_telemetry_unit","command_summary":"cargo test --workspace","required":true}],"unconfirmed_proposal_notes":["Keep optional pushgateway exporter out of scope until human approval."],"resolved_open_questions":["Should ParsedFrame use a value header struct?"],"deferred_proposals":["Add optional Prometheus pushgateway sink"]}"#;
+    let mut call_3_lines = vec![
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000103"}"#
+            .to_string(),
+        r#"{"type":"turn.started"}"#.to_string(),
+    ];
+    for idx in 1..=6 {
+        call_3_lines.push(format_codex_command_execution_line(
+            &format!("cmd_orch_r1_{idx}"),
+            "git status --porcelain",
+            "clean_tree_check\n",
+        ));
+    }
+    let call_3_large_cmd_line =
+        format_codex_command_execution_line("cmd_orch_r1_7", "git log -p -n 5", &large_tool_output);
+    assert!(call_3_large_cmd_line.len() > DEFAULT_MAX_LINE_BYTES);
+    call_3_lines.push(call_3_large_cmd_line);
+    call_3_lines.push(format_codex_agent_message_line(
+        "msg_orch_r1_plan",
+        orch_round_1_plan_json,
+    ));
+    call_3_lines.push(
+        r#"{"type":"turn.completed","usage":{"input_tokens":1840,"cached_input_tokens":512,"output_tokens":450}}"#
+            .to_string(),
+    );
+    let call_3_stream = format!("{}\n", call_3_lines.join("\n"));
+    fs::write(codex_prompts_dir.join("raw_stream_3.jsonl"), &call_3_stream)
+        .expect("write raw_stream_3.jsonl");
+
+    let job = fx.create_initial_job(
+        "job_codex_large_line_1",
+        vec![
+            "Implement binary frame header parser in src/parser.rs".to_string(),
+            "Add frame counter helper in src/metrics.rs".to_string(),
+            "Wire batch exporter in src/exporter.rs to consume parsed frames".to_string(),
+        ],
+        vec!["Should ParsedFrame use a value header struct?".to_string()],
+        vec!["Add optional Prometheus pushgateway sink".to_string()],
+    );
+
+    let cmd_store = receipt_command_store(&fx);
+    let plan_req = OrchestratorTestFixture::plan_req(
+        &recorded_grant.grant_id,
+        &job.job_id,
+        "cmd_orch_codex_large_line_1",
+        1,
+    );
+    let enqueued = cmd_store
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(plan_req))
+        .expect("enqueue codex orchestrator command");
+    let driver =
+        PlanningCommandDriver::new(cmd_store.clone(), fx.service.clone()).expect("create driver");
+    let executed = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &enqueued.command_id)
+        .await
+        .expect("execute codex planning command with >256 KiB tool-result JSONL events");
+    assert_eq!(executed.command.status, PlanningCommandStatus::Completed);
+
+    let PlanningCommandResultRef::OrchestratorPlan {
+        job_id: ref res_job_id,
+        ref planning_result,
+        artifact_verified,
+    } = executed
+        .command
+        .result_ref
+        .as_ref()
+        .expect("completed command result_ref")
+    else {
+        panic!("expected OrchestratorPlan result_ref");
+    };
+    assert!(artifact_verified);
+    assert_eq!(res_job_id, &job.job_id);
+    assert_eq!(planning_result.plan_revision, 1);
+    assert_eq!(planning_result.architect_advice_ids.len(), 1);
+
+    let published_plan = fx
+        .workflow
+        .get_plan(&planning_result.plan_id, None, None, None)
+        .expect("fetch published plan from workflow");
+    assert_eq!(published_plan.header.status, PlanStatus::Published);
+    assert_eq!(published_plan.header.revision, 1);
+    assert_eq!(published_plan.tasks.len(), 3);
+
+    let codex_invocations: u32 = fs::read_to_string(&codex_count_file)
+        .expect("read codex count")
+        .trim()
+        .parse()
+        .expect("parse codex count");
+    assert_eq!(codex_invocations, 3);
+
+    // Verify all 3 reservations (Orchestrator round 0, Architect round 1, Orchestrator round 1)
+    // genuinely ingested the >256 KiB stdout streams and recorded Tool events without overflow.
+    let ledger = fx.store.read_binding_ledger(BINDING_ID).expect("ledger");
+    let grant_after = ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == recorded_grant.grant_id)
+        .expect("find grant");
+    assert_eq!(grant_after.reservations.len(), 3);
+    for (idx, expected_stream_len) in [
+        (0usize, call_1_stream.len()),
+        (1usize, call_2_stream.len()),
+        (2usize, call_3_stream.len()),
+    ] {
+        let res = &grant_after.reservations[idx];
+        assert_eq!(res.status, PlanningReservationStatus::Completed);
+        let art_id = res
+            .report_artifact_id
+            .as_deref()
+            .expect("reservation artifact id");
+        let artifact = fx
+            .service
+            .read_planning_artifact(art_id)
+            .expect("read persisted planning artifact");
+        assert_eq!(artifact.execution.status, WorkerRunStatus::Succeeded);
+        assert!(artifact.execution.overflow.is_none());
+        assert_eq!(
+            artifact.execution.stdout_bytes_captured,
+            expected_stream_len
+        );
+        assert!(
+            artifact.execution.stdout_bytes_captured > DEFAULT_MAX_LINE_BYTES,
+            "reservation {idx} must have captured >256 KiB of stdout"
+        );
+        assert!(artifact.execution.evidence.saw_init_event);
+        assert!(artifact.execution.evidence.saw_result_event);
+        assert_eq!(artifact.execution.evidence.malformed_lines_count, 0);
+        assert!(artifact
+            .execution
+            .evidence
+            .retained_events
+            .iter()
+            .any(|ev| {
+                ev.kind == NormalizedEventKind::Tool
+                    && ev.raw_type == "item.completed:command_execution"
+            }));
+    }
+    assert_eq!(
+        fx.service
+            .read_planning_artifact(
+                grant_after.reservations[2]
+                    .report_artifact_id
+                    .as_deref()
+                    .expect("round 1 artifact id"),
+            )
+            .expect("round 1 artifact")
+            .execution
+            .evidence
+            .total_lines,
+        11
+    );
+}
+
+#[tokio::test]
+async fn codex_planning_preserves_total_overflow_hard_line_ceiling_unsealed_rejection_and_legacy_provider_line_limit(
+) {
+    use threadlane_workers::{
+        AdvisoryResponseErrorCode, OutputOverflowKind, WorkerRunStatus, DEFAULT_MAX_LINE_BYTES,
+        MAX_LINE_BYTES,
+    };
+
+    let (fx, _codex_count_file, codex_prompts_dir, codex_policy) = setup_codex_planning_fixture();
+    let job = fx.create_initial_job(
+        "job_codex_overflow_and_rules_1",
+        vec!["Implement binary frame header parser in src/parser.rs".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+    let valid_plan_json = r#"{"outcome":"plan","schema_version":1,"summary":"Plan summary.","tasks":[{"task_id":"task_parse","title":"Implement parser","description":"Parse frames in src/parser.rs.","role":"coder","difficulty":"medium","depends_on":[],"allowed_write_paths":["src/parser.rs"]}]}"#;
+
+    // 1. Whole-stream total stdout budget overflow (`StdoutTotalExceeded`):
+    // Approved total cap is 512 KiB (524,288 bytes). Emit two ~300 KiB command_execution lines
+    // (each individual line <= 512 KiB line budget, but combined > 512 KiB total budget).
+    let total_cap_grant = create_codex_grant_with_budget(
+        &fx,
+        &codex_policy,
+        "req_grant_codex_total_overflow_1",
+        PlanningCallBudget {
+            max_total_calls: 2,
+            max_orchestrator_calls: 2,
+            max_architect_calls: 0,
+            max_timeout_ms_per_call: 60_000,
+            max_output_bytes_per_call: 524_288,
+        },
+    );
+    let chunk_300_kib = "x".repeat(300_000);
+    let cmd_line_a =
+        format_codex_command_execution_line("cmd_tot_1", "git log -n 20", &chunk_300_kib);
+    let cmd_line_b =
+        format_codex_command_execution_line("cmd_tot_2", "git diff HEAD~1", &chunk_300_kib);
+    assert!(cmd_line_a.len() > DEFAULT_MAX_LINE_BYTES && cmd_line_a.len() < 524_288);
+    assert!(cmd_line_a.len() + cmd_line_b.len() > 524_288);
+    let call_1_total_overflow_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000201"}"#,
+        r#"{"type":"turn.started"}"#,
+        cmd_line_a,
+        cmd_line_b,
+        format_codex_agent_message_line("msg_tot", valid_plan_json),
+        r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}"#,
+    );
+    fs::write(
+        codex_prompts_dir.join("raw_stream_1.jsonl"),
+        &call_1_total_overflow_stream,
+    )
+    .expect("write raw_stream_1.jsonl");
+
+    let req_total_overflow = OrchestratorTestFixture::plan_req(
+        &total_cap_grant.grant_id,
+        &job.job_id,
+        "orch_codex_total_overflow_1",
+        0,
+    );
+    let err_total = fx
+        .service
+        .orchestrate_brief_to_plan(&fx.workflow, &req_total_overflow)
+        .await
+        .expect_err("total stdout budget overflow must fail closed");
+    assert_eq!(err_total.code, NativeErrorCode::ValidationFailed);
+
+    let ledger = fx.store.read_binding_ledger(BINDING_ID).expect("ledger");
+    let res_total = &ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == total_cap_grant.grant_id)
+        .expect("find total_cap_grant")
+        .reservations[0];
+    assert_eq!(
+        res_total.status,
+        PlanningReservationStatus::FailedAfterEffect
+    );
+    let art_total = fx
+        .service
+        .read_planning_artifact(res_total.report_artifact_id.as_deref().expect("art_total"))
+        .expect("read art_total");
+    assert_eq!(art_total.execution.status, WorkerRunStatus::OutputOverflow);
+    assert_eq!(
+        art_total.execution.overflow,
+        Some(OutputOverflowKind::StdoutTotalExceeded {
+            max_stdout_bytes: 524_288
+        })
+    );
+    let PlanningArtifactOutcomeKind::FailedAfterEffect {
+        response_error: Some(ref resp_err_total),
+        ..
+    } = art_total.outcome
+    else {
+        panic!("expected FailedAfterEffect with response_error");
+    };
+    assert_eq!(
+        resp_err_total.code,
+        AdvisoryResponseErrorCode::StreamOutputOverflow
+    );
+
+    // 2. Hard library line ceiling (`MAX_LINE_BYTES` = 4 MiB) when approved total stdout budget is larger (8 MiB),
+    // plus unsealed and malformed terminal stream rejection after a valid >256 KiB command_execution event:
+    let ceiling_grant = create_codex_grant_with_budget(
+        &fx,
+        &codex_policy,
+        "req_grant_codex_hard_ceiling_1",
+        PlanningCallBudget {
+            max_total_calls: 4,
+            max_orchestrator_calls: 4,
+            max_architect_calls: 0,
+            max_timeout_ms_per_call: 60_000,
+            max_output_bytes_per_call: 8 * 1024 * 1024,
+        },
+    );
+    let over_4_mib_payload = "y".repeat(MAX_LINE_BYTES + 4_096);
+    let over_4_mib_line =
+        format_codex_command_execution_line("cmd_over_4mib", "git log -p", &over_4_mib_payload);
+    assert!(over_4_mib_line.len() > MAX_LINE_BYTES);
+    assert!(over_4_mib_line.len() < 8 * 1024 * 1024);
+    let call_2_line_ceiling_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000202"}"#,
+        r#"{"type":"turn.started"}"#,
+        over_4_mib_line,
+        format_codex_agent_message_line("msg_ceil", valid_plan_json),
+        r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}"#,
+    );
+    fs::write(
+        codex_prompts_dir.join("raw_stream_2.jsonl"),
+        &call_2_line_ceiling_stream,
+    )
+    .expect("write raw_stream_2.jsonl");
+
+    let req_ceiling = OrchestratorTestFixture::plan_req(
+        &ceiling_grant.grant_id,
+        &job.job_id,
+        "orch_codex_hard_line_ceiling_2",
+        0,
+    );
+    let err_ceiling = fx
+        .service
+        .orchestrate_brief_to_plan(&fx.workflow, &req_ceiling)
+        .await
+        .expect_err(
+            "single line above MAX_LINE_BYTES must fail closed even under 8 MiB stdout cap",
+        );
+    assert_eq!(err_ceiling.code, NativeErrorCode::ValidationFailed);
+
+    let ledger = fx.store.read_binding_ledger(BINDING_ID).expect("ledger");
+    let res_ceiling = &ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == ceiling_grant.grant_id)
+        .expect("find ceiling_grant")
+        .reservations[0];
+    assert_eq!(
+        res_ceiling.status,
+        PlanningReservationStatus::FailedAfterEffect
+    );
+    let art_ceiling = fx
+        .service
+        .read_planning_artifact(
+            res_ceiling
+                .report_artifact_id
+                .as_deref()
+                .expect("art_ceiling"),
+        )
+        .expect("read art_ceiling");
+    assert_eq!(
+        art_ceiling.execution.status,
+        WorkerRunStatus::OutputOverflow
+    );
+    assert_eq!(
+        art_ceiling.execution.overflow,
+        Some(OutputOverflowKind::StdoutLineExceeded {
+            max_line_bytes: MAX_LINE_BYTES
+        })
+    );
+
+    // 3. Unsealed terminal stream (missing `turn.completed`) and malformed JSON line after a >256 KiB event line:
+    let large_reasoning_line = serde_json::to_string(&serde_json::json!({
+        "type": "item.completed",
+        "item": {
+            "id": "rsn_unsealed_large",
+            "type": "reasoning",
+            "text": chunk_300_kib
+        }
+    }))
+    .expect("serialize codex reasoning line");
+    assert!(large_reasoning_line.len() > DEFAULT_MAX_LINE_BYTES);
+    let call_3_unsealed_stream = format!(
+        "{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000203"}"#,
+        r#"{"type":"turn.started"}"#,
+        large_reasoning_line,
+        format_codex_agent_message_line("msg_unsealed", valid_plan_json),
+    );
+    fs::write(
+        codex_prompts_dir.join("raw_stream_3.jsonl"),
+        &call_3_unsealed_stream,
+    )
+    .expect("write raw_stream_3.jsonl");
+    let req_unsealed = OrchestratorTestFixture::plan_req(
+        &ceiling_grant.grant_id,
+        &job.job_id,
+        "orch_codex_unsealed_3",
+        0,
+    );
+    assert_eq!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_unsealed)
+            .await
+            .expect_err("unsealed Codex stream missing turn.completed must fail closed")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+
+    let call_4_malformed_stream = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}\n",
+        r#"{"type":"thread.started","thread_id":"01972d12-3456-7000-8000-000000000204"}"#,
+        r#"{"type":"turn.started"}"#,
+        cmd_line_a,
+        r#"{"type":"item.completed","item":{"id":"bad_json""#,
+        format_codex_agent_message_line("msg_malformed", valid_plan_json),
+        r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":50}}"#,
+    );
+    fs::write(
+        codex_prompts_dir.join("raw_stream_4.jsonl"),
+        &call_4_malformed_stream,
+    )
+    .expect("write raw_stream_4.jsonl");
+    let req_malformed = OrchestratorTestFixture::plan_req(
+        &ceiling_grant.grant_id,
+        &job.job_id,
+        "orch_codex_malformed_4",
+        0,
+    );
+    assert_eq!(
+        fx.service
+            .orchestrate_brief_to_plan(&fx.workflow, &req_malformed)
+            .await
+            .expect_err("malformed JSON line in Codex stream must fail closed")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+
+    let ledger = fx.store.read_binding_ledger(BINDING_ID).expect("ledger");
+    let ceiling_grant_after = ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == ceiling_grant.grant_id)
+        .expect("find ceiling_grant after unsealed/malformed");
+    let art_unsealed = fx
+        .service
+        .read_planning_artifact(
+            ceiling_grant_after.reservations[1]
+                .report_artifact_id
+                .as_deref()
+                .expect("art_unsealed"),
+        )
+        .expect("read art_unsealed");
+    assert_eq!(
+        art_unsealed.execution.status,
+        WorkerRunStatus::MissingResultEvidence
+    );
+    assert!(!art_unsealed.execution.evidence.saw_result_event);
+    let PlanningArtifactOutcomeKind::FailedAfterEffect {
+        response_error: Some(ref err_unsealed_resp),
+        ..
+    } = art_unsealed.outcome
+    else {
+        panic!("expected FailedAfterEffect on unsealed stream");
+    };
+    assert_eq!(
+        err_unsealed_resp.code,
+        AdvisoryResponseErrorCode::MissingTerminalFraming
+    );
+
+    let art_malformed = fx
+        .service
+        .read_planning_artifact(
+            ceiling_grant_after.reservations[2]
+                .report_artifact_id
+                .as_deref()
+                .expect("art_malformed"),
+        )
+        .expect("read art_malformed");
+    assert_eq!(
+        art_malformed.execution.status,
+        WorkerRunStatus::MalformedStream
+    );
+    assert_eq!(art_malformed.execution.evidence.malformed_lines_count, 1);
+    let PlanningArtifactOutcomeKind::FailedAfterEffect {
+        response_error: Some(ref err_malformed_resp),
+        ..
+    } = art_malformed.outcome
+    else {
+        panic!("expected FailedAfterEffect on malformed stream");
+    };
+    assert_eq!(
+        err_malformed_resp.code,
+        AdvisoryResponseErrorCode::MalformedStream
+    );
+
+    // 4. Legacy provider (`WorkerProvider::Antigravity`) retains `DEFAULT_MAX_LINE_BYTES` (256 KiB)
+    // strictness even when `max_output_bytes_per_call` is 4 MiB:
+    let agy_fx = OrchestratorTestFixture::new();
+    let agy_grant = agy_fx.create_grant_with_budget(
+        "grant_agy_legacy_line_limit_1",
+        PlanningCallBudget {
+            max_total_calls: 2,
+            max_orchestrator_calls: 2,
+            max_architect_calls: 0,
+            max_timeout_ms_per_call: 60_000,
+            max_output_bytes_per_call: 4_194_304,
+        },
+        1_800_000_000_000,
+    );
+    let agy_job = agy_fx.create_initial_job(
+        "job_agy_legacy_line_limit_1",
+        vec!["Implement binary frame header parser in src/parser.rs".to_string()],
+        Vec::new(),
+        Vec::new(),
+    );
+    agy_fx.set_mode("custom_file");
+    let agy_large_step_line = serde_json::to_string(&serde_json::json!({
+        "event": "step_update",
+        "step_update": {
+            "step_type": "tool_result",
+            "tool_name": "read_file",
+            "output": chunk_300_kib
+        }
+    }))
+    .expect("serialize agy large step line");
+    assert!(agy_large_step_line.len() > DEFAULT_MAX_LINE_BYTES);
+    let agy_result_line = serde_json::to_string(&serde_json::json!({
+        "event": "result",
+        "result": {
+            "status": "SUCCESS",
+            "response": valid_plan_json
+        }
+    }))
+    .expect("serialize agy result line");
+    fs::write(
+        agy_fx.agy_prompts_dir.join("raw_after_init_1.jsonl"),
+        format!("{agy_large_step_line}\n{agy_result_line}\n"),
+    )
+    .expect("write raw_after_init_1.jsonl");
+
+    let req_agy = OrchestratorTestFixture::plan_req(
+        &agy_grant.grant_id,
+        &agy_job.job_id,
+        "orch_agy_legacy_line_limit_1",
+        0,
+    );
+    assert_eq!(
+        agy_fx
+            .service
+            .orchestrate_brief_to_plan(&agy_fx.workflow, &req_agy)
+            .await
+            .expect_err("Antigravity must retain 256 KiB DEFAULT_MAX_LINE_BYTES limit")
+            .code,
+        NativeErrorCode::ValidationFailed
+    );
+    let agy_ledger = agy_fx
+        .store
+        .read_binding_ledger(BINDING_ID)
+        .expect("agy ledger");
+    let agy_res = &agy_ledger
+        .planning_grants
+        .iter()
+        .find(|g| g.grant_id == agy_grant.grant_id)
+        .expect("find agy_grant")
+        .reservations[0];
+    let agy_art = agy_fx
+        .service
+        .read_planning_artifact(agy_res.report_artifact_id.as_deref().expect("agy_art"))
+        .expect("read agy_art");
+    assert_eq!(agy_art.execution.status, WorkerRunStatus::OutputOverflow);
+    assert_eq!(
+        agy_art.execution.overflow,
+        Some(OutputOverflowKind::StdoutLineExceeded {
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES
+        })
+    );
+    assert!(fx
+        .workflow
+        .list_plans(None, None)
+        .expect("list plans")
+        .plans
+        .is_empty());
+    assert!(agy_fx
+        .workflow
+        .list_plans(None, None)
+        .expect("list agy plans")
+        .plans
+        .is_empty());
 }
