@@ -37,6 +37,15 @@ runtime snapshot; it does not execute a worker or test paid model access.
 The checklist cannot verify execution approval, notification delivery or an
 account's remaining quota. Those are checked for the concrete session.
 
+For a new native Codex chat, verify **Threadlane skill** in the same Connections
+card, then start with `$threadlane` and your task. Add `profile=default` (or a
+specific profile name/ID) only when you want an explicit profile. The skill reads
+the live guide, connects the chat, and infers the next planning/status step;
+it does not require manual role-routing prompts or authorize provider calls.
+Planning and execution still need their concrete scoped approvals. Skill files
+and a registered MCP server are separate from a connected, paired conversation.
+See [skill setup and recovery](CODEX-SETUP.md#bundled-threadlane-skill).
+
 ## Start with one small task
 
 Use an existing private operator context for the intended repository and chat.

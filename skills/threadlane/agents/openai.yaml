@@ -1,0 +1,4 @@
+interface:
+  display_name: "Threadlane"
+  short_description: "Coordinate work through Threadlane from Codex"
+  default_prompt: "Use $threadlane to connect this chat and help me shape the next task."

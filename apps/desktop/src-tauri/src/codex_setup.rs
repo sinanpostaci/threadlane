@@ -1,3 +1,4 @@
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -6,8 +7,38 @@ use threadlane_native::codex_setup::{
     run_codex_mcp_setup, CodexSetupMode, CodexSetupReport, CodexSetupRequest,
     CODEX_CONFIG_FILENAME,
 };
+use threadlane_native::codex_skill::{
+    resolve_codex_skills_dir, run_codex_skill_setup, CodexSkillSetupReport, CodexSkillSetupRequest,
+};
 
 use crate::AppError;
+
+/// Combined desktop startup setup report flattening the MCP registration report
+/// while attaching the independent bundled-skill installation report.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct DesktopCodexSetupReport {
+    #[serde(flatten)]
+    pub(crate) mcp: CodexSetupReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) skill_setup: Option<CodexSkillSetupReport>,
+}
+
+impl DesktopCodexSetupReport {
+    pub(crate) fn checking(config_path: Option<String>) -> Self {
+        Self {
+            mcp: CodexSetupReport::checking(config_path),
+            skill_setup: None,
+        }
+    }
+}
+
+impl Deref for DesktopCodexSetupReport {
+    type Target = CodexSetupReport;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mcp
+    }
+}
 
 /// Subdirectory under `app_data_dir` used for the private native MCP pairing store.
 pub(crate) const DESKTOP_PAIRING_SUBDIR: &str = "pairing";
@@ -29,6 +60,8 @@ pub(crate) struct CodexSetupServiceConfig {
     pub(crate) codex_home_override: Option<PathBuf>,
     #[cfg(test)]
     pub(crate) mcp_executable_override: Option<PathBuf>,
+    #[cfg(test)]
+    pub(crate) skills_dir_override: Option<PathBuf>,
 }
 
 impl CodexSetupServiceConfig {
@@ -52,6 +85,8 @@ impl CodexSetupServiceConfig {
             codex_home_override: None,
             #[cfg(test)]
             mcp_executable_override: None,
+            #[cfg(test)]
+            skills_dir_override: None,
         }
     }
 }
@@ -61,7 +96,7 @@ impl CodexSetupServiceConfig {
 #[derive(Clone)]
 pub(crate) struct CodexSetupService {
     config: CodexSetupServiceConfig,
-    latest_report: Arc<Mutex<CodexSetupReport>>,
+    latest_report: Arc<Mutex<DesktopCodexSetupReport>>,
     run_gate: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -70,7 +105,9 @@ impl CodexSetupService {
         let initial_config_path = initial_config_path_hint(&config);
         Self {
             config,
-            latest_report: Arc::new(Mutex::new(CodexSetupReport::checking(initial_config_path))),
+            latest_report: Arc::new(Mutex::new(DesktopCodexSetupReport::checking(
+                initial_config_path,
+            ))),
             run_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
@@ -87,13 +124,19 @@ impl CodexSetupService {
                 execute_desktop_codex_setup(&config, CodexSetupMode::Apply)
             })
             .await
-            .unwrap_or_else(|_| {
-                CodexSetupReport::error(
+            .unwrap_or_else(|_| DesktopCodexSetupReport {
+                mcp: CodexSetupReport::error(
                     CodexSetupMode::Apply,
                     None,
                     "internal_join_error",
                     "Background Codex MCP setup task terminated unexpectedly.",
-                )
+                ),
+                skill_setup: Some(CodexSkillSetupReport::error(
+                    CodexSetupMode::Apply,
+                    None,
+                    "internal_join_error",
+                    "Background Codex skill setup task terminated unexpectedly.",
+                )),
             });
 
             if let Ok(mut slot) = latest_report.lock() {
@@ -103,7 +146,7 @@ impl CodexSetupService {
     }
 
     #[cfg(test)]
-    pub(crate) fn cached_report_snapshot(&self) -> CodexSetupReport {
+    pub(crate) fn cached_report_snapshot(&self) -> DesktopCodexSetupReport {
         self.latest_report
             .lock()
             .expect("codex setup report mutex")
@@ -111,7 +154,7 @@ impl CodexSetupService {
     }
 
     /// Returns the latest Codex setup report, awaiting the initial startup background task if still in flight.
-    pub(crate) async fn status(&self) -> Result<CodexSetupReport, AppError> {
+    pub(crate) async fn status(&self) -> Result<DesktopCodexSetupReport, AppError> {
         let _guard = self.run_gate.lock().await;
         let report = self
             .latest_report
@@ -122,16 +165,16 @@ impl CodexSetupService {
     }
 
     /// Runs an explicit read-only recheck (`CodexSetupMode::Check`) and updates the cached report.
-    pub(crate) async fn recheck(&self) -> Result<CodexSetupReport, AppError> {
+    pub(crate) async fn recheck(&self) -> Result<DesktopCodexSetupReport, AppError> {
         self.run_mode(CodexSetupMode::Check).await
     }
 
     /// Runs an explicit setup retry (`CodexSetupMode::Apply`) and updates the cached report.
-    pub(crate) async fn apply(&self) -> Result<CodexSetupReport, AppError> {
+    pub(crate) async fn apply(&self) -> Result<DesktopCodexSetupReport, AppError> {
         self.run_mode(CodexSetupMode::Apply).await
     }
 
-    async fn run_mode(&self, mode: CodexSetupMode) -> Result<CodexSetupReport, AppError> {
+    async fn run_mode(&self, mode: CodexSetupMode) -> Result<DesktopCodexSetupReport, AppError> {
         let _guard = self.run_gate.lock().await;
         let config = self.config.clone();
         let report = tauri::async_runtime::spawn_blocking(move || {
@@ -164,6 +207,51 @@ fn initial_config_path_hint(config: &CodexSetupServiceConfig) -> Option<String> 
 }
 
 pub(crate) fn execute_desktop_codex_setup(
+    config: &CodexSetupServiceConfig,
+    mode: CodexSetupMode,
+) -> DesktopCodexSetupReport {
+    let mcp = execute_desktop_codex_mcp_setup(config, mode);
+    let skill_setup = execute_desktop_codex_skill_setup(config, mode);
+    DesktopCodexSetupReport {
+        mcp,
+        skill_setup: Some(skill_setup),
+    }
+}
+
+pub(crate) fn execute_desktop_codex_skill_setup(
+    config: &CodexSetupServiceConfig,
+    mode: CodexSetupMode,
+) -> CodexSkillSetupReport {
+    let skills_dir_res = {
+        #[cfg(test)]
+        {
+            let _ = resolve_codex_skills_dir;
+            config.skills_dir_override.clone().ok_or(())
+        }
+        #[cfg(not(test))]
+        {
+            let _ = config;
+            resolve_codex_skills_dir().map_err(|_| ())
+        }
+    };
+
+    let skills_dir = match skills_dir_res {
+        Ok(dir) => dir,
+        Err(()) => {
+            return CodexSkillSetupReport::error(
+                mode,
+                None,
+                "skills_dir_unresolved",
+                "Unable to resolve Codex skills directory from HOME.",
+            );
+        }
+    };
+
+    let request = CodexSkillSetupRequest { skills_dir };
+    run_codex_skill_setup(&request, mode)
+}
+
+pub(crate) fn execute_desktop_codex_mcp_setup(
     config: &CodexSetupServiceConfig,
     mode: CodexSetupMode,
 ) -> CodexSetupReport {
@@ -257,11 +345,45 @@ pub(crate) fn execute_desktop_codex_setup(
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     use tempfile::TempDir;
     use threadlane_native::codex_setup::{CodexSetupState, DEFAULT_NATIVE_MCP_EXECUTABLE_NAME};
+    use threadlane_native::codex_skill::{CodexSkillSetupState, THREADLANE_SKILL_VERSION};
 
     use super::*;
+
+    fn build_isolated_config(root: &Path, name: &str) -> CodexSetupServiceConfig {
+        let scoped = root.join(name);
+        let bin_dir = scoped.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let mcp_exe = bin_dir.join(DEFAULT_NATIVE_MCP_EXECUTABLE_NAME);
+        fs::write(&mcp_exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&mcp_exe, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let app_data = scoped.join("app-data");
+        let mut config = CodexSetupServiceConfig::from_desktop_dirs(
+            Some(scoped.join("runtime-state")),
+            scoped.join("registry"),
+            app_data.join("plans"),
+            app_data.join("authority"),
+            app_data.join("sessions"),
+            &app_data,
+        );
+        config.codex_home_override = Some(scoped.join("codex-home"));
+        config.mcp_executable_override = Some(mcp_exe);
+        config.skills_dir_override = Some(scoped.join("skills"));
+        config
+    }
+
+    fn resolve_skill_md_path(report: &CodexSkillSetupReport) -> PathBuf {
+        let raw = PathBuf::from(report.skill_path.as_ref().expect("skill_path"));
+        if raw.is_dir() {
+            raw.join("SKILL.md")
+        } else {
+            raw
+        }
+    }
 
     #[test]
     fn desktop_service_starts_in_checking_and_applies_using_desktop_store_paths() {
@@ -284,11 +406,18 @@ mod tests {
         );
         config.codex_home_override = Some(root.join("codex-home"));
         config.mcp_executable_override = Some(mcp_exe);
+        config.skills_dir_override = Some(root.join("skills"));
 
         let service = CodexSetupService::new(config.clone());
         let initial = service.cached_report_snapshot();
         assert_eq!(initial.state, CodexSetupState::Checking);
         assert!(initial.pairing_required);
+        assert!(initial.skill_setup.is_none());
+
+        let initial_json = serde_json::to_value(&initial).expect("serialize initial");
+        assert_eq!(initial_json["state"], "checking");
+        assert_eq!(initial_json["pairing_required"], true);
+        assert!(initial_json.get("skill_setup").is_none());
 
         let applied = execute_desktop_codex_setup(&config, CodexSetupMode::Apply);
         assert_eq!(applied.state, CodexSetupState::Registered);
@@ -296,6 +425,22 @@ mod tests {
         assert!(applied.config_modified);
         assert!(applied.restart_required);
         assert!(applied.pairing_required);
+        let applied_skill = applied.skill_setup.as_ref().expect("skill setup report");
+        assert_eq!(applied_skill.state, CodexSkillSetupState::Installed);
+        assert!(applied_skill.installed);
+        assert!(applied_skill.files_modified);
+        assert_eq!(applied_skill.version, THREADLANE_SKILL_VERSION);
+
+        let applied_json = serde_json::to_value(&applied).expect("serialize applied");
+        assert_eq!(applied_json["state"], "registered");
+        assert_eq!(applied_json["registered"], true);
+        assert_eq!(applied_json["pairing_required"], true);
+        assert_eq!(applied_json["skill_setup"]["state"], "installed");
+        assert_eq!(applied_json["skill_setup"]["installed"], true);
+        assert_eq!(
+            applied_json["skill_setup"]["version"],
+            THREADLANE_SKILL_VERSION
+        );
 
         let rechecked = execute_desktop_codex_setup(&config, CodexSetupMode::Check);
         assert_eq!(rechecked.state, CodexSetupState::Unchanged);
@@ -303,5 +448,156 @@ mod tests {
         assert!(!rechecked.config_modified);
         assert!(!rechecked.restart_required);
         assert!(rechecked.pairing_required);
+        let rechecked_skill = rechecked.skill_setup.as_ref().expect("skill setup report");
+        assert_eq!(rechecked_skill.state, CodexSkillSetupState::Unchanged);
+        assert!(rechecked_skill.installed);
+        assert!(!rechecked_skill.files_modified);
+    }
+
+    #[test]
+    fn skill_install_succeeds_independently_when_mcp_errors_or_is_manual_or_disabled() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let mut error_config = build_isolated_config(root, "mcp-error");
+        error_config.mcp_executable_override = Some(root.join("missing-mcp-binary"));
+        let error_report = execute_desktop_codex_setup(&error_config, CodexSetupMode::Apply);
+        assert_eq!(error_report.mcp.state, CodexSetupState::Error);
+        assert!(!error_report.mcp.registered);
+        assert!(error_report.mcp.pairing_required);
+        let error_skill = error_report.skill_setup.as_ref().expect("skill report");
+        assert_eq!(error_skill.state, CodexSkillSetupState::Installed);
+        assert!(error_skill.installed);
+        assert!(error_skill.files_modified);
+
+        let manual_config = build_isolated_config(root, "mcp-manual");
+        let manual_codex_home = manual_config.codex_home_override.as_ref().unwrap();
+        fs::create_dir_all(manual_codex_home).unwrap();
+        let manual_toml = "[mcp_servers.threadlane]\ncommand = \"/custom/manual/mcp\"\nargs = []\n";
+        fs::write(manual_codex_home.join(CODEX_CONFIG_FILENAME), manual_toml).unwrap();
+        let manual_report = execute_desktop_codex_setup(&manual_config, CodexSetupMode::Apply);
+        assert_ne!(manual_report.mcp.state, CodexSetupState::Registered);
+        assert!(!manual_report.mcp.registered);
+        assert!(!manual_report.mcp.config_modified);
+        let manual_skill = manual_report.skill_setup.as_ref().expect("skill report");
+        assert_eq!(manual_skill.state, CodexSkillSetupState::Installed);
+        assert!(manual_skill.installed);
+        assert!(manual_skill.files_modified);
+
+        let disabled_config = build_isolated_config(root, "mcp-disabled");
+        let disabled_codex_home = disabled_config.codex_home_override.as_ref().unwrap();
+        fs::create_dir_all(disabled_codex_home).unwrap();
+        let disabled_toml = "[mcp_servers.threadlane]\nenabled = false\n";
+        fs::write(
+            disabled_codex_home.join(CODEX_CONFIG_FILENAME),
+            disabled_toml,
+        )
+        .unwrap();
+        let disabled_report = execute_desktop_codex_setup(&disabled_config, CodexSetupMode::Apply);
+        assert_ne!(disabled_report.mcp.state, CodexSetupState::Registered);
+        assert!(!disabled_report.mcp.registered);
+        assert!(!disabled_report.mcp.config_modified);
+        let disabled_skill = disabled_report.skill_setup.as_ref().expect("skill report");
+        assert_eq!(disabled_skill.state, CodexSkillSetupState::Installed);
+        assert!(disabled_skill.installed);
+        assert!(disabled_skill.files_modified);
+    }
+
+    #[test]
+    fn skill_conflict_preserves_edited_skill_without_affecting_mcp_registration() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config = build_isolated_config(tmp.path(), "conflict-case");
+        let skills_dir = config.skills_dir_override.clone().unwrap();
+
+        let seed = run_codex_skill_setup(
+            &CodexSkillSetupRequest {
+                skills_dir: skills_dir.clone(),
+            },
+            CodexSetupMode::Apply,
+        );
+        assert_eq!(seed.state, CodexSkillSetupState::Installed);
+        let skill_md = resolve_skill_md_path(&seed);
+        let edited_contents = "# custom user edited threadlane skill\n";
+        fs::write(&skill_md, edited_contents).unwrap();
+
+        let report = execute_desktop_codex_setup(&config, CodexSetupMode::Apply);
+        assert_eq!(report.mcp.state, CodexSetupState::Registered);
+        assert!(report.mcp.registered);
+        assert!(report.mcp.config_modified);
+        assert!(report.mcp.pairing_required);
+
+        let skill = report.skill_setup.as_ref().expect("skill report");
+        assert_eq!(skill.state, CodexSkillSetupState::Conflict);
+        assert!(!skill.files_modified);
+        assert_eq!(fs::read_to_string(&skill_md).unwrap(), edited_contents);
+    }
+
+    #[test]
+    fn check_mode_on_missing_paths_creates_nothing_under_either_target() {
+        let tmp = TempDir::new().expect("tempdir");
+        let config = build_isolated_config(tmp.path(), "check-missing");
+        let codex_home = config.codex_home_override.as_ref().unwrap();
+        let skills_dir = config.skills_dir_override.as_ref().unwrap();
+        assert!(!codex_home.exists());
+        assert!(!skills_dir.exists());
+
+        let report = execute_desktop_codex_setup(&config, CodexSetupMode::Check);
+        assert!(!report.mcp.registered);
+        assert!(!report.mcp.config_modified);
+        assert!(report.mcp.pairing_required);
+
+        let skill = report.skill_setup.as_ref().expect("skill report");
+        assert_eq!(skill.state, CodexSkillSetupState::NotInstalled);
+        assert!(!skill.installed);
+        assert!(!skill.files_modified);
+        assert!(!codex_home.exists());
+        assert!(!skills_dir.exists());
+    }
+
+    #[test]
+    fn multiple_runtimes_share_skills_root_and_preserve_user_extra_files_on_repeated_apply() {
+        let tmp = TempDir::new().expect("tempdir");
+        let shared_skills = tmp.path().join("shared-skills");
+        let mut config_a = build_isolated_config(tmp.path(), "runtime-a");
+        let mut config_b = build_isolated_config(tmp.path(), "runtime-b");
+        config_a.skills_dir_override = Some(shared_skills.clone());
+        config_b.skills_dir_override = Some(shared_skills.clone());
+
+        let other_skill_file = shared_skills.join("custom-user-skill").join("SKILL.md");
+        fs::create_dir_all(other_skill_file.parent().unwrap()).unwrap();
+        fs::write(&other_skill_file, "# user extra skill\n").unwrap();
+
+        let first = execute_desktop_codex_setup(&config_a, CodexSetupMode::Apply);
+        assert_eq!(first.mcp.state, CodexSetupState::Registered);
+        let config_a_home = config_a.codex_home_override.as_ref().unwrap();
+        let config_a_toml = fs::read_to_string(config_a_home.join(CODEX_CONFIG_FILENAME)).unwrap();
+        assert!(config_a_toml.contains("runtime-a"));
+        let first_skill = first.skill_setup.as_ref().expect("first skill report");
+        assert_eq!(first_skill.state, CodexSkillSetupState::Installed);
+        assert!(first_skill.installed);
+        assert!(first_skill.files_modified);
+
+        let skill_md = resolve_skill_md_path(first_skill);
+        let extra_note = skill_md.parent().unwrap().join("USER_NOTES.md");
+        fs::write(&extra_note, "preserve user note\n").unwrap();
+
+        let second = execute_desktop_codex_setup(&config_b, CodexSetupMode::Apply);
+        assert_eq!(second.mcp.state, CodexSetupState::Registered);
+        let config_b_home = config_b.codex_home_override.as_ref().unwrap();
+        let config_b_toml = fs::read_to_string(config_b_home.join(CODEX_CONFIG_FILENAME)).unwrap();
+        assert!(config_b_toml.contains("runtime-b"));
+        let second_skill = second.skill_setup.as_ref().expect("second skill report");
+        assert_eq!(second_skill.state, CodexSkillSetupState::Unchanged);
+        assert!(second_skill.installed);
+        assert!(!second_skill.files_modified);
+
+        assert_eq!(
+            fs::read_to_string(&other_skill_file).unwrap(),
+            "# user extra skill\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&extra_note).unwrap(),
+            "preserve user note\n"
+        );
     }
 }

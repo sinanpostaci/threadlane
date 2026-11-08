@@ -37,6 +37,10 @@ path = "src/bin/threadlane-flow.rs"
 name = "threadlane-codex-setup"
 path = "src/bin/threadlane-codex-setup.rs"
 
+[[bin]]
+name = "threadlane-skill-setup"
+path = "src/bin/threadlane-skill-setup.rs"
+
 [dependencies]
 async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }

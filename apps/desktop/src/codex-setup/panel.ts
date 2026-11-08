@@ -1,6 +1,7 @@
 import { createButton, h } from '../ui/dom.ts';
 import {
   projectCodexSetupViewModel,
+  projectCodexSkillSetupView,
   type CodexSetupBadgeTone,
   type CodexSetupReport,
 } from './types.ts';
@@ -37,6 +38,11 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
   const vm = projectCodexSetupViewModel(props.report, {
     busy: props.busy,
     isBrowserPreview: props.isBrowserPreview,
+  });
+
+  const skillVm = projectCodexSkillSetupView(props.report.skill_setup, {
+    isBrowserPreview: props.isBrowserPreview,
+    isChecking: vm.isBusy,
   });
 
   const badgeWrapStyle =
@@ -93,6 +99,81 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
   const codeWrapStyle =
     'display: inline-block; max-width: 100%; white-space: normal; overflow-wrap: anywhere; word-break: break-word;';
 
+  const skillStatus = badgeDataStatus(skillVm.badgeTone);
+  const skillBadge = h(
+    'span',
+    {
+      className: 'aq-badge',
+      style: badgeWrapStyle,
+      ...(skillStatus ? { 'data-status': skillStatus } : {}),
+      'data-codex-skill-badge': skillVm.state,
+    },
+    skillVm.badgeLabel
+  );
+
+  const skillSection = h(
+    'div',
+    {
+      'data-codex-skill-section': 'true',
+      'data-codex-skill-state': skillVm.state,
+      style: 'margin: 10px 0 8px; min-width: 0; max-width: 100%;',
+    },
+    h(
+      'div',
+      {
+        className: 'aq-section',
+        style:
+          'margin-bottom: 6px; flex-wrap: wrap; min-width: 0; max-width: 100%;',
+      },
+      h(
+        'span',
+        {
+          style: 'min-width: 0; max-width: 100%; overflow-wrap: anywhere;',
+        },
+        'Threadlane skill'
+      )
+    ),
+    h(
+      'div',
+      {
+        style:
+          'display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; max-width: 100%; margin-bottom: 8px;',
+      },
+      skillBadge
+    ),
+    h('p', { className: 'aq-note' }, skillVm.message),
+    h(
+      'dl',
+      {
+        className: 'aq-facts',
+        style: 'margin: 6px 0 8px; min-width: 0; max-width: 100%;',
+      },
+      h(
+        'div',
+        { style: 'flex-wrap: wrap; min-width: 0; max-width: 100%;' },
+        h('dt', undefined, 'Skill path'),
+        h(
+          'dd',
+          { style: 'min-width: 0; max-width: 100%;' },
+          h('code', { style: codeWrapStyle }, skillVm.pathLabel)
+        )
+      )
+    )
+  );
+
+  if (skillVm.invocationHint) {
+    skillSection.appendChild(
+      h(
+        'p',
+        {
+          className: 'aq-note',
+          'data-codex-skill-hint': 'true',
+        },
+        skillVm.invocationHint
+      )
+    );
+  }
+
   const card = h(
     'section',
     {
@@ -132,6 +213,8 @@ export function buildCodexSetupPanel(props: CodexSetupPanelProps): HTMLElement {
       )
     )
   );
+
+  card.appendChild(skillSection);
 
   if (vm.restartNotice) {
     card.appendChild(

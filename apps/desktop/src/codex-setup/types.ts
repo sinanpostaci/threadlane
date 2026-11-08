@@ -9,6 +9,28 @@ export type CodexSetupState =
 
 export type CodexSetupMode = 'check' | 'apply';
 
+export type CodexSkillSetupState =
+  | 'installed'
+  | 'updated'
+  | 'unchanged'
+  | 'not_installed'
+  | 'outdated'
+  | 'conflict'
+  | 'error';
+
+export type CodexSkillSetupMode = 'check' | 'apply';
+
+export interface CodexSkillSetupReport {
+  state: CodexSkillSetupState;
+  mode: CodexSkillSetupMode;
+  skill_path: string | null;
+  version: string;
+  installed: boolean;
+  files_modified: boolean;
+  error_code: string | null;
+  message: string;
+}
+
 export interface CodexSetupReport {
   state: CodexSetupState;
   mode: CodexSetupMode;
@@ -19,6 +41,8 @@ export interface CodexSetupReport {
   pairing_required: boolean;
   error_code: string | null;
   message: string;
+  /** Present only when the desktop backend reports bundled skill installation. */
+  skill_setup?: CodexSkillSetupReport | null;
 }
 
 export type CodexSetupBadgeTone =
@@ -43,6 +67,15 @@ export interface CodexSetupViewModel {
   isBusy: boolean;
 }
 
+export interface CodexSkillSetupViewModel {
+  state: CodexSkillSetupState | 'unknown';
+  badgeLabel: string;
+  badgeTone: CodexSetupBadgeTone;
+  pathLabel: string;
+  message: string;
+  invocationHint: string | null;
+}
+
 export const PAIRING_REQUIRED_BADGE_LABEL = 'Conversation pairing required';
 
 export const RESTART_REQUIRED_NOTICE =
@@ -50,6 +83,15 @@ export const RESTART_REQUIRED_NOTICE =
 
 export const BROWSER_PREVIEW_SETUP_MESSAGE =
   'Browser preview mode: automatic Codex MCP registration only runs in the native Threadlane desktop app.';
+
+export const SKILL_INVOCATION_HINT =
+  'Use $threadlane in a new Codex chat.';
+
+export const BROWSER_PREVIEW_SKILL_SETUP_MESSAGE =
+  'Browser preview mode: automatic Threadlane skill installation only runs in the native Threadlane desktop app.';
+
+export const SKILL_SETUP_UNAVAILABLE_MESSAGE =
+  'Skill installation status was not reported by this desktop backend. Use Recheck to refresh it.';
 
 export function createInitialCodexSetupReport(): CodexSetupReport {
   return {
@@ -91,6 +133,7 @@ export function normalizeCodexSetupReport(raw: unknown): CodexSetupReport {
       pairing_required: true,
       error_code: 'invalid_response',
       message: 'Unable to read Codex MCP setup status from the desktop backend.',
+      skill_setup: null,
     };
   }
 
@@ -144,7 +187,148 @@ export function normalizeCodexSetupReport(raw: unknown): CodexSetupReport {
     pairing_required: true,
     error_code: errorCode,
     message,
+    skill_setup: normalizeCodexSkillSetup(obj.skill_setup),
   };
+}
+
+function invalidCodexSkillSetup(): CodexSkillSetupReport {
+  return {
+    state: 'error',
+    mode: 'check',
+    skill_path: null,
+    version: 'unknown',
+    installed: false,
+    files_modified: false,
+    error_code: 'invalid_response',
+    message:
+      'Threadlane skill installation status from the desktop backend was malformed.',
+  };
+}
+
+function normalizeCodexSkillSetup(raw: unknown): CodexSkillSetupReport | null {
+  if (raw === undefined || raw === null) {
+    return null;
+  }
+
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      state: 'error',
+      mode: 'check',
+      skill_path: null,
+      version: 'unknown',
+      installed: false,
+      files_modified: false,
+      error_code: 'invalid_response',
+      message:
+        'Unable to read Threadlane skill installation status from the desktop backend.',
+    };
+  }
+
+  const obj = raw as Record<string, unknown>;
+  const validStates: readonly CodexSkillSetupState[] = [
+    'installed',
+    'updated',
+    'unchanged',
+    'not_installed',
+    'outdated',
+    'conflict',
+    'error',
+  ];
+  const hasValidState =
+    typeof obj.state === 'string' &&
+    (validStates as readonly string[]).includes(obj.state);
+  const hasValidMode = obj.mode === 'check' || obj.mode === 'apply';
+  const hasValidVersion =
+    typeof obj.version === 'string' && obj.version.trim().length > 0;
+  const hasValidInstalled = typeof obj.installed === 'boolean';
+  const hasValidFilesModified = typeof obj.files_modified === 'boolean';
+  const hasValidSkillPath =
+    obj.skill_path === null || typeof obj.skill_path === 'string';
+  const hasValidErrorCode =
+    obj.error_code === null || typeof obj.error_code === 'string';
+
+  if (
+    !hasValidState ||
+    !hasValidMode ||
+    !hasValidVersion ||
+    !hasValidInstalled ||
+    !hasValidFilesModified ||
+    !hasValidSkillPath ||
+    !hasValidErrorCode
+  ) {
+    return invalidCodexSkillSetup();
+  }
+
+  const state = obj.state as CodexSkillSetupState;
+  const mode: CodexSkillSetupMode = obj.mode === 'check' ? 'check' : 'apply';
+  const skillPath =
+    typeof obj.skill_path === 'string' && obj.skill_path.trim().length > 0
+      ? obj.skill_path.trim()
+      : null;
+  const version = (obj.version as string).trim();
+  const reportedErrorCode =
+    typeof obj.error_code === 'string' && obj.error_code.trim().length > 0
+      ? obj.error_code.trim()
+      : null;
+  const reportedMessage =
+    typeof obj.message === 'string' && obj.message.trim().length > 0
+      ? obj.message.trim()
+      : null;
+  const isSuccessState =
+    state === 'installed' ||
+    state === 'updated' ||
+    state === 'unchanged';
+
+  if (
+    isSuccessState &&
+    (obj.installed !== true ||
+      skillPath === null ||
+      reportedErrorCode !== null)
+  ) {
+    return invalidCodexSkillSetup();
+  }
+
+  const postWriteError = state === 'error' && obj.files_modified === true;
+  const allowsInstalled =
+    isSuccessState ||
+    state === 'outdated' ||
+    state === 'not_installed' ||
+    postWriteError;
+  const installed = allowsInstalled && obj.installed === true;
+  // files_modified records an observed side effect, not install authority.
+  const filesModified = obj.files_modified === true;
+  const errorCode = reportedErrorCode;
+  const message = reportedMessage ?? defaultSkillMessageForState(state);
+
+  return {
+    state,
+    mode,
+    skill_path: skillPath,
+    version,
+    installed,
+    files_modified: filesModified,
+    error_code: errorCode,
+    message,
+  };
+}
+
+function defaultSkillMessageForState(state: CodexSkillSetupState): string {
+  switch (state) {
+    case 'installed':
+      return 'Threadlane skill files are installed. Use $threadlane in a new Codex chat.';
+    case 'updated':
+      return 'Threadlane skill files were updated. Use $threadlane in a new Codex chat.';
+    case 'unchanged':
+      return 'Threadlane skill files are already up to date. Use $threadlane in a new Codex chat.';
+    case 'not_installed':
+      return 'Threadlane skill files are not installed in the Codex skills directory.';
+    case 'outdated':
+      return 'Threadlane skill files are outdated and need an update.';
+    case 'conflict':
+      return 'Threadlane skill files conflict with local edits and were preserved without overwrite.';
+    case 'error':
+      return 'Threadlane skill setup requires operator attention.';
+  }
 }
 
 function defaultMessageForState(state: CodexSetupState): string {
@@ -164,6 +348,97 @@ function defaultMessageForState(state: CodexSetupState): string {
     case 'error':
       return 'Codex MCP setup requires operator attention.';
   }
+}
+
+export function projectCodexSkillSetupView(
+  skillSetup: CodexSkillSetupReport | null | undefined,
+  options: { isBrowserPreview?: boolean; isChecking?: boolean } = {}
+): CodexSkillSetupViewModel {
+  if (options.isBrowserPreview) {
+    return {
+      state: 'unknown',
+      badgeLabel: 'Preview only',
+      badgeTone: 'neutral',
+      pathLabel: 'Unavailable in browser preview',
+      message: BROWSER_PREVIEW_SKILL_SETUP_MESSAGE,
+      invocationHint: null,
+    };
+  }
+
+  if (!skillSetup) {
+    if (options.isChecking) {
+      return {
+        state: 'unknown',
+        badgeLabel: 'Checking skill status',
+        badgeTone: 'info',
+        pathLabel: 'Skill path pending',
+        message: 'Checking Threadlane skill installation status.',
+        invocationHint: null,
+      };
+    }
+
+    return {
+      state: 'unknown',
+      badgeLabel: 'Skill status unavailable',
+      badgeTone: 'neutral',
+      pathLabel: 'Skill path unavailable',
+      message: SKILL_SETUP_UNAVAILABLE_MESSAGE,
+      invocationHint: null,
+    };
+  }
+
+  const pathLabel = skillSetup.skill_path ?? 'Skill path unavailable';
+  const provenInstalled =
+    skillSetup.installed === true &&
+    (skillSetup.state === 'installed' ||
+      skillSetup.state === 'updated' ||
+      skillSetup.state === 'unchanged');
+  const invocationHint = provenInstalled ? SKILL_INVOCATION_HINT : null;
+
+  let badgeLabel: string;
+  let badgeTone: CodexSetupBadgeTone;
+
+  switch (skillSetup.state) {
+    case 'installed':
+      badgeLabel = 'Skill installed';
+      badgeTone = 'ready';
+      break;
+    case 'updated':
+      badgeLabel = 'Skill updated';
+      badgeTone = 'ready';
+      break;
+    case 'unchanged':
+      badgeLabel = 'Skill up to date';
+      badgeTone = 'ready';
+      break;
+    case 'not_installed':
+      badgeLabel = 'Skill not installed';
+      badgeTone = 'warning';
+      break;
+    case 'outdated':
+      badgeLabel = 'Skill update available';
+      badgeTone = 'warning';
+      break;
+    case 'conflict':
+      badgeLabel = 'Skill conflict (local edits preserved)';
+      badgeTone = 'warning';
+      break;
+    case 'error':
+      badgeLabel = skillSetup.files_modified
+        ? 'Skill setup error (files written)'
+        : 'Skill setup error';
+      badgeTone = 'danger';
+      break;
+  }
+
+  return {
+    state: skillSetup.state,
+    badgeLabel,
+    badgeTone,
+    pathLabel,
+    message: skillSetup.message,
+    invocationHint,
+  };
 }
 
 export function projectCodexSetupViewModel(

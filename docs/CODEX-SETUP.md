@@ -1,6 +1,6 @@
-# Codex MCP Startup Setup (`threadlane-codex-setup`)
+# Codex startup setup
 
-Threadlane provides a focused Rust helper (`threadlane_native::codex_setup`), a standalone CLI (`threadlane-codex-setup`), and a desktop startup integration that register the **unbound paired** `mcp_servers.threadlane` entry in `${CODEX_HOME:-$HOME/.codex}/config.toml`.
+Threadlane provides a focused Rust helper (`threadlane_native::codex_setup`), a standalone CLI (`threadlane-codex-setup`), and a desktop startup integration that register the **unbound paired** `mcp_servers.threadlane` entry in `${CODEX_HOME:-$HOME/.codex}/config.toml`. The desktop also installs or updates its bundled user-level `threadlane` skill independently of MCP registration. The diagnostic `threadlane-skill-setup` CLI performs only skill setup.
 
 ## Boundary and Safety Invariants
 
@@ -73,3 +73,82 @@ threadlane-codex-setup \
 - On startup, `threadlane-desktop` spawns a one-time background `apply` task using the active `DesktopControlState` paths (`registry_dir`, `plans_dir`, `authority_dir`, `sessions_dir`), `app_data_dir/pairing`, `app_data_dir/codex-setup`, `CODEX_HOME` (or `$HOME/.codex`), and the runtime `--state-dir` (or original `THREADLANE_CLI_XDG_STATE_HOME` / `XDG_STATE_HOME`, then `$HOME/.local/state/threadlane/runtime`).
 - The frontend launches `desktop_codex_setup_status` once independently during startup initialization (without blocking normal state polling and never inside the recurring activity poll) and renders a compact status card in **Settings > Connections** with explicit **Recheck** (`desktop_codex_setup_recheck`) and **Retry setup** (`desktop_codex_setup_apply`) buttons.
 - Browser preview mode (`?preview=1` or non-Tauri browser context) never executes setup and never simulates registration success.
+
+## Bundled Threadlane skill
+
+The desktop startup task also checks the two embedded skill resources and
+installs or updates them in `$HOME/.agents/skills/threadlane`. `USERPROFILE` is
+the fallback when `HOME` is absent. This location is independent of `CODEX_HOME`,
+Threadlane runtime/registry paths, and the application installation directory.
+The package embeds [SKILL.md](../skills/threadlane/SKILL.md) and
+[Codex metadata](../skills/threadlane/agents/openai.yaml); startup needs no network
+request, source checkout, provider call, extra backend, or persistent service.
+
+Start a new Codex chat with `$threadlane` and describe the work naturally. The
+only optional skill input is a profile name or ID, for example:
+
+```text
+$threadlane profile=default
+Help me investigate the model count shown in Tools.
+```
+
+This is a conversational instruction, not a shell command or typed MCP argument.
+Without an option, the Coworker resolves the configured default profile from the
+live catalog. A named profile applies to the next scoped plan/approval; it does
+not save global settings or replace an active frozen execution profile. Missing
+or ambiguous selections need clarification. There is no mode switch: the
+Coworker infers exploration, planning, status, and continuation from the request.
+
+The skill bootstraps automatic chat connection, the shared operating guide,
+profile and durable-state inspection, requirements collaboration, and the
+supported Orchestrator/Architect handoffs. Architect consultation still requires
+a valid planning grant and its role/model/budget allowance. A skill is guidance;
+it is not model permission, execution approval, active MCP pairing, or a guarantee
+of uninterrupted model memory. After context uncertainty, the Coworker refreshes
+the guide and live state instead of assuming earlier authority.
+
+Codex supports automatic discovery of user skills and their updates. If the
+installed skill is not visible in a particular Codex session, check that
+`SKILL.md` exists at the reported path and that Codex has not explicitly disabled
+it, then use Codex's supported refresh/restart fallback. Threadlane does not
+restart Codex, alter its active model, or re-enable a disabled skill. See
+[OpenAI's skill documentation](https://learn.chatgpt.com/docs/build-skills).
+
+### Ownership and recovery
+
+- The installer manages only `SKILL.md`, `agents/openai.yaml`, and its private
+  `.threadlane-managed.json` ownership journal. Unrelated skills, extra files,
+  existing parent directory modes, and Codex configuration are preserved.
+- An absent/empty target can be installed. Exact matching payloads can be adopted
+  without rewriting them. Other unmanaged files or edits to owned resources
+  produce a conflict and are preserved; Retry setup never forces replacement.
+- A shared nonblocking lock in the user skills root serializes setup across
+  Threadlane runtimes. Repeat setup of unchanged resources does not rewrite them.
+- Updates journal the previous and desired hashes before replacing resources and
+  finalize only after durable writes. A later launch can recover known partial
+  updates. Unknown edits, malformed ownership data, symlinks, nonregular paths,
+  and read-only resources are rejected. A post-write error is reported as such,
+  including whether files changed, rather than reported as success.
+- These filesystem checks do not claim Windows support or physical power-loss
+  guarantees. Live discovery and managed conversation acceptance are separate
+  from structural skill validation and local filesystem tests.
+
+### Skill diagnostic CLI and desktop status
+
+```sh
+threadlane-skill-setup --check
+threadlane-skill-setup
+threadlane-skill-setup --skills-dir /absolute/test-home/.agents/skills --check
+```
+
+`--check` creates nothing. The default Apply installs or refreshes only the owned
+skill resources. Reports distinguish `installed`, `updated`, `unchanged`,
+`not_installed`, `outdated`, `conflict`, and `error`; conflicts and errors exit
+nonzero. `installed: true` means the payload matches the evaluated bundle, not
+that Codex has activated it or enrolled the current chat.
+
+Settings → Connections shows MCP registration and **Threadlane skill** separately.
+The existing **Recheck** and **Retry setup** actions inspect or apply both. Desktop
+IPC preserves the original MCP report fields and adds optional `skill_setup`;
+legacy reports without it mean unknown skill state. Browser preview performs no
+installation. The original `threadlane-codex-setup` CLI remains MCP-only.

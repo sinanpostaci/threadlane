@@ -30,6 +30,8 @@ mod auto_pair;
 pub mod client;
 /// Safe startup and CLI registration helper for `mcp_servers.threadlane` in Codex `config.toml`.
 pub mod codex_setup;
+/// Safe startup and CLI installer for the bundled user-level Threadlane Codex skill.
+pub mod codex_skill;
 /// Safe per-chat v1 trusted-local operator context export for verified managed desktop chats.
 pub mod context_export;
 /// Opt-in local operator helper for the Threadlane control-plane supervisor.

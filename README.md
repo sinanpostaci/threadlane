@@ -67,8 +67,11 @@ installed planning, execution, review and completion chain.
   setup checklist for installed tools, model/effort assignments, saved profiles
   and the selected real runtime binding, plus the startup `mcp_servers.threadlane`
   registration status (`threadlane-codex-setup`) with explicit Recheck/Retry
-  controls and separate conversation pairing status. Activity highlights uncertain or
-  unsuccessful recent runs and evidence review, without replaying work.
+  controls and separate conversation pairing status. Startup also installs or updates
+  the owned user-level `$threadlane` skill, with optional `profile=...`, independently
+  of MCP pairing and planning/execution approval. Manual skill edits are preserved.
+  Activity highlights uncertain or unsuccessful recent runs and evidence review,
+  without replaying work.
   See [first everyday use](docs/FIRST-USE.md) and [Codex MCP startup setup](docs/CODEX-SETUP.md).
 
 - **Crash recovery**: Task state and events are persisted; interrupted workers

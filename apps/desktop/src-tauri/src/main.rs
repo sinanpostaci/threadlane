@@ -11,7 +11,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use codex_setup::{CodexSetupService, CodexSetupServiceConfig};
+use codex_setup::{CodexSetupService, CodexSetupServiceConfig, DesktopCodexSetupReport};
 use host_control::HostControlHub;
 use observation::{ObservationService, ObservationSourceConfig};
 use serde::{Deserialize, Serialize};
@@ -35,9 +35,7 @@ use threadlane_desktop_bridge::{
     RunDetail, ToolStatus, WindowAction,
 };
 use threadlane_host::{HostSessionSummary, TaskStateSnapshot};
-use threadlane_native::{
-    CodexSetupReport, NativeClient, NativeConfig, NativeError, NativeThreadPage,
-};
+use threadlane_native::{NativeClient, NativeConfig, NativeError, NativeThreadPage};
 use threadlane_plans::{
     compile_plan_revision, Difficulty, PlanChange, PlanError, PlanRevision, PlanStatus, PlanStore,
     WorkflowRole,
@@ -1358,21 +1356,21 @@ async fn desktop_link_observation_context(
 #[tauri::command]
 async fn desktop_codex_setup_status(
     state: State<'_, CodexSetupService>,
-) -> Result<CodexSetupReport, AppError> {
+) -> Result<DesktopCodexSetupReport, AppError> {
     state.status().await
 }
 
 #[tauri::command]
 async fn desktop_codex_setup_recheck(
     state: State<'_, CodexSetupService>,
-) -> Result<CodexSetupReport, AppError> {
+) -> Result<DesktopCodexSetupReport, AppError> {
     state.recheck().await
 }
 
 #[tauri::command]
 async fn desktop_codex_setup_apply(
     state: State<'_, CodexSetupService>,
-) -> Result<CodexSetupReport, AppError> {
+) -> Result<DesktopCodexSetupReport, AppError> {
     state.apply().await
 }
 
