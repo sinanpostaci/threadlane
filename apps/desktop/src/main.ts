@@ -129,7 +129,7 @@ import { ToolsPage } from './pages/tools.ts';
 import { ProfilesPage } from './pages/profiles.ts';
 import { PlansPage } from './pages/plans.ts';
 import { JobPlansPage } from './pages/job-plans.ts';
-import { ActivityFeedPage } from './pages/activity-feed.ts';
+import { ProjectsPage as ActivityFeedPage } from './pages/projects.ts';
 import { NativeLinkingPanel } from './pages/native.ts';
 import { renderActivityHistorySection } from './pages/history.ts';
 import { renderReadinessChecklist } from './pages/readiness.ts';
@@ -180,8 +180,7 @@ interface ObservationTicket {
 }
 
 const NAV_ITEMS: ReadonlyArray<{ page: NavPage; label: string; icon: UiIconName }> = [
-  { page: 'activity', label: 'Activity', icon: 'activity' },
-  { page: 'plans', label: 'Plans', icon: 'clipboard-list' },
+  { page: 'activity', label: 'Projects', icon: 'folder-open' },
   { page: 'tools', label: 'Tools', icon: 'blocks' },
   { page: 'profiles', label: 'Profiles', icon: 'sliders-horizontal' },
   { page: 'settings', label: 'Settings', icon: 'settings-2' },
@@ -507,6 +506,9 @@ class ThreadlaneDesktopApp {
       onLoadMore: () => {
         this.loadMoreObservation('activity');
       },
+      onClearScope: () => {
+        this.showAllActivity();
+      },
     });
     this.nativeLinkingPanel = new NativeLinkingPanel(() => {
       this.returnFocusKey = null;
@@ -681,7 +683,7 @@ class ThreadlaneDesktopApp {
     return null;
   }
 
-  private isObservationPageLayoutActive(): boolean {
+  private isProjectsPageLayoutActive(): boolean {
     if (
       this.state.isDevPreviewFixture ||
       this.state.detailTarget !== null ||
@@ -689,13 +691,11 @@ class ThreadlaneDesktopApp {
     ) {
       return false;
     }
-    if (this.state.page === 'activity') {
-      return !this.advancedActivityOpen;
-    }
-    if (this.state.page === 'plans') {
-      return !this.advancedPlansOpen;
-    }
-    return false;
+    return this.state.page === 'activity' && !this.advancedActivityOpen;
+  }
+
+  private isObservationPageLayoutActive(): boolean {
+    return this.isProjectsPageLayoutActive();
   }
 
   private renderObservationView(viewKey: ObservationViewKey): void {
@@ -1031,36 +1031,13 @@ class ThreadlaneDesktopApp {
   }
 
   private openActivityForJob(sourceId: string, jobId: string): void {
-    this.setActivityScope({ source_id: sourceId, job_id: jobId });
+    const scope = { source_id: sourceId, job_id: jobId };
+    this.setActivityScope(scope);
+    this.activityFeedPage.focusJob(scope);
   }
 
   private openPlansForJob(scope: ObservationScope): void {
-    const alreadyObserved = observationSnapshotHasJob(
-      this.observationViews.plans.snapshot,
-      scope
-    );
-    this.pinnedPlansJob = scope;
-    // A newer exact-job target invalidates any earlier plans ticket so an old
-    // source/job response cannot refocus or overwrite the new target.
-    this.observationViewGeneration.plans += 1;
-    if (this.observationPendingTicket?.viewKey === 'plans') {
-      this.observationPendingTicket = null;
-    }
-    this.observationViews.plans = {
-      ...this.observationViews.plans,
-      loading: !alreadyObserved,
-      error: alreadyObserved ? this.observationViews.plans.error : null,
-    };
-    this.advancedPlansOpen = false;
-    this.returnFocusKey = null;
-    this.state = navigateToPage(this.state, 'plans');
-    this.render('nav-plans');
-    if (alreadyObserved) {
-      this.jobPlansPage.focusJob(scope);
-      return;
-    }
-    this.renderObservationView('plans');
-    this.requestObservation('plans', 'focus', scope, { focusScope: scope });
+    this.openActivityForJob(scope.source_id, scope.job_id);
   }
 
   private showAllActivity(): void {
@@ -1798,9 +1775,11 @@ class ThreadlaneDesktopApp {
     const effectiveOpacity = surface === 'solid' ? 100 : opacity;
     const colorScheme = theme === 'system' ? 'light dark' : theme;
 
+    const projectsLayout = this.isProjectsPageLayoutActive();
     this.root.dataset.theme = theme;
     this.root.dataset.surface = surface;
     this.root.dataset.accent = accent;
+    this.root.dataset.projectsLayout = projectsLayout ? 'true' : 'false';
     this.root.dataset.observationLayout =
       this.isObservationPageLayoutActive() ? 'true' : 'false';
     this.root.style.colorScheme = colorScheme;

@@ -10,6 +10,7 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 
 export type UiIconName =
   | 'activity'
+  | 'folder-open'
   | 'messages-square'
   | 'clipboard-list'
   | 'blocks'
@@ -112,6 +113,12 @@ export function createUiIcon(name: UiIconName): SVGSVGElement {
   switch (name) {
     case 'activity':
       appendPath(svg, 'M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2');
+      break;
+    case 'folder-open':
+      appendPath(
+        svg,
+        'm6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2'
+      );
       break;
     case 'messages-square':
       appendPath(svg, 'M14 9a2 2 0 0 1-2 2H6l-4 4V4a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2z');

@@ -1,8 +1,8 @@
 # Desktop Control Panel (Milestone 3A)
 
-For the current Activity request feed, independent job plans, linked sources, and
-Settings → Connections, read [desktop observation](OBSERVATION.md) and
-[Codex MCP startup setup](CODEX-SETUP.md).
+For the current [Projects view](PROJECTS-VIEW.md) of projects, chats, calls, and
+inline plan summaries, plus linked sources and Settings → Connections, also read
+[desktop observation](OBSERVATION.md) and [Codex MCP startup setup](CODEX-SETUP.md).
 
 The historical Milestone 3A description below predates the durable read model.
 The new observation feed reads durable metadata directly in read-only mode so

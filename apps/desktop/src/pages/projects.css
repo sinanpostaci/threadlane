@@ -1,0 +1,586 @@
+.aq-app[data-projects-layout='true'] .aq-main {
+  padding: 0;
+}
+
+.threadlane-projects {
+  --tp-surface: var(--aq-base, var(--aq-surface, light-dark(#f7f7f7, #252525)));
+  --tp-ink: var(--aq-ink, var(--aq-text, light-dark(#292929, #e8e8e8)));
+  --tp-muted: var(--aq-muted, light-dark(#696969, #ababab));
+  --tp-faint: var(--aq-faint, light-dark(#686868, #a0a0a0));
+  --tp-line: var(--aq-line, var(--aq-border, light-dark(#e2e2e2, #3c3c3c)));
+  --tp-hover: var(--aq-hover, light-dark(#eeeeee, #303030));
+  --tp-nested: var(--aq-nested, light-dark(#f1f1f1, #222222));
+  --tp-field: var(--aq-field, var(--aq-elevated, light-dark(#ffffff, #202020)));
+  --tp-accent-base: var(--aq-accent-base, #98beaa);
+  --tp-accent: var(
+    --aq-accent,
+    light-dark(color-mix(in srgb, var(--tp-accent-base) 50%, #14261c), var(--tp-accent-base))
+  );
+  --tp-warm: var(--aq-warn, light-dark(#91672f, #c7aa79));
+  --tp-danger: var(--aq-danger, light-dark(#b44437, #e07a6f));
+  --tp-pad: 10px;
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+  color: var(--tp-ink);
+  background: transparent;
+  font: 400 13px/1.45 Inter, ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: -0.012em;
+}
+
+.threadlane-projects * {
+  box-sizing: border-box;
+}
+
+.threadlane-projects button,
+.threadlane-projects select {
+  font: inherit;
+}
+
+.threadlane-projects [hidden] {
+  display: none !important;
+}
+
+.threadlane-projects .tp-heading {
+  padding: 22px 16px 13px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.threadlane-projects .tp-heading h2 {
+  margin: 0;
+  font-size: 21px;
+  line-height: 1.2;
+  font-weight: 500;
+  letter-spacing: -0.055em;
+}
+
+.threadlane-projects .tp-live {
+  color: var(--tp-muted);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.threadlane-projects .tp-live-dot {
+  height: 6px;
+  width: 6px;
+  border-radius: 50%;
+  background: var(--tp-faint);
+}
+
+.threadlane-projects .tp-live[data-active='true'] .tp-live-dot {
+  background: var(--tp-accent);
+}
+
+.threadlane-projects .tp-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px 17px;
+  color: var(--tp-muted);
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+
+.threadlane-projects .tp-toolbar-start {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.threadlane-projects .tp-back-btn,
+.threadlane-projects .tp-load-more {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--tp-field);
+  color: var(--tp-ink);
+  border: 1px solid var(--tp-line);
+  border-radius: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.threadlane-projects .tp-back-btn:hover,
+.threadlane-projects .tp-load-more:hover:not(:disabled) {
+  background: var(--tp-hover);
+}
+
+.threadlane-projects .tp-back-btn svg {
+  width: 12px;
+  height: 12px;
+  color: var(--tp-muted);
+}
+
+.threadlane-projects .tp-toolbar select {
+  background: var(--tp-field);
+  color: var(--tp-muted);
+  border: 1px solid var(--tp-line);
+  border-radius: 6px;
+  padding: 4px 6px;
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-notice {
+  margin: 0 12px 12px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--tp-line);
+  background: var(--tp-nested);
+  color: var(--tp-muted);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-notice-error {
+  border-color: color-mix(in srgb, var(--tp-danger) 45%, var(--tp-line));
+  color: var(--tp-danger);
+}
+
+.threadlane-projects .tp-projects {
+  padding: 0 12px 5px;
+}
+
+.threadlane-projects .tp-project {
+  border-top: 1px solid var(--tp-line);
+}
+
+.threadlane-projects .tp-project:last-of-type {
+  border-bottom: 1px solid var(--tp-line);
+}
+
+.threadlane-projects summary {
+  list-style: none;
+  outline-offset: 2px;
+  cursor: pointer;
+}
+
+.threadlane-projects summary::-webkit-details-marker {
+  display: none;
+}
+
+.threadlane-projects .tp-project-heading {
+  padding: 13px 3px;
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto 12px;
+  gap: 8px;
+  align-items: center;
+  border-radius: 5px;
+}
+
+.threadlane-projects .tp-project-heading:hover,
+.threadlane-projects .tp-session-heading:hover {
+  background: var(--tp-hover);
+}
+
+.threadlane-projects .tp-project-icon,
+.threadlane-projects .tp-project-icon svg {
+  display: flex;
+  align-items: center;
+  width: 15px;
+  height: 15px;
+  color: var(--tp-muted);
+}
+
+.threadlane-projects .tp-project-name {
+  font-size: 13px;
+  font-weight: 500;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.threadlane-projects .tp-project-status {
+  font-size: 11px;
+  color: var(--tp-muted);
+}
+
+.threadlane-projects .tp-project-status.tp-working {
+  color: var(--tp-accent);
+}
+
+.threadlane-projects .tp-chevron {
+  width: 12px;
+  height: 12px;
+  color: var(--tp-muted);
+  transition: transform 120ms ease;
+}
+
+.threadlane-projects .tp-project[open] > summary > .tp-chevron {
+  transform: rotate(90deg);
+}
+
+.threadlane-projects .tp-sessions {
+  border-left: 1px solid var(--tp-line);
+  margin: 0 3px 11px 10px;
+  padding-left: 11px;
+}
+
+.threadlane-projects .tp-session + .tp-session {
+  margin-top: 2px;
+}
+
+.threadlane-projects .tp-session-heading {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: start;
+  column-gap: 8px;
+  padding: var(--tp-pad) 5px;
+  border-radius: 5px;
+}
+
+.threadlane-projects .tp-chat-icon,
+.threadlane-projects .tp-chat-icon svg {
+  width: 13px;
+  height: 13px;
+  color: var(--tp-faint);
+  margin-top: 2px;
+}
+
+.threadlane-projects .tp-session-copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.threadlane-projects .tp-session-name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.threadlane-projects .tp-session-state {
+  color: var(--tp-muted);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.threadlane-projects .tp-session-age {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tp-faint);
+  padding-top: 1px;
+  white-space: nowrap;
+}
+
+.threadlane-projects .tp-dot {
+  width: 4px;
+  height: 4px;
+  display: inline-block;
+  border-radius: 50%;
+  background: var(--tp-faint);
+}
+
+.threadlane-projects .tp-dot.working {
+  background: var(--tp-accent);
+}
+
+.threadlane-projects .tp-dot.waiting {
+  background: var(--tp-warm);
+}
+
+.threadlane-projects .tp-dot.danger {
+  background: var(--tp-danger);
+}
+
+.threadlane-projects .tp-complete-icon {
+  width: 10px;
+  height: 10px;
+  color: var(--tp-faint);
+}
+
+.threadlane-projects .tp-session[open] > .tp-session-heading .tp-session-name {
+  color: var(--tp-accent);
+}
+
+.threadlane-projects .tp-session-body {
+  margin: 0 5px 12px 26px;
+}
+
+.threadlane-projects .tp-job + .tp-job {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--tp-line);
+}
+
+.threadlane-projects .tp-job-focused {
+  outline: 1px solid var(--tp-accent);
+  outline-offset: 4px;
+  border-radius: 4px;
+}
+
+.threadlane-projects .tp-phase {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  color: var(--tp-muted);
+  font-size: 11px;
+  margin: 1px 0 8px;
+}
+
+.threadlane-projects .tp-phase .tp-waiting {
+  color: var(--tp-warm);
+}
+
+.threadlane-projects .tp-calls {
+  padding-left: 9px;
+  border-left: 2px solid color-mix(in srgb, var(--tp-accent) 50%, transparent);
+}
+
+.threadlane-projects .tp-calls.tp-calls-idle {
+  border-left-color: var(--tp-line);
+}
+
+.threadlane-projects .tp-call {
+  display: grid;
+  grid-template-columns: 13px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: start;
+  padding: 7px 0;
+}
+
+.threadlane-projects .tp-call + .tp-call {
+  padding-top: 9px;
+}
+
+.threadlane-projects .tp-provider,
+.threadlane-projects .tp-openai {
+  width: 13px;
+  height: 13px;
+  margin-top: 2px;
+}
+
+.threadlane-projects .tp-call-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.threadlane-projects .tp-call-name {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.threadlane-projects .tp-call-purpose {
+  color: var(--tp-muted);
+  font-weight: 400;
+}
+
+.threadlane-projects .tp-model {
+  color: var(--tp-muted);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-call-metric {
+  display: grid;
+  gap: 2px;
+  text-align: right;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--tp-muted);
+  white-space: nowrap;
+}
+
+.threadlane-projects .tp-call-metric > span:first-child {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 5px;
+}
+
+.threadlane-projects .tp-spinner {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.6px solid color-mix(in srgb, var(--tp-accent) 30%, transparent);
+  border-top-color: var(--tp-accent);
+  display: inline-block;
+  animation: tp-spin 0.85s linear infinite;
+}
+
+@keyframes tp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.threadlane-projects .tp-recent {
+  margin: 13px 0 2px;
+}
+
+.threadlane-projects .tp-recent > summary {
+  color: var(--tp-faint);
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.threadlane-projects .tp-recent > summary svg {
+  width: 11px;
+  height: 11px;
+  transition: transform 120ms ease;
+}
+
+.threadlane-projects .tp-recent[open] > summary > svg {
+  transform: rotate(90deg);
+}
+
+.threadlane-projects .tp-events {
+  margin: 8px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 7px;
+  list-style: none;
+  color: var(--tp-muted);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-events li {
+  display: grid;
+  grid-template-columns: 4px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: baseline;
+}
+
+.threadlane-projects .tp-event-mark {
+  height: 3px;
+  width: 3px;
+  border-radius: 50%;
+  background: var(--tp-faint);
+  align-self: center;
+}
+
+.threadlane-projects .tp-events time {
+  font-variant-numeric: tabular-nums;
+  color: var(--tp-faint);
+}
+
+.threadlane-projects .tp-plan-summary {
+  color: var(--tp-muted);
+  font-size: 12px;
+  margin: 5px 0 8px;
+}
+
+.threadlane-projects .tp-plan-tasks {
+  color: var(--tp-muted);
+  font-size: 11px;
+  display: grid;
+  gap: 5px;
+  padding-left: 14px;
+  margin: 0 0 10px;
+}
+
+.threadlane-projects .tp-context-note {
+  color: var(--tp-muted);
+  font-size: 11px;
+  margin: 8px 0;
+}
+
+.threadlane-projects .tp-call-finished {
+  border-top: 1px solid var(--tp-line);
+  margin-top: 6px;
+  padding-top: 8px;
+}
+
+.threadlane-projects .tp-empty {
+  margin: 0;
+  padding: 10px 6px 14px;
+  color: var(--tp-faint);
+  font-size: 11px;
+}
+
+.threadlane-projects .tp-bottom-note {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 16px 13px;
+  color: var(--tp-faint);
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+
+.threadlane-projects .tp-bottom-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.threadlane-projects .tp-warnings {
+  margin: 0;
+  padding: 0 16px 14px 30px;
+  color: var(--tp-warm);
+  font-size: 11px;
+  display: grid;
+  gap: 4px;
+}
+
+.threadlane-projects .tp-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (max-width: 390px) {
+  .threadlane-projects .tp-heading,
+  .threadlane-projects .tp-toolbar,
+  .threadlane-projects .tp-bottom-note {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .threadlane-projects .tp-projects {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .threadlane-projects .tp-session-body {
+    margin-left: 22px;
+  }
+  .threadlane-projects .tp-calls {
+    padding-left: 7px;
+  }
+  .threadlane-projects .tp-call {
+    gap: 5px;
+  }
+}
+
+@media (pointer: coarse) {
+  .threadlane-projects .tp-project-heading,
+  .threadlane-projects .tp-session-heading {
+    min-height: 44px;
+  }
+  .threadlane-projects .tp-toolbar select,
+  .threadlane-projects .tp-back-btn,
+  .threadlane-projects .tp-load-more {
+    min-height: 44px;
+    font-size: 16px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .threadlane-projects .tp-chevron,
+  .threadlane-projects .tp-recent > summary svg {
+    transition: none;
+  }
+  .threadlane-projects .tp-spinner {
+    animation: none;
+  }
+}
