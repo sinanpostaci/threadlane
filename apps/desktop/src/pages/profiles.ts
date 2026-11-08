@@ -669,7 +669,7 @@ function advisorSummaryText(validation: DecisionAdvisorValidation): string {
   if (validation.state === 'invalid') {
     return 'Needs repair';
   }
-  return `${validation.tool.label} · ${validation.model.label} · Shadow`;
+  return `${validation.tool.label} · ${validation.model.label}`;
 }
 
 function advisorToolNote(tool: ToolDefinition | null): string | null {
@@ -1682,6 +1682,25 @@ export class ProfilesPage {
       h(
         'div',
         { class: 'aq-profiles-overrides-body' },
+        h(
+          'div',
+          { class: 'aq-profiles-overrides-toolbar' },
+          h(
+            'p',
+            { class: 'aq-profiles-note', 'data-tone': 'muted' },
+            'Overrides replace the role default for that difficulty.'
+          ),
+          button(
+            'Clear difficulty overrides',
+            () => this.clearOverrides(role),
+            {
+              className: 'aq-profiles-link',
+              disabled: busy || !hasOverrides,
+              focusKey: `clear-overrides-${role}`,
+              ariaLabel: `Clear all difficulty overrides for ${workflowRoleLabel(role)}`,
+            }
+          )
+        ),
         ...DIFFICULTIES.map((slot) => this.buildChoiceRow(role, slot, busy))
       )
     );
@@ -1711,25 +1730,6 @@ export class ProfilesPage {
         )
       ),
       this.buildChoiceRow(role, 'default', busy),
-      h(
-        'div',
-        { class: 'aq-profiles-overrides-toolbar' },
-        h(
-          'p',
-          { class: 'aq-profiles-note', 'data-tone': 'muted' },
-          'Overrides replace the role default for that difficulty.'
-        ),
-        button(
-          'Clear difficulty overrides',
-          () => this.clearOverrides(role),
-          {
-            className: 'aq-profiles-link',
-            disabled: busy || !hasOverrides,
-            focusKey: `clear-overrides-${role}`,
-            ariaLabel: `Clear all difficulty overrides for ${workflowRoleLabel(role)}`,
-          }
-        )
-      ),
       overrides
     );
   }

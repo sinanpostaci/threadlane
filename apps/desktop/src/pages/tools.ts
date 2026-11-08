@@ -11,6 +11,10 @@ import type {
   ToolVersionInspection,
 } from '../registry/types.ts';
 import {
+  findEquivalentTool,
+  projectToolRegistrations,
+} from '../registry/tool-duplicates.ts';
+import {
   findToolVersionInspection,
   type ToolVersionScanState,
 } from '../registry/tool-versions.ts';
@@ -1095,6 +1099,13 @@ export class ToolsPage {
       if (this.disposed || !this.root || !this.root.isConnected) return false;
       const target = findByFocusKey(this.root, focusKey);
       if (!target) return false;
+      const duplicateWrapper = target.closest<HTMLDetailsElement>(
+        'details[data-duplicate-registrations]'
+      );
+      if (duplicateWrapper) {
+        duplicateWrapper.open = true;
+        this.expanded.add('duplicate-registrations');
+      }
       target.focus({ preventScroll: true });
       target.scrollIntoView?.({ block: 'nearest' });
       return true;
@@ -1331,6 +1342,12 @@ export class ToolsPage {
     refreshBtn.dataset.focus = 'discovery-refresh';
     refreshBtn.setAttribute('aria-label', 'Refresh discovery');
 
+    const { tools: primaryTools, duplicates: duplicateGroups } = projectToolRegistrations(
+      snapshot.tools,
+      snapshot.models
+    );
+    const duplicateTools = duplicateGroups.flatMap((group) => group.duplicates);
+
     const customFormOpen = createOpen && inlineConfigureTarget === null;
     const customToggleBtn = this.button(
       customFormOpen ? 'Cancel custom tool' : 'Add custom or API tool',
@@ -1390,7 +1407,7 @@ export class ToolsPage {
           )
         : null,
       customFormOpen ? this.buildCreateTool(snapshot, null) : null,
-      unregisteredFoundClis.length === 0 && snapshot.tools.length === 0
+      unregisteredFoundClis.length === 0 && primaryTools.length === 0
         ? h(
             'p',
             { className: 'aq-note aq-tools-empty' },
@@ -1410,10 +1427,49 @@ export class ToolsPage {
                 inlineConfigureTarget === item.id
               )
             ),
-            ...snapshot.tools.map((tool) =>
+            ...primaryTools.map((tool) =>
               this.buildTool(snapshot, tool, registeredMatches.get(tool.id) ?? null)
             )
           ),
+      duplicateTools.length > 0
+        ? (() => {
+            const key = 'duplicate-registrations';
+            const details = h(
+              'details',
+              {
+                className: 'aq-tools-advanced aq-tools-duplicates',
+                'data-duplicate-registrations': 'true',
+              },
+              h(
+                'summary',
+                { 'data-focus-key': 'duplicate-registrations-summary' },
+                `Duplicate registrations (${duplicateTools.length})`
+              ),
+              h(
+                'p',
+                { className: 'aq-tools-hint' },
+                'Additional entries for the same CLI command are hidden from the main list. Edit or delete redundant cards here.'
+              ),
+              h(
+                'div',
+                { className: 'aq-tools-list aq-tools-duplicate-list' },
+                ...duplicateTools.map((tool) =>
+                  this.buildTool(snapshot, tool, registeredMatches.get(tool.id) ?? null)
+                )
+              )
+            ) as HTMLDetailsElement;
+            details.open = this.expanded.has(key);
+            details.addEventListener('toggle', () => {
+              if (this.disposed || !this.root || !this.root.contains(details)) return;
+              if (details.open) {
+                this.expanded.add(key);
+              } else {
+                this.expanded.delete(key);
+              }
+            });
+            return details;
+          })()
+        : null,
       diagnosticItems.length > 0
         ? h(
             'details',
@@ -1800,7 +1856,7 @@ export class ToolsPage {
     return h(
       'article',
       {
-        className: 'aq-tools-card aq-tools-choice',
+        className: 'aq-tools-card aq-tools-tool-card aq-tools-discovered-card',
         'data-discovery-card': item.id,
       },
       h(
@@ -2105,7 +2161,7 @@ export class ToolsPage {
     return h(
       'article',
       {
-        className: `aq-tools-card aq-tools-choice${tool.enabled ? '' : ' aq-tools-card-disabled'}`,
+        className: `aq-tools-card aq-tools-tool-card${tool.enabled ? '' : ' aq-tools-card-disabled'}`,
       },
       h(
         'div',
@@ -3787,13 +3843,20 @@ export class ToolsPage {
     if (isNew && existingTools.some((tool) => tool.id === id)) {
       return 'A tool with this ID already exists. Edit the existing tool instead.';
     }
-    return {
+    const candidate: ToolDefinition = {
       id,
       label,
       adapter: draft.adapter,
       executable_path: draft.executable.trim() || null,
       enabled: draft.enabled,
     };
+    if (isNew) {
+      const equivalent = findEquivalentTool(candidate, existingTools);
+      if (equivalent) {
+        return `An equivalent CLI tool already exists: ${equivalent.label} (${equivalent.id}). Edit the existing tool card instead.`;
+      }
+    }
+    return candidate;
   }
 
   private validateModel(draft: ModelDraft, isNew: boolean): ModelDefinition | string {

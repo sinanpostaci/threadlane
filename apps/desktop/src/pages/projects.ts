@@ -70,14 +70,26 @@ type SessionIndicatorKind = 'working' | 'waiting' | 'danger' | 'completed' | 'ne
 interface JobDomEntry {
   key: string;
   jobView: ProjectJobView;
-  element: HTMLDivElement;
+  element: HTMLDetailsElement;
   phaseStateEl: HTMLSpanElement;
+  planLabelEl: HTMLSpanElement;
   phaseRightEl: HTMLSpanElement;
-  titleEl: HTMLParagraphElement;
+  titleEl: HTMLElement;
   summaryEl: HTMLParagraphElement;
   tasksListEl: HTMLUListElement;
   approvalNoteEl: HTMLParagraphElement;
   detailMetaEl: HTMLSpanElement;
+}
+
+const userJobOpenStateByInstance = new WeakMap<object, Map<string, boolean>>();
+
+function getUserJobOpenState(instance: object): Map<string, boolean> {
+  let state = userJobOpenStateByInstance.get(instance);
+  if (!state) {
+    state = new Map<string, boolean>();
+    userJobOpenStateByInstance.set(instance, state);
+  }
+  return state;
 }
 
 interface CallDomEntry {
@@ -910,8 +922,8 @@ export class ProjectsPage {
     const bodyEl = h(
       'div',
       { className: 'tp-session-body' },
-      jobsContainer,
       callsContainer,
+      jobsContainer,
       quietNoteEl,
       recentDetails
     );
@@ -928,7 +940,7 @@ export class ProjectsPage {
       details.open = savedSessionOpen;
     } else if (!this.initializedSessions.has(session.key)) {
       this.initializedSessions.add(session.key);
-      const shouldOpen = session.runningCount > 0 || session.attention;
+      const shouldOpen = session.runningCount > 0;
       details.open = shouldOpen;
       this.userSessionOpenState.set(session.key, shouldOpen);
     }
@@ -1055,11 +1067,28 @@ export class ProjectsPage {
   }
 
   private createJobEntry(jobView: ProjectJobView): JobDomEntry {
-    const phaseStateEl = h('span', { className: 'tp-phase-state' });
-    const phaseRightEl = h('span', { className: 'tp-phase-right' });
-    const phaseEl = h('div', { className: 'tp-phase' }, phaseStateEl, phaseRightEl);
+    const jobIconSpan = h(
+      'span',
+      { className: 'tp-job-icon' },
+      createUiIcon('clipboard-list')
+    );
+    const titleEl = h('span', { className: 'tp-job-title' });
+    const phaseStateEl = h('span', { className: 'tp-phase-state tp-job-state' });
+    const chevronEl = createUiIcon('chevron-right');
+    chevronEl.classList.add('tp-chevron');
 
-    const titleEl = h('p', { className: 'tp-plan-summary tp-job-title', hidden: true });
+    const jobSummaryEl = h(
+      'summary',
+      { className: 'tp-job-summary cursor-interaction' },
+      jobIconSpan,
+      titleEl,
+      phaseStateEl,
+      chevronEl
+    );
+
+    const planLabelEl = h('span', { className: 'tp-plan-label', hidden: true });
+    const phaseRightEl = h('span', { className: 'tp-phase-right' });
+    const phaseEl = h('div', { className: 'tp-phase' }, planLabelEl, phaseRightEl);
     const summaryEl = h('p', { className: 'tp-plan-summary', hidden: true });
     const tasksListEl = h('ul', { className: 'tp-plan-tasks', hidden: true });
     const approvalNoteEl = h(
@@ -1067,28 +1096,43 @@ export class ProjectsPage {
       { className: 'tp-context-note tp-approval-note', hidden: true },
       'Review and approve the scope in your Codex conversation.'
     );
+    const bodyEl = h(
+      'div',
+      { className: 'tp-job-body' },
+      phaseEl,
+      summaryEl,
+      tasksListEl,
+      approvalNoteEl
+    );
     const detailMetaEl = h('span', { className: 'tp-sr-only tp-job-detail', hidden: true });
 
     const element = h(
-      'div',
+      'details',
       {
         className: 'tp-job',
         tabindex: '-1',
         'data-job-key': jobView.key,
       },
-      phaseEl,
-      titleEl,
-      summaryEl,
-      tasksListEl,
-      approvalNoteEl,
+      jobSummaryEl,
+      bodyEl,
       detailMetaEl
     );
+
+    const jobOpenState = getUserJobOpenState(this);
+    const savedOpen = jobOpenState.get(jobView.key);
+    element.open = savedOpen ?? false;
+    element.addEventListener('toggle', () => {
+      if (!this.disposed) {
+        jobOpenState.set(jobView.key, element.open);
+      }
+    });
 
     return {
       key: jobView.key,
       jobView,
       element,
       phaseStateEl,
+      planLabelEl,
       phaseRightEl,
       titleEl,
       summaryEl,
@@ -1120,9 +1164,18 @@ export class ProjectsPage {
       entry.element.removeAttribute('data-focused');
     }
 
-    entry.phaseStateEl.textContent = jobView.planLabel
-      ? `${jobView.stateLabel} · ${jobView.planLabel}`
-      : jobView.stateLabel;
+    entry.element.setAttribute('data-attention', jobView.attention ? 'true' : 'false');
+    entry.phaseStateEl.textContent = jobView.stateLabel;
+    entry.phaseStateEl.className = jobView.attention
+      ? 'tp-phase-state tp-job-state tp-waiting'
+      : 'tp-phase-state tp-job-state';
+    if (jobView.planLabel) {
+      entry.planLabelEl.textContent = jobView.planLabel;
+      entry.planLabelEl.hidden = false;
+    } else {
+      entry.planLabelEl.hidden = true;
+      entry.planLabelEl.textContent = '';
+    }
 
     const approvalNeeded = jobView.attention && hasPlanApprovalEvidence(job);
     const defaultApprovalNote =
@@ -1159,18 +1212,20 @@ export class ProjectsPage {
       entry.phaseRightEl.textContent = jobView.taskSummary;
       entry.approvalNoteEl.hidden = true;
     }
-
-    const trimmedTitle = job.title.trim();
-    const trimmedSummary = job.summary?.trim() ?? '';
-    if (trimmedTitle && trimmedTitle !== sessionLabel.trim()) {
-      entry.titleEl.textContent = trimmedTitle;
-      entry.titleEl.hidden = false;
-    } else {
-      entry.titleEl.hidden = true;
-      entry.titleEl.textContent = '';
+    if (entry.phaseRightEl.parentElement) {
+      entry.phaseRightEl.parentElement.hidden =
+        !entry.planLabelEl.textContent && !entry.phaseRightEl.textContent;
     }
 
-    if (trimmedSummary && trimmedSummary !== trimmedTitle) {
+    const trimmedTitle = job.title.trim();
+    const displayTitle =
+      trimmedTitle || sessionLabel.trim() || jobView.planLabel || `Job ${job.id}`;
+    entry.titleEl.textContent = displayTitle;
+    entry.titleEl.title = displayTitle;
+    entry.titleEl.hidden = false;
+
+    const trimmedSummary = job.summary?.trim() ?? '';
+    if (trimmedSummary && trimmedSummary !== displayTitle) {
       entry.summaryEl.textContent = trimmedSummary;
       entry.summaryEl.hidden = false;
     } else {
@@ -1412,6 +1467,9 @@ export class ProjectsPage {
 
             sessionEntry.details.open = true;
             this.userSessionOpenState.set(sessionEntry.key, true);
+
+            jobEntry.element.open = true;
+            getUserJobOpenState(this).set(jobEntry.key, true);
 
             jobEntry.element.classList.add('tp-job-focused');
             jobEntry.element.setAttribute('data-focused', 'true');
