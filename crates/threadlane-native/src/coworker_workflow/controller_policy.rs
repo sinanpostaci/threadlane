@@ -4400,6 +4400,31 @@ impl ControllerPolicyStore {
         job: &CoworkerJobRecord,
         authority: &AuthorityStore,
     ) -> Result<ControllerConfigurationPreview, NativeError> {
+        let linkage = job.approval_linkage.as_ref().ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::UnauthorizedOperator,
+                "Job has no frozen approval linkage",
+            )
+        })?;
+        // Cross-verify live ApprovalRecord, active published PlanRevision, and RegistryStore revision.
+        let approval = authority
+            .get_for_operator_readonly(&linkage.approval_id)
+            .map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Referenced approval_id was not found or failed integrity check in AuthorityStore.",
+                )
+            })?;
+        verify_live_approval_and_registry(&approval, job, &request.policy, authority)?;
+
+        Self::prepare_execution_envelope(request, job)
+    }
+
+    /// Constructs the exact envelope for an already validated in-memory linked job.
+    pub(crate) fn prepare_execution_envelope(
+        request: &FreezeControllerExecutionEnvelopeRequest,
+        job: &CoworkerJobRecord,
+    ) -> Result<ControllerConfigurationPreview, NativeError> {
         if job.job_revision != request.expected_job_revision {
             return Err(NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -4418,17 +4443,6 @@ impl ControllerPolicyStore {
                 "Job approval linkage does not include a FrozenControllerCapabilityEnvelope.",
             ));
         };
-
-        // Cross-verify live ApprovalRecord, active published PlanRevision, and RegistryStore revision.
-        let approval = authority
-            .get_for_operator(&linkage.approval_id)
-            .map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "Referenced approval_id was not found or failed integrity check in AuthorityStore.",
-                )
-            })?;
-        verify_live_approval_and_registry(&approval, job, &request.policy, authority)?;
 
         let mut task_coder_choices = BTreeMap::new();
         for task in &job.tasks {
@@ -4564,10 +4578,20 @@ impl ControllerPolicyStore {
         }
         preview.envelope.verify_matches_job(job)?;
 
-        self.transact_binding(&request.binding_id, |ledger| {
+        self.record_admission_envelope(&preview.envelope, job)
+    }
+
+    /// Persists only a previously consented and validated admission envelope. Never resets runtime.
+    pub(crate) fn record_admission_envelope(
+        &self,
+        envelope: &FrozenControllerExecutionEnvelope,
+        job: &CoworkerJobRecord,
+    ) -> Result<ControllerJobRuntimeState, NativeError> {
+        envelope.verify_matches_job(job)?;
+        self.transact_binding(&envelope.binding_id, |ledger| {
             if let Some(existing) = ledger.jobs.get(&job.job_id) {
                 existing.envelope.verify_matches_job(job)?;
-                if existing.envelope == preview.envelope {
+                if &existing.envelope == envelope {
                     return Ok(existing.clone());
                 }
                 return Err(NativeError::new(
@@ -4590,7 +4614,7 @@ impl ControllerPolicyStore {
             let state = ControllerJobRuntimeState {
                 job_id: job.job_id.clone(),
                 runtime_revision: 1,
-                envelope: preview.envelope,
+                envelope: envelope.clone(),
                 lease: None,
                 role_usage,
                 total_task_attempts_reserved: 0,
@@ -4747,32 +4771,55 @@ impl ControllerPolicyStore {
         validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(instance_id, "instance_id", MAX_COWORKER_ID_LEN)?;
 
-        self.transact_binding(binding_id, |ledger| {
-            let state = ledger.jobs.get_mut(job_id).ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::NotConfigured,
-                    "No FrozenControllerExecutionEnvelope is recorded for this job.",
-                )
+        let (out, new_completion_effects, completion_lease) =
+            self.transact_binding(binding_id, |ledger| {
+                let state = ledger.jobs.get_mut(job_id).ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::NotConfigured,
+                        "No FrozenControllerExecutionEnvelope is recorded for this job.",
+                    )
+                })?;
+                let Some(ref lease) = state.lease else {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Controller must hold an active job lease before mutating runtime state.",
+                    ));
+                };
+                if !lease.active
+                    || lease.instance_id != instance_id
+                    || lease.lease_epoch != expected_lease_epoch
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Controller lease ownership mismatch or lease is no longer active.",
+                    ));
+                }
+                let existing_ids: BTreeSet<String> =
+                    state.pending_effects.keys().cloned().collect();
+                let out = mutate_fn(state)?;
+                state.runtime_revision = state.runtime_revision.saturating_add(1);
+                let new_completion_effects = state
+                    .pending_effects
+                    .values()
+                    .filter(|effect| {
+                        !existing_ids.contains(&effect.effect_id)
+                            && effect.job_id == job_id
+                            && effect.task_id.is_none()
+                            && effect.attempt_no.is_none()
+                            && effect.status == PendingControllerEffectStatus::ReservedBeforeEffect
+                            && matches!(
+                                effect.kind,
+                                PendingControllerEffectKind::JobAggregation
+                                    | PendingControllerEffectKind::CheckExecution
+                                    | PendingControllerEffectKind::ClosureInvocation
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                Ok((out, new_completion_effects, state.lease.clone()))
             })?;
-            let Some(ref lease) = state.lease else {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "Controller must hold an active job lease before mutating runtime state.",
-                ));
-            };
-            if !lease.active
-                || lease.instance_id != instance_id
-                || lease.lease_epoch != expected_lease_epoch
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "Controller lease ownership mismatch or lease is no longer active.",
-                ));
-            }
-            let out = mutate_fn(state)?;
-            state.runtime_revision = state.runtime_revision.saturating_add(1);
-            Ok(out)
-        })
+        super::pipeline::record_live_completion_effects(new_completion_effects, completion_lease);
+        Ok(out)
     }
 
     /// Executes an operator-initiated mutation (such as stop/cancel request or reconciliation)
@@ -4788,17 +4835,42 @@ impl ControllerPolicyStore {
     {
         validate_bounded_identifier(binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(job_id, "job_id", MAX_COWORKER_ID_LEN)?;
-        self.transact_binding(binding_id, |ledger| {
-            let state = ledger.jobs.get_mut(job_id).ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::NotConfigured,
-                    "No FrozenControllerExecutionEnvelope is recorded for this job.",
-                )
+        let (out, new_completion_effects, completion_lease) =
+            self.transact_binding(binding_id, |ledger| {
+                let state = ledger.jobs.get_mut(job_id).ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::NotConfigured,
+                        "No FrozenControllerExecutionEnvelope is recorded for this job.",
+                    )
+                })?;
+                let existing_ids: BTreeSet<String> =
+                    state.pending_effects.keys().cloned().collect();
+                let out = mutate_fn(state)?;
+                state.runtime_revision = state.runtime_revision.saturating_add(1);
+                let new_completion_effects = state
+                    .pending_effects
+                    .values()
+                    .filter(|effect| {
+                        !existing_ids.contains(&effect.effect_id)
+                            && effect.job_id == job_id
+                            && effect.task_id.is_none()
+                            && effect.attempt_no.is_none()
+                            && effect.status == PendingControllerEffectStatus::ReservedBeforeEffect
+                            && matches!(
+                                effect.kind,
+                                PendingControllerEffectKind::JobAggregation
+                                    | PendingControllerEffectKind::CheckExecution
+                                    | PendingControllerEffectKind::ClosureInvocation
+                            )
+                    })
+                    .cloned()
+                    .collect();
+                Ok((out, new_completion_effects, state.lease.clone()))
             })?;
-            let out = mutate_fn(state)?;
-            state.runtime_revision = state.runtime_revision.saturating_add(1);
-            Ok(out)
-        })
+        // Publish only after the transaction's durability acknowledgement. A recovered
+        // reservation or an uncertain write never becomes owned by a new completion future.
+        super::pipeline::record_live_completion_effects(new_completion_effects, completion_lease);
+        Ok(out)
     }
 
     fn transact_binding<T, F>(&self, binding_id: &str, f: F) -> Result<T, NativeError>
@@ -4819,7 +4891,22 @@ impl ControllerPolicyStore {
                 ledger_revision: 0,
                 jobs: BTreeMap::new(),
             });
+        let original = serde_json::to_vec(&ledger).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Cannot snapshot controller ledger",
+            )
+        })?;
         let out = f(&mut ledger)?;
+        let unchanged = serde_json::to_vec(&ledger).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Cannot snapshot controller ledger",
+            )
+        })? == original;
+        if unchanged {
+            return Ok(out);
+        }
         ledger.ledger_revision = ledger.ledger_revision.saturating_add(1);
         self.write_ledger_unlocked(binding_id, &ledger)?;
         Ok(out)
@@ -5359,6 +5446,7 @@ pub fn verify_frozen_runtime_registry_or_apply_config_hold(
     workflow_store: &CoworkerWorkflowStore,
     policy_store: &ControllerPolicyStore,
 ) -> Result<(), NativeError> {
+    crate::coworker_admission::verify_complete_admission(workflow_store, policy_store, job)?;
     runtime_state.envelope.verify_matches_job(job)?;
     verify_approval_and_plan_evidence(approval, job, &runtime_state.envelope.policy, authority)?;
 

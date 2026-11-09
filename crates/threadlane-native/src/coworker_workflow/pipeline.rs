@@ -36,9 +36,9 @@ use super::controller::{
     VerifiedControllerAdmission,
 };
 use super::controller_policy::{
-    deterministic_controller_instance_id, ControllerJobRuntimeState, PendingControllerEffectKind,
-    PendingControllerEffectStatus, DEFAULT_CONTROLLER_LEASE_TTL_MS,
-    MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
+    deterministic_controller_instance_id, ControllerJobLeaseRecord, ControllerJobRuntimeState,
+    PendingControllerEffect, PendingControllerEffectKind, PendingControllerEffectStatus,
+    DEFAULT_CONTROLLER_LEASE_TTL_MS, MAX_IN_SCOPE_CORRECTION_ATTEMPTS,
 };
 use super::job_completion::{
     CoworkerJobCompletionOutcome, CoworkerJobCompletionRequest, CoworkerJobCompletionService,
@@ -70,6 +70,36 @@ pub const DEFAULT_PIPELINE_POLL_INTERVAL_MS: u64 = 15;
 /// Default bounded non-blocking window in milliseconds used during a single [`CoworkerPipelineDriver::tick`]
 /// to drain fast ready stage completions while keeping slower stage futures in-flight across ticks.
 pub const DEFAULT_PIPELINE_TICK_DRAIN_WINDOW_MS: u64 = 25;
+
+// Only the future that successfully persists a NEW completion reservation can publish it.
+// This process-local view is never persisted, recovered, or used as execution authority.
+pub(crate) type LiveCompletionEffects = BTreeMap<String, (PendingControllerEffect, String, u64)>;
+
+tokio::task_local! {
+    static LIVE_COMPLETION_EFFECTS: watch::Sender<LiveCompletionEffects>;
+}
+
+pub(crate) fn record_live_completion_effects(
+    effects: Vec<PendingControllerEffect>,
+    lease: Option<ControllerJobLeaseRecord>,
+) {
+    let Some(lease) = lease.filter(|lease| lease.active && lease.lease_epoch > 0) else {
+        return;
+    };
+    if effects.is_empty() {
+        return;
+    }
+    let _ = LIVE_COMPLETION_EFFECTS.try_with(|sender| {
+        sender.send_modify(|owned| {
+            for effect in effects {
+                owned.insert(
+                    effect.effect_id.clone(),
+                    (effect, lease.instance_id.clone(), lease.lease_epoch),
+                );
+            }
+        });
+    });
+}
 
 /// Identity-only request for driving an admitted Coworker workflow job through the automatic
 /// pipeline.
@@ -432,6 +462,7 @@ pub struct CoworkerPipelineDriver<'g> {
     in_flight: FuturesUnordered<BoxStageFuture<'g>>,
     active_task_stages: BTreeMap<(String, u32), CoworkerPipelineInFlightStageKind>,
     job_completion_in_flight: bool,
+    live_completion_effects_tx: watch::Sender<LiveCompletionEffects>,
     in_flight_stages_tx: watch::Sender<Vec<CoworkerPipelineInFlightStageRef>>,
     failed_check_tasks: BTreeMap<(String, u32), Vec<String>>,
     last_completion_outcome: Option<Box<CoworkerJobCompletionOutcome>>,
@@ -465,6 +496,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
             .controller
             .verify_physical_ownership(guard, &binding_id, &thread_uuid, &job_id)?;
         let (in_flight_stages_tx, _) = watch::channel(Vec::new());
+        let (live_completion_effects_tx, _) = watch::channel(BTreeMap::new());
         Ok(Self {
             service,
             guard,
@@ -474,6 +506,7 @@ impl<'g> CoworkerPipelineDriver<'g> {
             in_flight: FuturesUnordered::new(),
             active_task_stages: BTreeMap::new(),
             job_completion_in_flight: false,
+            live_completion_effects_tx,
             in_flight_stages_tx,
             failed_check_tasks: BTreeMap::new(),
             last_completion_outcome: None,
@@ -530,6 +563,12 @@ impl<'g> CoworkerPipelineDriver<'g> {
         &self,
     ) -> watch::Receiver<Vec<CoworkerPipelineInFlightStageRef>> {
         self.in_flight_stages_tx.subscribe()
+    }
+
+    pub(crate) fn subscribe_live_completion_effects(
+        &self,
+    ) -> watch::Receiver<LiveCompletionEffects> {
+        self.live_completion_effects_tx.subscribe()
     }
 
     fn publish_in_flight_stages(&self) {
@@ -1532,12 +1571,19 @@ impl<'g> CoworkerPipelineDriver<'g> {
             now_ms,
         };
         self.job_completion_in_flight = true;
-        self.in_flight.push(Box::pin(async move {
-            let result = Box::pin(completion_service.complete_job(guard, &req))
-                .await
-                .map(Box::new);
-            InFlightStageCompletion::JobCompletion { result }
-        }));
+        let _ = self
+            .live_completion_effects_tx
+            .send_replace(BTreeMap::new());
+        let live_effects_tx = self.live_completion_effects_tx.clone();
+        self.in_flight.push(Box::pin(LIVE_COMPLETION_EFFECTS.scope(
+            live_effects_tx,
+            async move {
+                let result = Box::pin(completion_service.complete_job(guard, &req))
+                    .await
+                    .map(Box::new);
+                InFlightStageCompletion::JobCompletion { result }
+            },
+        )));
         self.publish_in_flight_stages();
     }
 
@@ -1710,6 +1756,9 @@ impl<'g> CoworkerPipelineDriver<'g> {
             }
             InFlightStageCompletion::JobCompletion { result } => {
                 self.job_completion_in_flight = false;
+                let _ = self
+                    .live_completion_effects_tx
+                    .send_replace(BTreeMap::new());
                 match result {
                     Ok(outcome) => {
                         self.last_completion_outcome = Some(outcome.clone());

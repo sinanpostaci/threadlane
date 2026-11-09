@@ -303,6 +303,30 @@ if (mode === "plan") {
     const subjectDigest = digestMatch[1];
     const candidateTreeSha = treeMatch[1];
 
+    // Optional fixture-local barrier. Expiry is failure, never an implicit accepted release.
+    const closureGatePath = path.join(stateDir, "hold_closure.gate");
+    if (fs.existsSync(closureGatePath)) {
+      const gate = JSON.parse(fs.readFileSync(closureGatePath, "utf8"));
+      const timeoutMs = Math.min(Math.max(Number(gate.timeout_ms) || 60000, 1000), 60000);
+      const enteredMarker = path.join(stateDir, "closure_entered.marker");
+      fs.writeFileSync(`${enteredMarker}.tmp`, JSON.stringify({
+        pid: process.pid,
+        subject_digest: subjectDigest,
+        candidate_tree_sha: candidateTreeSha,
+      }));
+      fs.renameSync(`${enteredMarker}.tmp`, enteredMarker);
+      const deadline = Date.now() + timeoutMs;
+      while (fs.existsSync(closureGatePath) && Date.now() < deadline) {
+        sleepMs(10);
+      }
+      const released = !fs.existsSync(closureGatePath);
+      fs.writeFileSync(path.join(stateDir, "closure_released.marker"), JSON.stringify({ released }));
+      if (!released) {
+        process.stderr.write("Closure fixture gate expired without release\n");
+        process.exit(6);
+      }
+    }
+
     const closureOverridePath = path.join(stateDir, "closure_override.json");
     let closureObj = {
       schema_version: 1,

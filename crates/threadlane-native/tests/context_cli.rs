@@ -3408,3 +3408,39 @@ async fn exported_operator_context_admits_planning_grant_and_scope_approval_with
 
     fixture.shutdown().await;
 }
+
+#[tokio::test]
+async fn admission_flow_forwarding_preserves_scope_and_refuses_protected_overrides() {
+    let mut f = ContextFixture::start().await;
+    let context = f.write_private_context("admission-context.json", &f.valid_context_json());
+    let marker = f.root.join("admission-argv.marker");
+    write_argv_recording_sibling(&f.pkg_bin_dir, "threadlane-flow", &marker);
+    for operation in ["preview", "record", "inspect", "reconcile"] {
+        let inner = ["coworker-admission", operation, "--job-id", "job_fixture"];
+        let mut args = vec!["--context", context.to_str().unwrap(), "flow"];
+        args.extend(inner);
+        assert!(run_bin(&f.context_bin, &args).await.status.success());
+        assert_eq!(
+            read_argv_marker(&marker),
+            expected_recorded_argv(&five_store_scope_args(&f), &inner)
+        );
+        for protected in [
+            "--binding=forged",
+            "--thread=forged",
+            "--plans-dir=/tmp/forged",
+            "--registry-dir=/tmp/forged",
+            "--authority-dir=/tmp/forged",
+            "--sessions-dir=/tmp/forged",
+            "--state-dir=/tmp/forged",
+        ] {
+            if marker.exists() {
+                fs::remove_file(&marker).unwrap();
+            }
+            let mut hostile = args.clone();
+            hostile.push(protected);
+            assert!(!run_bin(&f.context_bin, &hostile).await.status.success());
+            assert!(!marker.exists());
+        }
+    }
+    f.shutdown().await;
+}

@@ -584,10 +584,11 @@ async fn mcp_plan_task_params_schema_and_deserializer_normalize_worker_to_canoni
 }
 
 #[tokio::test]
-async fn operating_guide_and_startup_instructions_report_v2_and_worker_compatibility() {
+async fn operating_guide_and_startup_instructions_report_current_version_and_worker_compatibility()
+{
     use rmcp::handler::server::wrapper::Parameters;
 
-    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-08.v2");
+    assert_eq!(OPERATING_GUIDE_VERSION, "2026-11-09.v1");
     assert!(SCOPED_MCP_STARTUP_INSTRUCTIONS.contains(OPERATING_GUIDE_VERSION));
     assert!(PAIRED_MCP_STARTUP_INSTRUCTIONS.contains(OPERATING_GUIDE_VERSION));
     assert!(OPERATING_GUIDE_MARKDOWN.contains(OPERATING_GUIDE_VERSION));
@@ -596,7 +597,7 @@ async fn operating_guide_and_startup_instructions_report_v2_and_worker_compatibi
     assert!(OPERATING_GUIDE_MARKDOWN.contains("role_label"));
 
     let current = OperatingGuideResponse::current();
-    assert_eq!(current.version, "2026-11-08.v2");
+    assert_eq!(current.version, "2026-11-09.v1");
     assert_eq!(current.guide_markdown, OPERATING_GUIDE_MARKDOWN);
 
     let tmp = TempDir::new().expect("tempdir");
@@ -617,8 +618,9 @@ async fn operating_guide_and_startup_instructions_report_v2_and_worker_compatibi
         .description
         .as_deref()
         .expect("scoped operating_guide description");
-    assert!(scoped_desc.contains("2026-11-08.v2"));
+    assert!(scoped_desc.contains("2026-11-09.v1"));
     assert!(scoped_desc.contains("Worker (coder)"));
+    assert!(scoped_desc.contains("complete job admission"));
 
     let pairing_store = PairingStore::open(&pairing_dir).expect("open pairing store");
     let operator_token = pairing_store.operator_token().expect("operator token");
@@ -634,8 +636,9 @@ async fn operating_guide_and_startup_instructions_report_v2_and_worker_compatibi
         .description
         .as_deref()
         .expect("paired operating_guide description");
-    assert!(paired_desc.contains("2026-11-08.v2"));
+    assert!(paired_desc.contains("2026-11-09.v1"));
     assert!(paired_desc.contains("Worker (coder)"));
+    assert!(paired_desc.contains("complete job admission"));
 
     assert_eq!(
         scoped_server.get_info().instructions.as_deref(),
@@ -665,7 +668,7 @@ async fn operating_guide_and_startup_instructions_report_v2_and_worker_compatibi
         .expect("paired operating_guide")
         .structured_content
         .expect("structured guide");
-    assert_eq!(guide_res["data"]["version"], "2026-11-08.v2");
+    assert_eq!(guide_res["data"]["version"], "2026-11-09.v1");
     assert_eq!(
         guide_res["data"]["guide_markdown"],
         OPERATING_GUIDE_MARKDOWN

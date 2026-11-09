@@ -1654,12 +1654,27 @@ impl CoworkerCandidateService {
             ],
         );
 
-        let executable = resolve_verified_closure_tool_executable(
-            authority,
+        let executable = match crate::coworker_admission::complete_admission_pins(
+            &self.store,
+            policy_store,
             job,
-            &runtime.envelope,
-            &closure_choice,
-        )?;
+        )? {
+            Some(pins) => {
+                if pins.closure.choice != closure_choice {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "Admission Closure pin differs from frozen envelope",
+                    ));
+                }
+                pins.closure.executable()?.to_path_buf()
+            }
+            None => resolve_verified_closure_tool_executable(
+                authority,
+                job,
+                &runtime.envelope,
+                &closure_choice,
+            )?,
+        };
         let response_budget =
             AdvisoryResponseBudget::new(closure_budget.max_structured_response_bytes);
         response_budget

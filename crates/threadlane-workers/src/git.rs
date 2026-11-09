@@ -3726,7 +3726,20 @@ fn run_git_bytes_bounded_raw(
                         .saturating_sub(now.saturating_duration_since(exited_at));
                     wait_dur = wait_dur.min(rem_drain);
                 }
-                wait_dur = wait_dur.min(Duration::from_millis(20));
+                // Both pipes can reach EOF before the child's exit is observable: the final
+                // read may return 0 while `try_wait` still reports the child as running for
+                // a scheduling instant. With no live descriptors `poll([-1, -1], n)` is just
+                // a sleep, so the 20 ms active-pipe cap would add up to 20 ms to every short
+                // Git command after EOF. Recheck the no-pipe child at a short bounded interval
+                // instead; this remains a sleep (not a busy spin), and the overall deadline and
+                // post-exit drain window above still bound the loop. Live pipes keep the
+                // event-driven 20 ms poll.
+                let poll_cap = if stdout_open || stderr_open {
+                    Duration::from_millis(20)
+                } else {
+                    Duration::from_millis(1)
+                };
+                wait_dur = wait_dur.min(poll_cap);
                 let poll_ms = i32::try_from(wait_dur.as_millis()).unwrap_or(20).max(1);
 
                 unix_pgroup::poll_pipe_fds(

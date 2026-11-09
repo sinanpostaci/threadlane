@@ -347,6 +347,18 @@ fn create_bound_job(
     brief_id: &str,
     plan_id: &str,
 ) -> CoworkerJobRecord {
+    let (_, request) = prepare_job_for_binding(fixture, brief_id, plan_id);
+    fixture
+        .workflow_store
+        .bind_job_approval(&request, &fixture.authority)
+        .expect("bind job approval")
+}
+
+fn prepare_job_for_binding(
+    fixture: &ControllerPolicyFixture,
+    brief_id: &str,
+    plan_id: &str,
+) -> (CoworkerJobRecord, BindJobApprovalRequest) {
     let brief = WorkBrief {
         brief_id: brief_id.to_string(),
         binding_id: BINDING_A.to_string(),
@@ -440,23 +452,18 @@ fn create_bound_job(
         allow_check_failure_corrections: false,
     };
 
-    fixture
-        .workflow_store
-        .bind_job_approval(
-            &BindJobApprovalRequest {
-                binding_id: BINDING_A.to_string(),
-                thread_uuid: THREAD_UUID_A.to_string(),
-                job_id: job.job_id,
-                expected_job_revision: job.job_revision,
-                expected_ledger_revision: None,
-                approval_id: summary.approval_id,
-                policy: execution_policy(),
-                controller_envelope: Some(cap_env),
-                task_interfaces: BTreeMap::new(),
-            },
-            &fixture.authority,
-        )
-        .expect("bind job approval")
+    let request = BindJobApprovalRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        expected_job_revision: job.job_revision,
+        expected_ledger_revision: None,
+        approval_id: summary.approval_id,
+        policy: execution_policy(),
+        controller_envelope: Some(cap_env),
+        task_interfaces: BTreeMap::new(),
+    };
+    (job, request)
 }
 
 fn default_role_budgets() -> BTreeMap<WorkflowRole, ControllerRoleExecutionBudget> {
@@ -555,6 +562,907 @@ fn attested_record_request_from_preview(
     req.confirm_approval_subject_digest = Some(preview.approval_subject_digest.clone());
     req.confirm_envelope_digest = Some(preview.envelope_digest.clone());
     req
+}
+
+mod admission_regressions {
+    use super::*;
+    use threadlane_native::coworker_admission::{
+        verify_complete_admission, AdmissionConfirmation, AdmissionInspectionState,
+        AdmissionPersistenceBoundary, AdmissionPreview, AdmissionReceipt, AdmissionRequest,
+        AdmissionStage, CoworkerAdmissionService,
+    };
+    use threadlane_native::coworker_workflow::{
+        CoworkerLedgerMutationOutcome, CreatePlanningGrantRequest, FinalizePlanningCallRequest,
+        PlanningCallBudget, PlanningReadOnlyCapabilities, PlanningReservationStatus,
+        PlanningResultRef, RecordJobPlanningResultRequest, ReservePlanningCallRequest,
+    };
+
+    fn prepare(f: &ControllerPolicyFixture) -> AdmissionRequest {
+        let (job, mut binding) = prepare_job_for_binding(f, "brief-admission", "plan-admission");
+        let mut planning_policy = execution_policy();
+        planning_policy.policy_id = "policy-admission-planning".into();
+        planning_policy.allow_rules.truncate(1);
+        planning_policy.allow_rules[0].roles =
+            vec![WorkflowRole::Orchestrator, WorkflowRole::Architect];
+        let grant = f
+            .workflow_store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: BINDING_A.into(),
+                thread_uuid: THREAD_UUID_A.into(),
+                request_key: "grant-admission".into(),
+                expected_ledger_revision: None,
+                project_base: project_base(f),
+                profile_id: "profile-coworker".into(),
+                registry_revision: f.registry.snapshot_readonly().unwrap().revision,
+                policy: planning_policy,
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 2,
+                    max_orchestrator_calls: 1,
+                    max_architect_calls: 1,
+                    max_timeout_ms_per_call: 30_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms: 1_000,
+                expires_at_ms: 10_000,
+                operator_attested: true,
+            })
+            .unwrap();
+        let reservation = f
+            .workflow_store
+            .reserve_planning_call(&ReservePlanningCallRequest {
+                binding_id: BINDING_A.into(),
+                thread_uuid: THREAD_UUID_A.into(),
+                grant_id: grant.grant_id.clone(),
+                request_key: "planning-admission".into(),
+                expected_ledger_revision: None,
+                role: WorkflowRole::Orchestrator,
+                difficulty: Some(Difficulty::Hard),
+                selected_choice: headless_argon_choice(),
+                context_digest: job.work_brief_digest.clone(),
+                call_project_base: Some(project_base(f)),
+                current_time_ms: 2_000,
+            })
+            .unwrap();
+        let output_digest = sha256_hex(b"admission planning fixture output");
+        f.workflow_store
+            .finalize_planning_call(&FinalizePlanningCallRequest {
+                binding_id: BINDING_A.into(),
+                thread_uuid: THREAD_UUID_A.into(),
+                grant_id: grant.grant_id.clone(),
+                reservation_id: reservation.reservation_id.clone(),
+                expected_ledger_revision: None,
+                status: PlanningReservationStatus::Completed,
+                updated_at_ms: 2_100,
+                run_id: Some("run-admission".into()),
+                report_artifact_id: Some("report-admission".into()),
+                output_digest: Some(output_digest.clone()),
+                diagnostic: None,
+            })
+            .unwrap();
+        let approval = f
+            .authority
+            .get_for_operator_readonly(&binding.approval_id)
+            .unwrap();
+        let planning = PlanningResultRef {
+            grant_id: grant.grant_id,
+            reservation_id: reservation.reservation_id,
+            request_key: reservation.request_key,
+            run_id: "run-admission".into(),
+            report_artifact_id: "report-admission".into(),
+            output_digest,
+            work_brief_digest: job.work_brief_digest.clone(),
+            project_base: project_base(f),
+            profile_id: approval.profile_id,
+            registry_revision: approval.registry_revision,
+            policy_digest: grant.policy_digest,
+            selected_choice: headless_argon_choice(),
+            plan_id: approval.plan_id,
+            plan_revision: approval.plan_revision,
+            plan_digest: approval.plan_digest,
+            plan_status: threadlane_workflow::PlanStatus::Published,
+            task_interfaces: BTreeMap::new(),
+            architect_advice_ids: vec![],
+            resolved_open_questions: vec![],
+            deferred_proposals: vec![],
+            recorded_at_ms: 2_100,
+        };
+        let job = f
+            .workflow_store
+            .record_job_planning_result(&RecordJobPlanningResultRequest {
+                binding_id: BINDING_A.into(),
+                thread_uuid: THREAD_UUID_A.into(),
+                job_id: job.job_id,
+                expected_job_revision: Some(job.job_revision),
+                expected_ledger_revision: None,
+                planning_result: planning.clone(),
+            })
+            .unwrap();
+        binding.expected_job_revision = job.job_revision;
+        binding.expected_ledger_revision = Some(
+            f.workflow_store
+                .read_binding_ledger(BINDING_A)
+                .unwrap()
+                .ledger_revision,
+        );
+        let mut execution = sample_preview_request(f, &job);
+        execution.closure_choice.matched_difficulty = Some(Difficulty::Extreme);
+        binding
+            .controller_envelope
+            .as_mut()
+            .unwrap()
+            .allowed_closure_choices
+            .push(execution.closure_choice.clone());
+        AdmissionRequest {
+            request_key: "admission-1".into(),
+            binding,
+            planning_result: planning,
+            work_brief_digest: job.work_brief_digest,
+            execution,
+            reviewer_difficulty: Some(Difficulty::Hard),
+            closure_difficulty: Some(Difficulty::Extreme),
+        }
+    }
+
+    fn service(f: &ControllerPolicyFixture) -> CoworkerAdmissionService {
+        CoworkerAdmissionService::new(f.plans.dir(), f.authority.dir(), f.registry.config_dir())
+            .unwrap()
+    }
+
+    fn confirmation(p: &AdmissionPreview) -> AdmissionConfirmation {
+        AdmissionConfirmation {
+            trusted_local_attested: true,
+            preview_digest: p.preview_digest.clone(),
+            approval_subject_digest: p.approval_subject_digest.clone(),
+            envelope_digest: p.envelope.envelope_digest.clone(),
+        }
+    }
+
+    fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        let mut files = BTreeMap::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(snapshot(&path));
+            } else {
+                files.insert(
+                    path.clone(),
+                    (
+                        fs::read(&path).unwrap(),
+                        fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                );
+            }
+        }
+        files
+    }
+
+    fn receipt_path(f: &ControllerPolicyFixture) -> PathBuf {
+        fs::read_dir(f.plans.dir())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("coworker-admission-")
+                    && p.extension().is_some_and(|e| e == "json")
+            })
+            .unwrap()
+    }
+
+    fn unrelated_unknown_job(f: &ControllerPolicyFixture) -> CoworkerJobRecord {
+        use threadlane_native::coworker_workflow::{
+            FinalizeTaskOutboxRequest, OutboxDispatchKind, OutboxDispatchStatus,
+            ReserveTaskOutboxRequest,
+        };
+        let unrelated = create_bound_job(f, "brief-unrelated", "plan-unrelated");
+        let (job, outbox) = f
+            .workflow_store
+            .reserve_task_outbox(&ReserveTaskOutboxRequest {
+                binding_id: BINDING_A.into(),
+                thread_uuid: THREAD_UUID_A.into(),
+                job_id: unrelated.job_id,
+                expected_job_revision: unrelated.job_revision,
+                expected_ledger_revision: None,
+                request_key: "unrelated-unknown-attempt".into(),
+                kind: OutboxDispatchKind::TaskAttemptDispatch,
+                task_id: "task-1".into(),
+                role: WorkflowRole::Coder,
+                subject_digest: sha256_hex(b"unknown unrelated effect"),
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: vec![],
+            })
+            .unwrap();
+        f.workflow_store
+            .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+                binding_id: BINDING_A.into(),
+                thread_uuid: THREAD_UUID_A.into(),
+                job_id: job.job_id,
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                outbox_id: outbox.outbox_id,
+                status: OutboxDispatchStatus::EffectUnknown,
+                next_task_stage: CoworkerTaskStage::EffectUnknown,
+                run_id: None,
+                worker_id: None,
+                task_worktree_id: None,
+                head_commit: None,
+                tree_sha: None,
+                diff_digest: None,
+                report_artifact_id: None,
+                observed_model: None,
+                observed_effort: None,
+                receipt_id: None,
+                diagnostic: Some("Unknown fixture effect; never replay".into()),
+            })
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn preview_is_pure_and_recorded_duplicates_preserve_bytes_mtimes_and_runtime_progress() {
+        let f = setup_fixture();
+        let unrelated = unrelated_unknown_job(&f);
+        let request = prepare(&f);
+        let api = service(&f);
+        fs::write(
+            f.plans.dir().join("unrelated-artifact"),
+            b"immutable private fixture",
+        )
+        .unwrap();
+        let before = snapshot(f._tmp.path());
+        let preview = api.preview(&request).unwrap();
+        assert_eq!(snapshot(f._tmp.path()), before);
+        assert_eq!(
+            preview.proposed_job.job_revision,
+            request.binding.expected_job_revision + 1
+        );
+        assert!(preview.proposed_job.approval_linkage.is_some());
+        assert!(!preview.envelope.operator_attested);
+        let consent = confirmation(&preview);
+        let receipt = api.record(&request, &consent).unwrap();
+        assert_eq!(receipt.stage, AdmissionStage::Complete);
+        f.policy_store
+            .mutate_job_runtime_for_operator(BINDING_A, &request.binding.job_id, |state| {
+                state.stop_requested = true;
+                state.total_task_attempts_reserved = 1;
+                Ok(())
+            })
+            .unwrap();
+        let after = snapshot(f._tmp.path());
+        // A witnessed duplicate must not acquire the admission lock or sync existing files.
+        // Holding that lock here would make a false fast path contend with itself.
+        let admission_lock = fs::read_dir(f.plans.dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("coworker-admission-")
+                    && path
+                        .extension()
+                        .is_some_and(|extension| extension == "lock")
+            })
+            .unwrap();
+        let lock = threadlane_native::fs_safety::acquire_cross_process_lock(
+            f.plans.dir(),
+            admission_lock.file_name().unwrap().to_str().unwrap(),
+            "duplicate fixture lock",
+        )
+        .unwrap();
+        let duplicate = std::thread::scope(|scope| {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            let (api, request, consent) = (&api, &request, &consent);
+            scope.spawn(move || {
+                let _ = sender.send(api.record(request, consent));
+            });
+            let duplicate = receiver.recv_timeout(std::time::Duration::from_secs(5));
+            // Release before propagating a failed assertion so a regressed waiter is joined.
+            drop(lock);
+            duplicate
+        });
+        assert_eq!(
+            duplicate
+                .expect("witnessed duplicate must not wait for admission lock")
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(snapshot(f._tmp.path()), after);
+        let ledger = f.workflow_store.read_binding_ledger(BINDING_A).unwrap();
+        assert_eq!(
+            ledger
+                .jobs
+                .iter()
+                .find(|j| j.job_id == unrelated.job_id)
+                .unwrap(),
+            &unrelated
+        );
+        let job = ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == request.binding.job_id)
+            .unwrap();
+        verify_complete_admission(&f.workflow_store, &f.policy_store, job).unwrap();
+        assert!(
+            f.policy_store
+                .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                .unwrap()
+                .unwrap()
+                .stop_requested
+        );
+        assert_eq!(
+            fs::read(f.plans.dir().join("unrelated-artifact")).unwrap(),
+            b"immutable private fixture"
+        );
+    }
+
+    #[test]
+    fn preview_rejects_identity_scope_revision_and_allowlisted_but_unresolved_choices() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let baseline = snapshot(f._tmp.path());
+        let mut cases = Vec::new();
+        let mut r = request.clone();
+        r.binding.thread_uuid = THREAD_UUID_B.into();
+        cases.push(r);
+        let mut r = request.clone();
+        r.binding.expected_job_revision += 1;
+        r.execution.expected_job_revision += 1;
+        cases.push(r);
+        let mut r = request.clone();
+        *r.binding.expected_ledger_revision.as_mut().unwrap() += 1;
+        cases.push(r);
+        let mut r = request.clone();
+        r.work_brief_digest = sha256_hex(b"wrong brief");
+        cases.push(r);
+        let mut r = request.clone();
+        r.planning_result.plan_digest = sha256_hex(b"wrong plan");
+        cases.push(r);
+        let mut r = request.clone();
+        r.planning_result.registry_revision += 1;
+        cases.push(r);
+        let mut r = request.clone();
+        r.planning_result.project_base.base_tree_sha = "1".repeat(40);
+        cases.push(r);
+        let mut r = request.clone();
+        r.execution.reviewer_choice = headless_deepseek_choice();
+        cases.push(r);
+        let mut r = request.clone();
+        r.execution.closure_choice = headless_deepseek_choice();
+        cases.push(r);
+        let mut r = request.clone();
+        r.binding
+            .task_interfaces
+            .insert("task-not-approved".into(), Default::default());
+        cases.push(r);
+        for changed in cases {
+            assert!(api.preview(&changed).is_err());
+        }
+        assert_eq!(snapshot(f._tmp.path()), baseline);
+    }
+
+    #[test]
+    fn every_serialized_consent_field_is_bound_and_confirmation_flags_are_not_authority() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let preview = api.preview(&request).unwrap();
+        let consent = confirmation(&preview);
+        let mut changed = request.clone();
+        changed.execution.operator_attested = true;
+        changed.execution.confirm_approval_subject_digest = Some("irrelevant".into());
+        assert_eq!(
+            api.preview(&changed).unwrap().preview_digest,
+            preview.preview_digest
+        );
+        // Every scalar in every nested consent-bearing field is included in the preview subject.
+        fn leaves(
+            value: &serde_json::Value,
+            path: &mut Vec<String>,
+            output: &mut Vec<Vec<String>>,
+        ) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    for (key, value) in map {
+                        path.push(key.clone());
+                        leaves(value, path, output);
+                        path.pop();
+                    }
+                }
+                serde_json::Value::Array(values) => {
+                    for (index, value) in values.iter().enumerate() {
+                        path.push(index.to_string());
+                        leaves(value, path, output);
+                        path.pop();
+                    }
+                }
+                _ => output.push(path.clone()),
+            }
+        }
+        let original = serde_json::to_value(&preview).unwrap();
+        let mut paths = Vec::new();
+        leaves(&original, &mut Vec::new(), &mut paths);
+        for path in paths {
+            if path
+                .last()
+                .is_some_and(|p| p == "preview_digest" || p == "operator_attested")
+            {
+                continue;
+            }
+            let mut value = original.clone();
+            let mut target = &mut value;
+            for key in &path {
+                target = match target {
+                    serde_json::Value::Array(values) => &mut values[key.parse::<usize>().unwrap()],
+                    serde_json::Value::Object(map) => map.get_mut(key).unwrap(),
+                    _ => unreachable!(),
+                };
+            }
+            *target = match target.clone() {
+                serde_json::Value::String(mut text) => {
+                    text.push('x');
+                    text.into()
+                }
+                serde_json::Value::Number(number) => (number.as_u64().unwrap_or(0) + 1).into(),
+                serde_json::Value::Bool(boolean) => (!boolean).into(),
+                _ => "changed".into(),
+            };
+            if let Ok(changed) = serde_json::from_value::<AdmissionPreview>(value) {
+                assert_ne!(
+                    changed.compute_digest().ok().as_ref(),
+                    Some(&preview.preview_digest),
+                    "unbound field {path:?}"
+                );
+            }
+        }
+        let mut changed = request.clone();
+        changed.execution.created_at_ms += 1;
+        assert!(api.record(&changed, &consent).is_err());
+        let mut missing = consent;
+        missing.trusted_local_attested = false;
+        assert!(api.record(&request, &missing).is_err());
+    }
+
+    #[test]
+    fn missing_tampered_or_unsupported_receipts_fail_closed_without_repair() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let preview = api.preview(&request).unwrap();
+        api.record(&request, &confirmation(&preview)).unwrap();
+        let path = receipt_path(&f);
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            api.inspect(BINDING_A, &request.binding.job_id)
+                .unwrap()
+                .state,
+            AdmissionInspectionState::Conflicting
+        );
+        let ledger = f.workflow_store.read_binding_ledger(BINDING_A).unwrap();
+        let job = ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == request.binding.job_id)
+            .unwrap();
+        assert!(verify_complete_admission(&f.workflow_store, &f.policy_store, job).is_err());
+        assert!(api.reconcile(BINDING_A, &request.binding.job_id).is_err());
+        for corrupt in [b"broken-json".to_vec(), {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            value["schema_version"] = 99.into();
+            serde_json::to_vec(&value).unwrap()
+        }] {
+            threadlane_native::fs_safety::write_private_file_atomic(
+                f.plans.dir(),
+                path.file_name().unwrap().to_str().unwrap(),
+                &corrupt,
+                "fixture",
+            )
+            .unwrap();
+            assert!(api.inspect(BINDING_A, &request.binding.job_id).is_err());
+            assert_eq!(fs::read(&path).unwrap(), corrupt);
+        }
+    }
+
+    #[test]
+    fn concurrent_identical_records_create_one_admission_and_conflicting_reuse_is_refused() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let consent = confirmation(&api.preview(&request).unwrap());
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                api.record(&request, &consent)
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                api.record(&request, &consent)
+            });
+            assert_eq!(
+                first.join().unwrap().unwrap(),
+                second.join().unwrap().unwrap()
+            );
+        });
+        let before = snapshot(f._tmp.path());
+        let mut changed = request.clone();
+        changed.request_key = "conflicting-key".into();
+        assert!(api.record(&changed, &consent).is_err());
+        assert_eq!(snapshot(f._tmp.path()), before);
+    }
+
+    #[test]
+    fn partial_intent_reconciliation_preserves_original_subject_and_never_dispatches() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let preview = api.preview(&request).unwrap();
+        let consent = confirmation(&preview);
+        // A restart after intent persistence, before linkage, has this exact private state.
+        let receipt = AdmissionReceipt {
+            schema_version: 1,
+            preview: preview.clone(),
+            confirmation: consent,
+            stage: AdmissionStage::Intent,
+            runtime_initialized: false,
+        };
+        let seed = format!(
+            "threadlane-native:admission-path:v1:{}:{}:{}",
+            BINDING_A.len(),
+            BINDING_A,
+            request.binding.job_id
+        );
+        let filename = format!("coworker-admission-{}.json", sha256_hex(seed.as_bytes()));
+        threadlane_native::fs_safety::write_private_file_atomic(
+            f.plans.dir(),
+            &filename,
+            &serde_json::to_vec(&receipt).unwrap(),
+            "fixture intent",
+        )
+        .unwrap();
+        assert_eq!(
+            api.inspect(BINDING_A, &request.binding.job_id)
+                .unwrap()
+                .state,
+            AdmissionInspectionState::PartiallyRecorded
+        );
+        assert!(api.record(&request, &receipt.confirmation).is_err());
+        let reopened = service(&f);
+        let complete = reopened
+            .reconcile(BINDING_A, &request.binding.job_id)
+            .unwrap();
+        assert_eq!(complete.preview, preview);
+        assert_eq!(complete.stage, AdmissionStage::Complete);
+        let runtime = f
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &request.binding.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.total_task_attempts_reserved, 0);
+        assert!(runtime.pending_effects.is_empty());
+        assert!(runtime.lease.is_none());
+        assert!(runtime.attempt_artifacts.is_empty());
+        // Visible bytes explicitly labelled uncertain cannot authorize an effect.
+        let mut uncertain = complete;
+        uncertain.stage = AdmissionStage::Uncertain;
+        threadlane_native::fs_safety::write_private_file_atomic(
+            f.plans.dir(),
+            &filename,
+            &serde_json::to_vec(&uncertain).unwrap(),
+            "uncertain fixture",
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .inspect(BINDING_A, &request.binding.job_id)
+                .unwrap()
+                .state,
+            AdmissionInspectionState::Uncertain
+        );
+        let before = snapshot(f._tmp.path());
+        reopened
+            .inspect(BINDING_A, &request.binding.job_id)
+            .unwrap();
+        assert_eq!(snapshot(f._tmp.path()), before);
+        reopened
+            .reconcile(BINDING_A, &request.binding.job_id)
+            .unwrap();
+    }
+
+    thread_local! {
+        static FAIL_AT: std::cell::Cell<Option<AdmissionPersistenceBoundary>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn failure_probe(
+        point: AdmissionPersistenceBoundary,
+    ) -> Result<(), threadlane_native::NativeError> {
+        if FAIL_AT.with(|slot| slot.get()) != Some(point) {
+            return Ok(());
+        }
+        match point {
+            AdmissionPersistenceBoundary::BeforeIntent
+            | AdmissionPersistenceBoundary::BeforeLinkage
+            | AdmissionPersistenceBoundary::BeforeRuntime
+            | AdmissionPersistenceBoundary::BeforeComplete => {
+                Err(threadlane_native::NativeError::new(
+                    NativeErrorCode::IoError,
+                    "Injected pre-write refusal",
+                ))
+            }
+            _ => Err(threadlane_native::NativeError::persistence_uncertain(
+                "Injected lost durability acknowledgement",
+            )),
+        }
+    }
+
+    #[test]
+    fn failures_at_every_admission_boundary_remain_fenced_and_reconcile_without_replaying_effects()
+    {
+        use AdmissionPersistenceBoundary::*;
+        for point in [
+            BeforeIntent,
+            AfterIntent,
+            BeforeLinkage,
+            AfterLinkage,
+            BeforeRuntime,
+            AfterRuntime,
+            BeforeComplete,
+            AfterComplete,
+        ] {
+            let f = setup_fixture();
+            let unrelated = unrelated_unknown_job(&f);
+            let request = prepare(&f);
+            let api = service(&f).with_failure_probe(failure_probe);
+            let preview = api.preview(&request).unwrap();
+            let consent = confirmation(&preview);
+            FAIL_AT.with(|slot| slot.set(Some(point)));
+            assert!(
+                api.record(&request, &consent).is_err(),
+                "boundary {point:?}"
+            );
+            FAIL_AT.with(|slot| slot.set(None));
+            let inspection = api.inspect(BINDING_A, &request.binding.job_id).unwrap();
+            assert_ne!(inspection.state, AdmissionInspectionState::Complete);
+            let reopened = service(&f);
+            let complete = if point == BeforeIntent {
+                reopened.record(&request, &consent).unwrap()
+            } else {
+                reopened
+                    .reconcile(BINDING_A, &request.binding.job_id)
+                    .unwrap()
+            };
+            assert_eq!(complete.preview, preview);
+            assert_eq!(
+                complete.preview.request.execution.created_at_ms,
+                request.execution.created_at_ms
+            );
+            let ledger = f.workflow_store.read_binding_ledger(BINDING_A).unwrap();
+            assert_eq!(
+                ledger
+                    .jobs
+                    .iter()
+                    .find(|j| j.job_id == unrelated.job_id)
+                    .unwrap(),
+                &unrelated
+            );
+            let runtime = f
+                .policy_store
+                .get_job_runtime_readonly(BINDING_A, &request.binding.job_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(runtime.total_task_attempts_reserved, 0);
+            assert_eq!(runtime.total_corrections_reserved, 0);
+            assert!(runtime.pending_effects.is_empty());
+            assert!(runtime.attempt_artifacts.is_empty());
+            assert!(runtime.lease.is_none());
+            assert_eq!(runtime.runtime_revision, 1);
+        }
+    }
+
+    #[test]
+    fn marker_removal_is_refused_and_common_effectful_gate_enforces_missing_receipt() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let preview = api.preview(&request).unwrap();
+        api.record(&request, &confirmation(&preview)).unwrap();
+        let before =
+            fs::read(f.workflow_store.ledger_path_for_binding(BINDING_A).unwrap()).unwrap();
+        assert!(f
+            .workflow_store
+            .transact_binding_ledger(BINDING_A, None, |ledger| {
+                ledger.admission_markers.clear();
+                Ok(CoworkerLedgerMutationOutcome::Mutated(()))
+            })
+            .is_err());
+        assert_eq!(
+            fs::read(f.workflow_store.ledger_path_for_binding(BINDING_A).unwrap()).unwrap(),
+            before
+        );
+        fs::remove_file(receipt_path(&f)).unwrap();
+        let ledger = f.workflow_store.read_binding_ledger(BINDING_A).unwrap();
+        let mut job = ledger
+            .jobs
+            .iter()
+            .find(|j| j.job_id == request.binding.job_id)
+            .unwrap()
+            .clone();
+        let mut runtime = f
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .unwrap()
+            .unwrap();
+        let approval = f
+            .authority
+            .get_for_operator_readonly(&request.binding.approval_id)
+            .unwrap();
+        assert!(threadlane_native::coworker_workflow::controller_policy::verify_frozen_runtime_registry_or_apply_config_hold(
+            &approval, &mut job, &mut runtime, &f.authority, &f.workflow_store, &f.policy_store).is_err());
+        // Explicit stop remains an operator mutation, independent of admission execution proof.
+        f.policy_store
+            .mutate_job_runtime_for_operator(BINDING_A, &job.job_id, |state| {
+                state.stop_requested = true;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn receipt_path_for_root(plans: &Path) -> PathBuf {
+        fs::read_dir(plans)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("coworker-admission-")
+                    && p.extension().is_some_and(|e| e == "json")
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn restart_child_probe() {
+        let Some(root) = std::env::var_os("THREADLANE_ADMISSION_FIXTURE_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let plans = root.join("plans-store");
+        let api = CoworkerAdmissionService::new(
+            &plans,
+            &root.join("authority-store"),
+            &root.join("registry-store"),
+        )
+        .unwrap();
+        let workflow = CoworkerWorkflowStore::new(&plans).unwrap();
+        let controller = ControllerPolicyStore::new(&plans).unwrap();
+        let ledger = workflow.read_binding_ledger(BINDING_A).unwrap();
+        let job = ledger
+            .jobs
+            .iter()
+            .find(|j| ledger.admission_markers.contains_key(&j.job_id))
+            .unwrap();
+        let before = snapshot(&root);
+        assert_eq!(
+            api.inspect(BINDING_A, &job.job_id).unwrap().state,
+            AdmissionInspectionState::Uncertain
+        );
+        // Pure inspection must leave even locks and mtimes unchanged in this fresh process.
+        assert_eq!(snapshot(&root), before);
+        // A deliberate execution boundary can sync Complete existing consent without rewriting
+        // any subject, lease, counter, file bytes or mtime.
+        let receipt = api
+            .inspect(BINDING_A, &job.job_id)
+            .unwrap()
+            .receipt
+            .unwrap();
+        assert_eq!(
+            api.record(&receipt.preview.request, &receipt.confirmation)
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(snapshot(&root), before);
+        verify_complete_admission(&workflow, &controller, job).unwrap();
+        assert_eq!(snapshot(&root), before);
+        let runtime_before =
+            fs::read(controller.ledger_path_for_binding(BINDING_A).unwrap()).unwrap();
+        api.reconcile(BINDING_A, &job.job_id).unwrap();
+        assert_eq!(snapshot(&root), before);
+        verify_complete_admission(&workflow, &controller, job).unwrap();
+        // An explicitly Uncertain stage is never promoted by the execution guard, even when
+        // this process previously witnessed the same Complete receipt.
+        let receipt_file = receipt_path_for_root(&plans);
+        let mut uncertain: AdmissionReceipt =
+            serde_json::from_slice(&fs::read(&receipt_file).unwrap()).unwrap();
+        uncertain.stage = AdmissionStage::Uncertain;
+        threadlane_native::fs_safety::write_private_file_atomic(
+            &plans,
+            receipt_file.file_name().unwrap().to_str().unwrap(),
+            &serde_json::to_vec(&uncertain).unwrap(),
+            "uncertain restart fixture",
+        )
+        .unwrap();
+        let uncertain_files = snapshot(&root);
+        assert!(verify_complete_admission(&workflow, &controller, job).is_err());
+        assert_eq!(snapshot(&root), uncertain_files);
+        api.reconcile(BINDING_A, &job.job_id).unwrap();
+        assert_eq!(
+            fs::read(controller.ledger_path_for_binding(BINDING_A).unwrap()).unwrap(),
+            runtime_before
+        );
+    }
+
+    #[test]
+    fn new_process_witnesses_complete_consent_and_explicitly_reconciles_uncertain_without_reset() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let preview = api.preview(&request).unwrap();
+        api.record(&request, &confirmation(&preview)).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "admission_regressions::restart_child_probe",
+                "--nocapture",
+            ])
+            .env("THREADLANE_ADMISSION_FIXTURE_ROOT", f._tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn completed_admission_with_lost_runtime_never_gets_fresh_counters() {
+        let f = setup_fixture();
+        let request = prepare(&f);
+        let api = service(&f);
+        let preview = api.preview(&request).unwrap();
+        let consent = confirmation(&preview);
+        api.record(&request, &consent).unwrap();
+        f.policy_store
+            .mutate_job_runtime_for_operator(BINDING_A, &request.binding.job_id, |state| {
+                state.total_task_attempts_reserved = 3;
+                state.stop_requested = true;
+                Ok(())
+            })
+            .unwrap();
+        fs::remove_file(f.policy_store.ledger_path_for_binding(BINDING_A).unwrap()).unwrap();
+        let before = snapshot(f._tmp.path());
+        assert_eq!(
+            api.inspect(BINDING_A, &request.binding.job_id)
+                .unwrap()
+                .state,
+            AdmissionInspectionState::Conflicting
+        );
+        assert!(api.record(&request, &consent).is_err());
+        assert!(api.reconcile(BINDING_A, &request.binding.job_id).is_err());
+        assert_eq!(snapshot(f._tmp.path()), before);
+    }
+
+    #[test]
+    fn historical_manual_jobs_still_pass_the_new_readonly_guard() {
+        let f = setup_fixture();
+        let job = create_bound_job(&f, "brief-historical", "plan-historical");
+        assert!(job.planning_result.is_none());
+        let before = snapshot(f._tmp.path());
+        verify_complete_admission(&f.workflow_store, &f.policy_store, &job).unwrap();
+        assert_eq!(snapshot(f._tmp.path()), before);
+        assert!(f
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .unwrap()
+            .admission_markers
+            .is_empty());
+    }
 }
 
 #[test]

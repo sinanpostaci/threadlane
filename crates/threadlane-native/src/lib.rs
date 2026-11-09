@@ -38,8 +38,16 @@ pub mod context_export;
 pub mod control_runtime;
 /// Scoped conversational change routing, durable change records, and capability boundaries.
 pub mod conversation_change;
+/// Read-only native admission preview, consent receipts, reconciliation and execution proof.
+pub mod coworker_admission;
 /// Independent code controller process lifecycle (`run-owner`, `ensure`, `status`, `reconcile`, `cancel`) and authenticated local RPC.
 pub mod coworker_driver;
+pub use coworker_admission::{
+    complete_admission_pins, verify_complete_admission, AdmissionConfirmation,
+    AdmissionExecutablePin, AdmissionExecutablePins, AdmissionInspection, AdmissionInspectionState,
+    AdmissionMarker, AdmissionPreview, AdmissionReceipt, AdmissionRequest, AdmissionStage,
+    CoworkerAdmissionService,
+};
 /// Trusted-local standing read-only planning/advice grant preparation, recording, and revocation helpers.
 pub mod coworker_grants;
 /// Coworker notice scheduling and delivery helpers for the native workflow runtime.

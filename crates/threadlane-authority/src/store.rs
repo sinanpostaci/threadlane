@@ -447,6 +447,52 @@ impl AuthorityStore {
             })
     }
 
+    /// Reads and validates all [`ApprovalRecord`] entries from an existing private (`0700`)
+    /// authority directory without creating the directory or acquiring/creating `authority.lock`.
+    ///
+    /// Shares the exact private-file, symlink, inode, permission (`0600`), byte-size bound,
+    /// schema-version, uniqueness, and [`verify_approval_record_integrity`] checks used by
+    /// [`Self::open`] and [`Self::get_for_operator`].
+    pub fn read_snapshot_readonly_at(
+        dir: impl AsRef<Path>,
+    ) -> Result<Vec<ApprovalRecord>, AuthorityError> {
+        let dir_path = validate_existing_private_authority_dir(dir.as_ref())?;
+        let approvals_path = dir_path.join(APPROVALS_FILE_NAME);
+        Ok(read_ledger_from_path(&approvals_path)?.approvals)
+    }
+
+    /// Reads and validates a single private [`ApprovalRecord`] by `approval_id` from an existing
+    /// private (`0700`) authority directory without creating the directory or acquiring/creating
+    /// `authority.lock`.
+    pub fn get_for_operator_readonly_at(
+        dir: impl AsRef<Path>,
+        approval_id: &str,
+    ) -> Result<ApprovalRecord, AuthorityError> {
+        validate_identifier("approval_id", approval_id)?;
+        let approvals = Self::read_snapshot_readonly_at(dir)?;
+        approvals
+            .into_iter()
+            .find(|record| record.approval_id == approval_id)
+            .ok_or_else(|| AuthorityError::ApprovalNotFound {
+                approval_id: approval_id.to_string(),
+            })
+    }
+
+    /// Reads and validates all [`ApprovalRecord`] entries in [`Self::dir`] without acquiring or
+    /// creating `authority.lock`.
+    pub fn snapshot_readonly(&self) -> Result<Vec<ApprovalRecord>, AuthorityError> {
+        Self::read_snapshot_readonly_at(&self.dir)
+    }
+
+    /// Reads and validates a single private [`ApprovalRecord`] by `approval_id` in [`Self::dir`]
+    /// without acquiring or creating `authority.lock`.
+    pub fn get_for_operator_readonly(
+        &self,
+        approval_id: &str,
+    ) -> Result<ApprovalRecord, AuthorityError> {
+        Self::get_for_operator_readonly_at(&self.dir, approval_id)
+    }
+
     /// Lists bounded [`ApprovalSummary`] records for `binding_id` without exposing executable
     /// paths, credentials, or task instructions.
     pub fn list_for_binding(
@@ -1084,149 +1130,8 @@ impl AuthorityStore {
     }
 
     fn read_ledger_locked(&self) -> Result<PersistedAuthorityLedger, AuthorityError> {
-        let _ = validate_absolute_no_symlink_components(
-            &self.approvals_path,
-            "authority store ledger file",
-        )
-        .map_err(|err| AuthorityError::SecurityViolation {
-            path: self.approvals_path.display().to_string(),
-            reason: err.to_string(),
-        })?;
-
-        let symlink_meta = match fs::symlink_metadata(&self.approvals_path) {
-            Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(PersistedAuthorityLedger::default());
-            }
-            Err(err) => {
-                return Err(AuthorityError::Io {
-                    operation: "symlink_metadata".to_string(),
-                    reason: err.to_string(),
-                });
-            }
-        };
-
-        validate_preexisting_private_file(&self.approvals_path, "authority store ledger file")
-            .map_err(|err| AuthorityError::SecurityViolation {
-                path: self.approvals_path.display().to_string(),
-                reason: err.to_string(),
-            })?;
-
-        if symlink_meta.len() > MAX_AUTHORITY_STORE_BYTES as u64 {
-            return Err(AuthorityError::CorruptStore {
-                path: self.approvals_path.display().to_string(),
-                reason: format!(
-                    "authority ledger file size ({} bytes) exceeds maximum of {MAX_AUTHORITY_STORE_BYTES} bytes",
-                    symlink_meta.len()
-                ),
-            });
-        }
-
-        let file = File::open(&self.approvals_path).map_err(|err| AuthorityError::Io {
-            operation: "open_ledger".to_string(),
-            reason: err.to_string(),
-        })?;
-        let open_meta = file.metadata().map_err(|err| AuthorityError::Io {
-            operation: "ledger_metadata".to_string(),
-            reason: err.to_string(),
-        })?;
-        if !open_meta.file_type().is_file() {
-            return Err(AuthorityError::SecurityViolation {
-                path: self.approvals_path.display().to_string(),
-                reason: "authority ledger is not a regular file".to_string(),
-            });
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if symlink_meta.dev() != open_meta.dev() || symlink_meta.ino() != open_meta.ino() {
-                return Err(AuthorityError::SecurityViolation {
-                    path: self.approvals_path.display().to_string(),
-                    reason: "authority ledger inode changed during open".to_string(),
-                });
-            }
-            let mode = open_meta.permissions().mode() & 0o777;
-            if mode & 0o077 != 0 {
-                return Err(AuthorityError::SecurityViolation {
-                    path: self.approvals_path.display().to_string(),
-                    reason: format!(
-                        "authority ledger has non-private permissions {:04o} (expected 0600)",
-                        mode
-                    ),
-                });
-            }
-        }
-
-        let mut bytes = Vec::with_capacity(
-            usize::try_from(open_meta.len())
-                .unwrap_or(1024)
-                .min(MAX_AUTHORITY_STORE_BYTES + 1),
-        );
-        file.take((MAX_AUTHORITY_STORE_BYTES as u64) + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|err| AuthorityError::Io {
-                operation: "read_ledger".to_string(),
-                reason: err.to_string(),
-            })?;
-
-        if bytes.len() > MAX_AUTHORITY_STORE_BYTES {
-            return Err(AuthorityError::CorruptStore {
-                path: self.approvals_path.display().to_string(),
-                reason: format!(
-                    "authority ledger exceeds maximum size of {MAX_AUTHORITY_STORE_BYTES} bytes"
-                ),
-            });
-        }
-
-        let ledger: PersistedAuthorityLedger =
-            serde_json::from_slice(&bytes).map_err(|err| AuthorityError::CorruptStore {
-                path: self.approvals_path.display().to_string(),
-                reason: format!("invalid JSON in authority ledger: {err}"),
-            })?;
-
-        if ledger.schema_version != AUTHORITY_SCHEMA_VERSION {
-            return Err(AuthorityError::CorruptStore {
-                path: self.approvals_path.display().to_string(),
-                reason: format!(
-                    "unsupported authority schema_version {} (expected {AUTHORITY_SCHEMA_VERSION})",
-                    ledger.schema_version
-                ),
-            });
-        }
-
-        if ledger.approvals.len() > MAX_APPROVALS_IN_STORE {
-            return Err(AuthorityError::CorruptStore {
-                path: self.approvals_path.display().to_string(),
-                reason: format!(
-                    "authority ledger contains {} approvals, exceeding maximum of {MAX_APPROVALS_IN_STORE}",
-                    ledger.approvals.len()
-                ),
-            });
-        }
-
-        let mut seen_ids = BTreeSet::new();
-        let mut seen_digests = BTreeSet::new();
-        for record in &ledger.approvals {
-            verify_approval_record_integrity(record, &self.approvals_path)?;
-            if !seen_ids.insert(record.approval_id.clone()) {
-                return Err(AuthorityError::CorruptStore {
-                    path: self.approvals_path.display().to_string(),
-                    reason: format!("duplicate approval_id `{}` in ledger", record.approval_id),
-                });
-            }
-            if !seen_digests.insert(record.subject_digest.clone()) {
-                return Err(AuthorityError::CorruptStore {
-                    path: self.approvals_path.display().to_string(),
-                    reason: format!(
-                        "duplicate subject_digest `{}` in ledger",
-                        record.subject_digest
-                    ),
-                });
-            }
-        }
-
-        Ok(ledger)
+        let _ = validate_existing_private_authority_dir(&self.dir)?;
+        read_ledger_from_path(&self.approvals_path)
     }
 
     fn write_ledger_locked(&self, ledger: &PersistedAuthorityLedger) -> Result<(), AuthorityError> {
@@ -1463,6 +1368,202 @@ fn validate_workers_config_side_effect_free(
         .map_err(|err| AuthorityError::WorkersConfigInvalid {
             reason: err.to_string(),
         })
+}
+
+fn validate_existing_private_authority_dir(dir: &Path) -> Result<PathBuf, AuthorityError> {
+    ensure_platform_supported().map_err(|err| AuthorityError::SecurityViolation {
+        path: dir.display().to_string(),
+        reason: err.to_string(),
+    })?;
+    if dir.as_os_str().is_empty() {
+        return Err(AuthorityError::SecurityViolation {
+            path: String::new(),
+            reason: "authority store directory path must not be empty".to_string(),
+        });
+    }
+    let resolved_input = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let clean =
+        validate_absolute_no_symlink_components(&resolved_input, "authority store directory")
+            .map_err(|err| AuthorityError::SecurityViolation {
+                path: resolved_input.display().to_string(),
+                reason: err.to_string(),
+            })?;
+    let meta = fs::symlink_metadata(&clean).map_err(|err| AuthorityError::Io {
+        operation: "symlink_metadata".to_string(),
+        reason: err.to_string(),
+    })?;
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return Err(AuthorityError::SecurityViolation {
+            path: clean.display().to_string(),
+            reason: "authority store directory must be an existing non-symlink directory"
+                .to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(AuthorityError::SecurityViolation {
+                path: clean.display().to_string(),
+                reason: format!(
+                    "authority store directory has non-private permissions {:04o} (expected 0700)",
+                    mode
+                ),
+            });
+        }
+    }
+    Ok(clean)
+}
+
+fn read_ledger_from_path(
+    approvals_path: &Path,
+) -> Result<PersistedAuthorityLedger, AuthorityError> {
+    let _ = validate_absolute_no_symlink_components(approvals_path, "authority store ledger file")
+        .map_err(|err| AuthorityError::SecurityViolation {
+            path: approvals_path.display().to_string(),
+            reason: err.to_string(),
+        })?;
+
+    let symlink_meta = match fs::symlink_metadata(approvals_path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PersistedAuthorityLedger::default());
+        }
+        Err(err) => {
+            return Err(AuthorityError::Io {
+                operation: "symlink_metadata".to_string(),
+                reason: err.to_string(),
+            });
+        }
+    };
+
+    validate_preexisting_private_file(approvals_path, "authority store ledger file").map_err(
+        |err| AuthorityError::SecurityViolation {
+            path: approvals_path.display().to_string(),
+            reason: err.to_string(),
+        },
+    )?;
+
+    if symlink_meta.len() > MAX_AUTHORITY_STORE_BYTES as u64 {
+        return Err(AuthorityError::CorruptStore {
+            path: approvals_path.display().to_string(),
+            reason: format!(
+                "authority ledger file size ({} bytes) exceeds maximum of {MAX_AUTHORITY_STORE_BYTES} bytes",
+                symlink_meta.len()
+            ),
+        });
+    }
+
+    let file = File::open(approvals_path).map_err(|err| AuthorityError::Io {
+        operation: "open_ledger".to_string(),
+        reason: err.to_string(),
+    })?;
+    let open_meta = file.metadata().map_err(|err| AuthorityError::Io {
+        operation: "ledger_metadata".to_string(),
+        reason: err.to_string(),
+    })?;
+    if !open_meta.file_type().is_file() {
+        return Err(AuthorityError::SecurityViolation {
+            path: approvals_path.display().to_string(),
+            reason: "authority ledger is not a regular file".to_string(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if symlink_meta.dev() != open_meta.dev() || symlink_meta.ino() != open_meta.ino() {
+            return Err(AuthorityError::SecurityViolation {
+                path: approvals_path.display().to_string(),
+                reason: "authority ledger inode changed during open".to_string(),
+            });
+        }
+        let mode = open_meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(AuthorityError::SecurityViolation {
+                path: approvals_path.display().to_string(),
+                reason: format!(
+                    "authority ledger has non-private permissions {:04o} (expected 0600)",
+                    mode
+                ),
+            });
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(open_meta.len())
+            .unwrap_or(1024)
+            .min(MAX_AUTHORITY_STORE_BYTES + 1),
+    );
+    file.take((MAX_AUTHORITY_STORE_BYTES as u64) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|err| AuthorityError::Io {
+            operation: "read_ledger".to_string(),
+            reason: err.to_string(),
+        })?;
+
+    if bytes.len() > MAX_AUTHORITY_STORE_BYTES {
+        return Err(AuthorityError::CorruptStore {
+            path: approvals_path.display().to_string(),
+            reason: format!(
+                "authority ledger exceeds maximum size of {MAX_AUTHORITY_STORE_BYTES} bytes"
+            ),
+        });
+    }
+
+    let ledger: PersistedAuthorityLedger =
+        serde_json::from_slice(&bytes).map_err(|err| AuthorityError::CorruptStore {
+            path: approvals_path.display().to_string(),
+            reason: format!("invalid JSON in authority ledger: {err}"),
+        })?;
+
+    if ledger.schema_version != AUTHORITY_SCHEMA_VERSION {
+        return Err(AuthorityError::CorruptStore {
+            path: approvals_path.display().to_string(),
+            reason: format!(
+                "unsupported authority schema_version {} (expected {AUTHORITY_SCHEMA_VERSION})",
+                ledger.schema_version
+            ),
+        });
+    }
+
+    if ledger.approvals.len() > MAX_APPROVALS_IN_STORE {
+        return Err(AuthorityError::CorruptStore {
+            path: approvals_path.display().to_string(),
+            reason: format!(
+                "authority ledger contains {} approvals, exceeding maximum of {MAX_APPROVALS_IN_STORE}",
+                ledger.approvals.len()
+            ),
+        });
+    }
+
+    let mut seen_ids = BTreeSet::new();
+    let mut seen_digests = BTreeSet::new();
+    for record in &ledger.approvals {
+        verify_approval_record_integrity(record, approvals_path)?;
+        if !seen_ids.insert(record.approval_id.clone()) {
+            return Err(AuthorityError::CorruptStore {
+                path: approvals_path.display().to_string(),
+                reason: format!("duplicate approval_id `{}` in ledger", record.approval_id),
+            });
+        }
+        if !seen_digests.insert(record.subject_digest.clone()) {
+            return Err(AuthorityError::CorruptStore {
+                path: approvals_path.display().to_string(),
+                reason: format!(
+                    "duplicate subject_digest `{}` in ledger",
+                    record.subject_digest
+                ),
+            });
+        }
+    }
+
+    Ok(ledger)
 }
 
 fn current_unix_epoch_ms() -> Result<i64, AuthorityError> {

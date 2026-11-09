@@ -29,7 +29,7 @@
 //!   The owned `RunIntegration` worktree is preserved on disk for human inspection; this stage
 //!   never merges into `main`, pushes, or cleans up worktrees.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -377,7 +377,7 @@ impl CoworkerJobCompletionService {
         )?;
 
         let (adm, controller_instance_id, lease_epoch, entry_change_revision) =
-            verify_live_job_completion_gate(&self.controller, guard, request, None, None)?;
+            verify_live_job_completion_gate(&self.controller, guard, request, None, None, false)?;
 
         execute_or_reuse_final_job_aggregation(
             &self.controller,
@@ -420,7 +420,7 @@ impl CoworkerJobCompletionService {
         )?;
 
         let (adm, controller_instance_id, lease_epoch, entry_change_revision) =
-            verify_live_job_completion_gate(&self.controller, guard, request, None, None)?;
+            verify_live_job_completion_gate(&self.controller, guard, request, None, None, true)?;
 
         let aggregation = execute_or_reuse_final_job_aggregation(
             &self.controller,
@@ -439,6 +439,7 @@ impl CoworkerJobCompletionService {
             request,
             Some((&controller_instance_id, lease_epoch)),
             Some(entry_change_revision),
+            true,
         )?;
 
         let check_subject = FrozenCheckSubject {
@@ -532,6 +533,7 @@ impl CoworkerJobCompletionService {
             request,
             Some((&controller_instance_id, lease_epoch)),
             Some(entry_change_revision),
+            false,
         )?;
 
         if let Some(failed_id) = failed_check_id {
@@ -613,6 +615,7 @@ impl CoworkerJobCompletionService {
             request,
             Some((&controller_instance_id, lease_epoch)),
             Some(entry_change_revision),
+            false,
         )?;
 
         let closure_command_key = deterministic_prefixed_id(
@@ -990,6 +993,7 @@ fn verify_live_job_completion_gate(
     request: &CoworkerJobCompletionRequest,
     expected_lease: Option<(&str, u64)>,
     expected_change_revision: Option<u64>,
+    allow_reconcilable_candidate_check_unknown: bool,
 ) -> Result<(VerifiedControllerAdmission, String, u64, u64), NativeError> {
     let plans_dir = controller.workflow_store().plans_dir();
     controller.verify_physical_ownership(
@@ -1179,9 +1183,16 @@ fn verify_live_job_completion_gate(
         ));
     }
 
-    // Refuse if any effect on the job is in EffectUnknown state.
+    // Refuse if any effect on the job is in EffectUnknown state (unless it is a candidate
+    // CheckExecution effect with a valid non-uncertain persisted report on disk that can be
+    // verified, made durable, and reconciled in `execute_or_reconcile_single_candidate_check`).
     for eff in adm.runtime_state.pending_effects.values() {
         if eff.status == PendingControllerEffectStatus::EffectUnknown {
+            if allow_reconcilable_candidate_check_unknown
+                && is_reconcilable_candidate_check_unknown(plans_dir, &adm, eff)
+            {
+                continue;
+            }
             return Err(NativeError::new(
                 NativeErrorCode::AmbiguousWakeupPendingReconciliation,
                 format!(
@@ -1216,6 +1227,32 @@ fn verify_live_job_completion_gate(
         lease_epoch,
         change_summary.current_change_revision,
     ))
+}
+
+fn is_reconcilable_candidate_check_unknown(
+    plans_dir: &Path,
+    adm: &VerifiedControllerAdmission,
+    eff: &PendingControllerEffect,
+) -> bool {
+    if eff.kind != PendingControllerEffectKind::CheckExecution
+        || eff.task_id.is_some()
+        || eff.attempt_no.is_some()
+    {
+        return false;
+    }
+    let Some(check_id) = eff.external_correlation_id.as_deref() else {
+        return false;
+    };
+    let Some(spec) = adm.runtime_state.envelope.check_commands.get(check_id) else {
+        return false;
+    };
+    if !spec.required_for_candidate_closure {
+        return false;
+    }
+    let Ok(Some(report)) = read_persisted_candidate_check_report(plans_dir, &eff.effect_id) else {
+        return false;
+    };
+    report.check_id == spec.check_id && !is_uncertain_check_report(&report)
 }
 
 fn verify_primary_source_repository_clean_at_base(
@@ -1874,6 +1911,9 @@ fn execute_or_reuse_final_job_aggregation(
     let pre_existing_intent =
         inspect_job_integration_intent_readonly(&canonical_work_area, &integration_worktree_id)
             .map_err(|err| {
+                let message = format!(
+                    "failed to inspect JobIntegrationIntent for `{integration_worktree_id}`: {err}"
+                );
                 mark_effect_unknown_best_effort(
                     controller,
                     &request.binding_id,
@@ -1889,9 +1929,7 @@ fn execute_or_reuse_final_job_aggregation(
                 );
                 NativeError::new(
                     NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                    format!(
-                "failed to inspect JobIntegrationIntent for `{integration_worktree_id}`: {err}"
-            ),
+                    message,
                 )
             })?;
 
@@ -1939,75 +1977,128 @@ fn execute_or_reuse_final_job_aggregation(
         }
     }
 
-    let existing_persisted_report = if existing_agg_effect
+    let existing_agg_effect_confirmed = existing_agg_effect
         .as_ref()
-        .is_some_and(|e| e.status == PendingControllerEffectStatus::EffectConfirmed)
-    {
-        if !pre_existing_intent
-            .as_ref()
-            .is_some_and(|i| i.state == JobIntegrationIntentState::Completed)
-        {
-            mark_effect_unknown_best_effort(
-                controller,
-                &request.binding_id,
-                &request.job_id,
-                controller_instance_id,
-                lease_epoch,
-                &agg_effect_id,
-                &agg_request_key,
-                &agg_subject_digest,
-                &integration_worktree_id,
-                request.now_ms,
-                "confirmed JobAggregation effect is missing its Completed JobIntegrationIntent on disk",
-            );
-            return Err(NativeError::new(
-                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                "confirmed JobAggregation effect is missing its Completed JobIntegrationIntent on disk",
-            ));
+        .is_some_and(|e| e.status == PendingControllerEffectStatus::EffectConfirmed);
+
+    let existing_persisted_report = match existing_agg_effect.as_ref().map(|e| e.status) {
+        Some(PendingControllerEffectStatus::EffectConfirmed) => {
+            if !pre_existing_intent
+                .as_ref()
+                .is_some_and(|i| i.state == JobIntegrationIntentState::Completed)
+            {
+                mark_effect_unknown_best_effort(
+                    controller,
+                    &request.binding_id,
+                    &request.job_id,
+                    controller_instance_id,
+                    lease_epoch,
+                    &agg_effect_id,
+                    &agg_request_key,
+                    &agg_subject_digest,
+                    &integration_worktree_id,
+                    request.now_ms,
+                    "confirmed JobAggregation effect is missing its Completed JobIntegrationIntent on disk",
+                );
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "confirmed JobAggregation effect is missing its Completed JobIntegrationIntent on disk",
+                ));
+            }
+            let persisted = read_persisted_job_integration_report(plans_dir, &agg_effect_id)
+                .map_err(|err| {
+                    mark_effect_unknown_best_effort(
+                        controller,
+                        &request.binding_id,
+                        &request.job_id,
+                        controller_instance_id,
+                        lease_epoch,
+                        &agg_effect_id,
+                        &agg_request_key,
+                        &agg_subject_digest,
+                        &integration_worktree_id,
+                        request.now_ms,
+                        &format!("corrupt or unreadable persisted JobIntegrationReport: {err}"),
+                    );
+                    NativeError::new(
+                        NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                        format!(
+                            "failed to read persisted JobIntegrationReport for `{agg_effect_id}`: {err}"
+                        ),
+                    )
+                })?;
+            let Some(rep) = persisted else {
+                mark_effect_unknown_best_effort(
+                    controller,
+                    &request.binding_id,
+                    &request.job_id,
+                    controller_instance_id,
+                    lease_epoch,
+                    &agg_effect_id,
+                    &agg_request_key,
+                    &agg_subject_digest,
+                    &integration_worktree_id,
+                    request.now_ms,
+                    "persisted JobIntegrationReport missing for confirmed JobAggregation effect",
+                );
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    format!(
+                        "persisted JobIntegrationReport missing for confirmed JobAggregation effect `{agg_effect_id}`"
+                    ),
+                ));
+            };
+            Some(rep)
         }
-        let persisted = read_persisted_job_integration_report(plans_dir, &agg_effect_id).map_err(|err| {
-            mark_effect_unknown_best_effort(
-                controller,
-                &request.binding_id,
-                &request.job_id,
-                controller_instance_id,
-                lease_epoch,
-                &agg_effect_id,
-                &agg_request_key,
-                &agg_subject_digest,
-                &integration_worktree_id,
-                request.now_ms,
-                &format!("corrupt or unreadable persisted JobIntegrationReport: {err}"),
-            );
-            NativeError::new(
-                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                format!("failed to read persisted JobIntegrationReport for `{agg_effect_id}`: {err}"),
-            )
-        })?;
-        let Some(rep) = persisted else {
-            mark_effect_unknown_best_effort(
-                controller,
-                &request.binding_id,
-                &request.job_id,
-                controller_instance_id,
-                lease_epoch,
-                &agg_effect_id,
-                &agg_request_key,
-                &agg_subject_digest,
-                &integration_worktree_id,
-                request.now_ms,
-                "persisted JobIntegrationReport missing for confirmed JobAggregation effect",
-            );
-            return Err(NativeError::new(
-                NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                format!(
-                    "persisted JobIntegrationReport missing for confirmed JobAggregation effect `{agg_effect_id}`"
-                ),
-            ));
-        };
-        Some(rep)
-    } else {
-        None
+        Some(PendingControllerEffectStatus::ReservedBeforeEffect) => {
+            let persisted = read_persisted_job_integration_report(plans_dir, &agg_effect_id)
+                .map_err(|err| {
+                    mark_effect_unknown_best_effort(
+                        controller,
+                        &request.binding_id,
+                        &request.job_id,
+                        controller_instance_id,
+                        lease_epoch,
+                        &agg_effect_id,
+                        &agg_request_key,
+                        &agg_subject_digest,
+                        &integration_worktree_id,
+                        request.now_ms,
+                        &format!("corrupt or unreadable persisted JobIntegrationReport: {err}"),
+                    );
+                    NativeError::new(
+                        NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                        format!(
+                            "failed to read persisted JobIntegrationReport for `{agg_effect_id}`: {err}"
+                        ),
+                    )
+                })?;
+            if persisted.is_some()
+                && !pre_existing_intent
+                    .as_ref()
+                    .is_some_and(|i| i.state == JobIntegrationIntentState::Completed)
+            {
+                mark_effect_unknown_best_effort(
+                    controller,
+                    &request.binding_id,
+                    &request.job_id,
+                    controller_instance_id,
+                    lease_epoch,
+                    &agg_effect_id,
+                    &agg_request_key,
+                    &agg_subject_digest,
+                    &integration_worktree_id,
+                    request.now_ms,
+                    "persisted JobIntegrationReport found without a Completed JobIntegrationIntent on disk",
+                );
+                return Err(NativeError::new(
+                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                    "persisted JobIntegrationReport found without a Completed JobIntegrationIntent on disk",
+                ));
+            }
+            persisted
+        }
+        _ => None,
     };
 
     // Capture one frozen JobIntegrationScopeProvenance for the final batch.
@@ -2096,6 +2187,7 @@ fn execute_or_reuse_final_job_aggregation(
             request,
             Some((controller_instance_id, lease_epoch)),
             Some(entry_change_revision),
+            true,
         )?;
         controller.policy_store().mutate_job_runtime(
             &request.binding_id,
@@ -2305,9 +2397,10 @@ fn execute_or_reuse_final_job_aggregation(
         request,
         Some((controller_instance_id, lease_epoch)),
         Some(entry_change_revision),
+        true,
     )?;
 
-    let obs_handle = existing_persisted_report.is_none().then(|| {
+    let obs_handle = (!existing_agg_effect_confirmed).then(|| {
         begin_coworker_call_observation(CoworkerCallObservationSpec {
             journal_dir: plans_dir.to_path_buf(),
             operation: COWORKER_OBS_OP_INTEGRATION_JOB_AGGREGATION.to_string(),
@@ -2386,7 +2479,7 @@ fn execute_or_reuse_final_job_aggregation(
         }
     }
 
-    let (report_artifact_path, report_artifact_digest) = match existing_persisted_report {
+    let (report, report_artifact_path, report_artifact_digest) = match existing_persisted_report {
         Some(prev_report) => {
             if prev_report.job_scope != report.job_scope
                 || prev_report.integration_worktree_id != report.integration_worktree_id
@@ -2422,23 +2515,53 @@ fn execute_or_reuse_final_job_aggregation(
                     "persisted JobIntegrationReport drifted from live verified job integration state",
                 ));
             }
-            let path = job_integration_report_file_path(plans_dir, &agg_effect_id);
-            let bytes = read_private_file_bounded(
-                &path,
-                MAX_PERSISTED_COMPLETION_ARTIFACT_BYTES,
-                "job_integration_report",
-            )?
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::AmbiguousWakeupPendingReconciliation,
-                    "persisted JobIntegrationReport disappeared during verification",
-                )
-            })?;
-            (path, sha256_hex(&bytes))
+            if existing_agg_effect_confirmed {
+                let path = job_integration_report_file_path(plans_dir, &agg_effect_id);
+                let bytes = read_private_file_bounded(
+                    &path,
+                    MAX_PERSISTED_COMPLETION_ARTIFACT_BYTES,
+                    "job_integration_report",
+                )?
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                        "persisted JobIntegrationReport disappeared during verification",
+                    )
+                })?;
+                (prev_report, path, sha256_hex(&bytes))
+            } else {
+                // Before promoting an already-visible uncertain JobIntegrationReport from
+                // ReservedBeforeEffect to EffectConfirmed, explicitly establish file and parent-dir
+                // durability under bounded/private-file checks without overwriting the file.
+                let (durable_report, path, digest) =
+                    ensure_persisted_job_integration_report_durable(plans_dir, &agg_effect_id)?;
+                if durable_report != prev_report {
+                    mark_effect_unknown_best_effort(
+                        controller,
+                        &request.binding_id,
+                        &request.job_id,
+                        controller_instance_id,
+                        lease_epoch,
+                        &agg_effect_id,
+                        &agg_request_key,
+                        &agg_subject_digest,
+                        &integration_worktree_id,
+                        request.now_ms,
+                        "persisted JobIntegrationReport mutated during durability reconciliation",
+                    );
+                    return Err(NativeError::new(
+                        NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                        "persisted JobIntegrationReport mutated during durability reconciliation",
+                    ));
+                }
+                (durable_report, path, digest)
+            }
         }
         None => {
             // Persist the full bounded JobIntegrationReport to a private 0600 file separate from the 1 MiB ledger.
-            write_persisted_job_integration_report(plans_dir, &agg_effect_id, &report)?
+            let (path, digest) =
+                write_persisted_job_integration_report(plans_dir, &agg_effect_id, &report)?;
+            (report, path, digest)
         }
     };
 
@@ -2749,6 +2872,7 @@ async fn execute_or_reconcile_single_candidate_check(
         request,
         Some((controller_instance_id, lease_epoch)),
         Some(entry_change_revision),
+        true,
     )?;
 
     // Reject any conflicting candidate CheckExecution effect for the same check_id.
@@ -2828,7 +2952,23 @@ async fn execute_or_reconcile_single_candidate_check(
                             ),
                         ));
                     }
-                    let next_status = if report.passed() {
+                    // Before promoting an already-visible uncertain candidate check report from
+                    // ReservedBeforeEffect / EffectUnknown, explicitly establish file and parent-dir
+                    // durability under bounded/private-file checks without overwriting the file.
+                    let durable_report = ensure_persisted_candidate_check_report_durable(
+                        plans_dir,
+                        &check_effect_id,
+                    )?;
+                    if durable_report != report {
+                        return Err(NativeError::new(
+                            NativeErrorCode::AmbiguousWakeupPendingReconciliation,
+                            format!(
+                                "persisted candidate check `{}` report mutated during durability reconciliation",
+                                spec.check_id
+                            ),
+                        ));
+                    }
+                    let next_status = if durable_report.passed() {
                         PendingControllerEffectStatus::EffectConfirmed
                     } else {
                         PendingControllerEffectStatus::EffectFailedTerminal
@@ -2850,7 +2990,7 @@ async fn execute_or_reconcile_single_candidate_check(
                         check_id: spec.check_id.clone(),
                         effect_id: check_effect_id.clone(),
                         report_path: candidate_check_report_file_path(plans_dir, &check_effect_id),
-                        report,
+                        report: durable_report,
                     });
                 }
 
@@ -3312,6 +3452,109 @@ fn mark_effect_unknown_best_effort(
     );
 }
 
+/// Kind of private (`0600`) completion artifact persisted in `plans_dir` during job completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CompletionArtifactKind {
+    /// Persisted [`JobIntegrationReport`] artifact (`coworker-job-integration-report-<eff>.json`).
+    JobIntegrationReport,
+    /// Persisted candidate [`FrozenCheckExecutionReport`] artifact (`coworker-candidate-check-report-<eff>.json`).
+    CandidateCheckExecutionReport,
+}
+
+/// Deterministic fault-injection step for [`ScopedCompletionArtifactFaultGuard`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionArtifactFaultStep {
+    /// No fault for this step (allow the step to succeed normally).
+    None,
+    /// Fail `temp.as_file().sync_all()` before renaming the temporary file into place (`IoError`).
+    PreRenameTempFileSync,
+    /// Fail `File::open(dir)` immediately after renaming the temporary file into place (`PersistenceUncertain`).
+    PostRenameParentOpen,
+    /// Fail `dir_file.sync_all()` immediately after renaming the temporary file into place (`PersistenceUncertain`).
+    PostRenameParentSync,
+    /// Fail `file.sync_all()` while establishing durability on a visible uncertain artifact during recovery (`PersistenceUncertain`).
+    RecoveryFileSync,
+    /// Fail `File::open(dir)` while establishing durability on a visible uncertain artifact during recovery (`PersistenceUncertain`).
+    RecoveryParentOpen,
+    /// Fail `dir_file.sync_all()` while establishing durability on a visible uncertain artifact during recovery (`PersistenceUncertain`).
+    RecoveryParentSync,
+}
+
+type CompletionArtifactFaults =
+    BTreeMap<(PathBuf, CompletionArtifactKind), VecDeque<CompletionArtifactFaultStep>>;
+
+static SCOPED_COMPLETION_ARTIFACT_FAULTS: LazyLock<Mutex<CompletionArtifactFaults>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Scoped deterministic fault-injection guard for private completion artifact persistence and
+/// recovery durability establishment, keyed by `(plans_dir, artifact_kind)`.
+#[derive(Debug)]
+pub struct ScopedCompletionArtifactFaultGuard {
+    plans_dir: PathBuf,
+    artifact_kind: CompletionArtifactKind,
+}
+
+impl ScopedCompletionArtifactFaultGuard {
+    /// Installs a FIFO sequence of [`CompletionArtifactFaultStep`]s for `(plans_dir, artifact_kind)`.
+    #[must_use]
+    pub fn install(
+        plans_dir: impl AsRef<Path>,
+        artifact_kind: CompletionArtifactKind,
+        steps: impl IntoIterator<Item = CompletionArtifactFaultStep>,
+    ) -> Self {
+        let plans_dir = plans_dir.as_ref().to_path_buf();
+        let queue: VecDeque<CompletionArtifactFaultStep> = steps.into_iter().collect();
+        let mut map = SCOPED_COMPLETION_ARTIFACT_FAULTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.insert((plans_dir.clone(), artifact_kind), queue);
+        Self {
+            plans_dir,
+            artifact_kind,
+        }
+    }
+
+    /// Returns the number of unconsumed fault steps remaining for this guard's scope.
+    #[must_use]
+    pub fn remaining_steps(&self) -> usize {
+        let map = SCOPED_COMPLETION_ARTIFACT_FAULTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.get(&(self.plans_dir.clone(), self.artifact_kind))
+            .map_or(0, VecDeque::len)
+    }
+}
+
+impl Drop for ScopedCompletionArtifactFaultGuard {
+    fn drop(&mut self) {
+        let mut map = SCOPED_COMPLETION_ARTIFACT_FAULTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.remove(&(self.plans_dir.clone(), self.artifact_kind));
+    }
+}
+
+fn take_scoped_completion_artifact_fault(
+    dir: &Path,
+    artifact_kind: CompletionArtifactKind,
+    current_step: CompletionArtifactFaultStep,
+) -> bool {
+    let mut map = SCOPED_COMPLETION_ARTIFACT_FAULTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(queue) = map.get_mut(&(dir.to_path_buf(), artifact_kind)) else {
+        return false;
+    };
+    while matches!(queue.front(), Some(CompletionArtifactFaultStep::None)) {
+        queue.pop_front();
+    }
+    if queue.front() == Some(&current_step) {
+        queue.pop_front();
+        return true;
+    }
+    false
+}
+
 fn candidate_check_report_filename(effect_id: &str) -> String {
     format!("coworker-candidate-check-report-{effect_id}.json")
 }
@@ -3339,6 +3582,7 @@ fn write_persisted_candidate_check_report(
         &candidate_check_report_filename(effect_id),
         &bytes,
         "candidate_frozen_check_execution_report",
+        CompletionArtifactKind::CandidateCheckExecutionReport,
     )
 }
 
@@ -3364,6 +3608,26 @@ pub fn read_persisted_candidate_check_report(
         )
     })?;
     Ok(Some(report))
+}
+
+fn ensure_persisted_candidate_check_report_durable(
+    plans_dir: &Path,
+    effect_id: &str,
+) -> Result<FrozenCheckExecutionReport, NativeError> {
+    validate_bounded_identifier(effect_id, "effect_id", MAX_COWORKER_ID_LEN)?;
+    let bytes = ensure_private_completion_artifact_durable(
+        plans_dir,
+        &candidate_check_report_filename(effect_id),
+        MAX_PERSISTED_COMPLETION_ARTIFACT_BYTES,
+        "candidate_frozen_check_execution_report",
+        CompletionArtifactKind::CandidateCheckExecutionReport,
+    )?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "failed to parse persisted candidate FrozenCheckExecutionReport JSON during durability check",
+        )
+    })
 }
 
 fn job_integration_report_filename(effect_id: &str) -> String {
@@ -3394,6 +3658,7 @@ fn write_persisted_job_integration_report(
         &job_integration_report_filename(effect_id),
         &bytes,
         "job_integration_report",
+        CompletionArtifactKind::JobIntegrationReport,
     )?;
     Ok((path, digest))
 }
@@ -3422,11 +3687,125 @@ pub fn read_persisted_job_integration_report(
     Ok(Some(report))
 }
 
+fn ensure_persisted_job_integration_report_durable(
+    plans_dir: &Path,
+    effect_id: &str,
+) -> Result<(JobIntegrationReport, PathBuf, String), NativeError> {
+    validate_bounded_identifier(effect_id, "effect_id", MAX_COWORKER_ID_LEN)?;
+    let filename = job_integration_report_filename(effect_id);
+    let path = plans_dir.join(&filename);
+    let bytes = ensure_private_completion_artifact_durable(
+        plans_dir,
+        &filename,
+        MAX_PERSISTED_COMPLETION_ARTIFACT_BYTES,
+        "job_integration_report",
+        CompletionArtifactKind::JobIntegrationReport,
+    )?;
+    let digest = sha256_hex(&bytes);
+    let report: JobIntegrationReport = serde_json::from_slice(&bytes).map_err(|_| {
+        NativeError::new(
+            NativeErrorCode::ProtocolError,
+            "failed to parse persisted JobIntegrationReport JSON during durability check",
+        )
+    })?;
+    Ok((report, path, digest))
+}
+
+fn sync_completion_temp_file(
+    dir: &Path,
+    file: &File,
+    artifact_kind: CompletionArtifactKind,
+    label: &str,
+) -> Result<(), NativeError> {
+    if take_scoped_completion_artifact_fault(
+        dir,
+        artifact_kind,
+        CompletionArtifactFaultStep::PreRenameTempFileSync,
+    ) {
+        return Err(NativeError::new(
+            NativeErrorCode::IoError,
+            format!("failed to sync temporary {label} file: injected pre-rename file sync failure"),
+        ));
+    }
+    file.sync_all().map_err(|err| {
+        NativeError::new(
+            NativeErrorCode::IoError,
+            format!(
+                "failed to sync temporary {label} file: {}",
+                sanitize_io_error(&err)
+            ),
+        )
+    })
+}
+
+fn open_completion_parent_dir(
+    dir: &Path,
+    artifact_kind: CompletionArtifactKind,
+    fault_step: CompletionArtifactFaultStep,
+    label: &str,
+) -> Result<File, NativeError> {
+    if take_scoped_completion_artifact_fault(dir, artifact_kind, fault_step) {
+        return Err(NativeError::persistence_uncertain(format!(
+            "failed to open parent directory for {label} durability sync: injected parent directory open failure"
+        )));
+    }
+    File::open(dir).map_err(|err| {
+        NativeError::persistence_uncertain(format!(
+            "failed to open parent directory for {label} durability sync: {}",
+            sanitize_io_error(&err)
+        ))
+    })
+}
+
+fn sync_completion_parent_dir(
+    dir: &Path,
+    dir_file: &File,
+    artifact_kind: CompletionArtifactKind,
+    fault_step: CompletionArtifactFaultStep,
+    label: &str,
+) -> Result<(), NativeError> {
+    if take_scoped_completion_artifact_fault(dir, artifact_kind, fault_step) {
+        return Err(NativeError::persistence_uncertain(format!(
+            "failed to sync parent directory for {label} durability: injected parent directory sync failure"
+        )));
+    }
+    dir_file.sync_all().map_err(|err| {
+        NativeError::persistence_uncertain(format!(
+            "failed to sync parent directory for {label} durability: {}",
+            sanitize_io_error(&err)
+        ))
+    })
+}
+
+fn sync_completion_recovery_file(
+    dir: &Path,
+    file: &File,
+    artifact_kind: CompletionArtifactKind,
+    label: &str,
+) -> Result<(), NativeError> {
+    if take_scoped_completion_artifact_fault(
+        dir,
+        artifact_kind,
+        CompletionArtifactFaultStep::RecoveryFileSync,
+    ) {
+        return Err(NativeError::persistence_uncertain(format!(
+            "failed to sync existing {label} file during durability recovery: injected recovery file sync failure"
+        )));
+    }
+    file.sync_all().map_err(|err| {
+        NativeError::persistence_uncertain(format!(
+            "failed to sync existing {label} file during durability recovery: {}",
+            sanitize_io_error(&err)
+        ))
+    })
+}
+
 fn write_private_completion_artifact_bounded(
     dir: &Path,
     filename: &str,
     bytes: &[u8],
     label: &str,
+    artifact_kind: CompletionArtifactKind,
 ) -> Result<PathBuf, NativeError> {
     ensure_platform_supported()?;
     if bytes.len() > MAX_PERSISTED_COMPLETION_ARTIFACT_BYTES {
@@ -3439,6 +3818,24 @@ fn write_private_completion_artifact_bounded(
     }
     let target_path = dir.join(filename);
     validate_private_file_path(&target_path, label)?;
+
+    match fs::symlink_metadata(&target_path) {
+        Ok(_) => {
+            return Err(NativeError::persistence_uncertain(format!(
+                "refusing to overwrite existing {label} file"
+            )));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(NativeError::new(
+                NativeErrorCode::IoError,
+                format!(
+                    "failed to inspect target path for {label} file: {}",
+                    sanitize_io_error(&err)
+                ),
+            ));
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -3468,15 +3865,6 @@ fn write_private_completion_artifact_bounded(
                 ),
             )
         })?;
-        temp.as_file().sync_all().map_err(|err| {
-            NativeError::new(
-                NativeErrorCode::IoError,
-                format!(
-                    "failed to sync temporary {label} file: {}",
-                    sanitize_io_error(&err)
-                ),
-            )
-        })?;
         temp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|err| {
@@ -3488,6 +3876,7 @@ fn write_private_completion_artifact_bounded(
                     ),
                 )
             })?;
+        sync_completion_temp_file(dir, temp.as_file(), artifact_kind, label)?;
 
         temp.persist(&target_path).map_err(|err| {
             NativeError::new(
@@ -3499,20 +3888,158 @@ fn write_private_completion_artifact_bounded(
             )
         })?;
         fs::set_permissions(&target_path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+            NativeError::persistence_uncertain(format!(
+                "failed to enforce 0600 on persisted {label} file after rename: {}",
+                sanitize_io_error(&err)
+            ))
+        })?;
+        let dir_file = open_completion_parent_dir(
+            dir,
+            artifact_kind,
+            CompletionArtifactFaultStep::PostRenameParentOpen,
+            label,
+        )?;
+        sync_completion_parent_dir(
+            dir,
+            &dir_file,
+            artifact_kind,
+            CompletionArtifactFaultStep::PostRenameParentSync,
+            label,
+        )?;
+    }
+
+    Ok(target_path)
+}
+
+fn ensure_private_completion_artifact_durable(
+    dir: &Path,
+    filename: &str,
+    max_bytes: usize,
+    label: &str,
+    artifact_kind: CompletionArtifactKind,
+) -> Result<Vec<u8>, NativeError> {
+    ensure_platform_supported()?;
+    let path = dir.join(filename);
+    validate_private_file_path(&path, label)?;
+
+    let sym_meta = fs::symlink_metadata(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            NativeError::persistence_uncertain(format!(
+                "persisted {label} file is missing during durability reconciliation"
+            ))
+        } else {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                format!("failed to stat {label}: {}", sanitize_io_error(&err)),
+            )
+        }
+    })?;
+
+    if sym_meta.file_type().is_symlink() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!("{label} must not be a symlink"),
+        ));
+    }
+    if !sym_meta.is_file() {
+        return Err(NativeError::new(
+            NativeErrorCode::SecurityViolation,
+            format!("{label} must be a regular file"),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mode = sym_meta.permissions().mode() & 0o777;
+        if (mode & 0o077) != 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!("{label} has insecure file permissions {mode:04o} (expected 0600)"),
+            ));
+        }
+
+        if sym_meta.len() > max_bytes as u64 {
+            return Err(NativeError::new(
+                NativeErrorCode::OutputOverflow,
+                format!("{label} exceeds maximum size of {max_bytes} bytes"),
+            ));
+        }
+
+        let file = File::open(&path).map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                format!("failed to open {label}: {}", sanitize_io_error(&err)),
+            )
+        })?;
+        let open_meta = file.metadata().map_err(|err| {
             NativeError::new(
                 NativeErrorCode::IoError,
                 format!(
-                    "failed to enforce 0600 on {label} file: {}",
+                    "failed to stat open {label} descriptor: {}",
                     sanitize_io_error(&err)
                 ),
             )
         })?;
-        if let Ok(dir_file) = File::open(dir) {
-            let _ = dir_file.sync_all();
+        if !open_meta.is_file()
+            || open_meta.dev() != sym_meta.dev()
+            || open_meta.ino() != sym_meta.ino()
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!("{label} changed between metadata check and file open"),
+            ));
         }
-    }
+        let open_mode = open_meta.permissions().mode() & 0o777;
+        if (open_mode & 0o077) != 0 {
+            return Err(NativeError::new(
+                NativeErrorCode::SecurityViolation,
+                format!(
+                    "{label} open descriptor has insecure permissions {open_mode:04o} (expected 0600)"
+                ),
+            ));
+        }
+        if open_meta.len() > max_bytes as u64 {
+            return Err(NativeError::new(
+                NativeErrorCode::OutputOverflow,
+                format!("{label} exceeds maximum size of {max_bytes} bytes"),
+            ));
+        }
 
-    Ok(target_path)
+        let mut buf = Vec::with_capacity(open_meta.len() as usize);
+        let limit = (max_bytes as u64).saturating_add(1);
+        (&file).take(limit).read_to_end(&mut buf).map_err(|err| {
+            NativeError::new(
+                NativeErrorCode::IoError,
+                format!("failed to read {label}: {}", sanitize_io_error(&err)),
+            )
+        })?;
+        if buf.len() > max_bytes {
+            return Err(NativeError::new(
+                NativeErrorCode::OutputOverflow,
+                format!("{label} exceeds maximum size of {max_bytes} bytes"),
+            ));
+        }
+
+        sync_completion_recovery_file(dir, &file, artifact_kind, label)?;
+        let dir_file = open_completion_parent_dir(
+            dir,
+            artifact_kind,
+            CompletionArtifactFaultStep::RecoveryParentOpen,
+            label,
+        )?;
+        sync_completion_parent_dir(
+            dir,
+            &dir_file,
+            artifact_kind,
+            CompletionArtifactFaultStep::RecoveryParentSync,
+            label,
+        )?;
+
+        Ok(buf)
+    }
 }
 
 fn compute_deterministic_task_integration_order(

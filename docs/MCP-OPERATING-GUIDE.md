@@ -1,6 +1,6 @@
 # Threadlane MCP operating guide
 
-Version: `2026-11-08.v2`
+Version: `2026-11-09.v1`
 
 ## Act as the Coworker in the native Codex conversation
 
@@ -89,26 +89,41 @@ Version: `2026-11-08.v2`
      Use the exact returned preview, its original `request_key`, and `preview_digest`;
      do not generate a new key or rebuild the preview after approval.
   3. Use `prepare_work`, `request_technical_plan`, and `planning_command` under the
-     recorded grant to produce the actual `Orchestrator` plan. Before requesting
-     human execution approval, prepare the concrete authority scope preview via
-     `<context_router_executable> --context <context_path> approve prepare --request <private_json>`
-     (and, when needed, inspect the matching execution scope preview) and present the
-     plan together with ALL roles (`Worker` / `coder`, `Reviewer`, `Closure`, and any
-     advisory/correction roles), resolved models, efforts, call/attempt caps and
-     budgets, verification check-command scopes, repository-relative write
-     scopes/files, canonical repository and base commit, and `subject_digest` that
-     the later frozen execution envelope will use. Do not infer broad permission or
-     treat profile selection as authority.
-  4. Only after exact human execution approval of that complete presented scope in
-     this chat, record the approval via `<context_router_executable> --context <context_path> approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`,
-     preview and record the matching frozen execution envelope via `flow coworker-execution preview`
-     and `record`, and call `start_execution` for only that approved execution.
-     Recording `approve record` and the frozen envelope may only bind the exact scope
-     already shown to and approved by the human—recording may never add roles,
-     models, efforts, caps, check commands, or write/base scope. Avoid a redundant
-     extra human approval prompt when the frozen envelope matches that identical
-     already-approved scope; any changed or expanded scope requires a new preview and
-     fresh human approval before recording or starting execution.
+     recorded grant to produce the actual Orchestrator plan. Obtain the exact
+     authority approval for that published planning result: run
+     `<context_router_executable> --context <context_path> approve prepare --request <private_json>`,
+     present its concrete Worker scopes/files, models/efforts/canonical pins,
+     repository/base, budgets, concurrency and `subject_digest`, then only after
+     exact human approval record the unchanged authority request via
+     `<context_router_executable> --context <context_path> approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`.
+     This existing authority approval starts no execution and does not imply
+     Reviewer, Closure, checks, corrections or Git powers.
+  4. Before recording complete job admission consent, run
+     `<context_router_executable> --context <context_path> flow coworker-admission preview --request <private_admission_json>`.
+     Use the exact approval ID, recorded planning result, original job/ledger
+     revisions and stable request key/creation timestamp. Present the complete
+     preview: configured Orchestrator/Architect tiers (including missing/disabled
+     reasons) and separate planning grant/policy/budgets/reservations, historical
+     planning references, every Worker (`coder`), Reviewer and Closure choice and
+     canonical executable pin, dependencies/interfaces, write scope, repository
+     and immutable base/tree, concurrency, all role/call/runtime/output budgets,
+     exact check executables/arguments/working directories, correction/attempt
+     caps and task-commit/local-integration powers. The native Coworker remains
+     human selected without an execution slot. Configuration does not prove a
+     role ran. Worker-only approval does not authorize downstream powers.
+     After confirmation of this unchanged complete scope, record only that
+     request via
+     `<context_router_executable> --context <context_path> flow coworker-admission record --request <private_admission_json> --operator-approved --confirm-preview <PREVIEW_SHA256> --confirm-approval <APPROVAL_SUBJECT_SHA256> --confirm-envelope <ENVELOPE_SHA256>`.
+     All three digests and the explicit flag are required; JSON self-attestation
+     grants nothing. An identical already-approved complete scope requires no
+     redundant consent. Any changed/expanded scope needs fresh preview and consent.
+     Record starts no execution. Inspect with
+     `<context_router_executable> --context <context_path> flow coworker-admission inspect --job-id <JOB_ID>`,
+     read current `preview_execution` readiness, then separately call
+     `start_execution` with the returned frozen digest as `expected_envelope_digest`.
+     Preserve original source revisions; the compact record result's
+     `job_revision` is the original resulting linked revision, not a replacement
+     source revision. See [admission request/response examples](COWORKER-APPROVAL-ADMISSION.md).
   5. If `operator_context.available` is `false`, report its `code` and
      `message` and the concrete store/package configuration needed. Never treat the
      human's generic task request, profile selection, worker prose, another chat's
@@ -129,8 +144,8 @@ Version: `2026-11-08.v2`
      firewall/OS settings, install fixed bindings, edit global configuration, or
      restart the backend). Distinguish command-executor permission from
      Threadlane human approval: never invoke `grant-record`, `approve record`,
-     `coworker-execution record`, writes, or model calls automatically on
-     transport failure. Once the route is confirmed, `flow grant-prepare` and
+     `coworker-admission record`/`reconcile`, `coworker-execution record`, writes,
+     or model calls automatically on transport failure. Once the route is confirmed, `flow grant-prepare` and
      `approve prepare` are read-only preview steps; explicit human consent to
      the presented preview digest still precedes `flow grant-record` or
      `approve record`. Retry only a read-only diagnostic or preview once after
@@ -147,6 +162,47 @@ Version: `2026-11-08.v2`
   and quota restrictions always override saved profiles. Reading a profile,
   `catalog`, or guide grants no execution authority, approval, host startup, or
   model permission.
+
+## Admission persistence and recovery
+
+- `coworker-admission preview` and `inspect` are pure: no persistence locks,
+  sync, repair or journal. All admission commands bypass observation journaling;
+  the private intent/receipt is the durable mutation record. Inspection independently
+  reports `absent`, `partially_recorded`, `complete`, `uncertain` or `conflicting`.
+- Distinguish inspection `state` from stored `receipt.stage`. A fresh process can
+  report `uncertain` for an unchanged stored `complete` receipt without a local
+  durability witness. At a deliberate execution gate, that unchanged Complete
+  receipt with initialized runtime and matching linkage/marker/envelope may be
+  locked, existing workflow/controller ledgers, receipt and directory synced, and
+  subjects reread before caching a witness. Only successful sync returns count.
+  This changes no bytes/mtime, consent, revisions, counters, leases or provider
+  state and performs no missing admission write. Pure status/preview/inspect and
+  cancellation never establish the witness. Readiness may be `approved_and_frozen`
+  for stored Complete persistence despite pure inspection uncertainty.
+- Stored `uncertain`, `intent`, `linked` or `runtime_recorded`, missing required
+  receipts/runtime and conflicts remain fenced. Start never finishes an incomplete
+  admission. Inspect first, then explicitly use
+  `<context_router_executable> --context <context_path> flow coworker-admission reconcile --job-id <JOB_ID> --request-key <ORIGINAL_KEY>`
+  to complete only permitted original-consent persistence. Reconcile changes no
+  consent/key/timestamp and cannot reset initialized runtime. Complete duplicate
+  record and Complete reconcile only sync existing persistence and return the
+  original receipt without rewriting it. After `admission_reconciliation_required`,
+  `persistence_uncertain` or `outcome_unknown`, preserve the original request;
+  never invent another key or blindly replay a possibly completed mutation.
+- Immutable linkage/envelope conflicts require a new job or supported
+  amendment/replan with exact authority and complete-scope reapproval. Never edit
+  an old frozen job to add powers. Historical inspect after supersession is not
+  execution eligibility. An exactly matching manual linkage can opt in only when
+  all immutable subjects match. Existing manual `coworker-execution` recording and
+  legacy jobs without admission intent/marker retain their original routes and
+  limits. Newly admitted Workers, Reviewer and Closure consume frozen canonical
+  pins; marked jobs have no PATH fallback.
+- Source regression fixtures use disposable state and fake providers. They do
+  not prove installed-package/live-provider/native-chat delivery or physical
+  power-loss acceptance. Larger runtime limits, decomposition rules, user-language
+  role outputs with English code/comments, startup ergonomics, native UI status
+  and observation performance remain follow-up work. Admission does not fix generic
+  dispatch/conversation-change races or missing-check-executable status/stop issues.
 
 ## Execute, monitor, and stop
 

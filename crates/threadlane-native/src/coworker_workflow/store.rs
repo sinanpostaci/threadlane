@@ -70,6 +70,9 @@ pub struct CoworkerBindingLedger {
     /// Monotonically versioned Coworker workflow jobs for this binding.
     #[serde(default)]
     pub jobs: Vec<CoworkerJobRecord>,
+    /// Immutable automatic admission subjects, written atomically with approval linkage.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub admission_markers: BTreeMap<String, crate::coworker_admission::AdmissionMarker>,
 }
 
 impl CoworkerBindingLedger {
@@ -85,6 +88,7 @@ impl CoworkerBindingLedger {
             planning_grants: Vec::new(),
             architect_advice: Vec::new(),
             jobs: Vec::new(),
+            admission_markers: BTreeMap::new(),
         })
     }
 
@@ -116,11 +120,31 @@ impl CoworkerBindingLedger {
             })?;
         }
 
+        if self.admission_markers.len() > MAX_JOBS_PER_BINDING {
+            return Err(NativeError::new(
+                NativeErrorCode::ProtocolError,
+                "Too many admission markers",
+            ));
+        }
+        for (job_id, marker) in &self.admission_markers {
+            let job = self
+                .jobs
+                .iter()
+                .find(|j| &j.job_id == job_id)
+                .ok_or_else(|| {
+                    NativeError::new(
+                        NativeErrorCode::ProtocolError,
+                        "Admission marker has no job",
+                    )
+                })?;
+            marker.validate_for_job(job)?;
+        }
         if self.ledger_revision == 0 {
             if self.thread_uuid.is_some()
                 || !self.planning_grants.is_empty()
                 || !self.architect_advice.is_empty()
                 || !self.jobs.is_empty()
+                || !self.admission_markers.is_empty()
             {
                 return Err(NativeError::new(
                     NativeErrorCode::ProtocolError,
@@ -350,7 +374,7 @@ impl CoworkerBindingLedger {
         Ok(())
     }
 
-    fn ensure_thread_scope(&mut self, thread_uuid: &str) -> Result<(), NativeError> {
+    pub(crate) fn ensure_thread_scope(&mut self, thread_uuid: &str) -> Result<(), NativeError> {
         validate_canonical_thread_uuid("thread_uuid", thread_uuid).map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ValidationFailed,
@@ -922,6 +946,14 @@ impl CoworkerWorkflowStore {
                 Ok((original, value))
             }
             CoworkerLedgerMutationOutcome::Mutated(value) => {
+                for (job_id, marker) in &original.admission_markers {
+                    if working.admission_markers.get(job_id) != Some(marker) {
+                        return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "Automatic admission markers are immutable and cannot be removed",
+                        ));
+                    }
+                }
                 if let Some(expected_rev) = expected_ledger_revision {
                     if expected_rev != original.ledger_revision {
                         return Err(NativeError::new(
@@ -1928,329 +1960,29 @@ impl CoworkerWorkflowStore {
         request: &BindJobApprovalRequest,
         authority: &AuthorityStore,
     ) -> Result<CoworkerJobRecord, NativeError> {
-        validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
-        validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
-        validate_bounded_identifier(&request.approval_id, "approval_id", MAX_COWORKER_ID_LEN)?;
-        if request.expected_job_revision == 0 {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "expected_job_revision must be >= 1",
-            ));
-        }
-
         let approval = authority
             .get_for_operator(&request.approval_id)
             .map_err(map_authority_error)?;
-        if approval.binding_id != request.binding_id || approval.thread_uuid != request.thread_uuid
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "ApprovalRecord does not belong to the requested binding_id and thread_uuid",
-            ));
-        }
-
-        let plan_rev = authority
-            .plans()
-            .get_revision(&approval.plan_id, approval.plan_revision)
-            .map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::ProtocolError,
-                    "failed to read plan revision from PlanStore",
-                )
-            })?
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "referenced plan revision does not exist in PlanStore",
-                )
-            })?;
-        let latest_plan = authority
-            .plans()
-            .latest_revision(&approval.plan_id)
-            .map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::ProtocolError,
-                    "failed to read latest plan revision from PlanStore",
-                )
-            })?
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "referenced plan has no revisions in PlanStore",
-                )
-            })?;
-        if !plan_rev.status.is_active_published() || latest_plan.revision != approval.plan_revision
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "ApprovalRecord plan_revision is not the active published revision",
-            ));
-        }
-
-        let reg_snapshot = authority.registry().snapshot().map_err(|_| {
+        let registry = authority.registry().snapshot_readonly().map_err(|_| {
             NativeError::new(
                 NativeErrorCode::ProtocolError,
-                "failed to read workflow registry snapshot",
+                "Failed to read registry snapshot",
             )
         })?;
-        if reg_snapshot.revision != approval.registry_revision {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "current registry revision drifted from the frozen approval registry_revision",
-            ));
-        }
-
-        let live_base = CanonicalProjectBaseRef::resolve_and_validate(
-            &approval.repository_path,
-            &approval.base_commit,
-        )?;
-        let mut linkage = FrozenApprovalLinkage::from_approval_and_policy(
-            &approval,
-            live_base.base_tree_sha.clone(),
-            &request.policy,
-        )?;
-        if let Some(ref envelope) = request.controller_envelope {
-            linkage = linkage.with_controller_envelope(envelope.clone(), &request.policy)?;
-        }
-
-        let mut unique_roles = BTreeSet::new();
-        let mut role_reqs = Vec::new();
-        for task in &approval.tasks {
-            if unique_roles.insert((task.role, task.difficulty)) {
-                role_reqs.push(RolePreflightRequest::new(task.role, Some(task.difficulty)));
-            }
-        }
-        let report = preflight(
-            &reg_snapshot,
-            &PreflightRequest {
-                profile_id: Some(approval.profile_id.clone()),
-                roles: role_reqs,
-            },
-            &request.policy,
-        )?;
-        if !report.ready {
-            return Err(NativeError::new(
-                NativeErrorCode::ValidationFailed,
-                "A1 preflight blocked one or more approved tasks under the ExecutionPolicy",
-            ));
-        }
-
-        let mut task_records = Vec::with_capacity(approval.tasks.len());
-        for approved_task in &approval.tasks {
-            let outcome = report
-                .roles
-                .iter()
-                .find(|o| {
-                    o.role == approved_task.role
-                        && o.requested_difficulty == Some(approved_task.difficulty)
-                })
-                .and_then(|o| o.selected.as_ref())
-                .ok_or_else(|| {
+        let plans =
+            threadlane_workflow::PlanStore::read_snapshot_readonly_at(authority.plans().dir())
+                .map_err(|_| {
                     NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "missing A1 preflight selected choice for approved task",
+                        NativeErrorCode::ProtocolError,
+                        "Failed to read plans snapshot",
                     )
                 })?;
-            if !approved_task.is_frozen_headless_worker() {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "task lacks frozen headless worker authority",
-                ));
-            }
-            let outcome = crate::profile_flow::normalize_coder_choice(outcome)?;
-            validate_non_native_worker_choice(approved_task.role, &outcome)?;
-            if outcome.tool_id != approved_task.tool_id
-                || outcome.adapter != approved_task.adapter
-                || outcome.model_id != approved_task.model_id
-                || outcome.model_arg != approved_task.model_arg
-                || outcome.effort != approved_task.effort
-            {
-                return Err(NativeError::new(
-                    NativeErrorCode::ValidationFailed,
-                    "approved task model/tool/effort pin drifted from A1 preflight resolution",
-                ));
-            }
-            let iface_spec = request
-                .task_interfaces
-                .get(&approved_task.task_id)
-                .cloned()
-                .unwrap_or_default();
-            validate_unique_id_list(
-                &iface_spec.owned_interfaces,
-                "owned_interfaces",
-                MAX_WORK_BRIEF_ITEMS,
-            )?;
-            validate_unique_id_list(
-                &iface_spec.consumed_interfaces,
-                "consumed_interfaces",
-                MAX_WORK_BRIEF_ITEMS,
-            )?;
-
-            let initial_stage = if approved_task.depends_on.is_empty() {
-                CoworkerTaskStage::ReadyToDispatch
-            } else {
-                CoworkerTaskStage::PendingDependencies
-            };
-            task_records.push(CoworkerTaskRecord {
-                task_id: approved_task.task_id.clone(),
-                task_digest: approved_task.task_digest.clone(),
-                role: approved_task.role,
-                difficulty: approved_task.difficulty,
-                selected_choice: outcome.clone(),
-                depends_on: approved_task.depends_on.clone(),
-                write_paths: approved_task.allowed_write_paths.clone(),
-                owned_interfaces: iface_spec.owned_interfaces,
-                consumed_interfaces: iface_spec.consumed_interfaces,
-                stage: initial_stage,
-                stage_before_hold: None,
-                current_attempt_no: 0,
-                active_candidate_id: None,
-                accepted_candidate_id: None,
-                dependency_input_commit: None,
-                dependency_input_tree_sha: None,
-                accepted_predecessor_receipts: Vec::new(),
-                attempts: Vec::new(),
-                candidates: Vec::new(),
-                active_hold_ids: Vec::new(),
-                unresolved_outbox_id: None,
-            });
-        }
-
-        let (_, updated_job) = self.transact_binding_ledger(
+        let (_, job) = self.transact_binding_ledger(
             &request.binding_id,
             request.expected_ledger_revision,
-            |ledger| {
-                ledger.ensure_thread_scope(&request.thread_uuid)?;
-                if ledger.jobs.iter().any(|other| {
-                    other.job_id != request.job_id
-                        && (other
-                            .planning_result
-                            .as_ref()
-                            .map(|pr| pr.plan_id == approval.plan_id)
-                            .unwrap_or(false)
-                            || other
-                                .approval_linkage
-                                .as_ref()
-                                .map(|al| al.plan_id == approval.plan_id)
-                                .unwrap_or(false))
-                }) {
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "ApprovalRecord plan_id belongs to a different job in this binding",
-                    ));
-                }
-
-                if ledger
-                    .jobs
-                    .iter()
-                    .any(|other| other.supersedes_job_id.as_deref() == Some(request.job_id.as_str()))
-                {
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "job has been superseded by an amendment job and cannot bind execution approval",
-                    ));
-                }
-
-                let job = ledger
-                    .jobs
-                    .iter_mut()
-                    .find(|j| j.job_id == request.job_id)
-                    .ok_or_else(|| {
-                        NativeError::new(
-                            NativeErrorCode::ValidationFailed,
-                            "requested job_id was not found in this binding ledger",
-                        )
-                    })?;
-
-                if let Some(ref existing_linkage) = job.approval_linkage {
-                    if existing_linkage == &linkage {
-                        return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting(
-                            job.clone(),
-                        ));
-                    }
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "CoworkerJobRecord.approval_linkage is immutable and cannot be rebound to a different approval or policy",
-                    ));
-                }
-
-                if job.job_revision != request.expected_job_revision {
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "expected_job_revision does not match current job_revision",
-                    ));
-                }
-                if !job
-                    .work_brief
-                    .is_ready_for_execution_approval_with_planning(job.planning_result.as_ref())
-                {
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "WorkBrief has open_questions or unconfirmed proposed_additions and cannot bind execution approval",
-                    ));
-                }
-                if job.work_brief.project_base != live_base {
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "ApprovalRecord repository or base_commit does not match WorkBrief.project_base",
-                    ));
-                }
-                if job.holds.iter().any(|h| h.active) {
-                    return Err(NativeError::new(
-                        NativeErrorCode::ValidationFailed,
-                        "job has an active hold and cannot bind execution approval until resolved",
-                    ));
-                }
-
-                let mut resolved_tasks = task_records.clone();
-                if let Some(ref planning_result) = job.planning_result {
-                    if approval.plan_id != planning_result.plan_id
-                        || approval.plan_revision != planning_result.plan_revision
-                        || approval.plan_digest != planning_result.plan_digest
-                        || approval.profile_id != planning_result.profile_id
-                        || approval.registry_revision != planning_result.registry_revision
-                        || live_base != planning_result.project_base
-                        || job.work_brief_digest != planning_result.work_brief_digest
-                    {
-                        return Err(NativeError::new(
-                            NativeErrorCode::ValidationFailed,
-                            "ApprovalRecord does not match the job's recorded PlanningResultRef plan id, revision, digest, profile, brief digest, or base",
-                        ));
-                    }
-                    if !request.task_interfaces.is_empty()
-                        && !planning_result.task_interfaces.is_empty()
-                        && request.task_interfaces != planning_result.task_interfaces
-                    {
-                        return Err(NativeError::new(
-                            NativeErrorCode::ValidationFailed,
-                            "BindJobApprovalRequest.task_interfaces drifted from the job's recorded PlanningResultRef.task_interfaces",
-                        ));
-                    }
-                    if request.task_interfaces.is_empty()
-                        && !planning_result.task_interfaces.is_empty()
-                    {
-                        for task_rec in &mut resolved_tasks {
-                            if let Some(iface) =
-                                planning_result.task_interfaces.get(&task_rec.task_id)
-                            {
-                                task_rec.owned_interfaces = iface.owned_interfaces.clone();
-                                task_rec.consumed_interfaces = iface.consumed_interfaces.clone();
-                            }
-                        }
-                    }
-                }
-
-                let next_job_rev = job.job_revision.checked_add(1).ok_or_else(|| {
-                    NativeError::new(NativeErrorCode::ValidationFailed, "job_revision overflow")
-                })?;
-                job.job_revision = next_job_rev;
-                job.phase = CoworkerJobPhase::Executing;
-                job.approval_linkage = Some(linkage);
-                job.tasks = resolved_tasks;
-                Ok(CoworkerLedgerMutationOutcome::Mutated(job.clone()))
-            },
+            |ledger| prepare_job_approval_in_ledger(ledger, request, &approval, &registry, &plans),
         )?;
-        Ok(updated_job)
+        Ok(job)
     }
 
     /// Reserves an [`OutboxDispatchRecord`] in [`OutboxDispatchStatus::ReservedBeforeEffect`]
@@ -4293,4 +4025,304 @@ fn ledger_filename_for_binding(binding_id: &str) -> String {
 fn lock_filename_for_binding(binding_id: &str) -> String {
     let tag = binding_ledger_tag(binding_id);
     format!("coworker-workflow-{tag}.lock")
+}
+
+/// Shared in-memory approval candidate construction. No persistence or store locks.
+pub(crate) fn prepare_job_approval_in_ledger(
+    ledger: &mut CoworkerBindingLedger,
+    request: &BindJobApprovalRequest,
+    approval: &threadlane_authority::ApprovalRecord,
+    reg_snapshot: &threadlane_workflow::RegistrySnapshot,
+    plans: &[threadlane_workflow::PlanRevision],
+) -> Result<CoworkerLedgerMutationOutcome<CoworkerJobRecord>, NativeError> {
+    validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
+    validate_bounded_identifier(&request.job_id, "job_id", MAX_COWORKER_ID_LEN)?;
+    validate_bounded_identifier(&request.approval_id, "approval_id", MAX_COWORKER_ID_LEN)?;
+    if request.expected_job_revision == 0 {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "expected_job_revision must be >= 1",
+        ));
+    }
+
+    if approval.binding_id != request.binding_id || approval.thread_uuid != request.thread_uuid {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord does not belong to the requested binding_id and thread_uuid",
+        ));
+    }
+
+    let plan_rev = plans
+        .iter()
+        .find(|p| p.plan_id == approval.plan_id && p.revision == approval.plan_revision)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Referenced plan revision is absent",
+            )
+        })?;
+    let latest_plan = plans
+        .iter()
+        .filter(|p| p.plan_id == approval.plan_id)
+        .max_by_key(|p| p.revision)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "Referenced plan is absent",
+            )
+        })?;
+    if !plan_rev.status.is_active_published() || latest_plan.revision != approval.plan_revision {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord plan_revision is not the active published revision",
+        ));
+    }
+
+    if reg_snapshot.revision != approval.registry_revision {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "current registry revision drifted from the frozen approval registry_revision",
+        ));
+    }
+
+    let live_base = CanonicalProjectBaseRef::resolve_and_validate(
+        &approval.repository_path,
+        &approval.base_commit,
+    )?;
+    let mut linkage = FrozenApprovalLinkage::from_approval_and_policy(
+        approval,
+        live_base.base_tree_sha.clone(),
+        &request.policy,
+    )?;
+    if let Some(ref envelope) = request.controller_envelope {
+        linkage = linkage.with_controller_envelope(envelope.clone(), &request.policy)?;
+    }
+
+    let mut unique_roles = BTreeSet::new();
+    let mut role_reqs = Vec::new();
+    for task in &approval.tasks {
+        if unique_roles.insert((task.role, task.difficulty)) {
+            role_reqs.push(RolePreflightRequest::new(task.role, Some(task.difficulty)));
+        }
+    }
+    let report = preflight(
+        reg_snapshot,
+        &PreflightRequest {
+            profile_id: Some(approval.profile_id.clone()),
+            roles: role_reqs,
+        },
+        &request.policy,
+    )?;
+    if !report.ready {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "A1 preflight blocked one or more approved tasks under the ExecutionPolicy",
+        ));
+    }
+
+    let mut task_records = Vec::with_capacity(approval.tasks.len());
+    for approved_task in &approval.tasks {
+        let outcome = report
+            .roles
+            .iter()
+            .find(|o| {
+                o.role == approved_task.role
+                    && o.requested_difficulty == Some(approved_task.difficulty)
+            })
+            .and_then(|o| o.selected.as_ref())
+            .ok_or_else(|| {
+                NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "missing A1 preflight selected choice for approved task",
+                )
+            })?;
+        if !approved_task.is_frozen_headless_worker() {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "task lacks frozen headless worker authority",
+            ));
+        }
+        let outcome = crate::profile_flow::normalize_coder_choice(outcome)?;
+        validate_non_native_worker_choice(approved_task.role, &outcome)?;
+        if outcome.tool_id != approved_task.tool_id
+            || outcome.adapter != approved_task.adapter
+            || outcome.model_id != approved_task.model_id
+            || outcome.model_arg != approved_task.model_arg
+            || outcome.effort != approved_task.effort
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "approved task model/tool/effort pin drifted from A1 preflight resolution",
+            ));
+        }
+        let iface_spec = request
+            .task_interfaces
+            .get(&approved_task.task_id)
+            .cloned()
+            .unwrap_or_default();
+        validate_unique_id_list(
+            &iface_spec.owned_interfaces,
+            "owned_interfaces",
+            MAX_WORK_BRIEF_ITEMS,
+        )?;
+        validate_unique_id_list(
+            &iface_spec.consumed_interfaces,
+            "consumed_interfaces",
+            MAX_WORK_BRIEF_ITEMS,
+        )?;
+
+        let initial_stage = if approved_task.depends_on.is_empty() {
+            CoworkerTaskStage::ReadyToDispatch
+        } else {
+            CoworkerTaskStage::PendingDependencies
+        };
+        task_records.push(CoworkerTaskRecord {
+            task_id: approved_task.task_id.clone(),
+            task_digest: approved_task.task_digest.clone(),
+            role: approved_task.role,
+            difficulty: approved_task.difficulty,
+            selected_choice: outcome.clone(),
+            depends_on: approved_task.depends_on.clone(),
+            write_paths: approved_task.allowed_write_paths.clone(),
+            owned_interfaces: iface_spec.owned_interfaces,
+            consumed_interfaces: iface_spec.consumed_interfaces,
+            stage: initial_stage,
+            stage_before_hold: None,
+            current_attempt_no: 0,
+            active_candidate_id: None,
+            accepted_candidate_id: None,
+            dependency_input_commit: None,
+            dependency_input_tree_sha: None,
+            accepted_predecessor_receipts: Vec::new(),
+            attempts: Vec::new(),
+            candidates: Vec::new(),
+            active_hold_ids: Vec::new(),
+            unresolved_outbox_id: None,
+        });
+    }
+
+    ledger.ensure_thread_scope(&request.thread_uuid)?;
+    if ledger.jobs.iter().any(|other| {
+        other.job_id != request.job_id
+            && (other
+                .planning_result
+                .as_ref()
+                .map(|pr| pr.plan_id == approval.plan_id)
+                .unwrap_or(false)
+                || other
+                    .approval_linkage
+                    .as_ref()
+                    .map(|al| al.plan_id == approval.plan_id)
+                    .unwrap_or(false))
+    }) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord plan_id belongs to a different job in this binding",
+        ));
+    }
+
+    if ledger
+        .jobs
+        .iter()
+        .any(|other| other.supersedes_job_id.as_deref() == Some(request.job_id.as_str()))
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "job has been superseded by an amendment job and cannot bind execution approval",
+        ));
+    }
+
+    let job = ledger
+        .jobs
+        .iter_mut()
+        .find(|j| j.job_id == request.job_id)
+        .ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::ValidationFailed,
+                "requested job_id was not found in this binding ledger",
+            )
+        })?;
+
+    if let Some(ref existing_linkage) = job.approval_linkage {
+        if existing_linkage == &linkage {
+            return Ok(CoworkerLedgerMutationOutcome::IdempotentExisting(
+                job.clone(),
+            ));
+        }
+        return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "CoworkerJobRecord.approval_linkage is immutable and cannot be rebound to a different approval or policy",
+                    ));
+    }
+
+    if job.job_revision != request.expected_job_revision {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "expected_job_revision does not match current job_revision",
+        ));
+    }
+    if !job
+        .work_brief
+        .is_ready_for_execution_approval_with_planning(job.planning_result.as_ref())
+    {
+        return Err(NativeError::new(
+                        NativeErrorCode::ValidationFailed,
+                        "WorkBrief has open_questions or unconfirmed proposed_additions and cannot bind execution approval",
+                    ));
+    }
+    if job.work_brief.project_base != live_base {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "ApprovalRecord repository or base_commit does not match WorkBrief.project_base",
+        ));
+    }
+    if job.holds.iter().any(|h| h.active) {
+        return Err(NativeError::new(
+            NativeErrorCode::ValidationFailed,
+            "job has an active hold and cannot bind execution approval until resolved",
+        ));
+    }
+
+    let mut resolved_tasks = task_records.clone();
+    if let Some(ref planning_result) = job.planning_result {
+        if approval.plan_id != planning_result.plan_id
+            || approval.plan_revision != planning_result.plan_revision
+            || approval.plan_digest != planning_result.plan_digest
+            || approval.profile_id != planning_result.profile_id
+            || approval.registry_revision != planning_result.registry_revision
+            || live_base != planning_result.project_base
+            || job.work_brief_digest != planning_result.work_brief_digest
+        {
+            return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "ApprovalRecord does not match the job's recorded PlanningResultRef plan id, revision, digest, profile, brief digest, or base",
+                        ));
+        }
+        if !request.task_interfaces.is_empty()
+            && !planning_result.task_interfaces.is_empty()
+            && request.task_interfaces != planning_result.task_interfaces
+        {
+            return Err(NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "BindJobApprovalRequest.task_interfaces drifted from the job's recorded PlanningResultRef.task_interfaces",
+                        ));
+        }
+        if request.task_interfaces.is_empty() && !planning_result.task_interfaces.is_empty() {
+            for task_rec in &mut resolved_tasks {
+                if let Some(iface) = planning_result.task_interfaces.get(&task_rec.task_id) {
+                    task_rec.owned_interfaces = iface.owned_interfaces.clone();
+                    task_rec.consumed_interfaces = iface.consumed_interfaces.clone();
+                }
+            }
+        }
+    }
+
+    let next_job_rev = job.job_revision.checked_add(1).ok_or_else(|| {
+        NativeError::new(NativeErrorCode::ValidationFailed, "job_revision overflow")
+    })?;
+    job.job_revision = next_job_rev;
+    job.phase = CoworkerJobPhase::Executing;
+    job.approval_linkage = Some(linkage);
+    job.tasks = resolved_tasks;
+    Ok(CoworkerLedgerMutationOutcome::Mutated(job.clone()))
 }

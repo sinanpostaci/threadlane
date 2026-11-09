@@ -4,6 +4,12 @@ This document defines the shared data contracts, per-binding compare-and-swap le
 trust/provenance boundaries, and frozen Rust module signatures for the end-to-end Threadlane
 Coworker workflow package.
 
+The current trusted-local complete-job entry point is
+[approval admission](COWORKER-APPROVAL-ADMISSION.md). Sections describing staged
+writer ownership and upcoming signatures below preserve the original foundation
+contract; they are historical coordination records, not a claim that the now
+implemented driver/review/integration/Closure pipeline is unavailable.
+
 ## 1. Architectural Boundaries and Core Invariants
 
 1. **Native Coworker is the conversational interface only (`COWORKER_IS_CONVERSATIONAL_INTERFACE_ONLY = true`), while read-only advisory roles may normalize `CodexCli` explicitly**
@@ -20,10 +26,11 @@ Coworker workflow package.
      `resolve_model_target(WorkerProvider::CodexCli, ...)`. See
      [`docs/CODEX-ADVISORY.md`](CODEX-ADVISORY.md).
    - `validate_non_native_worker_choice` rejects `WorkflowRole::Follower`, any non-`HeadlessWorker`
-     route (`NativeHandoff`), `ToolAdapter::CodexCli` for `WorkflowRole::Coder` or
-     `WorkflowRole::Follower`, and any `CodexCli` choice lacking an explicit validated reasoning
-     effort across all planning reservations, architect advice records, controller capability
-     envelopes, and job task assignments.
+     route (`NativeHandoff`), unsupported adapters and any `CodexCli` choice lacking an explicit
+     validated reasoning effort. Complete newly approved Codex CLI Coder contracts use the
+     separate [Codex Coder](CODEX-CODER.md) route; a generic/native or legacy `provider=None`
+     approval is not automatically converted to headless execution. Exact admission still checks
+     the authority-approved task choice and canonical executable.
 2. **Supported trust and provenance model**
    - Grants and execution approvals rely on the existing trusted-local human-confirmation
      attestation (`operator_attested = true` on `PlanningAdviceGrant`; operator token +
@@ -136,6 +143,91 @@ Coworker workflow package.
      `policy_digest`, all tasks' `AcceptedPredecessorReceiptRef`s (`review_receipt_id` +
      `integration_receipt_id`), and passing `CandidateCheckEvidence` (`passed == true` and
      `exit_code == 0`) into a canonical SHA-256 `candidate_digest`.
+
+---
+
+## Complete approval admission contract
+
+`CoworkerAdmissionService` in `coworker_admission.rs` supplies pure `preview`,
+explicitly attested `record`, pure `inspect` and persistence-only `reconcile`.
+`threadlane-flow coworker-admission` exposes these through the existing private
+context `flow` family. No new MCP approval or authority schema is introduced.
+
+`AdmissionRequest` contains the stable `request_key`, nested
+`BindJobApprovalRequest`, exact recorded `PlanningResultRef`, `work_brief_digest`,
+nested `FreezeControllerExecutionEnvelopeRequest`, and explicit optional
+Reviewer/Closure difficulty tiers. Admission requires original job/ledger CAS
+revisions, exact existing authority, explicit controller capabilities, exact
+profile/task resolution and canonical Worker/Reviewer/Closure executables. The
+execution request uses the original source job revision; the service prepares its
+envelope against the prospective resulting linked job. Source and resulting
+revisions remain separately recorded and must never be substituted on retry.
+
+The order is exact published-plan authority approval, complete admission preview,
+presentation of all roles and execution powers, confirmation of that unchanged
+scope, record, readiness inspection, then separate `start_execution` with the
+returned frozen envelope digest. Record requires `--operator-approved` and
+`--confirm-preview`, `--confirm-approval`, `--confirm-envelope`. JSON alone grants
+nothing. An identical already-approved complete scope needs no redundant consent;
+Worker-only approval implies no Reviewer, Closure, checks, corrections or Git.
+Saved models and worker prose never authorize expansion. Local attestation does
+not prove cryptographic human identity; `native_per_call_identity_verified` stays
+`false`.
+
+`AdmissionPreview` covers the normalized original request, prospective linked
+job/ledger revision, exact authority budgets/concurrency, full execution envelope,
+canonical executable pins and planning display configuration. The latter includes
+all configured Orchestrator/Architect tiers and missing/disabled reasons, actual
+profile/models/tools, and original ledger-validated planning grant, policy,
+budgets and reservations. Configured planning roles are distinct from historical
+Orchestrator identity/Architect references in `PlanningResultRef`. The native
+Coworker has no profile execution slot. The domain-separated `preview_digest`
+covers this complete subject without changing legacy authority/envelope digests.
+
+`AdmissionReceipt` preserves that preview, original three-digest confirmation,
+stage and monotonic `runtime_initialized`. An intent precedes workflow linkage;
+linkage and immutable `AdmissionMarker` share a workflow transaction; runtime
+initialization and completion are separate persistence boundaries. These are
+admission receipts, not provider execution receipts. Request key, original
+creation timestamp, request/preview/authority/envelope digests and original/resulting
+revisions remain stable through duplicates and recovery. A compact CLI record or
+reconcile result returns the original **resulting** linked job revision even when
+the live job has advanced.
+
+Inspection independently classifies `absent`, `partially_recorded`, `complete`,
+`uncertain` or `conflicting`. Preview/inspect never lock, sync, repair or journal.
+All admission CLI commands bypass observation journaling; intent/receipt is the
+durable mutation record. A stored Complete receipt observed by a fresh process
+may inspect as uncertain because it lacks that process's durability witness.
+Deliberate execution gates can establish the witness only for unchanged stored
+Complete consent with initialized runtime and matching linkage/marker/envelope:
+lock, sync existing workflow/controller ledgers, receipt and directory, reread,
+then cache a witness on successful sync returns. This changes no subjects,
+bytes/mtime, revisions, counters, leases or provider state. Pure reads and
+cancellation never perform it.
+
+Stored Uncertain/Intent/Linked/RuntimeRecorded, missing required receipts or
+initialized runtime and conflicts remain fenced. Start never finishes an
+incomplete admission. Explicit original-key reconcile completes only permitted
+missing persistence backed by original consent; it cannot replace consent or
+reset initialized runtime. Complete duplicates and Complete reconcile sync
+existing persistence and return the original receipt without rewriting it.
+Failures after an intent direct the operator to inspect/reconcile;
+`persistence_uncertain` and `outcome_unknown` never justify a new key or blind replay.
+
+Immutable linkage or envelope conflicts require a new job or supported
+amendment/replan with exact authority and complete-scope reapproval. Exactly
+matching manual linkages may opt in only when all immutable subjects match.
+Older valid jobs without admission intent/marker retain prior manual routes and
+limitations. Newly admitted Workers, Reviewer and Closure consume canonical pins;
+marked jobs have no PATH fallback. Historical inspection after supersession does
+not establish current execution eligibility.
+
+This package's regression sources use disposable fixtures/fake providers. Parent
+validation owns combined gates; no installed/live-provider, native-chat delivery
+or physical power-loss acceptance is inferred from fixture success. Larger runtime
+limits, decomposition/language changes, startup ergonomics, native UI status and
+observation performance remain separate follow-up work.
 
 ---
 
@@ -587,10 +679,11 @@ The later integration writer owns:
 ### 4.1 Stage 1 Foundation Acceptance Cases (`crates/threadlane-native/tests/coworker_workflow_contract.rs`)
 
 1. **`native_coworker_rejected_as_headless_worker_or_grant_model_and_provenance_honest`**
-   - Rejects `WorkflowRole::Follower`, `RoleExecutionRoute::NativeHandoff`, and `ToolAdapter::CodexCli`
-     for `Coder`/`Follower` (or without an explicit reasoning effort) in
-     `validate_non_native_worker_choice`, while permitting normalized `HeadlessWorker` `CodexCli`
-     choices only for read-only advisory roles (`Orchestrator`, `Architect`, `Reviewer`, `Closure`).
+   - Rejects `WorkflowRole::Follower`, `RoleExecutionRoute::NativeHandoff`, and headless
+     `CodexCli` choices without an explicit validated reasoning effort. The original Stage 1
+     boundary admitted Codex CLI only for normalized read-only advisory roles (`Orchestrator`,
+     `Architect`, `Reviewer`, `Closure`); the later complete Codex Coder contract described above
+     adds its separately approved route without widening historical native approvals.
    - Rejects `PlanningAdviceGrant` with `operator_attested: false`, write/mutation capabilities,
      or policies permitting `Coder`/`Reviewer`/`Follower`.
    - Enforces `native_per_call_identity_verified == false`.

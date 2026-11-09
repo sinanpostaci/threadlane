@@ -40,6 +40,16 @@ const THREAD_UUID_B: &str = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
 const BINDING_A: &str = "bnd_coworker_alpha";
 const BINDING_B: &str = "bnd_coworker_beta";
 
+#[test]
+fn legacy_empty_ledgers_omit_admission_markers_and_round_trip_unchanged() {
+    let ledger = CoworkerBindingLedger::empty(BINDING_A).expect("empty ledger");
+    let bytes = serde_json::to_vec(&ledger).expect("serialize");
+    assert!(!String::from_utf8_lossy(&bytes).contains("admission_markers"));
+    let reopened: CoworkerBindingLedger = serde_json::from_slice(&bytes).expect("legacy ledger");
+    assert!(reopened.admission_markers.is_empty());
+    assert_eq!(ledger, reopened);
+}
+
 struct CoworkerTestFixture {
     _tmp: TempDir,
     repo_dir: PathBuf,

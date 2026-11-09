@@ -75,7 +75,7 @@ use crate::profile_flow::SelectedRoleChoice;
 
 /// Canonical human-scope approval route explanation included on execution preview responses.
 pub const TRUSTED_LOCAL_HUMAN_APPROVAL_ROUTE: &str =
-    "threadlane-flow trusted-local CLI attestation (approve published plan, bind job approval with controller capability envelope, and freeze controller execution envelope; local operator attestation, not cryptographic proof of human identity)";
+    "threadlane-flow coworker-admission preview|record|inspect|reconcile after exact published-plan authority approval; trusted-local operator attestation, not cryptographic proof of human identity";
 
 /// Parameters for the `preview_execution` MCP tool.
 ///
@@ -777,7 +777,7 @@ impl CoworkerExecutionGateway {
             (None, None) => {
                 readiness = ExecutionReadinessStatus::NeedsApproval;
                 readiness_detail = format!(
-                    "Job `{}` has no bound FrozenApprovalLinkage (`needs_approval`). Approve the published plan and bind/freeze the execution envelope via the trusted-local `threadlane-flow` CLI route before calling `start_execution`.",
+                    "Job `{}` has no bound FrozenApprovalLinkage (`needs_approval`). Approve the published plan and bind/freeze the execution envelope via `threadlane-flow coworker-admission preview|record` (inspect/reconcile after a lost response) before calling `start_execution`.",
                     job.job_id
                 );
             }
@@ -829,12 +829,12 @@ impl CoworkerExecutionGateway {
                 readiness = ExecutionReadinessStatus::MissingExecutionEnvelope;
                 readiness_detail = if linkage.controller_envelope.is_none() {
                     format!(
-                        "Job `{}` has a FrozenApprovalLinkage (`{}`) but is missing a FrozenControllerCapabilityEnvelope and recorded FrozenControllerExecutionEnvelope (`missing_execution_envelope`). Bind controller capabilities and freeze the execution envelope via the trusted-local `threadlane-flow` CLI route before calling `start_execution`.",
+                        "Job `{}` has a FrozenApprovalLinkage (`{}`) but is missing a FrozenControllerCapabilityEnvelope and recorded FrozenControllerExecutionEnvelope (`missing_execution_envelope`). This linkage is immutable. Create a new job from a replanned, explicitly approved scope with controller capabilities, then use `threadlane-flow coworker-admission preview|record` before calling `start_execution`.",
                         job.job_id, linkage.approval_id
                     )
                 } else {
                     format!(
-                        "Job `{}` has a FrozenApprovalLinkage (`{}`) and FrozenControllerCapabilityEnvelope but is missing a recorded FrozenControllerExecutionEnvelope (`missing_execution_envelope`). Freeze the execution envelope via the trusted-local `threadlane-flow` CLI route before calling `start_execution`.",
+                        "Job `{}` has a FrozenApprovalLinkage (`{}`) and FrozenControllerCapabilityEnvelope but is missing a recorded FrozenControllerExecutionEnvelope (`missing_execution_envelope`). Inspect/reconcile an existing admission receipt after a lost response, or use `threadlane-flow coworker-execution preview|record` for this legacy linked job. A different capability scope requires a new job, replan and explicit reapproval before `start_execution`.",
                         job.job_id, linkage.approval_id
                     )
                 };
@@ -845,7 +845,7 @@ impl CoworkerExecutionGateway {
                     return Err(NativeError::new(
                         NativeErrorCode::UnauthorizedOperator,
                         format!(
-                            "Job `{}` FrozenApprovalLinkage has no FrozenControllerCapabilityEnvelope (`missing_execution_envelope`).",
+                            "Job `{}` FrozenApprovalLinkage has no FrozenControllerCapabilityEnvelope (`missing_execution_envelope`). This linkage is immutable; create a new job, replan and obtain explicit reapproval with controller capabilities before automatic execution.",
                             job.job_id
                         ),
                     ));
@@ -895,7 +895,7 @@ impl CoworkerExecutionGateway {
                     loaded_approval = Some(approval);
                     readiness = ExecutionReadinessStatus::MissingExecutionEnvelope;
                     readiness_detail = format!(
-                        "Job `{}` has an unattested FrozenControllerExecutionEnvelope (`operator_attested == false`, `missing_execution_envelope`). Record local operator attestation via the trusted-local `threadlane-flow` CLI route before calling `start_execution`.",
+                        "Job `{}` has an unattested FrozenControllerExecutionEnvelope (`operator_attested == false`, `missing_execution_envelope`). Inspect/reconcile an existing admission receipt after a lost response, or use `threadlane-flow coworker-execution preview|record` for this legacy envelope. Changing this linked job's frozen capability scope requires a new job, replan and explicit reapproval before `start_execution`.",
                         job.job_id
                     );
                 } else {
@@ -903,12 +903,37 @@ impl CoworkerExecutionGateway {
                         job, linkage, rt, &approval, &authority, true,
                     )?;
                     loaded_approval = Some(approval);
-                    approved = true;
-                    readiness = ExecutionReadinessStatus::ApprovedAndFrozen;
-                    readiness_detail = format!(
-                        "Job `{}` is approved and has a verified operator-attested FrozenControllerExecutionEnvelope (`{}`). Ready for `start_execution` with expected_envelope_digest `{}`.",
-                        job.job_id, rt.envelope.envelope_id, rt.envelope.envelope_digest
-                    );
+                    let admission_ready = if wf_ledger.admission_markers.contains_key(&job.job_id) {
+                        let admission = crate::coworker_admission::CoworkerAdmissionService::new(
+                            &self.plans_dir,
+                            &self.authority_dir,
+                            &self.registry_dir,
+                        )?
+                        .inspect(&self.binding_id, &job.job_id)?;
+                        admission.linkage_present
+                            && admission.runtime_present
+                            && admission.state
+                                != crate::coworker_admission::AdmissionInspectionState::Conflicting
+                            && admission.receipt.as_ref().is_some_and(|r| {
+                                r.stage == crate::coworker_admission::AdmissionStage::Complete
+                            })
+                    } else {
+                        true
+                    };
+                    approved = admission_ready;
+                    readiness = if admission_ready {
+                        ExecutionReadinessStatus::ApprovedAndFrozen
+                    } else {
+                        ExecutionReadinessStatus::MissingExecutionEnvelope
+                    };
+                    readiness_detail = if admission_ready {
+                        format!(
+                            "Job `{}` is approved and has a verified operator-attested FrozenControllerExecutionEnvelope (`{}`). Ready for `start_execution` with expected_envelope_digest `{}`.",
+                            job.job_id, rt.envelope.envelope_id, rt.envelope.envelope_digest
+                        )
+                    } else {
+                        "Admission is incomplete, uncertain or conflicting. Use threadlane-flow coworker-admission inspect, then explicit reconcile with the original request key; execution cannot finish admission.".into()
+                    };
                 }
             }
         }
@@ -1189,6 +1214,14 @@ impl CoworkerExecutionGateway {
             ));
         }
 
+        // Sync only completed unchanged consent before any driver, notice or owner effect.
+        // This cannot finish incomplete or explicitly Uncertain persistence.
+        crate::coworker_admission::verify_complete_admission(
+            &CoworkerWorkflowStore::new(&self.plans_dir)?,
+            &ControllerPolicyStore::new(&self.plans_dir)?,
+            &ctx.job,
+        )?;
+
         if let Some((ref reconnect_cfg, backend_pid)) = self.managed_native_notice {
             let notice_key = CoworkerJobOwnershipKey::new(
                 self.binding_id.clone(),
@@ -1414,7 +1447,7 @@ impl CoworkerExecutionGateway {
             return Err(NativeError::new(
                 NativeErrorCode::UnauthorizedOperator,
                 format!(
-                    "Job `{}` needs human approval (`needs_approval`): no FrozenApprovalLinkage is bound. Approve the published plan and bind/freeze the execution envelope via the trusted-local `threadlane-flow` CLI route before starting execution.",
+                    "Job `{}` needs human approval (`needs_approval`): no FrozenApprovalLinkage is bound. Approve the published plan and bind/freeze the execution envelope via `threadlane-flow coworker-admission preview|record` (inspect/reconcile after a lost response) before starting execution.",
                     job.job_id
                 ),
             ));
@@ -1426,7 +1459,7 @@ impl CoworkerExecutionGateway {
             return Err(NativeError::new(
                 NativeErrorCode::UnauthorizedOperator,
                 format!(
-                    "Job `{}` is missing a FrozenControllerCapabilityEnvelope (`missing_execution_envelope`): bind approval with controller capabilities and freeze the execution envelope via the trusted-local `threadlane-flow` CLI route before starting execution.",
+                    "Job `{}` is missing a FrozenControllerCapabilityEnvelope (`missing_execution_envelope`): the existing approval linkage is immutable. Create a new job from a replanned, explicitly reapproved scope with controller capabilities, then use `threadlane-flow coworker-admission preview|record` before starting execution.",
                     job.job_id
                 ),
             ));
@@ -1439,7 +1472,7 @@ impl CoworkerExecutionGateway {
             return Err(NativeError::new(
                 NativeErrorCode::NotConfigured,
                 format!(
-                    "Job `{}` is missing a recorded FrozenControllerExecutionEnvelope (`missing_execution_envelope`): freeze the execution envelope via the trusted-local `threadlane-flow` CLI route before starting execution.",
+                    "Job `{}` is missing a recorded FrozenControllerExecutionEnvelope (`missing_execution_envelope`): inspect/reconcile any existing admission receipt using its original request key, or use `threadlane-flow coworker-execution preview|record` for this legacy linked job. A different capability scope requires a new job, replan and explicit reapproval.",
                     job.job_id
                 ),
             ));

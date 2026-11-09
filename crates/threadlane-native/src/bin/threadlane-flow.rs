@@ -30,6 +30,9 @@ use threadlane_core::observation::{
     ObservationJournalRecord, ObservationRecordPhase,
 };
 use threadlane_host::{ApprovedHostClient, HostError};
+use threadlane_native::coworker_admission::{
+    AdmissionConfirmation, AdmissionReceipt, AdmissionRequest, CoworkerAdmissionService,
+};
 use threadlane_native::coworker_driver::{
     CoworkerCodeDriver, CoworkerDriverCancelReport, CoworkerDriverEnsureReport,
     CoworkerDriverExecutionMode, CoworkerDriverRequest, CoworkerDriverRunOptions,
@@ -228,6 +231,9 @@ enum FlowCommand {
         visible_alias = "execution-envelope"
     )]
     CoworkerExecution(CoworkerExecutionCommand),
+    /// Admit an exact published job with explicit local consent; never launches execution.
+    #[command(subcommand, name = "coworker-admission")]
+    CoworkerAdmission(CoworkerAdmissionCommand),
     /// Enqueue, inspect, or execute durable Coworker planning commands (enqueue | get | list | execute-command | start-command).
     #[command(subcommand, name = "coworker-planning")]
     CoworkerPlanning(CoworkerPlanningCommand),
@@ -384,6 +390,49 @@ enum CoworkerPlanningCommand {
         /// Planning command identifier (`pcm_<32hex>`).
         #[arg(long = "command-id", value_name = "ID")]
         command_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CoworkerAdmissionCommand {
+    /// Pure normalized consent preview for an existing published, optionally unbound job.
+    Preview {
+        /// Absolute private (0600) AdmissionRequest JSON file.
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Persist exact consent only; does not start a host, provider, check or Git operation.
+    Record {
+        /// Absolute private (0600) AdmissionRequest JSON file.
+        #[arg(long)]
+        request: PathBuf,
+        /// Explicit trusted-local attestation; JSON cannot supply this authorization.
+        #[arg(long)]
+        operator_approved: bool,
+        /// Exact normalized admission preview digest.
+        #[arg(long)]
+        confirm_preview: Option<String>,
+        /// Exact existing authority subject digest.
+        #[arg(long)]
+        confirm_approval: Option<String>,
+        /// Exact full frozen execution envelope digest.
+        #[arg(long)]
+        confirm_envelope: Option<String>,
+    },
+    /// Pure historical inspection, including partial/uncertain persistence and original consent.
+    Inspect {
+        /// Existing job identifier in the fixed context scope.
+        #[arg(long)]
+        job_id: String,
+    },
+    /// Explicit persistence recovery using the original request key and immutable subjects.
+    Reconcile {
+        /// Existing job identifier in the fixed context scope.
+        #[arg(long)]
+        job_id: String,
+        /// Original admission request key; a new key cannot escape a conflict.
+        #[arg(long)]
+        request_key: String,
     },
 }
 
@@ -799,6 +848,9 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
         FlowCommand::GrantRevoke { .. } => ("flow.grant-revoke", true, true),
         FlowCommand::GrantList => ("flow.grant-list", false, false),
         FlowCommand::GrantGet { .. } => ("flow.grant-get", false, false),
+        // Admission has its own durable intent/receipt. Even inherited observation environment
+        // must not write before the fixed request scope and consent have been validated.
+        FlowCommand::CoworkerAdmission(_) => ("flow.coworker-admission", false, false),
         FlowCommand::CoworkerExecution(sub) => match sub {
             CoworkerExecutionCommand::Preview { .. } => {
                 ("flow.coworker-execution.preview", false, false)
@@ -1210,6 +1262,14 @@ async fn run(cli: Cli) -> Result<(), OperatorCliError> {
                 )?;
                 write_result(&binding, &summary, false)
             }
+            FlowCommand::CoworkerAdmission(subcommand) => run_coworker_admission(
+                subcommand,
+                &registry_dir,
+                &plans_dir,
+                &authority_dir,
+                &binding,
+                &thread,
+            ),
             FlowCommand::CoworkerExecution(subcommand) => run_coworker_execution(
                 subcommand,
                 &registry_dir,
@@ -1690,6 +1750,174 @@ fn load_scoped_job(
         STORED_SCOPE_MISMATCH,
     )?;
     Ok(job)
+}
+
+#[derive(serde::Serialize)]
+struct AdmissionRecordedSummary {
+    request_key: String,
+    job_id: String,
+    job_revision: u64,
+    request_digest: String,
+    preview_digest: String,
+    approval_subject_digest: String,
+    envelope_digest: String,
+    stage: threadlane_native::coworker_admission::AdmissionStage,
+}
+
+fn write_admission_receipt(
+    binding: &str,
+    receipt: &AdmissionReceipt,
+) -> Result<(), OperatorCliError> {
+    let p = &receipt.preview;
+    // This is the actual persisted linked job revision, not the source request revision.
+    let summary = AdmissionRecordedSummary {
+        request_key: p.request.request_key.clone(),
+        job_id: p.proposed_job.job_id.clone(),
+        job_revision: p.proposed_job.job_revision,
+        request_digest: threadlane_native::coworker_workflow::sha256_hex(
+            &serde_json::to_vec(&("threadlane-native:coworker-admission-request:v1", &p.request))
+                .map_err(|_| OperatorCliError::new("outcome_unknown",
+                    "Admission persisted but response serialization failed; inspect the original job."))?),
+        preview_digest: p.preview_digest.clone(),
+        approval_subject_digest: p.approval_subject_digest.clone(),
+        envelope_digest: p.envelope.envelope_digest.clone(),
+        stage: receipt.stage,
+    };
+    write_result(binding, &summary, true)
+}
+
+fn admission_error(
+    service: &CoworkerAdmissionService,
+    binding: &str,
+    job_id: &str,
+    error: &NativeError,
+) -> OperatorCliError {
+    if error.error_code() == NativeErrorCode::PersistenceUncertain {
+        return OperatorCliError::new("persistence_uncertain",
+            "Admission persistence is uncertain; inspect then explicitly reconcile the original job and request key.");
+    }
+    match service.inspect(binding, job_id) {
+        Ok(state) if !state.intent_present && !state.linkage_present =>
+            map_native_error(error, false),
+        Ok(_) => OperatorCliError::new("admission_reconciliation_required",
+            "An admission intent exists; inspect and explicitly reconcile its original request key. Do not generate a replacement request."),
+        Err(_) => OperatorCliError::new("outcome_unknown",
+            "Admission outcome could not be inspected; preserve the original request and inspect before recovery."),
+    }
+}
+
+fn run_coworker_admission(
+    command: CoworkerAdmissionCommand,
+    registry_dir: &Path,
+    plans_dir: &Path,
+    authority_dir: &Path,
+    binding: &str,
+    thread: &str,
+) -> Result<(), OperatorCliError> {
+    let service = CoworkerAdmissionService::new(plans_dir, authority_dir, registry_dir)
+        .map_err(|e| map_native_error(&e, false))?;
+    let workflow =
+        CoworkerWorkflowStore::new(plans_dir).map_err(|e| map_native_error(&e, false))?;
+    match command {
+        CoworkerAdmissionCommand::Preview { request } => {
+            let request: AdmissionRequest = read_request(&request)?;
+            ensure_admission_scope(&request, binding, thread)?;
+            load_scoped_job(&workflow, binding, thread, &request.binding.job_id)?;
+            let preview = service
+                .preview(&request)
+                .map_err(|e| map_native_error(&e, false))?;
+            write_result(binding, &preview, false)
+        }
+        CoworkerAdmissionCommand::Record {
+            request,
+            operator_approved,
+            confirm_preview,
+            confirm_approval,
+            confirm_envelope,
+        } => {
+            let mut request: AdmissionRequest = read_request(&request)?;
+            ensure_admission_scope(&request, binding, thread)?;
+            load_scoped_job(&workflow, binding, thread, &request.binding.job_id)?;
+            let confirmed_preview = confirm_preview.filter(|_| operator_approved)
+                .ok_or_else(|| OperatorCliError::new("unauthorized_operator",
+                    "Admission record requires --operator-approved and all three confirmation flags."))?;
+            let confirmed_preview = validate_confirm_preview(&confirmed_preview)?;
+            apply_execution_record_confirmations(
+                &mut request.execution,
+                operator_approved,
+                confirm_approval,
+                confirm_envelope,
+            )?;
+            let confirmation = AdmissionConfirmation {
+                trusted_local_attested: true,
+                preview_digest: confirmed_preview,
+                approval_subject_digest: request
+                    .execution
+                    .confirm_approval_subject_digest
+                    .clone()
+                    .expect("CLI confirmation validated"),
+                envelope_digest: request
+                    .execution
+                    .confirm_envelope_digest
+                    .clone()
+                    .expect("CLI confirmation validated"),
+            };
+            let receipt = service
+                .record(&request, &confirmation)
+                .map_err(|e| admission_error(&service, binding, &request.binding.job_id, &e))?;
+            write_admission_receipt(binding, &receipt)
+        }
+        CoworkerAdmissionCommand::Inspect { job_id } => {
+            load_scoped_job(&workflow, binding, thread, &job_id)?;
+            let inspection = service
+                .inspect(binding, &job_id)
+                .map_err(|e| map_native_error(&e, false))?;
+            write_result(binding, &inspection, false)
+        }
+        CoworkerAdmissionCommand::Reconcile {
+            job_id,
+            request_key,
+        } => {
+            load_scoped_job(&workflow, binding, thread, &job_id)?;
+            let inspection = service
+                .inspect(binding, &job_id)
+                .map_err(|e| map_native_error(&e, false))?;
+            if inspection
+                .receipt
+                .as_ref()
+                .map(|r| r.preview.request.request_key.as_str())
+                != Some(request_key.as_str())
+            {
+                return Err(OperatorCliError::new(
+                    "invalid_input",
+                    "Reconciliation requires the original persisted admission request key.",
+                ));
+            }
+            let receipt = service
+                .reconcile(binding, &job_id)
+                .map_err(|e| admission_error(&service, binding, &job_id, &e))?;
+            write_admission_receipt(binding, &receipt)
+        }
+    }
+}
+
+fn ensure_admission_scope(
+    request: &AdmissionRequest,
+    binding: &str,
+    thread: &str,
+) -> Result<(), OperatorCliError> {
+    if request.binding.binding_id != binding
+        || request.binding.thread_uuid != thread
+        || request.execution.binding_id != binding
+        || request.execution.thread_uuid != thread
+        || request.execution.job_id != request.binding.job_id
+    {
+        return Err(OperatorCliError::new(
+            "scope_mismatch",
+            REQUEST_SCOPE_MISMATCH,
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2220,6 +2448,20 @@ async fn run_coworker_driver(
     thread: &str,
     req: CoworkerDriverRequest,
 ) -> Result<(), OperatorCliError> {
+    // Detached owners are new processes. Establish durability of already completed consent
+    // before opening their driver; this gate cannot finish a partial/Uncertain admission.
+    if matches!(
+        &subcommand,
+        CoworkerDriverCommand::RunOwner { .. }
+            | CoworkerDriverCommand::Ensure { .. }
+            | CoworkerDriverCommand::Reconcile { .. }
+    ) {
+        let workflow = open_grant_store(plans_dir)?;
+        let job = load_scoped_job(&workflow, binding, thread, &req.job_id)?;
+        let policy = open_controller_policy_store(plans_dir)?;
+        threadlane_native::coworker_admission::verify_complete_admission(&workflow, &policy, &job)
+            .map_err(|e| map_native_error(&e, false))?;
+    }
     let driver = CoworkerCodeDriver::open_from_dirs(
         state_dir,
         registry_dir,
@@ -2799,5 +3041,65 @@ mod tests {
             assert_eq!(globals.thread, THREAD);
             assert!(matches!(parsed.command, FlowCommand::CodeDriver(_)));
         }
+    }
+}
+
+#[cfg(test)]
+mod admission_cli_tests {
+    use super::*;
+
+    #[test]
+    fn admission_global_flags_parse_before_group_between_levels_and_after_operation() {
+        for args in [
+            vec![
+                "threadlane-flow",
+                "--binding",
+                "binding",
+                "coworker-admission",
+                "inspect",
+                "--job-id",
+                "job_a",
+            ],
+            vec![
+                "threadlane-flow",
+                "coworker-admission",
+                "--binding",
+                "binding",
+                "inspect",
+                "--job-id",
+                "job_a",
+            ],
+            vec![
+                "threadlane-flow",
+                "coworker-admission",
+                "inspect",
+                "--job-id",
+                "job_a",
+                "--binding",
+                "binding",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(args).unwrap();
+            assert_eq!(parsed.binding.as_deref(), Some("binding"));
+            assert!(matches!(
+                parsed.command,
+                FlowCommand::CoworkerAdmission(CoworkerAdmissionCommand::Inspect { .. })
+            ));
+        }
+        assert!(Cli::try_parse_from([
+            "threadlane-flow",
+            "coworker-admission",
+            "record",
+            "--request",
+            "/private/request.json",
+            "--operator-approved",
+            "--confirm-preview",
+            &"a".repeat(64),
+            "--confirm-approval",
+            &"b".repeat(64),
+            "--confirm-envelope",
+            &"c".repeat(64)
+        ])
+        .is_ok());
     }
 }

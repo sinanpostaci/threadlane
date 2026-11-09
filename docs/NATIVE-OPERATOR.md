@@ -16,7 +16,7 @@ Run `threadlane guide` to print the canonical versioned operating guide
 ([`docs/MCP-OPERATING-GUIDE.md`](MCP-OPERATING-GUIDE.md)) offline without network
 or supervisor access. When connected over MCP (`threadlane mcp` or enrolled
 `threadlane-native-mcp`), call the read-only `operating_guide` (`{}`) tool to
-fetch the same shared guide and version (`2026-11-08.v2`).
+fetch the same shared guide and version (`2026-11-09.v1`).
 
 Compaction detection and memory retention are not automatic. On initial
 connection, session resume, context uncertainty, or before external effects when
@@ -43,8 +43,15 @@ On a fresh chat without an active planning grant or execution approval:
 
 1. Before any planning model use, run `<context_router_executable> --context <context_path> flow grant-prepare --request <private_json>` and present the concrete planning permission preview to the human.
 2. Only after explicit human approval of that preview in chat, record the grant via `<context_router_executable> --context <context_path> flow grant-record --request <private_json> --confirm-preview <PREVIEW_SHA256> --operator-approved`.
-3. Request the actual `Orchestrator` technical plan (`prepare_work`, `request_technical_plan`, `planning_command`), prepare the concrete authority scope preview via `<context_router_executable> --context <context_path> approve prepare --request <private_json>` before requesting human execution approval, and present the plan together with that preview's resolved model/effort, write scopes/files, base commit, `subject_digest`, and planned execution-policy budgets to the human.
-4. Only after exact human execution approval of that presented scope in chat, record that preview (`approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`), then preview/record the matching frozen execution envelope (`flow coworker-execution preview` / `record`) and start only that approved execution (`start_execution`).
+3. Request the actual `Orchestrator` technical plan (`prepare_work`, `request_technical_plan`, `planning_command`). Obtain the exact authority approval for its recorded published planning result: run `<context_router_executable> --context <context_path> approve prepare --request <private_json>`, present the concrete Worker scope/models/efforts/pins, repository/base, budgets, concurrency and `subject_digest`, and record that unchanged authority request only after exact human approval using `approve record --request <private_json> --confirm-subject <SUBJECT_SHA256> --confirm-thread <THREAD_UUID> --operator-approved`. Authority record starts no execution and does not imply downstream controller powers.
+4. Before recording admission consent, run `<context_router_executable> --context <context_path> flow coworker-admission preview --request <private_admission_json>`. The request uses the exact existing approval ID, original job/ledger revisions, recorded planning result, execution policy, explicit capabilities, complete envelope and stable key/timestamp. Present ALL roles (configured Orchestrator/Architect and their separate planning authority, every Worker, Reviewer, Closure), resolved model/effort/canonical executable pins, dependencies/interfaces/write scope, repository/base/tree, concurrency and role/runtime/output budgets, checks, correction/attempt caps, and commit/integration powers. Distinguish configuration from historical role calls. Worker-only consent does not imply Reviewer, Closure, checks, corrections or Git.
+5. Only after the complete unchanged preview is confirmed, run `<context_router_executable> --context <context_path> flow coworker-admission record --request <private_admission_json> --operator-approved --confirm-preview <PREVIEW_SHA256> --confirm-approval <APPROVAL_SUBJECT_SHA256> --confirm-envelope <ENVELOPE_SHA256>`. An identical already-approved complete scope needs no redundant consent; any changed/expanded scope needs fresh preview and consent. JSON self-attestation alone grants nothing. Preserve the original request key, creation timestamp and source revisions; the returned `job_revision` is the original resulting linked revision, not a revision to copy back into the request.
+6. Inspect with `flow coworker-admission inspect --job-id <JOB_ID>` and read current MCP `preview_execution` readiness, then separately call `start_execution` with the returned frozen digest as `expected_envelope_digest`. Recording starts no host/provider/check/Git operation. Use explicit `flow coworker-admission reconcile --job-id <JOB_ID> --request-key <ORIGINAL_KEY>` after inspecting partial/uncertain persistence, never a replacement key or blind replay. The [admission reference](COWORKER-APPROVAL-ADMISSION.md) has full nested request/response shapes and the distinction between pure inspection and execution-time durability establishment.
+
+There is no MCP self-approval tool. Local flags attest the already-approved scope,
+not cryptographic human identity or native per-call provenance. When
+`operator_context.available` is false, report its actual code/message and required
+store/package configuration; do not invent a context or authority.
 
 ### Local loopback access and sandboxed execution
 
@@ -62,7 +69,7 @@ report the supervisor as offline without checking local loopback access:
   mechanism. Never disable sandboxing globally, alter firewall/system settings,
   install fixed bindings, edit global configuration, or restart the backend.
 - Keep executor permission distinct from Threadlane human preview approval.
-  Never run `grant-record`, `approve record`, `coworker-execution record`,
+  Never run `grant-record`, `approve record`, `coworker-admission record`/`reconcile`, `coworker-execution record`,
   writes, or model calls automatically on transport failure. After the route is
   confirmed, `flow grant-prepare` and `approve prepare` remain read-only preview
   commands; explicit human consent to the shown digest still precedes
@@ -149,7 +156,42 @@ Resolution can link a fresh plan/approval but cannot make an old frozen approval
 current again. Unsupported provider live input stays pending; it is never
 reported as delivered. See [conversation changes](CONVERSATION-CHANGES.md).
 
-## Execution and events
+## Automatic job execution and historical/manual routes
+
+Complete admission supplies the implemented controller driver/gateway. After
+separate `start_execution`, exact current frozen authorization can drive Workers,
+checks, Reviewer, bounded corrections, local integration and one accepted Closure.
+Use `execution_mode`, `pipeline_status` and `pipeline_report`; initial Worker
+completion or `AllTasksIntegrated` alone is not package completion. Fixture
+coverage is separate from installed-package/live-provider/original-chat acceptance.
+
+Admission preview/inspect are pure and do not sync or repair. A fresh inspection
+may report `state: "uncertain"` for `receipt.stage: "complete"` without a local
+witness. Deliberate execution gates may sync unchanged existing Complete
+persistence and reread it to establish durability without changing bytes/mtime,
+consent, revisions, counters or leases. Stored Uncertain/Intent/Linked/RuntimeRecorded
+still requires original-key reconcile; start never finishes incomplete admission.
+Historical inspection after plan supersession is not current execution eligibility.
+
+Do not mutate an old job/linkage/envelope to add powers. Conflicts require a new
+job or supported amendment/replan with exact reapproval and complete admission.
+An already matching manual linkage may opt in only if all immutable subjects
+match. New-admission Workers, Reviewer and Closure use canonical pins without
+PATH fallback; unmarked manual/legacy jobs retain their previous valid routes.
+The separate `flow coworker-execution preview|record|inspect` route remains
+available for manual envelope recording with its original two-digest confirmations.
+Older limited scopes may expose only diagnostic Phase 1 behavior.
+
+Larger runtime policies, decomposition rules, user-language role outputs with
+English code/comments, startup ergonomics, native UI status and observation
+performance remain follow-up work. Admission does not fix generic dispatch/change
+races or the missing-check-executable status/stop issue, nor prove power-loss safety.
+
+## Execution and events (manual approved-session route)
+
+The following existing approved-session commands remain available. They describe
+manual task dispatch and its review/integration limits, distinct from the complete
+automatic job route above.
 
 Start `threadlane-host serve` explicitly for the recorded approval with the same
 stores. Session reads never launch a host. Notifications are a separate,

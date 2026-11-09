@@ -27,6 +27,7 @@
 //!   process-group watcher, and gracefully drains finite in-flight check/`Reviewer`/`Closure`
 //!   calls under the held physical guard while fencing stage promotion.
 
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -52,6 +53,7 @@ use threadlane_workflow::WorkflowRole;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
+use crate::coworker_workflow::pipeline::LiveCompletionEffects;
 use crate::coworker_workflow::{
     compute_derived_coder_effect_id, derived_execution_report_file_path,
     deterministic_controller_instance_id, deterministic_prefixed_id, sha256_hex,
@@ -1476,6 +1478,10 @@ impl CoworkerCodeDriver {
             .as_ref()
             .map(CoworkerPipelineDriver::subscribe_in_flight_stages);
 
+        let live_completion_effects_rx = pipeline_driver
+            .as_ref()
+            .map(CoworkerPipelineDriver::subscribe_live_completion_effects);
+
         let mut steps_completed = 0u32;
         let mut last_step_report: Option<CoworkerControllerStepReport> = None;
         let mut last_pipeline_report: Option<CoworkerDriverPipelineReport> = initial_prev_state
@@ -1619,6 +1625,7 @@ impl CoworkerCodeDriver {
                             host_session.mode,
                             effective_mode,
                             in_flight_stages_rx.as_ref(),
+                            live_completion_effects_rx.as_ref(),
                             false,
                             &last_step_report,
                             &last_pipeline_report,
@@ -1676,6 +1683,7 @@ impl CoworkerCodeDriver {
                                 host_session.mode,
                                 effective_mode,
                                 in_flight_stages_rx.as_ref(),
+                                live_completion_effects_rx.as_ref(),
                                 false,
                                 &last_step_report,
                                 &last_pipeline_report,
@@ -1750,6 +1758,7 @@ impl CoworkerCodeDriver {
                                         host_session.mode,
                                         effective_mode,
                                         in_flight_stages_rx.as_ref(),
+                                        live_completion_effects_rx.as_ref(),
                                         true,
                                         &last_step_report,
                                         &last_pipeline_report,
@@ -2885,7 +2894,60 @@ impl CoworkerCodeDriver {
                     "FullAutomaticPipeline mode requires an initialized CoworkerPipelineDriver.",
                 )
             })?;
-            let tick_report = Box::pin(drv.tick(now_ms.max(1))).await?;
+            // Once every task is integrated, continuously poll the retained completion
+            // future through subprocess exit, private artifact persistence and post-effect
+            // fencing. Generic pipeline ticks remain bounded. The owner RPC select keeps
+            // status and durable stop reachable throughout this frozen-budget drain.
+            let completing = drv
+                .in_flight_stages()
+                .iter()
+                .any(|stage| stage.kind == CoworkerPipelineInFlightStageKind::JobCompletion);
+            let tick_report = if completing {
+                let lease = session
+                    .verify_admission()?
+                    .runtime_state
+                    .lease
+                    .ok_or_else(|| {
+                        NativeError::new(
+                            NativeErrorCode::ValidationFailed,
+                            "missing completion lease",
+                        )
+                    })?;
+                let ttl_ms = crate::coworker_workflow::DEFAULT_CONTROLLER_LEASE_TTL_MS;
+                let mut drain = Box::pin(drv.drain_in_flight(now_ms.max(1)));
+                loop {
+                    tokio::select! {
+                        biased;
+                        report = &mut drain => break report?,
+                        () = tokio::time::sleep(Duration::from_millis((ttl_ms / 4).max(1))) => {
+                            // Renew only the same still-active lease under the actual held
+                            // physical guard. Never reacquire an expired/released epoch while
+                            // a post-effect completion is awaiting its frozen-budget result.
+                            let owner = session.guard().validate_before_effect(key)?;
+                            let renewal_ms = current_time_ms();
+                            self.controller.policy_store().mutate_job_runtime(
+                                &key.binding_id, &key.job_id, &lease.instance_id, lease.lease_epoch,
+                                |runtime| {
+                                    let current = runtime.lease.as_mut().ok_or_else(|| {
+                                        NativeError::new(NativeErrorCode::ValidationFailed, "missing completion lease")
+                                    })?;
+                                    if !completion_lease_matches_live_owner(current, key, owner, renewal_ms) {
+                                        return Err(NativeError::new(
+                                            NativeErrorCode::ValidationFailed,
+                                            "completion lease is stale; refusing epoch replacement",
+                                        ));
+                                    }
+                                    current.acquired_at_ms = renewal_ms;
+                                    current.expires_at_ms = renewal_ms.saturating_add(ttl_ms);
+                                    Ok(())
+                                },
+                            )?;
+                        }
+                    }
+                }
+            } else {
+                Box::pin(drv.tick(now_ms.max(1))).await?
+            };
             if tick_report.status == CoworkerPipelineStatus::Stopped {
                 draining_after_stop = !tick_report.in_flight_stages.is_empty();
             } else {
@@ -3132,6 +3194,7 @@ impl CoworkerCodeDriver {
         in_flight_stages_rx: Option<
             &tokio::sync::watch::Receiver<Vec<CoworkerPipelineInFlightStageRef>>,
         >,
+        live_completion_effects_rx: Option<&tokio::sync::watch::Receiver<LiveCompletionEffects>>,
         step_in_progress: bool,
         last_step_report: &Option<CoworkerControllerStepReport>,
         last_pipeline_report: &Option<CoworkerDriverPipelineReport>,
@@ -3289,6 +3352,7 @@ impl CoworkerCodeDriver {
                 last_step_report.clone(),
                 last_pipeline_report.clone(),
                 live_in_flight_stages,
+                live_completion_effects_rx.map_or_else(BTreeMap::new, |rx| rx.borrow().clone()),
                 *draining_after_stop,
             )
             .ok();
@@ -4048,6 +4112,7 @@ impl CoworkerCodeDriver {
         step_report: Option<CoworkerControllerStepReport>,
         mut pipeline_report: Option<CoworkerDriverPipelineReport>,
         live_in_flight_stages: Vec<CoworkerPipelineInFlightStageRef>,
+        live_completion_effects: LiveCompletionEffects,
         draining_after_stop: bool,
     ) -> Result<CoworkerDriverStatusReport, NativeError> {
         let step_report = step_report.or_else(|| {
@@ -4058,6 +4123,13 @@ impl CoworkerCodeDriver {
         });
         let mut inspection = self.inspect_scoped_job_readonly(key)?;
         if effective_mode == CoworkerDriverExecutionMode::FullAutomaticPipeline {
+            filter_live_owned_completion_reservations(
+                &mut inspection,
+                key,
+                verified_owner_summary,
+                &live_in_flight_stages,
+                &live_completion_effects,
+            );
             filter_live_owned_in_flight_review_reservations(
                 &mut inspection,
                 &live_in_flight_stages,
@@ -4150,7 +4222,22 @@ impl CoworkerCodeDriver {
                 for id in prev_rep.promoted_dependency_ready_task_ids {
                     push_unique_id(&mut synth_rep.promoted_dependency_ready_task_ids, &id);
                 }
-                if synth_rep.completion_summary.is_none() {
+                if synth_rep.completion_summary.is_none()
+                    && !live_in_flight_stages
+                        .iter()
+                        .any(|stage| stage.kind == CoworkerPipelineInFlightStageKind::JobCompletion)
+                    && inspection
+                        .job
+                        .combined_candidates
+                        .last()
+                        .is_none_or(|candidate| {
+                            matches!(
+                                candidate.status,
+                                CombinedCandidateStatus::ClosureAccepted
+                                    | CombinedCandidateStatus::Rejected
+                            )
+                        })
+                {
                     synth_rep.completion_summary = prev_rep.completion_summary;
                 }
             }
@@ -4566,8 +4653,33 @@ impl CoworkerCodeDriver {
             .iter()
             .find(|c| c.status == CombinedCandidateStatus::ClosureAccepted);
 
-        if let Some(cand) = accepted_candidate.or_else(|| inspection.job.combined_candidates.last())
+        let completion_in_flight = in_flight_stages
+            .iter()
+            .any(|stage| stage.kind == CoworkerPipelineInFlightStageKind::JobCompletion);
+        let terminal_candidate = accepted_candidate
+            .filter(|_| inspection.job.phase == CoworkerJobPhase::Completed)
+            .or_else(|| {
+                inspection
+                    .job
+                    .combined_candidates
+                    .last()
+                    .filter(|candidate| candidate.status == CombinedCandidateStatus::Rejected)
+            });
+        if completion_in_flight
+            || inspection
+                .job
+                .combined_candidates
+                .last()
+                .is_some_and(|candidate| {
+                    matches!(
+                        candidate.status,
+                        CombinedCandidateStatus::ChecksVerified
+                            | CombinedCandidateStatus::ClosureReserved
+                    )
+                })
         {
+            base.completion_summary = None;
+        } else if let Some(cand) = terminal_candidate {
             if base.completion_summary.is_none() {
                 base.completion_summary = Some(CoworkerDriverCompletionSummary {
                     status: if inspection.job.phase == CoworkerJobPhase::Completed
@@ -4594,7 +4706,9 @@ impl CoworkerCodeDriver {
                     final_candidate_subject_digest: None,
                     closure_reservation_id: cand.closure_reservation_id.clone(),
                     closure_attempt_id: None,
-                    reused_cached_closure_verdict: true,
+                    // Read-only projection observes accepted/rejected state; it did not
+                    // execute a cache lookup. Only an actual completion outcome proves reuse.
+                    reused_cached_closure_verdict: false,
                     closure_verdict_kind: if cand.status == CombinedCandidateStatus::ClosureAccepted
                     {
                         Some(ClosureVerdictKind::Accepted)
@@ -5981,6 +6095,104 @@ fn current_time_ms() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
+fn completion_reservation_matches_live_effect(
+    effect: &PendingControllerEffect,
+    live_effects: &LiveCompletionEffects,
+    lease: &ControllerJobLeaseRecord,
+) -> bool {
+    effect.status == PendingControllerEffectStatus::ReservedBeforeEffect
+        && effect.task_id.is_none()
+        && effect.attempt_no.is_none()
+        && matches!(
+            effect.kind,
+            PendingControllerEffectKind::ClosureInvocation
+                | PendingControllerEffectKind::JobAggregation
+                | PendingControllerEffectKind::CheckExecution
+        )
+        && live_effects
+            .get(&effect.effect_id)
+            .is_some_and(|(owned, instance_id, epoch)| {
+                owned == effect && instance_id == &lease.instance_id && *epoch == lease.lease_epoch
+            })
+}
+
+fn completion_lease_matches_live_owner(
+    lease: &ControllerJobLeaseRecord,
+    key: &CoworkerJobOwnershipKey,
+    verified_owner: &CoworkerOwnershipSummary,
+    now_ms: u64,
+) -> bool {
+    verified_owner.validate_for_key(key).is_ok()
+        && lease.is_active_at(now_ms)
+        && lease.lease_epoch > 0
+        && lease.expires_at_ms > lease.acquired_at_ms
+        && lease.job_id == key.job_id
+        && lease.binding_id == key.binding_id
+        && lease.instance_id
+            == deterministic_controller_instance_id(
+                &key.binding_id,
+                &key.job_id,
+                &verified_owner.instance_id,
+            )
+}
+
+fn filter_live_owned_completion_reservations(
+    inspection: &mut ReadonlyScopedJobInspection,
+    key: &CoworkerJobOwnershipKey,
+    verified_owner: &CoworkerOwnershipSummary,
+    stages: &[CoworkerPipelineInFlightStageRef],
+    live_effects: &LiveCompletionEffects,
+) {
+    let job = &inspection.job;
+    let runtime = &inspection.runtime_state;
+    if verified_owner.validate_for_key(key).is_err()
+        || job.binding_id != key.binding_id
+        || job.thread_uuid != key.thread_uuid
+        || job.job_id != key.job_id
+        || runtime.job_id != key.job_id
+        || runtime.envelope.binding_id != key.binding_id
+        || runtime.envelope.thread_uuid != key.thread_uuid
+        || job.tasks.is_empty()
+        || job
+            .tasks
+            .iter()
+            .any(|task| task.stage != CoworkerTaskStage::Integrated)
+        || !stages.iter().any(|stage| {
+            stage.kind == CoworkerPipelineInFlightStageKind::JobCompletion
+                && stage.task_id.is_none()
+                && stage.attempt_no.is_none()
+        })
+        || !runtime.lease.as_ref().is_some_and(|lease| {
+            completion_lease_matches_live_owner(lease, key, verified_owner, current_time_ms())
+        })
+        || runtime
+            .pending_effects
+            .values()
+            .any(|effect| effect.status == PendingControllerEffectStatus::EffectUnknown)
+        || job
+            .outbox
+            .iter()
+            .any(|outbox| outbox.status == OutboxDispatchStatus::EffectUnknown)
+    {
+        return;
+    }
+    // This is a copy used only by the authenticated held owner's RPC response. The watch
+    // contains only effects newly persisted inside its current completion future. Metadata,
+    // a matching stage kind, a recovered reservation, or a stale owner cannot populate it.
+    let lease = runtime
+        .lease
+        .as_ref()
+        .expect("verified completion lease")
+        .clone();
+    inspection
+        .runtime_state
+        .pending_effects
+        .retain(|_, effect| {
+            effect.job_id != key.job_id
+                || !completion_reservation_matches_live_effect(effect, live_effects, &lease)
+        });
+}
+
 fn reserved_check_matches_live_stage(
     effect: &crate::coworker_workflow::PendingControllerEffect,
     stage: &CoworkerPipelineInFlightStageRef,
@@ -6041,14 +6253,7 @@ fn filter_live_owned_in_flight_check_reservations(
                                 && task.stage == CoworkerTaskStage::ReadyForReview
                         })
                 }
-                None => {
-                    spec.required_for_candidate_closure
-                        && !job.tasks.is_empty()
-                        && job
-                            .tasks
-                            .iter()
-                            .all(|task| task.stage == CoworkerTaskStage::Integrated)
-                }
+                None => false,
             }
         })
         .map(|effect| effect.effect_id.clone())
@@ -7015,6 +7220,118 @@ mod live_check_projection_tests {
         assert!(!interrupted
             .iter()
             .any(|stage| reserved_check_matches_live_stage(&final_check, stage)));
+    }
+
+    #[test]
+    fn completion_projection_requires_exact_new_effect_and_never_hides_unknown() {
+        let mut effect = check_effect();
+        effect.task_id = None;
+        effect.attempt_no = None;
+        let lease = ControllerJobLeaseRecord {
+            job_id: effect.job_id.clone(),
+            binding_id: "binding-current".into(),
+            instance_id: "controller-current".into(),
+            lease_epoch: 1,
+            acquired_at_ms: 1,
+            expires_at_ms: 100,
+            active: true,
+        };
+        for kind in [
+            PendingControllerEffectKind::CheckExecution,
+            PendingControllerEffectKind::ClosureInvocation,
+            PendingControllerEffectKind::JobAggregation,
+        ] {
+            effect.kind = kind;
+            let live = BTreeMap::from([(
+                effect.effect_id.clone(),
+                (effect.clone(), lease.instance_id.clone(), lease.lease_epoch),
+            )]);
+            assert!(completion_reservation_matches_live_effect(
+                &effect, &live, &lease
+            ));
+            let mut different_epoch = lease.clone();
+            different_epoch.lease_epoch += 1;
+            assert!(!completion_reservation_matches_live_effect(
+                &effect,
+                &live,
+                &different_epoch
+            ));
+            assert!(!completion_reservation_matches_live_effect(
+                &effect,
+                &BTreeMap::new(),
+                &lease
+            ));
+            let mut changed = effect.clone();
+            changed.status = PendingControllerEffectStatus::EffectUnknown;
+            assert!(!completion_reservation_matches_live_effect(
+                &changed, &live, &lease
+            ));
+            changed = effect.clone();
+            changed.request_key.push_str("-old");
+            assert!(!completion_reservation_matches_live_effect(
+                &changed, &live, &lease
+            ));
+            changed = effect.clone();
+            changed.subject_digest = "b".repeat(64);
+            assert!(!completion_reservation_matches_live_effect(
+                &changed, &live, &lease
+            ));
+            changed = effect.clone();
+            changed.external_correlation_id = Some("old-attempt".into());
+            assert!(!completion_reservation_matches_live_effect(
+                &changed, &live, &lease
+            ));
+        }
+    }
+
+    #[test]
+    fn completion_projection_rejects_expired_and_different_physical_owner_leases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("owner");
+        prepare_private_dir(&root, "test_owner_root").unwrap();
+        let store = CoworkerJobOwnershipStore::new(&root).unwrap();
+        let key = CoworkerJobOwnershipKey::new(
+            "binding_a",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "job_a",
+        )
+        .unwrap();
+        let guard = store.try_acquire_job_option(&key, 100).unwrap().unwrap();
+        let owner = guard.validate_before_effect(&key).unwrap().clone();
+        let lease = ControllerJobLeaseRecord {
+            job_id: key.job_id.clone(),
+            binding_id: key.binding_id.clone(),
+            instance_id: deterministic_controller_instance_id(
+                &key.binding_id,
+                &key.job_id,
+                &owner.instance_id,
+            ),
+            lease_epoch: 1,
+            acquired_at_ms: 100,
+            expires_at_ms: 200,
+            active: true,
+        };
+        assert!(completion_lease_matches_live_owner(
+            &lease, &key, &owner, 150
+        ));
+        assert!(!completion_lease_matches_live_owner(
+            &lease, &key, &owner, 200
+        ));
+        let mut stale = lease.clone();
+        stale.active = false;
+        assert!(!completion_lease_matches_live_owner(
+            &stale, &key, &owner, 150
+        ));
+        stale = lease.clone();
+        stale.instance_id = "stale-owner".into();
+        assert!(!completion_lease_matches_live_owner(
+            &stale, &key, &owner, 150
+        ));
+        stale = lease;
+        stale.lease_epoch = 0;
+        assert!(!completion_lease_matches_live_owner(
+            &stale, &key, &owner, 150
+        ));
     }
 
     #[test]

@@ -2,12 +2,22 @@
 
 `threadlane-flow` provides the trusted-local operator CLI subcommand group `coworker-execution` (visible alias `execution-envelope`) to preview, record, and inspect frozen Coworker controller execution envelopes (`FrozenControllerExecutionEnvelope` and `ControllerJobRuntimeState`).
 
+For a newly planned automatic job, use the complete
+[approval admission route](COWORKER-APPROVAL-ADMISSION.md): obtain the exact existing
+authority approval, preview the complete job/roles/powers, record only the unchanged
+confirmed preview, inspect readiness, then separately call `start_execution` with
+the returned frozen digest. `coworker-execution` below remains the valid separate
+manual envelope route; it does not bind a published planning result or create the
+complete admission intent/marker. Worker-only approval does not imply Reviewer,
+Closure, checks, corrections or Git powers. An identical already-approved complete
+scope needs no redundant consent; any change requires fresh consent.
+
 ## Scope and Architectural Boundaries
 
 - **Native Codex remains the human interface**: The human operator stays in native Codex; no separate desktop panel is required.
-- **Model-less native Coworker**: The conversational Coworker is selected by the user in Codex, has no workflow profile model slot, and never borrows profile models. Headless roles (`Coder`, `Reviewer`, `Closure`, `Orchestrator`, `Architect`) must resolve to `RoleExecutionRoute::HeadlessWorker` and never `ToolAdapter::CodexCli` (`NativeHandoff`).
+- **Model-less native Coworker**: The conversational Coworker is selected by the user in Codex, has no workflow profile model slot, and never borrows profile models. Executable roles must resolve to `RoleExecutionRoute::HeadlessWorker` under exact policy/profile validation. Generic Codex CLI routing remains native; explicit read-only advisory normalization and complete approved Codex Coder contracts have their separate supported routes. See [Codex advisory workers](CODEX-ADVISORY.md) and [Codex Coder](CODEX-CODER.md).
 - **Configuration recording only**: `coworker-execution` validates and persists controller policy configuration in `plans_dir` (`coworker-controller-<tag>.json`, mode `0600`). It **never** starts or invokes any model, headless worker, check binary, or Git worktree/integration operation itself.
-- **Downstream phases**: Automatic controller scheduling/driving and paired MCP exposure of controller execution envelopes belong to subsequent phases and are not yet active through this CLI.
+- **Separate execution**: The controller driver and paired MCP execution gateway are implemented. Under complete current frozen authorization, `start_execution` drives Workers, checks, Reviewer, bounded corrections, local integration and one accepted Closure. This recording CLI starts none of them. Inspect `execution_mode`, `pipeline_status` and `pipeline_report`; older scopes may retain only diagnostic Phase 1 behavior. Fixture coverage does not establish installed-package or live-provider acceptance.
 - **Local attestation boundary**: `--operator-approved` records trusted-local operator attestation (`operator_attested: true`), not cryptographic proof of human intent or per-call chat provenance (`native_per_call_identity_verified` is always `false`). JSON fields, model output, or MCP prose can never self-approve.
 
 ## CLI Invocations and Flag Positions
@@ -71,7 +81,41 @@ The `--request <ABS>` file must be a private (`0600`) JSON object (`#[serde(deny
 - **Git Powers, Check-Failure Correction Capability & Optional Receipts**: `allow_task_worktree_commits: bool`, `allow_run_integration_execution: bool` (requires `local_git_integration_allowed: true` in the capability envelope), `default_integration_strategy: IntegrationStrategy` (`fast_forward_only` or `merge_no_ff`), optional `independence_completeness_receipt: Option<DeclaredIndependenceCompletenessReceipt>`, and optional `shadow_jev_policy: Option<ShadowJevAdvisorPolicy>` (`mode` must be `shadow`). Automatic failed-check correction preparation (`allow_check_failure_corrections`) is derived directly from the job's frozen `FrozenControllerCapabilityEnvelope` (`cap_env.allow_check_failure_corrections && max_in_scope_corrections_per_task > 0`), defaults to `false` (preserving byte-identical v1 digests when `false` and using a domain-separated v2 digest when `true`), and cannot be enabled by mutating an already-frozen approval or execution envelope.
 - **Attestation Fields**: `operator_attested: bool` (`false` in preview requests), plus optional `confirm_approval_subject_digest: Option<String>` and `confirm_envelope_digest: Option<String>` (governed by CLI flags on `record`).
 
+## Admission persistence and immutable scope
+
+The complete admission CLI uses `coworker-admission record` with
+`--operator-approved`, `--confirm-preview`, `--confirm-approval` and
+`--confirm-envelope`; the manual `coworker-execution record` above intentionally
+retains its existing two-digest format. JSON self-attestation grants no authority
+on either route. Do not replace complete admission with a manual envelope write
+to bypass its persistence fence. Marked jobs require the original complete
+receipt and frozen canonical Worker/Reviewer/Closure pins, with no PATH fallback.
+
+Pure admission preview/inspect never lock, sync or repair persistence. In a fresh
+process, inspect may report `state: "uncertain"` for a valid stored
+`receipt.stage: "complete"` without a local durability witness. Deliberate execution
+gates may sync unchanged existing Complete persistence and reread it to establish
+that witness. They never finish an incomplete admission. Stored `uncertain`,
+`intent`, `linked` or `runtime_recorded` requires explicit original-key
+`coworker-admission reconcile`; conflicts cannot be overwritten. Preserve source
+revisions, request key, timestamp and all consent digests through recovery.
+See the [admission reference](COWORKER-APPROVAL-ADMISSION.md) for response shapes.
+
+A linkage or execution-envelope conflict cannot be repaired by editing an old
+job/approval. Use a new job or supported amendment/replan with exact reapproval
+and complete-scope admission. An exactly matching manual linkage may opt in only
+when all immutable subjects match. Historical inspection after supersession is
+not permission to execute. Legacy/manual jobs without intent/marker retain their
+prior valid routes and limitations.
+
 ## Behavioral Test Coverage
+
+The following lists describe regression sources, not completed gates for this
+package. Admission CLI fixtures are in `coworker_admission_cli.rs`; foundation and
+controller policy fixtures are in `coworker_admission.rs` and
+`coworker_controller_policy.rs`. They use disposable state and fake providers.
+Formatting, combined behavioral validation and Clippy belong to the parent; no
+installed/live-provider or power-loss acceptance is claimed here.
 
 - **`crates/threadlane-native/tests/coworker_execution_cli.rs` (5 integration tests)**:
   - `help_and_invalid_coworker_execution_cli_arguments_use_bounded_error_envelope`

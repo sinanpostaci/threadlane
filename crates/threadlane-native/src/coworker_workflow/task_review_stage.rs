@@ -1105,16 +1105,22 @@ fn resolve_frozen_reviewer_route(
             ),
         ));
     }
-    let executable = resolve_advisory_tool_executable(tool_def).map_err(|err| {
-        NativeError::new(
-            NativeErrorCode::UnsupportedCapability,
-            format!(
-                "frozen Reviewer tool `{}` executable is unavailable: {}",
-                reviewer_choice.tool_id,
-                err.message()
-            ),
-        )
-    })?;
+    let executable = match crate::coworker_admission::complete_admission_pins(
+        controller.workflow_store(),
+        controller.policy_store(),
+        &adm.job,
+    )? {
+        Some(pins) => {
+            if pins.reviewer.choice != reviewer_choice {
+                return Err(NativeError::new(
+                    NativeErrorCode::ValidationFailed,
+                    "Admission Reviewer pin differs from frozen envelope",
+                ));
+            }
+            pins.reviewer.executable()?.to_path_buf()
+        }
+        None => resolve_advisory_tool_executable(tool_def)?,
+    };
 
     let provider = match reviewer_choice.adapter {
         ToolAdapter::Antigravity => WorkerProvider::Antigravity,

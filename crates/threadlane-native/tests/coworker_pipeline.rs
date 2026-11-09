@@ -2074,3 +2074,922 @@ mod coworker_owner_failure;
 
 #[path = "support/coworker_progress_attention.rs"]
 mod coworker_progress_attention;
+
+mod coworker_completion_durability {
+    use super::*;
+    use threadlane_native::coworker_workflow::controller_policy::TaskAttemptExecutionArtifacts;
+    use threadlane_native::coworker_workflow::job_completion::{
+        candidate_check_report_file_path, job_integration_report_file_path,
+        read_persisted_candidate_check_report, read_persisted_job_integration_report,
+        CompletionArtifactFaultStep, CompletionArtifactKind, ScopedCompletionArtifactFaultGuard,
+    };
+    use threadlane_native::coworker_workflow::{
+        CandidateCheckEvidence, FinalizeTaskOutboxRequest, OutboxDispatchKind,
+    };
+    use threadlane_native::coworker_workflow::{
+        OutboxDispatchStatus, RecordTaskReviewVerdictRequest, ReserveTaskOutboxRequest,
+    };
+    use threadlane_native::coworker_workflow::{StructuredReviewVerdict, TaskCandidateRef};
+    use threadlane_operations::{
+        accept_review_subject, commit_task_worktree_changes, execute_integration,
+        inspect_review_subject, CommitTaskChangesRequest, ExecuteIntegrationRequest,
+        InspectReviewSubjectRequest, ReviewAcceptanceRequest, ReviewPolicyBinding,
+        TestEvidenceSummary,
+    };
+    use threadlane_workers::{WorkerFilePermissions, WorkerRunStatus, WorktreeManager};
+
+    async fn prepare_single_task_integrated_job_for_completion(
+        fixture: &PipelineTestFixture,
+        tag: &str,
+    ) -> (CoworkerJobRecord, threadlane_host::ApprovedHostHandle) {
+        let tasks = vec![PlanTask {
+            id: "task-root-a".to_string(),
+            title: "Root task A".to_string(),
+            instruction: "CTRL_TASK_A implement src/a.rs".to_string(),
+            role: WorkflowRole::Coder,
+            difficulty: Difficulty::Hard,
+            depends_on: Vec::new(),
+            allowed_write_paths: vec!["src/a.rs".to_string()],
+        }];
+        let mut iface_map = BTreeMap::new();
+        iface_map.insert(
+            "task-root-a".to_string(),
+            TaskInterfaceOwnershipSpec {
+                owned_interfaces: vec!["iface_a".to_string()],
+                consumed_interfaces: Vec::new(),
+            },
+        );
+        let (job, approval_id) = Box::pin(create_planned_approved_and_frozen_job(
+            fixture,
+            &format!("brf_dur_{tag}"),
+            &format!("plan-dur-{tag}"),
+            tasks,
+            iface_map,
+            vec!["src/a.rs".to_string()],
+            1,
+            ExecutionBudgets::default(),
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+            IntegrationStrategy::FastForwardOnly,
+            true,
+        ))
+        .await;
+
+        let host = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        )))
+        .await
+        .expect("start real fixture host before creating owned worktrees");
+
+        let session_dir = fixture.sessions_dir.join(&approval_id);
+        let raw_work_area = session_dir.join("work-area");
+        fs::create_dir_all(&raw_work_area).expect("create session work-area");
+        fs::set_permissions(&session_dir, fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 session_dir");
+        fs::set_permissions(&raw_work_area, fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700 session work-area");
+        let work_area_root = fs::canonicalize(&raw_work_area).expect("canonicalize work_area_root");
+
+        let run_id = format!("run_orig_{tag}");
+        let manager =
+            WorktreeManager::new(&fixture.repo_dir, &work_area_root, &fixture.base_commit)
+                .expect("WorktreeManager::new");
+        let orig_int_manifest = manager
+            .create_run_worktree_with_token(&run_id, "int01")
+            .expect("create original RunIntegration worktree");
+        let allowed_paths = BTreeSet::from(["src/a.rs".to_string()]);
+        let task_manifest = manager
+            .create_task_worktree_with_token(&run_id, "task-root-a", "tok01", &allowed_paths)
+            .expect("create task worktree");
+        fs::write(
+            task_manifest.checkout_path.join("src/a.rs"),
+            "pub fn a() -> u32 { 101 }\n",
+        )
+        .expect("write task src/a.rs");
+
+        commit_task_worktree_changes(&CommitTaskChangesRequest {
+            work_area_root: work_area_root.clone(),
+            task_worktree_id: task_manifest.worktree_id.clone(),
+            commit_message: "Implement task-root-a".to_string(),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+            allow_missing_effort_evidence: false,
+        })
+        .expect("commit task changes");
+
+        let test_evidence = TestEvidenceSummary {
+            formatting_passed: true,
+            clippy_passed: true,
+            tests_passed: true,
+            passed_test_count: 1,
+            failed_test_count: 0,
+            evidence_summary: "cargo test passed".to_string(),
+        };
+        let subject = inspect_review_subject(&InspectReviewSubjectRequest {
+            work_area_root: work_area_root.clone(),
+            task_worktree_id: task_manifest.worktree_id.clone(),
+            policy: ReviewPolicyBinding {
+                policy_id: "policy-coworker-exec".to_string(),
+                codex_launch_report: None,
+                codex_source_report_sha256: None,
+                requested_provider: Some("antigravity".to_string()),
+                requested_model: Some("gemini-4-argon-high".to_string()),
+                requested_effort: Some("high".to_string()),
+                observed_model: Some("gemini-4-argon-high".to_string()),
+                observed_effort: Some("high".to_string()),
+                file_permissions: WorkerFilePermissions::TaskFiles,
+                require_effort_evidence: true,
+                require_passing_tests: true,
+            },
+            test_evidence: test_evidence.clone(),
+            worker_status: Some(WorkerRunStatus::Succeeded),
+        })
+        .expect("inspect review subject");
+
+        let review_receipt = accept_review_subject(&ReviewAcceptanceRequest {
+            subject: subject.clone(),
+            expected_subject_digest: subject.subject_digest.clone(),
+            reviewer_id: "op_controller".to_string(),
+            review_note: "Approved task-root-a".to_string(),
+            approved_at_ms: 3_000,
+            receipt_id: Some(format!("rev_orig_{tag}")),
+        })
+        .expect("accept review subject");
+
+        let integration_receipt = execute_integration(&ExecuteIntegrationRequest {
+            work_area_root: work_area_root.clone(),
+            integration_worktree_id: orig_int_manifest.worktree_id.clone(),
+            task_worktree_id: task_manifest.worktree_id.clone(),
+            subject: subject.clone(),
+            review_receipt: review_receipt.clone(),
+            strategy: IntegrationStrategy::FastForwardOnly,
+            expected_integration_head_commit: fixture.base_commit.clone(),
+            expected_task_head_commit: review_receipt.task_head_commit.clone(),
+            expected_source_head_commit: fixture.base_commit.clone(),
+            operator_id: "op_controller".to_string(),
+            integrated_at_ms: 3_010,
+            receipt_id: Some(format!("int_orig_{tag}")),
+        })
+        .expect("execute original per-task integration");
+
+        let policy_digest = job
+            .approval_linkage
+            .as_ref()
+            .expect("approval linkage")
+            .policy_digest
+            .clone();
+        let approved_command_key = fixture
+            .authority
+            .get_for_operator_readonly(&approval_id)
+            .expect("read exact fixture approval")
+            .tasks
+            .into_iter()
+            .find(|task| task.task_id == "task-root-a")
+            .expect("approved root task")
+            .command_key
+            .expect("frozen dispatch command key");
+        let (job, att_outbox) = fixture
+            .workflow_store
+            .reserve_task_outbox(&ReserveTaskOutboxRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: approved_command_key,
+                kind: OutboxDispatchKind::TaskAttemptDispatch,
+                task_id: "task-root-a".to_string(),
+                role: WorkflowRole::Coder,
+                subject_digest: review_receipt.subject_digest.clone(),
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+            })
+            .expect("reserve attempt outbox");
+        let (job, _) = fixture
+            .workflow_store
+            .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                outbox_id: att_outbox.outbox_id,
+                status: OutboxDispatchStatus::DispatchedEffectConfirmed,
+                next_task_stage: CoworkerTaskStage::ReadyForReview,
+                run_id: Some(run_id.clone()),
+                worker_id: Some(format!("wrk_coder_{tag}")),
+                task_worktree_id: Some(task_manifest.worktree_id.clone()),
+                head_commit: Some(review_receipt.task_head_commit.clone()),
+                tree_sha: Some(review_receipt.task_tree_sha.clone()),
+                diff_digest: Some(review_receipt.diff_digest.clone()),
+                report_artifact_id: Some(format!("art_coder_{tag}")),
+                observed_model: Some("gemini-4-argon-high".to_string()),
+                observed_effort: Some("high".to_string()),
+                receipt_id: None,
+                diagnostic: None,
+            })
+            .expect("finalize attempt outbox");
+        let (job, rev_outbox) = fixture
+            .workflow_store
+            .reserve_task_outbox(&ReserveTaskOutboxRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: format!("req_rev_{tag}"),
+                kind: OutboxDispatchKind::TaskReviewDispatch,
+                task_id: "task-root-a".to_string(),
+                role: WorkflowRole::Reviewer,
+                subject_digest: review_receipt.subject_digest.clone(),
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+            })
+            .expect("reserve review outbox");
+        let (job, _) = fixture
+            .workflow_store
+            .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                outbox_id: rev_outbox.outbox_id,
+                status: OutboxDispatchStatus::DispatchedEffectConfirmed,
+                next_task_stage: CoworkerTaskStage::UnderReview,
+                run_id: Some(run_id.clone()),
+                worker_id: Some(format!("wrk_rev_{tag}")),
+                task_worktree_id: Some(task_manifest.worktree_id.clone()),
+                head_commit: None,
+                tree_sha: None,
+                diff_digest: None,
+                report_artifact_id: Some(format!("art_rev_{tag}")),
+                observed_model: Some("gemini-4-argon-high".to_string()),
+                observed_effort: Some("high".to_string()),
+                receipt_id: None,
+                diagnostic: None,
+            })
+            .expect("finalize review outbox");
+
+        let candidate_id = format!("cnd_{tag}_01");
+        let check_ev = CandidateCheckEvidence {
+            check_id: "cargo_test".to_string(),
+            command_summary: "cargo test".to_string(),
+            passed: true,
+            exit_code: 0,
+            evidence_digest: "aa".repeat(32),
+        };
+        let (job, _) = fixture
+            .workflow_store
+            .record_task_candidate_and_verdict(&RecordTaskReviewVerdictRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                candidate: TaskCandidateRef {
+                    candidate_id: candidate_id.clone(),
+                    task_id: "task-root-a".to_string(),
+                    attempt_no: 1,
+                    base_commit: review_receipt.base_commit.clone(),
+                    head_commit: review_receipt.task_head_commit.clone(),
+                    tree_sha: review_receipt.task_tree_sha.clone(),
+                    diff_digest: review_receipt.diff_digest.clone(),
+                    write_paths: vec!["src/a.rs".to_string()],
+                    check_evidence_digests: vec![check_ev.evidence_digest.clone()],
+                    review_subject_digest: Some(review_receipt.subject_digest.clone()),
+                    review_verdict: Some(StructuredReviewVerdict {
+                        verdict_id: format!("vrd_{tag}_01"),
+                        task_id: "task-root-a".to_string(),
+                        attempt_no: 1,
+                        candidate_id: candidate_id.clone(),
+                        review_subject_digest: review_receipt.subject_digest.clone(),
+                        base_commit: review_receipt.base_commit.clone(),
+                        task_head_commit: review_receipt.task_head_commit.clone(),
+                        task_tree_sha: review_receipt.task_tree_sha.clone(),
+                        diff_digest: review_receipt.diff_digest.clone(),
+                        policy_digest,
+                        outcome: ReviewVerdictOutcome::Accept,
+                        findings: Vec::new(),
+                        required_in_scope_fixes: Vec::new(),
+                        conflicting_paths_or_interfaces: Vec::new(),
+                        prose_summary: Some("Accepted".to_string()),
+                        prose_may_advance_acceptance: false,
+                    }),
+                    review_receipt_id: Some(review_receipt.receipt_id.clone()),
+                    integration_receipt_id: None,
+                },
+            })
+            .expect("record task candidate and verdict");
+        let (job, int_outbox) = fixture
+            .workflow_store
+            .reserve_task_outbox(&ReserveTaskOutboxRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                request_key: format!("req_int_{tag}"),
+                kind: OutboxDispatchKind::TaskIntegration,
+                task_id: "task-root-a".to_string(),
+                role: WorkflowRole::Reviewer,
+                subject_digest: review_receipt.subject_digest.clone(),
+                dependency_input_commit: None,
+                dependency_input_tree_sha: None,
+                accepted_predecessor_receipts: Vec::new(),
+            })
+            .expect("reserve integration outbox");
+        let (job, _) = fixture
+            .workflow_store
+            .reconcile_or_finalize_outbox(&FinalizeTaskOutboxRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: None,
+                outbox_id: int_outbox.outbox_id,
+                status: OutboxDispatchStatus::DispatchedEffectConfirmed,
+                next_task_stage: CoworkerTaskStage::Integrated,
+                run_id: Some(run_id.clone()),
+                worker_id: None,
+                task_worktree_id: Some(task_manifest.worktree_id.clone()),
+                head_commit: None,
+                tree_sha: None,
+                diff_digest: None,
+                report_artifact_id: None,
+                observed_model: None,
+                observed_effort: None,
+                receipt_id: Some(integration_receipt.receipt_id.clone()),
+                diagnostic: None,
+            })
+            .expect("finalize integration outbox");
+
+        fixture
+            .policy_store
+            .mutate_job_runtime_for_operator(BINDING_A, &job.job_id, |state| {
+                state.attempt_artifacts.insert(
+                    ControllerJobRuntimeState::artifact_key("task-root-a", 1),
+                    TaskAttemptExecutionArtifacts {
+                        task_id: "task-root-a".to_string(),
+                        attempt_no: 1,
+                        run_id: run_id.clone(),
+                        worker_id: format!("wrk_coder_{tag}"),
+                        task_worktree_id: task_manifest.worktree_id.clone(),
+                        integration_worktree_id: orig_int_manifest.worktree_id.clone(),
+                        execution_base_commit: fixture.base_commit.clone(),
+                        observed_provider: "antigravity".to_string(),
+                        observed_model: Some("gemini-4-argon-high".to_string()),
+                        codex_launch_report: None,
+                        codex_source_report_sha256: None,
+                        codex_source_effect_id: None,
+                        observed_effort: Some("high".to_string()),
+                        committed_head_commit: Some(review_receipt.task_head_commit.clone()),
+                        committed_tree_sha: Some(review_receipt.task_tree_sha.clone()),
+                        candidate_id: Some(candidate_id),
+                        check_evidence: vec![check_ev],
+                        test_evidence_summary: Some(test_evidence),
+                        review_subject: Some(subject),
+                        reviewer_response_digest: Some("cc".repeat(32)),
+                        review_receipt: Some(review_receipt),
+                        integration_receipt: Some(integration_receipt),
+                        is_derived_attempt: false,
+                    },
+                );
+                Ok(())
+            })
+            .expect("insert attempt_artifacts");
+
+        (job, host)
+    }
+
+    fn find_effect_by_kind(
+        fixture: &PipelineTestFixture,
+        job_id: &str,
+        kind: PendingControllerEffectKind,
+    ) -> PendingControllerEffect {
+        let runtime = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, job_id)
+            .expect("read job runtime")
+            .expect("job runtime exists");
+        runtime
+            .pending_effects
+            .values()
+            .find(|eff| eff.kind == kind)
+            .expect("expected PendingControllerEffect for kind")
+            .clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn job_completion_durability_fault_matrix_and_recovery_without_replay() {
+        // 1a. Pre-rename temp-file sync failure on JobIntegrationReport: returns IoError, leaves
+        // no visible report file, and recovers cleanly from the Completed JobIntegrationIntent.
+        {
+            let fixture = setup_fixture();
+            let (job, host) = Box::pin(prepare_single_task_integrated_job_for_completion(
+                &fixture, "pre_agg",
+            ))
+            .await;
+            let session = fixture
+                .controller
+                .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 10_000)
+                .expect("open session");
+            let guard = ScopedCompletionArtifactFaultGuard::install(
+                &fixture.plans_dir,
+                CompletionArtifactKind::JobIntegrationReport,
+                vec![CompletionArtifactFaultStep::PreRenameTempFileSync],
+            );
+            let err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 10_100),
+            )
+            .await
+            .expect_err("pre-rename agg sync fault must fail");
+            assert_eq!(err.code(), NativeErrorCode::IoError.as_str());
+            assert_eq!(guard.remaining_steps(), 0);
+            drop(guard);
+
+            let agg_eff = find_effect_by_kind(
+                &fixture,
+                &job.job_id,
+                PendingControllerEffectKind::JobAggregation,
+            );
+            assert_eq!(
+                agg_eff.status,
+                PendingControllerEffectStatus::ReservedBeforeEffect
+            );
+            assert_eq!(
+                read_persisted_job_integration_report(&fixture.plans_dir, &agg_eff.effect_id)
+                    .expect("read absent agg report"),
+                None
+            );
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 0);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+
+            let recovered = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 10_200),
+            )
+            .await
+            .expect("recover after pre-rename agg sync fault");
+            assert_eq!(recovered.status, CoworkerJobCompletionStatus::Completed);
+            assert_eq!(recovered.job.phase, CoworkerJobPhase::Completed);
+            assert!(recovered.aggregation.reused_existing_receipts);
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+            session.release().expect("release session");
+            host.shutdown().await.expect("shutdown fixture host");
+        }
+
+        // 1b. Pre-rename temp-file sync failure on CandidateCheckExecutionReport: returns IoError
+        // after running check once, leaves no visible report, and refuses blind replay on retry.
+        {
+            let fixture = setup_fixture();
+            let (job, host) = Box::pin(prepare_single_task_integrated_job_for_completion(
+                &fixture, "pre_chk",
+            ))
+            .await;
+            let session = fixture
+                .controller
+                .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 11_000)
+                .expect("open session");
+            let guard = ScopedCompletionArtifactFaultGuard::install(
+                &fixture.plans_dir,
+                CompletionArtifactKind::CandidateCheckExecutionReport,
+                vec![CompletionArtifactFaultStep::PreRenameTempFileSync],
+            );
+            let err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 11_100),
+            )
+            .await
+            .expect_err("pre-rename check sync fault must fail");
+            assert_eq!(err.code(), NativeErrorCode::IoError.as_str());
+            assert_eq!(guard.remaining_steps(), 0);
+            drop(guard);
+
+            let chk_eff = find_effect_by_kind(
+                &fixture,
+                &job.job_id,
+                PendingControllerEffectKind::CheckExecution,
+            );
+            assert_eq!(
+                chk_eff.status,
+                PendingControllerEffectStatus::ReservedBeforeEffect
+            );
+            assert_eq!(
+                read_persisted_candidate_check_report(&fixture.plans_dir, &chk_eff.effect_id)
+                    .expect("read absent check report"),
+                None
+            );
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+
+            let retry_err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 11_200),
+            )
+            .await
+            .expect_err("unpersisted reserved check must fail closed without replay");
+            assert_eq!(
+                retry_err.code(),
+                NativeErrorCode::AmbiguousWakeupPendingReconciliation.as_str()
+            );
+            let chk_after = find_effect_by_kind(
+                &fixture,
+                &job.job_id,
+                PendingControllerEffectKind::CheckExecution,
+            );
+            assert_eq!(
+                chk_after.status,
+                PendingControllerEffectStatus::EffectUnknown
+            );
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+            session.release().expect("release session");
+            host.shutdown().await.expect("shutdown fixture host");
+        }
+
+        // 2. Post-rename durability matrix: PostRenameParentOpen and PostRenameParentSync across
+        // both JobIntegrationReport and CandidateCheckExecutionReport.
+        let post_rename_cases = [
+            (
+                0usize,
+                CompletionArtifactKind::JobIntegrationReport,
+                CompletionArtifactFaultStep::PostRenameParentOpen,
+                0u32,
+            ),
+            (
+                1usize,
+                CompletionArtifactKind::JobIntegrationReport,
+                CompletionArtifactFaultStep::PostRenameParentSync,
+                0u32,
+            ),
+            (
+                2usize,
+                CompletionArtifactKind::CandidateCheckExecutionReport,
+                CompletionArtifactFaultStep::PostRenameParentOpen,
+                1u32,
+            ),
+            (
+                3usize,
+                CompletionArtifactKind::CandidateCheckExecutionReport,
+                CompletionArtifactFaultStep::PostRenameParentSync,
+                1u32,
+            ),
+        ];
+        for (idx, kind, post_fault, expected_checks_on_first_try) in post_rename_cases {
+            let fixture = setup_fixture();
+            let tag = format!("post_{idx}");
+            let (job, host) = Box::pin(prepare_single_task_integrated_job_for_completion(
+                &fixture, &tag,
+            ))
+            .await;
+            let session = fixture
+                .controller
+                .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+                .expect("open session");
+            let guard = ScopedCompletionArtifactFaultGuard::install(
+                &fixture.plans_dir,
+                kind,
+                vec![post_fault],
+            );
+            let err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 20_100),
+            )
+            .await
+            .expect_err("post-rename fault must return PersistenceUncertain");
+            assert_eq!(err.code(), NativeErrorCode::PersistenceUncertain.as_str());
+            assert_eq!(guard.remaining_steps(), 0);
+            drop(guard);
+            assert_eq!(
+                read_invocation_count(&fixture.check_count_file),
+                expected_checks_on_first_try
+            );
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+
+            let plans_dir = &fixture.plans_dir;
+            let (eff_kind, eff_id, report_path) = match kind {
+                CompletionArtifactKind::JobIntegrationReport => {
+                    let eff = find_effect_by_kind(
+                        &fixture,
+                        &job.job_id,
+                        PendingControllerEffectKind::JobAggregation,
+                    );
+                    assert_eq!(
+                        eff.status,
+                        PendingControllerEffectStatus::ReservedBeforeEffect
+                    );
+                    let path = job_integration_report_file_path(plans_dir, &eff.effect_id);
+                    let ro = read_persisted_job_integration_report(plans_dir, &eff.effect_id)
+                        .expect("read-only agg report");
+                    assert!(!ro.expect("agg report exists").reused_existing_receipts);
+                    (
+                        PendingControllerEffectKind::JobAggregation,
+                        eff.effect_id,
+                        path,
+                    )
+                }
+                CompletionArtifactKind::CandidateCheckExecutionReport => {
+                    let eff = find_effect_by_kind(
+                        &fixture,
+                        &job.job_id,
+                        PendingControllerEffectKind::CheckExecution,
+                    );
+                    assert_eq!(
+                        eff.status,
+                        PendingControllerEffectStatus::ReservedBeforeEffect
+                    );
+                    let path = candidate_check_report_file_path(plans_dir, &eff.effect_id);
+                    let ro = read_persisted_candidate_check_report(plans_dir, &eff.effect_id)
+                        .expect("read-only check report");
+                    assert!(ro.expect("check report exists").passed());
+                    (
+                        PendingControllerEffectKind::CheckExecution,
+                        eff.effect_id,
+                        path,
+                    )
+                }
+            };
+
+            // Read-only inspection must not clear uncertainty or promote the effect.
+            assert_eq!(
+                find_effect_by_kind(&fixture, &job.job_id, eff_kind).status,
+                PendingControllerEffectStatus::ReservedBeforeEffect
+            );
+            let meta = fs::symlink_metadata(&report_path).expect("stat report_path");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            let preserved_bytes = fs::read(&report_path).expect("read preserved bytes");
+            let preserved_digest = sha256_hex(&preserved_bytes);
+
+            // Recovery must remain blocked while RecoveryFileSync, RecoveryParentOpen, or
+            // RecoveryParentSync fails, preserving exact bytes without extra check/Closure calls.
+            let rec_guard = ScopedCompletionArtifactFaultGuard::install(
+                &fixture.plans_dir,
+                kind,
+                vec![
+                    CompletionArtifactFaultStep::RecoveryFileSync,
+                    CompletionArtifactFaultStep::RecoveryParentOpen,
+                    CompletionArtifactFaultStep::RecoveryParentSync,
+                ],
+            );
+            for step_idx in 0..3u64 {
+                let rec_err = Box::pin(
+                    fixture
+                        .pipeline
+                        .completion_service()
+                        .complete_owned_session(&session, 20_200 + step_idx * 100),
+                )
+                .await
+                .expect_err("recovery must remain blocked while re-sync fails");
+                assert_eq!(
+                    rec_err.code(),
+                    NativeErrorCode::PersistenceUncertain.as_str()
+                );
+                assert_eq!(
+                    find_effect_by_kind(&fixture, &job.job_id, eff_kind).status,
+                    PendingControllerEffectStatus::ReservedBeforeEffect
+                );
+                assert_eq!(
+                    fs::read(&report_path).expect("read bytes after blocked recovery"),
+                    preserved_bytes
+                );
+                assert_eq!(
+                    read_invocation_count(&fixture.check_count_file),
+                    expected_checks_on_first_try
+                );
+                assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+            }
+            assert_eq!(rec_guard.remaining_steps(), 0);
+            drop(rec_guard);
+
+            // Final recovery establishes file + parent durability and promotes the exact report.
+            let outcome = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 20_600),
+            )
+            .await
+            .expect("recovery must succeed once durability is established");
+            assert_eq!(outcome.status, CoworkerJobCompletionStatus::Completed);
+            assert_eq!(outcome.job.phase, CoworkerJobPhase::Completed);
+            let promoted_eff = find_effect_by_kind(&fixture, &job.job_id, eff_kind);
+            assert_eq!(promoted_eff.effect_id, eff_id);
+            assert_eq!(
+                promoted_eff.status,
+                PendingControllerEffectStatus::EffectConfirmed
+            );
+            assert_eq!(
+                fs::read(&report_path).expect("read bytes after promotion"),
+                preserved_bytes
+            );
+            if kind == CompletionArtifactKind::JobIntegrationReport {
+                assert_eq!(outcome.aggregation.report_artifact_digest, preserved_digest);
+                assert!(!outcome.aggregation.reused_existing_receipts);
+            }
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 0);
+            assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 0);
+            session.release().expect("release session");
+            host.shutdown().await.expect("shutdown fixture host");
+        }
+
+        // 3. Candidate check spec/subject mismatch refusal and EffectUnknown durability recovery.
+        {
+            let fixture = setup_fixture();
+            let (job, host) = Box::pin(prepare_single_task_integrated_job_for_completion(
+                &fixture,
+                "chk_mismatch",
+            ))
+            .await;
+            let session = fixture
+                .controller
+                .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 30_000)
+                .expect("open session");
+            let guard = ScopedCompletionArtifactFaultGuard::install(
+                &fixture.plans_dir,
+                CompletionArtifactKind::CandidateCheckExecutionReport,
+                vec![CompletionArtifactFaultStep::PostRenameParentSync],
+            );
+            let err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 30_100),
+            )
+            .await
+            .expect_err("initial check post-rename sync fault");
+            assert_eq!(err.code(), NativeErrorCode::PersistenceUncertain.as_str());
+            drop(guard);
+
+            let chk_eff = find_effect_by_kind(
+                &fixture,
+                &job.job_id,
+                PendingControllerEffectKind::CheckExecution,
+            );
+            let report_path =
+                candidate_check_report_file_path(&fixture.plans_dir, &chk_eff.effect_id);
+            let preserved_bytes = fs::read(&report_path).expect("read preserved check bytes");
+            let valid_report =
+                read_persisted_candidate_check_report(&fixture.plans_dir, &chk_eff.effect_id)
+                    .expect("read valid check report")
+                    .expect("check report exists");
+
+            // Replace on-disk report with a spec_digest-mismatched report and verify refusal.
+            let mut bad_spec_report = valid_report.clone();
+            bad_spec_report.spec_digest = "ff".repeat(32);
+            bad_spec_report.evidence_digest = bad_spec_report
+                .compute_evidence_digest()
+                .expect("compute bad_spec evidence_digest");
+            fs::write(
+                &report_path,
+                serde_json::to_vec(&bad_spec_report).expect("serialize bad_spec_report"),
+            )
+            .expect("write bad_spec_report");
+            fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 bad_spec_report");
+
+            let mismatch_err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 30_200),
+            )
+            .await
+            .expect_err("spec_digest mismatch must fail closed");
+            assert_eq!(
+                mismatch_err.code(),
+                NativeErrorCode::SecurityViolation.as_str()
+            );
+            assert_eq!(
+                find_effect_by_kind(
+                    &fixture,
+                    &job.job_id,
+                    PendingControllerEffectKind::CheckExecution,
+                )
+                .status,
+                PendingControllerEffectStatus::ReservedBeforeEffect
+            );
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+
+            // Simulate an interrupted owner separately from the rejected, mismatched report.
+            fixture
+                .policy_store
+                .mutate_job_runtime_for_operator(BINDING_A, &job.job_id, |state| {
+                    state
+                        .pending_effects
+                        .get_mut(&chk_eff.effect_id)
+                        .expect("check effect")
+                        .status = PendingControllerEffectStatus::EffectUnknown;
+                    Ok(())
+                })
+                .expect("record interrupted check outcome");
+
+            // Unknown-effect recovery still verifies the complete cached proof.
+            let gate_err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 30_300),
+            )
+            .await
+            .expect_err("EffectUnknown with mismatched report must be refused");
+            assert_eq!(gate_err.code(), NativeErrorCode::SecurityViolation.as_str());
+
+            // Restore exact valid preserved_bytes while effect is EffectUnknown: verify recovery
+            // stays blocked on RecoveryParentSync and then promotes to EffectConfirmed once durable.
+            fs::write(&report_path, &preserved_bytes).expect("restore preserved_bytes");
+            fs::set_permissions(&report_path, fs::Permissions::from_mode(0o600))
+                .expect("chmod 0600 restored report");
+
+            // Automatic driving remains held even with a valid visible report. Only the
+            // explicit completion service below establishes durability and reconciles it.
+            let mut driver = fixture
+                .pipeline
+                .driver(session.guard(), BINDING_A, THREAD_UUID_A, &job.job_id)
+                .expect("create unknown-effect pipeline driver");
+            let held = Box::pin(driver.tick(30_350))
+                .await
+                .expect("inspect held pipeline");
+            assert_eq!(held.status, CoworkerPipelineStatus::BlockedOnUnknownEffect);
+            assert_eq!(driver.in_flight_count(), 0);
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 0);
+            drop(driver);
+
+            let rec_guard = ScopedCompletionArtifactFaultGuard::install(
+                &fixture.plans_dir,
+                CompletionArtifactKind::CandidateCheckExecutionReport,
+                vec![CompletionArtifactFaultStep::RecoveryParentSync],
+            );
+            let blocked_err = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 30_400),
+            )
+            .await
+            .expect_err("EffectUnknown recovery must stay blocked when re-sync fails");
+            assert_eq!(
+                blocked_err.code(),
+                NativeErrorCode::PersistenceUncertain.as_str()
+            );
+            assert_eq!(
+                find_effect_by_kind(
+                    &fixture,
+                    &job.job_id,
+                    PendingControllerEffectKind::CheckExecution,
+                )
+                .status,
+                PendingControllerEffectStatus::EffectUnknown
+            );
+            drop(rec_guard);
+
+            let recovered = Box::pin(
+                fixture
+                    .pipeline
+                    .completion_service()
+                    .complete_owned_session(&session, 30_500),
+            )
+            .await
+            .expect("EffectUnknown check with valid report must recover once durable");
+            assert_eq!(recovered.status, CoworkerJobCompletionStatus::Completed);
+            assert_eq!(recovered.job.phase, CoworkerJobPhase::Completed);
+            assert_eq!(
+                find_effect_by_kind(
+                    &fixture,
+                    &job.job_id,
+                    PendingControllerEffectKind::CheckExecution,
+                )
+                .status,
+                PendingControllerEffectStatus::EffectConfirmed
+            );
+            assert_eq!(
+                fs::read(&report_path).expect("read bytes after EffectUnknown recovery"),
+                preserved_bytes
+            );
+            assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
+            assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+            session.release().expect("release session");
+            host.shutdown().await.expect("shutdown fixture host");
+        }
+    }
+}
