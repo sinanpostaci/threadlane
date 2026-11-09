@@ -591,6 +591,7 @@ impl WorkerSpec {
                     &resolved_write_scopes,
                 )?;
                 let guarded_prompt = build_antigravity_task_files_prompt_for_scopes(
+                    &canonical_workdir,
                     &resolved_write_scopes,
                     &self.prompt,
                 );

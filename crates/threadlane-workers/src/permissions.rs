@@ -1613,20 +1613,28 @@ pub fn build_antigravity_task_files_settings_json_for_scopes(
 pub(crate) const AGY_TASK_FILES_PROMPT_BOUNDARY: &str = "[THREADLANE_TASK_INSTRUCTION] ";
 
 /// Builds the session-local Antigravity `--print` prompt for [`WorkerFilePermissions::TaskFiles`]
-/// from resolved repository-relative [`WriteScopeKind`] entries and the caller's `task_prompt`.
+/// from the validated `canonical_workdir`, resolved repository-relative [`WriteScopeKind`]
+/// entries, and the caller's `task_prompt`.
 ///
-/// Prepends a concise single-line execution contract instructing the headless Antigravity worker
-/// to use only built-in file read/search/edit tools, never invoke or request `command`/shell/
-/// terminal tools (which headless `--mode accept-edits` cannot prompt for and auto-denies), never
-/// run builds/tests/Git/subagents/web/MCP from the worker, never write provider/control configs,
-/// and persist edits only within the exact resolved write scopes (distinguishing directory
-/// subtrees from exact files). Preserves `task_prompt` byte-for-byte after
-/// [`AGY_TASK_FILES_PROMPT_BOUNDARY`].
+/// Prepends a concise single-line execution contract stating the exact `canonical_workdir`
+/// root, instructing the headless Antigravity worker to prefer repository-relative paths under
+/// that root (or derive absolute tool paths only by joining `canonical_workdir` with the
+/// repository-relative filename without inferring checkout names from approval/job/worktree
+/// identifiers, using source-repository paths, or depending on `command`/`pwd`/`list_dir`
+/// permission), use only built-in file read/search/edit tools, never invoke or request
+/// `command`/shell/terminal tools (which headless `--mode accept-edits` cannot prompt for and
+/// auto-denies), never run builds/tests/Git/subagents/web/MCP from the worker, never write
+/// provider/control configs, and persist edits only within the exact resolved write scopes
+/// (distinguishing directory subtrees from exact files). Preserves `task_prompt` byte-for-byte
+/// after [`AGY_TASK_FILES_PROMPT_BOUNDARY`].
 #[must_use]
 pub(crate) fn build_antigravity_task_files_prompt_for_scopes(
+    canonical_workdir: &Path,
     resolved_write_scopes: &BTreeMap<String, WriteScopeKind>,
     task_prompt: &str,
 ) -> String {
+    let workdir_lossy = canonical_workdir.to_string_lossy();
+    let clean_workdir = workdir_lossy.trim_end_matches('/');
     let mut scope_descriptions = Vec::with_capacity(resolved_write_scopes.len());
     for (raw_entry, &scope_kind) in resolved_write_scopes {
         let clean_entry = raw_entry.strip_suffix('/').unwrap_or(raw_entry.as_str());
@@ -1647,7 +1655,13 @@ pub(crate) fn build_antigravity_task_files_prompt_for_scopes(
 
     format!(
         "[THREADLANE_AGY_TASK_FILES_CONTRACT] Session-local Antigravity task_files execution contract: \
-use only built-in file read/search/edit tools (`read_file`, `view_file`, `list_dir`, `grep_search`, \
+canonical task working directory (authoritative checkout root for every file operation): `{clean_workdir}`. \
+Prefer repository-relative paths under `{clean_workdir}` for tools; if an allowed read or edit tool requires \
+an absolute path, derive it ONLY by joining this exact canonical root with the repository-relative filename \
+(`{clean_workdir}/<repo-relative-path>`). Never infer or invent checkout names or paths from approval, job, \
+run, task, or worktree identifiers, never use source-repository paths instead of `{clean_workdir}`, and \
+avoid depending on `command`, `pwd`, or `list_dir` permission to discover the checkout root. \
+Use only built-in file read/search/edit tools (`read_file`, `view_file`, `list_dir`, `grep_search`, \
 `edit_file`, `write_file`, `write_to_file`, `replace_file_content`, `multi_replace_file_content`). \
 Never use or request `command`, `run_command`, `bash`, `shell`, `execute`, `run_in_terminal`, or any \
 terminal/shell tool; headless mode cannot prompt for `command` permissions and auto-denies them. \

@@ -1638,3 +1638,139 @@ printf '{"type":"result","subtype":"success","model":"gemini-4-argon-high","effo
     );
     assert_eq!(manifest_a_exec.worker_report.constructed_argv, launch_argv);
 }
+
+#[test]
+fn task_files_contract_pins_canonical_checkout_against_source_repo_and_approval_metadata() {
+    let env = ScopedTestEnv::new();
+    let noop_bin = env.write_fake_executable("canonical-contract-agy", "exit 0");
+    let allowed_write_paths = env.default_allowed_paths();
+
+    let manager = WorktreeManager::new(&env.repo_dir, &env.work_area, &env.base_commit)
+        .expect("create WorktreeManager for canonical task checkout test");
+    let manifest = manager
+        .create_task_worktree("run-20261109", "task-impl-01", &allowed_write_paths)
+        .expect("create canonical task worktree");
+    let canonical_checkout = &manifest.checkout_path;
+    assert_ne!(
+        canonical_checkout, &env.repo_dir,
+        "task checkout location must be distinct from source repository location"
+    );
+
+    let canonical_checkout_str = canonical_checkout
+        .to_str()
+        .expect("utf8 canonical task checkout");
+    let source_repo_str = env.repo_dir.to_str().expect("utf8 source repo");
+    let decoy_approval_checkout = env
+        .root_dir
+        .join("threadlane-appr-9941-alpha-job-7732-maint/implementation");
+    let decoy_approval_checkout_str = decoy_approval_checkout
+        .to_str()
+        .expect("utf8 decoy approval checkout");
+    assert_ne!(canonical_checkout_str, decoy_approval_checkout_str);
+
+    let caller_prompt = format!(
+        "Context metadata (untrusted caller notes):\n\
+         approval_id: appr-9941-alpha\n\
+         job_id: job-7732-maint\n\
+         worktree_hint: {decoy_approval_checkout_str}\n\
+         source_repository: {source_repo_str}\n\
+         Task: inspect crates/threadlane-workers/src/lib.rs and update docs/WORKERS.md.\n"
+    );
+
+    let spec = env.antigravity_spec(noop_bin, &caller_prompt, WorkerFilePermissions::TaskFiles);
+    let argv = spec
+        .build_argv_for_workdir(canonical_checkout)
+        .expect("build_argv_for_workdir for canonical task checkout");
+    assert_eq!(argv.len(), 14);
+    assert_eq!(argv[10], "--settings");
+    assert_eq!(argv[12], "--print");
+
+    let (contract_header, retained_prompt) = argv[13]
+        .split_once("[THREADLANE_TASK_INSTRUCTION] ")
+        .expect("TaskFiles launch prompt must contain [THREADLANE_TASK_INSTRUCTION] boundary");
+    assert!(
+        contract_header.starts_with("[THREADLANE_AGY_TASK_FILES_CONTRACT] "),
+        "authoritative contract prefix must remain intact"
+    );
+    assert_eq!(
+        retained_prompt, caller_prompt,
+        "verbatim caller task prompt must be preserved byte-for-byte after the boundary"
+    );
+
+    // Authoritative contract header must state the exact canonical task checkout root and never
+    // substitute the source repository or misleading approval/job/worktree paths.
+    let quoted_canonical_root = format!("`{canonical_checkout_str}`");
+    assert!(
+        contract_header.contains(&quoted_canonical_root),
+        "contract header must state the exact canonical task checkout root `{canonical_checkout_str}`"
+    );
+    assert!(
+        !contract_header.contains(source_repo_str),
+        "contract header must never contain source repository path `{source_repo_str}`"
+    );
+    assert!(
+        !contract_header.contains(decoy_approval_checkout_str),
+        "contract header must never contain caller approval/job decoy path `{decoy_approval_checkout_str}`"
+    );
+
+    // Contract header must guide relative path preference, absolute path construction by joining
+    // the exact canonical root with the repo-relative path, non-inference from approval/job/worktree
+    // identifiers or source-repo paths, and avoiding command/pwd/list_dir dependency.
+    let canonical_join_prefix = format!("{canonical_checkout_str}/");
+    assert!(
+        contract_header.contains("relative"),
+        "contract header must guide preferring repository-relative paths"
+    );
+    assert!(
+        contract_header.contains(&canonical_join_prefix) && contract_header.contains("join"),
+        "contract header must explain deriving absolute tool paths only by joining the canonical root with the repo-relative path"
+    );
+    assert!(
+        contract_header.contains("approval")
+            && contract_header.contains("job")
+            && contract_header.contains("worktree")
+            && contract_header.contains("source"),
+        "contract header must forbid inferring checkout names from approval/job/worktree identifiers or source-repo paths"
+    );
+    assert!(
+        contract_header.contains("`pwd`")
+            && contract_header.contains("`command`")
+            && contract_header.contains("`list_dir`"),
+        "contract header must avoid depending on command/pwd/list_dir permission to discover the checkout root"
+    );
+
+    // Permission JSON must remain unchanged: only canonical read_file(<canonical_checkout>/**)
+    // plus exact finite write scopes (directory subtree vs exact file).
+    let settings_val: Value =
+        serde_json::from_str(&argv[11]).expect("parse --settings inline JSON");
+    let perms_obj = settings_val["permissions"]
+        .as_object()
+        .expect("permissions object");
+    assert_eq!(
+        perms_obj.len(),
+        1,
+        "TaskFiles permissions object must only contain `allow`"
+    );
+    let allow = parse_allow_rules(&argv[11]);
+    let mut expected_allow = vec![format!(
+        "{AGY_READ_PERMISSION_TOOL}({canonical_checkout_str}/**)"
+    )];
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_allow.push(format!(
+            "{tool}({canonical_checkout_str}/crates/threadlane-workers)"
+        ));
+        expected_allow.push(format!(
+            "{tool}({canonical_checkout_str}/crates/threadlane-workers/**)"
+        ));
+    }
+    for tool in AGY_WRITE_PERMISSION_TOOLS {
+        expected_allow.push(format!("{tool}({canonical_checkout_str}/docs/WORKERS.md)"));
+    }
+    assert_eq!(allow, expected_allow);
+    assert!(
+        allow.iter().all(|rule| {
+            !rule.contains(source_repo_str) && !rule.contains(decoy_approval_checkout_str)
+        }),
+        "permission allowlist must never grant access to source repo or decoy approval checkout"
+    );
+}
