@@ -494,9 +494,41 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
             .collect()
     );
 
+    let captured_agy_prompt =
+        fs::read_to_string(&fixture.agy_prompt_file).expect("read agy prompt file");
+    const AGY_TASK_INSTRUCTION_DELIMITER: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+    assert!(
+        captured_agy_prompt.starts_with("[THREADLANE_AGY_TASK_FILES_CONTRACT] "),
+        "captured AGY prompt must start with the TaskFiles execution contract"
+    );
     assert_eq!(
-        fs::read_to_string(&fixture.agy_prompt_file).expect("read agy prompt file"),
-        receipt.derived_prompt
+        captured_agy_prompt
+            .matches(AGY_TASK_INSTRUCTION_DELIMITER)
+            .count(),
+        1,
+        "captured AGY prompt must contain exactly one task instruction delimiter"
+    );
+    let (agy_contract, retained_instruction) = captured_agy_prompt
+        .split_once(AGY_TASK_INSTRUCTION_DELIMITER)
+        .expect("captured AGY prompt must contain the task instruction delimiter");
+    assert_eq!(retained_instruction, receipt.derived_prompt.as_str());
+    assert!(
+        agy_contract.contains(
+            "Persist changes only within declared task write scopes: [`src/a.rs` (exact file only; no descendant `/**`)]."
+        ),
+        "contract must scope writes to the exact allowed `src/a.rs` file"
+    );
+    assert!(
+        agy_contract.contains(
+            "Never use or request `command`, `run_command`, `bash`, `shell`, `execute`, `run_in_terminal`, or any terminal/shell tool"
+        ),
+        "contract must forbid terminal/shell execution"
+    );
+    assert!(
+        agy_contract.contains(
+            "Do not write provider or control configs (`.gemini`, `.codex`, `.opencode`, `.claude`, `.agents`, `.git`, `AGENTS.md`, `.env*`)."
+        ),
+        "contract must forbid provider/control configuration writes"
     );
     assert_eq!(
         fs::read_to_string(task_manifest.checkout_path.join("src/a.rs"))

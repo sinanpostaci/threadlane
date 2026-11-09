@@ -1793,9 +1793,41 @@ async fn approved_mcp_session_live_auth_verification_task_dispatch_retry_cancel_
     assert_eq!(read_invocation_count(&fixture.agy_count_file), 1);
     assert_eq!(read_invocation_count(&fixture.oc_count_file), 0);
     assert!(!fixture.oc_prompt_file.exists());
+    let captured_agy_prompt =
+        fs::read_to_string(&fixture.agy_prompt_file).expect("read prompt file");
+    const AGY_TASK_INSTRUCTION_DELIMITER: &str = "[THREADLANE_TASK_INSTRUCTION] ";
+    assert!(
+        captured_agy_prompt.starts_with("[THREADLANE_AGY_TASK_FILES_CONTRACT] "),
+        "captured AGY prompt must start with the TaskFiles execution contract"
+    );
     assert_eq!(
-        fs::read_to_string(&fixture.agy_prompt_file).expect("read prompt file"),
-        "Implement frozen root AGY task"
+        captured_agy_prompt
+            .matches(AGY_TASK_INSTRUCTION_DELIMITER)
+            .count(),
+        1,
+        "captured AGY prompt must contain exactly one task instruction delimiter"
+    );
+    let (agy_contract, retained_instruction) = captured_agy_prompt
+        .split_once(AGY_TASK_INSTRUCTION_DELIMITER)
+        .expect("captured AGY prompt must contain the task instruction delimiter");
+    assert_eq!(retained_instruction, "Implement frozen root AGY task");
+    assert!(
+        agy_contract.contains(
+            "Persist changes only within declared task write scopes: [`src/lib.rs` (exact file only; no descendant `/**`)]."
+        ),
+        "contract must scope writes to the exact allowed `src/lib.rs` file"
+    );
+    assert!(
+        agy_contract.contains(
+            "Never use or request `command`, `run_command`, `bash`, `shell`, `execute`, `run_in_terminal`, or any terminal/shell tool"
+        ),
+        "contract must forbid terminal/shell execution"
+    );
+    assert!(
+        agy_contract.contains(
+            "Do not write provider or control configs (`.gemini`, `.codex`, `.opencode`, `.claude`, `.agents`, `.git`, `AGENTS.md`, `.env*`)."
+        ),
+        "contract must forbid provider/control configuration writes"
     );
 
     // 11. Inspect `approved_activity` (both session-wide and task-scoped).
