@@ -13,7 +13,7 @@ let
   );
 
   # Recompute only when apps/desktop/package-lock.json changes.
-  desktopNpmDepsHash = "sha256-X5rZ5gmquTWSPoHlMrAXKmJ72RDB+hki/RRWrrpLb9Q=";
+  desktopNpmDepsHash = "sha256-jtrBh3znCB27fwtgbv0AYW67itZ59ZiqOqomfzKzNiY=";
 
   desktopLibs = with pkgs; [
     gtk3

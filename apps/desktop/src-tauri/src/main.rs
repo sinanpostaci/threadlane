@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod chat_navigation;
 mod codex_setup;
 mod host_control;
 mod observation;
+mod tray;
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -70,6 +72,10 @@ struct DesktopCli {
     /// Optional path to a trusted local threadlane-host executable binary.
     #[arg(long = "host-executable")]
     host_executable: Option<PathBuf>,
+
+    /// Skip only the automatic startup Codex MCP and bundled-skill apply pass.
+    #[arg(long = "no-codex-startup-setup", default_value_t = false)]
+    no_codex_startup_setup: bool,
 }
 
 /// Safe structured error returned to the desktop frontend over Tauri IPC.
@@ -832,11 +838,16 @@ fn desktop_tool_status(bridge: State<'_, DesktopBridge>) -> Result<Vec<ToolStatu
 }
 
 #[tauri::command]
-fn desktop_window_action(window: Window, action: WindowAction) -> Result<(), String> {
+fn desktop_window_action(
+    app: tauri::AppHandle,
+    window: Window,
+    tray: State<'_, tray::TrayState>,
+    action: WindowAction,
+) -> Result<(), String> {
     match action {
-        WindowAction::Close => window
-            .close()
-            .map_err(|_| "Unable to close desktop window.".to_string()),
+        WindowAction::Close => {
+            tray::handle_window_action_close(&app, &window, &tray).map_err(|err| err.message)
+        }
         WindowAction::Minimize => window
             .minimize()
             .map_err(|_| "Unable to minimize desktop window.".to_string()),
@@ -1092,10 +1103,12 @@ async fn desktop_plan_execution_preview(
 
 #[tauri::command]
 async fn desktop_approve_plan(
+    window: Window,
     bridge: State<'_, DesktopBridge>,
     control: State<'_, DesktopControlState>,
     request: OperatorApprovalRequest,
 ) -> Result<ApprovalSummary, AppError> {
+    tray::ensure_main_window_only(&window)?;
     let initial_snapshot = bridge.snapshot(None).await.map_err(|_| {
         AppError::new(
             "bridge_unavailable",
@@ -1154,11 +1167,13 @@ async fn desktop_plan_approvals(
 
 #[tauri::command]
 async fn desktop_start_approved_session(
+    window: Window,
     bridge: State<'_, DesktopBridge>,
     control: State<'_, DesktopControlState>,
     approval_id: String,
     notify_codex_tool_id: Option<String>,
 ) -> Result<HostSessionSummary, AppError> {
+    tray::ensure_main_window_only(&window)?;
     match notify_codex_tool_id {
         Some(notify_codex_tool_id) => {
             host_control::start_approved_session_with_notifications(
@@ -1175,22 +1190,26 @@ async fn desktop_start_approved_session(
 
 #[tauri::command]
 async fn desktop_stop_approved_session(
+    window: Window,
     bridge: State<'_, DesktopBridge>,
     control: State<'_, DesktopControlState>,
     approval_id: String,
     expected_instance_id: String,
 ) -> Result<HostSessionSummary, AppError> {
+    tray::ensure_main_window_only(&window)?;
     host_control::stop_approved_session(&bridge, &control, approval_id, expected_instance_id).await
 }
 
 #[tauri::command]
 async fn desktop_restart_approved_session(
+    window: Window,
     bridge: State<'_, DesktopBridge>,
     control: State<'_, DesktopControlState>,
     approval_id: String,
     expected_prior_instance_id: String,
     notify_codex_tool_id: Option<String>,
 ) -> Result<HostSessionSummary, AppError> {
+    tray::ensure_main_window_only(&window)?;
     match notify_codex_tool_id {
         Some(notify_codex_tool_id) => {
             host_control::restart_approved_session_with_notifications(
@@ -1377,6 +1396,7 @@ async fn desktop_codex_setup_apply(
 fn main() -> ExitCode {
     let cli = DesktopCli::parse();
     let initial_runtime_state_dir = cli.state_dir.clone();
+    let initial_demo_state_dir = cli.demo_state_dir.clone();
     let bridge = match DesktopBridge::new(cli.state_dir, cli.demo_state_dir) {
         Ok(bridge) => bridge,
         Err(err) => {
@@ -1387,9 +1407,14 @@ fn main() -> ExitCode {
 
     let cli_registry_dir = cli.registry_dir;
     let cli_host_executable = cli.host_executable;
+    let no_codex_startup_setup = cli.no_codex_startup_setup;
 
     let result = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .manage(bridge)
+        .on_window_event(|window, event| {
+            tray::handle_window_event(window, event);
+        })
         .setup(move |app| {
             let registry_dir = match cli_registry_dir {
                 Some(dir) => dir,
@@ -1403,6 +1428,31 @@ fn main() -> ExitCode {
                 .path()
                 .app_data_dir()
                 .map_err(|_| "Failed to resolve application data directory.")?;
+
+            let launch_fingerprint = tray::LaunchFingerprint::new(
+                initial_runtime_state_dir.clone(),
+                initial_demo_state_dir.clone(),
+                registry_dir.clone(),
+                cli_host_executable.clone(),
+            );
+            let activate_handle = app.handle().clone();
+            let single_instance = match tray::SingleInstanceGuard::acquire_or_notify(
+                &app_data_dir,
+                launch_fingerprint,
+                move || {
+                    tray::show_and_focus_main_window(&activate_handle);
+                },
+            ) {
+                Ok(tray::SingleInstanceAcquisition::Primary(guard)) => guard,
+                Ok(tray::SingleInstanceAcquisition::RestoredExisting) => {
+                    std::process::exit(0);
+                }
+                Err(err) => {
+                    eprintln!("threadlane-desktop error: {}", err.message);
+                    return Err(err.message.into());
+                }
+            };
+
             let plans_dir = app_data_dir.join("plans");
             let authority_dir = app_data_dir.join("authority");
             let sessions_dir = app_data_dir.join("sessions");
@@ -1422,7 +1472,9 @@ fn main() -> ExitCode {
                 control.sessions_dir.clone(),
                 &app_data_dir,
             ));
-            codex_setup.spawn_startup_apply();
+            if !no_codex_startup_setup {
+                codex_setup.spawn_startup_apply();
+            }
             let observation = ObservationService::new(ObservationSourceConfig {
                 runtime_state_dir: initial_runtime_state_dir,
                 registry_dir: control.registry.config_dir().to_path_buf(),
@@ -1434,6 +1486,7 @@ fn main() -> ExitCode {
             app.manage(control);
             app.manage(codex_setup);
             app.manage(observation);
+            tray::setup_tray(app.handle(), &app_data_dir, Some(single_instance))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1473,6 +1526,10 @@ fn main() -> ExitCode {
             desktop_codex_setup_status,
             desktop_codex_setup_recheck,
             desktop_codex_setup_apply,
+            tray::desktop_tray_preferences,
+            tray::desktop_set_tray_preferences,
+            tray::desktop_tray_action,
+            chat_navigation::desktop_open_codex_chat,
         ])
         .run(tauri::generate_context!());
 
@@ -1926,5 +1983,44 @@ mod tests {
         });
         assert_eq!(sec_err.code, "security_violation");
         assert!(!sec_err.message.contains("/etc/shadow"));
+    }
+
+    #[test]
+    fn desktop_cli_parses_no_codex_startup_setup_flag_and_preserves_existing_flags() {
+        let default_cli =
+            DesktopCli::try_parse_from(["threadlane-desktop"]).expect("parse default CLI");
+        assert!(!default_cli.no_codex_startup_setup);
+        assert!(default_cli.state_dir.is_none());
+        assert!(default_cli.demo_state_dir.is_none());
+        assert!(default_cli.registry_dir.is_none());
+        assert!(default_cli.host_executable.is_none());
+
+        let smoke_cli = DesktopCli::try_parse_from([
+            "threadlane-desktop",
+            "--no-codex-startup-setup",
+            "--state-dir",
+            "/tmp/tl-state",
+            "--demo-state-dir",
+            "/tmp/tl-demo",
+            "--registry-dir",
+            "/tmp/tl-registry",
+            "--host-executable",
+            "/tmp/tl-host",
+        ])
+        .expect("parse CLI with --no-codex-startup-setup and existing flags");
+        assert!(smoke_cli.no_codex_startup_setup);
+        assert_eq!(smoke_cli.state_dir, Some(PathBuf::from("/tmp/tl-state")));
+        assert_eq!(
+            smoke_cli.demo_state_dir,
+            Some(PathBuf::from("/tmp/tl-demo"))
+        );
+        assert_eq!(
+            smoke_cli.registry_dir,
+            Some(PathBuf::from("/tmp/tl-registry"))
+        );
+        assert_eq!(
+            smoke_cli.host_executable,
+            Some(PathBuf::from("/tmp/tl-host"))
+        );
     }
 }

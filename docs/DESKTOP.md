@@ -1,5 +1,52 @@
 # Desktop Control Panel (Milestone 3A)
 
+## Current desktop workspace
+
+The production entry point uses React and Radix Themes. Projects groups actual
+observation records by project and chat; selecting a chat shows its activity and
+compact, initially closed job summaries. Expand a job to inspect task states and
+technical details. Working calls and human-attention counts are independent: one
+chat may have both. A finished Worker is not an accepted job. Missing usage stays
+unknown and unavailable observations retain an explicit stale/unavailable state.
+Interface labels are English. Observed chat/job titles, summaries and task text
+are content, rendered in their source language without translating fixed UI labels.
+
+The sidebar collapses on wide windows. At 760 px and below it becomes a modal
+navigation drawer; the minimum native window is 360 × 500 px and the initial
+window is 1040 × 760 px. Tools retains its catalog/model-family editor. Profiles
+shows the saved profile list, five roles, four difficulty overrides and explicit
+reset controls. Dirty drafts survive section changes; external changes and stale
+saves require reconciliation rather than a silent overwrite or automatic retry.
+Saving configuration grants no planning or execution permission.
+
+Archive history stores a local visibility cutoff, without deleting backend
+records. It hides older inactive history, including pending historical items;
+working records remain visible. Show archived removes that cutoff. A time window
+alone retains unresolved work. Storage failures are reported rather than
+pretending that archival or restoration succeeded.
+
+When a system tray is available, closing the main window hides it by default.
+Settings → Window close behavior can select Quit instead. The tray offers Open
+and Quit, and its small popover displays a bounded observation summary. Quit is
+required to fully restart a hidden app after an update. If tray creation fails,
+the window remains the available control surface. Watcher disappearance after
+startup and real desktop tray interaction require separate host qualification.
+An isolated test launch may use `--no-codex-startup-setup` to avoid modifying
+Codex setup; it must use separate XDG/runtime directories.
+
+Open in Codex submits only a canonical `codex://threads/<uuid>` URL. A narrow
+Rust command revalidates the source, thread and optional job against bounded
+read-only observation data before invoking the OS opener. It accepts no arbitrary
+URL, command or executable, and has no frontend shell/opener capability. A
+successful submission does not prove that Codex displayed the chat or that the
+human read or approved anything. System notifications are separate future work.
+
+Linux is the current qualification target. macOS has shared source preparation
+only; native macOS tray/navigation and packaging are unverified. Windows is
+deferred. Browser fixtures exercise the real components through an isolated IPC
+stub; they do not prove native WebKit rendering, real tray clicks, OS navigation,
+or an installed end-to-end provider workflow.
+
 For the current [Projects view](PROJECTS-VIEW.md) of projects, chats, calls, and
 inline plan summaries, plus linked sources and Settings → Connections, also read
 [desktop observation](OBSERVATION.md) and [Codex MCP startup setup](CODEX-SETUP.md).

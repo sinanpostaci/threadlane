@@ -16,9 +16,9 @@
       {
         "label": "main",
         "title": "Threadlane",
-        "width": 390,
-        "height": 840,
-        "minWidth": 320,
+        "width": 1040,
+        "height": 760,
+        "minWidth": 360,
         "minHeight": 500,
         "resizable": true,
         "transparent": true,

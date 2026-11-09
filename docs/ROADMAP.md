@@ -1,8 +1,10 @@
 # Threadlane implementation plan
 
 Threadlane is the user-selected product name (2026-10-29). Rust + Tauri is the
-selected technology. The approved narrow, quiet, smoked-glass mockup remains the
-visual direction. README documentation will distinguish planned and working features.
+selected technology. The approved desktop direction is a compact React/Radix
+workspace: a collapsible projects/chat sidebar and a selected-chat activity view,
+with neutral surfaces and progressive disclosure. README documentation distinguishes
+planned capabilities from qualified behavior.
 
 ## Product contract
 
@@ -31,20 +33,21 @@ task dispatch and follow-up must not require a panel visit for each action.
    requested/observed models and effort; per-task worktrees, per-run integration
    worktree, scoped diff gates, bounded/paginated run history and compact mutation
    responses, process-tree supervision and evidence acceptance.
-3. **Desktop panel.** Tauri, a narrow TypeScript UI, Activity/Chats/Tools/Profiles/
-   Settings, prompt and event inspection, system theme, accent, adjustable glass
-   surface with an accessible opaque fallback. Choose the frontend library when
-   this milestone starts. Freeze the event contract before parallel UI work.
+3. **Desktop panel.** Tauri with React/Radix, Projects/Tools/Profiles/Settings,
+   selected-chat activity, compact job summaries, system theme and accent. A
+   modal navigation drawer supports small windows. Core execution and observation
+   contracts remain independent of the UI library.
 4. **Profiles and Jev.** Global tool/model/effort registry and configurable role/
    difficulty assignments. Jev is included as an API integration; start in shadow
    mode for output classification and missing-evidence flags. Keep a small
    decision-provider boundary for later OpenAI Decisions support.
-5. **Release hardening.** Early macOS/Windows smoke tests, platform lifecycle and
-   secret storage, optional service/tray behaviour, Nix packaging, measured cost
-   and notification budgets, crash recovery and compatibility checks.
+5. **Release hardening.** Linux lifecycle and tray qualification, Nix packaging,
+   measured cost and notification budgets, crash recovery and compatibility checks.
+   Keep shared macOS preparation inexpensive; macOS acceptance follows the MVP.
+   Windows implementation and acceptance are deferred.
 
-Linux/NixOS is the first test host, not a product restriction. Jev, glass and
-cross-platform support remain in scope. Staging work must not erase those goals.
+Linux/NixOS is the first supported test host. Shared core boundaries support future
+platform work without implying that untested macOS or Windows builds are supported.
 
 ## Current checkpoint
 

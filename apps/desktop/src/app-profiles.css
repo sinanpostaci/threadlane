@@ -1,0 +1,359 @@
+.tl-profiles {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  max-width: 780px;
+  min-width: 0;
+  margin: 0 auto;
+  color: #ececef;
+}
+
+.tl-profiles *,
+.tl-profiles *::before,
+.tl-profiles *::after {
+  box-sizing: border-box;
+}
+
+.tl-profiles-section-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
+.tl-profiles-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Touch target sizing (>=40px secondary, >=44px primary/triggers) */
+.tl-profiles-primary-btn.rt-Button {
+  min-height: 44px;
+  padding-inline: 14px;
+}
+
+.tl-profiles-touch-btn.rt-Button {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+
+.tl-profiles .rt-SelectTrigger {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 40px;
+}
+
+.tl-profiles-role-select-field {
+  min-width: 0;
+}
+
+.tl-profiles-role-select-field .rt-SelectTrigger {
+  min-height: 44px;
+}
+
+/* Neutral status pills */
+.tl-profiles-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+  background: #232328;
+  color: #d4d4d8;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.tl-profiles-pill[data-tone="working"] {
+  color: #f4f4f5;
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.tl-profiles-pill[data-tone="attention"] {
+  color: #fcd34d;
+  background: rgba(245, 158, 11, 0.12);
+  border-color: rgba(245, 158, 11, 0.28);
+}
+
+.tl-profiles-pill[data-tone="danger"] {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.28);
+}
+
+.tl-profiles-pill[data-tone="success"] {
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.1);
+  border-color: rgba(34, 197, 94, 0.24);
+}
+
+/* Callout bars for actual errors, conflicts, and confirmations */
+.tl-profiles-callout {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #1d1d21;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tl-profiles-callout[data-tone="warn"] {
+  border-color: rgba(245, 158, 11, 0.32);
+}
+
+.tl-profiles-callout[data-tone="danger"] {
+  border-color: rgba(239, 68, 68, 0.34);
+}
+
+.tl-profiles-callout[data-tone="success"] {
+  border-color: rgba(34, 197, 94, 0.28);
+}
+
+.tl-profiles-callout-copy {
+  flex: 1 1 220px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.tl-profiles-callout-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Selectable flat list tables for Profiles and Execution Roles */
+.tl-profiles-list-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: #1b1b1f;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.tl-profiles-role-row-btn {
+  width: 100%;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.tl-profiles-role-row-btn:last-child {
+  border-bottom: 0;
+}
+
+.tl-profiles-role-row-btn:hover:not(:disabled) {
+  background: #212126;
+}
+
+.tl-profiles-role-row-btn[aria-pressed="true"] {
+  background: #26262c;
+}
+
+.tl-profiles-role-row-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Editor containers */
+.tl-profiles-editor-box {
+  padding: 12px 14px;
+  border-radius: 8px;
+  background: #1b1b1f;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.tl-profiles-field-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  color: #a1a1aa;
+  margin-bottom: 4px;
+}
+
+.tl-profiles-text-input {
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: #141417;
+  color: #f4f4f5;
+  font: inherit;
+  font-size: 13px;
+}
+
+.tl-profiles-text-input:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.28);
+  outline-offset: 1px;
+}
+
+.tl-profiles-text-input:disabled {
+  opacity: 0.6;
+}
+
+.tl-profiles-default-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  min-width: 0;
+}
+
+.tl-profiles-override-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tl-profiles-override-card {
+  padding: 10px 12px;
+  border-radius: 7px;
+  background: #161619;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tl-profiles-override-card[data-overridden="true"] {
+  border-color: rgba(255, 255, 255, 0.16);
+  background: #19191e;
+}
+
+.tl-profiles-override-accordion {
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+}
+
+.tl-profiles-override-accordion-trigger {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.tl-profiles-override-accordion-trigger:hover:not(:disabled) {
+  background: #1f1f24;
+}
+
+.tl-profiles-override-accordion-trigger:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.28);
+  outline-offset: -2px;
+}
+
+.tl-profiles-override-accordion-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.tl-profiles-override-summary {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.tl-profiles-override-accordion-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.tl-profiles-override-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  min-width: 0;
+}
+
+.tl-profiles-override-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+  min-width: 0;
+}
+
+.tl-profiles-error-list {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  color: #fca5a5;
+}
+
+.tl-profiles-empty-box {
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  background: #18181b;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+@media (max-width: 760px) {
+  .tl-profiles-editor-box {
+    padding: 10px 12px;
+  }
+
+  .tl-profiles-default-grid,
+  .tl-profiles-override-controls {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
