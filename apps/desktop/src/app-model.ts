@@ -356,7 +356,6 @@ function countSessionWorking(session: ProjectSessionView): number {
     const state = jv.job.state;
     return (
       state === 'running' ||
-      state === 'reviewing' ||
       jv.job.active_call_count > 0
     );
   }).length;

@@ -345,6 +345,21 @@ describe('app-model workspace and journal projection', () => {
     const jobSection = journal.jobs[0]!;
     assert.equal(jobSection.isAuthoritativeJobDone, false);
     assert.equal(jobSection.workerFinishedPendingAcceptance, true);
+    assert.equal(journal.workingCount, 0, 'waiting for review is not an active call');
+    assert.equal(projection.totalWorkingCount, 0);
+
+    const activeReview = projectDesktopWorkspace(
+      makeSnapshot({
+        ...snapshot,
+        jobs: snapshot.jobs.map((job) => ({ ...job, active_call_count: 1 })),
+        requests: [...snapshot.requests, makeRequest({
+          id: 'reviewer-active', job_id: 'job-reviewing', thread_uuid: UUID_CHAT_A,
+          state: 'running', executor: makeExecutor({ role: 'reviewer' }),
+        })],
+      }),
+      { nowMs: NOW_MS }
+    );
+    assert.equal(activeReview.totalWorkingCount, 1);
     assert.notEqual(jobSection.statusLabel, 'Done');
     assert.notEqual(jobSection.tone, 'success');
 
