@@ -1752,6 +1752,41 @@ fn load_scoped_job(
     Ok(job)
 }
 
+fn load_driver_admitted_job(
+    store: &CoworkerWorkflowStore,
+    expected_binding_id: &str,
+    expected_thread_uuid: &str,
+    job_id: &str,
+) -> Result<CoworkerJobRecord, OperatorCliError> {
+    validate_job_id(job_id)?;
+    let ledger = store
+        .read_binding_ledger(expected_binding_id)
+        .map_err(|error| map_native_error(&error, false))?;
+    ledger
+        .validate(expected_binding_id)
+        .map_err(|error| map_native_error(&error, false))?;
+    if ledger.thread_uuid.as_deref() != Some(expected_thread_uuid) {
+        return Err(OperatorCliError::new(
+            NativeErrorCode::SecurityViolation.as_str(),
+            STORED_SCOPE_MISMATCH,
+        ));
+    }
+    let Some(job) = ledger.jobs.into_iter().find(|item| item.job_id == job_id) else {
+        return Err(OperatorCliError::new(
+            NativeErrorCode::ValidationFailed.as_str(),
+            "Role-flow request or persisted state failed validation.",
+        ));
+    };
+    ensure_scope(
+        &job,
+        expected_binding_id,
+        expected_thread_uuid,
+        NativeErrorCode::SecurityViolation.as_str(),
+        STORED_SCOPE_MISMATCH,
+    )?;
+    Ok(job)
+}
+
 #[derive(serde::Serialize)]
 struct AdmissionRecordedSummary {
     request_key: String,
@@ -2457,7 +2492,7 @@ async fn run_coworker_driver(
             | CoworkerDriverCommand::Reconcile { .. }
     ) {
         let workflow = open_grant_store(plans_dir)?;
-        let job = load_scoped_job(&workflow, binding, thread, &req.job_id)?;
+        let job = load_driver_admitted_job(&workflow, binding, thread, &req.job_id)?;
         let policy = open_controller_policy_store(plans_dir)?;
         threadlane_native::coworker_admission::verify_complete_admission(&workflow, &policy, &job)
             .map_err(|e| map_native_error(&e, false))?;

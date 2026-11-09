@@ -2801,7 +2801,13 @@ mod coworker_completion_durability {
             );
             if kind == CompletionArtifactKind::JobIntegrationReport {
                 assert_eq!(outcome.aggregation.report_artifact_digest, preserved_digest);
-                assert!(!outcome.aggregation.reused_existing_receipts);
+                assert!(outcome.aggregation.reused_existing_receipts);
+                assert!(
+                    !outcome
+                        .aggregation
+                        .job_integration_report
+                        .reused_existing_receipts
+                );
             }
             assert_eq!(read_invocation_count(&fixture.check_count_file), 1);
             assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);

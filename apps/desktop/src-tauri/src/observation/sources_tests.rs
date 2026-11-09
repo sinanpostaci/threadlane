@@ -1367,6 +1367,7 @@ mod coworker_projection_tests {
                 job_integrated_not_closed,
                 job_completed,
             ],
+            admission_markers: std::collections::BTreeMap::new(),
         };
         write_binding_ledger(&stores.plans, &ledger);
 
@@ -1457,6 +1458,7 @@ mod coworker_projection_tests {
             planning_grants: Vec::new(),
             architect_advice: Vec::new(),
             jobs: vec![job_active],
+            admission_markers: std::collections::BTreeMap::new(),
         };
         write_binding_ledger(&stores.plans, &ledger);
 
@@ -1664,6 +1666,7 @@ mod coworker_projection_tests {
             planning_grants: Vec::new(),
             architect_advice: Vec::new(),
             jobs: vec![job],
+            admission_markers: std::collections::BTreeMap::new(),
         };
         write_binding_ledger(&stores.plans, &ledger);
 

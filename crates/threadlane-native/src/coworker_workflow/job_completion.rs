@@ -2479,6 +2479,7 @@ fn execute_or_reuse_final_job_aggregation(
         }
     }
 
+    let reused_existing_receipts = report.reused_existing_receipts;
     let (report, report_artifact_path, report_artifact_digest) = match existing_persisted_report {
         Some(prev_report) => {
             if prev_report.job_scope != report.job_scope
@@ -2528,7 +2529,7 @@ fn execute_or_reuse_final_job_aggregation(
                         "persisted JobIntegrationReport disappeared during verification",
                     )
                 })?;
-                (prev_report, path, sha256_hex(&bytes))
+                (report, path, sha256_hex(&bytes))
             } else {
                 // Before promoting an already-visible uncertain JobIntegrationReport from
                 // ReservedBeforeEffect to EffectConfirmed, explicitly establish file and parent-dir
@@ -2604,7 +2605,7 @@ fn execute_or_reuse_final_job_aggregation(
         approved_base_commit: report.approved_base_commit.clone(),
         final_integrated_target_commit: report.final_integrated_target_commit.clone(),
         final_integrated_tree_sha: report.final_integrated_tree_sha.clone(),
-        reused_existing_receipts: report.reused_existing_receipts,
+        reused_existing_receipts,
         report_artifact_path,
         report_artifact_digest,
         job_integration_report: report,

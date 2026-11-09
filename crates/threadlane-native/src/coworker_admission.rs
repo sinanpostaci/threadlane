@@ -1074,6 +1074,7 @@ impl CoworkerAdmissionService {
 /// A Complete unchanged receipt may establish durability by syncing existing files without
 /// changing bytes, mtime, counters or leases. Partial/conflicting/explicitly Uncertain receipts
 /// require explicit reconciliation. Never use this function in pure preview or status.
+#[inline(never)]
 pub fn verify_complete_admission(
     workflow: &CoworkerWorkflowStore,
     controller: &ControllerPolicyStore,
@@ -1185,6 +1186,7 @@ fn establish_complete_locked(
     remember_witness(path, receipt)
 }
 
+#[inline(never)]
 fn inspect_admission(
     workflow: &CoworkerWorkflowStore,
     controller: &ControllerPolicyStore,
@@ -1195,7 +1197,6 @@ fn inspect_admission(
     let ledger = workflow.read_binding_ledger(binding_id)?;
     let receipt = read_receipt(workflow, binding_id, job_id)?;
     let marker = ledger.admission_markers.get(job_id);
-    let runtime = controller.get_job_runtime_readonly(binding_id, job_id)?;
     let mut inspection = AdmissionInspection {
         state: AdmissionInspectionState::Absent,
         intent_present: receipt.is_some(),
@@ -1209,6 +1210,7 @@ fn inspect_admission(
         }
         return Ok(inspection);
     };
+    let runtime = controller.get_job_runtime_readonly(binding_id, job_id)?;
     let preview = &receipt.preview;
     let job = ledger.jobs.iter().find(|j| j.job_id == job_id);
     let linkage_matches = job.is_some_and(|job| {
