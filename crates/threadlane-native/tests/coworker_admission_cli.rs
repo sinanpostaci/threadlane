@@ -1954,3 +1954,795 @@ async fn cli_refuses_conflicting_consent_scope_and_revisions_and_deduplicates_pr
     })
     .await
 }
+
+fn populate_isolated_system_path_dir(isolated_bin: &Path) {
+    fs::create_dir_all(isolated_bin).expect("create isolated_bin");
+    fs::set_permissions(isolated_bin, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 isolated_bin");
+    let Some(parent_path) = std::env::var_os("PATH") else {
+        return;
+    };
+    for util in [
+        "git", "node", "sh", "mkdir", "cat", "rmdir", "sleep", "rm", "cp", "mv", "chmod", "printf",
+    ] {
+        for dir in std::env::split_paths(&parent_path) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join(util);
+            if let Ok(meta) = fs::metadata(&candidate) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    let link_path = isolated_bin.join(util);
+                    if !link_path.exists() {
+                        std::os::unix::fs::symlink(&candidate, &link_path)
+                            .expect("symlink basic utility into isolated_bin");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_system_mode_agy_worker_child_probe() {
+    let Some(isolated_bin_os) = std::env::var_os("THREADLANE_CLI_SYSTEM_MODE_AGY_BIN") else {
+        return;
+    };
+    let isolated_bin = PathBuf::from(isolated_bin_os);
+    Box::pin(async move {
+        use threadlane_native::coworker_workflow::{
+            FinalizePlanningCallRequest, PlanningResultRef, RecordJobPlanningResultRequest,
+            ReservePlanningCallRequest,
+        };
+        use threadlane_workflow::{compile_plan_revision, PlanChange};
+
+        let f = setup_fixture();
+        let state = f.root.join("runtime-sys-agy");
+        fs::create_dir(&state).unwrap();
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+        let supervisor = Supervisor::start(SupervisorConfig::new(state.clone()))
+            .await
+            .unwrap();
+        let binding = SupervisorClient::from_state_dir(&state)
+            .unwrap()
+            .create_binding(THREAD_UUID_A, "admission-system-agy-cli")
+            .await
+            .unwrap()
+            .binding_id;
+
+        let probe_marker = f.root.join("unexpected_provider_probe.marker");
+        let providers_dir = f.root.join("providers");
+        fs::create_dir_all(&providers_dir).unwrap();
+        let canonical_agy_v1 = providers_dir.join("agy-v1");
+        let canonical_agy_v2 = providers_dir.join("agy-v2");
+        let canonical_codex_v1 = providers_dir.join("codex-v1");
+        for bin in [&canonical_agy_v1, &canonical_agy_v2, &canonical_codex_v1] {
+            write_executable_script(
+                bin,
+                &format!(
+                    "#!/bin/sh\nprintf 'probed' > \"{}\"\nexit 99\n",
+                    probe_marker.display()
+                ),
+            );
+        }
+        let canonical_agy_v1 = fs::canonicalize(&canonical_agy_v1).unwrap();
+        let canonical_agy_v2 = fs::canonicalize(&canonical_agy_v2).unwrap();
+        let canonical_codex_v1 = fs::canonicalize(&canonical_codex_v1).unwrap();
+
+        let agy_link = isolated_bin.join("agy");
+        let codex_link = isolated_bin.join("codex");
+        let _ = fs::remove_file(&agy_link);
+        let _ = fs::remove_file(&codex_link);
+        std::os::unix::fs::symlink(&canonical_agy_v1, &agy_link).unwrap();
+        std::os::unix::fs::symlink(&canonical_codex_v1, &codex_link).unwrap();
+
+        let rev = f.registry.snapshot().unwrap().revision;
+        f.registry
+            .apply(
+                rev,
+                RegistryChange::UpsertTool {
+                    tool: ToolDefinition {
+                        id: "tool-agy".to_string(),
+                        label: "Antigravity CLI (System Mode)".to_string(),
+                        adapter: ToolAdapter::Antigravity,
+                        executable_path: None,
+                        enabled: true,
+                    },
+                },
+            )
+            .unwrap();
+        let rev = f.registry.snapshot().unwrap().revision;
+        f.registry
+            .apply(
+                rev,
+                RegistryChange::UpsertProfile {
+                    profile: WorkflowProfile {
+                        decision_advisor: None,
+                        id: "profile-coworker".to_string(),
+                        name: "Coworker System AGY Worker + Codex Advisory".to_string(),
+                        assignments: vec![
+                            RoleAssignment {
+                                role: WorkflowRole::Orchestrator,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: "model-codex-native".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Architect,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: "model-codex-native".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Coder,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: "model-argon".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Reviewer,
+                                difficulty: Some(Difficulty::Hard),
+                                choice: ModelChoice {
+                                    model_id: "model-codex-native".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                            RoleAssignment {
+                                role: WorkflowRole::Closure,
+                                difficulty: Some(Difficulty::Extreme),
+                                choice: ModelChoice {
+                                    model_id: "model-codex-native".to_string(),
+                                    effort: Some("high".to_string()),
+                                },
+                            },
+                        ],
+                    },
+                },
+            )
+            .unwrap();
+
+        let codex_choice = |difficulty: Difficulty| SelectedRoleChoice {
+            tool_id: "tool-codex".to_string(),
+            adapter: ToolAdapter::CodexCli,
+            route: RoleExecutionRoute::HeadlessWorker,
+            model_id: "model-codex-native".to_string(),
+            model_arg: "gpt-6-astra".to_string(),
+            effort: Some("high".to_string()),
+            matched_difficulty: Some(difficulty),
+        };
+        let planning_policy = ExecutionPolicy {
+            schema_version: 1,
+            policy_id: "policy-sys-agy-plan".to_string(),
+            allow_rules: vec![PolicyAllowRule {
+                tool_id: "tool-codex".to_string(),
+                model_id: "model-codex-native".to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+            }],
+        };
+        let exec_policy = ExecutionPolicy {
+            schema_version: 1,
+            policy_id: "policy-sys-agy-exec".to_string(),
+            allow_rules: vec![
+                PolicyAllowRule {
+                    tool_id: "tool-agy".to_string(),
+                    model_id: "model-argon".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                    roles: vec![WorkflowRole::Coder],
+                },
+                PolicyAllowRule {
+                    tool_id: "tool-codex".to_string(),
+                    model_id: "model-codex-native".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                    roles: vec![
+                        WorkflowRole::Orchestrator,
+                        WorkflowRole::Architect,
+                        WorkflowRole::Reviewer,
+                        WorkflowRole::Closure,
+                    ],
+                },
+            ],
+        };
+
+        let pb = project_base(&f);
+        let reg_snap = f.registry.snapshot().unwrap();
+        let brief = WorkBrief {
+            brief_id: "brief-sys-agy".to_string(),
+            binding_id: binding.clone(),
+            thread_uuid: THREAD_UUID_A.to_string(),
+            project_base: pb.clone(),
+            kind: WorkBriefKind::NewJob,
+            summary: "System-mode AGY Worker CLI admission test".to_string(),
+            confirmed_requirements: vec!["Validate System-mode AGY Worker pin".to_string()],
+            proposed_additions: Vec::new(),
+            assumptions: vec!["Isolated PATH fixture".to_string()],
+            open_questions: Vec::new(),
+            accepted_architect_decisions: Vec::new(),
+        };
+        let job = f
+            .workflow_store
+            .create_or_amend_job(&CreateCoworkerJobRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: "req-job-sys-agy".to_string(),
+                expected_ledger_revision: None,
+                work_brief: brief,
+                amended_target_task_ids: Vec::new(),
+                amended_write_paths: Vec::new(),
+                amended_interfaces: Vec::new(),
+            })
+            .unwrap();
+        let grant = f
+            .workflow_store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: "req-grant-sys-agy".to_string(),
+                expected_ledger_revision: None,
+                project_base: pb.clone(),
+                profile_id: "profile-coworker".to_string(),
+                registry_revision: reg_snap.revision,
+                policy: planning_policy,
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 2,
+                    max_orchestrator_calls: 1,
+                    max_architect_calls: 1,
+                    max_timeout_ms_per_call: 30_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms: 1_000,
+                expires_at_ms: 60_000,
+                operator_attested: true,
+            })
+            .unwrap();
+        let reservation = f
+            .workflow_store
+            .reserve_planning_call(&ReservePlanningCallRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant.grant_id.clone(),
+                request_key: "req-plan-call-sys-agy".to_string(),
+                expected_ledger_revision: None,
+                role: WorkflowRole::Orchestrator,
+                difficulty: Some(Difficulty::Hard),
+                selected_choice: codex_choice(Difficulty::Hard),
+                context_digest: job.work_brief_digest.clone(),
+                call_project_base: Some(pb.clone()),
+                current_time_ms: 2_000,
+            })
+            .unwrap();
+        let output_digest = sha256_hex(b"sys-agy-plan-output");
+        f.workflow_store
+            .finalize_planning_call(&FinalizePlanningCallRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant.grant_id.clone(),
+                reservation_id: reservation.reservation_id.clone(),
+                expected_ledger_revision: None,
+                status: PlanningReservationStatus::Completed,
+                updated_at_ms: 2_100,
+                run_id: Some("run-sys-agy-plan".to_string()),
+                report_artifact_id: Some("report-sys-agy-plan".to_string()),
+                output_digest: Some(output_digest.clone()),
+                diagnostic: None,
+            })
+            .unwrap();
+
+        let tasks = three_tasks();
+        let draft = f
+            .plans
+            .change_at(
+                0,
+                PlanChange::SaveDraft {
+                    plan_id: "plan-sys-agy".to_string(),
+                    binding_id: binding.clone(),
+                    profile_id: "profile-coworker".to_string(),
+                    profile_revision: reg_snap.revision,
+                    summary: "System-mode AGY Worker plan".to_string(),
+                    tasks: tasks.clone(),
+                },
+                1_700_000_000_000,
+            )
+            .unwrap();
+        let published = f
+            .plans
+            .change(
+                draft.revision,
+                PlanChange::Publish {
+                    plan_id: "plan-sys-agy".to_string(),
+                    revision: draft.revision,
+                },
+            )
+            .unwrap();
+        let compiled = compile_plan_revision(&published, &reg_snap).unwrap();
+        let approval_summary = f
+            .authority
+            .approve_at(
+                OperatorApprovalRequest {
+                    binding_id: binding.clone(),
+                    thread_uuid: THREAD_UUID_A.to_string(),
+                    plan_id: "plan-sys-agy".to_string(),
+                    plan_revision: published.revision,
+                    expected_registry_revision: reg_snap.revision,
+                    expected_plan_digest: compiled.plan_digest.clone(),
+                    repository_path: f.repo_dir.clone(),
+                    base_commit: f.base_commit.clone(),
+                    approved_task_ids: tasks.iter().map(|t| t.id.clone()).collect(),
+                    approved_write_paths: vec![
+                        "src/a.rs".to_string(),
+                        "src/b.rs".to_string(),
+                        "src/c.rs".to_string(),
+                    ],
+                    max_parallel: 2,
+                    budgets: ExecutionBudgets::default(),
+                },
+                1_700_000_001_000,
+            )
+            .expect("System-mode AGY Worker authority approval must succeed");
+        let approval_record = f
+            .authority
+            .get_for_operator_readonly(&approval_summary.approval_id)
+            .unwrap();
+        for task in &approval_record.tasks {
+            assert_eq!(
+                task.canonical_executable.as_ref(),
+                Some(&canonical_agy_v1),
+                "authority must freeze canonical symlink target for System-mode AGY Worker"
+            );
+        }
+        assert!(
+            !probe_marker.exists(),
+            "authority approval must never execute or probe provider binary"
+        );
+
+        let planning_result = PlanningResultRef {
+            grant_id: grant.grant_id,
+            reservation_id: reservation.reservation_id,
+            request_key: reservation.request_key,
+            run_id: "run-sys-agy-plan".to_string(),
+            report_artifact_id: "report-sys-agy-plan".to_string(),
+            output_digest,
+            work_brief_digest: job.work_brief_digest.clone(),
+            project_base: pb,
+            profile_id: approval_record.profile_id.clone(),
+            registry_revision: approval_record.registry_revision,
+            policy_digest: grant.policy_digest,
+            selected_choice: codex_choice(Difficulty::Hard),
+            plan_id: approval_record.plan_id.clone(),
+            plan_revision: approval_record.plan_revision,
+            plan_digest: approval_record.plan_digest.clone(),
+            plan_status: threadlane_workflow::PlanStatus::Published,
+            task_interfaces: BTreeMap::new(),
+            architect_advice_ids: Vec::new(),
+            resolved_open_questions: Vec::new(),
+            deferred_proposals: Vec::new(),
+            recorded_at_ms: 2_100,
+        };
+        let job = f
+            .workflow_store
+            .record_job_planning_result(&RecordJobPlanningResultRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id,
+                expected_job_revision: Some(job.job_revision),
+                expected_ledger_revision: None,
+                planning_result: planning_result.clone(),
+            })
+            .unwrap();
+
+        let mut task_entries = BTreeMap::new();
+        for approved_task in &approval_record.tasks {
+            task_entries.insert(
+                approved_task.task_id.clone(),
+                TaskIndependenceCompletenessEntry {
+                    task_id: approved_task.task_id.clone(),
+                    task_digest: approved_task.task_digest.clone(),
+                    owned_interfaces: Vec::new(),
+                    consumed_interfaces: Vec::new(),
+                    explicitly_no_interfaces: true,
+                    semantic_independence_attested: true,
+                },
+            );
+        }
+        let mut completeness = DeclaredIndependenceCompletenessReceipt {
+            receipt_id: format!("icr_{}", job.job_id),
+            job_id: job.job_id.clone(),
+            approval_id: approval_summary.approval_id.clone(),
+            plan_digest: approval_record.plan_digest.clone(),
+            task_entries,
+            hold_attestations: BTreeMap::new(),
+            recorded_at_ms: 1_700_000_050_000,
+            operator_attested: true,
+            receipt_digest: String::new(),
+        };
+        completeness.receipt_digest = completeness.compute_digest().unwrap();
+
+        let cap_env = FrozenControllerCapabilityEnvelope {
+            allowed_reviewer_choices: vec![codex_choice(Difficulty::Hard)],
+            allowed_closure_choices: vec![codex_choice(Difficulty::Extreme)],
+            max_in_scope_correction_attempts: 1,
+            allowed_check_ids: vec!["cargo_test".to_string()],
+            local_git_integration_allowed: true,
+            allow_check_failure_corrections: false,
+        };
+        let mut role_budgets = BTreeMap::new();
+        role_budgets.insert(
+            WorkflowRole::Coder,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 6),
+        );
+        role_budgets.insert(
+            WorkflowRole::Reviewer,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 6),
+        );
+        role_budgets.insert(
+            WorkflowRole::Closure,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Closure, 2),
+        );
+        let request = AdmissionRequest {
+            request_key: "admit-sys-agy".to_string(),
+            binding: BindJobApprovalRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: Some(
+                    f.workflow_store
+                        .read_binding_ledger(&binding)
+                        .unwrap()
+                        .ledger_revision,
+                ),
+                approval_id: approval_summary.approval_id.clone(),
+                policy: exec_policy.clone(),
+                controller_envelope: Some(cap_env),
+                task_interfaces: BTreeMap::new(),
+            },
+            planning_result,
+            work_brief_digest: job.work_brief_digest.clone(),
+            execution: FreezeControllerExecutionEnvelopeRequest {
+                binding_id: binding.clone(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                policy: exec_policy,
+                reviewer_choice: codex_choice(Difficulty::Hard),
+                closure_choice: codex_choice(Difficulty::Extreme),
+                role_budgets,
+                max_in_scope_corrections_per_task: 1,
+                max_total_corrections_per_job: 2,
+                max_total_task_attempts_per_job: 6,
+                check_commands: default_check_commands(&f),
+                allow_task_worktree_commits: true,
+                allow_run_integration_execution: true,
+                default_integration_strategy: IntegrationStrategy::MergeNoFf,
+                independence_completeness_receipt: Some(completeness),
+                shadow_jev_policy: None,
+                created_at_ms: 1_700_000_100_000,
+                operator_attested: false,
+                confirm_approval_subject_digest: None,
+                confirm_envelope_digest: None,
+            },
+            reviewer_difficulty: Some(Difficulty::Hard),
+            closure_difficulty: Some(Difficulty::Extreme),
+        };
+
+        let req_path = private_json(&f, "admission-sys-agy.json", &request);
+        let req_str = req_path.to_str().unwrap();
+
+        let plans_before = snapshot(&f.plans_dir);
+        let authority_before = snapshot(&f.authority_dir);
+        let registry_before = snapshot(&f.registry_dir);
+        let repo_before = snapshot(&f.repo_dir);
+
+        let preview = cli(
+            &f,
+            &state,
+            &binding,
+            &["coworker-admission", "preview", "--request", req_str],
+        )
+        .await;
+        assert_eq!(snapshot(&f.plans_dir), plans_before);
+        assert_eq!(snapshot(&f.authority_dir), authority_before);
+        assert_eq!(snapshot(&f.registry_dir), registry_before);
+        assert_eq!(snapshot(&f.repo_dir), repo_before);
+        assert!(
+            !probe_marker.exists(),
+            "preview must never invoke or probe provider"
+        );
+        assert_no_execution(&f);
+        for (_task_id, pin) in preview["executable_pins"]["workers"].as_object().unwrap() {
+            assert_eq!(
+                pin["canonical_executable"].as_str().unwrap(),
+                canonical_agy_v1.to_str().unwrap()
+            );
+        }
+        assert_eq!(
+            preview["executable_pins"]["reviewer"]["canonical_executable"]
+                .as_str()
+                .unwrap(),
+            canonical_codex_v1.to_str().unwrap()
+        );
+        assert_eq!(
+            preview["executable_pins"]["closure"]["canonical_executable"]
+                .as_str()
+                .unwrap(),
+            canonical_codex_v1.to_str().unwrap()
+        );
+
+        let pd = preview["preview_digest"].as_str().unwrap();
+        let ad = preview["approval_subject_digest"].as_str().unwrap();
+        let ed = preview["envelope"]["envelope_digest"].as_str().unwrap();
+
+        // Changed PATH target for System-mode AGY Worker must be rejected by preview and record.
+        fs::remove_file(&agy_link).unwrap();
+        std::os::unix::fs::symlink(&canonical_agy_v2, &agy_link).unwrap();
+        assert!(!cli_output(
+            &f,
+            &state,
+            &binding,
+            &["coworker-admission", "preview", "--request", req_str],
+        )
+        .await
+        .status
+        .success());
+        assert!(!cli_output(
+            &f,
+            &state,
+            &binding,
+            &[
+                "coworker-admission",
+                "record",
+                "--request",
+                req_str,
+                "--operator-approved",
+                "--confirm-preview",
+                pd,
+                "--confirm-approval",
+                ad,
+                "--confirm-envelope",
+                ed,
+            ],
+        )
+        .await
+        .status
+        .success());
+        assert_eq!(snapshot(&f.plans_dir), plans_before);
+
+        // Missing PATH executable for System-mode AGY Worker must be rejected.
+        fs::remove_file(&agy_link).unwrap();
+        assert!(!cli_output(
+            &f,
+            &state,
+            &binding,
+            &["coworker-admission", "preview", "--request", req_str],
+        )
+        .await
+        .status
+        .success());
+        assert_eq!(snapshot(&f.plans_dir), plans_before);
+
+        // Restore exact frozen target; verify disabled tool, adapter mismatch, and shared
+        // System-mode AGY advisory refusal before recording.
+        std::os::unix::fs::symlink(&canonical_agy_v1, &agy_link).unwrap();
+        {
+            let reg_file = f.registry_dir.join("registry.json");
+            let saved_reg_bytes = fs::read(&reg_file).unwrap();
+
+            // Disabled Worker tool must be refused.
+            let mut reg_mut = f.registry.snapshot().unwrap();
+            reg_mut
+                .tools
+                .iter_mut()
+                .find(|t| t.id == "tool-agy")
+                .unwrap()
+                .enabled = false;
+            fs::write(&reg_file, serde_json::to_vec(&reg_mut).unwrap()).unwrap();
+            let registry_for_case = snapshot(&f.registry_dir);
+            assert!(!cli_output(
+                &f,
+                &state,
+                &binding,
+                &["coworker-admission", "preview", "--request", req_str],
+            )
+            .await
+            .status
+            .success());
+            assert_eq!(snapshot(&f.plans_dir), plans_before);
+            assert_eq!(snapshot(&f.registry_dir), registry_for_case);
+
+            // Adapter mismatch on Worker tool must be refused.
+            reg_mut
+                .tools
+                .iter_mut()
+                .find(|t| t.id == "tool-agy")
+                .unwrap()
+                .enabled = true;
+            reg_mut
+                .tools
+                .iter_mut()
+                .find(|t| t.id == "tool-agy")
+                .unwrap()
+                .adapter = ToolAdapter::OpencodeV2;
+            fs::write(&reg_file, serde_json::to_vec(&reg_mut).unwrap()).unwrap();
+            let registry_for_case = snapshot(&f.registry_dir);
+            assert!(!cli_output(
+                &f,
+                &state,
+                &binding,
+                &["coworker-admission", "preview", "--request", req_str],
+            )
+            .await
+            .status
+            .success());
+            assert_eq!(snapshot(&f.plans_dir), plans_before);
+            assert_eq!(snapshot(&f.registry_dir), registry_for_case);
+
+            // Shared System-mode AGY tool selected for Reviewer/Closure must still be refused by
+            // the advisory resolver (Worker PATH discovery never bypasses advisory rules).
+            reg_mut
+                .tools
+                .iter_mut()
+                .find(|t| t.id == "tool-agy")
+                .unwrap()
+                .adapter = ToolAdapter::Antigravity;
+            for assignment in &mut reg_mut.profiles[0].assignments {
+                if matches!(
+                    assignment.role,
+                    WorkflowRole::Reviewer | WorkflowRole::Closure
+                ) {
+                    assignment.choice = ModelChoice {
+                        model_id: "model-argon".to_string(),
+                        effort: Some("high".to_string()),
+                    };
+                }
+            }
+            fs::write(&reg_file, serde_json::to_vec(&reg_mut).unwrap()).unwrap();
+            let registry_for_case = snapshot(&f.registry_dir);
+            let mut shared_req = request.clone();
+            for rule in &mut shared_req.binding.policy.allow_rules {
+                if rule.tool_id == "tool-agy" {
+                    rule.roles = vec![
+                        WorkflowRole::Coder,
+                        WorkflowRole::Reviewer,
+                        WorkflowRole::Closure,
+                    ];
+                }
+            }
+            shared_req.execution.policy = shared_req.binding.policy.clone();
+            let agy_advisory_choice = |difficulty: Difficulty| SelectedRoleChoice {
+                tool_id: "tool-agy".to_string(),
+                adapter: ToolAdapter::Antigravity,
+                route: RoleExecutionRoute::HeadlessWorker,
+                model_id: "model-argon".to_string(),
+                model_arg: "gemini-4-argon-high".to_string(),
+                effort: Some("high".to_string()),
+                matched_difficulty: Some(difficulty),
+            };
+            shared_req.execution.reviewer_choice = agy_advisory_choice(Difficulty::Hard);
+            shared_req.execution.closure_choice = agy_advisory_choice(Difficulty::Extreme);
+            let cap = shared_req.binding.controller_envelope.as_mut().unwrap();
+            cap.allowed_reviewer_choices = vec![agy_advisory_choice(Difficulty::Hard)];
+            cap.allowed_closure_choices = vec![agy_advisory_choice(Difficulty::Extreme)];
+            let shared_req_path = private_json(&f, "admission-shared-agy.json", &shared_req);
+            let shared_out = cli_output(
+                &f,
+                &state,
+                &binding,
+                &[
+                    "coworker-admission",
+                    "preview",
+                    "--request",
+                    shared_req_path.to_str().unwrap(),
+                ],
+            )
+            .await;
+            assert!(!shared_out.status.success());
+            assert_eq!(snapshot(&f.plans_dir), plans_before);
+            assert_eq!(snapshot(&f.registry_dir), registry_for_case);
+
+            fs::write(&reg_file, &saved_reg_bytes).unwrap();
+            assert_eq!(fs::read(&reg_file).unwrap(), saved_reg_bytes);
+        }
+        let registry_before_record = snapshot(&f.registry_dir);
+
+        let recorded = cli(
+            &f,
+            &state,
+            &binding,
+            &[
+                "coworker-admission",
+                "record",
+                "--request",
+                req_str,
+                "--operator-approved",
+                "--confirm-preview",
+                pd,
+                "--confirm-approval",
+                ad,
+                "--confirm-envelope",
+                ed,
+            ],
+        )
+        .await;
+        assert_eq!(recorded["stage"], "complete");
+        assert_eq!(recorded["envelope_digest"], ed);
+        assert_eq!(snapshot(&f.registry_dir), registry_before_record);
+        assert!(
+            !probe_marker.exists(),
+            "record must never invoke or probe provider"
+        );
+        assert_no_execution(&f);
+
+        supervisor.shutdown().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn cli_system_mode_agy_worker_and_codex_advisory_preview_and_record_succeed_and_reject_path_drift(
+) {
+    use threadlane_workers::{
+        run_bounded_command, BoundedCommandBudgets, BoundedCommandSpec, BoundedCommandStatus,
+    };
+
+    let tmp = TempDir::new().expect("tempdir for isolated PATH");
+    let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let isolated_bin = root.join("isolated-system-bin");
+    populate_isolated_system_path_dir(&isolated_bin);
+
+    let exe = fs::canonicalize(std::env::current_exe().expect("current_exe"))
+        .expect("canonicalize current_exe");
+    let isolated_bin_str = isolated_bin
+        .to_str()
+        .expect("utf8 isolated_bin")
+        .to_string();
+    let report = run_bounded_command(&BoundedCommandSpec {
+        executable: exe,
+        argv: vec![
+            "--exact".to_string(),
+            "cli_system_mode_agy_worker_child_probe".to_string(),
+            "--nocapture".to_string(),
+        ],
+        working_directory: root,
+        env_overrides: vec![
+            ("PATH".to_string(), isolated_bin_str.clone()),
+            (
+                "THREADLANE_CLI_SYSTEM_MODE_AGY_BIN".to_string(),
+                isolated_bin_str,
+            ),
+        ],
+        strip_git_env: true,
+        budgets: BoundedCommandBudgets {
+            timeout_ms: 60_000,
+            max_stdout_bytes: 262_144,
+            max_stderr_bytes: 262_144,
+        },
+    })
+    .await
+    .expect("run bounded child probe");
+    assert_eq!(
+        report.status,
+        BoundedCommandStatus::Succeeded,
+        "status={:?}\nstdout:\n{}\nstderr:\n{}",
+        report.status,
+        String::from_utf8_lossy(&report.stdout_bytes),
+        String::from_utf8_lossy(&report.stderr_bytes)
+    );
+    assert_eq!(
+        report.exit_code,
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&report.stdout_bytes),
+        String::from_utf8_lossy(&report.stderr_bytes)
+    );
+}

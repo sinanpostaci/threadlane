@@ -639,7 +639,14 @@ impl CoworkerAdmissionService {
                 .iter()
                 .find(|t| t.id == pin.choice.tool_id)
                 .ok_or_else(|| invalid("Worker tool is absent"))?;
-            if resolve_advisory_tool_executable(tool)? != pin.canonical_executable {
+            let (live_provider, live_executable) = resolve_and_validate_current_worker_executable(
+                tool,
+                &task.task_id,
+                pin.choice.adapter,
+            )?;
+            if approved.provider != Some(live_provider)
+                || live_executable != pin.canonical_executable
+            {
                 return Err(invalid("Worker executable drifted from authority pin"));
             }
             pins.insert(task.task_id.clone(), pin);
@@ -1394,4 +1401,21 @@ fn forget_witness(path: &Path) {
     if let Ok(mut map) = witnesses().lock() {
         map.remove(path);
     }
+}
+
+pub(crate) fn resolve_and_validate_current_worker_executable(
+    tool: &threadlane_workflow::ToolDefinition,
+    task_id: &str,
+    expected_adapter: crate::ToolAdapter,
+) -> Result<(threadlane_workers::WorkerProvider, PathBuf), NativeError> {
+    if !tool.enabled || tool.adapter != expected_adapter {
+        return Err(invalid("Worker tool is disabled or adapter drifted"));
+    }
+    threadlane_authority::resolve_and_validate_worker_executable(
+        &tool.id,
+        task_id,
+        expected_adapter,
+        tool.executable_path.as_deref(),
+    )
+    .map_err(|_| invalid("Worker executable resolution failed"))
 }

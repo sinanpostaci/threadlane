@@ -5171,11 +5171,14 @@ pub(crate) fn assess_live_registry_and_preflight(
 ///   [`normalize_read_only_advisory_choice`] and requires exact equality with the frozen choices
 ///   (`tool_id`, `adapter`, `route`, `model_id`, effective `model_arg`, `effort`, and
 ///   `matched_difficulty`).
-/// - Requires every selected role tool (`Coder`, `Reviewer`, and `Closure`) to resolve via
-///   [`resolve_advisory_tool_executable`] to the exact same canonical executable path recorded in
-///   an actual frozen [`ApprovedTaskRecord::canonical_executable`] for that same `tool_id` and
-///   `adapter`, with all matching frozen task paths in agreement. If `Reviewer` or `Closure` uses
-///   a tool not represented in `approval.tasks`, returns `Ok(false)`.
+/// - Requires every approved [`WorkflowRole::Coder`] task tool to resolve via
+///   [`crate::coworker_admission::resolve_and_validate_current_worker_executable`] to the exact
+///   frozen `provider` and [`ApprovedTaskRecord::canonical_executable`], with all matching frozen
+///   task paths for a `tool_id` in agreement. Requires [`WorkflowRole::Reviewer`] and
+///   [`WorkflowRole::Closure`] tools to resolve via [`resolve_advisory_tool_executable`] to the
+///   exact canonical executable path recorded in a matching frozen
+///   [`ApprovedTaskRecord::canonical_executable`] for that same `tool_id` and `adapter`. If
+///   `Reviewer` or `Closure` uses a tool not represented in `approval.tasks`, returns `Ok(false)`.
 /// - If `envelope.shadow_jev_policy` is enabled, returns `Ok(false)` conservatively because its
 ///   live dependencies cannot be proven from existing frozen task evidence.
 #[inline(never)]
@@ -5374,6 +5377,25 @@ pub(crate) fn prove_registry_snapshot_equivalence_to_frozen_authority(
                 );
             }
         }
+        let Some(tool_def) = reg_snap
+            .tools
+            .iter()
+            .find(|t| t.id == approved_task.tool_id)
+        else {
+            return Ok(false);
+        };
+        let Ok((live_provider, live_exec)) =
+            crate::coworker_admission::resolve_and_validate_current_worker_executable(
+                tool_def,
+                &approved_task.task_id,
+                approved_task.adapter,
+            )
+        else {
+            return Ok(false);
+        };
+        if approved_task.provider != Some(live_provider) || &live_exec != frozen_exec {
+            return Ok(false);
+        }
     }
 
     let mut selected_role_tools: BTreeMap<&str, ToolAdapter> = BTreeMap::new();
@@ -5394,17 +5416,23 @@ pub(crate) fn prove_registry_snapshot_equivalence_to_frozen_authority(
         }
     }
 
-    for (tool_id, expected_adapter) in selected_role_tools {
-        let Some((frozen_adapter, frozen_exec)) = frozen_exec_by_tool.get(tool_id) else {
+    for advisory_choice in [&envelope.reviewer_choice, &envelope.closure_choice] {
+        let Some((frozen_adapter, frozen_exec)) =
+            frozen_exec_by_tool.get(advisory_choice.tool_id.as_str())
+        else {
             return Ok(false);
         };
-        if *frozen_adapter != expected_adapter {
+        if *frozen_adapter != advisory_choice.adapter {
             return Ok(false);
         }
-        let Some(tool_def) = reg_snap.tools.iter().find(|t| t.id == tool_id) else {
+        let Some(tool_def) = reg_snap
+            .tools
+            .iter()
+            .find(|t| t.id == advisory_choice.tool_id)
+        else {
             return Ok(false);
         };
-        if !tool_def.enabled || tool_def.adapter != expected_adapter {
+        if !tool_def.enabled || tool_def.adapter != advisory_choice.adapter {
             return Ok(false);
         }
         let Ok(live_exec) = resolve_advisory_tool_executable(tool_def) else {

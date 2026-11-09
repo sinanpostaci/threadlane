@@ -2140,3 +2140,767 @@ async fn full_pipeline_completes_through_aggregate_and_closure_after_unrelated_r
     })
     .await;
 }
+
+fn populate_isolated_system_path_dir_for_drift(isolated_bin: &Path) {
+    fs::create_dir_all(isolated_bin).expect("create isolated_bin");
+    fs::set_permissions(isolated_bin, fs::Permissions::from_mode(0o700))
+        .expect("chmod 0700 isolated_bin");
+    let Some(parent_path) = std::env::var_os("PATH") else {
+        return;
+    };
+    for util in [
+        "git", "node", "sh", "mkdir", "cat", "rmdir", "sleep", "rm", "cp", "mv", "chmod", "printf",
+    ] {
+        for dir in std::env::split_paths(&parent_path) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join(util);
+            if let Ok(meta) = fs::metadata(&candidate) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    let link_path = isolated_bin.join(util);
+                    if !link_path.exists() {
+                        std::os::unix::fs::symlink(&candidate, &link_path)
+                            .expect("symlink basic utility into isolated_bin");
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn system_mode_agy_worker_registry_drift_child_probe() {
+    let Some(isolated_bin_os) = std::env::var_os("THREADLANE_DRIFT_SYSTEM_MODE_AGY_BIN") else {
+        return;
+    };
+    let isolated_bin = PathBuf::from(isolated_bin_os);
+    Box::pin(async move {
+        use threadlane_native::coworker_admission::{
+            AdmissionConfirmation, AdmissionRequest, AdmissionStage, CoworkerAdmissionService,
+        };
+        use threadlane_native::CoworkerCodeDriver;
+
+        let fixture = setup_fixture();
+        let role_script_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-coworker-roles.mjs");
+        let fake_codex_mjs = fixture.root.join("bin/fake-codex-advisory.mjs");
+        fs::write(
+            &fake_codex_mjs,
+            r#"import { execFileSync } from "node:child_process";
+const roleScript = process.argv[2];
+const stateDir = process.argv[3];
+const args = process.argv.slice(4);
+if (args.includes("--ignore-rules")) {
+  execFileSync(
+    process.execPath,
+    [roleScript, stateDir, ...args],
+    { stdio: ["ignore", "inherit", "inherit"] },
+  );
+  process.exit(0);
+}
+let model = "gpt-6-astra";
+for (let i = 0; i < args.length; i += 1) {
+  if (args[i] === "--model" && i + 1 < args.length) {
+    model = args[i + 1];
+    i += 1;
+  }
+}
+const prompt = args[args.length - 1] || "";
+const out = execFileSync(
+  process.execPath,
+  [roleScript, stateDir, "--model", model, "--effort", "high", "--mode", "plan", "--print", prompt],
+  { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] },
+);
+const lines = out.trim().split("\n");
+const last = JSON.parse(lines[lines.length - 1]);
+const responseText = last.result.response;
+process.stdout.write(`${JSON.stringify({ type: "thread.started", thread_id: "th-codex-advisory" })}\n`);
+process.stdout.write(`${JSON.stringify({ type: "turn.started" })}\n`);
+process.stdout.write(`${JSON.stringify({ type: "item.completed", item: { id: "msg-1", type: "agent_message", text: responseText } })}\n`);
+process.stdout.write(`${JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } })}\n`);
+"#,
+        )
+        .expect("write fake-codex-advisory.mjs");
+        let fake_codex_exe = fixture.root.join("bin/fake-codex");
+        write_executable_script(
+            &fake_codex_exe,
+            &format!(
+                "#!/bin/sh\nset -eu\nexec node \"{}\" \"{}\" \"{}\" \"$@\"\n",
+                fake_codex_mjs.display(),
+                role_script_path.display(),
+                fixture.root.display(),
+            ),
+        );
+        let fake_agy_drifted_exe = fixture.root.join("bin/fake-agy-drifted");
+        write_executable_script(
+            &fake_agy_drifted_exe,
+            &format!(
+                "#!/bin/sh\nset -eu\nexec node \"{}\" \"{}\" \"$@\"\n",
+                role_script_path.display(),
+                fixture.root.display(),
+            ),
+        );
+        let canonical_agy_v1 = fs::canonicalize(&fixture.fake_agy_exe).unwrap();
+        let canonical_agy_v2 = fs::canonicalize(&fake_agy_drifted_exe).unwrap();
+        let canonical_codex_v1 = fs::canonicalize(&fake_codex_exe).unwrap();
+
+        let agy_link = isolated_bin.join("agy");
+        let codex_link = isolated_bin.join("codex");
+        let _ = fs::remove_file(&agy_link);
+        let _ = fs::remove_file(&codex_link);
+        std::os::unix::fs::symlink(&canonical_agy_v1, &agy_link).unwrap();
+        std::os::unix::fs::symlink(&canonical_codex_v1, &codex_link).unwrap();
+
+        // Configure tool-agy with executable_path: None (System mode) for Hard Coder Worker, and
+        // tool-codex (System mode) for Medium Coder Worker plus Orchestrator, Architect, Reviewer, Closure.
+        apply_registry_change(
+            &fixture,
+            RegistryChange::UpsertTool {
+                tool: ToolDefinition {
+                    id: "tool-agy".to_string(),
+                    label: "Antigravity CLI (System Mode)".to_string(),
+                    adapter: ToolAdapter::Antigravity,
+                    executable_path: None,
+                    enabled: true,
+                },
+            },
+        );
+        apply_registry_change(
+            &fixture,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    decision_advisor: None,
+                    id: "profile-coworker".to_string(),
+                    name: "Coworker System AGY Worker + Codex Worker/Advisory".to_string(),
+                    assignments: vec![
+                        RoleAssignment {
+                            role: WorkflowRole::Orchestrator,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-codex-native".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Architect,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-codex-native".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-argon".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Coder,
+                            difficulty: Some(Difficulty::Medium),
+                            choice: ModelChoice {
+                                model_id: "model-codex-native".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Reviewer,
+                            difficulty: Some(Difficulty::Hard),
+                            choice: ModelChoice {
+                                model_id: "model-codex-native".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                        RoleAssignment {
+                            role: WorkflowRole::Closure,
+                            difficulty: Some(Difficulty::Extreme),
+                            choice: ModelChoice {
+                                model_id: "model-codex-native".to_string(),
+                                effort: Some("high".to_string()),
+                            },
+                        },
+                    ],
+                },
+            },
+        );
+
+        let codex_choice = |difficulty: Difficulty| SelectedRoleChoice {
+            tool_id: "tool-codex".to_string(),
+            adapter: ToolAdapter::CodexCli,
+            route: RoleExecutionRoute::HeadlessWorker,
+            model_id: "model-codex-native".to_string(),
+            model_arg: "gpt-6-astra".to_string(),
+            effort: Some("high".to_string()),
+            matched_difficulty: Some(difficulty),
+        };
+        let sys_planning_policy = ExecutionPolicy {
+            schema_version: 1,
+            policy_id: "policy-sys-agy-plan".to_string(),
+            allow_rules: vec![PolicyAllowRule {
+                tool_id: "tool-codex".to_string(),
+                model_id: "model-codex-native".to_string(),
+                efforts: vec!["high".to_string()],
+                allow_no_effort: false,
+                roles: vec![WorkflowRole::Orchestrator, WorkflowRole::Architect],
+            }],
+        };
+        let sys_exec_policy = ExecutionPolicy {
+            schema_version: 1,
+            policy_id: "policy-sys-agy-exec".to_string(),
+            allow_rules: vec![
+                PolicyAllowRule {
+                    tool_id: "tool-agy".to_string(),
+                    model_id: "model-argon".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                    roles: vec![WorkflowRole::Coder],
+                },
+                PolicyAllowRule {
+                    tool_id: "tool-codex".to_string(),
+                    model_id: "model-codex-native".to_string(),
+                    efforts: vec!["high".to_string()],
+                    allow_no_effort: false,
+                    roles: vec![
+                        WorkflowRole::Orchestrator,
+                        WorkflowRole::Architect,
+                        WorkflowRole::Coder,
+                        WorkflowRole::Reviewer,
+                        WorkflowRole::Closure,
+                    ],
+                },
+            ],
+        };
+
+        let (mut tasks, task_interfaces, approved_write_paths) = default_two_root_tasks();
+        tasks[0].difficulty = Difficulty::Hard;
+        tasks[1].difficulty = Difficulty::Medium;
+        let pb = project_base(&fixture);
+        let reg_snap = fixture.registry.snapshot().expect("registry snapshot");
+        let brief = sample_brief(&fixture, "brf_sys_agy_unrel");
+        let job = fixture
+            .workflow_store
+            .create_or_amend_job(&CreateCoworkerJobRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: "req_job_brf_sys_agy_unrel".to_string(),
+                expected_ledger_revision: None,
+                work_brief: brief,
+                amended_target_task_ids: Vec::new(),
+                amended_write_paths: Vec::new(),
+                amended_interfaces: Vec::new(),
+            })
+            .expect("create job");
+
+        let driver_planning_artifacts_dir =
+            threadlane_native::planning_driver::planning_artifacts_dir(&fixture.plans_dir);
+        let driver_planning_service = CoworkerPlanningService::new(
+            fixture.workflow_store.clone(),
+            &fixture.registry_dir,
+            &driver_planning_artifacts_dir,
+        )
+        .expect("create driver_planning_service");
+
+        let grant = fixture
+            .workflow_store
+            .create_planning_grant(&CreatePlanningGrantRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                request_key: "req_grant_brf_sys_agy_unrel".to_string(),
+                expected_ledger_revision: None,
+                project_base: pb,
+                profile_id: "profile-coworker".to_string(),
+                registry_revision: reg_snap.revision,
+                policy: sys_planning_policy,
+                capabilities: PlanningReadOnlyCapabilities::strict_read_only(),
+                budget: PlanningCallBudget {
+                    max_total_calls: 4,
+                    max_orchestrator_calls: 2,
+                    max_architect_calls: 2,
+                    max_timeout_ms_per_call: 30_000,
+                    max_output_bytes_per_call: 65_536,
+                },
+                created_at_ms: 1_000,
+                expires_at_ms: 60_000,
+                operator_attested: true,
+            })
+            .expect("create planning grant");
+
+        let planned_tasks: Vec<StructuredPlannedTask> = tasks
+            .iter()
+            .map(|t| {
+                let iface = task_interfaces
+                    .get(&t.id)
+                    .cloned()
+                    .unwrap_or(TaskInterfaceOwnershipSpec {
+                        owned_interfaces: Vec::new(),
+                        consumed_interfaces: Vec::new(),
+                    });
+                StructuredPlannedTask {
+                    task_id: t.id.clone(),
+                    title: t.title.clone(),
+                    description: t.instruction.clone(),
+                    role: t.role,
+                    difficulty: t.difficulty,
+                    depends_on: t.depends_on.clone(),
+                    allowed_write_paths: t.allowed_write_paths.clone(),
+                    owned_interfaces: iface.owned_interfaces,
+                    consumed_interfaces: iface.consumed_interfaces,
+                    model_override: None,
+                    tool_override: None,
+                }
+            })
+            .collect();
+        let structured_plan = StructuredOrchestratorOutput::Plan {
+            schema_version: 1,
+            summary: "System-mode AGY Worker + Codex Worker/Advisory two-task plan".to_string(),
+            tasks: planned_tasks,
+            check_suggestions: vec![PlannedCheckSuggestion {
+                check_id: "cargo_test".to_string(),
+                command_summary: "cargo test --workspace".to_string(),
+                required: true,
+            }],
+            unconfirmed_proposal_notes: Vec::new(),
+            resolved_open_questions: Vec::new(),
+            deferred_proposals: Vec::new(),
+        };
+        fs::write(
+            &fixture.agy_plan_response_file,
+            serde_json::to_string(&structured_plan).unwrap(),
+        )
+        .unwrap();
+
+        let plan_outcome = Box::pin(driver_planning_service.orchestrate_brief_to_plan(
+            &fixture.scoped_workflow,
+            &OrchestrateWorkBriefPlanRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                grant_id: grant.grant_id.clone(),
+                job_id: job.job_id.clone(),
+                request_key: "req_orch_brf_sys_agy_unrel".to_string(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                architect_difficulty: Some(Difficulty::Hard),
+                plan_id: Some("plan-sys-agy-unrel".to_string()),
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: 0,
+                current_time_ms: 2_000,
+            },
+        ))
+        .await
+        .expect("orchestrate_brief_to_plan via Codex advisory");
+        let published_outcome = plan_outcome.require_published_plan().unwrap();
+
+        let job = fixture
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|j| j.job_id == job.job_id)
+            .unwrap();
+        let approval_summary = fixture
+            .authority
+            .approve_at(
+                OperatorApprovalRequest {
+                    binding_id: BINDING_A.to_string(),
+                    thread_uuid: THREAD_UUID_A.to_string(),
+                    plan_id: published_outcome.planning_result.plan_id.clone(),
+                    plan_revision: published_outcome.planning_result.plan_revision,
+                    expected_registry_revision: reg_snap.revision,
+                    expected_plan_digest: published_outcome.planning_result.plan_digest.clone(),
+                    repository_path: fixture.repo_dir.clone(),
+                    base_commit: fixture.base_commit.clone(),
+                    approved_task_ids: tasks.iter().map(|t| t.id.clone()).collect(),
+                    approved_write_paths,
+                    max_parallel: 2,
+                    budgets: ExecutionBudgets::default(),
+                },
+                1_700_000_001_000,
+            )
+            .expect("approve System-mode AGY + Codex Worker plan");
+        let approval_record = fixture
+            .authority
+            .get_for_operator_readonly(&approval_summary.approval_id)
+            .unwrap();
+        assert_eq!(approval_record.tasks.len(), 2);
+        let task_a_approved = approval_record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-root-a")
+            .unwrap();
+        assert_eq!(task_a_approved.tool_id, "tool-agy");
+        assert_eq!(
+            task_a_approved.canonical_executable.as_ref(),
+            Some(&canonical_agy_v1)
+        );
+        let task_b_approved = approval_record
+            .tasks
+            .iter()
+            .find(|t| t.task_id == "task-root-b")
+            .unwrap();
+        assert_eq!(task_b_approved.tool_id, "tool-codex");
+        assert_eq!(
+            task_b_approved.canonical_executable.as_ref(),
+            Some(&canonical_codex_v1)
+        );
+
+        let mut task_entries = BTreeMap::new();
+        for approved_task in &approval_record.tasks {
+            let iface = task_interfaces
+                .get(&approved_task.task_id)
+                .cloned()
+                .unwrap_or_default();
+            task_entries.insert(
+                approved_task.task_id.clone(),
+                TaskIndependenceCompletenessEntry {
+                    task_id: approved_task.task_id.clone(),
+                    task_digest: approved_task.task_digest.clone(),
+                    owned_interfaces: iface.owned_interfaces,
+                    consumed_interfaces: iface.consumed_interfaces,
+                    explicitly_no_interfaces: false,
+                    semantic_independence_attested: true,
+                },
+            );
+        }
+        let mut completeness = DeclaredIndependenceCompletenessReceipt {
+            receipt_id: format!("icr_{}", job.job_id),
+            job_id: job.job_id.clone(),
+            approval_id: approval_summary.approval_id.clone(),
+            plan_digest: approval_record.plan_digest.clone(),
+            task_entries,
+            hold_attestations: BTreeMap::new(),
+            recorded_at_ms: 1_700_000_050_000,
+            operator_attested: true,
+            receipt_digest: String::new(),
+        };
+        completeness.receipt_digest = completeness.compute_digest().unwrap();
+
+        let cap_env = FrozenControllerCapabilityEnvelope {
+            allowed_reviewer_choices: vec![codex_choice(Difficulty::Hard)],
+            allowed_closure_choices: vec![codex_choice(Difficulty::Extreme)],
+            max_in_scope_correction_attempts: 1,
+            allowed_check_ids: vec!["cargo_test".to_string()],
+            local_git_integration_allowed: true,
+            allow_check_failure_corrections: false,
+        };
+        let mut role_budgets = BTreeMap::new();
+        role_budgets.insert(
+            WorkflowRole::Coder,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 4),
+        );
+        role_budgets.insert(
+            WorkflowRole::Reviewer,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Reviewer, 4),
+        );
+        role_budgets.insert(
+            WorkflowRole::Closure,
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Closure, 2),
+        );
+        let admission_req = AdmissionRequest {
+            request_key: "admit_brf_sys_agy_unrel".to_string(),
+            binding: BindJobApprovalRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                expected_ledger_revision: Some(
+                    fixture
+                        .workflow_store
+                        .read_binding_ledger(BINDING_A)
+                        .unwrap()
+                        .ledger_revision,
+                ),
+                approval_id: approval_summary.approval_id.clone(),
+                policy: sys_exec_policy.clone(),
+                controller_envelope: Some(cap_env),
+                task_interfaces,
+            },
+            planning_result: published_outcome.planning_result.clone(),
+            work_brief_digest: job.work_brief_digest.clone(),
+            execution: FreezeControllerExecutionEnvelopeRequest {
+                binding_id: BINDING_A.to_string(),
+                thread_uuid: THREAD_UUID_A.to_string(),
+                job_id: job.job_id.clone(),
+                expected_job_revision: job.job_revision,
+                policy: sys_exec_policy,
+                reviewer_choice: codex_choice(Difficulty::Hard),
+                closure_choice: codex_choice(Difficulty::Extreme),
+                role_budgets,
+                max_in_scope_corrections_per_task: 1,
+                max_total_corrections_per_job: 2,
+                max_total_task_attempts_per_job: 4,
+                check_commands: default_check_commands(&fixture),
+                allow_task_worktree_commits: true,
+                allow_run_integration_execution: true,
+                default_integration_strategy: IntegrationStrategy::MergeNoFf,
+                independence_completeness_receipt: Some(completeness),
+                shadow_jev_policy: None,
+                created_at_ms: 1_700_000_100_000,
+                operator_attested: false,
+                confirm_approval_subject_digest: None,
+                confirm_envelope_digest: None,
+            },
+            reviewer_difficulty: Some(Difficulty::Hard),
+            closure_difficulty: Some(Difficulty::Extreme),
+        };
+
+        let admission_api = CoworkerAdmissionService::new(
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.registry_dir,
+        )
+        .unwrap();
+        let count_before_preview = read_invocation_count(&fixture.agy_count_file);
+        let preview = admission_api
+            .preview(&admission_req)
+            .expect("System-mode AGY Worker + Codex Worker/Advisory admission preview must succeed");
+        assert_eq!(
+            read_invocation_count(&fixture.agy_count_file),
+            count_before_preview,
+            "admission preview must never invoke or probe provider"
+        );
+        assert_eq!(
+            preview.executable_pins.workers["task-root-a"].canonical_executable,
+            canonical_agy_v1
+        );
+        assert_eq!(
+            preview.executable_pins.workers["task-root-b"].canonical_executable,
+            canonical_codex_v1
+        );
+        assert_eq!(
+            preview.executable_pins.reviewer.canonical_executable,
+            canonical_codex_v1
+        );
+        assert_eq!(
+            preview.executable_pins.closure.canonical_executable,
+            canonical_codex_v1
+        );
+        let receipt = admission_api
+            .record(
+                &admission_req,
+                &AdmissionConfirmation {
+                    trusted_local_attested: true,
+                    preview_digest: preview.preview_digest.clone(),
+                    approval_subject_digest: preview.approval_subject_digest.clone(),
+                    envelope_digest: preview.envelope.envelope_digest.clone(),
+                },
+            )
+            .expect("admission record must succeed");
+        assert_eq!(receipt.stage, AdmissionStage::Complete);
+
+        // Apply unrelated registry edits advancing revision beyond frozen authority.
+        let frozen_revision = approval_record.registry_revision;
+        let unused_assignments = fixture.registry.snapshot().unwrap().profiles[0]
+            .assignments
+            .clone();
+        apply_registry_change(
+            &fixture,
+            RegistryChange::UpsertProfile {
+                profile: WorkflowProfile {
+                    id: "profile-unused".to_string(),
+                    name: "Unused Profile".to_string(),
+                    decision_advisor: None,
+                    assignments: unused_assignments,
+                },
+            },
+        );
+        let live_snapshot = apply_registry_change(
+            &fixture,
+            RegistryChange::SetDefaultProfile {
+                profile_id: Some("profile-unused".to_string()),
+            },
+        );
+        assert!(live_snapshot.revision > frozen_revision);
+
+        let workflow_ledger_path = fixture
+            .workflow_store
+            .ledger_path_for_binding(BINDING_A)
+            .unwrap();
+        let policy_ledger_path = fixture
+            .policy_store
+            .ledger_path_for_binding(BINDING_A)
+            .unwrap();
+        let saved_workflow_bytes = fs::read(&workflow_ledger_path).unwrap();
+        let saved_policy_bytes = fs::read(&policy_ledger_path).unwrap();
+
+        let host_control = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_summary.approval_id,
+        )))
+        .await
+        .expect("start approved host");
+
+        let code_driver = CoworkerCodeDriver::open_from_dirs(
+            fixture.root.join("runtime-sys-agy-unrel"),
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+        )
+        .expect("open CoworkerCodeDriver");
+        let pipeline = CoworkerPipelineService::new(code_driver.controller().clone())
+            .expect("create CoworkerPipelineService");
+
+        let session = pipeline
+            .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+            .expect("open owned pipeline session");
+        let final_report = tokio::time::timeout(
+            Duration::from_secs(180),
+            session.drive_until_settled(21_000),
+        )
+        .await
+        .expect("drive_until_settled must complete within timeout")
+        .expect("pipeline with System-mode AGY Worker + Codex Worker/Advisory must complete across unrelated registry edit");
+        let _ = session.release();
+
+        assert_eq!(final_report.status, CoworkerPipelineStatus::Completed);
+        assert_eq!(final_report.job_phase, CoworkerJobPhase::Completed);
+        let completed_job = fixture
+            .workflow_store
+            .read_binding_ledger(BINDING_A)
+            .unwrap()
+            .jobs
+            .into_iter()
+            .find(|j| j.job_id == job.job_id)
+            .unwrap();
+        let completed_runtime = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            completed_job.holds.is_empty(),
+            "unrelated registry edit must not mint a hold for System-mode AGY Worker + Codex Worker/Advisory: {:?}",
+            completed_job.holds
+        );
+        assert!(!completed_runtime.stop_requested);
+        assert_eq!(read_invocation_count(&fixture.agy_planning_count_file), 1);
+        assert_eq!(read_invocation_count(&fixture.agy_coder_count_file), 2);
+        assert_eq!(read_invocation_count(&fixture.agy_reviewer_count_file), 2);
+        assert_eq!(read_invocation_count(&fixture.agy_closure_count_file), 1);
+        assert_eq!(read_invocation_count(&fixture.check_count_file), 3);
+
+        // Now restore the post-admission Executing job state and verify that changing the discovered
+        // PATH executable target to canonical_agy_v2 (or removing it) while registry revision >
+        // frozen_revision fences the job with a persisted RegistryConfigurationChanged hold and
+        // stop_requested == false.
+        fs::write(&workflow_ledger_path, &saved_workflow_bytes).unwrap();
+        fs::write(&policy_ledger_path, &saved_policy_bytes).unwrap();
+        fs::remove_file(&agy_link).unwrap();
+        std::os::unix::fs::symlink(&canonical_agy_v2, &agy_link).unwrap();
+        let coder_before_hold = read_invocation_count(&fixture.agy_coder_count_file);
+        let drift_session = code_driver
+            .controller()
+            .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 30_000)
+            .expect("open_owned_session must fence instead of failing on Worker PATH target drift");
+        let adm_drifted = drift_session
+            .verify_admission()
+            .expect("verify_admission after Worker PATH target drift");
+        assert_eq!(adm_drifted.job.phase, CoworkerJobPhase::Held);
+        assert!(!adm_drifted.runtime_state.stop_requested);
+        assert_eq!(adm_drifted.job.holds.len(), 1);
+        assert!(adm_drifted.job.holds[0].active);
+        assert!(adm_drifted.job.holds[0].holds_entire_job);
+        assert!(is_registry_configuration_changed_hold(&adm_drifted.job.holds[0]));
+        let step_drifted = drift_session
+            .step(31_000)
+            .await
+            .expect("controller step while held by Worker PATH target drift");
+        assert!(step_drifted.dispatched_task_ids.is_empty());
+        assert_eq!(
+            read_invocation_count(&fixture.agy_coder_count_file),
+            coder_before_hold
+        );
+        drift_session.release().expect("release drift_session");
+
+        // Missing PATH executable for System-mode AGY Worker must also fence the job with
+        // RegistryConfigurationChanged and stop_requested == false.
+        fs::write(&workflow_ledger_path, &saved_workflow_bytes).unwrap();
+        fs::write(&policy_ledger_path, &saved_policy_bytes).unwrap();
+        fs::remove_file(&agy_link).unwrap();
+        let missing_session = code_driver
+            .controller()
+            .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 40_000)
+            .expect("open_owned_session must fence when Worker PATH executable is missing");
+        let adm_missing = missing_session
+            .verify_admission()
+            .expect("verify_admission when Worker PATH executable is missing");
+        assert_eq!(adm_missing.job.phase, CoworkerJobPhase::Held);
+        assert!(!adm_missing.runtime_state.stop_requested);
+        assert_eq!(adm_missing.job.holds.len(), 1);
+        assert!(adm_missing.job.holds[0].active);
+        assert!(adm_missing.job.holds[0].holds_entire_job);
+        assert!(is_registry_configuration_changed_hold(&adm_missing.job.holds[0]));
+        missing_session.release().expect("release missing_session");
+        host_control.shutdown().await.expect("shutdown host");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn system_mode_agy_worker_with_codex_advisory_continues_on_unrelated_registry_edit_and_holds_on_path_drift(
+) {
+    use threadlane_workers::{
+        run_bounded_command, BoundedCommandBudgets, BoundedCommandSpec, BoundedCommandStatus,
+    };
+
+    let tmp = TempDir::new().expect("tempdir for isolated PATH");
+    let root = fs::canonicalize(tmp.path()).expect("canonicalize tempdir");
+    let isolated_bin = root.join("isolated-system-bin");
+    populate_isolated_system_path_dir_for_drift(&isolated_bin);
+
+    let exe = fs::canonicalize(std::env::current_exe().expect("current_exe"))
+        .expect("canonicalize current_exe");
+    let isolated_bin_str = isolated_bin
+        .to_str()
+        .expect("utf8 isolated_bin")
+        .to_string();
+    let report = run_bounded_command(&BoundedCommandSpec {
+        executable: exe,
+        argv: vec![
+            "--exact".to_string(),
+            "coworker_full_driver::coworker_registry_drift::system_mode_agy_worker_registry_drift_child_probe"
+                .to_string(),
+            "--nocapture".to_string(),
+        ],
+        working_directory: root,
+        env_overrides: vec![
+            ("PATH".to_string(), isolated_bin_str.clone()),
+            (
+                "THREADLANE_DRIFT_SYSTEM_MODE_AGY_BIN".to_string(),
+                isolated_bin_str,
+            ),
+        ],
+        strip_git_env: true,
+        budgets: BoundedCommandBudgets {
+            timeout_ms: 180_000,
+            max_stdout_bytes: 262_144,
+            max_stderr_bytes: 262_144,
+        },
+    })
+    .await
+    .expect("run bounded registry drift child probe");
+    assert_eq!(
+        report.status,
+        BoundedCommandStatus::Succeeded,
+        "status={:?}\nstdout:\n{}\nstderr:\n{}",
+        report.status,
+        String::from_utf8_lossy(&report.stdout_bytes),
+        String::from_utf8_lossy(&report.stderr_bytes)
+    );
+    assert_eq!(
+        report.exit_code,
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&report.stdout_bytes),
+        String::from_utf8_lossy(&report.stderr_bytes)
+    );
+}
