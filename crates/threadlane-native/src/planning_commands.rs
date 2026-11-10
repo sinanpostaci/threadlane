@@ -433,6 +433,9 @@ pub struct PlanningCommandRecord {
     /// Public ownership summary bound when claimed by a live [`CoworkerJobOwnershipGuard`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Cumulative advisory history for actual owned reservations; excluded from command digests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_health: Vec<crate::provider_health::ScopedProviderHealth>,
     /// Verified service result reference when `status == Completed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_ref: Option<PlanningCommandResultRef>,
@@ -642,6 +645,21 @@ impl PlanningCommandRecord {
 
         if let Some(ref summary) = self.owner_summary {
             summary.validate_for_key(&self.ownership_key()?)?;
+        }
+        if self.provider_health.len() > crate::provider_health::MAX_PLANNING_HEALTH_INVOCATIONS {
+            return Err(crate::provider_health::rejected());
+        }
+        let mut health_keys = std::collections::BTreeSet::new();
+        for health in &self.provider_health {
+            health.validate()?;
+            // Capture ownership is immutable history. Reconciliation may claim a new owner;
+            // live persistence and callbacks separately require the current physical guard.
+            if health.ownership_key != self.ownership_key()?
+                || !health_keys.insert(health.invocation.key())
+                || !planning_health_belongs_to_command(self, &health.invocation)
+            {
+                return Err(crate::provider_health::rejected());
+            }
         }
         if let Some(ref res_ref) = self.result_ref {
             res_ref.validate()?;
@@ -1282,6 +1300,7 @@ impl PlanningCommandStore {
                     status: PlanningCommandStatus::Queued,
                     pending_reconciliation: false,
                     owner_summary: None,
+                    provider_health: Vec::new(),
                     result_ref: None,
                     diagnostic: None,
                     enqueued_at_ms: now_ms,
@@ -3833,5 +3852,166 @@ exit 0
             churn_err.code,
             NativeErrorCode::AmbiguousWakeupPendingReconciliation
         );
+    }
+}
+
+/// Checks exact service-generated round keys; arbitrary prefix matches never identify a call.
+fn planning_health_belongs_to_command(
+    command: &PlanningCommandRecord,
+    invocation: &crate::provider_health::ProviderHealthInvocation,
+) -> bool {
+    use crate::provider_health::ProviderHealthInvocation;
+    let ProviderHealthInvocation::Planning {
+        grant_id,
+        request_key,
+        role,
+        ..
+    } = invocation
+    else {
+        return false;
+    };
+    if *grant_id != command.grant_id {
+        return false;
+    }
+    match &command.payload {
+        PlanningCommandPayload::Architect(_) => {
+            *role == WorkflowRole::Architect && *request_key == command.service_request_key
+        }
+        PlanningCommandPayload::Orchestrator(request) => match role {
+            WorkflowRole::Orchestrator => is_valid_orchestrator_round_key(
+                request_key,
+                &command.service_request_key,
+                request.max_architect_rounds,
+            ),
+            WorkflowRole::Architect => (1..=request
+                .max_architect_rounds
+                .min(MAX_ORCHESTRATOR_ARCHITECT_ROUNDS))
+                .any(|round| {
+                    (1..=crate::coworker_workflow::MAX_WORK_BRIEF_ITEMS).any(|question| {
+                        *request_key
+                            == format!("{}_arch_r{round}_{question}", command.service_request_key)
+                    })
+                }),
+            _ => false,
+        },
+    }
+}
+
+impl PlanningCommandStore {
+    /// Rechecks the live actual reservation against the claimed command without mutating a grant.
+    pub(crate) fn verify_provider_health_reservation(
+        &self,
+        command: &PlanningCommandRecord,
+        invocation: &crate::provider_health::ProviderHealthInvocation,
+    ) -> Result<(), NativeError> {
+        use crate::provider_health::{rejected, ProviderHealthInvocation};
+        if !planning_health_belongs_to_command(command, invocation) {
+            return Err(rejected());
+        }
+        let ProviderHealthInvocation::Planning {
+            grant_id,
+            reservation_id,
+            request_key,
+            context_digest,
+            role,
+        } = invocation
+        else {
+            return Err(rejected());
+        };
+        let ledger = self
+            .workflow_store
+            .read_binding_ledger(&command.binding_id)?;
+        if ledger.binding_id != command.binding_id
+            || ledger.thread_uuid.as_deref() != Some(&command.thread_uuid)
+        {
+            return Err(rejected());
+        }
+        let grant = ledger
+            .planning_grants
+            .iter()
+            .find(|grant| grant.grant_id == *grant_id)
+            .ok_or_else(rejected)?;
+        let reservation = grant
+            .reservations
+            .iter()
+            .find(|r| r.reservation_id == *reservation_id)
+            .ok_or_else(rejected)?;
+        if grant.binding_id != command.binding_id
+            || grant.thread_uuid != command.thread_uuid
+            || reservation.request_key != *request_key
+            || reservation.context_digest != *context_digest
+            || reservation.role != *role
+            || reservation.status != PlanningReservationStatus::ReservedBeforeEffect
+            || reservation.call_project_base.as_ref() != Some(&command.call_project_base)
+            || (command.role == *role && reservation.selected_choice != command.selected_choice)
+            || (request_key == &command.service_request_key
+                && context_digest != &command.context_digest)
+        {
+            return Err(rejected());
+        }
+        Ok(())
+    }
+
+    /// Optional diagnostics use the existing command ledger and require its actual physical guard.
+    /// Failure here grants no notice eligibility and must not replace a supervised provider result.
+    pub(crate) fn record_provider_health(
+        &self,
+        guard: &CoworkerJobOwnershipGuard,
+        expected: &PlanningCommandRecord,
+        invocation: &crate::provider_health::ProviderHealthInvocation,
+        snapshot: &threadlane_workers::ProviderHealthSnapshot,
+        terminal: bool,
+    ) -> Result<(), NativeError> {
+        use crate::provider_health::{
+            rejected, ScopedProviderHealth, MAX_PLANNING_HEALTH_INVOCATIONS,
+        };
+        let key = expected.ownership_key()?;
+        let owner = self.ownership_store.verify_live_guard(guard, &key)?.clone();
+        self.transact_binding_ledger(&expected.binding_id, None, |ledger| {
+            ensure_ledger_thread(ledger, &expected.thread_uuid)?;
+            let command = ledger
+                .commands
+                .iter_mut()
+                .find(|c| c.command_id == expected.command_id)
+                .ok_or_else(rejected)?;
+            if command.status != PlanningCommandStatus::Running
+                || command.command_digest != expected.command_digest
+                || command.owner_summary.as_ref() != Some(&owner)
+            {
+                return Err(rejected());
+            }
+            guard.validate_summary_before_effect(&key, &owner)?;
+            self.verify_provider_health_reservation(command, invocation)?;
+            let record = ScopedProviderHealth {
+                ownership_key: key.clone(),
+                owner: owner.clone(),
+                lease_epoch: None,
+                invocation: invocation.clone(),
+                snapshot: snapshot.clone(),
+                terminal_observed: terminal,
+            };
+            record.validate()?;
+            if let Some(prior) = command
+                .provider_health
+                .iter_mut()
+                .find(|h| h.invocation.key() == invocation.key())
+            {
+                if !record.is_valid_successor_of(prior) {
+                    return Err(rejected());
+                }
+                if *prior == record {
+                    return Ok(CommandLedgerTxOutcome::Idempotent(()));
+                }
+                *prior = record;
+            } else {
+                if command.provider_health.len() >= MAX_PLANNING_HEALTH_INVOCATIONS {
+                    return Err(rejected());
+                }
+                command.provider_health.push(record);
+            }
+            command.validate()?;
+            Ok(CommandLedgerTxOutcome::Mutated(()))
+        })?;
+        Ok(())
     }
 }

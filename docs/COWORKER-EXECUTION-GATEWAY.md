@@ -71,3 +71,41 @@ admissions, jobs or providers were created. Larger runtime policy, decomposition
 user-language role outputs, startup ergonomics, native UI status and observation
 performance remain follow-up work; generic dispatch/conversation-change races and
 the missing-check-executable status/stop issue are not fixed here.
+
+
+## Scoped provider diagnostic availability
+
+AGY health hints are separate from the original Worker tool-progress watchdog.
+Authenticated `ApprovedHostClient` snapshots bind original Worker metadata to
+its approval, command, run, worker and claim. Reviewer, Closure and direct derived
+corrections bind hints to the physical owner, lease, frozen envelope and actual
+reserved effect/subject/task/attempt. Early callbacks require durable verified
+scope, not verified semantics: the log-text evidence remains
+`unverified_provider_diagnostic_hint`, including exact logger-shaped forgeries.
+No hint changes lifecycle, acceptance, real failure, workflow holds or authority.
+
+The fixed callback asks Coworker to read `execution_status` once for its named job.
+Role `provider_health` views expose exact current liveness separately from their
+recorded snapshots; each task's `original_worker_provider_health` keeps its
+original host identity and worker status distinct from derived corrections.
+Only a live, nonterminal current hint is advisory attention. First/last
+observations and counts remain historical after recovery, terminal return or
+owner release. Real failure and Unknown reconciliation never disappear when
+advisory display closes.
+
+One early notice per invocation can precede the watchdog soft deadline. Its
+separate stable fingerprint excludes retries, revisions and owner reopen.
+Health shares progress/failure attention's 14-attempt subquota inside the total
+16, leaving two terminal/fatal slots. Fingerprint deduplication precedes quota
+checks. Scope is rechecked before sending; owner release allows no new live
+health wakeup. Intent-before-send, Submitted versus Unknown and no ambiguous
+replay remain unchanged. Callback bodies contain no raw diagnostics, prompts,
+paths, arbitrary errors or model overrides.
+
+Coworker explains the observed AGY text pattern, retry count/high-water,
+monotonic duration and source availability in the human conversation language
+(Turkish in this pilot); running is
+not productive work and no client/network/upstream cause is inferred. A hint is
+not permission for cancellation, redispatch, model change or timeout extension.
+[Provider health](PROVIDER-HEALTH.md) separates Linux fixtures from installed,
+live-provider and macOS acceptance and lists bounded capture limitations.

@@ -2630,6 +2630,8 @@ mod tests {
                 head_commit: Some("d".repeat(40)),
                 dropped_live_events: 0,
                 outcome: WorkerOutcomeSummary {
+                    provider_retry_high_water: None,
+                    provider_health: None,
                     exit_code: Some(0),
                     signal: None,
                     duration_ms: Some(70_000),

@@ -40,12 +40,13 @@ use threadlane_operations::{
     inspect_review_subject_readonly, InspectReviewSubjectRequest, OperationsError, ReviewSubject,
 };
 use threadlane_workers::{
-    is_worktree_clean, resolve_model_target, run_advisory_worker_with_structured_result_and_cancel,
-    validate_exact_40_hex_sha, validate_executable_file, validate_sha256_hex_digest,
-    AdvisoryResponseBudget, AdvisoryStructuredExecution, AdvisoryWorkerSpec,
-    BoundedAdvisoryResponse, CleanupRefusalReason, ExecutionBudgets, ResolvedModelTarget,
-    WorkerError, WorkerExecutionReport, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
-    DEFAULT_GIT_COMMAND_TIMEOUT_MS, MAX_PROMPT_BYTES,
+    is_worktree_clean, resolve_model_target,
+    run_advisory_worker_with_structured_result_and_health_observer, validate_exact_40_hex_sha,
+    validate_executable_file, validate_sha256_hex_digest, AdvisoryResponseBudget,
+    AdvisoryStructuredExecution, AdvisoryWorkerSpec, BoundedAdvisoryResponse, CleanupRefusalReason,
+    ExecutionBudgets, ResolvedModelTarget, WorkerError, WorkerExecutionReport,
+    WorkerFilePermissions, WorkerProvider, WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    MAX_PROMPT_BYTES,
 };
 
 use crate::coworker_observation::{
@@ -565,6 +566,26 @@ pub async fn run_task_review_with_claim(
     expected_summary: Option<&CoworkerOwnershipSummary>,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<TaskReviewExecutionReport, NativeError> {
+    run_task_review_with_claim_and_health(
+        request,
+        ownership_guard,
+        expected_claim,
+        expected_summary,
+        cancel_rx,
+        None,
+    )
+    .await
+}
+
+/// Optional cumulative metadata observer; caller must construct it from a real reserved effect.
+pub async fn run_task_review_with_claim_and_health(
+    request: &TaskReviewExecutionRequest,
+    ownership_guard: &CoworkerJobOwnershipGuard,
+    expected_claim: Option<&CoworkerDriverOwnershipClaim>,
+    expected_summary: Option<&CoworkerOwnershipSummary>,
+    cancel_rx: &mut watch::Receiver<bool>,
+    health_sink: Option<&crate::provider_health::ScopedHealthSink<'_>>,
+) -> Result<TaskReviewExecutionReport, NativeError> {
     ensure_platform_supported()?;
     let resolved_model = request.validate()?;
     let ownership_key = request.ownership_key()?;
@@ -661,10 +682,18 @@ pub async fn run_task_review_with_claim(
         })
     });
 
-    let structured_execution = match run_advisory_worker_with_structured_result_and_cancel(
-        &advisory_spec,
-        response_budget,
-        cancel_rx,
+    let structured_execution = match crate::provider_health::supervise_health(
+        health_sink,
+        |observer| {
+            run_advisory_worker_with_structured_result_and_health_observer(
+                &advisory_spec,
+                response_budget,
+                cancel_rx,
+                None,
+                Some(observer),
+            )
+        },
+        |execution| execution.execution.provider_health.as_ref(),
     )
     .await
     {

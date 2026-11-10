@@ -3780,6 +3780,13 @@ pub struct ControllerJobRuntimeState {
     /// Intent-before-effect records keyed by `effect_id`.
     #[serde(default)]
     pub pending_effects: BTreeMap<String, PendingControllerEffect>,
+    /// Bounded actual role invocation history, separate from immutable envelope/receipt subjects.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_health: BTreeMap<String, crate::provider_health::ScopedProviderHealth>,
+    /// Genuine original host Worker snapshots, keyed by approved task; never derived correction data.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub original_worker_provider_health:
+        BTreeMap<String, crate::provider_health::OriginalWorkerProviderHealth>,
     /// Candidate-level frozen check evidence recorded for the combined `RunIntegration` candidate.
     #[serde(default)]
     pub candidate_check_evidence: Vec<CandidateCheckEvidence>,
@@ -4622,6 +4629,8 @@ impl ControllerPolicyStore {
                 derived_attempts: Vec::new(),
                 attempt_artifacts: BTreeMap::new(),
                 pending_effects: BTreeMap::new(),
+                provider_health: BTreeMap::new(),
+                original_worker_provider_health: BTreeMap::new(),
                 candidate_check_evidence: Vec::new(),
                 final_candidate_subject: None,
                 closure_attempt_id: None,
@@ -4941,6 +4950,45 @@ impl ControllerPolicyStore {
             ));
         }
         for (job_id, state) in &ledger.jobs {
+            if state.provider_health.len() > crate::provider_health::MAX_ROLE_HEALTH_INVOCATIONS
+                || state.original_worker_provider_health.len()
+                    > state.envelope.task_coder_choices.len()
+            {
+                return Err(crate::provider_health::rejected());
+            }
+            for (effect_id, record) in &state.provider_health {
+                crate::provider_health::verify_controller_health_history(state, record)?;
+                if record.invocation.key() != effect_id
+                    || record.ownership_key.binding_id != expected_binding_id
+                    || record.ownership_key.thread_uuid != state.envelope.thread_uuid
+                    || record.ownership_key.job_id != *job_id
+                {
+                    return Err(crate::provider_health::rejected());
+                }
+                let crate::provider_health::ProviderHealthInvocation::Controller {
+                    approval_id,
+                    envelope_digest,
+                    ..
+                } = &record.invocation
+                else {
+                    return Err(crate::provider_health::rejected());
+                };
+                if approval_id != &state.envelope.approval_id
+                    || envelope_digest != &state.envelope.envelope_digest
+                {
+                    return Err(crate::provider_health::rejected());
+                }
+            }
+            for (task_id, record) in &state.original_worker_provider_health {
+                if task_id != &record.task_id
+                    || record.approval_id != state.envelope.approval_id
+                    || record.approval_subject_digest != state.envelope.approval_subject_digest
+                    || !state.envelope.task_coder_choices.contains_key(task_id)
+                    || !record.snapshot.is_valid()
+                {
+                    return Err(crate::provider_health::rejected());
+                }
+            }
             for (attempt_id, record) in &state.closure_artifacts {
                 record.validate(
                     expected_binding_id,

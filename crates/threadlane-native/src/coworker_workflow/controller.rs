@@ -154,6 +154,10 @@ pub struct CoworkerControllerTaskObservation {
     /// available. This is advisory progress evidence, never an outcome or model metric.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog_attention: Option<threadlane_core::WorkerProgressWatchdogSnapshot>,
+    /// Genuine original host diagnostic history, explicitly separate from the current derived attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_worker_provider_health:
+        Option<crate::provider_health::OriginalWorkerProviderHealth>,
     /// Whether this task was fenced by a hold, stop request, superseding brief, or sibling impact.
     pub fenced: bool,
 }
@@ -1342,6 +1346,38 @@ impl CoworkerControllerService {
                 NativeErrorCode::ValidationFailed,
                 "controller lease_epoch changed concurrently during reconciliation",
             ));
+        }
+
+        // Optional host diagnostics never replace authoritative admission or provider results.
+        if let Some(health) = crate::provider_health::OriginalWorkerProviderHealth::from_snapshot(
+            snapshot,
+            approval,
+            approved_task,
+        ) {
+            let _ = self.policy_store.mutate_job_runtime(
+                &request.binding_id,
+                &request.job_id,
+                controller_instance_id,
+                lease_epoch,
+                |state| {
+                    guard.validate_before_effect(&guard.key())?;
+                    if state.envelope.approval_id != approval.approval_id
+                        || state.envelope.thread_uuid != request.thread_uuid
+                    {
+                        return Err(crate::provider_health::rejected());
+                    }
+                    if let Some(prior) = state.original_worker_provider_health.get(&health.task_id)
+                    {
+                        if !health.is_valid_successor_of(prior) {
+                            return Err(crate::provider_health::rejected());
+                        }
+                    }
+                    state
+                        .original_worker_provider_health
+                        .insert(health.task_id.clone(), health);
+                    Ok(())
+                },
+            );
         }
 
         let task = current_adm
@@ -2702,6 +2738,10 @@ impl CoworkerControllerService {
                 .and_then(|w| w.worktree.task_worktree_id.clone()),
             observed_model: snap.worker.as_ref().and_then(|w| w.observed_model.clone()),
             observed_effort: snap.worker.as_ref().and_then(|w| w.observed_effort.clone()),
+            original_worker_provider_health: refreshed_runtime
+                .original_worker_provider_health
+                .get(task_id)
+                .cloned(),
             watchdog_attention: snap
                 .worker
                 .as_ref()

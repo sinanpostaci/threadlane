@@ -26,7 +26,7 @@
 //!   (`receipt.task_worktree_id`) paired with `receipt.integration_worktree_id` and original
 //!   `execution_base_commit`, preserving the original host `run_id` and `worker_id` UUIDs on
 //!   controller records while passing the compact owned manifest identifiers (`manifest.run_id`,
-//!   `manifest.task_id`) to [`execute_worker_task_with_observer`]. It never resets the prior
+//!   `manifest.task_id`) to [`execute_worker_task_with_health_observer`]. It never resets the prior
 //!   attempt's committed `HEAD`, never alters base/scope/model, and never reuses a provider session
 //!   (`session_id = None`).
 //! - **Private `0600` execution report artifact before promotion**:
@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 use threadlane_authority::{validation::validate_canonical_thread_uuid, ApprovedTaskRecord};
 use threadlane_operations::ReviewSubject;
 use threadlane_workers::{
-    ensure_worktree_job_inactive_readonly, execute_worker_task_with_observer, is_worktree_clean,
-    load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    ensure_worktree_job_inactive_readonly, execute_worker_task_with_health_observer,
+    is_worktree_clean, load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
     resolve_model_target, run_sanitized_git, validate_exact_40_hex_sha, validate_sha256_hex_digest,
     ChangedPathEntry, ExecutionBudgets, ResolvedModelTarget, TaskExecutionReport,
     WorkAcceptanceState, WorkerFilePermissions, WorkerProvider, WorkerRunStatus, WorkerSpec,
@@ -310,9 +310,9 @@ pub struct PersistedDerivedTaskExecutionArtifact {
     pub original_run_id: String,
     /// Original frozen host `worker_id` UUID from Attempt 1.
     pub original_worker_id: String,
-    /// Compact owned worktree manifest `run_id` passed to `execute_worker_task_with_observer`.
+    /// Compact owned worktree manifest `run_id` passed to `execute_worker_task_with_health_observer`.
     pub manifest_run_id: String,
-    /// Compact owned worktree manifest `task_id` passed to `execute_worker_task_with_observer`.
+    /// Compact owned worktree manifest `task_id` passed to `execute_worker_task_with_health_observer`.
     pub manifest_task_id: String,
     /// Reused owned `WorktreeKind::Task` identifier.
     pub task_worktree_id: String,
@@ -1499,6 +1499,15 @@ pub async fn execute_task_correction(
 
     // Phase 2: Execute the isolated headless Coder provider process outside `controller.step_mutex()`
     // while keeping the physical OS ownership FD (`guard`) held and supervising live stop/cancel state.
+    let health_sink = crate::provider_health::ScopedHealthSink::controller(
+        controller,
+        guard,
+        &claimed_ctx.effect_id,
+        WorkflowRole::Coder,
+        Some(&request.task_id),
+        Some(claimed_ctx.next_attempt_no),
+        &claimed_ctx.receipt.receipt_digest,
+    )?;
     let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
     let manifest_task_id = claimed_ctx
         .task_manifest
@@ -1565,13 +1574,20 @@ pub async fn execute_task_correction(
     let obs_receipt_id = claimed_ctx.receipt.receipt_id.clone();
     let obs_artifact_id = claimed_ctx.report_artifact_id.clone();
 
-    let exec_result = execute_worker_task_with_observer(
-        &claimed_ctx.worker_spec,
-        &claimed_ctx.task_manifest.run_id,
-        manifest_task_id.as_str(),
-        Some(&claimed_ctx.receipt.task_worktree_id),
-        &mut cancel_rx,
-        None,
+    let exec_result = crate::provider_health::supervise_health(
+        Some(&health_sink),
+        |observer| {
+            execute_worker_task_with_health_observer(
+                &claimed_ctx.worker_spec,
+                &claimed_ctx.task_manifest.run_id,
+                manifest_task_id.as_str(),
+                Some(&claimed_ctx.receipt.task_worktree_id),
+                &mut cancel_rx,
+                None,
+                Some(observer),
+            )
+        },
+        |report| report.worker_report.provider_health.as_ref(),
     )
     .await;
     cancel_watcher.abort();

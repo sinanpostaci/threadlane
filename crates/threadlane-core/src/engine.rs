@@ -3929,6 +3929,8 @@ mod tests {
 
     fn default_outcome(cancelled: bool) -> WorkerOutcomeSummary {
         WorkerOutcomeSummary {
+            provider_retry_high_water: None,
+            provider_health: None,
             exit_code: Some(if cancelled { 130 } else { 0 }),
             signal: None,
             duration_ms: Some(15),

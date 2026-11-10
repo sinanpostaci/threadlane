@@ -455,6 +455,9 @@ pub struct ExecutionStatusResponse {
     /// Verified live ownership summary when a live owner is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Scoped unverified diagnostic history with independently checked live owner/effect display.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_health: Vec<crate::provider_health::ProviderHealthView>,
     /// Persisted logical lease record in [`ControllerPolicyStore`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<ControllerJobLeaseRecord>,
@@ -536,6 +539,7 @@ impl ExecutionStatusResponse {
             owner_state: report.owner_state,
             fatal_error: report.fatal_error,
             verified_owner_summary: report.verified_owner_summary,
+            provider_health: report.provider_health,
             lease: report.lease,
             lease_active: report.lease_active,
             lease_owner_instance_id: report.lease_owner_instance_id,

@@ -19,10 +19,14 @@ let model = "";
 let effort = "";
 let mode = "";
 let prompt = "";
+let diagnosticPath = "";
 
 for (let i = 0; i < args.length; i += 1) {
   const arg = args[i];
-  if (arg === "--model" && i + 1 < args.length) {
+  if (arg === "--log-file" && i + 1 < args.length) {
+    diagnosticPath = args[i + 1];
+    i += 1;
+  } else if (arg === "--model" && i + 1 < args.length) {
     model = args[i + 1];
     i += 1;
   } else if (arg === "--effort" && i + 1 < args.length) {
@@ -35,6 +39,13 @@ for (let i = 0; i < args.length; i += 1) {
     prompt = args[i + 1];
     i += 1;
   }
+}
+
+// Test opt-in only: the same forged logger-shaped text must remain unverified metadata.
+if (diagnosticPath && fs.existsSync(path.join(stateDir, "emit_provider_health_hint.gate"))) {
+  fs.writeFileSync(diagnosticPath,
+    "I0101 00:00:01.000000 1 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n",
+    { mode: 0o600 });
 }
 
 const sleepBuf = new Int32Array(new SharedArrayBuffer(4));

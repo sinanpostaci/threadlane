@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, watch};
 use crate::advisory_response::{
     AdvisoryResponseBudget, AdvisoryResponseCollector, AdvisoryStructuredExecution,
 };
+use crate::antigravity_diagnostics::start_owned_capture;
 use crate::error::WorkerError;
 use crate::fs_safety::{
     ensure_platform_supported, sanitize_and_redact, validate_existing_canonical_dir,
@@ -23,6 +24,7 @@ use crate::opencode_metadata::{
     OwnedOpenCodeSession,
 };
 use crate::progress_watchdog::{ProgressWatchdog, ProgressWatchdogSnapshot};
+use crate::provider_health::{HealthPublisher, ProviderHealthObserver, ProviderHealthSnapshot};
 use crate::spec::{
     is_pinned_codex_read_only_argv, is_pinned_codex_task_files_argv, AdvisoryWorkerSpec,
     ExecutionBudgets, ResolvedModelTarget, WorkerProvider, WorkerSpec,
@@ -174,7 +176,7 @@ pub struct WorkerExecutionReport {
     /// (e.g. by an escaped/reparented descendant) or if process-group termination remained incomplete.
     #[serde(default)]
     pub cleanup_incomplete: bool,
-    /// Bounded, secret-redacted summary of stderr output (if non-empty).
+    /// Bounded, secret-redacted stderr summary; suppressed for health-aware AGY invocations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redacted_stderr_summary: Option<String>,
     /// Number of live normalized events that could not be delivered to the optional
@@ -193,6 +195,9 @@ pub struct WorkerExecutionReport {
     /// Advisory tool-hint supervision, independent of evidence verification and acceptance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_watchdog: Option<ProgressWatchdogSnapshot>,
+    /// Bounded unverified diagnostic hints, independent of execution/acceptance evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_health: Option<ProviderHealthSnapshot>,
 }
 
 impl WorkerExecutionReport {
@@ -968,6 +973,18 @@ pub async fn run_worker_with_observer(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
 ) -> Result<WorkerExecutionReport, WorkerError> {
+    run_worker_with_health_observer(spec, working_directory, cancel_rx, progress_tx, None).await
+}
+
+/// Runs with an independent cumulative health watch observer; existing progress semantics are preserved.
+/// Use one health channel per invocation. Watch data grants no persistence or callback authority.
+pub async fn run_worker_with_health_observer(
+    spec: &WorkerSpec,
+    working_directory: &Path,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
+) -> Result<WorkerExecutionReport, WorkerError> {
     ensure_platform_supported()?;
     let validation = spec.validate()?;
     let canonical_workdir =
@@ -994,6 +1011,7 @@ pub async fn run_worker_with_observer(
         None,
         cancel_rx,
         progress_tx,
+        health_observer,
     )
     .await?;
     Ok(report)
@@ -1039,6 +1057,17 @@ pub async fn run_advisory_worker_with_observer(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
 ) -> Result<WorkerExecutionReport, WorkerError> {
+    run_advisory_worker_with_health_observer(spec, cancel_rx, progress_tx, None).await
+}
+
+/// Runs with an independent cumulative health watch observer; existing progress semantics are preserved.
+/// Use one health channel per invocation. Watch data grants no persistence or callback authority.
+pub async fn run_advisory_worker_with_health_observer(
+    spec: &AdvisoryWorkerSpec,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
+) -> Result<WorkerExecutionReport, WorkerError> {
     ensure_platform_supported()?;
     let validation = spec.validate()?;
     let canonical_workdir = validation.canonical_working_directory.clone();
@@ -1062,6 +1091,7 @@ pub async fn run_advisory_worker_with_observer(
         None,
         cancel_rx,
         progress_tx,
+        health_observer,
     )
     .await?;
     Ok(report)
@@ -1110,6 +1140,25 @@ pub async fn run_advisory_worker_with_structured_result_and_observer(
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
 ) -> Result<AdvisoryStructuredExecution, WorkerError> {
+    run_advisory_worker_with_structured_result_and_health_observer(
+        spec,
+        response_budget,
+        cancel_rx,
+        progress_tx,
+        None,
+    )
+    .await
+}
+
+/// Runs with an independent cumulative health watch observer; existing progress semantics are preserved.
+/// Use one health channel per invocation. Watch data grants no persistence or callback authority.
+pub async fn run_advisory_worker_with_structured_result_and_health_observer(
+    spec: &AdvisoryWorkerSpec,
+    response_budget: AdvisoryResponseBudget,
+    cancel_rx: &mut watch::Receiver<bool>,
+    progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
+) -> Result<AdvisoryStructuredExecution, WorkerError> {
     ensure_platform_supported()?;
     response_budget.validate()?;
     let validation = spec.validate()?;
@@ -1135,6 +1184,7 @@ pub async fn run_advisory_worker_with_structured_result_and_observer(
         Some(response_budget),
         cancel_rx,
         progress_tx,
+        health_observer,
     )
     .await?;
 
@@ -1171,6 +1221,7 @@ async fn run_supervised_process_group<F>(
     response_budget: Option<AdvisoryResponseBudget>,
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: Option<mpsc::Sender<NormalizedWorkerEvent>>,
+    health_observer: Option<ProviderHealthObserver>,
 ) -> Result<(WorkerExecutionReport, Option<AdvisoryResponseCollector>), WorkerError>
 where
     F: FnOnce(&str) -> Result<Vec<String>, WorkerError>,
@@ -1187,6 +1238,10 @@ where
     } = inputs;
 
     let start_instant = Instant::now();
+    // None is the explicit legacy opt-out. Freeze this invocation-level choice before
+    // capture setup: failed/unavailable capture and closed observers must not expose stderr.
+    let health_requested = health_observer.is_some();
+    let health = HealthPublisher::new(provider == WorkerProvider::Antigravity, health_observer);
     let watchdog = Arc::new(Mutex::new(ProgressWatchdog::new(
         budgets.timeout_ms,
         budgets.progress_watchdog.as_ref(),
@@ -1267,6 +1322,8 @@ where
                             evidence: empty_parser.finalize(),
                             opencode_metadata: None,
                             opencode_metadata_error: Some(abort_code.to_string()),
+                            provider_health: health_requested
+                                .then(|| health.finish(duration_ms, false)),
                             progress_watchdog: Some(
                                 watchdog
                                     .lock()
@@ -1321,6 +1378,8 @@ where
                         evidence: empty_parser.finalize(),
                         opencode_metadata: None,
                         opencode_metadata_error: Some(alloc_diag.as_str().to_string()),
+                        provider_health: health_requested
+                            .then(|| health.finish(duration_ms, false)),
                         progress_watchdog: Some(
                             watchdog
                                 .lock()
@@ -1334,6 +1393,12 @@ where
         }
     }
 
+    let mut diagnostic_task = start_owned_capture(
+        health_requested && provider == WorkerProvider::Antigravity,
+        &mut constructed_argv,
+        health.clone(),
+        start_instant,
+    );
     let mut cmd = Command::new(&canonical_executable);
     cmd.args(&constructed_argv)
         .envs(child_env)
@@ -1419,6 +1484,7 @@ where
         budgets.max_stderr_bytes,
         overflow_tx,
         drain_stop_rx,
+        health_requested && provider == WorkerProvider::Antigravity,
     ));
 
     let mut timed_out = false;
@@ -1568,6 +1634,11 @@ where
             }
         };
 
+    if let Some(task) = diagnostic_task.as_mut() {
+        let elapsed_ms = u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+        task.finish(elapsed_ms).await;
+    }
+
     let final_overflow = recorded_overflow.or(stdout_overflow).or(stderr_overflow);
     let (exit_code, signal) = extract_exit_code_and_signal(exit_status);
 
@@ -1658,6 +1729,8 @@ where
             opencode_metadata,
             opencode_metadata_error,
             progress_watchdog: Some(final_watchdog),
+            provider_health: health_requested
+                .then(|| health.finish(duration_ms, status == WorkerRunStatus::Succeeded)),
         },
         response_collector,
     ))
@@ -1830,6 +1903,7 @@ async fn drain_stderr_incremental(
     max_stderr_bytes: usize,
     overflow_tx: mpsc::UnboundedSender<OutputOverflowKind>,
     mut drain_stop_rx: watch::Receiver<bool>,
+    suppress_summary: bool,
 ) -> (usize, Option<String>, Option<OutputOverflowKind>) {
     let mut total_bytes: usize = 0;
     let mut buf: Vec<u8> = Vec::with_capacity(4096.min(max_stderr_bytes));
@@ -1850,7 +1924,7 @@ async fn drain_stderr_incremental(
             Ok(n) => {
                 if total_bytes.saturating_add(n) > max_stderr_bytes {
                     let remaining = max_stderr_bytes.saturating_sub(buf.len());
-                    if remaining > 0 {
+                    if !suppress_summary && remaining > 0 {
                         buf.extend_from_slice(&chunk[..remaining.min(n)]);
                     }
                     total_bytes = total_bytes.saturating_add(n);
@@ -1860,7 +1934,9 @@ async fn drain_stderr_incremental(
                     break;
                 }
                 total_bytes += n;
-                buf.extend_from_slice(&chunk[..n]);
+                if !suppress_summary {
+                    buf.extend_from_slice(&chunk[..n]);
+                }
             }
             Err(_) => break,
         }
@@ -2178,6 +2254,7 @@ mod tests {
             opencode_metadata: None,
             opencode_metadata_error: opencode_metadata_error.map(str::to_string),
             progress_watchdog: None,
+            provider_health: None,
         }
     }
 

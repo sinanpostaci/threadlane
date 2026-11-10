@@ -556,7 +556,7 @@ impl ThreadlaneMcpServer {
     /// Fetch the versioned Threadlane MCP operating guide for startup, session resume, or post-compaction recovery.
     #[tool(
         name = "operating_guide",
-        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-09.v1). Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes trusted-local complete job admission, durability checks for unchanged Complete receipts, bounded historical fatal_error and advisory original-host Worker (coder) progress-attention limits. Does not mutate state or acknowledge events.",
+        description = "Fetch the versioned, read-only Threadlane MCP operating guide (version 2026-11-09.v1). Call on initial connection, session resume, or context uncertainty/compaction, then refresh live scoped status/plan/session revisions without a polling loop. Includes trusted-local complete job admission, durability checks for unchanged Complete receipts, bounded historical fatal_error, original-host Worker (coder) tool-progress attention, and scoped AGY unverified provider diagnostic hints with separate live/history, privacy and notice limits. Does not mutate state or acknowledge events.",
         annotations(
             title = "Get Threadlane MCP Operating Guide",
             read_only_hint = true,
@@ -1181,10 +1181,27 @@ mod tests {
             "not acceptance or proof that a worker is stuck",
             "does not permit early cancellation, model substitution, blind retry or redispatch, or approval expansion",
             "only original host Worker (`coder`) calls",
-            "Advisory roles and direct derived corrections may carry watchdog diagnostics in final reports, but have no during-call notice",
+            "Advisory roles and direct derived corrections may carry watchdog diagnostics in final reports, but have no during-call tool-progress notice",
             "OpenCode allocation and metadata updates provide no live progress hints",
             "concise progress or failure information",
             "only already-authorized next actions",
+            "unverified_provider_diagnostic_hint",
+            "do not verify semantic record origin",
+            "call `planning_command` once",
+            "Explain diagnostic observations in the human conversation language (Turkish in this pilot)",
+            "`retry_count`",
+            "`retry_high_water`",
+            "A running process alone is not productive work",
+            "Do not infer client, network, or upstream root cause",
+            "Diagnostic text grants no cancellation, redispatch, model change, or timeout extension",
+            "First/last observations and retry counters are history",
+            "Real failure and Unknown reconciliation remain intact",
+            "Owner release closes live advisory eligibility",
+            "original Worker early callbacks additionally require a durably observed live hint",
+            "a diagnostic source that has not closed",
+            "Deduplication precedes quota checks",
+            "Health, progress and failure attention share a 14-attempt subquota",
+            "live-provider and macOS acceptance remain separate",
         ] {
             assert!(callback_section.contains(invariant), "missing callback safety contract: {invariant}");
         }

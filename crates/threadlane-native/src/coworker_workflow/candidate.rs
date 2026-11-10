@@ -22,11 +22,11 @@ use threadlane_operations::{
 };
 use threadlane_workers::{
     load_and_verify_manifest, resolve_exact_commit_sha, resolve_exact_tree_sha,
-    resolve_model_target, run_advisory_worker_with_structured_result, validate_exact_40_hex_sha,
-    validate_sha256_hex_digest, AdvisoryResponseBudget, AdvisoryStructuredExecution,
-    AdvisoryWorkerSpec, ExecutionBudgets, WorkerFilePermissions, WorkerProvider, WorkerRunStatus,
-    WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_LINE_BYTES, MAX_EVENTS,
-    MAX_LINE_BYTES,
+    resolve_model_target, run_advisory_worker_with_structured_result_and_health_observer,
+    validate_exact_40_hex_sha, validate_sha256_hex_digest, AdvisoryResponseBudget,
+    AdvisoryStructuredExecution, AdvisoryWorkerSpec, ExecutionBudgets, WorkerFilePermissions,
+    WorkerProvider, WorkerRunStatus, WorktreeKind, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
+    DEFAULT_MAX_LINE_BYTES, MAX_EVENTS, MAX_LINE_BYTES,
 };
 use threadlane_workflow::{ToolAdapter, WorkflowRole};
 
@@ -1149,7 +1149,7 @@ impl CoworkerCandidateService {
 
     /// Reserves or reuses a single candidate-bound Closure evaluation in
     /// [`FinalCandidateClosureStore`], invokes the read-only Closure worker via
-    /// [`run_advisory_worker_with_structured_result`] if not already cached, records the terminal
+    /// [`threadlane_workers::run_advisory_worker_with_structured_result_and_health_observer`] if not already cached, records the terminal
     /// [`ClosureVerdict`] (with `grants_merge_or_push_authority: false` and
     /// `substitutes_for_required_checks: false`), and updates the [`CoworkerJobRecord`] phase.
     ///
@@ -1163,16 +1163,76 @@ impl CoworkerCandidateService {
         policy_store: &ControllerPolicyStore,
         request: &ExecuteFinalCandidateClosureRequest,
     ) -> Result<ExecuteFinalCandidateClosureOutcome, NativeError> {
+        self.execute_final_candidate_closure_with_health(authority, policy_store, request, None)
+            .await
+    }
+
+    /// Managed callers pass the actual borrowed job guard; direct primitives get final metadata only.
+    pub async fn execute_final_candidate_closure_with_health(
+        &self,
+        authority: &AuthorityStore,
+        policy_store: &ControllerPolicyStore,
+        request: &ExecuteFinalCandidateClosureRequest,
+        health_owner: Option<(
+            &super::controller::CoworkerControllerService,
+            &super::ownership::CoworkerJobOwnershipGuard,
+        )>,
+    ) -> Result<ExecuteFinalCandidateClosureOutcome, NativeError> {
+        if let Some((controller, guard)) = health_owner {
+            if controller.workflow_store().plans_dir() != self.store.plans_dir()
+                || controller.policy_store().plans_dir() != policy_store.plans_dir()
+                || !std::ptr::eq(controller.authority().as_ref(), authority)
+            {
+                return Err(crate::provider_health::rejected());
+            }
+            controller.verify_physical_ownership(
+                guard,
+                &request.binding_id,
+                &request.thread_uuid,
+                &request.job_id,
+            )?;
+        }
         let execution =
             match self.prepare_final_candidate_closure(authority, policy_store, request)? {
                 PreparedFinalCandidateClosure::Cached(outcome) => return Ok(*outcome),
                 PreparedFinalCandidateClosure::Recovered(recovered) => recovered,
                 PreparedFinalCandidateClosure::NeedsWorkerDispatch(dispatch) => {
-                    let worker_res = run_advisory_worker_with_structured_result(
-                        &dispatch.advisory_spec,
-                        dispatch.response_budget,
+                    let health_sink = health_owner
+                        .map(|(controller, guard)| {
+                            crate::provider_health::ScopedHealthSink::controller(
+                                controller,
+                                guard,
+                                &dispatch.effect_id,
+                                WorkflowRole::Closure,
+                                None,
+                                None,
+                                &request.final_subject.subject_digest,
+                            )
+                        })
+                        .transpose()?;
+                    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+                    let worker_res = crate::provider_health::supervise_health(
+                        health_sink.as_ref(),
+                        |observer| {
+                            run_advisory_worker_with_structured_result_and_health_observer(
+                                &dispatch.advisory_spec,
+                                dispatch.response_budget,
+                                &mut cancel_rx,
+                                None,
+                                Some(observer),
+                            )
+                        },
+                        |execution| execution.execution.provider_health.as_ref(),
                     )
                     .await;
+                    if let Some((controller, guard)) = health_owner {
+                        controller.verify_physical_ownership(
+                            guard,
+                            &request.binding_id,
+                            &request.thread_uuid,
+                            &request.job_id,
+                        )?;
+                    }
                     match self.record_dispatched_closure_worker_result(
                         policy_store,
                         request,

@@ -1328,6 +1328,24 @@ async fn finish_test_2_cache_and_artifact_assertions(
             &first_outcome.attempt.attempt_id,
         )
         .expect("load full closure execution artifact");
+    let health = loaded_artifact
+        .execution_report
+        .provider_health
+        .as_ref()
+        .expect("direct Closure final diagnostic coverage");
+    assert!(health.is_valid());
+    assert_eq!(health.evidence_class,
+        threadlane_workers::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+    assert!(
+        fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_ID, job_id)
+            .expect("direct Closure runtime")
+            .expect("runtime")
+            .provider_health
+            .is_empty(),
+        "unowned direct primitive must not invent a live role owner"
+    );
     assert!(!loaded_artifact.fenced_from_promotion);
     assert_eq!(
         loaded_artifact.execution_report.status,
@@ -3867,6 +3885,23 @@ async fn codex_cli_final_candidate_closure_persists_pinned_launch_configuration_
             &outcome.attempt.attempt_id,
         )
         .expect("load codex closure sidecar artifact");
+    let health = loaded_artifact
+        .execution_report
+        .provider_health
+        .as_ref()
+        .expect("unsupported provider coverage is explicit");
+    assert_eq!(
+        health.availability,
+        threadlane_workers::provider_health::ProviderDiagnosticAvailability::Unavailable
+    );
+    assert_eq!(health.unavailable_reason,
+        Some(threadlane_workers::provider_health::ProviderDiagnosticUnavailableReason::UnsupportedProvider));
+    assert_eq!(health.retry_count, 0);
+    assert!(!loaded_artifact
+        .execution_report
+        .constructed_argv
+        .iter()
+        .any(|arg| arg == "--log-file"));
     assert_eq!(loaded_artifact.observed_model, None);
     assert_eq!(loaded_artifact.observed_effort, None);
     assert!(loaded_artifact

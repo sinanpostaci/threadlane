@@ -48,9 +48,9 @@ use threadlane_core::observation::ObservationCallState;
 use threadlane_workers::{
     inspect_base_commit_path_kind, is_commit_ancestor, is_source_worktree_clean, is_worktree_clean,
     resolve_exact_commit_sha, resolve_exact_tree_sha, resolve_model_target,
-    run_advisory_worker_with_structured_result, run_sanitized_git, run_sanitized_git_bytes,
-    validate_repo_relative_path, validate_sha256_hex_digest, AdvisoryResponseBudget,
-    AdvisoryResponseError, AdvisoryResponseFraming, AdvisoryResponseSource,
+    run_advisory_worker_with_structured_result_and_health_observer, run_sanitized_git,
+    run_sanitized_git_bytes, validate_repo_relative_path, validate_sha256_hex_digest,
+    AdvisoryResponseBudget, AdvisoryResponseError, AdvisoryResponseFraming, AdvisoryResponseSource,
     AdvisoryStructuredExecution, AdvisoryWorkerSpec, BaseCommitPathKind, BoundedAdvisoryResponse,
     ExecutionBudgets, WorkerError, WorkerExecutionReport, WorkerFilePermissions, WorkerProvider,
     WorkerRunStatus, DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
@@ -1962,15 +1962,37 @@ impl CoworkerPlanningService {
         &self,
         request: &RunArchitectAdviceRequest,
     ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        self.obtain_architect_advice_with_health(request, None)
+            .await
+    }
+
+    /// Executes with explicitly borrowed physical command ownership for optional live metadata.
+    pub async fn obtain_architect_advice_with_health(
+        &self,
+        request: &RunArchitectAdviceRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
+    ) -> Result<ArchitectAdviceOutcome, NativeError> {
+        if let Some(owner) = health_owner {
+            owner.verify_service_request(
+                self,
+                &request.binding_id,
+                &request.thread_uuid,
+                &request.grant_id,
+                &request.request_key,
+                WorkflowRole::Architect,
+            )?;
+        }
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         let binding_mutex = self.binding_async_mutex(&request.binding_id);
         let _binding_guard = binding_mutex.lock().await;
-        self.obtain_architect_advice_locked(request).await
+        self.obtain_architect_advice_locked(request, health_owner)
+            .await
     }
 
     async fn obtain_architect_advice_locked(
         &self,
         request: &RunArchitectAdviceRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
     ) -> Result<ArchitectAdviceOutcome, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
@@ -2386,8 +2408,24 @@ impl CoworkerPlanningService {
             entry_summary: None,
         });
 
-        let run_result =
-            run_advisory_worker_with_structured_result(&worker_spec, response_budget).await;
+        let health_sink = health_owner
+            .map(|owner| owner.invocation(&reservation))
+            .transpose()?;
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let run_result = crate::provider_health::supervise_health(
+            health_sink.as_ref(),
+            |observer| {
+                run_advisory_worker_with_structured_result_and_health_observer(
+                    &worker_spec,
+                    response_budget,
+                    &mut cancel_rx,
+                    None,
+                    Some(observer),
+                )
+            },
+            |execution| execution.execution.provider_health.as_ref(),
+        )
+        .await;
         let post_snapshot_check =
             snapshot.verify_invariants(&request.context_dependencies.project_base);
         let post_repo_check =
@@ -2992,6 +3030,27 @@ impl CoworkerPlanningService {
         workflow: &ScopedWorkflow,
         request: &OrchestrateWorkBriefPlanRequest,
     ) -> Result<OrchestrateWorkBriefPlanOutcome, NativeError> {
+        self.orchestrate_brief_to_plan_with_health(workflow, request, None)
+            .await
+    }
+
+    /// Explicit command owner is forwarded across every Orchestrator and Architect round.
+    pub async fn orchestrate_brief_to_plan_with_health(
+        &self,
+        workflow: &ScopedWorkflow,
+        request: &OrchestrateWorkBriefPlanRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
+    ) -> Result<OrchestrateWorkBriefPlanOutcome, NativeError> {
+        if let Some(owner) = health_owner {
+            owner.verify_service_request(
+                self,
+                &request.binding_id,
+                &request.thread_uuid,
+                &request.grant_id,
+                &request.request_key,
+                WorkflowRole::Orchestrator,
+            )?;
+        }
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         if workflow.binding_id() != request.binding_id {
             return Err(NativeError::new(
@@ -3001,7 +3060,7 @@ impl CoworkerPlanningService {
         }
         let binding_mutex = self.binding_async_mutex(&request.binding_id);
         let _binding_guard = binding_mutex.lock().await;
-        self.orchestrate_brief_to_plan_locked(workflow, request)
+        self.orchestrate_brief_to_plan_locked(workflow, request, health_owner)
             .await
     }
 
@@ -3009,6 +3068,7 @@ impl CoworkerPlanningService {
         &self,
         workflow: &ScopedWorkflow,
         request: &OrchestrateWorkBriefPlanRequest,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
     ) -> Result<OrchestrateWorkBriefPlanOutcome, NativeError> {
         validate_bounded_identifier(&request.binding_id, "binding_id", MAX_COWORKER_ID_LEN)?;
         validate_bounded_identifier(&request.grant_id, "grant_id", MAX_COWORKER_ID_LEN)?;
@@ -3109,6 +3169,7 @@ impl CoworkerPlanningService {
                     } else {
                         None
                     },
+                    health_owner,
                 )
                 .await?;
 
@@ -3265,7 +3326,9 @@ impl CoworkerPlanningService {
                             accept_into_brief: false,
                             current_time_ms: request.current_time_ms,
                         };
-                        let arch_outcome = self.obtain_architect_advice_locked(&arch_req).await?;
+                        let arch_outcome = self
+                            .obtain_architect_advice_locked(&arch_req, health_owner)
+                            .await?;
                         if !active_advice_ids.contains(&arch_outcome.record.advice_id) {
                             active_advice_ids.push(arch_outcome.record.advice_id.clone());
                         }
@@ -3283,6 +3346,7 @@ impl CoworkerPlanningService {
         round_request_key: &str,
         active_advice_ids: &[String],
         expected_ledger_revision: Option<u64>,
+        health_owner: Option<&crate::provider_health::PlanningHealthOwner<'_>>,
     ) -> Result<
         (
             PlanningCallReservation,
@@ -3588,8 +3652,24 @@ impl CoworkerPlanningService {
             entry_summary: None,
         });
 
-        let run_result =
-            run_advisory_worker_with_structured_result(&worker_spec, response_budget).await;
+        let health_sink = health_owner
+            .map(|owner| owner.invocation(&reservation))
+            .transpose()?;
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let run_result = crate::provider_health::supervise_health(
+            health_sink.as_ref(),
+            |observer| {
+                run_advisory_worker_with_structured_result_and_health_observer(
+                    &worker_spec,
+                    response_budget,
+                    &mut cancel_rx,
+                    None,
+                    Some(observer),
+                )
+            },
+            |execution| execution.execution.provider_health.as_ref(),
+        )
+        .await;
         let post_snapshot_check = snapshot.verify_invariants(&call_base);
         let post_repo_check = verify_live_repository_clean_at_base(&call_base);
         drop(snapshot);

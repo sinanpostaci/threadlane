@@ -124,6 +124,9 @@ pub enum NormalizedEventKind {
 }
 
 /// Bounded, normalized representation of a single provider NDJSON event.
+///
+/// Provider health is deliberately outside this stdout channel. Provider prose, tool output,
+/// or supervisor-shaped JSON cannot produce an owned diagnostic watch snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NormalizedWorkerEvent {
     /// 1-based provider stdout line number; `0` is reserved for supervisor-generated events.

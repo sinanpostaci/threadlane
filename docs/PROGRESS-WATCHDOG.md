@@ -27,7 +27,8 @@ by `execution_status`. Advisory Architect, Orchestrator, Reviewer, Closure, and
 direct derived correction calls do not currently forward a live observer to the
 approved host worker ledger. Their final execution reports may contain watchdog
 state, but this package does not claim during-call native progress notifications
-for those routes. In particular, absent file writes during read-only planning do
+for those routes. AGY provider-health notices use a separate cumulative diagnostic
+channel on these routes; they do not extend tool-progress coverage. In particular, absent file writes during read-only planning do
 not prove a stuck planning role.
 
 Existing hard runtime limits and process cleanup remain unchanged. Cancellation,
@@ -52,3 +53,32 @@ Status inputs are validated before release. A new error or concurrent change
 observed only after ownership has been released returns an error without a new
 owner-authorized wakeup; this package does not claim authority beyond that
 boundary.
+
+
+## Separate provider diagnostic hints
+
+[Provider health](PROVIDER-HEALTH.md) reports bounded AGY log-text pattern matches
+as `unverified_provider_diagnostic_hint`. An invocation-owned private FIFO does
+not authenticate the semantics of a record. A matching forgery remains unverified
+and changes no authoritative lifecycle, approval, hold, failure or execution state.
+This channel does not wait for the watchdog soft deadline and does not move it.
+
+Health uses a cumulative watch observer, preserving first/last observations and
+retry counts through coalescing independently of ordinary progress delivery.
+Original approved host Workers use authenticated host snapshots; owned planning,
+Reviewer, Closure and derived correction calls use verified invocation records.
+The native outbox is outside the pipe reader; native delivery and supervised
+provider polling run concurrently on those scoped calls.
+
+One early fixed diagnostic-availability wakeup per invocation follows durable
+scope/owner-checked persistence. Health joins progress/failure attention in the
+14-of-16 subquota; planning applies the same two-slot terminal/fatal reserve.
+A hint is historical after recovery, terminal observation or owner loss; it does
+not erase real failure, immutable observations or Unknown receipt reconciliation.
+Native Coworker reads the named status once and explains unverified AGY text,
+counts, elapsed time and availability in the human conversation language (Turkish
+in this pilot) without guessing root cause.
+
+These changes do not fix every missing live tool-progress route. AGY 1.5.3 startup
+capture qualification, source Linux fixtures and installed/live-provider/macOS
+acceptance are distinct. Unavailable or truncated diagnostics never imply health.

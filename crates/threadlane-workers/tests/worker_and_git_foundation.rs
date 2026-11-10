@@ -474,11 +474,52 @@ exit 17
         .expect("run nonzero worker");
     assert_eq!(report.exit_code, Some(17));
     assert_eq!(report.status, WorkerRunStatus::NonZeroExit);
-    let stderr_summary = report
+    // Explicitly non-health legacy calls retain bounded, secret-redacted stderr.
+    assert!(report.stderr_bytes_captured > 0);
+    let summary = report
         .redacted_stderr_summary
-        .expect("stderr summary present");
-    assert!(stderr_summary.contains("[REDACTED]"));
-    assert!(!stderr_summary.contains("AIzaSySecretKeyValue12345"));
+        .as_deref()
+        .expect("legacy stderr summary");
+    assert!(summary.contains("fatal crash"));
+    assert!(summary.contains("[REDACTED]"));
+    assert!(summary.len() <= threadlane_workers::supervisor::MAX_STDERR_SUMMARY_BYTES);
+    // The compatibility API has no health observer and must not opt in implicitly.
+    assert!(report.provider_health.is_none());
+    assert!(!serde_json::to_string(&report)
+        .unwrap()
+        .contains("AIzaSySecretKeyValue12345"));
+
+    // Health-aware calls suppress even non-secret stderr when no diagnostic writer opens
+    // the source. A closed consumer must not turn this invocation into a legacy call.
+    for close_observer in [false, true] {
+        let (_cancel_tx, mut cancel_rx) = watch::channel(false);
+        let (health_tx, health_rx) = watch::channel(None);
+        if close_observer {
+            drop(health_rx);
+        }
+        let report = threadlane_workers::run_worker_with_health_observer(
+            &spec,
+            &workdir,
+            &mut cancel_rx,
+            None,
+            Some(health_tx),
+        )
+        .await
+        .expect("run health-aware nonzero worker");
+        assert_eq!(report.exit_code, Some(17));
+        assert_eq!(report.status, WorkerRunStatus::NonZeroExit);
+        assert!(report.stderr_bytes_captured > 0);
+        assert!(report.redacted_stderr_summary.is_none());
+        let health = report.provider_health.as_ref().expect("requested health");
+        assert_eq!(health.retry_count, 0);
+        assert_eq!(
+            health.availability,
+            threadlane_workers::provider_health::ProviderDiagnosticAvailability::Unavailable
+        );
+        let serialized = serde_json::to_string(&report).unwrap();
+        assert!(!serialized.contains("fatal crash"));
+        assert!(!serialized.contains("AIzaSySecretKeyValue12345"));
+    }
 }
 
 #[tokio::test]

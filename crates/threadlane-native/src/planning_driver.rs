@@ -101,6 +101,12 @@ pub struct PlanningCommandSummary {
     /// Public ownership summary bound when claimed by a live [`CoworkerJobOwnershipGuard`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Durable bounded diagnostic history; liveness is supplied by command status/ownership.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_health: Vec<crate::provider_health::ScopedProviderHealth>,
+    /// Read-time physical ownership projection. History alone never indicates current attention.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_health_views: Vec<crate::provider_health::ProviderHealthView>,
     /// Verified service result reference when `status == Completed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_ref: Option<PlanningCommandResultRef>,
@@ -161,6 +167,16 @@ impl PlanningCommandSummary {
             status: record.status,
             pending_reconciliation: record.pending_reconciliation,
             owner_summary: record.owner_summary.clone(),
+            provider_health: record.provider_health.clone(),
+            provider_health_views: record
+                .provider_health
+                .iter()
+                .cloned()
+                .map(|record| crate::provider_health::ProviderHealthView {
+                    record,
+                    live: false,
+                })
+                .collect(),
             result_ref: record.result_ref.clone(),
             current_plan_status: None,
             executable: None,
@@ -610,6 +626,8 @@ async fn execute_queued_command(
     })?;
     guard.validate_summary_before_effect(&key, &recorded_owner)?;
 
+    let health_owner =
+        crate::provider_health::PlanningHealthOwner::new(command_store, &guard, &running_cmd)?;
     let call_now_ms = current_wall_clock_ms()?;
     match &running_cmd.payload {
         PlanningCommandPayload::Architect(stored_req) => {
@@ -617,7 +635,10 @@ async fn execute_queued_command(
             req.request_key = running_cmd.service_request_key.clone();
             req.current_time_ms = call_now_ms;
 
-            match service.obtain_architect_advice(&req).await {
+            match service
+                .obtain_architect_advice_with_health(&req, Some(&health_owner))
+                .await
+            {
                 Ok(outcome) => {
                     guard.validate_summary_before_effect(&key, &recorded_owner)?;
                     let report_artifact_id =
@@ -704,7 +725,7 @@ async fn execute_queued_command(
             req.current_time_ms = call_now_ms;
 
             match service
-                .orchestrate_brief_to_plan(&scoped_workflow, &req)
+                .orchestrate_brief_to_plan_with_health(&scoped_workflow, &req, Some(&health_owner))
                 .await
             {
                 Ok(outcome) => {
@@ -1396,6 +1417,30 @@ fn verified_command_summary_readonly(
         None
     };
     let mut summary = PlanningCommandSummary::from_record(&cmd);
+    if !summary.provider_health_views.is_empty()
+        && cmd.status == PlanningCommandStatus::Running
+        && !cmd.pending_reconciliation
+    {
+        let key = cmd.ownership_key()?;
+        // Optional liveness loss closes advisory display; it cannot replace a proven result.
+        let live_owner = match command_store.ownership_store().inspect_job_lock(&key).ok() {
+            Some(CoworkerJobLockState::HeldByActiveProcess {
+                recorded_summary: Some(owner),
+                lock_file_identity,
+            }) if owner.lock_file_identity == lock_file_identity => Some(owner),
+            _ => None,
+        };
+        for view in &mut summary.provider_health_views {
+            view.live = !view.record.terminal_observed
+                && crate::provider_health::has_live_diagnostic_source(&view.record.snapshot)
+                && view.record.ownership_key == key
+                && cmd.owner_summary.as_ref() == live_owner.as_ref()
+                && live_owner.as_ref() == Some(&view.record.owner)
+                && command_store
+                    .verify_provider_health_reservation(&cmd, &view.record.invocation)
+                    .is_ok();
+        }
+    }
     summary.current_plan_status = current_plan_status;
     summary.executable = current_plan_status
         .filter(|status| *status != PlanStatus::Published)

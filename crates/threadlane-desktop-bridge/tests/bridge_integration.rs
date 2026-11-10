@@ -598,6 +598,9 @@ fn sample_worker_snapshot(
             head_commit: Some("fedcba9876543210fedcba9876543210fedcba98".to_string()),
         },
         progress: WorkerProgressSummary {
+            provider_retry_high_water: None,
+            provider_health: None,
+            provider_health_live_observed: false,
             watchdog_attention: None,
             durable_progress_events: 4,
             coalesced_progress_events: 2,
@@ -607,6 +610,8 @@ fn sample_worker_snapshot(
             last_event_at_ms: Some(1_700_000_000_500),
         },
         outcome: Some(WorkerOutcomeSummary {
+            provider_retry_high_water: None,
+            provider_health: None,
             exit_code: Some(0),
             signal: None,
             duration_ms: Some(1200),

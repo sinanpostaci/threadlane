@@ -3014,3 +3014,6 @@ fi
 
 #[cfg(test)]
 mod approved_tests;
+
+/// Scoped provider diagnostic hint observation over existing command and controller ledgers.
+pub mod provider_health;

@@ -37,8 +37,9 @@ use crate::protocol::{
 };
 use crate::workers::{
     build_completion_record, build_pre_spawn_cancelled_completion, execute_claimed_worker,
-    map_live_event_to_progress, prepare_claim_worktrees, resolve_worker_execution,
-    ResolvedWorkerExecution, ValidatedWorkersConfig, WorkersConfig, LIVE_OBSERVER_CHANNEL_CAPACITY,
+    map_live_event_to_progress, map_provider_health_to_progress, prepare_claim_worktrees,
+    resolve_worker_execution, ResolvedWorkerExecution, ValidatedWorkersConfig, WorkersConfig,
+    LIVE_OBSERVER_CHANNEL_CAPACITY,
 };
 
 /// Default background tick interval (ms) for advancing due demo runs and checking wake-up claims.
@@ -1905,14 +1906,43 @@ async fn run_single_claimed_worker(
         }
     };
 
+    let (health_tx, mut health_rx) = watch::channel(None);
+    let health_state = Arc::clone(&state);
+    let health_claim = claim.clone();
+    let health_fut = async move {
+        while health_rx.changed().await.is_ok() {
+            // Release the watch borrow before taking the core mutex. Updates coalesce
+            // cumulatively while durable persistence is busy; ordinary progress cannot drop them.
+            let snapshot = health_rx.borrow_and_update().clone();
+            let Some(snapshot) = snapshot else { continue };
+            let update = match map_provider_health_to_progress(&snapshot) {
+                Ok(update) => update,
+                Err(_) => continue, // Malformed diagnostics have no execution authority.
+            };
+            let Some(mut access) = health_state.acquire_for_worker(false).await else {
+                break;
+            };
+            let persisted = access.core_mut().record_worker_progress(
+                &health_claim,
+                &[update],
+                current_time_ms(),
+            );
+            drop(access);
+            if !finish_optional_health_persistence(&health_state, persisted) {
+                break;
+            }
+        }
+    };
+
     let exec_fut = execute_claimed_worker(
         &resolved,
         &claim,
         &worktree_update.task_worktree_id,
         &mut cancel_rx,
         progress_tx,
+        health_tx,
     );
-    let (exec_res, ()) = tokio::join!(exec_fut, progress_fut);
+    let (exec_res, (), ()) = tokio::join!(exec_fut, progress_fut, health_fut);
 
     // 4. Persist terminal outcome (unless stopped solely due to supervisor shutdown/fault).
     if state.fatal_error().is_some() {
@@ -1959,6 +1989,20 @@ async fn run_single_claimed_worker(
     run_id
 }
 
+// A failed optional write has no durable notice evidence and no authority to poison the
+// independent terminal-result write. Critical terminal persistence keeps its existing fencing.
+fn finish_optional_health_persistence<T>(
+    state: &SharedState,
+    result: Result<T, CoreError>,
+) -> bool {
+    if result.is_ok() {
+        state.wake_notify.notify_one();
+        true
+    } else {
+        false
+    }
+}
+
 /// Returns the current wall-clock timestamp in milliseconds since the Unix epoch.
 pub fn current_time_ms() -> i64 {
     SystemTime::now()
@@ -1981,6 +2025,124 @@ mod tests {
     const OTHER_THREAD_UUID: &str = "44444444-4444-4444-8444-444444444444";
     const INSTANCE_ID: &str = "hst_55555555555555555555555555555555";
     const STALE_INSTANCE_ID: &str = "hst_66666666666666666666666666666666";
+
+    #[tokio::test]
+    async fn diagnostic_persistence_failure_keeps_terminal_recording_available_and_terminal_failure_still_fences(
+    ) {
+        use threadlane_core::{
+            WorkerAcceptanceState, WorkerCompletionRecord, WorkerOutcomeSummary,
+        };
+        let root = tempfile::tempdir().expect("private root");
+        let state_dir = root.path().join("state");
+        let handle = Supervisor::start(SupervisorConfig::new(&state_dir))
+            .await
+            .expect("start");
+        let client = SupervisorClient::from_state_dir(&state_dir).expect("client");
+        let binding = client
+            .create_binding(THREAD_UUID, "health persistence regression")
+            .await
+            .expect("binding");
+        let digest = "a".repeat(64);
+        let mut access = handle.shared.acquire_for_request().await.expect("core");
+        let worker = access
+            .core_mut()
+            .execute(
+                &binding.binding_id,
+                Command::StartWorker {
+                    command_key: "health-terminal-regression".into(),
+                    profile_id: "prof_test".into(),
+                    profile_digest: digest.clone(),
+                    provider: "antigravity".into(),
+                    requested_model: "gemini-4-argon-high".into(),
+                    requested_effort: "high".into(),
+                    base_commit: "1".repeat(40),
+                    instruction: "test optional metadata persistence".into(),
+                    execution_binding: None,
+                    now_ms: current_time_ms(),
+                },
+            )
+            .expect("queue")
+            .into_worker()
+            .expect("worker");
+        let claim = access
+            .core_mut()
+            .claim_worker(
+                &binding.binding_id,
+                &worker.run_id,
+                worker.revision,
+                &digest,
+                current_time_ms(),
+            )
+            .expect("claim");
+        drop(access);
+
+        // Inject a persistence-class error at the same policy boundary as the live consumer.
+        let diagnostic_error =
+            CoreError::CorruptState("injected diagnostic-only persistence fault".into());
+        assert!(!finish_optional_health_persistence::<()>(
+            &handle.shared,
+            Err(diagnostic_error)
+        ));
+        assert!(handle.fatal_error().is_none());
+        let mut access = handle
+            .shared
+            .acquire_for_worker(true)
+            .await
+            .expect("terminal core stays available");
+        let terminal = access
+            .core_mut()
+            .record_worker_outcome(
+                &claim,
+                WorkerCompletionRecord {
+                    status: WorkerStatus::Completed,
+                    observed_model: Some("gemini-4-argon-high".into()),
+                    observed_effort: Some("high".into()),
+                    head_commit: Some("2".repeat(40)),
+                    dropped_live_events: 0,
+                    outcome: WorkerOutcomeSummary {
+                        provider_retry_high_water: None,
+                        provider_health: None,
+                        exit_code: Some(0),
+                        signal: None,
+                        duration_ms: Some(10),
+                        timed_out: false,
+                        cancelled: false,
+                        cancel_requested_before_completion: false,
+                        missing_model_evidence: false,
+                        missing_effort_evidence: false,
+                        provider_error: false,
+                        incomplete_cleanup: false,
+                        rejected_by_diff_gate: false,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        acceptance_state: WorkerAcceptanceState::ReadyForReview,
+                        changed_paths_count: 0,
+                        changed_paths_preview: Vec::new(),
+                        violation_count: 0,
+                        violation_summaries: Vec::new(),
+                        final_summary: None,
+                        failure_reason: None,
+                        report_artifact_id: None,
+                    },
+                },
+                current_time_ms(),
+            )
+            .expect("independent proven outcome is recorded");
+        assert_eq!(terminal.status, WorkerStatus::Completed);
+        assert!(terminal.progress.provider_health.is_none());
+        drop(access);
+        assert!(handle.fatal_error().is_none());
+
+        handle.shared.check_core_err_fatal(
+            "terminal write regression",
+            &CoreError::CorruptState("critical terminal fault".into()),
+        );
+        assert!(
+            handle.fatal_error().is_some(),
+            "critical terminal fencing must remain"
+        );
+        handle.shutdown().await;
+    }
 
     fn sample_host_control(session_binding_id: &str) -> HostControlConfig {
         HostControlConfig {
@@ -2720,6 +2882,8 @@ mod tests {
                         head_commit: None,
                         dropped_live_events: 0,
                         outcome: WorkerOutcomeSummary {
+                            provider_retry_high_water: None,
+                            provider_health: None,
                             exit_code: None,
                             signal: None,
                             duration_ms: Some(5),

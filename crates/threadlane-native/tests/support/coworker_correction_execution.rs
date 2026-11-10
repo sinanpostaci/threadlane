@@ -56,6 +56,8 @@ async fn prepare_task_for_derived_correction_with_budgets(
         "#!/bin/sh\nset -eu\nprintf \"running 1 test\\ntest src_a ... ok\\n\"\nexit 0\n",
     );
 
+    install_owned_health_fixture(fixture);
+
     let mut task_interfaces = BTreeMap::new();
     task_interfaces.insert(
         task_id.to_string(),
@@ -691,20 +693,65 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     )
     .expect("write Accept reviewer response");
 
-    let review_2 = Box::pin(review_service.review_task_attempt(
-        reopened_session.guard(),
-        &CoworkerTaskReviewStageRequest {
-            binding_id: BINDING_A.to_string(),
-            thread_uuid: THREAD_UUID_A.to_string(),
-            job_id: job.job_id.clone(),
-            task_id: "task-corr-exec".to_string(),
-            attempt_no: 2,
-            now_ms: step_ts + 800,
-            untrusted_candidate_context: Some("Updated src/a.rs::a() to return 101".to_string()),
-        },
-    ))
-    .await
-    .expect("review_task_attempt attempt 2 Accept");
+    let review_gate = fixture.plans_dir.join("health-review.gate");
+    fs::write(&review_gate, b"hold").expect("hold reviewer");
+    let inspect_review = async {
+        let health = wait_for_owned_role_health(
+            &fixture,
+            reopened_session.guard(),
+            &job.job_id,
+            WorkflowRole::Reviewer,
+            Some("task-corr-exec"),
+            Some(2),
+        )
+        .await;
+        fs::remove_file(&review_gate).expect("release reviewer");
+        health
+    };
+    let health_review_req = CoworkerTaskReviewStageRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        task_id: "task-corr-exec".to_string(),
+        attempt_no: 2,
+        now_ms: step_ts + 800,
+        untrusted_candidate_context: Some("Updated src/a.rs::a() to return 101".to_string()),
+    };
+    let review_future =
+        Box::pin(review_service.review_task_attempt(reopened_session.guard(), &health_review_req));
+    let (review_result, live_review_health) =
+        Box::pin(async { tokio::join!(review_future, inspect_review) }).await;
+    let review_2 = review_result.expect("review_task_attempt attempt 2 Accept");
+    let terminal_review_runtime = fixture
+        .policy_store
+        .get_job_runtime_readonly(BINDING_A, &job.job_id)
+        .expect("terminal Reviewer runtime")
+        .expect("runtime");
+    let terminal_review_health = terminal_review_runtime
+        .provider_health
+        .get(live_review_health.invocation.key())
+        .expect("terminal Reviewer health");
+    assert!(terminal_review_health.terminal_observed);
+    assert_eq!(
+        terminal_review_health.snapshot.unavailable_reason,
+        Some(
+            threadlane_workers::provider_health::ProviderDiagnosticUnavailableReason::SourceClosed
+        )
+    );
+    assert_eq!(
+        terminal_review_health.snapshot.first_failure,
+        live_review_health.snapshot.first_failure
+    );
+    assert_eq!(
+        terminal_review_health.snapshot,
+        review_2
+            .report
+            .structured_execution
+            .execution
+            .provider_health
+            .clone()
+            .expect("Reviewer report health")
+    );
     assert_eq!(review_2.status, CoworkerTaskReviewStageStatus::Accepted);
     assert_eq!(review_2.task_stage, CoworkerTaskStage::Accepted);
     assert_eq!(review_2.attempt_no, 2);
@@ -820,6 +867,25 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
         .get_job_runtime_readonly(BINDING_A, &job.job_id)
         .expect("get final runtime")
         .expect("final runtime exists");
+    let original_health = runtime_final
+        .original_worker_provider_health
+        .get("task-corr-exec")
+        .expect("original host health");
+    assert_eq!(original_health.run_id, art_1_before.run_id);
+    assert_eq!(original_health.worker_id, art_1_before.worker_id);
+    assert_eq!(original_health.snapshot.retry_count, 1);
+    assert!(runtime_final
+        .provider_health
+        .values()
+        .any(|health| matches!(
+            &health.invocation,
+            threadlane_native::provider_health::ProviderHealthInvocation::Controller {
+                role: WorkflowRole::Coder,
+                attempt_no: Some(2),
+                ..
+            }
+        )));
+
     let stored_art_1 = runtime_final
         .attempt_artifacts
         .get(&art_key_1)
@@ -849,6 +915,75 @@ async fn task_correction_executes_derived_coder_attempt_reopens_idempotently_ver
     assert_eq!(
         fs::read_to_string(fixture.repo_dir.join("src/a.rs")).expect("read primary src/a.rs"),
         "pub fn a() -> u32 { 1 }\n"
+    );
+
+    let closure_gate = fixture.plans_dir.join("health-closure.gate");
+    fs::write(&closure_gate, b"hold").expect("hold job Closure");
+    let completion_service =
+        CoworkerJobCompletionService::from_controller(fixture.controller.clone())
+            .expect("completion service");
+    let completion_req = CoworkerJobCompletionRequest {
+        binding_id: BINDING_A.to_string(),
+        thread_uuid: THREAD_UUID_A.to_string(),
+        job_id: job.job_id.clone(),
+        now_ms: step_ts + 1_100,
+    };
+    // Match the other nested stages: join only the pinned handle, not the completion state.
+    let completion =
+        Box::pin(completion_service.complete_job(reopened_session.guard(), &completion_req));
+    let inspect_closure = async {
+        let health = wait_for_owned_role_health(
+            &fixture,
+            reopened_session.guard(),
+            &job.job_id,
+            WorkflowRole::Closure,
+            None,
+            None,
+        )
+        .await;
+        fs::remove_file(&closure_gate).expect("release job Closure");
+        health
+    };
+    let (completion, live_closure_health) =
+        Box::pin(async { tokio::join!(completion, inspect_closure) }).await;
+    let completion = completion.expect("complete job with scoped live Closure diagnostics");
+    assert_eq!(completion.status, CoworkerJobCompletionStatus::Completed);
+    let closure_health = completion
+        .provider_health
+        .iter()
+        .find(|view| view.record.invocation.key() == live_closure_health.invocation.key())
+        .expect("final Closure health");
+    assert!(!closure_health.live);
+    assert!(closure_health.record.terminal_observed);
+    assert_eq!(
+        closure_health.record.snapshot.unavailable_reason,
+        Some(
+            threadlane_workers::provider_health::ProviderDiagnosticUnavailableReason::SourceClosed
+        )
+    );
+    assert_eq!(
+        closure_health.record.snapshot.first_failure,
+        live_closure_health.snapshot.first_failure
+    );
+    assert_eq!(
+        completion
+            .original_worker_provider_health
+            .get("task-corr-exec"),
+        Some(original_health)
+    );
+    assert_eq!(
+        fixture
+            .authority
+            .get_for_operator(&approval_id)
+            .expect("unchanged approval after closure"),
+        approval_before
+    );
+    assert_eq!(
+        threadlane_native::provider_health::controller_health_views(&runtime_final, None)
+            .iter()
+            .filter(|view| view.live)
+            .count(),
+        0
     );
 
     reopened_session
@@ -921,6 +1056,18 @@ async fn task_correction_held_provider_rejects_duplicate_claim_without_marking_u
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+
+        let live_health = wait_for_owned_role_health(
+            &fixture,
+            guard,
+            &job.job_id,
+            WorkflowRole::Coder,
+            Some("task-corr-held"),
+            Some(2),
+        )
+        .await;
+        assert!(!live_health.terminal_observed);
+        assert_eq!(live_health.invocation.key(), expected_eff_id);
 
         // Verify the task is currently Running on attempt 2 with a single reservation.
         let ledger_running = fixture
@@ -1111,6 +1258,29 @@ async fn task_correction_held_provider_rejects_duplicate_claim_without_marking_u
         .get_job_runtime_readonly(BINDING_A, &job.job_id)
         .expect("read runtime after cancellation")
         .expect("runtime exists");
+    let health_after_cancel = rt_after_cancel
+        .provider_health
+        .get(&expected_eff_id)
+        .expect("terminal correction health");
+    assert!(health_after_cancel.terminal_observed);
+    assert_eq!(
+        health_after_cancel.snapshot,
+        cancelled_report
+            .execution_report
+            .worker_report
+            .provider_health
+            .clone()
+            .expect("terminal report health")
+    );
+    assert!(health_after_cancel.snapshot.current_failure.is_some());
+    assert!(health_after_cancel.snapshot.recovery.is_none());
+    assert_eq!(
+        health_after_cancel.snapshot.unavailable_reason,
+        Some(
+            threadlane_workers::provider_health::ProviderDiagnosticUnavailableReason::SourceClosed
+        )
+    );
+
     let coder_usage_cancel = rt_after_cancel
         .role_usage
         .get(&WorkflowRole::Coder)
@@ -2125,4 +2295,154 @@ exit 0
         .release()
         .expect("release reopened session");
     host_handle.shutdown().await.expect("shutdown host");
+}
+
+/// Adds only a deterministic unverified diagnostic fixture to an already-created fake executable.
+fn install_owned_health_fixture(fixture: &ControllerTestFixture) {
+    let original = fs::read_to_string(&fixture.fake_agy_exe).expect("read disposable role fixture");
+    if original.contains("THREADLANE_OWNED_HEALTH_FIXTURE") {
+        return;
+    }
+    let prefix = format!(
+        r#"
+# THREADLANE_OWNED_HEALTH_FIXTURE: synthetic text is not authenticated provider semantics.
+health_previous=''
+health_role=''
+for health_argument in "$@"; do
+    if [ "$health_previous" = '--log-file' ]; then
+        printf '%s\n' 'I0101 00:00:01.000000 1 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.' > "$health_argument"
+    fi
+    case "$health_argument" in
+        *StructuredTaskReviewModelResponse*) health_role='review' ;;
+        *StructuredClosureModelResponse*) health_role='closure' ;;
+    esac
+    health_previous="$health_argument"
+done
+health_wait=0
+while [ -n "$health_role" ] && [ -f '{plans_dir}/health-'"$health_role"'.gate' ] && [ "$health_wait" -lt 1000 ]; do
+    sleep 0.01
+    health_wait=$((health_wait + 1))
+done
+"#,
+        plans_dir = fixture.plans_dir.display()
+    );
+    let updated = original.replacen("set -eu\n", &format!("set -eu\n{prefix}"), 1);
+    assert_ne!(updated, original, "fixture shell prefix must be present");
+    write_executable_script(&fixture.fake_agy_exe, &updated);
+}
+
+/// Live status must be durably readable before release, with exact effect/task/attempt/subject checks.
+async fn wait_for_owned_role_health(
+    fixture: &ControllerTestFixture,
+    guard: &CoworkerJobOwnershipGuard,
+    job_id: &str,
+    role: WorkflowRole,
+    task_id: Option<&str>,
+    attempt_no: Option<u32>,
+) -> threadlane_native::provider_health::ScopedProviderHealth {
+    use threadlane_native::provider_health::{
+        controller_health_views, ProviderHealthInvocation, ScopedHealthSink,
+    };
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let state = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, job_id)
+            .expect("read scoped live health")
+            .expect("runtime");
+        let owner = guard
+            .validate_before_effect(&guard.key())
+            .expect("actual owner");
+        let found = controller_health_views(&state, Some(owner)).into_iter().find(|view| {
+            view.live && view.record.snapshot.retry_count > 0 && matches!(
+                &view.record.invocation,
+                ProviderHealthInvocation::Controller { role: actual_role, task_id: actual_task, attempt_no: actual_attempt, .. }
+                    if *actual_role == role && actual_task.as_deref() == task_id && *actual_attempt == attempt_no
+            )
+        });
+        if let Some(view) = found {
+            let ProviderHealthInvocation::Controller {
+                effect_id,
+                subject_digest,
+                ..
+            } = &view.record.invocation
+            else {
+                unreachable!()
+            };
+            assert!(!view.record.terminal_observed);
+            assert_eq!(
+                view.record.snapshot.availability,
+                threadlane_workers::provider_health::ProviderDiagnosticAvailability::Available
+            );
+            assert!(view.record.snapshot.unavailable_reason.is_none());
+            assert_eq!(view.record.snapshot.evidence_class,
+                threadlane_workers::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+            let before = fs::read(
+                fixture
+                    .policy_store
+                    .ledger_path_for_binding(BINDING_A)
+                    .expect("runtime path"),
+            )
+            .expect("runtime bytes");
+            assert!(ScopedHealthSink::controller(
+                &fixture.controller,
+                guard,
+                "eff_wrong_reservation",
+                role,
+                task_id,
+                attempt_no,
+                subject_digest
+            )
+            .is_err());
+            assert!(ScopedHealthSink::controller(
+                &fixture.controller,
+                guard,
+                effect_id,
+                role,
+                task_id,
+                attempt_no,
+                &"f".repeat(64)
+            )
+            .is_err());
+            if attempt_no.is_some() {
+                assert!(ScopedHealthSink::controller(
+                    &fixture.controller,
+                    guard,
+                    effect_id,
+                    role,
+                    task_id,
+                    Some(99),
+                    subject_digest
+                )
+                .is_err());
+                assert!(ScopedHealthSink::controller(
+                    &fixture.controller,
+                    guard,
+                    effect_id,
+                    role,
+                    Some("wrong_task"),
+                    attempt_no,
+                    subject_digest
+                )
+                .is_err());
+            }
+            let after = fs::read(
+                fixture
+                    .policy_store
+                    .ledger_path_for_binding(BINDING_A)
+                    .expect("runtime path"),
+            )
+            .expect("runtime bytes");
+            assert_eq!(
+                before, after,
+                "rejected scope must not mint metadata or reserve execution"
+            );
+            return view.record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing live health for {role:?} while provider is held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

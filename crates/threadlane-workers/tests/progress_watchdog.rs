@@ -264,6 +264,7 @@ async fn quiet_research_receives_attention_before_exit_and_continues_to_success(
     let legacy_report: threadlane_workers::WorkerExecutionReport =
         serde_json::from_value(legacy_report).unwrap();
     assert!(legacy_report.progress_watchdog.is_none());
+    assert_eq!(legacy_report.provider_health, report.provider_health);
     assert_eq!(legacy_report.status, report.status);
     assert!(report.duration_ms >= 300);
     assert_eq!(

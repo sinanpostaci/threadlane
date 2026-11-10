@@ -18,6 +18,296 @@ use threadlane_workers::ProgressWatchdogPolicy;
 use tokio::net::UnixListener;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+#[cfg(target_os = "linux")]
+async fn health_callback(
+    listener: &UnixListener,
+    repo: &str,
+) -> (
+    tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    Value,
+) {
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut ws = accept_async(stream).await.unwrap();
+    while let Some(frame) = ws.next().await {
+        let Message::Text(text) = frame.unwrap() else {
+            continue;
+        };
+        let request: Value = serde_json::from_str(&text).unwrap();
+        let result = match request["method"].as_str().unwrap() {
+            "initialized" => continue,
+            "initialize" => json!({}),
+            "thread/read" | "thread/resume" => json!({
+                "thread": {"id": THREAD_UUID_A, "cwd": repo, "status": {"type": "idle"}},
+                "cwd": repo,
+            }),
+            "turn/start" => return (ws, request),
+            method => panic!("unexpected health notice method {method}"),
+        };
+        ws.send(Message::Text(
+            json!({"id": request["id"], "result": result})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    }
+    panic!("missing diagnostic availability callback");
+}
+
+#[cfg(target_os = "linux")]
+async fn accept_health_callback(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    request: &Value,
+) {
+    ws.send(Message::Text(
+        json!({"id": request["id"], "result": {
+            "turn": {"id": "0196ed00-0000-7000-8000-0000000000aa", "status": "inProgress"}
+        }})
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+}
+
+/// Emits five synthetic five-minute patterns immediately; no real provider or wall-clock wait.
+#[cfg(target_os = "linux")]
+fn health_hint_script() -> &'static str {
+    r#"
+health_log=''
+health_previous=''
+for health_argument in "$@"; do
+    if [ "$health_previous" = '--log-file' ]; then health_log=$health_argument; break; fi
+    health_previous=$health_argument
+done
+if [ -n "$health_log" ]; then
+    health_attempt=1
+    while [ "$health_attempt" -le 5 ]; do
+        printf 'I0101 00:00:01.000000     1 run.go:315] Run: attempt %s failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n' "$health_attempt"
+        health_attempt=$((health_attempt + 1))
+    done > "$health_log"
+fi
+"#
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn original_worker_health_notifies_before_soft_deadline_and_deduplicates_submitted_or_unknown() {
+    run_with_16mib_test_stack(|| async move {
+        for unknown in [false, true] {
+            let fixture = setup_fixture();
+            let (job, approval_id) = create_planned_approved_and_frozen_job(
+                &fixture,
+                "brf_health_original",
+                "plan-health-original",
+                vec![PlanTask {
+                    id: "task-health".into(),
+                    title: "Original diagnostic hint".into(),
+                    instruction: "Read fixture state until explicitly cancelled".into(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: Vec::new(),
+                    allowed_write_paths: vec!["src/a.rs".into()],
+                }],
+                BTreeMap::new(),
+                vec!["src/a.rs".into()],
+                1,
+                ExecutionBudgets {
+                    timeout_ms: 30_000,
+                    progress_watchdog: Some(ProgressWatchdogPolicy {
+                        soft_timeout_ms: 20_000,
+                        extension_ms: 1_000,
+                        recent_advancement_ms: 100,
+                    }),
+                    ..ExecutionBudgets::default()
+                },
+                ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 1),
+                IntegrationStrategy::MergeNoFf,
+                true,
+            )
+            .await;
+            let marker = fixture.root.join("health-original-starts");
+            write_executable_script(&fixture.fake_agy_exe, &format!(
+                "#!/bin/sh\nset -eu\nprintf 'started\\n' >> '{}'\n{}\nprintf '%s\\n' '{{\"event\":\"init\",\"init\":{{\"session_id\":\"fixture\",\"model\":\"gemini-4-argon-high\"}}}}'\nwhile :; do sleep 0.02; done\n",
+                marker.display(), health_hint_script()));
+            let host = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                &approval_id,
+            )))
+            .await
+            .unwrap();
+            let client = ApprovedHostClient::new(
+                Arc::clone(&fixture.authority),
+                &fixture.sessions_dir,
+                BINDING_A,
+                THREAD_UUID_A,
+            )
+            .unwrap();
+            let now = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            };
+            let session = fixture
+                .controller
+                .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, now())
+                .unwrap();
+            session.step(now()).await.unwrap();
+            session.release().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let snapshot = client.get_task(&approval_id, "task-health").await.unwrap();
+                if snapshot
+                    .worker
+                    .as_ref()
+                    .and_then(|worker| worker.progress.provider_health.as_ref())
+                    .is_some_and(|health| health.retry_count == 5)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "health never reached host ledger"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let driver = CoworkerCodeDriver::from_controller(
+                fixture.root.join("runtime"),
+                &fixture.registry_dir,
+                &fixture.plans_dir,
+                &fixture.authority_dir,
+                &fixture.sessions_dir,
+                Arc::clone(&fixture.authority),
+                fixture.controller.clone(),
+            )
+            .unwrap();
+            let key = CoworkerJobOwnershipKey::new(BINDING_A, THREAD_UUID_A, &job.job_id).unwrap();
+            let digest = fixture
+                .policy_store
+                .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                .unwrap()
+                .unwrap()
+                .envelope
+                .envelope_digest;
+            let sockets = fixture.root.join("health-native");
+            fs::create_dir(&sockets).unwrap();
+            fs::set_permissions(&sockets, fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = sockets.join("native.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            let notices = coworker_notice_dir(&fixture.plans_dir);
+            CoworkerNoticeStore::new(&notices)
+                .unwrap()
+                .configure(
+                    CoworkerNoticeConfig::new(
+                        key.clone(),
+                        digest.clone(),
+                        NativeToolOutputConfig::new_user_message_steer(
+                            socket,
+                            THREAD_UUID_A.into(),
+                            fixture.repo_dir.clone(),
+                        ),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let peer_controller = fixture.controller.clone();
+            let peer_client = client.clone();
+            let peer_approval = approval_id.clone();
+            let peer_key = key.clone();
+            let repo = fixture.repo_dir.to_string_lossy().into_owned();
+            let peer = tokio::spawn(async move {
+                let (mut ws, request) = health_callback(&listener, &repo).await;
+                let snapshot = peer_client
+                    .get_task(&peer_approval, "task-health")
+                    .await
+                    .unwrap();
+                assert_eq!(snapshot.status, TaskExecutionStatus::Running);
+                let worker = snapshot.worker.unwrap();
+                assert!(
+                    worker.progress.watchdog_attention.is_none(),
+                    "notice must precede soft deadline"
+                );
+                let durable = peer_controller
+                    .policy_store()
+                    .get_job_runtime_readonly(BINDING_A, &peer_key.job_id)
+                    .unwrap()
+                    .unwrap();
+                let health = &durable.original_worker_provider_health["task-health"];
+                assert_eq!(health.snapshot.retry_count, 5);
+                assert_eq!(health.snapshot.evidence_class,
+                    threadlane_core::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+                assert!(!durable.stop_requested);
+                assert!(matches!(
+                    peer_controller
+                        .ownership_store()
+                        .inspect_job_lock(&peer_key)
+                        .unwrap(),
+                    CoworkerJobLockState::HeldByActiveProcess { .. }
+                ));
+                assert_eq!(
+                    request["params"]["input"][0]["text"],
+                    threadlane::format_coworker_job_wakeup_message(&peer_key.job_id).unwrap()
+                );
+                if !unknown {
+                    accept_health_callback(&mut ws, &request).await;
+                }
+            });
+            let opts = CoworkerDriverRunOptions {
+                max_steps: Some(1),
+                poll_interval_ms: 5,
+                execution_mode: Some(CoworkerDriverExecutionMode::Phase1InitialDispatchOnly),
+                ..Default::default()
+            };
+            let report = tokio::time::timeout(
+                Duration::from_secs(10),
+                Box::pin(driver.run_owner(BINDING_A, THREAD_UUID_A, &job.job_id, opts)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            peer.await.unwrap();
+            assert!(!report.stop_requested);
+            let metadata = CoworkerNoticeStore::inspect(&notices, &key, &digest).unwrap();
+            assert_eq!(metadata.attempt_count, 1);
+            assert_eq!(
+                metadata.latest.unwrap().status,
+                if unknown {
+                    NoticeDeliveryStatus::Unknown
+                } else {
+                    NoticeDeliveryStatus::Submitted
+                }
+            );
+            Box::pin(driver.run_owner(BINDING_A, THREAD_UUID_A, &job.job_id, opts))
+                .await
+                .unwrap();
+            assert_eq!(
+                CoworkerNoticeStore::inspect(&notices, &key, &digest)
+                    .unwrap()
+                    .attempt_count,
+                1
+            );
+            assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+            let running = client.get_task(&approval_id, "task-health").await.unwrap();
+            assert_eq!(running.status, TaskExecutionStatus::Running);
+            client
+                .cancel_task(
+                    &approval_id,
+                    "task-health",
+                    running.worker.unwrap().revision,
+                    Some("fixture teardown".into()),
+                )
+                .await
+                .unwrap();
+            host.shutdown().await.unwrap();
+        }
+    });
+}
+
 fn run_with_16mib_test_stack<F, Fut>(make_future: F)
 where
     F: FnOnce() -> Fut + Send + 'static,
@@ -38,6 +328,206 @@ where
         .expect("spawn 16MiB test thread")
         .join()
         .expect("16MiB test thread panicked");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reviewer_derived_correction_and_closure_send_durable_advisories_without_changing_authority() {
+    run_with_16mib_test_stack(|| async move {
+        let fixture = setup_fixture();
+        let (job, approval_id) = create_planned_approved_and_frozen_job(
+            &fixture,
+            "brf_health_roles",
+            "plan-health-roles",
+            vec![PlanTask {
+                id: "task-root-a".into(),
+                title: "One bounded correction".into(),
+                instruction: "CTRL_TASK_A implement src/a.rs".into(),
+                role: WorkflowRole::Coder,
+                difficulty: Difficulty::Hard,
+                depends_on: Vec::new(),
+                allowed_write_paths: vec!["src/a.rs".into()],
+            }],
+            BTreeMap::new(),
+            vec!["src/a.rs".into()],
+            1,
+            ExecutionBudgets::default(),
+            ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 2),
+            IntegrationStrategy::MergeNoFf,
+            true,
+        )
+        .await;
+        let original_script = fs::read_to_string(&fixture.fake_agy_exe).unwrap();
+        let exec_node = original_script
+            .lines()
+            .find(|line| line.starts_with("exec node "))
+            .unwrap();
+        let gate = fixture.root.join("health-role-await-callback");
+        let health_wrapper = format!(
+            "#!/bin/sh\nset -eu\ncase \"$*\" in\n*EXPECTED_TASK_REVIEW_IDENTITY_JSON:*|*StructuredClosureModelResponse*|*'THREADLANE IN-SCOPE CORRECTION DIRECTIVE'*)\nprintf 'held\\n' > '{}'\n{}\nwhile [ -f '{}' ]; do sleep 0.01; done\n;;\nesac\n{}\n",
+            gate.display(), health_hint_script(), gate.display(), exec_node);
+        write_executable_script(&fixture.fake_agy_exe, &health_wrapper);
+        fs::write(
+            fixture
+                .root
+                .join("reviewer_override_task-root-a_attempt_1.json"),
+            json!({"outcome": "correct_in_scope", "findings": ["Expected a() to return 101"],
+                "required_in_scope_fixes": ["Update src/a.rs to return 101"],
+                "summary": "One approved in-scope correction"})
+            .to_string(),
+        )
+        .unwrap();
+        let key = CoworkerJobOwnershipKey::new(BINDING_A, THREAD_UUID_A, &job.job_id).unwrap();
+        let before = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .unwrap()
+            .unwrap();
+        let digest = before.envelope.envelope_digest.clone();
+        let notices = coworker_notice_dir(&fixture.plans_dir);
+        let sockets = fixture.root.join("health-role-native");
+        fs::create_dir(&sockets).unwrap();
+        fs::set_permissions(&sockets, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = sockets.join("native.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        CoworkerNoticeStore::new(&notices)
+            .unwrap()
+            .configure(
+                CoworkerNoticeConfig::new(
+                    key.clone(),
+                    digest.clone(),
+                    NativeToolOutputConfig::new_user_message_steer(
+                        socket,
+                        THREAD_UUID_A.into(),
+                        fixture.repo_dir.clone(),
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let peer_controller = fixture.controller.clone();
+        let peer_key = key.clone();
+        let repo = fixture.repo_dir.to_string_lossy().into_owned();
+        let peer = tokio::spawn(async move {
+            let mut seen = std::collections::BTreeSet::new();
+            for expected_role in [
+                WorkflowRole::Reviewer,
+                WorkflowRole::Coder,
+                WorkflowRole::Reviewer,
+                WorkflowRole::Closure,
+            ] {
+                let (mut ws, request) = health_callback(&listener, &repo).await;
+                let state = peer_controller
+                    .policy_store()
+                    .get_job_runtime_readonly(BINDING_A, &peer_key.job_id)
+                    .unwrap()
+                    .unwrap();
+                let current = state
+                    .provider_health
+                    .values()
+                    .find(|health| {
+                        !health.terminal_observed && health.snapshot.current_failure.is_some()
+                    })
+                    .expect("current advisory must be DURABLE before callback");
+                assert!((1..=5).contains(&current.snapshot.retry_count));
+                assert_eq!(current.snapshot.evidence_class,
+                    threadlane_workers::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+                let threadlane_native::provider_health::ProviderHealthInvocation::Controller {
+                    effect_id,
+                    role,
+                    ..
+                } = &current.invocation
+                else {
+                    panic!("expected controller invocation");
+                };
+                assert_eq!(*role, expected_role);
+                assert!(seen.insert(effect_id.clone()), "no repeated retry callback");
+                assert_eq!(
+                    state.pending_effects[effect_id].status,
+                    PendingControllerEffectStatus::ReservedBeforeEffect
+                );
+                assert!(!state.stop_requested);
+                assert!(matches!(
+                    peer_controller
+                        .ownership_store()
+                        .inspect_job_lock(&peer_key)
+                        .unwrap(),
+                    CoworkerJobLockState::HeldByActiveProcess { .. }
+                ));
+                assert_eq!(
+                    request["params"]["input"][0]["text"],
+                    threadlane::format_coworker_job_wakeup_message(&peer_key.job_id).unwrap()
+                );
+                accept_health_callback(&mut ws, &request).await;
+                fs::remove_file(&gate).unwrap();
+            }
+        });
+        let host = Box::pin(ApprovedHost::start(ApprovedHostConfig::new(
+            &fixture.registry_dir,
+            &fixture.plans_dir,
+            &fixture.authority_dir,
+            &fixture.sessions_dir,
+            &approval_id,
+        )))
+        .await
+        .unwrap();
+        let session = fixture
+            .pipeline
+            .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+            .unwrap();
+        let report = tokio::time::timeout(
+            Duration::from_secs(120),
+            Box::pin(session.drive_until_settled(20_000)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.status, CoworkerPipelineStatus::Completed);
+        let final_state = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_state.envelope, before.envelope,
+            "diagnostics never alter immutable approval"
+        );
+        assert_eq!(final_state.provider_health.len(), 4);
+        for view in threadlane_native::provider_health::controller_health_views(&final_state, None)
+        {
+            assert!(!view.live);
+            assert!(view.record.terminal_observed);
+            assert_eq!(view.record.snapshot.retry_count, 5);
+            assert!(view.record.snapshot.first_failure.is_some());
+            assert!(view.record.snapshot.last_failure.is_some());
+            assert!(view.record.snapshot.current_failure.is_none());
+        }
+        assert_eq!(
+            CoworkerNoticeStore::inspect(&notices, &key, &digest)
+                .unwrap()
+                .attempt_count,
+            4
+        );
+        session.release().unwrap();
+        let after_release = fixture
+            .policy_store
+            .get_job_runtime_readonly(BINDING_A, &job.job_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_release.provider_health, final_state.provider_health);
+        assert_eq!(
+            CoworkerNoticeStore::inspect(&notices, &key, &digest)
+                .unwrap()
+                .attempt_count,
+            4
+        );
+        host.shutdown().await.unwrap();
+    });
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1435,5 +1925,497 @@ fn held_running_sibling_prevents_premature_quiescent_settlement_until_terminal_r
         assert_eq!(read_invocation_count(&fixture.check_count_file), 0);
 
         let _ = host.shutdown().await;
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn superseded_role_health_retains_history_and_result_without_reserving_a_new_notice() {
+    run_with_16mib_test_stack(|| async move {
+        use threadlane_native::coworker_workflow::deterministic_controller_instance_id;
+        use threadlane_native::provider_health::{supervise_health, ScopedHealthSink};
+
+        // The unchanged baseline proves this exact reservation/configuration is notice eligible.
+        for superseded in [false, true] {
+            let fixture = setup_fixture();
+            let (job, _) = create_planned_approved_and_frozen_job(
+                &fixture,
+                "brf_health_supersession",
+                "plan-health-supersession",
+                vec![PlanTask {
+                    id: "task-health".into(),
+                    title: "Health scope".into(),
+                    instruction: "Read bounded fixture state".into(),
+                    role: WorkflowRole::Coder,
+                    difficulty: Difficulty::Hard,
+                    depends_on: vec![],
+                    allowed_write_paths: vec!["src/a.rs".into()],
+                }],
+                BTreeMap::new(),
+                vec!["src/a.rs".into()],
+                1,
+                ExecutionBudgets::default(),
+                ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 1),
+                IntegrationStrategy::MergeNoFf,
+                true,
+            )
+            .await;
+            let session = fixture
+                .controller
+                .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+                .unwrap();
+            let key = session.guard().key();
+            let instance = deterministic_controller_instance_id(
+                BINDING_A,
+                &job.job_id,
+                session.guard().instance_id(),
+            );
+            let lease = fixture
+                .policy_store
+                .acquire_or_renew_lease(BINDING_A, &job.job_id, &instance, 20_000, 30_000)
+                .unwrap();
+            let effect_id = "eff_11111111111111111111111111111111";
+            let subject = "a".repeat(64);
+            fixture
+                .policy_store
+                .mutate_job_runtime(
+                    BINDING_A,
+                    &job.job_id,
+                    &instance,
+                    lease.lease_epoch,
+                    |state| {
+                        let _ = state.reserve_role_call(WorkflowRole::Reviewer)?;
+                        state.pending_effects.insert(
+                            effect_id.into(),
+                            PendingControllerEffect {
+                                effect_id: effect_id.into(),
+                                request_key: "req_health_supersession".into(),
+                                job_id: job.job_id.clone(),
+                                task_id: Some("task-health".into()),
+                                attempt_no: Some(1),
+                                kind: PendingControllerEffectKind::ReviewerInvocation,
+                                status: PendingControllerEffectStatus::ReservedBeforeEffect,
+                                subject_digest: subject.clone(),
+                                external_correlation_id: None,
+                                created_at_ms: 20_000,
+                                updated_at_ms: 20_000,
+                                diagnostic: None,
+                            },
+                        );
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            // Construct the live sink before amendment, as an already running role would.
+            let sink = ScopedHealthSink::controller(
+                &fixture.controller,
+                session.guard(),
+                effect_id,
+                WorkflowRole::Reviewer,
+                Some("task-health"),
+                Some(1),
+                &subject,
+            )
+            .unwrap();
+            let before = fixture
+                .policy_store
+                .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                .unwrap()
+                .unwrap();
+            if superseded {
+                let mut brief = job.work_brief.clone();
+                brief.brief_id = "brf_health_amendment".into();
+                brief.kind = WorkBriefKind::Amendment {
+                    target_job_id: job.job_id.clone(),
+                    target_job_revision: job.job_revision,
+                    amendment_reason: "Refine fixture requirements".into(),
+                };
+                fixture
+                    .workflow_store
+                    .create_or_amend_job(&CreateCoworkerJobRequest {
+                        binding_id: BINDING_A.into(),
+                        thread_uuid: THREAD_UUID_A.into(),
+                        request_key: "req_health_amendment".into(),
+                        expected_ledger_revision: None,
+                        work_brief: brief,
+                        amended_target_task_ids: vec![],
+                        amended_write_paths: vec![],
+                        amended_interfaces: vec![],
+                    })
+                    .unwrap();
+            }
+            let directory = coworker_notice_dir(&fixture.plans_dir);
+            let sockets = fixture.root.join("health-supersession-native");
+            fs::create_dir(&sockets).unwrap();
+            fs::set_permissions(&sockets, fs::Permissions::from_mode(0o700)).unwrap();
+            let socket = sockets.join("health-refused.sock");
+            // Keep the socket inode but close its listener: a wrongly eligible notice would
+            // still reserve a durable attempt and fail promptly, with no external endpoint.
+            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            let digest = &before.envelope.envelope_digest;
+            CoworkerNoticeStore::new(&directory)
+                .unwrap()
+                .configure(
+                    CoworkerNoticeConfig::new(
+                        key.clone(),
+                        digest.clone(),
+                        NativeToolOutputConfig::new_user_message_steer(
+                            socket,
+                            THREAD_UUID_A.into(),
+                            fixture.repo_dir.clone(),
+                        ),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+
+            let mut parser =
+                threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser::new();
+            parser.ingest_at(0, b"I0101 00:00:01.000000 1 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n", 10);
+            let hint = parser.snapshot();
+            let expected = hint.clone();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                supervise_health(
+                    Some(&sink),
+                    |observer| {
+                        let fixture = &fixture;
+                        let job = &job;
+                        let directory = &directory;
+                        let key = &key;
+                        let hint = hint.clone();
+                        let expected = expected.clone();
+                        async move {
+                            observer.send_replace(Some(hint.clone()));
+                            let deadline = Instant::now() + Duration::from_secs(2);
+                            loop {
+                                let state = fixture
+                                    .policy_store
+                                    .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                                    .unwrap()
+                                    .unwrap();
+                                if let Some(record) = state.provider_health.get(effect_id) {
+                                    assert!(!record.terminal_observed);
+                                    assert_eq!(record.snapshot, expected);
+                                    break;
+                                }
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "missing durable diagnostic history"
+                                );
+                                tokio::task::yield_now().await;
+                            }
+                            if superseded {
+                                // Allow the notice consumer to run while the invocation remains live.
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            } else {
+                                while CoworkerNoticeStore::inspect(directory, key, digest)
+                                    .unwrap()
+                                    .attempt_count
+                                    == 0
+                                {
+                                    assert!(
+                                        Instant::now() < deadline,
+                                        "baseline did not reserve a notice"
+                                    );
+                                    tokio::task::yield_now().await;
+                                }
+                            }
+                            Ok::<_, ()>((false, hint.clone()))
+                        }
+                    },
+                    |result| Some(&result.1),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(
+                !result.0,
+                "diagnostics cannot replace the independent provider result"
+            );
+            assert_eq!(result.1, expected);
+            let after = fixture
+                .policy_store
+                .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.envelope, before.envelope);
+            assert_eq!(after.pending_effects, before.pending_effects);
+            assert_eq!(after.stop_requested, before.stop_requested);
+            assert_eq!(after.provider_health[effect_id].snapshot, expected);
+            assert!(after.provider_health[effect_id].terminal_observed);
+            assert_eq!(
+                CoworkerNoticeStore::inspect(&directory, &key, digest)
+                    .unwrap()
+                    .attempt_count,
+                if superseded { 0 } else { 1 },
+            );
+            drop(sink);
+            session.release().unwrap();
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn controller_first_closed_lost_or_truncated_hint_is_history_while_cleanup_is_held() {
+    run_with_16mib_test_stack(|| async move {
+        use futures_util::poll;
+        use threadlane_native::coworker_workflow::deterministic_controller_instance_id;
+        use threadlane_native::provider_health::{
+            controller_health_views, supervise_health, ScopedHealthSink,
+        };
+        use threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser;
+        use threadlane_workers::provider_health::ProviderDiagnosticUnavailableReason as Reason;
+
+        for role in [
+            WorkflowRole::Reviewer,
+            WorkflowRole::Coder,
+            WorkflowRole::Closure,
+        ] {
+            for reason in [
+                Reason::SourceClosed,
+                Reason::SourceLost,
+                Reason::ResourceLimit,
+            ] {
+                let fixture = setup_fixture();
+                let (job, _) = create_planned_approved_and_frozen_job(
+                    &fixture,
+                    "brf_health_closed",
+                    "plan-health-closed",
+                    vec![PlanTask {
+                        id: "task-health".into(),
+                        title: "Final drain hint".into(),
+                        instruction: "Read bounded fixture state".into(),
+                        role: WorkflowRole::Coder,
+                        difficulty: Difficulty::Hard,
+                        depends_on: vec![],
+                        allowed_write_paths: vec!["src/a.rs".into()],
+                    }],
+                    BTreeMap::new(),
+                    vec!["src/a.rs".into()],
+                    1,
+                    ExecutionBudgets::default(),
+                    ControllerRoleExecutionBudget::default_for_role(WorkflowRole::Coder, 1),
+                    IntegrationStrategy::MergeNoFf,
+                    true,
+                )
+                .await;
+                let session = fixture
+                    .controller
+                    .open_owned_session(BINDING_A, THREAD_UUID_A, &job.job_id, 20_000)
+                    .unwrap();
+                let key = session.guard().key();
+                let instance = deterministic_controller_instance_id(
+                    BINDING_A,
+                    &job.job_id,
+                    session.guard().instance_id(),
+                );
+                let lease = fixture
+                    .policy_store
+                    .acquire_or_renew_lease(BINDING_A, &job.job_id, &instance, 20_000, 30_000)
+                    .unwrap();
+                let effect_id = "eff_11111111111111111111111111111111";
+                let subject = "a".repeat(64);
+                let task_id = (role != WorkflowRole::Closure).then_some("task-health");
+                let attempt_no = task_id.map(|_| 2);
+                let kind = match role {
+                    WorkflowRole::Reviewer => PendingControllerEffectKind::ReviewerInvocation,
+                    WorkflowRole::Coder => PendingControllerEffectKind::CoderDispatch,
+                    WorkflowRole::Closure => PendingControllerEffectKind::ClosureInvocation,
+                    _ => unreachable!(),
+                };
+                fixture
+                    .policy_store
+                    .mutate_job_runtime(
+                        BINDING_A,
+                        &job.job_id,
+                        &instance,
+                        lease.lease_epoch,
+                        |state| {
+                            let _ = state.reserve_role_call(role)?;
+                            state.pending_effects.insert(
+                                effect_id.into(),
+                                PendingControllerEffect {
+                                    effect_id: effect_id.into(),
+                                    request_key: "req_health_closed".into(),
+                                    job_id: job.job_id.clone(),
+                                    task_id: task_id.map(str::to_owned),
+                                    attempt_no,
+                                    kind,
+                                    status: PendingControllerEffectStatus::ReservedBeforeEffect,
+                                    subject_digest: subject.clone(),
+                                    external_correlation_id: None,
+                                    created_at_ms: 20_000,
+                                    updated_at_ms: 20_000,
+                                    diagnostic: None,
+                                },
+                            );
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                let sink = ScopedHealthSink::controller(
+                    &fixture.controller,
+                    session.guard(),
+                    effect_id,
+                    role,
+                    task_id,
+                    attempt_no,
+                    &subject,
+                )
+                .unwrap();
+                let before = fixture
+                    .policy_store
+                    .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                    .unwrap()
+                    .unwrap();
+                let directory = coworker_notice_dir(&fixture.plans_dir);
+                let sockets = fixture.root.join("health-closed-native");
+                fs::create_dir(&sockets).unwrap();
+                fs::set_permissions(&sockets, fs::Permissions::from_mode(0o700)).unwrap();
+                let socket = sockets.join("health.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                listener.set_nonblocking(true).unwrap();
+                fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+                let digest = &before.envelope.envelope_digest;
+                CoworkerNoticeStore::new(&directory)
+                    .unwrap()
+                    .configure(
+                        CoworkerNoticeConfig::new(
+                            key.clone(),
+                            digest.clone(),
+                            NativeToolOutputConfig::new_user_message_steer(
+                                socket,
+                                THREAD_UUID_A.into(),
+                                fixture.repo_dir.clone(),
+                            ),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+
+                let mut parser = AntigravityDiagnosticParser::new();
+                let quiet = parser.snapshot();
+                parser.ingest_at(0, b"I0101 00:00:01.000000 1 run.go:315] Run: attempt 7 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n", 10);
+                parser.unavailable(reason, 11);
+                parser.unavailable(Reason::SourceClosed, 12);
+                let hint = parser.snapshot();
+                assert_eq!(hint.unavailable_reason, Some(reason));
+                assert!(hint.is_valid());
+                let expected = hint.clone();
+                let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+                let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+                let mut supervision = Box::pin(supervise_health(
+                    Some(&sink),
+                    |observer| async move {
+                        observer.send_replace(Some(quiet));
+                        drain_rx.await.unwrap();
+                        // No hint was visible until coverage had already ended.
+                        observer.send_replace(Some(hint.clone()));
+                        cleanup_rx.await.unwrap();
+                        if role == WorkflowRole::Closure {
+                            Err("injected provider error after final drain")
+                        } else {
+                            Ok((false, hint))
+                        }
+                    },
+                    |result| Some(&result.1),
+                ));
+                assert!(poll!(supervision.as_mut()).is_pending());
+                assert!(poll!(supervision.as_mut()).is_pending());
+                assert!(poll!(supervision.as_mut()).is_pending());
+                let quiet_state = fixture
+                    .policy_store
+                    .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                    .unwrap()
+                    .unwrap();
+                let owner = session.guard().validate_before_effect(&key).unwrap();
+                let quiet_view = controller_health_views(&quiet_state, Some(owner));
+                assert_eq!(quiet_view.len(), 1);
+                assert!(
+                    quiet_view[0].live,
+                    "available coverage can be live without a hint"
+                );
+                assert!(quiet_view[0].record.snapshot.current_failure.is_none());
+
+                drain_tx.send(()).unwrap();
+                assert!(poll!(supervision.as_mut()).is_pending());
+                assert!(poll!(supervision.as_mut()).is_pending());
+                assert!(poll!(supervision.as_mut()).is_pending());
+                let held = fixture
+                    .policy_store
+                    .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(held.provider_health[effect_id].snapshot, expected);
+                assert!(!held.provider_health[effect_id].terminal_observed);
+                assert_eq!(held.pending_effects, before.pending_effects);
+                assert_eq!(held.lease, before.lease);
+                let owner = session.guard().validate_before_effect(&key).unwrap();
+                let views = controller_health_views(&held, Some(owner));
+                assert_eq!(views.len(), 1, "closed coverage remains readable history");
+                assert!(!views[0].live, "{role:?}/{reason:?}");
+                let notices = CoworkerNoticeStore::inspect(&directory, &key, digest).unwrap();
+                assert_eq!(
+                    notices.attempt_count, 0,
+                    "no early intent for {role:?}/{reason:?}"
+                );
+                assert!(notices.latest.is_none());
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+
+                cleanup_tx.send(()).unwrap();
+                let outcome = tokio::time::timeout(Duration::from_secs(5), supervision)
+                    .await
+                    .unwrap();
+                if role == WorkflowRole::Closure {
+                    assert_eq!(outcome, Err("injected provider error after final drain"));
+                } else {
+                    let outcome = outcome.unwrap();
+                    assert!(
+                        !outcome.0,
+                        "coverage cannot change the provider's non-success result"
+                    );
+                    assert_eq!(outcome.1, expected);
+                }
+                let after = fixture
+                    .policy_store
+                    .get_job_runtime_readonly(BINDING_A, &job.job_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.envelope, before.envelope);
+                assert_eq!(after.pending_effects, before.pending_effects);
+                assert_eq!(after.stop_requested, before.stop_requested);
+                assert_eq!(after.provider_health[effect_id].snapshot, expected);
+                assert!(after.provider_health[effect_id].terminal_observed);
+                assert!(after.provider_health[effect_id]
+                    .snapshot
+                    .current_failure
+                    .is_some());
+                assert!(after.provider_health[effect_id].snapshot.recovery.is_none());
+                assert_eq!(after.provider_health[effect_id].snapshot.retry_count, 1);
+                assert_eq!(
+                    after.provider_health[effect_id].snapshot.retry_high_water,
+                    Some(7)
+                );
+                assert_eq!(
+                    CoworkerNoticeStore::inspect(&directory, &key, digest)
+                        .unwrap()
+                        .attempt_count,
+                    0
+                );
+                assert_eq!(
+                    listener.accept().unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                drop(sink);
+                session.release().unwrap();
+            }
+        }
     });
 }

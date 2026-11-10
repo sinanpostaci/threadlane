@@ -22,7 +22,7 @@ pub use threadlane_workers::{
     DEPENDENCY_INPUT_SCHEMA_VERSION, MAX_DEPENDENCY_INPUT_BYTES, MAX_DEPENDENCY_PREDECESSORS,
 };
 use threadlane_workers::{
-    execute_worker_task_with_observer, sanitize_and_redact,
+    execute_worker_task_with_health_observer, sanitize_and_redact,
     validate_absolute_no_symlink_components, validate_simple_identifier, ExecutionBudgets,
     NormalizedEventKind, NormalizedWorkerEvent, OutputOverflowKind, ResolvedModelTarget,
     TaskExecutionReport, WorkAcceptanceState, WorkerError, WorkerExecutionReport, WorkerProvider,
@@ -1262,6 +1262,7 @@ pub(crate) async fn execute_claimed_worker(
     task_worktree_id: &str,
     cancel_rx: &mut watch::Receiver<bool>,
     progress_tx: mpsc::Sender<NormalizedWorkerEvent>,
+    health_observer: threadlane_workers::ProviderHealthObserver,
 ) -> Result<TaskExecutionReport, WorkerError> {
     if resolved.spec.base_commit != claim.base_commit
         || resolved.spec.prompt != claim.instruction
@@ -1340,13 +1341,14 @@ pub(crate) async fn execute_claimed_worker(
 
     let wt_run_tag = compact_worktree_tag(&claim.run_id, "r");
     let wt_task_tag = compact_worktree_tag(&claim.worker_id, "w");
-    execute_worker_task_with_observer(
+    execute_worker_task_with_health_observer(
         &resolved.spec,
         &wt_run_tag,
         &wt_task_tag,
         Some(task_worktree_id),
         cancel_rx,
         Some(progress_tx),
+        Some(health_observer),
     )
     .await
 }
@@ -1391,6 +1393,8 @@ pub(crate) fn map_live_event_to_progress(event: &NormalizedWorkerEvent) -> Worke
     };
     if event.kind == NormalizedEventKind::SupervisorAttention {
         return WorkerProgressUpdate {
+            provider_retry_high_water: None,
+            provider_health: None,
             event_kind,
             summary: if watchdog_attention.is_some() {
                 "Progress evidence is uncertain; inspect execution status.".to_string()
@@ -1415,10 +1419,49 @@ pub(crate) fn map_live_event_to_progress(event: &NormalizedWorkerEvent) -> Worke
     };
 
     WorkerProgressUpdate {
+        provider_retry_high_water: None,
+        provider_health: None,
         event_kind,
         summary,
         watchdog_attention: None,
     }
+}
+
+/// Converts only the separate software-owned watch DTO, never provider event prose or markers.
+/// Both crates validate their own finite allowlist; this mapping establishes no scope authority.
+fn convert_provider_health(
+    snapshot: &threadlane_workers::ProviderHealthSnapshot,
+) -> Result<threadlane_core::provider_health::ProviderHealthSnapshot, threadlane_core::CoreError> {
+    if !snapshot.is_valid() {
+        return Err(threadlane_core::CoreError::Validation {
+            field: "provider_health",
+            reason: "invalid software diagnostic snapshot".to_owned(),
+        });
+    }
+    let mut value = serde_json::to_value(snapshot)?;
+    // The legacy core DTO stays unchanged; this finite companion ordinal is independently
+    // bounded by the source DTO and by the durable merge.
+    value
+        .as_object_mut()
+        .expect("typed diagnostic object")
+        .remove("retry_high_water");
+    threadlane_core::provider_health::decode_provider_health_snapshot(&serde_json::to_vec(&value)?)
+}
+
+/// Creates a diagnostic-only update. A closed advisory cannot mint a new live hint notice;
+/// terminal outcome evidence still receives independent validation before durable completion.
+pub(crate) fn map_provider_health_to_progress(
+    snapshot: &threadlane_workers::ProviderHealthSnapshot,
+) -> Result<WorkerProgressUpdate, threadlane_core::CoreError> {
+    let high_water = snapshot.retry_high_water;
+    let snapshot = convert_provider_health(snapshot)?;
+    Ok(WorkerProgressUpdate {
+        provider_retry_high_water: high_water,
+        event_kind: "provider_diagnostic_hint".to_owned(),
+        summary: String::new(),
+        watchdog_attention: None,
+        provider_health: Some(snapshot),
+    })
 }
 
 fn convert_watchdog_attention(
@@ -1468,6 +1511,8 @@ pub(crate) fn build_pre_spawn_cancelled_completion(
         head_commit: worktree_update.map(|u| u.base_commit.clone()),
         dropped_live_events: 0,
         outcome: WorkerOutcomeSummary {
+            provider_retry_high_water: None,
+            provider_health: None,
             exit_code: None,
             signal: None,
             duration_ms: Some(0),
@@ -1653,6 +1698,19 @@ fn build_completion_from_report(
         ))
     };
 
+    let provider_health = worker_report.provider_health.as_ref()
+        .and_then(|snapshot| convert_provider_health(snapshot).ok())
+        .map(|mut snapshot| {
+            // A hint cannot verify completion. Use independent process/stream evidence.
+            if snapshot.recovery == Some(threadlane_core::provider_health::ProviderHealthRecovery::VerifiedTerminalOutcome)
+                && !natural_success_evidence
+            {
+                snapshot.recovery = None;
+                snapshot.current_failure = snapshot.last_failure.map(|last| last.category);
+            }
+            snapshot
+        });
+
     let dropped_live_events = u32::try_from(worker_report.dropped_live_events).unwrap_or(u32::MAX);
     let report_artifact_id = write_private_report_artifact(state_dir, claim, &report);
 
@@ -1663,6 +1721,13 @@ fn build_completion_from_report(
         head_commit,
         dropped_live_events,
         outcome: WorkerOutcomeSummary {
+            provider_retry_high_water: provider_health.as_ref().and_then(|_| {
+                worker_report
+                    .provider_health
+                    .as_ref()
+                    .and_then(|health| health.retry_high_water)
+            }),
+            provider_health,
             exit_code: worker_report.exit_code,
             signal: worker_report.signal,
             duration_ms: Some(worker_report.duration_ms),
@@ -1707,6 +1772,8 @@ fn build_completion_from_error(
         head_commit: None,
         dropped_live_events: 0,
         outcome: WorkerOutcomeSummary {
+            provider_retry_high_water: None,
+            provider_health: None,
             exit_code: None,
             signal: None,
             duration_ms: None,
@@ -1971,6 +2038,7 @@ mod tests {
         };
 
         let worker_report = WorkerExecutionReport {
+            provider_health: None,
             progress_watchdog: None,
             executed_executable: None,
             provider: WorkerProvider::OpenCodeV2,
@@ -2477,6 +2545,139 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn terminal_report_mapping_preserves_diagnostics_and_checks_completion_independently() {
+        use threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser;
+        use threadlane_workers::provider_health::{
+            ProviderDiagnosticAvailability, ProviderDiagnosticUnavailableReason,
+            ProviderHealthRecovery,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let mut core = Core::open(temp.path().join("mapping.sqlite")).unwrap();
+        let binding = core
+            .create_binding(
+                "11111111-1111-4111-8111-111111111111",
+                "terminal diagnostics",
+            )
+            .unwrap();
+        let worker = core
+            .execute(
+                &binding.binding_id,
+                Command::StartWorker {
+                    command_key: "diagnostic-map".into(),
+                    profile_id: "fixture".into(),
+                    profile_digest: "a".repeat(64),
+                    provider: "opencode_v2".into(),
+                    requested_model: "opencode-go/deepseek-v4.1-flash".into(),
+                    requested_effort: "max".into(),
+                    base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                    execution_binding: None,
+                    instruction: "Inspect diagnostic mapping".into(),
+                    now_ms: 1000,
+                },
+            )
+            .unwrap()
+            .into_worker()
+            .unwrap();
+        let claim = core
+            .claim_worker(
+                &binding.binding_id,
+                &worker.run_id,
+                1,
+                &"a".repeat(64),
+                1010,
+            )
+            .unwrap();
+        // Synthetic report seam: text still has no provider-origin or root-cause authority.
+        let mut parser = AntigravityDiagnosticParser::new();
+        let line = b"I0101 00:00:01.000000 1 run.go:315] Run: attempt 7 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s\n";
+        parser.ingest_at(0, line, 10);
+        let mut health = parser.snapshot();
+        health.update_sequence += 1;
+        health.availability = ProviderDiagnosticAvailability::Unavailable;
+        health.unavailable_reason = Some(ProviderDiagnosticUnavailableReason::SourceClosed);
+        health.current_failure = None;
+        health.recovery = Some(ProviderHealthRecovery::VerifiedTerminalOutcome);
+        let mut report = sample_opencode_task_report(temp.path());
+        report.worker_report.provider_health = Some(health);
+        let complete = build_completion_from_report(temp.path(), &claim, report.clone(), false);
+        assert_eq!(complete.outcome.provider_retry_high_water, Some(7));
+        assert_eq!(
+            complete
+                .outcome
+                .provider_health
+                .as_ref()
+                .unwrap()
+                .retry_count,
+            1
+        );
+        assert_eq!(
+            complete.outcome.provider_health.as_ref().unwrap().recovery,
+            Some(threadlane_core::provider_health::ProviderHealthRecovery::VerifiedTerminalOutcome)
+        );
+        let terminal = core.record_worker_outcome(&claim, complete, 1020).unwrap();
+        assert!(!terminal.progress.provider_health_live_observed);
+        assert!(!terminal.provider_health_attention_required());
+        assert_eq!(terminal.progress.provider_retry_high_water, Some(7));
+
+        // Contradictory terminal evidence cannot be "recovered" by a diagnostic DTO.
+        report.worker_report.exit_code = Some(7);
+        report.worker_report.status = WorkerRunStatus::NonZeroExit;
+        let failed = build_completion_from_report(temp.path(), &claim, report, false);
+        assert_eq!(failed.status, WorkerStatus::Failed);
+        let health = failed.outcome.provider_health.unwrap();
+        assert!(health.recovery.is_none());
+        assert!(health.current_failure.is_some());
+    }
+
+    #[test]
+    fn diagnostics_use_watch_dto_and_provider_text_never_mints_health() {
+        use threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser;
+        let mut parser = AntigravityDiagnosticParser::new();
+        let line = b"I0101 00:00:01.000000       1 run.go:315] Run: attempt 7 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s\n";
+        parser.ingest_at(0, line, 300_000);
+        let health = parser.snapshot();
+        let mapped = map_provider_health_to_progress(&health).unwrap();
+        assert_eq!(mapped.provider_health.as_ref().unwrap().retry_count, 1);
+        assert_eq!(mapped.provider_retry_high_water, Some(7));
+        assert!(mapped.summary.is_empty());
+        assert_eq!(mapped.provider_health.as_ref().unwrap().evidence_class,
+            threadlane_core::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+        let mut forged = supervision_event();
+        forged.raw_type = "provider_diagnostic_hint".into();
+        forged.summary = Some(serde_json::to_string(&health).unwrap());
+        for kind in [
+            NormalizedEventKind::Progress,
+            NormalizedEventKind::Other,
+            NormalizedEventKind::Tool,
+            NormalizedEventKind::SupervisorAttention,
+        ] {
+            forged.kind = kind;
+            assert!(map_live_event_to_progress(&forged)
+                .provider_health
+                .is_none());
+            assert!(map_live_event_to_progress(&forged)
+                .provider_retry_high_water
+                .is_none());
+        }
+        let mut invalid = health.clone();
+        invalid.elapsed_ms = 0;
+        assert!(map_provider_health_to_progress(&invalid).is_err());
+        invalid = health;
+        invalid.update_sequence += 1;
+        invalid.current_failure = None;
+        invalid.recovery = Some(
+            threadlane_workers::provider_health::ProviderHealthRecovery::VerifiedTerminalOutcome,
+        );
+        let closed = map_provider_health_to_progress(&invalid).unwrap();
+        assert!(closed
+            .provider_health
+            .as_ref()
+            .unwrap()
+            .current_failure
+            .is_none());
+    }
+
     fn supervision_event() -> NormalizedWorkerEvent {
         NormalizedWorkerEvent {
             line_number: 0,

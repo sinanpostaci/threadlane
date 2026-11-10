@@ -863,6 +863,9 @@ pub struct CoworkerDriverStatusReport {
     /// Verified live ownership summary when a live owner is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_owner_summary: Option<CoworkerOwnershipSummary>,
+    /// Durable scoped role diagnostics; only exact current verified owner/effect pairs are live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_health: Vec<crate::provider_health::ProviderHealthView>,
     /// Persisted lease record in `ControllerPolicyStore`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease: Option<ControllerJobLeaseRecord>,
@@ -3027,6 +3030,34 @@ impl CoworkerCodeDriver {
                         .await;
                     session.guard().validate_before_effect(key)?;
                     if let Ok(snapshot) = snapshot {
+                        // Independent of soft tool-progress attention. Only already durable,
+                        // verified original-host hints are eligible for this fixed wakeup.
+                        if snapshot
+                            .worker
+                            .as_ref()
+                            .is_some_and(|worker| worker.progress.provider_health.is_some())
+                        {
+                            let directory = crate::coworker_notice::coworker_notice_dir(
+                                self.controller.workflow_store().plans_dir(),
+                            );
+                            if crate::coworker_notice::CoworkerNoticeStore::inspect(
+                                &directory,
+                                key,
+                                &admission.runtime_state.envelope.envelope_digest,
+                            )
+                            .is_ok_and(|metadata| metadata.configured)
+                            {
+                                if let Ok(store) =
+                                    crate::coworker_notice::CoworkerNoticeStore::new(directory)
+                                {
+                                    let _ = store
+                                        .notify_original_provider_health(
+                                            session, &client, &snapshot,
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
                         if let Some(attention) = crate::coworker_notice::verified_progress_attention(
                             &admission, &snapshot,
                         ) {
@@ -4245,7 +4276,12 @@ impl CoworkerCodeDriver {
         }
         let pipeline_status = pipeline_report.as_ref().map(|r| r.status);
 
+        let provider_health = crate::provider_health::controller_health_views(
+            &inspection.runtime_state,
+            Some(verified_owner_summary),
+        );
         Ok(CoworkerDriverStatusReport {
+            provider_health,
             binding_id: key.binding_id.clone(),
             thread_uuid: key.thread_uuid.clone(),
             job_id: key.job_id.clone(),
@@ -4399,7 +4435,10 @@ impl CoworkerCodeDriver {
             })
             .unwrap_or(CoworkerDriverHostMode::NotRunningOrInspectedReadonly);
 
+        let provider_health =
+            crate::provider_health::controller_health_views(&inspection.runtime_state, None);
         Ok(CoworkerDriverStatusReport {
+            provider_health,
             binding_id: key.binding_id.clone(),
             thread_uuid: key.thread_uuid.clone(),
             job_id: key.job_id.clone(),
@@ -5041,6 +5080,11 @@ impl CoworkerCodeDriver {
                 observed_model,
                 observed_effort,
                 watchdog_attention: None,
+                original_worker_provider_health: inspection
+                    .runtime_state
+                    .original_worker_provider_health
+                    .get(&task.task_id)
+                    .cloned(),
                 fenced,
             });
         }

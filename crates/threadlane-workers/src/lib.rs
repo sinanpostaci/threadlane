@@ -31,6 +31,8 @@
 
 /// Opt-in complete structured advisory response capture and framing provenance.
 pub mod advisory_response;
+/// Invocation-owned bounded capture and unverified AGY diagnostic hint classifier.
+pub mod antigravity_diagnostics;
 /// Versioned exact-match AGY catalog model variant metadata.
 pub mod antigravity_models;
 /// Generic bounded-command execution primitive under isolated Unix process-group supervision.
@@ -53,6 +55,8 @@ pub mod opencode_metadata;
 pub mod permissions;
 /// Advisory progress hints and soft deadlines within the existing hard runtime ceiling.
 pub mod progress_watchdog;
+/// Cumulative unverified diagnostic snapshots, separate from execution authority.
+pub mod provider_health;
 /// Typed worker specification, execution budgets, policy allowlists, and exact argv builders.
 pub mod spec;
 /// Incremental NDJSON stream parser, normalized events, and requested-vs-observed evidence checks.
@@ -88,19 +92,19 @@ pub use git::{
     begin_worktree_job, cleanup_integrated_worktree, cleanup_worktree,
     ensure_worktree_job_inactive_readonly, evaluate_diff_gate, evaluate_diff_gate_with_limits,
     evaluate_diff_gate_with_scan_limits, evaluate_diff_gate_with_timeout, execute_worker_task,
-    execute_worker_task_with_observer, inspect_base_commit_path_kind, is_commit_ancestor,
-    is_source_worktree_clean, is_worktree_clean, load_and_verify_manifest,
-    open_existing_private_lock_file, resolve_allowed_write_scopes_at_base,
-    resolve_exact_commit_sha, resolve_exact_tree_sha, run_sanitized_git,
-    run_sanitized_git_allow_nonzero, run_sanitized_git_bytes, sanitize_git_command_env,
-    sanitize_git_command_env_from, validate_exact_40_hex_sha, validate_sha256_hex_digest,
-    BaseCommitPathKind, ChangedPathEntry, CleanupReport, CleanupRequest, DiffChangeKind,
-    DiffGateReport, DiffViolation, DiffViolationKind, IntegratedCleanupReport,
-    IntegratedCleanupRequest, IsolationLevel, SupervisedGitOutput, TaskExecutionReport,
-    WorkAcceptanceState, WorkAreaOwnershipMarker, WorktreeJobGuard, WorktreeKind, WorktreeManager,
-    WorktreeManifest, CHECKOUTS_SUBDIR, DEFAULT_GIT_COMMAND_TIMEOUT_MS,
-    DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES, DEFAULT_MAX_SCAN_DEPTH,
-    DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION,
+    execute_worker_task_with_health_observer, execute_worker_task_with_observer,
+    inspect_base_commit_path_kind, is_commit_ancestor, is_source_worktree_clean, is_worktree_clean,
+    load_and_verify_manifest, open_existing_private_lock_file,
+    resolve_allowed_write_scopes_at_base, resolve_exact_commit_sha, resolve_exact_tree_sha,
+    run_sanitized_git, run_sanitized_git_allow_nonzero, run_sanitized_git_bytes,
+    sanitize_git_command_env, sanitize_git_command_env_from, validate_exact_40_hex_sha,
+    validate_sha256_hex_digest, BaseCommitPathKind, ChangedPathEntry, CleanupReport,
+    CleanupRequest, DiffChangeKind, DiffGateReport, DiffViolation, DiffViolationKind,
+    IntegratedCleanupReport, IntegratedCleanupRequest, IsolationLevel, SupervisedGitOutput,
+    TaskExecutionReport, WorkAcceptanceState, WorkAreaOwnershipMarker, WorktreeJobGuard,
+    WorktreeKind, WorktreeManager, WorktreeManifest, CHECKOUTS_SUBDIR,
+    DEFAULT_GIT_COMMAND_TIMEOUT_MS, DEFAULT_MAX_DIFF_CHANGED_PATHS, DEFAULT_MAX_GIT_OUTPUT_BYTES,
+    DEFAULT_MAX_SCAN_DEPTH, DEFAULT_MAX_SCAN_ENTRIES, MANIFESTS_SUBDIR, MANIFEST_SCHEMA_VERSION,
     SANITIZED_GIT_ENV_OVERRIDES, WORK_AREA_MARKER_FILENAME, WORK_AREA_MARKER_VERSION,
 };
 pub use opencode_metadata::{
@@ -138,6 +142,7 @@ pub use progress_watchdog::{
     ProgressAttentionReason, ProgressWatchdog, ProgressWatchdogPolicy, ProgressWatchdogSnapshot,
     ProgressWatchdogStatus,
 };
+pub use provider_health::{ProviderHealthObserver, ProviderHealthSnapshot};
 pub use spec::resolve_model_target;
 pub use spec::{
     extract_pinned_codex_task_files_write_scopes, is_control_config_path, is_path_allowed,
@@ -158,9 +163,11 @@ pub use stream::{
 };
 pub use supervisor::{
     is_process_alive, is_process_group_alive, run_advisory_worker, run_advisory_worker_with_cancel,
-    run_advisory_worker_with_observer, run_advisory_worker_with_structured_result,
+    run_advisory_worker_with_health_observer, run_advisory_worker_with_observer,
+    run_advisory_worker_with_structured_result,
     run_advisory_worker_with_structured_result_and_cancel,
+    run_advisory_worker_with_structured_result_and_health_observer,
     run_advisory_worker_with_structured_result_and_observer, run_worker, run_worker_with_cancel,
-    run_worker_with_observer, OutputOverflowKind, WorkerExecutionReport, WorkerRunStatus,
-    POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
+    run_worker_with_health_observer, run_worker_with_observer, OutputOverflowKind,
+    WorkerExecutionReport, WorkerRunStatus, POST_EXIT_PIPE_DRAIN_TIMEOUT_MS,
 };

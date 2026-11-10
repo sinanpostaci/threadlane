@@ -51,6 +51,7 @@ struct GatewayFixture {
     worker_marker: PathBuf,
     release_path: PathBuf,
     mode_path: PathBuf,
+    health_enabled_path: PathBuf,
     state_dir: PathBuf,
     pairing_dir: PathBuf,
     registry_dir: PathBuf,
@@ -78,6 +79,7 @@ impl GatewayFixture {
         let started_path = root.join("worker-started");
         let release_path = root.join("worker-release");
         let mode_path = root.join("worker-mode");
+        let health_enabled_path = root.join("worker-health-enabled");
         fs::write(&release_path, b"release\n").expect("open release gate by default");
         fs::write(&mode_path, b"architect\n").expect("default worker mode");
         write_fake_worker(
@@ -86,6 +88,7 @@ impl GatewayFixture {
             &started_path,
             &release_path,
             &mode_path,
+            &health_enabled_path,
         );
 
         let state_dir = root.join("runtime");
@@ -196,6 +199,7 @@ impl GatewayFixture {
             worker_marker,
             release_path,
             mode_path,
+            health_enabled_path,
             state_dir,
             pairing_dir,
             registry_dir,
@@ -350,10 +354,21 @@ fn write_fake_worker(
     started_path: &Path,
     release_path: &Path,
     mode_path: &Path,
+    health_enabled_path: &Path,
 ) {
     let script = format!(
         r#"#!/bin/sh
 set -eu
+if [ -f '{}' ]; then
+    health_previous=''
+    for health_argument in "$@"; do
+        if [ "$health_previous" = '--log-file' ]; then
+            printf '%s\n' 'I0101 00:00:01.000000 1 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.' > "$health_argument"
+            break
+        fi
+        health_previous="$health_argument"
+    done
+fi
 printf 'invoked\n' >> '{}'
 printf 'started\n' > '{}'
 i=0
@@ -388,6 +403,7 @@ esac
 printf '{{"event":"result","result":{{"status":"SUCCESS","response":"%s"}}}}\n' "$RESPONSE_JSON"
 exit 0
 "#,
+        health_enabled_path.display(),
         counter_path.display(),
         started_path.display(),
         release_path.display(),
@@ -780,6 +796,7 @@ async fn wait_for_command_completion(
 async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_and_unknown_reconciliation(
 ) {
     let mut fixture = GatewayFixture::start().await;
+    fs::write(&fixture.health_enabled_path, b"enabled\n").expect("enable fixture health hints");
     let mcp = fixture.enrolled_mcp();
     let now_ms = current_wall_clock_ms().expect("wall clock");
     let grant_id = fixture.create_grant(
@@ -829,6 +846,15 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
         PlanningCommandStatus::Queued | PlanningCommandStatus::Running
     ));
 
+    let arch_live = wait_for_early_health(&mcp, &submit_arch.command_id).await;
+    assert_eq!(arch_live.status, PlanningCommandStatus::Running);
+    assert_eq!(arch_live.command.provider_health.len(), 1);
+    assert!(!arch_live.command.provider_health[0].terminal_observed);
+    assert_eq!(arch_live.command.provider_health[0].snapshot.retry_count, 1);
+    assert_eq!(arch_live.command.provider_health[0].snapshot.evidence_class,
+        threadlane_workers::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+    let first_arch_hint = arch_live.command.provider_health[0].snapshot.first_failure;
+
     // Release the held fake worker and wait for completion.
     fs::write(&fixture.release_path, b"release\n").expect("release held worker");
     let arch_detail = wait_for_command_completion(&mcp, &submit_arch.command_id).await;
@@ -839,6 +865,13 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
         format_command_detail_context(&arch_detail)
     );
     assert!(!arch_detail.pending_reconciliation);
+    assert!(arch_detail.command.provider_health[0].terminal_observed);
+    assert_eq!(
+        arch_detail.command.provider_health[0]
+            .snapshot
+            .first_failure,
+        first_arch_hint
+    );
     assert_eq!(
         arch_detail
             .structured_architect_advice
@@ -866,6 +899,10 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
         PlanningCommandStartStatus::AlreadyCompleted
     );
     assert!(!repeat_arch.launched);
+    assert_eq!(
+        repeat_arch.command.provider_health,
+        arch_detail.command.provider_health
+    );
     let arch_calls = fs::read_to_string(&fixture.worker_marker)
         .expect("read worker_marker")
         .lines()
@@ -879,6 +916,7 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
 
     // 3. Typed Orchestrator outcome 1: `RequiresHumanClarification`.
     fs::write(&fixture.mode_path, b"orch_clarify\n").expect("set mode orch_clarify");
+    fs::remove_file(&fixture.release_path).expect("hold Orchestrator");
     let clarify_submit: PlanningCommandSubmissionResponse = invoke_mcp_ok(
         &mcp,
         "request_technical_plan",
@@ -890,6 +928,15 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
         }),
     )
     .await;
+    let orch_live = wait_for_early_health(&mcp, &clarify_submit.command_id).await;
+    assert!(matches!(
+        orch_live.command.provider_health[0].invocation,
+        threadlane_native::provider_health::ProviderHealthInvocation::Planning {
+            role: WorkflowRole::Orchestrator,
+            ..
+        }
+    ));
+    fs::write(&fixture.release_path, b"release\n").expect("release Orchestrator");
     let clarify_detail = wait_for_command_completion(&mcp, &clarify_submit.command_id).await;
     assert_eq!(
         clarify_detail.status,
@@ -1168,6 +1215,7 @@ async fn consult_architect_and_request_technical_plan_detached_flow_cli_reopen_a
 async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_architect_and_respects_zero_or_budget_limits(
 ) {
     let mut fixture = GatewayFixture::start().await;
+    fs::write(&fixture.health_enabled_path, b"enabled\n").expect("enable fixture health hints");
     let mcp = fixture.enrolled_mcp();
     let now_ms = current_wall_clock_ms().expect("wall clock");
     let grant_id = fixture.create_grant(
@@ -1263,6 +1311,38 @@ async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_archi
         auto_detail.result_ref,
         Some(PlanningCommandResultRef::OrchestratorPlan { .. })
     ));
+    assert_eq!(
+        auto_detail.command.provider_health.len(),
+        3,
+        "every Orchestrator/Architect round has its own invocation"
+    );
+    assert!(auto_detail
+        .command
+        .provider_health
+        .iter()
+        .all(|health| health.terminal_observed && health.snapshot.retry_count == 1));
+    assert_eq!(
+        auto_detail
+            .command
+            .provider_health
+            .iter()
+            .filter(|health| matches!(
+                health.invocation,
+                threadlane_native::provider_health::ProviderHealthInvocation::Planning {
+                    role: WorkflowRole::Architect,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+    let health_reservations: std::collections::BTreeSet<_> = auto_detail
+        .command
+        .provider_health
+        .iter()
+        .map(|health| health.invocation.key())
+        .collect();
+    assert_eq!(health_reservations.len(), 3);
     let orch_summary = auto_detail
         .orchestrator_plan_summary
         .as_ref()
@@ -1311,6 +1391,10 @@ async fn request_technical_plan_omitted_max_architect_rounds_auto_consults_archi
         PlanningCommandStartStatus::AlreadyCompleted
     );
     assert!(!repeat_auto.launched);
+    assert_eq!(
+        repeat_auto.command.provider_health,
+        auto_detail.command.provider_health
+    );
 
     // 3. When the active grant policy or remaining budget does not permit a headless Architect call,
     //    omitted `max_architect_rounds` defaults to `0` and returns honest `OrchestratorRequiresArchitectAdvice`
@@ -1700,5 +1784,652 @@ async fn wait_for_planning_notice_delivery(
             "planning notice callback was not finalized: {value}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planning_health_is_durable_before_live_callback_and_terminal_notice_remains_separate() {
+    use futures_util::{SinkExt, StreamExt};
+    use threadlane::NativeToolOutputConfig;
+    use threadlane_native::coworker_notice::{
+        planning_notice_dir, NoticeDeliveryStatus, PlanningNoticeConfig, PlanningNoticeStore,
+        PlanningNoticeTerminalKind,
+    };
+    use threadlane_native::coworker_workflow::{
+        CoworkerJobLockState, OrchestrateWorkBriefPlanRequest,
+    };
+    use threadlane_native::planning_driver::open_planning_driver_for_plans_dir;
+    use tokio::net::UnixListener;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    for (role, unknown, automatic_round) in [
+        (WorkflowRole::Architect, false, false),
+        (WorkflowRole::Orchestrator, false, false),
+        (WorkflowRole::Orchestrator, false, true),
+        (WorkflowRole::Architect, true, false),
+    ] {
+        let mut fixture = GatewayFixture::start().await;
+        fs::write(&fixture.health_enabled_path, b"enabled\n").expect("enable fixture health hints");
+        let mcp = fixture.enrolled_mcp();
+        let now = current_wall_clock_ms().unwrap();
+        let grant_id = fixture.create_grant("health-planning-grant", now - 1000, now + 3_600_000);
+        let prep: PrepareWorkResponse = invoke_mcp_ok(&mcp, "prepare_work", json!({
+            "grant_id": grant_id, "request_key": "health-planning-prep",
+            "summary": "Offline diagnostic availability", "confirmed_requirements": ["Read src/lib.rs"]
+        })).await;
+        fs::remove_file(&fixture.release_path).unwrap();
+        if role == WorkflowRole::Orchestrator {
+            fs::write(
+                &fixture.mode_path,
+                if automatic_round {
+                    &b"orch_ask_then_plan\n"[..]
+                } else {
+                    &b"orch_plan\n"[..]
+                },
+            )
+            .unwrap();
+        }
+        let fake_worker = fixture.repo_dir.parent().unwrap().join("bin/fake-agy");
+        let script = fs::read_to_string(&fake_worker).unwrap();
+        let hint_line = script
+            .lines()
+            .find(|line| line.contains("retrying in 4s."))
+            .unwrap();
+        let hints = (1..=5)
+            .map(|attempt| {
+                hint_line.replace("attempt 1 failed", &format!("attempt {attempt} failed"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Each internal invocation waits for its own early callback, not just the root call.
+        let script = script.replace(
+            "health_previous=''",
+            &format!(
+                "rm -f '{}'\nhealth_previous=''",
+                fixture.release_path.display()
+            ),
+        );
+        fs::write(&fake_worker, script.replace(hint_line, &hints)).unwrap();
+
+        let driver =
+            open_planning_driver_for_plans_dir(&fixture.plans_dir, &fixture.registry_dir).unwrap();
+        let store = driver.command_store();
+        let ledger = store
+            .workflow_store()
+            .read_binding_ledger(&fixture.binding_id)
+            .unwrap();
+        let grant = ledger
+            .planning_grants
+            .iter()
+            .find(|grant| grant.grant_id == grant_id)
+            .unwrap();
+        let request = if role == WorkflowRole::Architect {
+            EnqueuePlanningCommandRequest::from_architect(RunArchitectAdviceRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.into(),
+                grant_id: grant_id.clone(),
+                request_key: "health-planning-call".into(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                context_dependencies: ArchitectContextDependencies {
+                    project_base: prep.project_base.clone(),
+                    work_brief_digest: prep.work_brief_digest.clone(),
+                    plan_digest: None,
+                    policy_digest: grant.policy_digest.clone(),
+                    dependency_file_blobs: CoworkerPlanningService::compute_dependency_file_blobs(
+                        &prep.project_base,
+                        &["src/lib.rs".into()],
+                    )
+                    .unwrap(),
+                    interface_ownership_digests: BTreeMap::new(),
+                    accepted_predecessor_trees: BTreeMap::new(),
+                },
+                question_summary: "Inspect the read-only boundary".into(),
+                prior_advice_context: Vec::new(),
+                accept_into_brief: false,
+                current_time_ms: now,
+            })
+        } else {
+            EnqueuePlanningCommandRequest::from_orchestrator(OrchestrateWorkBriefPlanRequest {
+                binding_id: fixture.binding_id.clone(),
+                thread_uuid: THREAD_UUID.into(),
+                grant_id: grant_id.clone(),
+                job_id: prep.job_id.clone(),
+                request_key: "health-planning-call".into(),
+                expected_ledger_revision: None,
+                difficulty: Some(Difficulty::Hard),
+                plan_id: None,
+                expected_plan_revision: 0,
+                architect_advice_ids: Vec::new(),
+                max_architect_rounds: if automatic_round { 1 } else { 0 },
+                architect_difficulty: None,
+                current_time_ms: now,
+            })
+        };
+        let command = store.enqueue_command(&request).unwrap();
+        let key = command.ownership_key().unwrap();
+        let notices = planning_notice_dir(&fixture.plans_dir);
+        create_private_dir(&notices);
+        let socket = notices.join("health.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        PlanningNoticeStore::new(&notices)
+            .unwrap()
+            .configure(
+                PlanningNoticeConfig::new(
+                    key.clone(),
+                    command.command_digest.clone(),
+                    NativeToolOutputConfig::new_user_message_steer(
+                        socket,
+                        THREAD_UUID.into(),
+                        fixture.repo_dir.clone(),
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let peer_store = store.clone();
+        let peer_key = key.clone();
+        let release = fixture.release_path.clone();
+        let repo = fixture.repo_dir.to_string_lossy().into_owned();
+        let expected_roles = if automatic_round {
+            vec![
+                WorkflowRole::Orchestrator,
+                WorkflowRole::Architect,
+                WorkflowRole::Orchestrator,
+            ]
+        } else {
+            vec![role]
+        };
+        let expected_calls = expected_roles.len();
+        let peer = tokio::spawn(async move {
+            let mut seen = std::collections::BTreeSet::new();
+            // Each live invocation has its own callback; the last connection is terminal.
+            for expected_role in expected_roles
+                .iter()
+                .copied()
+                .map(Some)
+                .chain(std::iter::once(None))
+            {
+                let terminal = expected_role.is_none();
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = accept_async(stream).await.unwrap();
+                while let Some(frame) = ws.next().await {
+                    let Message::Text(text) = frame.unwrap() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "initialized" => continue,
+                        "initialize" => json!({}),
+                        "thread/read" | "thread/resume" => json!({
+                            "thread": {"id": THREAD_UUID, "cwd": repo, "status": {"type": "idle"}},
+                            "cwd": repo,
+                        }),
+                        "turn/start" => {
+                            let durable = peer_store
+                                .get_command(&peer_key.binding_id, THREAD_UUID, &peer_key.job_id)
+                                .unwrap()
+                                .unwrap();
+                            let health = if terminal {
+                                durable.provider_health.last().unwrap()
+                            } else {
+                                durable
+                                    .provider_health
+                                    .iter()
+                                    .find(|health| !health.terminal_observed)
+                                    .expect("current reserved invocation")
+                            };
+                            if let Some(expected_role) = expected_role {
+                                let threadlane_native::provider_health::ProviderHealthInvocation::Planning {
+                                    role, reservation_id, ..
+                                } = &health.invocation else { panic!("expected planning invocation"); };
+                                assert_eq!(*role, expected_role);
+                                assert!(
+                                    seen.insert(reservation_id.clone()),
+                                    "no duplicate early callback"
+                                );
+                            }
+                            assert!((1..=5).contains(&health.snapshot.retry_count));
+                            if terminal {
+                                assert_eq!(health.snapshot.retry_count, 5);
+                            }
+                            assert_eq!(health.snapshot.evidence_class,
+                                threadlane_workers::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+                            assert_eq!(
+                                durable.status,
+                                if terminal {
+                                    PlanningCommandStatus::Completed
+                                } else {
+                                    PlanningCommandStatus::Running
+                                }
+                            );
+                            assert_eq!(health.terminal_observed, terminal);
+                            if !terminal {
+                                assert_eq!(
+                                    health.snapshot.availability,
+                                    threadlane_workers::provider_health::ProviderDiagnosticAvailability::Available
+                                );
+                                assert!(health.snapshot.unavailable_reason.is_none());
+                            }
+                            assert_eq!(health.snapshot.current_failure.is_none(), terminal);
+                            let active = matches!(
+                                peer_store
+                                    .ownership_store()
+                                    .inspect_job_lock(&peer_key)
+                                    .unwrap(),
+                                CoworkerJobLockState::HeldByActiveProcess { .. }
+                            );
+                            assert_eq!(active, !terminal);
+                            let visible = threadlane_native::planning_driver::get_planning_command_summary_readonly(
+                                peer_store.workflow_store().plans_dir(), peer_store.registry_dir(),
+                                &peer_key.binding_id, THREAD_UUID, &peer_key.job_id,
+                            ).unwrap().unwrap();
+                            assert_eq!(
+                                visible.provider_health_views.iter().any(|view| view.live),
+                                !terminal
+                            );
+                            assert_eq!(
+                                request["params"]["input"][0]["text"],
+                                threadlane::format_coworker_planning_wakeup_message(
+                                    &peer_key.job_id
+                                )
+                                .unwrap()
+                            );
+                            let raw = request.to_string();
+                            assert!(!raw.contains("retrying in"));
+                            assert!(!raw.contains(SECRET_SENTINEL));
+                            if !unknown || terminal {
+                                ws.send(Message::Text(
+                                    json!({"id": request["id"], "result": {
+                                        "turn": {"id": "0196ed00-0000-7000-8000-0000000000aa",
+                                            "status": "inProgress"}
+                                    }})
+                                    .to_string()
+                                    .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            if !terminal {
+                                fs::write(&release, b"release\n").unwrap();
+                            }
+                            break;
+                        }
+                        method => panic!("unexpected health callback {method}"),
+                    };
+                    ws.send(Message::Text(
+                        json!({"id": request["id"], "result": result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            }
+        });
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(30),
+            Box::pin(driver.execute_command(&fixture.binding_id, THREAD_UUID, &command.command_id)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.command.status, PlanningCommandStatus::Completed);
+        let first = PlanningNoticeStore::inspect(&notices, &key, &command.command_digest).unwrap();
+        assert_eq!(first.attempt_count, expected_calls);
+        let first = first.latest.unwrap();
+        assert_eq!(
+            first.terminal_kind,
+            PlanningNoticeTerminalKind::DiagnosticAvailable
+        );
+        assert_eq!(
+            first.status,
+            if unknown {
+                NoticeDeliveryStatus::Unknown
+            } else {
+                NoticeDeliveryStatus::Submitted
+            }
+        );
+        let terminal = driver
+            .notify_terminal_command_if_configured(
+                &fixture.binding_id,
+                THREAD_UUID,
+                &command.command_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            terminal.terminal_kind,
+            PlanningNoticeTerminalKind::Completed
+        );
+        assert_ne!(terminal.fingerprint, first.fingerprint);
+        assert_eq!(terminal.attempt_count, expected_calls + 1);
+        let duplicate = driver
+            .notify_terminal_command_if_configured(
+                &fixture.binding_id,
+                THREAD_UUID,
+                &command.command_id,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(duplicate.was_duplicate);
+        assert_eq!(duplicate.attempt_count, expected_calls + 1);
+        let replay = driver
+            .execute_command(&fixture.binding_id, THREAD_UUID, &command.command_id)
+            .await
+            .unwrap();
+        assert!(replay.was_already_completed);
+        assert_eq!(
+            fs::read_to_string(&fixture.worker_marker)
+                .unwrap()
+                .lines()
+                .count(),
+            expected_calls
+        );
+        tokio::time::timeout(Duration::from_secs(5), peer)
+            .await
+            .unwrap()
+            .unwrap();
+        fixture.shutdown().await;
+    }
+}
+
+/// Waits only inside a bounded fake-provider test; production observation has no polling loop.
+async fn wait_for_early_health(
+    mcp: &PairedMcpServer,
+    command_id: &str,
+) -> PlanningCommandDetailResponse {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    loop {
+        let detail: PlanningCommandDetailResponse =
+            invoke_mcp_ok(mcp, "planning_command", json!({"command_id": command_id})).await;
+        if detail
+            .command
+            .provider_health
+            .iter()
+            .any(|h| h.snapshot.retry_count > 0)
+        {
+            assert!(!detail.command.provider_health[0].terminal_observed);
+            return detail;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "missing early scoped diagnostic while provider is held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn planning_first_closed_lost_or_truncated_hint_is_history_while_cleanup_is_held() {
+    use futures_util::poll;
+    use threadlane::NativeToolOutputConfig;
+    use threadlane_native::coworker_notice::{
+        planning_notice_dir, PlanningNoticeConfig, PlanningNoticeStore,
+    };
+    use threadlane_native::coworker_workflow::{
+        OrchestrateWorkBriefPlanRequest, ReservePlanningCallRequest,
+    };
+    use threadlane_native::planning_driver::{
+        get_planning_command_summary_readonly, open_planning_driver_for_plans_dir,
+    };
+    use threadlane_native::provider_health::{supervise_health, PlanningHealthOwner};
+    use threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser;
+    use threadlane_workers::provider_health::ProviderDiagnosticUnavailableReason as Reason;
+
+    for role in [WorkflowRole::Architect, WorkflowRole::Orchestrator] {
+        for reason in [
+            Reason::SourceClosed,
+            Reason::SourceLost,
+            Reason::ResourceLimit,
+        ] {
+            let mut fixture = GatewayFixture::start().await;
+            let now = current_wall_clock_ms().unwrap();
+            let grant_id = fixture.create_grant("closed-hint-grant", now - 1000, now + 3_600_000);
+            let prep: PrepareWorkResponse = invoke_mcp_ok(
+                &fixture.enrolled_mcp(),
+                "prepare_work",
+                json!({
+                    "grant_id": grant_id, "request_key": "closed-hint-prep",
+                    "summary": "Bounded final drain", "confirmed_requirements": ["Read src/lib.rs"]
+                }),
+            )
+            .await;
+            let driver =
+                open_planning_driver_for_plans_dir(&fixture.plans_dir, &fixture.registry_dir)
+                    .unwrap();
+            let store = driver.command_store();
+            let ledger = store
+                .workflow_store()
+                .read_binding_ledger(&fixture.binding_id)
+                .unwrap();
+            let grant = ledger
+                .planning_grants
+                .iter()
+                .find(|grant| grant.grant_id == grant_id)
+                .unwrap();
+            let request = if role == WorkflowRole::Architect {
+                EnqueuePlanningCommandRequest::from_architect(RunArchitectAdviceRequest {
+                    binding_id: fixture.binding_id.clone(),
+                    thread_uuid: THREAD_UUID.into(),
+                    grant_id: grant_id.clone(),
+                    request_key: "closed-hint-call".into(),
+                    expected_ledger_revision: None,
+                    difficulty: Some(Difficulty::Hard),
+                    context_dependencies: ArchitectContextDependencies {
+                        project_base: prep.project_base.clone(),
+                        work_brief_digest: prep.work_brief_digest.clone(),
+                        plan_digest: None,
+                        policy_digest: grant.policy_digest.clone(),
+                        dependency_file_blobs:
+                            CoworkerPlanningService::compute_dependency_file_blobs(
+                                &prep.project_base,
+                                &["src/lib.rs".into()],
+                            )
+                            .unwrap(),
+                        interface_ownership_digests: BTreeMap::new(),
+                        accepted_predecessor_trees: BTreeMap::new(),
+                    },
+                    question_summary: "Inspect final drain metadata".into(),
+                    prior_advice_context: Vec::new(),
+                    accept_into_brief: false,
+                    current_time_ms: now,
+                })
+            } else {
+                EnqueuePlanningCommandRequest::from_orchestrator(OrchestrateWorkBriefPlanRequest {
+                    binding_id: fixture.binding_id.clone(),
+                    thread_uuid: THREAD_UUID.into(),
+                    grant_id: grant_id.clone(),
+                    job_id: prep.job_id.clone(),
+                    request_key: "closed-hint-call".into(),
+                    expected_ledger_revision: None,
+                    difficulty: Some(Difficulty::Hard),
+                    plan_id: None,
+                    expected_plan_revision: 0,
+                    architect_advice_ids: Vec::new(),
+                    max_architect_rounds: 0,
+                    architect_difficulty: None,
+                    current_time_ms: now,
+                })
+            };
+            let queued = store.enqueue_command(&request).unwrap();
+            let key = queued.ownership_key().unwrap();
+            let guard = store
+                .ownership_store()
+                .try_acquire_job(&key, now)
+                .unwrap()
+                .into_guard()
+                .unwrap();
+            let command = store
+                .claim_running(&guard, &key.binding_id, THREAD_UUID, &key.job_id, None)
+                .unwrap();
+            let reservation = store
+                .workflow_store()
+                .reserve_planning_call(&ReservePlanningCallRequest {
+                    binding_id: key.binding_id.clone(),
+                    thread_uuid: THREAD_UUID.into(),
+                    grant_id: grant_id.clone(),
+                    request_key: command.service_request_key.clone(),
+                    expected_ledger_revision: None,
+                    role,
+                    difficulty: command.payload.difficulty(),
+                    selected_choice: command.selected_choice.clone(),
+                    context_digest: command.context_digest.clone(),
+                    call_project_base: Some(command.call_project_base.clone()),
+                    current_time_ms: now,
+                })
+                .unwrap();
+            let owner = PlanningHealthOwner::new(store, &guard, &command).unwrap();
+            let sink = owner.invocation(&reservation).unwrap();
+            let directory = planning_notice_dir(&fixture.plans_dir);
+            create_private_dir(&directory);
+            let socket = directory.join("closed-hint.sock");
+            // A real listening endpoint stays available throughout the held cleanup interval.
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            PlanningNoticeStore::new(&directory)
+                .unwrap()
+                .configure(
+                    PlanningNoticeConfig::new(
+                        key.clone(),
+                        command.command_digest.clone(),
+                        NativeToolOutputConfig::new_user_message_steer(
+                            socket,
+                            THREAD_UUID.into(),
+                            fixture.repo_dir.clone(),
+                        ),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut parser = AntigravityDiagnosticParser::new();
+            let quiet = parser.snapshot();
+            parser.ingest_at(0, b"I0101 00:00:01.000000 1 run.go:315] Run: attempt 7 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n", 10);
+            parser.unavailable(reason, 11);
+            // Final drain retains SourceLost/ResourceLimit rather than overwriting the reason.
+            parser.unavailable(Reason::SourceClosed, 12);
+            let hint = parser.snapshot();
+            assert_eq!(hint.unavailable_reason, Some(reason));
+            assert!(hint.is_valid());
+            let expected = hint.clone();
+            let (drain_tx, drain_rx) = tokio::sync::oneshot::channel();
+            let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+            let mut supervision = Box::pin(supervise_health(
+                Some(&sink),
+                |observer| async move {
+                    observer.send_replace(Some(quiet));
+                    drain_rx.await.unwrap();
+                    // The FIRST hint is already closed/lost/truncated on watch publication.
+                    observer.send_replace(Some(hint.clone()));
+                    cleanup_rx.await.unwrap();
+                    if role == WorkflowRole::Architect {
+                        Err("injected provider error after final drain")
+                    } else {
+                        Ok((false, hint))
+                    }
+                },
+                |result| Some(&result.1),
+            ));
+            // Fixed polls drive both watch consumers while oneshots prevent provider completion.
+            assert!(poll!(supervision.as_mut()).is_pending());
+            assert!(poll!(supervision.as_mut()).is_pending());
+            assert!(poll!(supervision.as_mut()).is_pending());
+            let quiet_view = get_planning_command_summary_readonly(
+                &fixture.plans_dir,
+                &fixture.registry_dir,
+                &key.binding_id,
+                THREAD_UUID,
+                &key.job_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(quiet_view.provider_health_views[0].live);
+            assert!(quiet_view.provider_health_views[0]
+                .record
+                .snapshot
+                .current_failure
+                .is_none());
+
+            drain_tx.send(()).unwrap();
+            assert!(poll!(supervision.as_mut()).is_pending());
+            assert!(poll!(supervision.as_mut()).is_pending());
+            assert!(poll!(supervision.as_mut()).is_pending());
+            guard.validate_before_effect(&key).unwrap();
+            let held = get_planning_command_summary_readonly(
+                &fixture.plans_dir,
+                &fixture.registry_dir,
+                &key.binding_id,
+                THREAD_UUID,
+                &key.job_id,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(held.status, PlanningCommandStatus::Running);
+            assert_eq!(held.provider_health.len(), 1);
+            assert_eq!(held.provider_health[0].snapshot, expected);
+            assert!(!held.provider_health[0].terminal_observed);
+            assert!(!held.provider_health_views[0].live);
+            let notices =
+                PlanningNoticeStore::inspect(&directory, &key, &command.command_digest).unwrap();
+            assert_eq!(
+                notices.attempt_count, 0,
+                "no new early intent for {role:?}/{reason:?}"
+            );
+            assert!(notices.latest.is_none());
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+
+            cleanup_tx.send(()).unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(5), supervision)
+                .await
+                .unwrap();
+            if role == WorkflowRole::Architect {
+                assert_eq!(outcome, Err("injected provider error after final drain"));
+            } else {
+                let outcome = outcome.unwrap();
+                assert!(
+                    !outcome.0,
+                    "coverage cannot replace the non-success provider result"
+                );
+                assert_eq!(outcome.1, expected);
+            }
+            let terminal = store
+                .get_command(&key.binding_id, THREAD_UUID, &key.job_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(terminal.provider_health[0].snapshot, expected);
+            assert!(terminal.provider_health[0].terminal_observed);
+            assert!(terminal.provider_health[0]
+                .snapshot
+                .current_failure
+                .is_some());
+            assert!(terminal.provider_health[0].snapshot.recovery.is_none());
+            assert_eq!(terminal.provider_health[0].snapshot.retry_count, 1);
+            assert_eq!(
+                terminal.provider_health[0].snapshot.retry_high_water,
+                Some(7)
+            );
+            assert_eq!(
+                PlanningNoticeStore::inspect(&directory, &key, &command.command_digest)
+                    .unwrap()
+                    .attempt_count,
+                0
+            );
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            drop(sink);
+            drop(guard);
+            fixture.shutdown().await;
+        }
     }
 }

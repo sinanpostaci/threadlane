@@ -260,6 +260,13 @@ pub struct CoworkerJobCompletionOutcome {
     pub closure_outcome: Option<ExecuteFinalCandidateClosureOutcome>,
     /// Final structured [`ClosureVerdict`] when `Closure` completed.
     pub closure_verdict: Option<ClosureVerdict>,
+    /// Cumulative role evidence from the existing runtime ledger, also available through execution_status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_health: Vec<crate::provider_health::ProviderHealthView>,
+    /// Original host Worker evidence; derived correction data is retained in provider_health instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub original_worker_provider_health:
+        BTreeMap<String, crate::provider_health::OriginalWorkerProviderHealth>,
     /// Updated [`CoworkerJobRecord`] snapshot after the stage finished.
     pub job: CoworkerJobRecord,
 }
@@ -552,6 +559,14 @@ impl CoworkerJobCompletionService {
                 final_candidate_subject: None,
                 closure_outcome: None,
                 closure_verdict: None,
+                provider_health: crate::provider_health::controller_health_views(
+                    &post_chk_adm.runtime_state,
+                    None,
+                ),
+                original_worker_provider_health: post_chk_adm
+                    .runtime_state
+                    .original_worker_provider_health
+                    .clone(),
                 job: post_chk_adm.job,
             });
         }
@@ -716,10 +731,11 @@ impl CoworkerJobCompletionService {
 
             let closure_res = self
                 .candidate_service
-                .execute_final_candidate_closure(
+                .execute_final_candidate_closure_with_health(
                     self.controller.authority(),
                     self.controller.policy_store(),
                     &closure_req,
+                    Some((&self.controller, guard)),
                 )
                 .await;
 
@@ -880,7 +896,21 @@ impl CoworkerJobCompletionService {
             CoworkerJobCompletionStatus::ClosureNotAccepted
         };
 
+        let terminal_runtime = self
+            .controller
+            .policy_store()
+            .get_job_runtime_readonly(&request.binding_id, &request.job_id)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| post_chk_adm.runtime_state.clone());
         Ok(CoworkerJobCompletionOutcome {
+            provider_health: crate::provider_health::controller_health_views(
+                &terminal_runtime,
+                None,
+            ),
+            original_worker_provider_health: terminal_runtime
+                .original_worker_provider_health
+                .clone(),
             binding_id: request.binding_id.clone(),
             thread_uuid: request.thread_uuid.clone(),
             job_id: request.job_id.clone(),

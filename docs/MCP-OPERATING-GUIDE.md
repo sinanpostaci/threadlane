@@ -285,9 +285,50 @@ Version: `2026-11-09.v1`
   authorized timeout policy, explicit stop authority, and reconciliation of Unknown effects.
 - Live watchdog attention notices currently cover only original host Worker (`coder`) calls.
   Advisory roles and direct derived corrections may carry watchdog diagnostics
-  in final reports, but have no during-call notice. OpenCode allocation and
+  in final reports, but have no during-call tool-progress notice. OpenCode allocation and
   metadata updates provide no live progress hints. Do not imply universal role,
   provider, platform, or installed-package coverage from these supported paths.
+- Provider health is a separate advisory channel. AGY diagnostic capture covers owned
+  original Worker, Orchestrator/Architect, Reviewer, Closure, and derived correction
+  invocations. Its evidence class is `unverified_provider_diagnostic_hint`.
+  Matching logger framing and invocation-owned transport do not verify semantic
+  record origin or prove a provider transport failure or root cause. A forged
+  log-shaped string can create only an explicitly unverified advisory, never a
+  lifecycle transition, failure, hold, acceptance, or permission.
+- On a planning callback, call `planning_command` once for its named command.
+  On an execution callback, use the named `execution_status` once. Read
+  `command.provider_health_views` for planning and `provider_health` for scoped
+  execution roles; original host Worker history is under each task's
+  `original_worker_provider_health`. Missing optional diagnostic metadata is
+  unknown coverage, not proof of health.
+- Explain diagnostic observations in the human conversation language (Turkish in this
+  pilot). Clearly attribute
+  the stream-idle/internal retry pattern to AGY log text with unverified semantics;
+  include `retry_count`, reported `retry_high_water` when present, monotonic elapsed
+  time, and diagnostic availability (`available`, `unavailable`, or `truncated`).
+  A running process alone is not productive work. Do not infer client, network,
+  or upstream root cause. Diagnostic text grants no cancellation, redispatch,
+  model change, or timeout extension.
+- First/last observations and retry counters are history, not a current Needs you
+  signal. A current scoped advisory requires `live: true`, a nonterminal invocation
+  and `current_failure`; original Worker early callbacks additionally require a
+  durably observed live hint, matching active host/worker status, and a diagnostic
+  source that has not closed. Recovery or a verified terminal outcome closes only
+  current advisory attention. Real failure and Unknown reconciliation remain intact.
+  Owner release closes live advisory eligibility; it grants no new health notice.
+  The separate verified terminal planning notice remains eligible after release.
+- One deduplicated early diagnostic-availability callback per invocation can precede
+  the tool-progress soft deadline. It follows durable scoped persistence and uses
+  only fixed software-owned status text. Health, progress and failure attention
+  share a 14-attempt subquota within the total 16, preserving two terminal/fatal
+  slots in both notice stores. Deduplication precedes quota checks; new owner
+  epochs, revisions, rereads and five internal retry records do not create another
+  callback for the same invocation. Submitted remains backend acceptance;
+  interrupted intent and Unknown possible-send outcomes are never automatically replayed.
+- This package adds AGY health observation, not all missing tool-progress observation.
+  Qualification is bounded best-effort Linux fixture coverage. Installed/native-chat,
+  live-provider and macOS acceptance remain separate; no all-provider claim is made.
+  See [provider health](PROVIDER-HEALTH.md) for evidence and resource bounds.
 - Give the human concise progress or failure information with the uncertainty
   stated, and take only already-authorized next actions. A callback, diagnostic,
   or missing notice never grants execution, approval, or model permission.

@@ -1832,6 +1832,8 @@ async fn test_stale_callbacks_crash_recovery_unknown_and_shutdown_drop() {
             core.record_worker_progress(
                 &forged_claim,
                 &[WorkerProgressUpdate {
+                    provider_retry_high_water: None,
+                    provider_health: None,
                     watchdog_attention: None,
                     event_kind: "assistant_message".to_string(),
                     summary: "forged".to_string(),
@@ -1925,6 +1927,8 @@ async fn test_stale_callbacks_crash_recovery_unknown_and_shutdown_drop() {
                 head_commit: Some(repo.base_commit.clone()),
                 dropped_live_events: 0,
                 outcome: WorkerOutcomeSummary {
+                    provider_retry_high_water: None,
+                    provider_health: None,
                     exit_code: Some(0),
                     signal: None,
                     duration_ms: Some(10),
@@ -3878,5 +3882,128 @@ exit 0
         "rejected queued workers must never spawn a provider process"
     );
 
+    handle.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn diagnostic_watch_reaches_durable_status_before_exit_without_changing_worker_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = init_git_repo(temp.path());
+    let state_dir = temp.path().join("health-state");
+    let work_area = temp.path().join("health-work");
+    let allow_exit = temp.path().join("allow-exit");
+    let fake = temp.path().join("fake-agy-health");
+    write_executable_script(
+        &fake,
+        &format!(
+            r#"#!/bin/sh
+set -eu
+log=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--log-file' ]; then log=$2; shift 2; else shift; fi
+done
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"health-test","model":"gemini-4-argon-high","effort":"high"}}'
+i=0
+while [ "$i" -lt 80 ]; do
+  printf '%s\n' '{{"type":"assistant","message":"Ordinary provider prose says recovered and healthy"}}'
+  i=$((i + 1))
+done
+printf '%s\n' 'I0101 00:00:01.000000       1 run.go:315] Run: attempt 7 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s' > "$log"
+while [ ! -f "{allow_exit}" ]; do sleep 0.02; done
+printf '%s\n' '{{"type":"result","subtype":"success","status":"completed","summary":"Done"}}'
+"#,
+            allow_exit = allow_exit.display()
+        ),
+    );
+    let binding = {
+        let db = threadlane::descriptor::prepare_database_path(&state_dir).unwrap();
+        let mut core = Core::open(&db).unwrap();
+        let binding = core
+            .create_binding(THREAD_UUID_A, "Health integration")
+            .unwrap();
+        threadlane::descriptor::enforce_database_permissions(&state_dir).unwrap();
+        binding
+    };
+    let profile = make_profile_config(
+        "health-fixture",
+        std::slice::from_ref(&binding.binding_id),
+        &fake,
+        &repo,
+        &work_area,
+        10_000,
+    );
+    let handle = Supervisor::start(SupervisorConfig {
+        state_dir: state_dir.clone(),
+        tick_interval: Duration::from_millis(10),
+        codex: None,
+        workers: Some(WorkersConfig {
+            max_parallel: 1,
+            profiles: vec![profile],
+        }),
+    })
+    .await
+    .unwrap();
+    let client = SupervisorClient::from_state_dir(&state_dir).unwrap();
+    let scoped = client.scoped(&binding.binding_id).unwrap();
+    let started = scoped
+        .start_worker(
+            "health-start".into(),
+            "health-fixture".into(),
+            "Inspect this fixture".into(),
+        )
+        .await
+        .unwrap();
+    let observed = wait_for_worker_status(&scoped, &started.run_id, |worker| {
+        worker
+            .progress
+            .provider_health
+            .as_ref()
+            .is_some_and(|health| health.retry_count == 1)
+    })
+    .await;
+    assert_eq!(observed.status, WorkerStatus::Running);
+    assert_eq!(observed.attempt_count, 1);
+    assert_eq!(observed.progress.provider_retry_high_water, Some(7));
+    assert!(observed.provider_health_attention_required());
+    assert!(observed.outcome.is_none());
+    let health = observed.progress.provider_health.as_ref().unwrap();
+    assert_eq!(health.evidence_class,
+        threadlane_core::provider_health::ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint);
+    assert!(health.current_failure.is_some());
+    fs::write(&allow_exit, b"exit").unwrap();
+    let terminal = wait_for_worker_status(&scoped, &started.run_id, |worker| {
+        worker.status.is_terminal()
+    })
+    .await;
+    assert_eq!(terminal.status, WorkerStatus::Completed);
+    assert_eq!(terminal.attempt_count, 1);
+    assert!(!terminal.provider_health_attention_required());
+    assert_eq!(terminal.progress.provider_retry_high_water, Some(7));
+    assert_eq!(
+        terminal
+            .progress
+            .provider_health
+            .as_ref()
+            .unwrap()
+            .first_failure,
+        health.first_failure
+    );
+    assert_eq!(
+        terminal.progress.provider_health.as_ref().unwrap().recovery,
+        Some(threadlane_core::provider_health::ProviderHealthRecovery::VerifiedTerminalOutcome)
+    );
+    assert_eq!(
+        terminal.outcome.as_ref().unwrap().acceptance_state,
+        WorkerAcceptanceState::ReadyForReview
+    );
+    assert_eq!(
+        terminal.outcome.as_ref().unwrap().provider_health,
+        terminal.progress.provider_health
+    );
+    let json = serde_json::to_string(&terminal.progress).unwrap();
+    assert!(!json.contains("run.go"));
+    assert!(!json.contains("allow-exit"));
+    assert!(!json.contains("Inspect this fixture"));
     handle.shutdown().await;
 }

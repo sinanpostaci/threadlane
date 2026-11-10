@@ -28,6 +28,8 @@ fn sample_worktree_update(run_id: &str, worker_id: &str) -> WorkerWorktreeUpdate
 
 fn sample_ready_outcome() -> WorkerOutcomeSummary {
     WorkerOutcomeSummary {
+        provider_retry_high_water: None,
+        provider_health: None,
         exit_code: Some(0),
         signal: None,
         duration_ms: Some(420),
@@ -158,11 +160,15 @@ fn worker_lifecycle_start_claim_progress_complete_and_wake_ack() {
             &claim,
             &[
                 WorkerProgressUpdate {
+                    provider_retry_high_water: None,
+                    provider_health: None,
                     watchdog_attention: None,
                     event_kind: "system_init".to_string(),
                     summary: "Initialized provider session".to_string(),
                 },
                 WorkerProgressUpdate {
+                    provider_retry_high_water: None,
+                    provider_health: None,
                     watchdog_attention: None,
                     event_kind: "assistant_message".to_string(),
                     summary: "Inspecting workspace files".to_string(),
@@ -669,6 +675,8 @@ fn worker_atomic_claim_correlation_and_stale_callback_rejection() {
             core.record_worker_progress(
                 bad_claim,
                 &[WorkerProgressUpdate {
+                    provider_retry_high_water: None,
+                    provider_health: None,
                     watchdog_attention: None,
                     event_kind: "tool_use".to_string(),
                     summary: "forged progress".to_string(),
@@ -1200,6 +1208,8 @@ fn worker_bounded_progress_cap_secret_redaction_and_wire_budget_enforcement() {
     let mut updates = Vec::with_capacity(total_updates);
     for idx in 0..total_updates {
         updates.push(WorkerProgressUpdate {
+            provider_retry_high_water: None,
+            provider_health: None,
                     watchdog_attention: None,
             event_kind: "assistant_message".to_string(),
             summary: format!(
@@ -1243,6 +1253,8 @@ fn worker_bounded_progress_cap_secret_redaction_and_wire_budget_enforcement() {
         .collect();
 
     let outcome = WorkerOutcomeSummary {
+        provider_retry_high_water: None,
+        provider_health: None,
         exit_code: Some(1),
         signal: None,
         duration_ms: Some(1_500),

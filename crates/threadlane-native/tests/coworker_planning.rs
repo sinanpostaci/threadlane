@@ -3907,3 +3907,270 @@ async fn codex_planning_preserves_total_overflow_hard_line_ceiling_unsealed_reje
         .plans
         .is_empty());
 }
+
+#[tokio::test]
+async fn planning_health_uses_actual_command_guard_and_reservation_and_reopens_unknown_history() {
+    use threadlane_native::coworker_workflow::ReservePlanningCallRequest;
+    use threadlane_native::provider_health::{supervise_health, PlanningHealthOwner};
+    use threadlane_native::{
+        current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandStatus,
+    };
+    let fx = OrchestratorTestFixture::new();
+    let grant = fx.create_default_grant("health-command-grant");
+    let job = fx.create_initial_job(
+        "health-command-job",
+        vec!["Implement telemetry parser".into()],
+        vec![],
+        vec![],
+    );
+    let commands = receipt_command_store(&fx);
+    let request =
+        OrchestratorTestFixture::plan_req(&grant.grant_id, &job.job_id, "health-command", 0);
+    let queued = commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(request))
+        .expect("enqueue");
+    let key = queued.ownership_key().expect("command key");
+    let now = current_wall_clock_ms().expect("clock");
+    let guard = commands
+        .ownership_store()
+        .try_acquire_job(&key, now)
+        .expect("acquire")
+        .into_guard()
+        .expect("physical guard");
+    let command = commands
+        .claim_running(&guard, BINDING_ID, THREAD_UUID, &queued.command_id, None)
+        .expect("claim command");
+    let reservation = fx
+        .store
+        .reserve_planning_call(&ReservePlanningCallRequest {
+            binding_id: BINDING_ID.into(),
+            thread_uuid: THREAD_UUID.into(),
+            grant_id: grant.grant_id,
+            request_key: command.service_request_key.clone(),
+            expected_ledger_revision: None,
+            role: command.role,
+            difficulty: command.payload.difficulty(),
+            selected_choice: command.selected_choice.clone(),
+            context_digest: command.context_digest.clone(),
+            call_project_base: Some(command.call_project_base.clone()),
+            current_time_ms: now,
+        })
+        .expect("actual reservation");
+    let owner = PlanningHealthOwner::new(&commands, &guard, &command)
+        .expect("exact physical command owner");
+    let sink = owner.invocation(&reservation).expect("exact reservation");
+    let command_path = commands
+        .ledger_path_for_binding(BINDING_ID)
+        .expect("command path");
+    let before = fs::read(&command_path).expect("command bytes before rejection");
+    let mut wrong_reservation = reservation.clone();
+    wrong_reservation.reservation_id = "prs_wrong_reservation".into();
+    assert!(owner.invocation(&wrong_reservation).is_err());
+    let mut wrong_subject = reservation.clone();
+    wrong_subject.context_digest = "f".repeat(64);
+    assert!(owner.invocation(&wrong_subject).is_err());
+    assert_eq!(
+        before,
+        fs::read(&command_path).expect("command bytes after rejection")
+    );
+
+    let mut parser =
+        threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser::new();
+    parser.ingest_at(0, b"I0101 00:00:01.000000 1 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n", 10);
+    let snapshot = parser.snapshot();
+    let expected = snapshot.clone();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let invocation = supervise_health(
+        Some(&sink),
+        |observer| async move {
+            observer.send_replace(Some(snapshot.clone()));
+            release_rx.await.expect("release finite fake invocation");
+            Ok::<_, ()>(snapshot)
+        },
+        |snapshot| Some(snapshot),
+    );
+    let inspect = async {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let current = commands
+                .get_command(BINDING_ID, THREAD_UUID, &command.command_id)
+                .expect("read live command")
+                .expect("command");
+            if !current.provider_health.is_empty() {
+                assert_eq!(current.status, PlanningCommandStatus::Running);
+                assert_eq!(current.command_digest, command.command_digest);
+                assert_eq!(current.provider_health[0].snapshot, expected);
+                assert!(!current.provider_health[0].terminal_observed);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing durable live command diagnostic"
+            );
+            tokio::task::yield_now().await;
+        }
+        release_tx.send(()).expect("release fake invocation");
+    };
+    let (result, ()) = tokio::join!(invocation, inspect);
+    assert_eq!(result.expect("independent result"), expected);
+    let finished = commands
+        .get_command(BINDING_ID, THREAD_UUID, &command.command_id)
+        .expect("terminal history")
+        .expect("command");
+    assert!(finished.provider_health[0].terminal_observed);
+    assert_eq!(finished.command_digest, command.command_digest);
+    assert_eq!(
+        finished.status,
+        PlanningCommandStatus::Running,
+        "a diagnostic return has no command lifecycle authority"
+    );
+    assert_eq!(
+        fx.invocation_count(),
+        0,
+        "scope checks and metadata never dispatch a provider"
+    );
+
+    drop(sink);
+    drop(guard);
+    let reopened = receipt_command_store(&fx)
+        .get_command(BINDING_ID, THREAD_UUID, &command.command_id)
+        .expect("reopen")
+        .expect("historical command");
+    assert_eq!(reopened.status, PlanningCommandStatus::Unknown);
+    assert!(reopened.pending_reconciliation);
+    assert_eq!(reopened.provider_health, finished.provider_health);
+    assert_eq!(reopened.command_digest, command.command_digest);
+}
+
+#[tokio::test]
+async fn reconciliation_preserves_old_health_owner_without_live_update_or_redispatch_authority() {
+    use threadlane_native::provider_health::{
+        PlanningHealthOwner, ProviderHealthInvocation, ScopedProviderHealth,
+    };
+    use threadlane_native::{
+        current_wall_clock_ms, EnqueuePlanningCommandRequest, PlanningCommandBindingLedger,
+        PlanningCommandStatus,
+    };
+
+    let fx = OrchestratorTestFixture::new();
+    let grant = fx.create_default_grant("health-history-grant");
+    let job = fx.create_initial_job(
+        "health-history-job",
+        vec!["Implement telemetry parser".into()],
+        vec![],
+        vec![],
+    );
+    let driver =
+        threadlane_native::open_planning_driver_for_plans_dir(&fx.plans_dir, &fx.registry_dir)
+            .unwrap();
+    let commands = driver.command_store().clone();
+    let queued = commands
+        .enqueue_command(&EnqueuePlanningCommandRequest::from_orchestrator(
+            OrchestratorTestFixture::plan_req(
+                &grant.grant_id,
+                &job.job_id,
+                "health-history-command",
+                0,
+            ),
+        ))
+        .unwrap();
+    let completed = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &queued.command_id)
+        .await
+        .unwrap();
+    let original = completed.command;
+    let original_owner = original.owner_summary.clone().unwrap();
+    let calls_before_recovery = fx.invocation_count();
+    let threadlane_native::PlanningCommandResultRef::OrchestratorPlan {
+        planning_result, ..
+    } = original.result_ref.as_ref().unwrap()
+    else {
+        panic!("expected plan receipt");
+    };
+
+    // Model the crash window after a verified receipt but before command completion.
+    // All edits are confined to this disposable command ledger; no provider is redispatched.
+    let path = commands.ledger_path_for_binding(BINDING_ID).unwrap();
+    let mut ledger: PlanningCommandBindingLedger =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let interrupted = ledger
+        .commands
+        .iter_mut()
+        .find(|c| c.command_id == queued.command_id)
+        .unwrap();
+    let mut parser =
+        threadlane_workers::antigravity_diagnostics::AntigravityDiagnosticParser::new();
+    parser.ingest_at(0, b"I0101 00:00:01.000000 1 run.go:315] Run: attempt 1 failed (stream reading error: stream idle timeout (5m0s): context deadline exceeded), retrying in 4s.\n", 10);
+    interrupted.provider_health = vec![ScopedProviderHealth {
+        ownership_key: original.ownership_key().unwrap(),
+        owner: original_owner.clone(),
+        lease_epoch: None,
+        invocation: ProviderHealthInvocation::Planning {
+            grant_id: planning_result.grant_id.clone(),
+            reservation_id: planning_result.reservation_id.clone(),
+            request_key: planning_result.request_key.clone(),
+            context_digest: original.context_digest.clone(),
+            role: original.role,
+        },
+        snapshot: parser.snapshot(),
+        terminal_observed: false,
+    }];
+    interrupted.status = PlanningCommandStatus::Unknown;
+    interrupted.pending_reconciliation = true;
+    interrupted.result_ref = None;
+    interrupted.completed_at_ms = None;
+    interrupted.diagnostic = Some("synthetic crash after receipt".into());
+    interrupted.validate().unwrap();
+    let history = interrupted.provider_health.clone();
+    fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+    let recovered = driver
+        .execute_command(BINDING_ID, THREAD_UUID, &queued.command_id)
+        .await
+        .unwrap();
+    assert!(recovered.reconciled_from_existing);
+    assert_eq!(recovered.command.status, PlanningCommandStatus::Completed);
+    assert_eq!(recovered.command.result_ref, original.result_ref);
+    assert_eq!(recovered.command.command_digest, original.command_digest);
+    assert_ne!(
+        recovered.command.owner_summary.as_ref(),
+        Some(&original_owner)
+    );
+    assert_eq!(recovered.command.provider_health, history);
+    assert_eq!(fx.invocation_count(), calls_before_recovery);
+
+    // A physically held new guard does not make retained old-owner hints live.
+    let guard = commands
+        .ownership_store()
+        .try_acquire_job(
+            &original.ownership_key().unwrap(),
+            current_wall_clock_ms().unwrap(),
+        )
+        .unwrap()
+        .into_guard()
+        .unwrap();
+    assert!(PlanningHealthOwner::new(&commands, &guard, &recovered.command).is_err());
+    let summary = threadlane_native::get_planning_command_summary_readonly(
+        &fx.plans_dir,
+        &fx.registry_dir,
+        BINDING_ID,
+        THREAD_UUID,
+        &queued.command_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(summary.provider_health, history);
+    assert!(summary.provider_health_views.iter().all(|view| !view.live));
+    assert!(summary.provider_health[0]
+        .snapshot
+        .current_failure
+        .is_some());
+    assert_eq!(
+        commands
+            .get_command(BINDING_ID, THREAD_UUID, &queued.command_id)
+            .unwrap()
+            .unwrap()
+            .provider_health,
+        history,
+    );
+}

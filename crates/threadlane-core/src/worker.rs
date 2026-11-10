@@ -345,9 +345,99 @@ impl WorkerProgressWatchdogSnapshot {
     }
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Validates the bounded diagnostic allowlist without granting source or execution authority.
+fn validate_provider_health(
+    snapshot: &crate::provider_health::ProviderHealthSnapshot,
+) -> Result<(), CoreError> {
+    crate::provider_health::decode_provider_health_snapshot(&serde_json::to_vec(snapshot)?)?;
+    Ok(())
+}
+
+fn merge_provider_health(
+    previous: &mut Option<crate::provider_health::ProviderHealthSnapshot>,
+    previous_high_water: &mut Option<u32>,
+    incoming: &crate::provider_health::ProviderHealthSnapshot,
+    incoming_high_water: Option<u32>,
+) -> Result<bool, CoreError> {
+    validate_provider_health(incoming)?;
+    if incoming_high_water.is_some_and(|value| {
+        value == 0
+            || value > crate::provider_health::MAX_PROVIDER_HEALTH_RECORDS
+            || incoming.retry_count == 0
+    }) {
+        return Err(CoreError::Validation {
+            field: "provider_retry_high_water",
+            reason: "invalid bounded unverified retry ordinal".to_owned(),
+        });
+    }
+    if let Some(prior) = previous.as_ref() {
+        // Delayed cumulative observations cannot rewind durable history or add counters.
+        if incoming.update_sequence < prior.update_sequence {
+            return Ok(false);
+        }
+        if incoming == prior
+            && (incoming_high_water.is_none() || incoming_high_water == *previous_high_water)
+        {
+            return Ok(false);
+        }
+        if !incoming.is_valid_successor_of(prior)
+            || incoming.update_sequence == prior.update_sequence
+            || (incoming.retry_count - prior.retry_count
+                > incoming.update_sequence - prior.update_sequence)
+            || (incoming.retry_count == prior.retry_count
+                && prior.recovery.is_some()
+                && incoming.recovery.is_none())
+            || match (*previous_high_water, incoming_high_water) {
+                (Some(prior_high), Some(next)) => {
+                    next < prior_high
+                        || (next > prior_high && incoming.retry_count == prior.retry_count)
+                }
+                (Some(_), None) => true,
+                _ => false,
+            }
+            || (incoming.retry_count > prior.retry_count
+                && prior.last_failure.is_some_and(|last| {
+                    incoming.last_failure.is_none_or(|next| {
+                        next.update_sequence <= prior.update_sequence
+                            || next.elapsed_ms < prior.elapsed_ms
+                            || next.elapsed_ms < last.elapsed_ms
+                    })
+                }))
+            || (prior.first_failure.is_none()
+                && incoming.first_failure.is_some_and(|first| {
+                    first.update_sequence <= prior.update_sequence
+                        || first.elapsed_ms < prior.elapsed_ms
+                }))
+        {
+            return Err(CoreError::Validation {
+                field: "provider_health",
+                reason: "inconsistent cumulative unverified diagnostic history".to_string(),
+            });
+        }
+    }
+    *previous = Some(incoming.clone());
+    *previous_high_water = incoming_high_water;
+    Ok(true)
+}
+
 /// Bounded live progress counters and latest redacted summary for a worker attempt.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerProgressSummary {
+    /// Highest retry ordinal reported by unverified diagnostic text, distinct from record count.
+    /// Absent means unknown, never zero dispatch attempts or proven healthy transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry_high_water: Option<u32>,
+    /// A hint was durably observed on the live diagnostic channel. Terminal merging never
+    /// sets this flag. Callbacks still require verified scope, owner and durable deduplication.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub provider_health_live_observed: bool,
+    /// Cumulative unverified diagnostic hints; absent on legacy records with unknown coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_health: Option<crate::provider_health::ProviderHealthSnapshot>,
     /// Count of durable `WorkerProgress` events emitted to the binding event stream (`<= MAX_WORKER_PROGRESS_EVENTS_PER_ATTEMPT`).
     pub durable_progress_events: u32,
     /// Count of additional live progress updates coalesced into this snapshot after reaching the durable event cap.
@@ -371,6 +461,13 @@ pub struct WorkerProgressSummary {
 /// Contains no raw stdout, raw prompts, argv, or credentials. No `accepted` boolean is ever set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerOutcomeSummary {
+    /// Highest retry ordinal reported by unverified diagnostic text, distinct from record count.
+    /// Absent means unknown, never zero dispatch attempts or proven healthy transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry_high_water: Option<u32>,
+    /// Cumulative unverified diagnostic hints; absent on legacy records with unknown coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_health: Option<crate::provider_health::ProviderHealthSnapshot>,
     /// Process exit code when the worker exited normally.
     pub exit_code: Option<i32>,
     /// Terminating signal number when the worker was killed by a signal.
@@ -474,6 +571,25 @@ pub struct WorkerSnapshot {
     pub cancel_reason: Option<String>,
 }
 
+impl WorkerSnapshot {
+    /// Whether a live invocation has a current unverified diagnostic advisory. Terminal
+    /// history never supplies current-running attention or callback/replay authority.
+    pub fn provider_health_attention_required(&self) -> bool {
+        matches!(
+            self.status,
+            WorkerStatus::Running | WorkerStatus::CancelRequested
+        ) && self.progress.provider_health_live_observed
+            && self
+                .progress
+                .provider_health
+                .as_ref()
+                .is_some_and(|health| {
+                    health.current_failure.is_some() && health.recovery.is_none()
+                        && health.unavailable_reason != Some(crate::provider_health::ProviderDiagnosticUnavailableReason::SourceClosed)
+                })
+    }
+}
+
 /// Persisted dispatcher claim binding a single execution attempt to `(binding_id, run_id, worker_id, revision, claim_id, profile_digest)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerClaim {
@@ -532,6 +648,13 @@ pub struct WorkerWorktreeUpdate {
 /// Single live progress item forwarded from the worker observer channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerProgressUpdate {
+    /// Highest retry ordinal reported by unverified diagnostic text, distinct from record count.
+    /// Absent means unknown, never zero dispatch attempts or proven healthy transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_retry_high_water: Option<u32>,
+    /// Cumulative unverified diagnostic hints; absent on legacy records with unknown coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_health: Option<crate::provider_health::ProviderHealthSnapshot>,
     /// Normalized event kind label (`system_init`, `assistant_message`, `tool_use`, `tool_result`, etc.).
     pub event_kind: String,
     /// Sanitized summary text for the event.
@@ -1011,6 +1134,8 @@ impl Core {
         }
 
         let outcome = WorkerOutcomeSummary {
+            provider_retry_high_water: None,
+            provider_health: None,
             exit_code: None,
             signal: None,
             duration_ms: Some(0),
@@ -1236,14 +1361,47 @@ impl Core {
         }
 
         let mut progress = worker.progress;
-        let next_status = if worker.status == WorkerStatus::Claimed {
+        let has_ordinary_progress = updates.iter().any(|item| item.provider_health.is_none());
+        let next_status = if worker.status == WorkerStatus::Claimed && has_ordinary_progress {
             WorkerStatus::Running
         } else {
             worker.status
         };
-        let started_at_ms = worker.started_at_ms.unwrap_or(valid_now);
+        let started_at_ms = worker
+            .started_at_ms
+            .or_else(|| has_ordinary_progress.then_some(valid_now));
 
         for item in updates {
+            if let Some(health) = &item.provider_health {
+                if item.event_kind != "provider_diagnostic_hint"
+                    || item.watchdog_attention.is_some()
+                    || (health.recovery == Some(crate::provider_health::ProviderHealthRecovery::VerifiedTerminalOutcome)
+                        && health.unavailable_reason != Some(crate::provider_health::ProviderDiagnosticUnavailableReason::SourceClosed))
+                {
+                    return Err(CoreError::Validation {
+                        field: "provider_health",
+                        reason: "diagnostics require the separate live snapshot channel"
+                            .to_string(),
+                    });
+                }
+                if merge_provider_health(
+                    &mut progress.provider_health, &mut progress.provider_retry_high_water,
+                    health, item.provider_retry_high_water,
+                )?
+                    && health.current_failure.is_some()
+                    && health.unavailable_reason != Some(crate::provider_health::ProviderDiagnosticUnavailableReason::SourceClosed)
+                {
+                    progress.provider_health_live_observed = true;
+                }
+                // Retain no caller text; spend no ordinary event capacity or lifecycle authority.
+                continue;
+            }
+            if item.provider_retry_high_water.is_some() {
+                return Err(CoreError::Validation {
+                    field: "provider_retry_high_water",
+                    reason: "retry ordinals require diagnostic snapshot metadata".to_owned(),
+                });
+            }
             if let Some(attention) = &item.watchdog_attention {
                 attention.validate_attention()?;
                 if item.event_kind != "supervisor_attention" {
@@ -1394,6 +1552,39 @@ impl Core {
         let worktree_json = serde_json::to_string(&worktree)?;
 
         let mut progress = worker.progress;
+        if let Some(health) = &outcome.provider_health {
+            // Final evidence completes history even when all live receivers were closed.
+            // Reject contradictory diagnostic metadata without allowing it to prevent the
+            // independently established terminal outcome or manufacture a new live notice.
+            let duration_consistent = outcome
+                .duration_ms
+                .is_none_or(|duration| health.elapsed_ms <= duration);
+            let recovery_consistent = health.recovery
+                != Some(crate::provider_health::ProviderHealthRecovery::VerifiedTerminalOutcome)
+                || (outcome.exit_code == Some(0)
+                    && outcome.signal.is_none()
+                    && !outcome.timed_out
+                    && !outcome.cancelled
+                    && !outcome.provider_error
+                    && !outcome.incomplete_cleanup
+                    && !outcome.stdout_truncated
+                    && !outcome.stderr_truncated
+                    && !outcome.missing_model_evidence
+                    && !outcome.missing_effort_evidence);
+            if duration_consistent && recovery_consistent {
+                match merge_provider_health(
+                    &mut progress.provider_health,
+                    &mut progress.provider_retry_high_water,
+                    health,
+                    outcome.provider_retry_high_water,
+                ) {
+                    Ok(_) | Err(CoreError::Validation { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        outcome.provider_health = progress.provider_health.clone();
+        outcome.provider_retry_high_water = progress.provider_retry_high_water;
         progress.dropped_live_events = progress
             .dropped_live_events
             .saturating_add(completion.dropped_live_events);
@@ -1585,6 +1776,8 @@ impl Core {
                 || worker.cancel_requested_at_ms.is_some();
 
             let outcome = WorkerOutcomeSummary {
+                provider_retry_high_water: None,
+                provider_health: None,
                 exit_code: None,
                 signal: None,
                 duration_ms: None,
@@ -1935,6 +2128,8 @@ impl Core {
         if worker.status == WorkerStatus::Queued && worker.claim_id.is_none() {
             // Unclaimed queued worker has no external process or worktree: transition directly to Cancelled.
             let outcome = WorkerOutcomeSummary {
+                provider_retry_high_water: None,
+                provider_health: None,
                 exit_code: None,
                 signal: None,
                 duration_ms: Some(0),

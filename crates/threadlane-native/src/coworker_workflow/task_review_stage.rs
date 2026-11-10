@@ -34,7 +34,7 @@ use super::controller_policy::{
 use super::ownership::CoworkerJobOwnershipGuard;
 use super::review::{ExpectedTaskReviewIdentity, MAX_TASK_REVIEW_RESPONSE_BYTES};
 use super::review_execution::{
-    run_task_review_with_guard, TaskReviewExecutionReport, TaskReviewExecutionRequest,
+    run_task_review_with_claim_and_health, TaskReviewExecutionReport, TaskReviewExecutionRequest,
     TaskReviewExecutionStatus,
 };
 use super::store::{
@@ -432,7 +432,25 @@ pub async fn execute_task_review_stage(
             &effect_id,
         )?;
 
-        let run_res = run_task_review_with_guard(&exec_req, guard).await;
+        let health_sink = crate::provider_health::ScopedHealthSink::controller(
+            controller,
+            guard,
+            &effect_id,
+            WorkflowRole::Reviewer,
+            Some(&request.task_id),
+            Some(request.attempt_no),
+            &review_subject.subject_digest,
+        )?;
+        let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let run_res = run_task_review_with_claim_and_health(
+            &exec_req,
+            guard,
+            None,
+            None,
+            &mut cancel_rx,
+            Some(&health_sink),
+        )
+        .await;
 
         controller.verify_physical_ownership(
             guard,

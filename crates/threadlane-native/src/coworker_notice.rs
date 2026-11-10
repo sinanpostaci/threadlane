@@ -25,7 +25,7 @@ use crate::{NativeError, NativeErrorCode};
 
 /// Maximum number of persisted notice delivery attempts allowed per job scope.
 pub const MAX_NOTICE_ATTEMPTS: usize = 16;
-// Advisory progress cannot consume the final two shared slots for terminal/fatal notices.
+// Advisory health, progress and failure attention preserve two terminal/fatal slots.
 const MAX_PROGRESS_NOTICE_ATTEMPTS: usize = MAX_NOTICE_ATTEMPTS - 2;
 /// Timeout in milliseconds applied when invoking a coworker notice wakeup.
 pub const NOTICE_TIMEOUT_MS: u64 = 2_000;
@@ -529,6 +529,98 @@ fn derive_progress_notice_fingerprint(
     ))
 }
 
+/// Separate from progress/failure milestones; no revision, owner epoch or retry ordinal.
+pub(crate) fn derive_provider_health_notice_fingerprint<T: Serialize>(
+    key: &CoworkerJobOwnershipKey,
+    immutable_subject: &str,
+    invocation: &T,
+) -> Result<String, NativeError> {
+    key.validate()?;
+    validate_sha256_digest_str(immutable_subject, "health notice subject")?;
+    let identity = serde_json::to_vec(&(
+        "unverified_provider_health_notice_v1",
+        key,
+        immutable_subject,
+        invocation,
+    ))
+    .map_err(|_| crate::provider_health::rejected())?;
+    Ok(sha256_hex(&identity))
+}
+
+fn verified_original_provider_health_fingerprint(
+    admission: &VerifiedControllerAdmission,
+    key: &CoworkerJobOwnershipKey,
+    snapshot: &threadlane_host::TaskStateSnapshot,
+) -> Option<String> {
+    let task = admission
+        .approval
+        .tasks
+        .iter()
+        .find(|t| t.task_id == snapshot.task_id)?;
+    let job_task = admission
+        .job
+        .tasks
+        .iter()
+        .find(|t| t.task_id == task.task_id)?;
+    // Final watch metadata can arrive while the independent terminal outcome is pending.
+    // Only a durably observed live hint may create an early diagnostic callback.
+    if !snapshot
+        .worker
+        .as_ref()?
+        .provider_health_attention_required()
+    {
+        return None;
+    }
+    let health = crate::provider_health::OriginalWorkerProviderHealth::from_snapshot(
+        snapshot,
+        &admission.approval,
+        task,
+    )?;
+    let durable = admission
+        .runtime_state
+        .original_worker_provider_health
+        .get(&task.task_id)?;
+    if admission.runtime_state.stop_requested
+        || key.binding_id != admission.job.binding_id
+        || key.thread_uuid != admission.job.thread_uuid
+        || key.job_id != admission.job.job_id
+        || job_task.current_attempt_no != 1
+        || crate::coworker_workflow::task_has_derived_attempt_or_post_initial_state(
+            job_task,
+            &admission.runtime_state,
+        )
+        || !health.is_valid_successor_of(durable)
+        || durable.snapshot.current_failure.is_none()
+        || health.snapshot.current_failure.is_none()
+        || !matches!(
+            snapshot.status,
+            threadlane_host::TaskExecutionStatus::Running
+                | threadlane_host::TaskExecutionStatus::CancelRequested
+        )
+        || !matches!(
+            health.worker_status,
+            threadlane_core::WorkerStatus::Running | threadlane_core::WorkerStatus::CancelRequested
+        )
+    {
+        return None;
+    }
+    derive_provider_health_notice_fingerprint(
+        key,
+        &admission.runtime_state.envelope.envelope_digest,
+        &(
+            &health.approval_id,
+            &health.approval_subject_digest,
+            &health.task_id,
+            &health.task_digest,
+            &health.command_key,
+            &health.run_id,
+            &health.worker_id,
+            &health.claim_id,
+        ),
+    )
+    .ok()
+}
+
 // This accepts genuine host snapshots only after their caller used ApprovedHostClient.
 // Scope, immutable approval identity, actual receipt IDs, reconciled controller failure state,
 // and terminal worker failure status are verified here; provider prose never enters wakeup text.
@@ -703,6 +795,131 @@ pub struct CoworkerNoticeStore {
 }
 
 impl CoworkerNoticeStore {
+    /// Only live guard-backed scoped sinks can use this advisory route.
+    pub(crate) async fn notify_provider_health(
+        &self,
+        sink: &crate::provider_health::ScopedHealthSink<'_>,
+    ) -> Result<Option<NoticeReport>, NativeError> {
+        let Some(eligibility) = sink.notice_eligibility()? else {
+            return Ok(None);
+        };
+        if eligibility.planning {
+            return Err(crate::provider_health::rejected());
+        }
+        let fingerprint = eligibility.fingerprint.clone();
+        self.deliver_provider_health(eligibility, || async {
+            Ok(sink
+                .notice_eligibility()?
+                .is_some_and(|fresh| !fresh.planning && fresh.fingerprint == fingerprint))
+        })
+        .await
+    }
+
+    /// Caller supplies only genuine ApprovedHostClient data; recheck the live host before send.
+    pub(crate) async fn notify_original_provider_health(
+        &self,
+        session: &OwnedCoworkerControllerSession,
+        client: &threadlane_host::ApprovedHostClient,
+        snapshot: &threadlane_host::TaskStateSnapshot,
+    ) -> Result<Option<NoticeReport>, NativeError> {
+        let key = session.guard().key();
+        session.guard().validate_before_effect(&key)?;
+        let admission = session.verify_admission()?;
+        let Some(fingerprint) =
+            verified_original_provider_health_fingerprint(&admission, &key, snapshot)
+        else {
+            return Ok(None);
+        };
+        let eligibility = crate::provider_health::ProviderHealthNoticeEligibility {
+            key: key.clone(),
+            guard: session.guard(),
+            subject_digest: admission.runtime_state.envelope.envelope_digest.clone(),
+            repository_path: admission
+                .approval
+                .repository_path
+                .to_str()
+                .ok_or_else(crate::provider_health::rejected)?
+                .to_owned(),
+            fingerprint: fingerprint.clone(),
+            job_revision: admission.job.job_revision,
+            planning: false,
+        };
+        self.deliver_provider_health(eligibility, || async {
+            session.guard().validate_before_effect(&key)?;
+            let current = client
+                .get_task(&admission.approval.approval_id, &snapshot.task_id)
+                .await
+                .map_err(|_| crate::provider_health::rejected())?;
+            let fresh = session.verify_admission()?;
+            Ok(
+                verified_original_provider_health_fingerprint(&fresh, &key, &current).as_ref()
+                    == Some(&fingerprint),
+            )
+        })
+        .await
+    }
+
+    async fn deliver_provider_health<F, Fut>(
+        &self,
+        eligibility: crate::provider_health::ProviderHealthNoticeEligibility<'_>,
+        revalidate: F,
+    ) -> Result<Option<NoticeReport>, NativeError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<bool, NativeError>>,
+    {
+        let key = &eligibility.key;
+        let (lock_name, state_name) = scope_filenames(key)?;
+        let reserved = {
+            let _lock =
+                acquire_cross_process_lock(&self.root_dir, &lock_name, "coworker_notice_lock")?;
+            let Some(mut state) = self.read_state_locked(&state_name)? else {
+                return Ok(None);
+            };
+            eligibility.guard.validate_before_effect(key)?;
+            validate_config_identity(
+                &state.config,
+                key,
+                &eligibility.subject_digest,
+                Path::new(&eligibility.repository_path),
+            )?;
+            self.reserve_progress_for_fingerprint_locked(
+                &state_name,
+                &mut state,
+                key,
+                eligibility.job_revision,
+                eligibility.fingerprint.clone(),
+                Some(eligibility.guard),
+            )?
+        };
+        let (context, attempt, fingerprint, job_revision) = match reserved {
+            ReserveOutcome::MissingConfig => return Ok(None),
+            ReserveOutcome::Completed(report) => return Ok(Some(report)),
+            ReserveOutcome::Reserved {
+                context,
+                attempt,
+                fingerprint,
+                job_revision,
+            } => (context, attempt, fingerprint, job_revision),
+        };
+        eligibility.guard.validate_before_effect(key)?;
+        if !revalidate().await? {
+            return Ok(None);
+        }
+        eligibility.guard.validate_before_effect(key)?;
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
+        eligibility.guard.validate_before_effect(key)?;
+        self.finalize_attempt(
+            key,
+            NoticeKind::Attention,
+            job_revision,
+            &fingerprint,
+            &outcome,
+        )
+        .map(Some)
+    }
+
     /// Creates the store root as a private directory and returns a store handle.
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self, NativeError> {
         let root_dir = root_dir.into();
@@ -1445,6 +1662,9 @@ pub fn planning_notice_dir(plans_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanningNoticeTerminalKind {
+    /// Advisory availability only; admitted through a separate live guard-backed route.
+    /// The enum name is retained for API compatibility; this is never a terminal outcome.
+    DiagnosticAvailable,
     /// Command completed with a verified planning artifact and applicable published plan.
     Completed,
     /// Command terminated in a known failure.
@@ -1457,6 +1677,7 @@ impl PlanningNoticeTerminalKind {
     /// Returns the stable `snake_case` string representation of this terminal kind.
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::DiagnosticAvailable => "diagnostic_available",
             Self::Completed => "completed",
             Self::KnownFailed => "known_failed",
             Self::Unknown => "unknown",
@@ -1980,6 +2201,66 @@ pub struct PlanningNoticeStore {
 }
 
 impl PlanningNoticeStore {
+    /// Live diagnostic availability is distinct from terminal eligibility and needs a guard.
+    pub(crate) async fn notify_provider_health(
+        &self,
+        sink: &crate::provider_health::ScopedHealthSink<'_>,
+    ) -> Result<Option<PlanningNoticeReport>, NativeError> {
+        let Some(eligibility) = sink.notice_eligibility()? else {
+            return Ok(None);
+        };
+        if !eligibility.planning {
+            return Err(crate::provider_health::rejected());
+        }
+        let key = &eligibility.key;
+        let (lock_name, state_name) = planning_scope_filenames(key)?;
+        let reserved = {
+            let _lock =
+                acquire_cross_process_lock(&self.root_dir, &lock_name, "planning_notice_lock")?;
+            let Some(mut state) = self.read_state_locked(&state_name)? else {
+                return Ok(None);
+            };
+            eligibility.guard.validate_before_effect(key)?;
+            validate_planning_config_identity(
+                &state.config,
+                key,
+                &eligibility.subject_digest,
+                Path::new(&eligibility.repository_path),
+            )?;
+            self.reserve_for_kind_locked(
+                &state_name,
+                &mut state,
+                key,
+                PlanningNoticeTerminalKind::DiagnosticAvailable,
+                eligibility.fingerprint.clone(),
+                Some(eligibility.guard),
+            )?
+        };
+        let (context, attempt, fingerprint, kind) = match reserved {
+            PlanningReserveOutcome::MissingConfig => return Ok(None),
+            PlanningReserveOutcome::Completed(report) => return Ok(Some(report)),
+            PlanningReserveOutcome::Reserved {
+                context,
+                attempt,
+                fingerprint,
+                terminal_kind,
+            } => (context, attempt, fingerprint, terminal_kind),
+        };
+        // Reserved intent remains Unknown on reopen if fresh scope no longer permits a send.
+        let Some(fresh) = sink.notice_eligibility()? else {
+            return Ok(None);
+        };
+        if !fresh.planning || fresh.fingerprint != fingerprint {
+            return Ok(None);
+        }
+        eligibility.guard.validate_before_effect(key)?;
+        let (_shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let outcome = context.invoke_wakeup(&attempt, &mut shutdown_rx).await;
+        eligibility.guard.validate_before_effect(key)?;
+        self.finalize_attempt(key, kind, &fingerprint, &outcome)
+            .map(Some)
+    }
+
     /// Creates the store root as a private `0700` directory and returns a store handle.
     pub fn new(root_dir: impl Into<PathBuf>) -> Result<Self, NativeError> {
         let root_dir = root_dir.into();
@@ -2099,6 +2380,27 @@ impl PlanningNoticeStore {
         };
         validate_planning_config_identity(&state.config, key, command_digest, repository_path)?;
         let terminal_kind = validate_planning_notice_eligibility(snapshot)?;
+        let fingerprint = derive_planning_notice_fingerprint(key, command_digest)?;
+        self.reserve_for_kind_locked(
+            &state_name,
+            &mut state,
+            key,
+            terminal_kind,
+            fingerprint,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_for_kind_locked(
+        &self,
+        state_name: &str,
+        state: &mut StoredPlanningNoticeState,
+        key: &CoworkerJobOwnershipKey,
+        terminal_kind: PlanningNoticeTerminalKind,
+        fingerprint: String,
+        guard: Option<&CoworkerJobOwnershipGuard>,
+    ) -> Result<PlanningReserveOutcome, NativeError> {
         let mut dirty = false;
         for entry in &mut state.attempts {
             if entry.status == PersistedAttemptStatus::Intent {
@@ -2107,9 +2409,8 @@ impl PlanningNoticeStore {
             }
         }
         if dirty {
-            self.write_state_locked(&state_name, &state)?;
+            self.write_state_locked(state_name, state)?;
         }
-        let fingerprint = derive_planning_notice_fingerprint(key, command_digest)?;
         let count = state.attempts.len();
         if let Some(existing) = state.attempts.iter().find(|a| a.fingerprint == fingerprint) {
             return Ok(PlanningReserveOutcome::Completed(PlanningNoticeReport {
@@ -2124,7 +2425,12 @@ impl PlanningNoticeStore {
                 attempt_count: count,
             }));
         }
-        if count >= MAX_NOTICE_ATTEMPTS {
+        let cap = if terminal_kind == PlanningNoticeTerminalKind::DiagnosticAvailable {
+            MAX_PROGRESS_NOTICE_ATTEMPTS
+        } else {
+            MAX_NOTICE_ATTEMPTS
+        };
+        if count >= cap {
             return Ok(PlanningReserveOutcome::Completed(PlanningNoticeReport {
                 attempt_id: None,
                 command_id: key.job_id.clone(),
@@ -2141,6 +2447,9 @@ impl PlanningNoticeStore {
         let attempt_id = format!("pnotice_{}_{}", count + 1, &fingerprint[..16]);
         let attempt = CoworkerPlanningWakeupAttempt::new(key.job_id.clone(), attempt_id.clone())
             .map_err(|err| NativeError::new(NativeErrorCode::ValidationFailed, err.to_string()))?;
+        if let Some(guard) = guard {
+            guard.validate_before_effect(key)?;
+        }
         state.attempts.push(PersistedPlanningNoticeAttempt {
             attempt_id,
             terminal_kind,
@@ -2148,7 +2457,7 @@ impl PlanningNoticeStore {
             status: PersistedAttemptStatus::Intent,
             diagnostic: None,
         });
-        self.write_state_locked(&state_name, &state)?;
+        self.write_state_locked(state_name, state)?;
         Ok(PlanningReserveOutcome::Reserved {
             context: Box::new(context),
             attempt,
@@ -2282,6 +2591,228 @@ fn planning_scope_filenames(
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn provider_health_uses_a_distinct_invocation_fingerprint_and_shared_progress_subcap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, complete) = fixture(tmp.path());
+        let health = |ordinal: usize| {
+            derive_provider_health_notice_fingerprint(
+                &cfg.key,
+                &cfg.envelope_digest,
+                &(
+                    "original_worker",
+                    "task_1",
+                    format!("run_{ordinal}"),
+                    format!("worker_{ordinal}"),
+                ),
+            )
+            .unwrap()
+        };
+        assert_ne!(
+            health(0),
+            derive_progress_notice_fingerprint(&cfg.key, "task_1", "run_0", "worker_0").unwrap()
+        );
+        assert_ne!(
+            health(0),
+            derive_worker_failure_notice_fingerprint(&cfg.key, "task_1", "run_0", "worker_0")
+                .unwrap()
+        );
+        let reserve = |store: &CoworkerNoticeStore, ordinal, revision| {
+            let (lock_name, state_name) = scope_filenames(&cfg.key).unwrap();
+            let _lock =
+                acquire_cross_process_lock(&store.root_dir, &lock_name, "coworker_notice_lock")
+                    .unwrap();
+            let mut state = store.read_state_locked(&state_name).unwrap().unwrap();
+            store
+                .reserve_progress_for_fingerprint_locked(
+                    &state_name,
+                    &mut state,
+                    &cfg.key,
+                    revision,
+                    health(ordinal),
+                    None,
+                )
+                .unwrap()
+        };
+        for invocation in 0..MAX_PROGRESS_NOTICE_ATTEMPTS {
+            assert!(matches!(
+                reserve(&store, invocation, 1),
+                ReserveOutcome::Reserved { .. }
+            ));
+        }
+        let reopened = CoworkerNoticeStore::new(tmp.path().join("store")).unwrap();
+        assert!(matches!(
+            reserve(&reopened, 13, 999),
+            ReserveOutcome::Completed(NoticeReport {
+                was_duplicate: true,
+                status: NoticeDeliveryStatus::Unknown,
+                cap_reached: false,
+                attempt_count: 14,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reserve(&reopened, 14, 999),
+            ReserveOutcome::Completed(NoticeReport {
+                cap_reached: true,
+                was_duplicate: false,
+                attempt_count: 14,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reopened
+                .reserve_fatal_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    999,
+                    None
+                )
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+        assert!(matches!(
+            reopened
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.envelope_digest,
+                    &cfg.target.project_root,
+                    NoticeKind::Complete,
+                    999,
+                    complete,
+                    None
+                )
+                .unwrap(),
+            ReserveOutcome::Reserved { .. }
+        ));
+        assert!(matches!(
+            reserve(&reopened, 13, 1000),
+            ReserveOutcome::Completed(NoticeReport {
+                was_duplicate: true,
+                cap_reached: false,
+                attempt_count: 16,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn planning_health_deduplicates_before_subcap_and_never_weakens_terminal_eligibility() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (store, cfg, complete) =
+            planning_fixture(tmp.path(), "pcm_0123456789abcdef0123456789abcdef");
+        let reserve = |store: &PlanningNoticeStore, ordinal: usize, kind| {
+            let (lock_name, state_name) = planning_scope_filenames(&cfg.key).unwrap();
+            let _lock =
+                acquire_cross_process_lock(&store.root_dir, &lock_name, "planning_notice_lock")
+                    .unwrap();
+            let mut state = store.read_state_locked(&state_name).unwrap().unwrap();
+            let fingerprint = derive_provider_health_notice_fingerprint(
+                &cfg.key,
+                &cfg.command_digest,
+                &("reservation", ordinal),
+            )
+            .unwrap();
+            store
+                .reserve_for_kind_locked(&state_name, &mut state, &cfg.key, kind, fingerprint, None)
+                .unwrap()
+        };
+        for ordinal in 0..MAX_PROGRESS_NOTICE_ATTEMPTS {
+            assert!(matches!(
+                reserve(
+                    &store,
+                    ordinal,
+                    PlanningNoticeTerminalKind::DiagnosticAvailable
+                ),
+                PlanningReserveOutcome::Reserved { .. }
+            ));
+        }
+        let reopened = PlanningNoticeStore::new(tmp.path().join("planning-notices")).unwrap();
+        assert!(matches!(
+            reserve(
+                &reopened,
+                13,
+                PlanningNoticeTerminalKind::DiagnosticAvailable
+            ),
+            PlanningReserveOutcome::Completed(PlanningNoticeReport {
+                was_duplicate: true,
+                cap_reached: false,
+                status: NoticeDeliveryStatus::Unknown,
+                attempt_count: 14,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reserve(
+                &reopened,
+                14,
+                PlanningNoticeTerminalKind::DiagnosticAvailable
+            ),
+            PlanningReserveOutcome::Completed(PlanningNoticeReport {
+                cap_reached: true,
+                was_duplicate: false,
+                attempt_count: 14,
+                ..
+            })
+        ));
+        assert!(
+            validate_planning_notice_eligibility(PlanningNoticeSnapshot {
+                has_active_owner_lock: true,
+                ..complete
+            })
+            .is_err()
+        );
+        assert!(
+            validate_planning_notice_eligibility(PlanningNoticeSnapshot {
+                status: PlanningCommandStatus::Running,
+                ..complete
+            })
+            .is_err()
+        );
+        assert!(matches!(
+            reopened
+                .reserve_attempt(
+                    &cfg.key,
+                    &cfg.command_digest,
+                    &cfg.target.project_root,
+                    complete
+                )
+                .unwrap(),
+            PlanningReserveOutcome::Reserved { .. }
+        ));
+        // Exercise the common total cap without manufacturing a second command terminal result.
+        assert!(matches!(
+            reserve(&reopened, 99, PlanningNoticeTerminalKind::Unknown),
+            PlanningReserveOutcome::Reserved { .. }
+        ));
+        assert!(matches!(
+            reserve(
+                &reopened,
+                13,
+                PlanningNoticeTerminalKind::DiagnosticAvailable
+            ),
+            PlanningReserveOutcome::Completed(PlanningNoticeReport {
+                was_duplicate: true,
+                cap_reached: false,
+                attempt_count: 16,
+                ..
+            })
+        ));
+        assert!(matches!(
+            reserve(
+                &reopened,
+                100,
+                PlanningNoticeTerminalKind::DiagnosticAvailable
+            ),
+            PlanningReserveOutcome::Completed(PlanningNoticeReport {
+                cap_reached: true,
+                attempt_count: 16,
+                ..
+            })
+        ));
+    }
 
     fn fixture(
         dir: &Path,
@@ -4482,6 +5013,244 @@ mod tests {
         }
     }
 
+    #[test]
+    fn original_health_fingerprint_requires_live_observation_and_an_open_source() {
+        use crate::coworker_workflow::{
+            CoworkerJobPhase, CoworkerJobRecord, FrozenApprovalLinkage, PlanningResultRef,
+            WorkBrief, WorkBriefKind,
+        };
+        use threadlane_core::provider_health::{
+            ProviderDiagnosticAvailability, ProviderDiagnosticUnavailableReason,
+            ProviderHealthCategory, ProviderHealthEvidenceClass, ProviderHealthObservation,
+            ProviderHealthSnapshot,
+        };
+        use threadlane_core::{
+            WorkerProgressSummary, WorkerSnapshot, WorkerStatus, WorkerWorktreeSummary,
+        };
+
+        // Inert scoped values test this eligibility boundary. Admission and native delivery
+        // are separately exercised by the owned-host integration fixture.
+        let run = "run_00000000-0000-4000-8000-000000000001";
+        let worker_id = "wrk_00000000-0000-4000-8000-000000000001";
+        let (mut task, mut runtime) = original_failed_attempt_fixture(run, worker_id);
+        task.stage = CoworkerTaskStage::Running;
+        let env = runtime.envelope.clone();
+        let approval: threadlane_authority::ApprovalRecord = serde_json::from_value(serde_json::json!({
+            "approval_id": env.approval_id, "subject_digest": env.approval_subject_digest,
+            "policy_version": 1, "binding_id": env.binding_id, "thread_uuid": env.thread_uuid,
+            "plan_id": env.plan_id, "plan_revision": 1, "profile_id": "prf_synthetic",
+            "registry_revision": 1, "plan_digest": env.plan_digest,
+            "repository_path": env.project_base.repository_path, "base_commit": env.project_base.base_commit,
+            "approved_task_ids": ["task_1"], "approved_write_paths": [], "max_parallel": 1,
+            "budgets": threadlane_workers::ExecutionBudgets::default(), "created_at_ms": 1,
+            "tasks": [{
+                "task_id": "task_1", "title": "Synthetic task", "instruction": "Synthetic instruction",
+                "instruction_digest": "a".repeat(64), "role": "coder", "difficulty": "medium",
+                "tool_id": "tool_synthetic", "adapter": "codex_cli", "model_id": "model_synthetic",
+                "model_arg": "model-synthetic", "base_model": "model-synthetic",
+                "depends_on": [], "allowed_write_paths": [], "task_digest": task.task_digest,
+                "profile_id": "prf_synthetic", "command_key": "cmd_synthetic"
+            }]
+        })).unwrap();
+        let linkage = FrozenApprovalLinkage {
+            approval_id: env.approval_id.clone(),
+            approval_subject_digest: env.approval_subject_digest.clone(),
+            plan_id: env.plan_id.clone(),
+            plan_revision: 1,
+            plan_digest: env.plan_digest.clone(),
+            project_base: env.project_base.clone(),
+            profile_id: env.profile_id.clone(),
+            registry_revision: 1,
+            policy_id: env.policy.policy_id.clone(),
+            policy_digest: env.policy_digest.clone(),
+            approved_task_ids: vec!["task_1".into()],
+            approved_write_paths: vec![],
+            controller_envelope: None,
+        };
+        let result: PlanningResultRef = serde_json::from_value(serde_json::json!({
+            "grant_id": "pgr_synthetic", "reservation_id": "prs_synthetic",
+            "request_key": "req_synthetic", "run_id": run, "report_artifact_id": "art_synthetic",
+            "output_digest": "a".repeat(64), "work_brief_digest": env.work_brief_digest,
+            "project_base": env.project_base, "profile_id": env.profile_id, "registry_revision": 1,
+            "policy_digest": env.policy_digest, "selected_choice": task.selected_choice,
+            "plan_id": env.plan_id, "plan_revision": 1, "plan_digest": env.plan_digest,
+            "plan_status": "published", "recorded_at_ms": 1
+        }))
+        .unwrap();
+        let job = CoworkerJobRecord {
+            job_id: runtime.job_id.clone(),
+            job_revision: 1,
+            create_request_key: "req_synthetic".into(),
+            binding_id: env.binding_id.clone(),
+            thread_uuid: env.thread_uuid.clone(),
+            phase: CoworkerJobPhase::Executing,
+            work_brief: WorkBrief {
+                brief_id: env.work_brief_id.clone(),
+                binding_id: env.binding_id.clone(),
+                thread_uuid: env.thread_uuid.clone(),
+                project_base: env.project_base.clone(),
+                kind: WorkBriefKind::NewJob,
+                summary: "Synthetic brief".into(),
+                confirmed_requirements: vec![],
+                proposed_additions: vec![],
+                assumptions: vec![],
+                open_questions: vec![],
+                accepted_architect_decisions: vec![],
+            },
+            work_brief_digest: env.work_brief_digest.clone(),
+            supersedes_job_id: None,
+            planning_result: Some(result.clone()),
+            approval_linkage: Some(linkage.clone()),
+            tasks: vec![task],
+            holds: vec![],
+            outbox: vec![],
+            combined_candidates: vec![],
+        };
+        let first = ProviderHealthObservation {
+            category: ProviderHealthCategory::StreamIdleRetry,
+            elapsed_ms: 10,
+            update_sequence: 1,
+        };
+        let hint = ProviderHealthSnapshot {
+            schema_version: 1,
+            evidence_class: ProviderHealthEvidenceClass::UnverifiedProviderDiagnosticHint,
+            availability: ProviderDiagnosticAvailability::Available,
+            unavailable_reason: None,
+            elapsed_ms: 10,
+            update_sequence: 1,
+            retry_count: 1,
+            first_failure: Some(first),
+            last_failure: Some(first),
+            current_failure: Some(ProviderHealthCategory::StreamIdleRetry),
+            recovery: None,
+        };
+        let worker = WorkerSnapshot {
+            untrusted_data: true,
+            worker_id: worker_id.into(),
+            run_id: run.into(),
+            binding_id: "bnd_host".into(),
+            revision: 1,
+            status: WorkerStatus::Running,
+            profile_id: "prf_synthetic".into(),
+            profile_digest: "a".repeat(64),
+            provider: "codex_cli".into(),
+            requested_model: "model-synthetic".into(),
+            requested_effort: "high".into(),
+            observed_model: None,
+            observed_effort: None,
+            instruction: "Synthetic instruction".into(),
+            claim_id: Some("wclm_synthetic".into()),
+            attempt_count: 1,
+            execution_binding: None,
+            worktree: WorkerWorktreeSummary {
+                run_worktree_id: None,
+                run_worktree_path: None,
+                run_branch_name: None,
+                task_worktree_id: None,
+                task_worktree_path: None,
+                task_branch_name: None,
+                base_commit: "0".repeat(40),
+                head_commit: None,
+            },
+            progress: WorkerProgressSummary {
+                provider_health: Some(hint),
+                provider_health_live_observed: true,
+                ..Default::default()
+            },
+            outcome: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            started_at_ms: Some(1),
+            completed_at_ms: None,
+            cancel_requested_at_ms: None,
+            cancel_reason: None,
+        };
+        let approved_task = &approval.tasks[0];
+        let mut snapshot = threadlane_host::TaskStateSnapshot {
+            approval_id: approval.approval_id.clone(),
+            subject_digest: approval.subject_digest.clone(),
+            binding_id: approval.binding_id.clone(),
+            thread_uuid: approval.thread_uuid.clone(),
+            session_binding_id: worker.binding_id.clone(),
+            task_id: approved_task.task_id.clone(),
+            task_digest: approved_task.task_digest.clone(),
+            adapter: approved_task.adapter,
+            provider: approved_task.provider,
+            depends_on: vec![],
+            dependency_input: None,
+            profile_id: approved_task.profile_id.clone(),
+            command_key: approved_task.command_key.clone(),
+            status: threadlane_host::TaskExecutionStatus::Running,
+            run_id: Some(run.into()),
+            worker_id: Some(worker_id.into()),
+            worker: Some(worker),
+            accepted: false,
+            lifecycle: None,
+        };
+        let durable = crate::provider_health::OriginalWorkerProviderHealth::from_snapshot(
+            &snapshot,
+            &approval,
+            approved_task,
+        )
+        .unwrap();
+        runtime
+            .original_worker_provider_health
+            .insert("task_1".into(), durable);
+        let admission = VerifiedControllerAdmission {
+            job,
+            planning_result: result,
+            linkage,
+            approval,
+            runtime_state: runtime,
+        };
+        let key = CoworkerJobOwnershipKey::new(
+            &admission.job.binding_id,
+            &admission.job.thread_uuid,
+            &admission.job.job_id,
+        )
+        .unwrap();
+        let fingerprint =
+            verified_original_provider_health_fingerprint(&admission, &key, &snapshot)
+                .expect("genuine live hint is eligible");
+        assert_eq!(
+            verified_original_provider_health_fingerprint(&admission, &key, &snapshot),
+            Some(fingerprint.clone()),
+            "rereading the same live invocation preserves its deduplication identity",
+        );
+        snapshot
+            .worker
+            .as_mut()
+            .unwrap()
+            .progress
+            .provider_health_live_observed = false;
+        assert!(
+            verified_original_provider_health_fingerprint(&admission, &key, &snapshot).is_none(),
+            "terminal-only merging while status is Running cannot authorize an early notice",
+        );
+        let worker = snapshot.worker.as_mut().unwrap();
+        worker.progress.provider_health_live_observed = true;
+        let closed = worker.progress.provider_health.as_mut().unwrap();
+        closed.availability = ProviderDiagnosticAvailability::Unavailable;
+        closed.unavailable_reason = Some(ProviderDiagnosticUnavailableReason::SourceClosed);
+        closed.update_sequence += 1;
+        assert!(closed.is_valid());
+        assert!(
+            verified_original_provider_health_fingerprint(&admission, &key, &snapshot).is_none(),
+            "closed-source history cannot authorize a new early notice before terminal persistence",
+        );
+        assert_eq!(
+            admission.runtime_state.original_worker_provider_health["task_1"]
+                .snapshot
+                .retry_count,
+            1
+        );
+        assert!(!admission.runtime_state.stop_requested);
+        assert_eq!(
+            snapshot.worker.as_ref().unwrap().status,
+            WorkerStatus::Running
+        );
+    }
+
     fn original_failed_attempt_fixture(
         run_id: &str,
         worker_id: &str,
@@ -4597,6 +5366,8 @@ mod tests {
             derived_attempts: Vec::new(),
             attempt_artifacts: std::collections::BTreeMap::new(),
             pending_effects: std::collections::BTreeMap::new(),
+            provider_health: std::collections::BTreeMap::new(),
+            original_worker_provider_health: std::collections::BTreeMap::new(),
             candidate_check_evidence: Vec::new(),
             final_candidate_subject: None,
             closure_attempt_id: None,

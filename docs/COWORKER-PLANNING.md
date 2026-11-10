@@ -108,3 +108,39 @@ command without a notice; this is not an indefinite background delivery service.
 Tests use disposable repositories, local fake providers, and private WebSocket
 peers. Installed managed enrollment and real desktop delivery remain separate
 acceptance gates; no paid-provider or cross-platform acceptance is implied.
+
+
+## Live provider diagnostic availability
+
+Owned Orchestrator and Architect calls, including internal consultation rounds,
+persist bounded AGY hints per actual reservation before an optional early native
+callback. Live eligibility separately requires the actual physical guard, current
+Running command, immutable command/grant/role/context, exact still-reserved call,
+durable current hint and configured matching native target. The existing terminal
+eligibility rule still rejects active owners. Neither route grants model or
+execution authority.
+
+The callback uses the fixed software planning text asking for `planning_command`.
+It contains no diagnostic text, paths, prompts or arbitrary errors. Read
+`command.provider_health_views`: `live` describes the current physical owner and
+reservation, while `record.snapshot.current_failure` describes current advisory
+attention. `command.provider_health` preserves first/last history. Terminal,
+recovered or ownerless observations are not current Needs you signals. Pure reads
+perform no send and stale owner metadata alone is insufficient.
+
+The legacy `terminal_kind` field also accepts `diagnostic_available` for the
+separate live advisory route; this value is not a terminal planning outcome.
+Its fingerprint is per invocation and independent of owner epoch, job revision
+and retry count. Health notices deduplicate before the 14-attempt attention
+subquota within the shared total of 16 per command; a verified terminal callback
+uses its original distinct fingerprint after release. Intent-before-send and
+Unknown/no-replay behavior remain unchanged, including ambiguous early sends.
+Early notification failures cannot replace a proven planning result.
+
+Coworker fetches the named command once and describes the unverified AGY
+stream-idle/internal retry text, observed count, reported high-water ordinal,
+elapsed time and diagnostic availability in the human conversation language
+(Turkish in this pilot). Running is not
+evidence of productive planning. No client/network/upstream cause or permission
+to cancel, redispatch, switch models or extend deadlines follows from a hint.
+See [provider health](PROVIDER-HEALTH.md) for finite bounds and qualification limits.

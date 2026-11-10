@@ -394,6 +394,47 @@ pub fn read_private_json<T: DeserializeOwned>(
     Ok(parsed)
 }
 
+/// Creates a supervisor-only, private, nonblocking Linux FIFO with fixed kernel capacity.
+///
+/// No user-supplied path reaches this helper. O_NOFOLLOW, held-fd metadata, and per-round
+/// continuity checks remain required at the caller; content semantics stay unverified.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub(crate) fn create_private_diagnostic_fifo(path: &Path) -> std::io::Result<File> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("invalid diagnostic sink"))?;
+    // SAFETY: c_path is a live NUL-terminated path; mkfifo creates but never follows a target.
+    if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // RDWR is Linux-qualified: the supervisor keeps an anchor so early startup/dup2 does not
+    // cause false EOF or SIGPIPE. This fd is never inherited by the child.
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    // SAFETY: geteuid takes no arguments and has no side effects.
+    let owner = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_fifo()
+        || metadata.uid() != owner
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(std::io::Error::other("invalid diagnostic sink ownership"));
+    }
+    // SAFETY: file is an open FIFO; F_SETPIPE_SZ changes only its bounded kernel capacity.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) } != 4096 {
+        return Err(std::io::Error::other("unavailable bounded diagnostic sink"));
+    }
+    Ok(file)
+}
+
 /// Sanitizes untrusted text for diagnostic summaries by replacing control characters,
 /// redacting common credential/token patterns, and truncating to `max_bytes` on a UTF-8 boundary.
 pub fn sanitize_and_redact(raw: &str, max_bytes: usize) -> String {
@@ -535,4 +576,113 @@ pub fn truncate_utf8(text: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}{SUFFIX}", &text[..end])
+}
+
+/// Descriptor-relative cleanup for an owned private FIFO or its empty directory.
+/// No symlink is followed and no recursive removal is performed. Questionable entries stay.
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+pub(crate) fn remove_owned_diagnostic_entry(
+    parent: &File,
+    name: &std::ffi::OsStr,
+    held: &File,
+    directory: bool,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(std::io::Error::other("invalid diagnostic entry name"));
+    }
+    let name = std::ffi::CString::new(bytes)
+        .map_err(|_| std::io::Error::other("invalid diagnostic entry name"))?;
+    let expected = held.metadata()?;
+    let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: both descriptors remain held and name is a single NUL-terminated component.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            named.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstatat initialized the stat buffer on success.
+    let named = unsafe { named.assume_init() };
+    let kind = if directory {
+        libc::S_IFDIR
+    } else {
+        libc::S_IFIFO
+    };
+    let mode = if directory { 0o700 } else { 0o600 };
+    if named.st_dev != expected.dev()
+        || named.st_ino != expected.ino()
+        || named.st_uid != expected.uid()
+        || named.st_mode & libc::S_IFMT != kind
+        || named.st_mode & 0o7777 != mode
+        || (!directory && named.st_nlink != 1)
+    {
+        return Err(std::io::Error::other("diagnostic entry identity changed"));
+    }
+    // SAFETY: unlinkat is relative to the held directory and never follows a final symlink.
+    // Identity checks are conservative, not atomic protection against hostile same-user writes.
+    let flags = if directory { libc::AT_REMOVEDIR } else { 0 };
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod diagnostic_cleanup_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt};
+
+    #[test]
+    fn descriptor_relative_cleanup_survives_parent_replacement_and_preserves_foreign_leaf() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_fd = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&parent)
+            .unwrap();
+        let fifo = create_private_diagnostic_fifo(&parent.join("capture")).unwrap();
+        let moved = root.path().join("moved");
+        fs::rename(&parent, &moved).unwrap();
+        let replacement = root.path().join("replacement");
+        fs::create_dir(&replacement).unwrap();
+        fs::write(replacement.join("capture"), b"foreign").unwrap();
+        symlink(&replacement, &parent).unwrap();
+
+        // Simulates a parent change after the caller's continuity check.
+        remove_owned_diagnostic_entry(&parent_fd, std::ffi::OsStr::new("capture"), &fifo, false)
+            .unwrap();
+        assert!(!moved.join("capture").exists());
+        assert_eq!(fs::read(parent.join("capture")).unwrap(), b"foreign");
+
+        let fifo2 = create_private_diagnostic_fifo(&moved.join("capture")).unwrap();
+        fs::remove_file(moved.join("capture")).unwrap();
+        symlink(replacement.join("capture"), moved.join("capture")).unwrap();
+        assert!(remove_owned_diagnostic_entry(
+            &parent_fd,
+            std::ffi::OsStr::new("capture"),
+            &fifo2,
+            false,
+        )
+        .is_err());
+        assert!(moved
+            .join("capture")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(replacement.join("capture")).unwrap(), b"foreign");
+    }
 }

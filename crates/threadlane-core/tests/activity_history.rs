@@ -91,6 +91,8 @@ fn empty_binding_and_read_only_invariants_across_reopen() {
     core.record_worker_progress(
         &claim,
         &[WorkerProgressUpdate {
+            provider_retry_high_water: None,
+            provider_health: None,
             watchdog_attention: None,
             event_kind: "assistant".to_string(),
             summary: "Inspecting crate".to_string(),
